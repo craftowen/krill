@@ -1096,6 +1096,7 @@ impl Shell {
                             });
                             s.apply_accounts_snapshot_for_host(host, snap, cx);
                         }
+                        s.refresh_bots_badge(cx);
                     })
                     .is_ok();
                 if !keep_going {

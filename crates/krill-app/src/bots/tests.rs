@@ -1,23 +1,30 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px};
 use krill_proto::SessionId;
+use krill_proto::agent::Permission;
 use krill_proto::bots::{
     BOT_MCP_APPS, BUILTIN_BOT_TEMPLATES, BotAccessRequest, BotAccessRequestStatus, BotConfig,
-    BotConnectorStatus, BotId, BotItem, BotItemEvent, BotItemEventKind, BotItemLink, BotItemStatus,
-    BotMcpAuthKind, BotRpcRequest, BotRpcResponse, BotSuggestion, BotTemplateCategory,
-    BotToolRelayStatus, BotToolServerStatus, COMPOSIO_CURATED_APPS, ConnectorHealthState,
+    BotConnectorStatus, BotConnectorTestResult, BotGroupChat, BotGroupMessage, BotGroupThread,
+    BotGroupView, BotId, BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind,
+    BotItemLink, BotItemStatus, BotMcpAuthKind, BotMcpOAuthState, BotMemoryHistoryEntry,
+    BotMemoryTidyStatus, BotMemoryTopicInfo, BotRpcRequest, BotRpcResponse, BotSessionSummary,
+    BotSuggestion, BotTemplateCategory, BotToolRelayStatus, BotToolServerStatus,
+    COMPOSIO_CURATED_APPS, ComposioConnectionInfo, ConnectorHealthState, DefaultTrackerBots,
     ExternalBotCandidate, ExternalBotSourceApp, ExternalSource, forget_memory_fact,
     generate_slack_socket_mode_manifest,
 };
 
+use crate::layout::TabColor;
+
 use super::create::{ModelChoice, filter_templates};
 use super::items::ItemFilter;
 use super::rpc::{
-    BOT_RUNTIMES, BotRpcCall, format_csv_i64s, format_csv_strings, parse_csv_i64s,
-    parse_csv_strings, runtime_models, sidebar_snapshot,
+    BOT_RUNTIMES, BotRpcCall, avatar_color_hex, format_csv_i64s, format_csv_strings,
+    parse_csv_i64s, parse_csv_strings, runtime_models, sidebar_snapshot,
 };
 use super::{BadgeChanged, Close, DetailTab, OpenSession, Screen, View};
 
@@ -27,6 +34,13 @@ struct MockState {
     items: Vec<BotItem>,
     soul: String,
     memory: String,
+    memory_history: Vec<BotMemoryHistoryEntry>,
+    tidy_status: BotMemoryTidyStatus,
+    topics: BTreeMap<String, String>,
+    sessions: Vec<BotSessionSummary>,
+    groups: Vec<BotGroupChat>,
+    group_threads: Vec<BotGroupThread>,
+    group_messages: Vec<BotGroupMessage>,
     statuses: Vec<BotConnectorStatus>,
     access_requests: Vec<BotAccessRequest>,
     relay: BotToolRelayStatus,
@@ -34,6 +48,14 @@ struct MockState {
     requests: Vec<BotRpcRequest>,
     candidates: Vec<ExternalBotCandidate>,
     suggestions: Vec<BotSuggestion>,
+    oauth_states: BTreeMap<(BotId, String), BotMcpOAuthState>,
+    composio_connections: Vec<ComposioConnectionInfo>,
+    default_trackers: DefaultTrackerBots,
+    fail_get_soul: Option<String>,
+    fail_get_memory: Option<String>,
+    fail_create_item: Option<String>,
+    fail_reload_connectors: Option<String>,
+    fail_set_connector_config: Option<String>,
 }
 
 fn sample_bot(id: &str, name: &str) -> BotConfig {
@@ -102,17 +124,91 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 st.bots.push(cfg.clone());
                 Ok(BotRpcResponse::Bot(Box::new(cfg)))
             }
+            BotRpcRequest::CreateBotV2(v2) => {
+                let base = &v2.base;
+                let id_str = v2.slug.as_ref().map_or_else(
+                    || format!("bot-{}", st.bots.len() + 1),
+                    |s| s.as_str().to_owned(),
+                );
+                let mut cfg = BotConfig::new(
+                    BotId::new(&id_str).unwrap(),
+                    &base.name,
+                    &base.agent_id,
+                    1_700_000_000_000,
+                )
+                .unwrap();
+                if let Some(slug) = &v2.slug {
+                    cfg.slug = slug.clone();
+                }
+                cfg.description.clone_from(&base.description);
+                cfg.emoji.clone_from(&base.emoji);
+                cfg.avatar_color.clone_from(&v2.avatar_color);
+                cfg.model.clone_from(&base.model);
+                cfg.effort.clone_from(&base.effort);
+                if let Some(perm) = base.permission_mode {
+                    cfg.permission_mode = perm;
+                }
+                cfg.workspace.clone_from(&base.workspace);
+                cfg.template_id.clone_from(&base.template_id);
+                cfg.skills.clone_from(&v2.skills);
+                if let Some(s) = &base.initial_soul {
+                    st.soul.clone_from(s);
+                }
+                st.bots.push(cfg.clone());
+                Ok(BotRpcResponse::Bot(Box::new(cfg)))
+            }
             BotRpcRequest::UpdateBot(params) => {
                 let bot = st
                     .bots
                     .iter_mut()
                     .find(|b| b.id == params.bot_id)
                     .ok_or_else(|| "bot not found".to_owned())?;
+                if let Some(name) = &params.name {
+                    bot.name.clone_from(name);
+                }
+                if let Some(desc) = &params.description {
+                    bot.description.clone_from(desc);
+                }
+                params.emoji.clone().apply(&mut bot.emoji);
+                params.avatar.clone().apply(&mut bot.avatar);
+                if let Some(agent_id) = &params.agent_id {
+                    bot.agent_id.clone_from(agent_id);
+                }
+                params.model.clone().apply(&mut bot.model);
+                params.effort.clone().apply(&mut bot.effort);
+                if let Some(perm) = params.permission_mode {
+                    bot.permission_mode = perm;
+                }
+                params.workspace.clone().apply(&mut bot.workspace);
                 if let Some(p) = params.paused {
                     bot.paused = p;
                 }
+                if let Some(n) = params.notifications {
+                    bot.notifications = n;
+                }
+                if let Some(schedules) = &params.schedules {
+                    bot.schedules.clone_from(schedules);
+                }
+                if let Some(look_around) = &params.look_around {
+                    bot.look_around = look_around.clone();
+                }
+                if let Some(memory_tidy) = params.memory_tidy {
+                    bot.memory_tidy = memory_tidy;
+                }
                 if let Some(tools) = &params.mcp_tools {
                     bot.mcp_tools.clone_from(tools);
+                }
+                Ok(BotRpcResponse::Bot(Box::new(bot.clone())))
+            }
+            BotRpcRequest::UpdateBotExtras(params) => {
+                let bot = st
+                    .bots
+                    .iter_mut()
+                    .find(|b| b.id == params.bot_id)
+                    .ok_or_else(|| "bot not found".to_owned())?;
+                params.avatar_color.clone().apply(&mut bot.avatar_color);
+                if let Some(skills) = &params.skills {
+                    bot.skills.clone_from(skills);
                 }
                 Ok(BotRpcResponse::Bot(Box::new(bot.clone())))
             }
@@ -122,17 +218,55 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     bot_id: bot_id.clone(),
                 })
             }
-            BotRpcRequest::StartBotSession { bot_id, .. } => Ok(BotRpcResponse::SessionStarted {
-                bot_id: bot_id.clone(),
-                session_id: SessionId(77),
-                pid: 4242,
-            }),
-            BotRpcRequest::GetSoul { .. } => Ok(BotRpcResponse::Text(st.soul.clone())),
+            BotRpcRequest::StartBotSession { bot_id, .. } => {
+                let sid = SessionId(77 + st.sessions.len() as u64);
+                st.sessions.push(BotSessionSummary {
+                    session_id: sid,
+                    bot_id: bot_id.clone(),
+                    link_id: None,
+                    pid: 4242,
+                    live: true,
+                    working: false,
+                    label: "Bot Chat".to_owned(),
+                    created_at_ms: 1_700_000_000_000,
+                });
+                Ok(BotRpcResponse::SessionStarted {
+                    bot_id: bot_id.clone(),
+                    session_id: sid,
+                    pid: 4242,
+                })
+            }
+            BotRpcRequest::ListBotSessions { bot_id } => {
+                let filtered = st
+                    .sessions
+                    .iter()
+                    .filter(|s| bot_id.as_ref().is_none_or(|b| &s.bot_id == b))
+                    .cloned()
+                    .collect();
+                Ok(BotRpcResponse::BotSessions(filtered))
+            }
+            BotRpcRequest::StopBotSession { session_id, .. } => {
+                if let Some(s) = st.sessions.iter_mut().find(|s| s.session_id == *session_id) {
+                    s.live = false;
+                }
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::GetSoul { .. } => {
+                if let Some(err) = st.fail_get_soul.clone() {
+                    return Err(err);
+                }
+                Ok(BotRpcResponse::Text(st.soul.clone()))
+            }
             BotRpcRequest::SetSoul { content, .. } => {
                 st.soul.clone_from(content);
                 Ok(BotRpcResponse::Ok)
             }
-            BotRpcRequest::GetMemory { .. } => Ok(BotRpcResponse::Text(st.memory.clone())),
+            BotRpcRequest::GetMemory { .. } => {
+                if let Some(err) = st.fail_get_memory.clone() {
+                    return Err(err);
+                }
+                Ok(BotRpcResponse::Text(st.memory.clone()))
+            }
             BotRpcRequest::UpdateMemory { content, .. } => {
                 st.memory.clone_from(content);
                 Ok(BotRpcResponse::MemoryUpdated {
@@ -150,15 +284,125 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     removed_count: removed,
                 })
             }
-            BotRpcRequest::RunMemoryTidy { bot_id } => Ok(BotRpcResponse::MemoryTidyResult {
-                bot_id: bot_id.clone(),
-                summary: "Compacted 1 duplicate fact".to_owned(),
-                changes: 1,
+            BotRpcRequest::EditMemoryFact {
+                bot_id,
+                old_fact,
+                new_fact,
+            } => {
+                let before = st.memory.clone();
+                st.memory = st.memory.replace(old_fact, new_fact);
+                let after = st.memory.clone();
+                let idx = st.memory_history.len() + 1;
+                st.memory_history.push(BotMemoryHistoryEntry {
+                    entry_id: format!("hist-{idx}"),
+                    bot_id: bot_id.clone(),
+                    timestamp_ms: 1_700_000_000_000,
+                    actor: "owner".to_owned(),
+                    action: "edit".to_owned(),
+                    added: vec![new_fact.clone()],
+                    removed: vec![old_fact.clone()],
+                    before_content: before,
+                    after_content: after.clone(),
+                    undoable: true,
+                    undone: false,
+                });
+                Ok(BotRpcResponse::MemoryUpdated {
+                    content: after,
+                    restored_facts: Vec::new(),
+                    removed_count: 0,
+                })
+            }
+            BotRpcRequest::GetMemoryHistory { .. } => {
+                Ok(BotRpcResponse::MemoryHistory(st.memory_history.clone()))
+            }
+            BotRpcRequest::UndoMemoryChange { entry_id, .. } => {
+                let restored = st
+                    .memory_history
+                    .iter_mut()
+                    .find(|e| e.entry_id == *entry_id)
+                    .map(|entry| {
+                        entry.undone = true;
+                        entry.before_content.clone()
+                    });
+                if let Some(before) = restored {
+                    st.memory = before;
+                }
+                Ok(BotRpcResponse::MemoryUpdated {
+                    content: st.memory.clone(),
+                    restored_facts: Vec::new(),
+                    removed_count: 0,
+                })
+            }
+            BotRpcRequest::RunMemoryTidy { bot_id } => {
+                st.tidy_status.last_tidy_id = Some("tidy-1".to_owned());
+                st.tidy_status.undoable = true;
+                Ok(BotRpcResponse::MemoryTidyResult {
+                    bot_id: bot_id.clone(),
+                    summary: "Compacted 1 duplicate fact".to_owned(),
+                    changes: 1,
+                })
+            }
+            BotRpcRequest::GetMemoryTidyStatus { .. } => {
+                Ok(BotRpcResponse::MemoryTidyStatus(st.tidy_status.clone()))
+            }
+            BotRpcRequest::UndoMemoryTidy { .. } => Ok(BotRpcResponse::MemoryUpdated {
+                content: st.memory.clone(),
+                restored_facts: Vec::new(),
+                removed_count: 0,
             }),
+            BotRpcRequest::ListMemoryTopics { .. } => {
+                let list = st
+                    .topics
+                    .iter()
+                    .map(|(topic, body)| BotMemoryTopicInfo {
+                        topic: topic.clone(),
+                        bytes: body.len() as u64,
+                        updated_at_ms: 1_700_000_000_000,
+                    })
+                    .collect();
+                Ok(BotRpcResponse::MemoryTopics(list))
+            }
+            BotRpcRequest::GetMemoryTopic { topic, .. } => Ok(BotRpcResponse::Text(
+                st.topics.get(topic).cloned().unwrap_or_default(),
+            )),
+            BotRpcRequest::SetMemoryTopic { topic, content, .. } => {
+                st.topics.insert(topic.clone(), content.clone());
+                Ok(BotRpcResponse::Ok)
+            }
             BotRpcRequest::RunLookAround { bot_id } => Ok(BotRpcResponse::LookAroundResult {
                 bot_id: bot_id.clone(),
                 suggestions: st.suggestions.clone(),
             }),
+            BotRpcRequest::ListSuggestions {
+                bot_id,
+                include_dismissed,
+            } => {
+                let filtered = st
+                    .suggestions
+                    .iter()
+                    .filter(|s| bot_id.as_ref().is_none_or(|b| &s.bot_id == b))
+                    .filter(|s| *include_dismissed || !s.dismissed)
+                    .cloned()
+                    .collect();
+                Ok(BotRpcResponse::Suggestions(filtered))
+            }
+            BotRpcRequest::DismissSuggestion { suggestion_id, .. } => {
+                if let Some(s) = st.suggestions.iter_mut().find(|s| s.id == *suggestion_id) {
+                    s.dismissed = true;
+                }
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::StartSuggestion {
+                bot_id,
+                suggestion_id,
+            } => {
+                st.suggestions.retain(|s| s.id != *suggestion_id);
+                Ok(BotRpcResponse::SessionStarted {
+                    bot_id: bot_id.clone(),
+                    session_id: SessionId(91),
+                    pid: 4243,
+                })
+            }
             BotRpcRequest::ListItems {
                 bot_id,
                 include_closed,
@@ -173,6 +417,9 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 Ok(BotRpcResponse::Items(filtered))
             }
             BotRpcRequest::CreateItem(params) => {
+                if let Some(err) = st.fail_create_item.clone() {
+                    return Err(err);
+                }
                 let num = (st.items.len() as u64) + 1;
                 let item = BotItem {
                     uid: format!("item-{num}"),
@@ -201,13 +448,53 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     .iter_mut()
                     .find(|i| i.uid == params.item_id)
                     .ok_or_else(|| "item not found".to_owned())?;
+                if let Some(title) = &params.title {
+                    item.title.clone_from(title);
+                }
+                if let Some(desc) = &params.description {
+                    item.description = Some(desc.clone());
+                }
+                if let Some(done) = &params.done_means {
+                    item.done_means = Some(done.clone());
+                }
                 if let Some(status) = params.status {
                     item.status = status;
+                }
+                if let Some(note) = &params.close_note {
+                    item.close_note = Some(note.clone());
                 }
                 params
                     .snoozed_until_ms
                     .clone()
                     .apply(&mut item.snoozed_until_ms);
+                Ok(BotRpcResponse::Item(Box::new(item.clone())))
+            }
+            BotRpcRequest::AnswerBotItem {
+                item_id,
+                answer_text,
+                option_index,
+                ..
+            } => {
+                let item = st
+                    .items
+                    .iter_mut()
+                    .find(|i| i.uid == *item_id)
+                    .ok_or_else(|| "item not found".to_owned())?;
+                let txt = answer_text
+                    .clone()
+                    .unwrap_or_else(|| format!("Selected option {}", option_index.unwrap_or(0)));
+                item.events.push(BotItemEvent {
+                    id: (item.events.len() as u64) + 1,
+                    item_uid: item.uid.clone(),
+                    kind: BotItemEventKind::Commented,
+                    actor: BotItemActor::Owner { device: None },
+                    text: txt,
+                    decisions: Vec::new(),
+                    created_at_ms: 1_700_000_000_000,
+                });
+                if item.status == BotItemStatus::NeedsYou {
+                    item.status = BotItemStatus::Working;
+                }
                 Ok(BotRpcResponse::Item(Box::new(item.clone())))
             }
             BotRpcRequest::AddItemComment { item_id, text, .. } => {
@@ -220,7 +507,7 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     id: (item.events.len() as u64) + 1,
                     item_uid: item.uid.clone(),
                     kind: BotItemEventKind::Commented,
-                    actor: krill_proto::bots::BotItemActor::Owner { device: None },
+                    actor: BotItemActor::Owner { device: None },
                     text: text.clone(),
                     decisions: Vec::new(),
                     created_at_ms: 1_700_000_000_000,
@@ -236,7 +523,170 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 item.links.push(link.clone());
                 Ok(BotRpcResponse::Item(Box::new(item.clone())))
             }
+            BotRpcRequest::ListGroups => Ok(BotRpcResponse::Groups(st.groups.clone())),
+            BotRpcRequest::CreateGroup {
+                name,
+                bot_ids,
+                description,
+            } => {
+                let id = format!("grp-{}", st.groups.len() + 1);
+                let g = BotGroupChat {
+                    id: id.clone(),
+                    name: name.clone(),
+                    bot_ids: bot_ids.clone(),
+                    description: description.clone(),
+                    created_at_ms: 1_700_000_000_000,
+                    updated_at_ms: 1_700_000_000_000,
+                };
+                st.groups.push(g.clone());
+                st.group_threads.push(BotGroupThread {
+                    thread_id: format!("thr-{id}-1"),
+                    group_id: id,
+                    title: "Main".to_owned(),
+                    created_at_ms: 1_700_000_000_000,
+                    updated_at_ms: 1_700_000_000_000,
+                });
+                Ok(BotRpcResponse::Group(g))
+            }
+            BotRpcRequest::UpdateGroup {
+                group_id,
+                name,
+                description,
+                bot_ids,
+            } => {
+                let g = st
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *group_id)
+                    .ok_or_else(|| "group not found".to_owned())?;
+                if let Some(n) = name {
+                    g.name.clone_from(n);
+                }
+                if let Some(d) = description {
+                    g.description.clone_from(d);
+                }
+                if let Some(ids) = bot_ids {
+                    g.bot_ids.clone_from(ids);
+                }
+                Ok(BotRpcResponse::Group(g.clone()))
+            }
+            BotRpcRequest::DeleteGroup { group_id } => {
+                st.groups.retain(|g| g.id != *group_id);
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::ReorderGroups { group_ids } => {
+                let mut reordered = Vec::new();
+                for id in group_ids {
+                    if let Some(g) = st.groups.iter().find(|g| &g.id == id) {
+                        reordered.push(g.clone());
+                    }
+                }
+                st.groups = reordered;
+                Ok(BotRpcResponse::Groups(st.groups.clone()))
+            }
+            BotRpcRequest::NewGroupThread { group_id, title } => {
+                let tid = format!("thr-{}-{}", group_id, st.group_threads.len() + 1);
+                let g = st
+                    .groups
+                    .iter()
+                    .find(|g| g.id == *group_id)
+                    .cloned()
+                    .ok_or_else(|| "group not found".to_owned())?;
+                st.group_threads.push(BotGroupThread {
+                    thread_id: tid.clone(),
+                    group_id: group_id.clone(),
+                    title: title.clone().unwrap_or_else(|| "Thread".to_owned()),
+                    created_at_ms: 1_700_000_000_000,
+                    updated_at_ms: 1_700_000_000_000,
+                });
+                let threads = st
+                    .group_threads
+                    .iter()
+                    .filter(|t| t.group_id == *group_id)
+                    .cloned()
+                    .collect();
+                let messages = st
+                    .group_messages
+                    .iter()
+                    .filter(|m| m.group_id == *group_id && m.thread_id == tid)
+                    .cloned()
+                    .collect();
+                Ok(BotRpcResponse::GroupView(BotGroupView {
+                    group: g,
+                    threads,
+                    messages,
+                    active_run: false,
+                }))
+            }
+            BotRpcRequest::ReadGroup {
+                group_id,
+                thread_id,
+                ..
+            } => {
+                let g = st
+                    .groups
+                    .iter()
+                    .find(|g| g.id == *group_id)
+                    .cloned()
+                    .ok_or_else(|| "group not found".to_owned())?;
+                let threads: Vec<_> = st
+                    .group_threads
+                    .iter()
+                    .filter(|t| t.group_id == *group_id)
+                    .cloned()
+                    .collect();
+                let active_tid = thread_id
+                    .as_deref()
+                    .or_else(|| threads.first().map(|t| t.thread_id.as_str()));
+                let messages = st
+                    .group_messages
+                    .iter()
+                    .filter(|m| {
+                        m.group_id == *group_id && active_tid.is_none_or(|t| m.thread_id == t)
+                    })
+                    .cloned()
+                    .collect();
+                Ok(BotRpcResponse::GroupView(BotGroupView {
+                    group: g,
+                    threads,
+                    messages,
+                    active_run: false,
+                }))
+            }
+            BotRpcRequest::SendGroupMessage {
+                group_id,
+                thread_id,
+                sender,
+                text,
+                ..
+            } => {
+                let tid = thread_id.clone().unwrap_or_else(|| {
+                    st.group_threads
+                        .iter()
+                        .find(|t| t.group_id == *group_id)
+                        .map_or_else(|| "thr-1".to_owned(), |t| t.thread_id.clone())
+                });
+                let msg = BotGroupMessage {
+                    message_id: format!("msg-{}", st.group_messages.len() + 1),
+                    group_id: group_id.clone(),
+                    thread_id: tid,
+                    sender_id: sender.clone(),
+                    sender_name: sender.clone(),
+                    body: text.clone(),
+                    mentions: Vec::new(),
+                    created_at_ms: 1_700_000_000_000,
+                    in_progress: false,
+                };
+                st.group_messages.push(msg.clone());
+                Ok(BotRpcResponse::GroupMessagePosted {
+                    message: msg,
+                    dispatched_bots: Vec::new(),
+                })
+            }
             BotRpcRequest::SetConnectorConfig { bot_id, connectors } => {
+                if let Some(err) = st.fail_set_connector_config.clone() {
+                    return Err(err);
+                }
                 let bot = st
                     .bots
                     .iter_mut()
@@ -249,6 +699,74 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 st.secrets.push((secret_ref.clone(), value.clone()));
                 Ok(BotRpcResponse::Ok)
             }
+            BotRpcRequest::DeleteSecret { secret_ref } => {
+                st.secrets.retain(|(k, _)| k != secret_ref);
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::ReloadConnectors { .. } => {
+                if let Some(err) = st.fail_reload_connectors.clone() {
+                    return Err(err);
+                }
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::TestConnector { source, .. } => {
+                Ok(BotRpcResponse::ConnectorTest(BotConnectorTestResult {
+                    source: *source,
+                    ok: true,
+                    account_label: Some("@bot".to_owned()),
+                    detail: "connected".to_owned(),
+                }))
+            }
+            BotRpcRequest::RedeemPairingCode { code } => {
+                if let Some(req) = st.access_requests.first_mut() {
+                    req.status = BotAccessRequestStatus::Approved;
+                }
+                let _ = code;
+                Ok(BotRpcResponse::Ok)
+            }
+            BotRpcRequest::StartMcpOAuth { bot_id, tool_id }
+            | BotRpcRequest::McpOAuthStatus { bot_id, tool_id } => {
+                let st_val = BotMcpOAuthState {
+                    bot_id: bot_id.clone(),
+                    tool_id: tool_id.clone(),
+                    status: "connected".to_owned(),
+                    auth_url: None,
+                    error: None,
+                    updated_at_ms: 1_700_000_000_000,
+                };
+                st.oauth_states
+                    .insert((bot_id.clone(), tool_id.clone()), st_val.clone());
+                Ok(BotRpcResponse::McpOAuth(st_val))
+            }
+            BotRpcRequest::CancelMcpOAuth { bot_id, tool_id } => {
+                let st_val = BotMcpOAuthState {
+                    bot_id: bot_id.clone(),
+                    tool_id: tool_id.clone(),
+                    status: "canceled".to_owned(),
+                    auth_url: None,
+                    error: None,
+                    updated_at_ms: 1_700_000_000_000,
+                };
+                st.oauth_states
+                    .insert((bot_id.clone(), tool_id.clone()), st_val.clone());
+                Ok(BotRpcResponse::McpOAuth(st_val))
+            }
+            BotRpcRequest::ListComposioConnections { .. } => Ok(
+                BotRpcResponse::ComposioConnections(st.composio_connections.clone()),
+            ),
+            BotRpcRequest::SetDefaultTrackerBot { source, bot_id } => {
+                match source {
+                    ExternalSource::GitHub => st.default_trackers.github.clone_from(bot_id),
+                    ExternalSource::Linear => st.default_trackers.linear.clone_from(bot_id),
+                    _ => {}
+                }
+                Ok(BotRpcResponse::DefaultTrackerBots(
+                    st.default_trackers.clone(),
+                ))
+            }
+            BotRpcRequest::GetDefaultTrackerBots => Ok(BotRpcResponse::DefaultTrackerBots(
+                st.default_trackers.clone(),
+            )),
             BotRpcRequest::ConnectorStatus { bot_id } => {
                 let filtered = st
                     .statuses
@@ -701,6 +1219,482 @@ fn connectors_slack_manifest_composio_access_and_tools_relay_and_escape(cx: &mut
     assert!(*closed.lock().unwrap());
 }
 
+#[gpui::test]
+fn create_v2_explicit_slug_blank_template_reopen_and_validation(cx: &mut TestAppContext) {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let (view, vcx) = open_view(cx, state.clone());
+
+    let new_btn = vcx.debug_bounds("bots-new-btn").unwrap();
+    vcx.simulate_click(new_btn.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bots-create-view").is_some());
+    assert!(vcx.debug_bounds("bots-create-start-blank").is_some());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_template(&BUILTIN_BOT_TEMPLATES[0], Some(window), cx);
+            v.start_blank_template(window, cx);
+            assert!(v.create.selected_template_id.is_none());
+            if let Some(slug) = &v.create.slug_input {
+                slug.update(cx, |s, cx| s.set_value("Invalid Slug!", window, cx));
+            }
+            if let Some(name) = &v.create.name_input {
+                name.update(cx, |s, cx| s.set_value("Custom Ops", window, cx));
+            }
+            v.submit_create_bot(cx);
+            assert!(v.error.is_some());
+            assert_eq!(v.screen(), Screen::Create);
+
+            if let Some(slug) = &v.create.slug_input {
+                slug.update(cx, |s, cx| s.set_value("custom-ops", window, cx));
+            }
+            v.create.avatar_color = Some(TabColor::Green);
+            v.submit_create_bot(cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.screen(), Screen::Detail);
+        assert_eq!(v.bots().len(), 1);
+        assert_eq!(v.bots()[0].slug.as_str(), "custom-ops");
+        assert_eq!(
+            v.bots()[0].avatar_color.as_deref(),
+            Some(avatar_color_hex(TabColor::Green))
+        );
+        let name_val = v
+            .create
+            .name_input
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string())
+            .unwrap_or_default();
+        assert!(
+            name_val.is_empty(),
+            "CreateState must clear after Ok submit"
+        );
+
+        view.update(cx, |v, cx| {
+            v.open_create(cx);
+            assert_eq!(v.screen(), Screen::Create);
+            v.reopen(cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(vcx, |v, _| v.screen()), Screen::Detail);
+}
+
+#[gpui::test]
+fn concurrency_slots_error_preservation_ime_and_dirty_guard(cx: &mut TestAppContext) {
+    let mut mock = MockState::default();
+    mock.bots.push(sample_bot("bot-1", "Bot One"));
+    mock.bots.push(sample_bot("bot-2", "Bot Two"));
+    mock.soul = "Original Soul\n".to_owned();
+    mock.memory = "# Memory\n\n- Keep me\n".to_owned();
+    mock.items
+        .push(sample_item("bot-1", "item-1", 1, BotItemStatus::NeedsYou));
+    let state = Arc::new(Mutex::new(mock));
+    let (view, vcx) = open_view(cx, state.clone());
+    let bot1 = BotId::new("bot-1").unwrap();
+    let bot2 = BotId::new("bot-2").unwrap();
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_detail_tab(DetailTab::SoulMemory, cx));
+    });
+    vcx.run_until_parked();
+
+    // Inject GetSoul + GetMemory errors -> must keep loaded editor contents & show Retry.
+    state.lock().unwrap().fail_get_soul = Some("soul down".to_owned());
+    state.lock().unwrap().fail_get_memory = Some("memory down".to_owned());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.load_selected_bot_detail(bot1.clone(), cx));
+    });
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("bots-error-retry").is_some());
+    vcx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.error.is_some());
+        let soul_val = v
+            .soul_memory
+            .soul_input
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string())
+            .unwrap_or_default();
+        let mem_val = v
+            .soul_memory
+            .memory_input
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string())
+            .unwrap_or_default();
+        assert_eq!(soul_val, "Original Soul\n");
+        assert!(mem_val.contains("- Keep me"));
+
+        // Clear failure, click Retry via load, then test dirty switch guard.
+        {
+            let mut st = state.lock().unwrap();
+            st.fail_get_soul = None;
+            st.fail_get_memory = None;
+        }
+        view.update(cx, |v, cx| {
+            assert!(!v.input_is_composing(window, cx));
+            v.reload(cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.error.is_none()));
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(inp) = &v.soul_memory.soul_input {
+                inp.update(cx, |s, cx| s.set_value("Unsaved edit", window, cx));
+            }
+            v.select_bot(bot2.clone(), cx);
+            assert_eq!(v.pending_switch_bot, Some(bot2.clone()));
+            assert_eq!(v.selected_bot_id, Some(bot1.clone()));
+            v.confirm_select_bot(bot2.clone(), cx);
+            assert_eq!(v.selected_bot_id, Some(bot2.clone()));
+            assert!(v.pending_switch_bot.is_none());
+            v.confirm_select_bot(bot1.clone(), cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    // Independent task slots allow concurrent actions without stranding busy flags.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.run_memory_tidy(bot1.clone(), cx);
+            v.update_item_status(bot1.clone(), "item-1".to_owned(), BotItemStatus::Done, cx);
+            v.start_bot_chat(bot1.clone(), cx);
+            v.toggle_pause_bot(bot1.clone(), true, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(!v.soul_memory.tidy_running);
+        assert!(!v.items.busy);
+        assert!(!v.chats.opening);
+        assert!(!v.busy);
+        assert!(v.bots().iter().find(|b| b.id == bot1).unwrap().paused);
+        assert_eq!(state.lock().unwrap().items[0].status, BotItemStatus::Done);
+    });
+
+    // Empty rejection + input draft preservation on CreateItem failure.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_detail_tab(DetailTab::Items, cx));
+    });
+    vcx.run_until_parked();
+    state.lock().unwrap().fail_create_item = Some("disk full".to_owned());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.create_bot_item(bot1.clone(), "   ", None, Some(window), cx);
+            assert!(v.error.is_some());
+            if let Some(inp) = &v.items.new_title_input {
+                inp.update(cx, |s, cx| s.set_value("Keep draft", window, cx));
+            }
+            v.create_bot_item(bot1.clone(), "Keep draft", None, Some(window), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.error.is_some());
+        let preserved = v
+            .items
+            .new_title_input
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string())
+            .unwrap_or_default();
+        assert_eq!(preserved, "Keep draft");
+    });
+}
+
+#[gpui::test]
+fn v2_groups_settings_memory_undo_decisions_and_connectors(cx: &mut TestAppContext) {
+    let bot1 = BotId::new("bot-1").unwrap();
+    let bot2 = BotId::new("bot-2").unwrap();
+    let mut mock = MockState::default();
+    mock.bots.push(sample_bot("bot-1", "Ops Bot"));
+    mock.bots.push(sample_bot("bot-2", "Review Bot"));
+    mock.soul = "# Ops\n".to_owned();
+    mock.memory = "# Memory\n\n- Old fact A\n- Fact B\n".to_owned();
+    mock.topics
+        .insert("deploy".to_owned(), "# Deploy\nRun checks".to_owned());
+    mock.suggestions.push(BotSuggestion {
+        id: "sug-1".to_owned(),
+        bot_id: bot1.clone(),
+        title: "Clean stale PR".to_owned(),
+        why: "Inactive 14 days".to_owned(),
+        ask: "Close it?".to_owned(),
+        link: None,
+        source: Some(ExternalSource::GitHub),
+        dismissed: false,
+        created_at_ms: 1_700_000_000_000,
+    });
+    let mut decision_item = sample_item("bot-1", "item-d", 1, BotItemStatus::NeedsYou);
+    decision_item
+        .links
+        .push(BotItemLink::Dispatch("88".to_owned()));
+    decision_item.events.push(BotItemEvent {
+        id: 2,
+        item_uid: "item-d".to_owned(),
+        kind: BotItemEventKind::Status,
+        actor: BotItemActor::Bot {
+            bot_id: bot1.clone(),
+            session_id: None,
+        },
+        text: "Need decision".to_owned(),
+        decisions: vec![BotItemDecision {
+            question: "Ship now?".to_owned(),
+            options: vec!["Go".to_owned(), "Wait".to_owned()],
+            recommended: Some(0),
+        }],
+        created_at_ms: 1_700_000_000_100,
+    });
+    mock.items.push(decision_item);
+    mock.sessions.push(BotSessionSummary {
+        session_id: SessionId(55),
+        bot_id: bot2.clone(),
+        link_id: None,
+        pid: 9001,
+        live: true,
+        working: false,
+        label: "Existing Review".to_owned(),
+        created_at_ms: 1_700_000_000_000,
+    });
+
+    let state = Arc::new(Mutex::new(mock));
+    let (view, vcx) = open_view(cx, state.clone());
+    let opened = Arc::new(Mutex::new(Vec::<SessionId>::new()));
+    let opened_cap = opened.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, ev: &OpenSession, _| {
+            opened_cap.lock().unwrap().push(ev.session_id);
+        })
+        .detach();
+    });
+
+    // Decision quick-reply + open chat guard (paused blocked, live session focuses without duplicate RPC)
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.answer_item_decision("item-d".to_owned(), None, Some(0), None, cx);
+            v.start_bot_chat(bot2.clone(), cx);
+            v.toggle_pause_bot(bot1.clone(), true, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        state.lock().unwrap().items[0].status,
+        BotItemStatus::Working
+    );
+    assert_eq!(*opened.lock().unwrap(), vec![SessionId(55)]);
+    assert!(
+        !state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::StartBotSession { bot_id, .. } if *bot_id == bot2))
+    );
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.start_bot_chat(bot1.clone(), cx));
+    });
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.error.is_some()));
+
+    // Settings tab: edit identity + schedule + save
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_detail_tab(DetailTab::Settings, cx));
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bots-tab-settings-body").is_some());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(inp) = &v.settings.name_input {
+                inp.update(cx, |s, cx| s.set_value("Ops Bot v2", window, cx));
+            }
+            v.settings.effort = "high".to_owned();
+            v.settings.permission_mode = Permission::Yolo;
+            if let Some(sn) = &v.settings.sched_name_input {
+                sn.update(cx, |s, cx| s.set_value("Daily triage", window, cx));
+            }
+            if let Some(sc) = &v.settings.sched_cron_input {
+                sc.update(cx, |s, cx| s.set_value("0 9 * * *", window, cx));
+            }
+            if let Some(sp) = &v.settings.sched_prompt_input {
+                sp.update(cx, |s, cx| s.set_value("Check inbox", window, cx));
+            }
+            v.add_schedule(bot1.clone(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.save_bot_settings(bot1.clone(), cx));
+    });
+    vcx.run_until_parked();
+    {
+        let st = state.lock().unwrap();
+        assert_eq!(st.bots[0].name, "Ops Bot v2");
+        assert_eq!(st.bots[0].permission_mode, Permission::Yolo);
+        assert_eq!(st.bots[0].schedules.len(), 1);
+    }
+
+    // Soul & Memory: fact edit -> undo -> topic load/save -> dismiss suggestion
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_detail_tab(DetailTab::SoulMemory, cx);
+            v.edit_memory_fact(bot1.clone(), "- Old fact A".to_owned(), "- New fact A", cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(state.lock().unwrap().memory.contains("- New fact A"));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.undo_memory_change(bot1.clone(), "hist-1".to_owned(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(state.lock().unwrap().memory.contains("- Old fact A"));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.select_memory_topic(bot1.clone(), "deploy", cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            assert_eq!(v.soul_memory.selected_topic.as_deref(), Some("deploy"));
+            v.save_memory_topic(bot1.clone(), "ops", "# Ops\n".to_owned(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.dismiss_suggestion(bot1.clone(), "sug-1".to_owned(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(state.lock().unwrap().topics.contains_key("ops"));
+    assert!(state.lock().unwrap().suggestions[0].dismissed);
+
+    // Groups screen: create group -> thread -> @mention message -> stop
+    vcx.update(|_, cx| {
+        view.update(cx, View::open_groups);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bots-groups-view").is_some());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(inp) = &v.groups.name_input {
+                inp.update(cx, |s, cx| s.set_value("Triage Room", window, cx));
+            }
+            v.groups.member_bot_ids = vec![bot1.clone(), bot2.clone()];
+            v.submit_create_or_update_group(cx);
+        });
+    });
+    vcx.run_until_parked();
+    let gid = view.read_with(vcx, |v, _| v.groups.groups[0].id.clone());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(t) = &v.groups.thread_title_input {
+                t.update(cx, |s, cx| s.set_value("Incident", window, cx));
+            }
+            v.create_group_thread(gid.clone(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(c) = &v.groups.composer_input {
+                c.update(cx, |s, cx| s.set_value("@bot-1 check", window, cx));
+            }
+            v.send_group_message(gid.clone(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .group_messages
+            .iter()
+            .any(|m| m.body == "@bot-1 check")
+    );
+
+    // Connectors rollback + reload error propagation + pairing + tracker + MCP OAuth
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.screen = Screen::Detail;
+            v.set_detail_tab(DetailTab::Connectors, cx);
+        });
+    });
+    vcx.run_until_parked();
+    state.lock().unwrap().fail_reload_connectors = Some("relay timeout".to_owned());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.reload_connectors(bot1.clone(), cx));
+    });
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| {
+        v.error
+            .as_ref()
+            .is_some_and(|e| e.contains("relay timeout"))
+    }));
+
+    state.lock().unwrap().fail_reload_connectors = None;
+    state.lock().unwrap().fail_set_connector_config = Some("db read-only".to_owned());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            let conn = v.selected_bot().unwrap().connectors.clone();
+            v.save_connector_secret(bot1.clone(), "tg:tok".to_owned(), "sec-123", conn, None, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        state.lock().unwrap().secrets.is_empty(),
+        "SetConnectorConfig failure must roll back SetSecret with DeleteSecret"
+    );
+
+    state.lock().unwrap().fail_set_connector_config = None;
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.test_connector(bot1.clone(), ExternalSource::Telegram, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(view.read_with(vcx, |v, _| v.notice.is_some()));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.redeem_pairing_code("PAIR-42", None, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_default_tracker_bot(ExternalSource::GitHub, Some(bot1.clone()), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_detail_tab(DetailTab::ToolsSharing, cx);
+            v.start_mcp_oauth(bot1.clone(), "vercel".to_owned(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.connectors.default_tracker_bots.github, Some(bot1.clone()));
+        assert_eq!(
+            v.tools
+                .mcp_oauth_states
+                .get(&(bot1, "vercel".to_owned()))
+                .map(|s| s.status.as_str()),
+            Some("connected")
+        );
+    });
+}
+
 #[test]
 fn sidebar_snapshot_counts_attention_per_bot_and_offers_models_per_runtime() {
     let bots = vec![sample_bot("bot-a", "A"), sample_bot("bot-b", "B")];
@@ -828,12 +1822,10 @@ fn create_form_rejects_empty_custom_model_and_missing_folder(cx: &mut TestAppCon
         assert_eq!(v.bots().len(), 1);
     });
     assert!(
-        state
-            .lock()
-            .unwrap()
-            .requests
-            .iter()
-            .all(|r| !matches!(r, BotRpcRequest::CreateBot(_))),
+        state.lock().unwrap().requests.iter().all(|r| !matches!(
+            r,
+            BotRpcRequest::CreateBot(_) | BotRpcRequest::CreateBotV2(_)
+        )),
         "neither attempt reached the daemon"
     );
 

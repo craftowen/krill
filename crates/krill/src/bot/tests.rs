@@ -3,6 +3,7 @@
 //! mock RPC execution, secret redaction, and zip export/import.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,11 +12,17 @@ use krill_proto::SessionId;
 use krill_proto::agent::Permission;
 use krill_proto::bots::package::{BotPackageExportOptions, export_bot_zip, import_bot_zip};
 use krill_proto::bots::{
-    ActsFor, BotAccessRequest, BotAccessRequestStatus, BotConfig, BotConnectorStatus, BotGroupChat,
-    BotId, BotItem, BotItemLink, BotItemStatus, BotMcpAuthKind, BotRpcRequest, BotRpcResponse,
-    BotSuggestion, BotToolRelayStatus, BotToolServerStatus, ConnectorHealthState,
+    ActsFor, BotAccessRequest, BotAccessRequestStatus, BotAvatarData, BotConfig,
+    BotConnectorStatus, BotConnectorTestResult, BotGroupChat, BotGroupMessage, BotGroupReplyMode,
+    BotGroupThread, BotGroupView, BotId, BotItem, BotItemActor, BotItemDecision, BotItemEvent,
+    BotItemEventKind, BotItemLink, BotItemStatus, BotItemsPage, BotMcpAuthKind, BotMcpOAuthState,
+    BotMember, BotMemoryHistoryEntry, BotMemoryTidyStatus, BotMemoryTopicInfo, BotRpcRequest,
+    BotRpcResponse, BotScheduleConfig, BotSessionSummary, BotSuggestion, BotToolRelayStatus,
+    BotToolServerStatus, ComposioConnectionInfo, ConnectorHealthState, DefaultTrackerBots,
     ExternalBotCandidate, ExternalBotSourceApp, ExternalSource, FieldPatch,
 };
+use krill_proto::control::FEAT_CONTROL;
+use krill_proto::ipc::FEAT_BOTS;
 
 use super::exec::{
     build_secret_ref, execute_online, parse_snooze_until, today_iso_utc, try_execute_offline,
@@ -24,7 +31,7 @@ use super::parse::{
     AppsKind, BotCommand, ConnectorPatch, GoogleServiceKind, MailKind, SecretInputSource,
     TextInputSource, parse_command,
 };
-use super::{BotClient, CliError};
+use super::{BotClient, CliError, USAGE, ensure_bots_feature, run_with_client};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -250,6 +257,10 @@ fn parses_soul_memory_items_suggest_reply_send_and_groups() {
             bot: Some("mybot".to_owned()),
             status: Some(BotItemStatus::NeedsYou),
             all: true,
+            include_snoozed: false,
+            limit: None,
+            cursor: None,
+            page: None,
             json: false,
         }
     );
@@ -279,16 +290,7 @@ fn parses_soul_memory_items_suggest_reply_send_and_groups() {
 
     assert_eq!(
         parse_command(
-            &s(&[
-                "items",
-                "mybot",
-                "link",
-                "42",
-                "pr",
-                "org/repo#99",
-                "--label",
-                "Main PR",
-            ]),
+            &s(&["items", "mybot", "link", "42", "pr", "org/repo#99"]),
             None
         )
         .unwrap(),
@@ -296,9 +298,15 @@ fn parses_soul_memory_items_suggest_reply_send_and_groups() {
             bot: Some("mybot".to_owned()),
             item_id: "42".to_owned(),
             link: BotItemLink::Pr("org/repo#99".to_owned()),
-            label: Some("Main PR".to_owned()),
             json: false,
         }
+    );
+    assert!(
+        parse_command(
+            &s(&["items", "mybot", "link", "42", "pr", "x", "--label", "y"]),
+            None
+        )
+        .is_err()
     );
     assert_eq!(
         parse_command(
@@ -310,7 +318,6 @@ fn parses_soul_memory_items_suggest_reply_send_and_groups() {
             bot: Some("bot-1".to_owned()),
             item_id: "42".to_owned(),
             link: BotItemLink::Url("https://example.com".to_owned()),
-            label: None,
             json: false,
         }
     );
@@ -975,17 +982,24 @@ fn mock_rpc_covers_memory_items_connectors_tools_and_zip_roundtrip() {
         |_| None,
     )
     .unwrap();
-    let Some(BotRpcRequest::ImportBotZip {
+    let Some(BotRpcRequest::ImportBotZipV2 {
         zip_bytes,
         name_override,
+        slug_override,
         ..
     }) = mock_imp.recorded.first()
     else {
-        panic!("expected ImportBotZip");
+        panic!("expected ImportBotZipV2");
     };
-    assert_eq!(name_override.as_deref(), Some("imported-pr"));
+    assert_eq!(name_override.as_deref(), None);
+    assert_eq!(
+        slug_override
+            .as_ref()
+            .map(krill_proto::bots::BotSlug::as_str),
+        Some("imported-pr")
+    );
     let parsed_pkg = import_bot_zip(zip_bytes).unwrap();
-    assert_eq!(parsed_pkg.manifest.slug.as_str(), "imported-pr");
+    assert_eq!(parsed_pkg.manifest.slug.as_str(), "pr-reviewer");
 
     // 5. Additional RPC formatting smoke checks (Start, Items, Groups, Relay, Access, LookAround, External)
     let mut mock_misc = MockClient::new([
@@ -1157,4 +1171,1072 @@ fn mock_rpc_covers_memory_items_connectors_tools_and_zip_roundtrip() {
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn parses_and_executes_new_v2_and_import_v2_preserving_slug_and_name() {
+    let bot = sample_bot();
+    let mut empty = Cursor::new(Vec::<u8>::new());
+
+    let mut mock_new = MockClient::new([BotRpcResponse::Bot(Box::new(bot.clone()))]);
+    execute_online(
+        parse_command(
+            &s(&[
+                "new",
+                "Helper",
+                "--slug",
+                "helper-custom",
+                "--avatar-color",
+                "#3b82f6",
+                "--skills",
+                "code-review,triage",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_new,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    let Some(BotRpcRequest::CreateBotV2(params)) = mock_new.recorded.first() else {
+        panic!("expected CreateBotV2");
+    };
+    assert_eq!(
+        params.slug.as_ref().map(krill_proto::bots::BotSlug::as_str),
+        Some("helper-custom")
+    );
+    assert_eq!(params.avatar_color.as_deref(), Some("#3b82f6"));
+    assert_eq!(params.skills, vec!["code-review", "triage"]);
+
+    let dir = temp_dir("import-v2");
+    let zip_path = dir.join("sample.zip");
+    let raw_zip = export_bot_zip(
+        &bot,
+        "# PR Reviewer\n",
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+        None,
+        BotPackageExportOptions {
+            include_memory: false,
+            include_avatar: false,
+        },
+    )
+    .unwrap();
+    fs::write(&zip_path, raw_zip).unwrap();
+
+    let mut mock_imp = MockClient::new([BotRpcResponse::Bot(Box::new(bot))]);
+    execute_online(
+        parse_command(
+            &s(&[
+                "import",
+                zip_path.to_str().unwrap(),
+                "--slug",
+                "custom-slug",
+                "--name",
+                "Custom Display Name",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_imp,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    let Some(BotRpcRequest::ImportBotZipV2 {
+        name_override,
+        slug_override,
+        ..
+    }) = mock_imp.recorded.first()
+    else {
+        panic!("expected ImportBotZipV2");
+    };
+    assert_eq!(name_override.as_deref(), Some("Custom Display Name"));
+    assert_eq!(
+        slug_override
+            .as_ref()
+            .map(krill_proto::bots::BotSlug::as_str),
+        Some("custom-slug")
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn split_bot_and_action_skipping_flags_works_across_all_subcommands() {
+    // Leading --bot / --bot= / --json before action across all 7 subcommands + new v2 commands
+    assert!(matches!(
+        parse_command(&s(&["items", "--json", "--bot", "b1", "ls"]), None).unwrap(),
+        BotCommand::ItemsList {
+            bot: Some(ref b),
+            json: true,
+            ..
+        } if b == "b1"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["soul", "--bot=b1", "set", "--text", "hi"]), None).unwrap(),
+        BotCommand::SoulSet { ref bot, .. } if bot == "b1"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["memory", "--json", "--bot", "b1", "history"]), None).unwrap(),
+        BotCommand::MemoryHistory {
+            ref bot,
+            json: true,
+            ..
+        } if bot == "b1"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["connectors", "--bot=b1", "test", "github"]), None).unwrap(),
+        BotCommand::ConnectorTest {
+            ref bot,
+            source: ExternalSource::GitHub,
+            ..
+        } if bot == "b1"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["access", "--bot", "b1", "ls"]), None).unwrap(),
+        BotCommand::AccessList {
+            bot: Some(ref b),
+            ..
+        } if b == "b1"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["secret", "--bot=b1", "rm", "github"]), None).unwrap(),
+        BotCommand::SecretRemove {
+            ref bot,
+            ref key,
+            ..
+        } if bot == "b1" && key == "github"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["tools", "--bot", "add", "add", "sentry"]), None).unwrap(),
+        BotCommand::ToolsAdd(ref a) if a.bot == "add" && a.app_id == "sentry"
+    ));
+
+    // Disambiguating bot named like action keyword vs positional value matching keyword
+    assert!(matches!(
+        parse_command(&s(&["memory", "ls", "add", "Fact one"]), None).unwrap(),
+        BotCommand::MemoryAdd { ref bot, ref fact, .. } if bot == "ls" && fact == "Fact one"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["items", "add", "done"]), Some("b1")).unwrap(),
+        BotCommand::ItemsAdd(ref a) if a.bot == "b1" && a.title == "done"
+    ));
+    assert!(matches!(
+        parse_command(&s(&["connectors", "status", "github"]), None).unwrap(),
+        BotCommand::ConnectorConfigure(ref c)
+            if c.bot == "status" && matches!(c.patch, ConnectorPatch::GitHub { .. })
+    ));
+
+    // Reject duplicate --text/--file/--stdin in memory set
+    assert!(parse_command(&s(&["memory", "b1", "set", "--text", "a", "--stdin"]), None).is_err());
+    assert!(
+        parse_command(
+            &s(&["memory", "b1", "set", "--file", "a.md", "--text", "b"]),
+            None
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn parses_and_executes_v2_items_memory_schedules_tools_groups_sessions_avatar_composio() {
+    let mut bot = sample_bot();
+    bot.emoji = Some("🤖".to_owned());
+    bot.avatar = Some("mascot:O1".to_owned());
+    bot.avatar_color = Some("#3b82f6".to_owned());
+    bot.first_run_completed = true;
+    bot.skills = vec!["code-review".to_owned()];
+    bot.members = vec![BotMember {
+        id: "U1".to_owned(),
+        name: "Alice".to_owned(),
+        source: ExternalSource::Slack,
+        workspace_id: Some("T1".to_owned()),
+    }];
+    bot.schedules = vec![BotScheduleConfig {
+        id: "sched-daily".to_owned(),
+        name: "Daily".to_owned(),
+        cron: "0 9 * * 1-5".to_owned(),
+        prompt: "Check".to_owned(),
+        enabled: true,
+        timezone: Some("UTC".to_owned()),
+    }];
+
+    // format_bot_detail prints all v2 metadata
+    let bot_detail = super::format::format_bot_detail(&bot, false).unwrap();
+    for expected in [
+        "emoji",
+        "avatar_color #3b82f6",
+        "first_run_completed true",
+        "skills      code-review",
+        "members     Alice (slack:U1)",
+        "notifications permission=true complete=true error=true",
+        "schedules   sched-daily: Daily (0 9 * * 1-5) [enabled]",
+    ] {
+        assert!(
+            bot_detail.contains(expected),
+            "missing {expected} in:\n{bot_detail}"
+        );
+    }
+
+    // Items v2: show, answer, paginated ls, update decisions, --bot qualification
+    let mut item_with_events = sample_item();
+    item_with_events.events.push(BotItemEvent {
+        id: 1,
+        item_uid: item_with_events.uid.clone(),
+        kind: BotItemEventKind::Commented,
+        actor: BotItemActor::Bot {
+            bot_id: bot.id.clone(),
+            session_id: None,
+        },
+        text: "Ready to ship?".to_owned(),
+        decisions: vec![BotItemDecision {
+            question: "Deploy?".to_owned(),
+            options: vec!["Ship".to_owned(), "Hold".to_owned()],
+            recommended: Some(0),
+        }],
+        created_at_ms: 10,
+    });
+
+    // Reject out-of-range --recommended
+    assert!(
+        parse_command(
+            &s(&[
+                "items",
+                "update",
+                "42",
+                "--ask",
+                "Deploy?",
+                "--option",
+                "Ship",
+                "--recommended",
+                "3",
+            ]),
+            None,
+        )
+        .is_err()
+    );
+
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let mut mock_items = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Item(Box::new(item_with_events.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Item(Box::new(item_with_events.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Item(Box::new(item_with_events.clone())),
+        BotRpcResponse::ItemsPage(BotItemsPage {
+            items: vec![item_with_events.clone()],
+            next_cursor: Some("cur-2".to_owned()),
+            total_count: 10,
+            unseen_count: 3,
+        }),
+        BotRpcResponse::ItemsPage(BotItemsPage {
+            items: vec![item_with_events],
+            next_cursor: None,
+            total_count: 10,
+            unseen_count: 3,
+        }),
+    ]);
+
+    let show_out = execute_online(
+        parse_command(&s(&["items", "bot-pr-1", "show", "42"]), None).unwrap(),
+        &mut mock_items,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(show_out.contains("Ready to ship?"));
+    assert!(show_out.contains("question: Deploy?"));
+    assert!(show_out.contains("[0] Ship (recommended)"));
+    assert_eq!(
+        mock_items.recorded.get(1),
+        Some(&BotRpcRequest::GetBotItem {
+            item_id: "bot-pr-1#42".to_owned()
+        })
+    );
+
+    execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "bot-pr-1",
+                "update",
+                "42",
+                "--ask",
+                "Deploy?",
+                "--option",
+                "Ship",
+                "--option",
+                "Hold",
+                "--recommended",
+                "0",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_items,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_items.recorded.get(3),
+        Some(BotRpcRequest::UpdateItem(p))
+            if p.item_id == "bot-pr-1#42" && p.decisions.len() == 1 && p.decisions[0].recommended == Some(0)
+    ));
+
+    execute_online(
+        parse_command(
+            &s(&[
+                "items", "bot-pr-1", "answer", "42", "--option", "0", "--text", "Go ahead",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_items,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_items.recorded.get(5),
+        Some(BotRpcRequest::AnswerBotItem {
+            item_id,
+            option_index: Some(0),
+            answer_text: Some(t),
+            ..
+        }) if item_id == "bot-pr-1#42" && t == "Go ahead"
+    ));
+
+    let page_out = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "ls",
+                "--page",
+                "2",
+                "--limit",
+                "5",
+                "--include-snoozed",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_items,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(page_out.contains("total=10 unseen=3"));
+    assert!(matches!(
+        mock_items.recorded.last(),
+        Some(BotRpcRequest::ListItemsPage {
+            include_snoozed: true,
+            limit: Some(5),
+            cursor: Some(c),
+            ..
+        }) if c == "cur-2"
+    ));
+
+    // Update --first-run-completed + --avatar-color -> UpdateBot + UpdateBotExtras
+    let mut mock_upd = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+    ]);
+    execute_online(
+        parse_command(
+            &s(&[
+                "update",
+                "bot-pr-1",
+                "--first-run-completed",
+                "on",
+                "--avatar-color",
+                "#10b981",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_upd,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_upd.recorded.get(1),
+        Some(BotRpcRequest::UpdateBot(p)) if p.first_run_completed == Some(true)
+    ));
+    assert!(matches!(
+        mock_upd.recorded.get(2),
+        Some(BotRpcRequest::UpdateBotExtras(p)) if p.avatar_color == FieldPatch::Set("#10b981".to_owned())
+    ));
+
+    // Schedules: invalid cron rejected; add -> enable -> disable -> rm
+    assert!(
+        parse_command(
+            &s(&[
+                "schedules",
+                "bot-pr-1",
+                "add",
+                "--name",
+                "Bad",
+                "--cron",
+                "not a cron",
+                "--prompt",
+                "hi",
+            ]),
+            None,
+        )
+        .is_err()
+    );
+    let mut mock_sched = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+    ]);
+    execute_online(
+        parse_command(
+            &s(&[
+                "schedules",
+                "bot-pr-1",
+                "add",
+                "--id",
+                "hourly",
+                "--name",
+                "Hourly",
+                "--cron",
+                "0 * * * *",
+                "--prompt",
+                "Scan",
+                "--disabled",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_sched,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_sched.recorded.get(1),
+        Some(BotRpcRequest::UpdateBot(p))
+            if p.schedules.as_ref().is_some_and(|s| s.len() == 2 && !s[1].enabled)
+    ));
+    execute_online(
+        parse_command(
+            &s(&["schedules", "bot-pr-1", "disable", "sched-daily"]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_sched,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_sched.recorded.get(3),
+        Some(BotRpcRequest::UpdateBot(p))
+            if p.schedules.as_ref().is_some_and(|s| !s[0].enabled)
+    ));
+
+    // Tools enable/disable/oauth + ENABLED column in tools ls
+    let mut bot_with_tool = bot.clone();
+    bot_with_tool
+        .mcp_tools
+        .push(krill_proto::bots::BotMcpToolConfig {
+            id: "sentry".to_owned(),
+            name: "Sentry".to_owned(),
+            endpoint_url: Some("https://mcp.sentry.dev/mcp".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BrowserOAuth,
+            header_names: Vec::new(),
+            secret_ref: None,
+            enabled: true,
+        });
+    let mut mock_tools = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot_with_tool.clone())),
+        BotRpcResponse::Bot(Box::new(bot_with_tool.clone())),
+        BotRpcResponse::Bot(Box::new(bot_with_tool.clone())),
+        BotRpcResponse::Bot(Box::new(bot_with_tool.clone())),
+        BotRpcResponse::McpOAuth(BotMcpOAuthState {
+            bot_id: bot.id.clone(),
+            tool_id: "sentry".to_owned(),
+            status: "pending".to_owned(),
+            auth_url: Some("https://auth.example.com".to_owned()),
+            error: None,
+            updated_at_ms: 1,
+        }),
+    ]);
+    let tools_out = execute_online(
+        parse_command(&s(&["tools", "bot-pr-1", "ls"]), None).unwrap(),
+        &mut mock_tools,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(tools_out.contains("ENABLED"));
+    execute_online(
+        parse_command(&s(&["tools", "bot-pr-1", "disable", "sentry"]), None).unwrap(),
+        &mut mock_tools,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_tools.recorded.get(2),
+        Some(BotRpcRequest::UpdateBot(p))
+            if p.mcp_tools.as_ref().is_some_and(|t| !t[0].enabled)
+    ));
+    let oauth_out = execute_online(
+        parse_command(
+            &s(&["tools", "bot-pr-1", "oauth", "sentry", "--status"]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_tools,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(oauth_out.contains("status=pending"));
+
+    // Remaining v2 RPC routing smoke checks (memory, tidy, suggestions, up-next, groups, sessions, avatar, tracker-default, access redeem, composio)
+    let avatar_dir = temp_dir("avatar-v2");
+    let png_in = avatar_dir.join("in.png");
+    let png_out = avatar_dir.join("out/saved.png");
+    fs::write(&png_in, b"\x89PNG\r\n\x1a\nfakepng").unwrap();
+    let mut mock_v2 = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::MemoryHistory(vec![BotMemoryHistoryEntry {
+            entry_id: "e1".to_owned(),
+            bot_id: bot.id.clone(),
+            timestamp_ms: 1,
+            actor: "owner".to_owned(),
+            action: "edit".to_owned(),
+            added: vec!["x".to_owned()],
+            removed: Vec::new(),
+            before_content: String::new(),
+            after_content: String::new(),
+            undoable: true,
+            undone: false,
+        }]),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::MemoryUpdated {
+            content: "updated".to_owned(),
+            restored_facts: Vec::new(),
+            removed_count: 0,
+        },
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::MemoryTidyStatus(BotMemoryTidyStatus::default()),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::MemoryTopics(vec![BotMemoryTopicInfo {
+            topic: "repos".to_owned(),
+            bytes: 12,
+            updated_at_ms: 1,
+        }]),
+        BotRpcResponse::Suggestions(vec![]),
+        BotRpcResponse::Ok,
+        BotRpcResponse::BotSessions(vec![BotSessionSummary {
+            session_id: SessionId(9),
+            bot_id: bot.id.clone(),
+            link_id: None,
+            pid: 99,
+            live: true,
+            working: false,
+            label: "Triage".to_owned(),
+            created_at_ms: 1,
+        }]),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Ok,
+        BotRpcResponse::GroupView(BotGroupView {
+            group: BotGroupChat {
+                id: "g1".to_owned(),
+                name: "Ops".to_owned(),
+                bot_ids: vec![bot.id.clone()],
+                description: String::new(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            threads: vec![BotGroupThread {
+                thread_id: "t1".to_owned(),
+                group_id: "g1".to_owned(),
+                title: "Incident".to_owned(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+            messages: vec![],
+            active_run: false,
+        }),
+        BotRpcResponse::GroupMessagePosted {
+            message: BotGroupMessage {
+                message_id: "m1".to_owned(),
+                group_id: "g1".to_owned(),
+                thread_id: "t1".to_owned(),
+                sender_id: "owner".to_owned(),
+                sender_name: "owner".to_owned(),
+                body: "status?".to_owned(),
+                mentions: vec![bot.id.clone()],
+                created_at_ms: 2,
+                in_progress: false,
+            },
+            dispatched_bots: vec![bot.id.clone()],
+        },
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Ok,
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::BotAvatar(BotAvatarData {
+            bot_id: bot.id.clone(),
+            mime: "image/png".to_owned(),
+            png_bytes: b"\x89PNG\r\n\x1a\ndata".to_vec(),
+        }),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::ConnectorTest(BotConnectorTestResult {
+            source: ExternalSource::GitHub,
+            ok: true,
+            account_label: Some("octocat".to_owned()),
+            detail: "ok".to_owned(),
+        }),
+        BotRpcResponse::DefaultTrackerBots(DefaultTrackerBots {
+            github: Some(bot.id.clone()),
+            linear: None,
+        }),
+        BotRpcResponse::Ok,
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::ComposioConnections(vec![ComposioConnectionInfo {
+            id: "c1".to_owned(),
+            app_id: "notion".to_owned(),
+            status: "ACTIVE".to_owned(),
+            account_label: Some("me@example.com".to_owned()),
+            created_at_ms: None,
+        }]),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::ComposioConnectStarted {
+            connection_id: "c2".to_owned(),
+            redirect_url: "https://composio.example/auth".to_owned(),
+        },
+    ]);
+
+    assert!(
+        execute_online(
+            parse_command(&s(&["memory", "bot-pr-1", "history"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("e1")
+    );
+    assert!(
+        execute_online(
+            parse_command(
+                &s(&["memory", "bot-pr-1", "edit", "--old", "a", "--new", "b"]),
+                None
+            )
+            .unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("updated")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["tidy", "bot-pr-1", "status"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("memory tidy for")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["memory", "bot-pr-1", "topics"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("repos")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["suggestions", "ls", "--include-dismissed"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("No suggestions")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["up-next", "seen"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("seen")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["sessions", "ls"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("s9")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["sessions", "bot-pr-1", "stop", "s9"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("stopped session s9")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["groups", "read", "g1"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("Incident")
+    );
+    let send_g = execute_online(
+        parse_command(
+            &s(&[
+                "groups",
+                "send",
+                "g1",
+                "--thread",
+                "t1",
+                "--reply-mode",
+                "all",
+                "status?",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_v2,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(send_g.contains("m1"));
+    assert!(matches!(
+        mock_v2.recorded.last(),
+        Some(BotRpcRequest::SendGroupMessage {
+            reply_mode: Some(BotGroupReplyMode::All),
+            ..
+        })
+    ));
+    execute_online(
+        parse_command(
+            &s(&["avatar", "set", "bot-pr-1", png_in.to_str().unwrap()]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_v2,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    execute_online(
+        parse_command(
+            &s(&["avatar", "get", "bot-pr-1", png_out.to_str().unwrap()]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_v2,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(png_out.is_file());
+    assert!(
+        execute_online(
+            parse_command(&s(&["connectors", "bot-pr-1", "test", "github"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("ok=true")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["tracker-default"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("github: bot-pr-1")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["access", "redeem", "PAIR-123"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("redeemed")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["composio", "bot-pr-1", "connections"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("notion")
+    );
+    assert!(
+        execute_online(
+            parse_command(&s(&["composio", "bot-pr-1", "connect", "linear"]), None).unwrap(),
+            &mut mock_v2,
+            &mut empty,
+            0,
+            |_| None
+        )
+        .unwrap()
+        .contains("https://composio.example/auth")
+    );
+
+    fs::remove_dir_all(&avatar_dir).ok();
+}
+
+#[test]
+fn connector_noop_google_defaults_resolve_bot_json_errors_and_p2_fixes() {
+    let bot = sample_bot();
+    let mut empty = Cursor::new(Vec::<u8>::new());
+
+    // 1. Zero modifying flags -> never calls SetConnectorConfig
+    let mut mock_noop = MockClient::new([BotRpcResponse::Bot(Box::new(bot.clone()))]);
+    execute_online(
+        parse_command(&s(&["connectors", "bot-pr-1", "telegram"]), None).unwrap(),
+        &mut mock_noop,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert_eq!(mock_noop.recorded.len(), 1);
+    assert!(matches!(
+        mock_noop.recorded[0],
+        BotRpcRequest::GetBot { .. }
+    ));
+
+    // 2. google-setup --enable without --services -> gmail = true, calendar = true
+    let mut mock_google = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+    ]);
+    execute_online(
+        parse_command(
+            &s(&["connectors", "bot-pr-1", "google-setup", "--enable"]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_google,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(matches!(
+        mock_google.recorded.get(1),
+        Some(BotRpcRequest::SetConnectorConfig { connectors, .. })
+            if connectors.google.enabled && connectors.google.services.gmail && connectors.google.services.calendar
+    ));
+
+    // 3. resolve_bot: falls back to ListBots on not-found, propagates transport/permission errors without ListBots
+    let mut mock_nf = MockClient::with_results([
+        Err(CliError::fail("bot not found: pr-reviewer")),
+        Ok(BotRpcResponse::Bots(vec![bot.clone()])),
+    ]);
+    execute_online(
+        parse_command(&s(&["show", "pr-reviewer"]), None).unwrap(),
+        &mut mock_nf,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert_eq!(mock_nf.recorded.len(), 2);
+
+    let mut mock_perm = MockClient::with_results([Err(CliError::fail("permission denied"))]);
+    let perm_err = execute_online(
+        parse_command(&s(&["show", "pr-reviewer"]), None).unwrap(),
+        &mut mock_perm,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(perm_err.message.contains("permission denied"));
+    assert_eq!(mock_perm.recorded.len(), 1);
+
+    // 4. Export to non-existent trailing-slash directory
+    let dir = temp_dir("trailing-slash");
+    let trailing = format!("{}/nested-dir/", dir.display());
+    let raw_zip = export_bot_zip(
+        &bot,
+        "# PR Reviewer\n",
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+        None,
+        BotPackageExportOptions {
+            include_memory: false,
+            include_avatar: false,
+        },
+    )
+    .unwrap();
+    let mut mock_exp = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::ExportedZip {
+            filename: "pr-reviewer.zip".to_owned(),
+            zip_bytes: raw_zip,
+        },
+    ]);
+    execute_online(
+        parse_command(&s(&["export", "bot-pr-1", &trailing]), None).unwrap(),
+        &mut mock_exp,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(dir.join("nested-dir/pr-reviewer.zip").is_file());
+    fs::remove_dir_all(&dir).ok();
+
+    // 5. tools add accepts http://[::1]
+    let mut mock_v6 = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Bot(Box::new(bot)),
+    ]);
+    execute_online(
+        parse_command(
+            &s(&[
+                "tools",
+                "bot-pr-1",
+                "add",
+                "local",
+                "--url",
+                "http://[::1]:8080/mcp",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut mock_v6,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+
+    // 6. parse_snooze_until validates real calendar month lengths & leap years
+    assert!(parse_snooze_until("2026-02-29", 0).is_err());
+    assert!(parse_snooze_until("2026-02-31", 0).is_err());
+    assert!(parse_snooze_until("2026-04-31", 0).is_err());
+    assert!(parse_snooze_until("2024-02-29", 0).is_ok());
+
+    // 7. --json error formatting across parse failures, FEAT_BOTS unnegotiated, and BotRpcResponse::Error
+    let (parse_err, json_flag) = run_with_client(
+        &[OsString::from("unknown-sub"), OsString::from("--json")],
+        None,
+        |_| -> Result<MockClient, CliError> { panic!("should not connect") },
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(json_flag);
+    let parsed_json: serde_json::Value =
+        serde_json::from_str(&super::format_cli_error(&parse_err, true)).unwrap();
+    assert_eq!(parsed_json["ok"], false);
+    assert_eq!(parsed_json["code"], 2);
+
+    let feat_err = ensure_bots_feature(FEAT_CONTROL).unwrap_err();
+    let feat_json: serde_json::Value =
+        serde_json::from_str(&super::format_cli_error(&feat_err, true)).unwrap();
+    assert_eq!(feat_json["ok"], false);
+    assert!(feat_json["error"].as_str().unwrap().contains("FEAT_BOTS"));
+    assert!(ensure_bots_feature(FEAT_CONTROL | FEAT_BOTS).is_ok());
+
+    let (rpc_err, rpc_json_flag) = run_with_client(
+        &[OsString::from("ls"), OsString::from("--json")],
+        None,
+        |_| Ok(MockClient::with_results([Err(CliError::fail("boom"))])),
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(rpc_json_flag);
+    let rpc_json: serde_json::Value =
+        serde_json::from_str(&super::format_cli_error(&rpc_err, true)).unwrap();
+    assert_eq!(rpc_json["ok"], false);
+    assert_eq!(rpc_json["error"], "boom");
+
+    // 8. Secret keys & connector *-ref flags documented in USAGE
+    for flag in [
+        "--secret-ref",
+        "--app-token-ref",
+        "--bot-token-ref",
+        "--client-secret-ref",
+        "--token-secret-ref",
+        "--token-ref",
+        "--api-key-ref",
+        "google-oauth",
+        "google-token",
+        "slack-app",
+        "slack-bot",
+    ] {
+        assert!(USAGE.contains(flag), "missing {flag} in bot USAGE");
+    }
 }

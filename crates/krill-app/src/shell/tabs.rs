@@ -199,6 +199,10 @@ impl Shell {
                     .layout
                     .session(tab.focused)
                     .and_then(|id| self.sidebar.read(cx).session_on(host, id));
+                let bot_meta = self
+                    .layout
+                    .session(tab.focused)
+                    .and_then(|id| self.sidebar.read(cx).bot_session_meta_on(host, id).cloned());
                 let launch_agent = match self.layout.launch(tab.focused).map(|l| &l.program) {
                     Some(Program::Agent { id }) => launch_agent_id(id),
                     _ => "",
@@ -251,6 +255,20 @@ impl Shell {
                         String::new()
                     }
                 );
+                let bot_dot_color =
+                    if tab.color.is_some() || self.layout.file(tab.focused).is_some() {
+                        None
+                    } else {
+                        bot_meta
+                            .as_ref()
+                            .map(|m| m.tab_color().map_or(p.primary, ui::tab_tag_color))
+                    };
+                let tab_bot_meta = bot_meta.clone();
+                let description = if let Some(meta) = &bot_meta {
+                    format!("{description} · {}", meta.display_prefix())
+                } else {
+                    description
+                };
                 let pane = tab.focused;
                 // 파일 탭에는 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
                 let description = if self.layout.file(pane).is_some() {
@@ -357,11 +375,19 @@ impl Shell {
                                     .rounded_full()
                                     .bg(ui::tab_tag_color(color))
                             }))
+                            .children(bot_dot_color.map(|color| {
+                                div()
+                                    .debug_selector(move || format!("tab-bot-color-{i}"))
+                                    .flex_none()
+                                    .size(ui::STATE_DOT)
+                                    .rounded_full()
+                                    .bg(color)
+                            }))
                             .child(if let Some(fp) = file_prefix {
                                 // MK-119: 파일 탭은 [파일 아이콘][미저장 점]으로 바꾼다.
                                 fp.into_any_element()
                             } else {
-                                // OWE-662: [상태 글리프(미확인이면 벨)][에이전트 아이콘][제목].
+                                // OWE-662: [상태 글리프(미확인이면 벨)][봇 배지/에이전트 아이콘][제목].
                                 div()
                                     .flex()
                                     .items_center()
@@ -375,6 +401,30 @@ impl Shell {
                                         )
                                         .debug_selector(move || format!("tab-state-{i}")),
                                     )
+                                    .children(tab_bot_meta.map(|meta| {
+                                        div()
+                                            .debug_selector(move || format!("tab-bot-{i}"))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .child(
+                                                if let Some(emoji) =
+                                                    meta.emoji.filter(|e| !e.trim().is_empty())
+                                                {
+                                                    div()
+                                                        .text_size(ui::TEXT_XS)
+                                                        .child(emoji)
+                                                        .into_any_element()
+                                                } else {
+                                                    ui::icons::svg_icon(
+                                                        ui::icons::CUSTOM_AGENT_SVG,
+                                                        ui::ICON_XS,
+                                                        p.muted_foreground,
+                                                    )
+                                                    .into_any_element()
+                                                },
+                                            )
+                                    }))
                                     .child(
                                         // OWE-886: 빈 에이전트도 `status::agent_icon` 하나로 통일(§6.5).
                                         ui::status::agent_icon(agent, ui::ICON_SM, p.foreground),

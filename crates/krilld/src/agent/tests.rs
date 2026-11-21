@@ -2057,3 +2057,117 @@ fn pane_env_inherits_socket_override_from_process() {
             .contains("1 passed")
     );
 }
+
+#[test]
+fn bot_mcp_launch_injects_claude_and_codex_mcp_add_dir_and_no_proxy() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-mcp-launch-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let bot_home = dir.join("bot-home");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&bot_home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let mcp = BotMcpLaunchConfig {
+        bot_home: Some(bot_home.clone()),
+        http_servers: vec![BotMcpHttpServer {
+            id: "krill".to_owned(),
+            url: "http://127.0.0.1:45123/bot-tools/krill/mcp".to_owned(),
+            bearer_token: "secret-tok-123".to_owned(),
+        }],
+        stdio_servers: vec![BotMcpStdioServer {
+            id: "gh-local".to_owned(),
+            command: vec!["gh-mcp".to_owned(), "--readonly".to_owned()],
+            env: vec![("GH_TOKEN".to_owned(), "ghp_abc".to_owned())],
+        }],
+    };
+
+    // 1. Claude gets `--mcp-config <0600 file>`, `--add-dir <bot_home>`, and NO_PROXY loopback.
+    let claude_prof = profile(&["claude"]);
+    let (claude_launch, _, _) = launch_selected_in_with_bot_mcp(
+        &claude_prof,
+        Permission::Manual,
+        krill_proto::SessionId(901),
+        Some(&state),
+        None,
+        Some(&workspace),
+        Some(&mcp),
+    )
+    .unwrap();
+    let claude_argv: Vec<String> = claude_launch
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let mcp_pos = claude_argv
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .unwrap();
+    let mcp_path = PathBuf::from(&claude_argv[mcp_pos + 1]);
+    assert!(mcp_path.is_file());
+    let mcp_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&mcp_path).unwrap()).unwrap();
+    assert_eq!(
+        mcp_json["mcpServers"]["krill"]["url"],
+        "http://127.0.0.1:45123/bot-tools/krill/mcp"
+    );
+    assert_eq!(
+        mcp_json["mcpServers"]["gh-local"]["env"]["GH_TOKEN"],
+        "ghp_abc"
+    );
+    let add_dir_pos = claude_argv.iter().position(|a| a == "--add-dir").unwrap();
+    assert_eq!(Path::new(&claude_argv[add_dir_pos + 1]), bot_home);
+    assert!(
+        claude_launch.env.iter().any(|(k, v)| k == b"NO_PROXY"
+            && String::from_utf8_lossy(v).contains("127.0.0.1,localhost,::1"))
+    );
+    assert!(
+        claude_launch
+            .env
+            .iter()
+            .any(|(k, v)| k == b"no_proxy" && String::from_utf8_lossy(v).contains("127.0.0.1"))
+    );
+
+    // Discard cleans up both Claude settings JSON and `-mcp-` JSON.
+    claude::discard(&state, krill_proto::SessionId(901));
+    assert!(!mcp_path.exists());
+
+    // 2. Codex gets `-c mcp_servers.*` flags, env vars, and NO_PROXY without raw token in argv.
+    let codex_prof = profile(&["codex"]);
+    let (codex_launch, _, _) = launch_selected_in_with_bot_mcp(
+        &codex_prof,
+        Permission::Manual,
+        krill_proto::SessionId(902),
+        Some(&state),
+        None,
+        Some(&workspace),
+        Some(&mcp),
+    )
+    .unwrap();
+    let codex_argv: Vec<String> = codex_launch
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let joined = codex_argv.join(" ");
+    assert!(joined.contains("mcp_servers.krill.url="));
+    assert!(joined.contains("mcp_servers.krill.bearer_token_env_var="));
+    assert!(!joined.contains("secret-tok-123"));
+    assert!(joined.contains("mcp_servers.gh-local.command="));
+    assert!(joined.contains("mcp_servers.gh-local.env_vars=[\"GH_TOKEN\"]"));
+    assert!(
+        codex_launch
+            .env
+            .iter()
+            .any(|(k, v)| k == b"GH_TOKEN" && v == b"ghp_abc")
+    );
+    assert!(
+        codex_launch
+            .env
+            .iter()
+            .any(|(k, v)| k == b"NO_PROXY" && String::from_utf8_lossy(v).contains("::1"))
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

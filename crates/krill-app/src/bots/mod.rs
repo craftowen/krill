@@ -1,5 +1,5 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
-//! Krill Bots modal UI (Phases 1-3 complete, STYLEGUIDE-compliant).
+//! Krill Bots modal UI (Phases 1-3 + Orca v2 parity, STYLEGUIDE-compliant).
 //!
 //! Opens as a single modal over the main workspace window via `ui::modal_backdrop` +
 //! `ui::page_modal_size`, matching `Automations` and `Artifacts`. Active bot chats open
@@ -7,8 +7,10 @@
 
 mod connectors;
 mod create;
+mod groups;
 mod items;
 pub mod rpc;
+mod settings;
 mod soul_memory;
 mod tools_sharing;
 
@@ -19,24 +21,28 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, FontWeight, KeyDownEvent, SharedString, Task,
-    Window, div, prelude::*, px,
+    AnyWindowHandle, Context, Entity, EntityInputHandler as _, EventEmitter, FocusHandle,
+    Focusable as _, FontWeight, KeyDownEvent, SharedString, Task, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::InputState;
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::bots::{
     BotAccessRequest, BotAccessRequestStatus, BotConfig, BotConnectorStatus, BotId, BotItem,
-    BotItemStatus, BotRpcRequest, BotRpcResponse, ConnectorHealthState, ExternalSource,
+    BotItemStatus, BotRpcRequest, BotRpcResponse, BotSessionSummary, ConnectorHealthState,
+    ExternalSource,
 };
 
+use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 pub use rpc::{
-    BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, SidebarBot, SidebarSnapshot, daemon_bot_rpc,
-    fetch_sidebar_snapshot,
+    BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
+    daemon_bot_rpc, fetch_sidebar_state,
 };
+use rpc::{call_checked, decode_png_avatar, parse_avatar_color};
 
 /// Request the host `Shell` to close the Bots modal.
 #[derive(Debug)]
@@ -57,6 +63,13 @@ pub struct BadgeChanged {
     pub bots: Vec<SidebarBot>,
 }
 
+/// Notify the host `Shell` when cached `SessionId -> BotSessionMeta` mappings update.
+#[derive(Debug, Clone)]
+pub struct SessionsChanged {
+    pub host: HostId,
+    pub sessions: BTreeMap<SessionId, BotSessionMeta>,
+}
+
 /// Active sub-tab inside a bot's detail view.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DetailTab {
@@ -65,6 +78,7 @@ pub enum DetailTab {
     SoulMemory,
     Connectors,
     ToolsSharing,
+    Settings,
 }
 
 /// Active right-pane screen inside the Bots modal.
@@ -74,46 +88,78 @@ pub enum Screen {
     Detail,
     Create,
     Import,
+    Groups,
+}
+
+#[derive(Default)]
+struct ChatsState {
+    expanded: bool,
+    loading: bool,
+    opening: bool,
 }
 
 pub struct View {
     focus: FocusHandle,
+    window_handle: Option<AnyWindowHandle>,
     rpc: BotRpcCall,
+    rpc_is_mock: bool,
+    host: HostId,
+    target: Option<HostTarget>,
+    available_hosts: Vec<(HostId, String, Option<HostTarget>)>,
     default_cwd: Option<PathBuf>,
     bots: Vec<BotConfig>,
     selected_bot_id: Option<BotId>,
+    pending_switch_bot: Option<BotId>,
     screen: Screen,
     detail_tab: DetailTab,
     loading: bool,
     busy: bool,
-    opening_chat: bool,
+    chats: ChatsState,
     error: Option<SharedString>,
     notice: Option<SharedString>,
     armed_delete_bot: Option<BotId>,
     all_open_items: Vec<BotItem>,
     all_connector_statuses: Vec<BotConnectorStatus>,
     all_access_requests: Vec<BotAccessRequest>,
+    bot_sessions: Vec<BotSessionSummary>,
     create: create::CreateState,
     items: items::ItemsState,
     soul_memory: soul_memory::SoulMemoryState,
     connectors: connectors::ConnectorsState,
     tools: tools_sharing::ToolsState,
     import_state: tools_sharing::ImportState,
+    settings: settings::SettingsState,
+    groups: groups::GroupsState,
     load_gen: u64,
     detail_gen: u64,
     load_task: Option<Task<()>>,
     detail_task: Option<Task<()>>,
-    action_task: Option<Task<()>>,
+    open_chat_task: Option<Task<()>>,
+    tidy_task: Option<Task<()>>,
+    look_task: Option<Task<()>>,
+    import_task: Option<Task<()>>,
+    mutation_task: Option<Task<()>>,
+    sessions_task: Option<Task<()>>,
+    item_task: Option<Task<()>>,
+    memory_task: Option<Task<()>>,
+    connector_task: Option<Task<()>>,
+    tools_task: Option<Task<()>>,
+    group_task: Option<Task<()>>,
+    group_poll_task: Option<Task<()>>,
+    oauth_poll_task: Option<Task<()>>,
+    avatar_task: Option<Task<()>>,
     language: crate::i18n::Language,
 }
 
 impl EventEmitter<Close> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<BadgeChanged> for View {}
+impl EventEmitter<SessionsChanged> for View {}
 
 impl std::fmt::Debug for View {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BotsView")
+            .field("host", &self.host)
             .field("bots", &self.bots.len())
             .field("selected_bot_id", &self.selected_bot_id)
             .field("screen", &self.screen)
@@ -123,49 +169,101 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    /// Creates a new Bots modal connected to the local Krill daemon.
+    /// Creates a new Bots modal connected to the local Krill daemon (or custom target).
     pub fn new(
-        target: Option<crate::hosts::HostTarget>,
+        target: Option<HostTarget>,
         default_cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_rpc(daemon_bot_rpc(target), default_cwd, cx)
+        Self::new_on_host(HostId::Local, target, default_cwd, cx)
     }
 
-    /// Creates a Bots modal backed by an injectable RPC handler (used by tests and custom targets).
+    /// Creates a new Bots modal bound to a specific [`HostId`] and [`HostTarget`].
+    pub fn new_on_host(
+        host: HostId,
+        target: Option<HostTarget>,
+        default_cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::build_with_rpc(
+            daemon_bot_rpc(target.clone()),
+            false,
+            host,
+            target,
+            default_cwd,
+            cx,
+        );
+        view.reload(cx);
+        view
+    }
+
+    /// Creates a Bots modal backed by an injectable RPC handler (used by tests).
     pub fn with_rpc(rpc: BotRpcCall, default_cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
-        let mut view = Self {
+        let mut view = Self::build_with_rpc(rpc, true, HostId::Local, None, default_cwd, cx);
+        view.reload(cx);
+        view
+    }
+
+    fn build_with_rpc(
+        rpc: BotRpcCall,
+        rpc_is_mock: bool,
+        host: HostId,
+        target: Option<HostTarget>,
+        default_cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
             focus: cx.focus_handle(),
+            window_handle: None,
             rpc,
+            rpc_is_mock,
+            host,
+            target,
+            available_hosts: Vec::new(),
             default_cwd,
             bots: Vec::new(),
             selected_bot_id: None,
+            pending_switch_bot: None,
             screen: Screen::Detail,
             detail_tab: DetailTab::Items,
             loading: false,
             busy: false,
-            opening_chat: false,
+            chats: ChatsState::default(),
             error: None,
             notice: None,
             armed_delete_bot: None,
             all_open_items: Vec::new(),
             all_connector_statuses: Vec::new(),
             all_access_requests: Vec::new(),
+            bot_sessions: Vec::new(),
             create: create::CreateState::default(),
             items: items::ItemsState::default(),
             soul_memory: soul_memory::SoulMemoryState::default(),
             connectors: connectors::ConnectorsState::default(),
             tools: tools_sharing::ToolsState::default(),
             import_state: tools_sharing::ImportState::default(),
+            settings: settings::SettingsState::default(),
+            groups: groups::GroupsState::default(),
             load_gen: 0,
             detail_gen: 0,
             load_task: None,
             detail_task: None,
-            action_task: None,
+            open_chat_task: None,
+            tidy_task: None,
+            look_task: None,
+            import_task: None,
+            mutation_task: None,
+            sessions_task: None,
+            item_task: None,
+            memory_task: None,
+            connector_task: None,
+            tools_task: None,
+            group_task: None,
+            group_poll_task: None,
+            oauth_poll_task: None,
+            avatar_task: None,
             language: crate::i18n::language(),
-        };
-        view.reload(cx);
-        view
+        }
     }
 
     #[must_use]
@@ -189,9 +287,51 @@ impl View {
     }
 
     #[must_use]
+    pub fn host(&self) -> &HostId {
+        &self.host
+    }
+
+    #[must_use]
     pub fn selected_bot(&self) -> Option<&BotConfig> {
         let id = self.selected_bot_id.as_ref()?;
         self.bots.iter().find(|b| &b.id == id)
+    }
+
+    #[must_use]
+    pub fn session_meta_for(&self, bot_id: &BotId) -> Option<BotSessionMeta> {
+        self.bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .map(BotSessionMeta::from_bot)
+    }
+
+    /// Updates available hosts and switches the daemon RPC target when viewing a different host.
+    pub fn set_host_target(
+        &mut self,
+        host: HostId,
+        target: Option<HostTarget>,
+        hosts: Vec<(HostId, String, Option<HostTarget>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.available_hosts = hosts;
+        if self.rpc_is_mock {
+            cx.notify();
+            return;
+        }
+        let target_changed =
+            self.host != host || (target.is_some() && self.target.as_ref() != target.as_ref());
+        self.host = host;
+        self.target.clone_from(&target);
+        if target_changed {
+            self.rpc = daemon_bot_rpc(target);
+            self.selected_bot_id = None;
+            self.bots.clear();
+            self.bot_sessions.clear();
+            self.settings.avatar_cache.clear();
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     #[must_use]
@@ -202,14 +342,21 @@ impl View {
     pub fn on_hide(&mut self, cx: &mut Context<Self>) {
         self.armed_delete_bot = None;
         self.soul_memory.armed_forget = None;
+        self.pending_switch_bot = None;
+        self.group_poll_task = None;
+        self.oauth_poll_task = None;
         cx.notify();
     }
 
     pub fn reopen(&mut self, cx: &mut Context<Self>) {
         self.armed_delete_bot = None;
         self.soul_memory.armed_forget = None;
+        self.pending_switch_bot = None;
         self.error = None;
         self.notice = None;
+        if !self.bots.is_empty() {
+            self.screen = Screen::Detail;
+        }
         self.reload(cx);
     }
 
@@ -227,7 +374,28 @@ impl View {
         });
     }
 
-    /// Loads bots list, open items, connector statuses, access requests, and tool relay status.
+    pub(super) fn emit_sessions_changed(&self, cx: &mut Context<Self>) {
+        let mut sessions = BTreeMap::new();
+        for summary in &self.bot_sessions {
+            if let Some(meta) = self.session_meta_for(&summary.bot_id) {
+                sessions.insert(summary.session_id, meta);
+            }
+        }
+        cx.emit(SessionsChanged {
+            host: self.host.clone(),
+            sessions,
+        });
+    }
+
+    #[must_use]
+    pub(super) fn sessions_for_bot(&self, bot_id: &BotId) -> Vec<&BotSessionSummary> {
+        self.bot_sessions
+            .iter()
+            .filter(|s| &s.bot_id == bot_id)
+            .collect()
+    }
+
+    /// Loads bots list, open items, connector statuses, access requests, tool relay status, and sessions.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.load_gen = self.load_gen.wrapping_add(1);
         let generation = self.load_gen;
@@ -238,31 +406,81 @@ impl View {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let bots = match rpc(&BotRpcRequest::ListBots)? {
+                    let bots = match call_checked(&rpc, &BotRpcRequest::ListBots)? {
                         BotRpcResponse::Bots(list) => list,
-                        BotRpcResponse::Error(msg) => return Err(msg),
                         other => return Err(format!("unexpected ListBots response: {other:?}")),
                     };
-                    let open_items = match rpc(&BotRpcRequest::ListItems {
-                        bot_id: None,
-                        include_closed: false,
-                    }) {
+                    let mut warnings = Vec::new();
+                    let open_items = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListItems {
+                            bot_id: None,
+                            include_closed: false,
+                        },
+                    ) {
                         Ok(BotRpcResponse::Items(list)) => list,
-                        _ => Vec::new(),
+                        Ok(BotRpcResponse::Ok) => Vec::new(),
+                        Ok(other) => {
+                            warnings.push(format!("ListItems: {other:?}"));
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            warnings.push(e);
+                            Vec::new()
+                        }
                     };
-                    let statuses = match rpc(&BotRpcRequest::ConnectorStatus { bot_id: None }) {
+                    let statuses = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ConnectorStatus { bot_id: None },
+                    ) {
                         Ok(BotRpcResponse::ConnectorStatuses(list)) => list,
-                        _ => Vec::new(),
+                        Ok(BotRpcResponse::Ok) => Vec::new(),
+                        Ok(other) => {
+                            warnings.push(format!("ConnectorStatus: {other:?}"));
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            warnings.push(e);
+                            Vec::new()
+                        }
                     };
-                    let access = match rpc(&BotRpcRequest::ListAccessRequests { bot_id: None }) {
+                    let access = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListAccessRequests { bot_id: None },
+                    ) {
                         Ok(BotRpcResponse::AccessRequests(list)) => list,
-                        _ => Vec::new(),
+                        Ok(BotRpcResponse::Ok) => Vec::new(),
+                        Ok(other) => {
+                            warnings.push(format!("ListAccessRequests: {other:?}"));
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            warnings.push(e);
+                            Vec::new()
+                        }
                     };
-                    let relay = match rpc(&BotRpcRequest::ToolRelayStatus) {
+                    let relay = match call_checked(&rpc, &BotRpcRequest::ToolRelayStatus) {
                         Ok(BotRpcResponse::ToolRelayStatus(st)) => Some(st),
-                        _ => None,
+                        Ok(_) => None,
+                        Err(e) => {
+                            warnings.push(e);
+                            None
+                        }
                     };
-                    Ok::<_, String>((bots, open_items, statuses, access, relay))
+                    let sessions = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListBotSessions { bot_id: None },
+                    ) {
+                        Ok(BotRpcResponse::BotSessions(list)) => Some(list),
+                        Ok(_) => None,
+                        Err(e) => {
+                            warnings.push(e);
+                            None
+                        }
+                    };
+                    Ok::<_, String>((
+                        bots, open_items, statuses, access, relay, sessions, warnings,
+                    ))
                 })
                 .await;
 
@@ -272,13 +490,19 @@ impl View {
                 }
                 this.loading = false;
                 match outcome {
-                    Ok((bots, open_items, statuses, access, relay)) => {
+                    Ok((bots, open_items, statuses, access, relay, sessions, warnings)) => {
                         this.bots = bots;
                         this.all_open_items = open_items;
                         this.all_connector_statuses = statuses;
                         this.all_access_requests = access;
                         if let Some(st) = relay {
                             this.tools.relay_status = Some(st);
+                        }
+                        if let Some(list) = sessions {
+                            this.bot_sessions = list;
+                        }
+                        if !warnings.is_empty() {
+                            this.error = Some(SharedString::from(warnings.join(" | ")));
                         }
                         let still_valid = this
                             .selected_bot_id
@@ -288,6 +512,7 @@ impl View {
                             this.selected_bot_id = this.bots.first().map(|b| b.id.clone());
                         }
                         this.emit_badge(cx);
+                        this.emit_sessions_changed(cx);
                         if let Some(bot_id) = this.selected_bot_id.clone() {
                             this.load_selected_bot_detail(bot_id, cx);
                         }
@@ -304,13 +529,27 @@ impl View {
     }
 
     pub fn select_bot(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        if self.selected_bot_id.as_ref() != Some(&bot_id) && self.soul_memory.has_unsaved_edits(cx)
+        {
+            self.pending_switch_bot = Some(bot_id);
+            cx.notify();
+            return;
+        }
+        self.confirm_select_bot(bot_id, cx);
+    }
+
+    pub fn confirm_select_bot(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
         self.armed_delete_bot = None;
         self.soul_memory.armed_forget = None;
+        self.soul_memory.discard_unsaved_edits();
+        self.soul_memory.selected_topic = None;
+        self.pending_switch_bot = None;
         self.error = None;
         self.notice = None;
         self.selected_bot_id = Some(bot_id.clone());
         self.screen = Screen::Detail;
         self.connectors.needs_sync_from_bot = true;
+        self.settings.needs_sync_from_bot = true;
         self.load_selected_bot_detail(bot_id, cx);
         cx.notify();
     }
@@ -325,6 +564,9 @@ impl View {
         if tab == DetailTab::Connectors {
             self.connectors.needs_sync_from_bot = true;
         }
+        if tab == DetailTab::Settings {
+            self.settings.needs_sync_from_bot = true;
+        }
         if tab == DetailTab::ToolsSharing {
             self.refresh_tool_relay_status(cx);
         }
@@ -333,8 +575,13 @@ impl View {
 
     pub fn open_create(&mut self, cx: &mut Context<Self>) {
         self.armed_delete_bot = None;
+        self.pending_switch_bot = None;
         self.error = None;
         self.notice = None;
+        let handle = self.window_handle;
+        let default_cwd = self.default_cwd.clone();
+        self.create
+            .clear_form_fields(handle, default_cwd.as_deref(), cx);
         self.screen = Screen::Create;
         self.create.opened_alone = false;
         cx.notify();
@@ -348,6 +595,7 @@ impl View {
 
     pub fn open_import(&mut self, cx: &mut Context<Self>) {
         self.armed_delete_bot = None;
+        self.pending_switch_bot = None;
         self.error = None;
         self.notice = None;
         self.screen = Screen::Import;
@@ -358,47 +606,181 @@ impl View {
         self.detail_gen = self.detail_gen.wrapping_add(1);
         let generation = self.detail_gen;
         let rpc = self.rpc.clone();
+        let bot_cfg = self.bots.iter().find(|b| b.id == bot_id).cloned();
+        let has_avatar = bot_cfg.as_ref().is_some_and(|b| b.avatar.is_some());
+        let composio_enabled = bot_cfg
+            .as_ref()
+            .is_some_and(|b| b.connectors.composio.enabled);
+
+        if let Some(cfg) = &bot_cfg {
+            self.soul_memory.sync_config_from_bot(cfg);
+            self.settings.sync_from_bot(cfg);
+        }
+
         self.detail_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
-                    let items = match rpc(&BotRpcRequest::ListItems {
-                        bot_id: Some(bot_id_bg.clone()),
-                        include_closed: true,
-                    }) {
-                        Ok(BotRpcResponse::Items(list)) => list,
-                        _ => Vec::new(),
+                    let items_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListItems {
+                            bot_id: Some(bot_id_bg.clone()),
+                            include_closed: true,
+                        },
+                    ) {
+                        Ok(BotRpcResponse::Items(list)) => Ok(list),
+                        Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
+                        Ok(other) => Err(format!("unexpected ListItems: {other:?}")),
+                        Err(e) => Err(e),
                     };
-                    let soul = match rpc(&BotRpcRequest::GetSoul {
-                        bot_id: bot_id_bg.clone(),
-                    }) {
-                        Ok(BotRpcResponse::Text(t)) => t,
-                        _ => String::new(),
+                    let soul_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::GetSoul {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::Text(t)) => Ok(Some(t)),
+                        Ok(BotRpcResponse::Ok) => Ok(None),
+                        Ok(other) => Err(format!("unexpected GetSoul: {other:?}")),
+                        Err(e) => Err(e),
                     };
-                    let memory = match rpc(&BotRpcRequest::GetMemory {
-                        bot_id: bot_id_bg.clone(),
-                    }) {
-                        Ok(BotRpcResponse::Text(t)) => t,
-                        _ => String::new(),
+                    let memory_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::GetMemory {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::Text(t)) => Ok(Some(t)),
+                        Ok(BotRpcResponse::Ok) => Ok(None),
+                        Ok(other) => Err(format!("unexpected GetMemory: {other:?}")),
+                        Err(e) => Err(e),
                     };
-                    let statuses = match rpc(&BotRpcRequest::ConnectorStatus {
-                        bot_id: Some(bot_id_bg.clone()),
-                    }) {
-                        Ok(BotRpcResponse::ConnectorStatuses(list)) => list,
-                        _ => Vec::new(),
+                    let statuses_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ConnectorStatus {
+                            bot_id: Some(bot_id_bg.clone()),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::ConnectorStatuses(list)) => Ok(list),
+                        Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
+                        Ok(other) => Err(format!("unexpected ConnectorStatus: {other:?}")),
+                        Err(e) => Err(e),
                     };
-                    let access = match rpc(&BotRpcRequest::ListAccessRequests {
-                        bot_id: Some(bot_id_bg),
-                    }) {
-                        Ok(BotRpcResponse::AccessRequests(list)) => list,
-                        _ => Vec::new(),
+                    let access_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListAccessRequests {
+                            bot_id: Some(bot_id_bg.clone()),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::AccessRequests(list)) => Ok(list),
+                        Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
+                        Ok(other) => Err(format!("unexpected ListAccessRequests: {other:?}")),
+                        Err(e) => Err(e),
                     };
-                    let relay = match rpc(&BotRpcRequest::ToolRelayStatus) {
-                        Ok(BotRpcResponse::ToolRelayStatus(st)) => Some(st),
-                        _ => None,
+                    let relay_res = match call_checked(&rpc, &BotRpcRequest::ToolRelayStatus) {
+                        Ok(BotRpcResponse::ToolRelayStatus(st)) => Ok(Some(st)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
                     };
-                    (items, soul, memory, statuses, access, relay)
+                    let sessions_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListBotSessions { bot_id: None },
+                    ) {
+                        Ok(BotRpcResponse::BotSessions(list)) => Ok(Some(list)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                    let suggestions_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListSuggestions {
+                            bot_id: Some(bot_id_bg.clone()),
+                            include_dismissed: false,
+                        },
+                    ) {
+                        Ok(BotRpcResponse::Suggestions(list)) => Ok(Some(list)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                    let history_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::GetMemoryHistory {
+                            bot_id: bot_id_bg.clone(),
+                            limit: Some(25),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::MemoryHistory(list)) => Ok(Some(list)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                    let tidy_status_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::GetMemoryTidyStatus {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::MemoryTidyStatus(st)) => Ok(Some(st)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                    let topics_res = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListMemoryTopics {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::MemoryTopics(list)) => Ok(Some(list)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
+                    };
+                    let tracker_res =
+                        match call_checked(&rpc, &BotRpcRequest::GetDefaultTrackerBots) {
+                            Ok(BotRpcResponse::DefaultTrackerBots(d)) => Ok(Some(d)),
+                            Ok(_) => Ok(None),
+                            Err(e) => Err(e),
+                        };
+                    let composio_res = if composio_enabled {
+                        match call_checked(
+                            &rpc,
+                            &BotRpcRequest::ListComposioConnections {
+                                bot_id: bot_id_bg.clone(),
+                            },
+                        ) {
+                            Ok(BotRpcResponse::ComposioConnections(list)) => Ok(Some(list)),
+                            Ok(_) => Ok(None),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                    let avatar_img = if has_avatar {
+                        match call_checked(&rpc, &BotRpcRequest::GetBotAvatar { bot_id: bot_id_bg })
+                        {
+                            Ok(BotRpcResponse::BotAvatar(data)) => {
+                                decode_png_avatar(&data.png_bytes).ok()
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    DetailBundle {
+                        items_res,
+                        soul_res,
+                        memory_res,
+                        statuses_res,
+                        access_res,
+                        relay_res,
+                        sessions_res,
+                        suggestions_res,
+                        history_res,
+                        tidy_status_res,
+                        topics_res,
+                        tracker_res,
+                        composio_res,
+                        avatar_img,
+                    }
                 })
                 .await;
 
@@ -406,14 +788,87 @@ impl View {
                 if this.detail_gen != generation || this.selected_bot_id.as_ref() != Some(&bot_id) {
                     return;
                 }
-                let (items, soul, memory, statuses, access, relay) = loaded;
-                this.items.items = items;
-                this.soul_memory.set_loaded(soul, memory);
-                this.connectors.bot_statuses = statuses;
-                this.connectors.bot_access_requests = access;
+                let mut errors = Vec::new();
+                match loaded.items_res {
+                    Ok(items) => this.items.items = items,
+                    Err(e) => errors.push(e),
+                }
+                let soul_opt = match loaded.soul_res {
+                    Ok(val) => val,
+                    Err(e) => {
+                        errors.push(e);
+                        None
+                    }
+                };
+                let mem_opt = match loaded.memory_res {
+                    Ok(val) => val,
+                    Err(e) => {
+                        errors.push(e);
+                        None
+                    }
+                };
+                // Preserve existing SOUL/MEMORY text when either section failed to load.
+                this.soul_memory
+                    .apply_loaded_sections(&bot_id, soul_opt, mem_opt);
+
+                match loaded.statuses_res {
+                    Ok(statuses) => this.connectors.bot_statuses = statuses,
+                    Err(e) => errors.push(e),
+                }
+                match loaded.access_res {
+                    Ok(access) => this.connectors.bot_access_requests = access,
+                    Err(e) => errors.push(e),
+                }
+                match loaded.relay_res {
+                    Ok(Some(st)) => this.tools.relay_status = Some(st),
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.sessions_res {
+                    Ok(Some(list)) => {
+                        this.bot_sessions = list;
+                        this.emit_sessions_changed(cx);
+                    }
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.suggestions_res {
+                    Ok(Some(list)) => this.soul_memory.suggestions = list,
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.history_res {
+                    Ok(Some(list)) => this.soul_memory.memory_history = list,
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.tidy_status_res {
+                    Ok(Some(st)) => this.soul_memory.tidy_status = Some(st),
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.topics_res {
+                    Ok(Some(list)) => this.soul_memory.memory_topics = list,
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.tracker_res {
+                    Ok(Some(d)) => this.connectors.default_tracker_bots = d,
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                match loaded.composio_res {
+                    Ok(Some(c)) => this.connectors.composio_connections = c,
+                    Ok(None) => {}
+                    Err(e) => errors.push(e),
+                }
+                if let Some(img) = loaded.avatar_img {
+                    this.settings.avatar_cache.insert(bot_id.clone(), img);
+                }
+
                 this.connectors.needs_sync_from_bot = true;
-                if let Some(st) = relay {
-                    this.tools.relay_status = Some(st);
+                if !errors.is_empty() {
+                    this.error = Some(SharedString::from(errors.join(" | ")));
                 }
                 this.sync_open_items_for_bot(&bot_id);
                 this.emit_badge(cx);
@@ -440,8 +895,29 @@ impl View {
         }
     }
 
+    /// Focuses an active live chat session if one already exists; otherwise spawns a new one.
     pub(super) fn start_bot_chat(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
-        if self.opening_chat {
+        if self.chats.opening {
+            return;
+        }
+        if self
+            .selected_bot()
+            .is_some_and(|b| b.id == bot_id && b.paused)
+            || self.bots.iter().any(|b| b.id == bot_id && b.paused)
+        {
+            self.error = Some(SharedString::from(text::OPEN_CHAT_PAUSED_TOOLTIP.get()));
+            cx.notify();
+            return;
+        }
+        if let Some(live) = self
+            .bot_sessions
+            .iter()
+            .find(|s| s.bot_id == bot_id && s.live)
+        {
+            cx.emit(OpenSession {
+                bot_id,
+                session_id: live.session_id,
+            });
             return;
         }
         let cwd = self
@@ -451,30 +927,46 @@ impl View {
             .and_then(|b| b.workspace.clone())
             .filter(|s| !s.trim().is_empty());
         let rpc = self.rpc.clone();
-        self.opening_chat = true;
+        self.chats.opening = true;
         self.error = None;
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        self.open_chat_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    rpc(&BotRpcRequest::StartBotSession {
-                        bot_id: bot_id_bg,
-                        cwd,
-                        prompt: None,
-                    })
+                    call_checked(
+                        &rpc,
+                        &BotRpcRequest::StartBotSession {
+                            bot_id: bot_id_bg,
+                            cwd,
+                            prompt: None,
+                        },
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.opening_chat = false;
+                this.chats.opening = false;
                 match res {
                     Ok(BotRpcResponse::SessionStarted {
-                        bot_id, session_id, ..
+                        bot_id,
+                        session_id,
+                        pid,
                     }) => {
+                        this.bot_sessions.push(BotSessionSummary {
+                            session_id,
+                            bot_id: bot_id.clone(),
+                            link_id: None,
+                            pid,
+                            live: true,
+                            working: false,
+                            label: this
+                                .session_meta_for(&bot_id)
+                                .map(|m| m.bot_name)
+                                .unwrap_or_default(),
+                            created_at_ms: now_unix_ms(),
+                        });
+                        this.emit_sessions_changed(cx);
                         cx.emit(OpenSession { bot_id, session_id });
-                    }
-                    Ok(BotRpcResponse::Error(msg)) => {
-                        this.error = Some(SharedString::from(msg));
                     }
                     Ok(other) => {
                         this.error = Some(SharedString::from(format!(
@@ -492,16 +984,183 @@ impl View {
         cx.notify();
     }
 
-    pub(super) fn toggle_pause_bot(&mut self, bot_id: BotId, paused: bool, cx: &mut Context<Self>) {
+    pub fn refresh_bot_sessions(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        if self.chats.loading {
+            return;
+        }
         let rpc = self.rpc.clone();
-        self.busy = true;
-        self.error = None;
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        self.chats.loading = true;
+        self.sessions_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    rpc(&BotRpcRequest::UpdateBot(Box::new(
-                        krill_proto::bots::UpdateBotParams {
+                    call_checked(&rpc, &BotRpcRequest::ListBotSessions { bot_id: None })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chats.loading = false;
+                match res {
+                    Ok(BotRpcResponse::BotSessions(list)) => {
+                        this.bot_sessions = list;
+                        this.emit_sessions_changed(cx);
+                    }
+                    Ok(other) => {
+                        this.error = Some(SharedString::from(format!(
+                            "unexpected ListBotSessions response: {other:?}"
+                        )));
+                    }
+                    Err(err) => this.error = Some(SharedString::from(err)),
+                }
+                let _ = &bot_id;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub fn reset_bot_chat(
+        &mut self,
+        bot_id: BotId,
+        session_id: Option<SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_session_action(
+            bot_id.clone(),
+            BotRpcRequest::ResetBotChat { bot_id, session_id },
+            true,
+            cx,
+        );
+    }
+
+    pub fn stop_bot_session(
+        &mut self,
+        bot_id: BotId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_session_action(
+            bot_id.clone(),
+            BotRpcRequest::StopBotSession { bot_id, session_id },
+            false,
+            cx,
+        );
+    }
+
+    pub fn retry_bot_kickoff(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        self.run_session_action(
+            bot_id.clone(),
+            BotRpcRequest::RetryBotKickoff { bot_id },
+            true,
+            cx,
+        );
+    }
+
+    pub fn send_bot_run_again(
+        &mut self,
+        bot_id: BotId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_session_action(
+            bot_id.clone(),
+            BotRpcRequest::SendBotRunAgain { bot_id, session_id },
+            true,
+            cx,
+        );
+    }
+
+    pub fn take_over_workspace(
+        &mut self,
+        bot_id: BotId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_session_action(
+            bot_id.clone(),
+            BotRpcRequest::TakeOverWorkspace { bot_id, session_id },
+            false,
+            cx,
+        );
+    }
+
+    fn run_session_action(
+        &mut self,
+        bot_id: BotId,
+        req: BotRpcRequest,
+        focus_on_start: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chats.loading {
+            return;
+        }
+        let rpc = self.rpc.clone();
+        self.chats.loading = true;
+        self.error = None;
+        self.sessions_task = Some(cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let reply = call_checked(&rpc, &req)?;
+                    let sessions = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListBotSessions { bot_id: None },
+                    ) {
+                        Ok(BotRpcResponse::BotSessions(list)) => Some(list),
+                        _ => None,
+                    };
+                    Ok::<_, String>((reply, sessions))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.chats.loading = false;
+                match res {
+                    Ok((reply, sessions)) => {
+                        if let Some(list) = sessions {
+                            this.bot_sessions = list;
+                            this.emit_sessions_changed(cx);
+                        }
+                        if focus_on_start
+                            && let BotRpcResponse::SessionStarted {
+                                bot_id: bid,
+                                session_id,
+                                ..
+                            } = reply
+                        {
+                            cx.emit(OpenSession {
+                                bot_id: bid,
+                                session_id,
+                            });
+                        } else {
+                            let _ = &bot_id;
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        }
+                    }
+                    Err(err) => {
+                        this.error = Some(SharedString::from(err));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn toggle_pause_bot(&mut self, bot_id: BotId, paused: bool, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let rpc = self.rpc.clone();
+        self.busy = true;
+        self.error = None;
+        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    call_checked(
+                        &rpc,
+                        &BotRpcRequest::UpdateBot(Box::new(krill_proto::bots::UpdateBotParams {
                             bot_id,
                             name: None,
                             description: None,
@@ -519,8 +1178,8 @@ impl View {
                             look_around: None,
                             memory_tidy: None,
                             mcp_tools: None,
-                        },
-                    )))
+                        })),
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -531,13 +1190,14 @@ impl View {
                         this.notice = Some(SharedString::from(text::SAVED.get()));
                         this.emit_badge(cx);
                     }
-                    Ok(BotRpcResponse::Error(msg)) => {
-                        this.error = Some(SharedString::from(msg));
+                    Ok(other) => {
+                        this.error = Some(SharedString::from(format!(
+                            "unexpected UpdateBot response: {other:?}"
+                        )));
                     }
                     Err(err) => {
                         this.error = Some(SharedString::from(err));
                     }
-                    Ok(_) => {}
                 }
                 cx.notify();
             })
@@ -557,18 +1217,24 @@ impl View {
     }
 
     pub(super) fn delete_bot(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let rpc = self.rpc.clone();
         self.busy = true;
         self.error = None;
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        self.mutation_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    rpc(&BotRpcRequest::DeleteBot {
-                        bot_id: bot_id_bg,
-                        delete_home: true,
-                    })
+                    call_checked(
+                        &rpc,
+                        &BotRpcRequest::DeleteBot {
+                            bot_id: bot_id_bg,
+                            delete_home: true,
+                        },
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -579,6 +1245,8 @@ impl View {
                         this.all_open_items.retain(|i| i.owner_bot_id != bot_id);
                         this.all_access_requests.retain(|r| r.bot_id != bot_id);
                         this.all_connector_statuses.retain(|s| s.bot_id != bot_id);
+                        this.bot_sessions.retain(|s| s.bot_id != bot_id);
+                        this.settings.avatar_cache.remove(&bot_id);
                         if this.selected_bot_id.as_ref() == Some(&bot_id) {
                             this.selected_bot_id = this.bots.first().map(|b| b.id.clone());
                             if let Some(next_id) = this.selected_bot_id.clone() {
@@ -589,14 +1257,16 @@ impl View {
                             }
                         }
                         this.emit_badge(cx);
+                        this.emit_sessions_changed(cx);
                     }
-                    Ok(BotRpcResponse::Error(msg)) => {
-                        this.error = Some(SharedString::from(msg));
+                    Ok(other) => {
+                        this.error = Some(SharedString::from(format!(
+                            "unexpected DeleteBot response: {other:?}"
+                        )));
                     }
                     Err(err) => {
                         this.error = Some(SharedString::from(err));
                     }
-                    Ok(_) => {}
                 }
                 cx.notify();
             })
@@ -609,11 +1279,19 @@ impl View {
         let app: &mut gpui::App = cx;
         self.create.input_is_composing(window, app)
             || self.items.input_is_composing(window, app)
+            || self.soul_memory.input_is_composing(window, app)
             || self.connectors.input_is_composing(window, app)
             || self.tools.input_is_composing(window, app)
+            || self.import_state.input_is_composing(window, app)
+            || self.settings.input_is_composing(window, app)
+            || self.groups.input_is_composing(window, app)
     }
 
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) {
+        if self.pending_switch_bot.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.armed_delete_bot.take().is_some() {
             cx.notify();
             return;
@@ -623,7 +1301,11 @@ impl View {
             return;
         }
         let alone = self.screen == Screen::Create && self.create.opened_alone;
-        if matches!(self.screen, Screen::Create | Screen::Import) && !self.bots.is_empty() && !alone
+        if matches!(
+            self.screen,
+            Screen::Create | Screen::Import | Screen::Groups
+        ) && !self.bots.is_empty()
+            && !alone
         {
             self.screen = Screen::Detail;
             cx.notify();
@@ -643,8 +1325,52 @@ impl View {
         }
     }
 
+    fn render_error_with_retry(
+        &self,
+        err: SharedString,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let selected = self.selected_bot_id.clone();
+        div().px_5().pt_3().child(
+            div()
+                .px_3()
+                .py_2()
+                .rounded(ui::RADIUS_SM)
+                .border_1()
+                .border_color(p.destructive.opacity(0.3))
+                .bg(p.destructive.opacity(0.1))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.destructive)
+                        .child(err),
+                )
+                .child(
+                    ui::secondary("bots-error-retry", text::RETRY.get())
+                        .debug_selector(|| "bots-error-retry".into())
+                        .disabled(self.loading)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.error = None;
+                            if let Some(bid) = selected.clone() {
+                                this.load_selected_bot_detail(bid, cx);
+                            } else {
+                                this.reload(cx);
+                            }
+                        })),
+                ),
+        )
+    }
+
     fn render_left_rail(
         &self,
+        rail_width: gpui::Pixels,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -693,6 +1419,8 @@ impl View {
                 .collect();
             let display_emoji = bot.emoji.clone().unwrap_or_default();
             let has_emoji = !display_emoji.is_empty();
+            let avatar_img = self.settings.avatar_cache.get(&bot.id).cloned();
+            let accent_dot = parse_avatar_color(bot.avatar_color.as_deref());
             let runtime_label = rpc::runtime_display_label(&bot.agent_id);
             let row_id = format!("bots-rail-item-{bot_id_sel}");
             let row_sel = row_id.clone();
@@ -735,7 +1463,21 @@ impl View {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
-                                    .when(has_emoji, |d| {
+                                    .when_some(accent_dot, |d, tc| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .size(ui::STATE_DOT)
+                                                .rounded_full()
+                                                .bg(ui::tab_tag_color(tc)),
+                                        )
+                                    })
+                                    .when_some(avatar_img, |d, img| {
+                                        d.child(
+                                            gpui::img(img).size(px(16.)).rounded_full().flex_none(),
+                                        )
+                                    })
+                                    .when(bot.avatar.is_none() && has_emoji, |d| {
                                         d.child(
                                             div()
                                                 .flex_none()
@@ -743,7 +1485,7 @@ impl View {
                                                 .child(display_emoji),
                                         )
                                     })
-                                    .when(!has_emoji, |d| {
+                                    .when(bot.avatar.is_none() && !has_emoji, |d| {
                                         d.child(ui::icons::svg_icon(
                                             ui::icons::CUSTOM_AGENT_SVG,
                                             ui::ICON_SM,
@@ -777,6 +1519,7 @@ impl View {
                                     .min_w_0()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap_1()
                                     .child(ui::icons::agent_brand_icon(
                                         &bot.agent_id,
@@ -795,6 +1538,22 @@ impl View {
                                             p,
                                             ui::BadgeTone::Muted,
                                             text::PAUSED_BADGE.get(),
+                                        ))
+                                    })
+                                    .when(!bot.paused && needs_count > 0, |d| {
+                                        d.child(ui::badge(
+                                            p,
+                                            ui::BadgeTone::Warning,
+                                            text::NEEDS_YOU_BADGE
+                                                .format(&[("n", &needs_count.to_string())]),
+                                        ))
+                                    })
+                                    .when(pending_count > 0, |d| {
+                                        d.child(ui::badge(
+                                            p,
+                                            ui::BadgeTone::Neutral,
+                                            text::PENDING_ACCESS_BADGE
+                                                .format(&[("n", &pending_count.to_string())]),
                                         ))
                                     }),
                             )
@@ -817,7 +1576,7 @@ impl View {
         div()
             .id("bots-left-rail")
             .debug_selector(|| "bots-left-rail".into())
-            .w(px(236.))
+            .w(rail_width)
             .flex_none()
             .h_full()
             .min_h_0()
@@ -853,7 +1612,10 @@ impl View {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.sidebar_foreground)
                                     .child(text::TITLE.get()),
-                            ),
+                            )
+                            .when(self.loading, |d| {
+                                d.child(ui::badge(p, ui::BadgeTone::Muted, text::LOADING.get()))
+                            }),
                     )
                     .child(ui::button_with_tooltip(
                         Button::new("bots-refresh")
@@ -867,6 +1629,34 @@ impl View {
                         text::REFRESH.get(),
                     )),
             )
+            .when(self.available_hosts.len() > 1, |d| {
+                let mut host_pills = div()
+                    .px_2()
+                    .py_1p5()
+                    .border_b_1()
+                    .border_color(p.sidebar_border)
+                    .flex()
+                    .flex_wrap()
+                    .gap_1();
+                for (hidx, (hid, label, target)) in self.available_hosts.iter().enumerate() {
+                    let h_active = &self.host == hid;
+                    let hid_c = hid.clone();
+                    let target_c = target.clone();
+                    let all_c = self.available_hosts.clone();
+                    host_pills = host_pills.child(
+                        ui::segment(p, format!("bots-host-{hidx}"), label.clone(), h_active)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_host_target(
+                                    hid_c.clone(),
+                                    target_c.clone(),
+                                    all_c.clone(),
+                                    cx,
+                                );
+                            })),
+                    );
+                }
+                d.child(host_pills)
+            })
             .child(list)
             .child(
                 div()
@@ -877,6 +1667,17 @@ impl View {
                     .flex()
                     .flex_col()
                     .gap_1p5()
+                    .child(
+                        ui::segment(
+                            p,
+                            "bots-nav-groups",
+                            text::GROUP_CHATS_HEADING.get(),
+                            self.screen == Screen::Groups,
+                        )
+                        .debug_selector(|| "bots-nav-groups".into())
+                        .w_full()
+                        .on_click(cx.listener(|this, _, _, cx| this.open_groups(cx))),
+                    )
                     .child(
                         ui::primary("bots-new-btn", text::NEW_BOT.get())
                             .debug_selector(|| "bots-new-btn".into())
@@ -890,6 +1691,55 @@ impl View {
                             .on_click(cx.listener(|this, _, _, cx| this.open_import(cx))),
                     ),
             )
+    }
+
+    fn render_compact_switcher(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
+        let mut bar = div()
+            .w_full()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(p.border)
+            .bg(p.sidebar)
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1p5();
+        for bot in &self.bots {
+            let bid = bot.id.clone();
+            let active =
+                self.screen == Screen::Detail && self.selected_bot_id.as_ref() == Some(&bid);
+            bar = bar.child(
+                ui::segment(
+                    p,
+                    SharedString::from(format!("bots-compact-select-{}", bid.as_str())),
+                    bot.name.clone(),
+                    active,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_bot(bid.clone(), cx);
+                })),
+            );
+        }
+        bar.child(
+            ui::segment(
+                p,
+                "bots-compact-groups",
+                text::GROUP_CHATS_HEADING.get(),
+                self.screen == Screen::Groups,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.open_groups(cx))),
+        )
+        .child(
+            ui::primary("bots-new-btn", text::NEW_BOT.get())
+                .debug_selector(|| "bots-new-btn".into())
+                .on_click(cx.listener(|this, _, _, cx| this.open_create(cx))),
+        )
+        .child(
+            ui::secondary("bots-import-btn", text::IMPORT.get())
+                .debug_selector(|| "bots-import-btn".into())
+                .on_click(cx.listener(|this, _, _, cx| this.open_import(cx))),
+        )
     }
 
     fn render_empty_state(p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -942,6 +1792,194 @@ impl View {
             )
     }
 
+    fn render_chats_panel(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let sessions: Vec<&BotSessionSummary> = self.sessions_for_bot(&bot.id);
+        let heading = text::CHATS_HEADING.format(&[("n", &sessions.len().to_string())]);
+        let bot_reset = bot.id.clone();
+        let bot_kickoff = bot.id.clone();
+
+        let mut panel = ui::card(p)
+            .debug_selector(|| "bots-chats-panel".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(heading),
+                    )
+                    .child(
+                        ui::controls()
+                            .child(
+                                ui::ghost("bots-chats-kickoff", text::CHAT_RETRY_KICKOFF_BTN.get())
+                                    .disabled(self.chats.loading || bot.paused)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.retry_bot_kickoff(bot_kickoff.clone(), cx);
+                                    })),
+                            )
+                            .child(
+                                ui::secondary("bots-chats-reset", text::CHAT_RESET_BTN.get())
+                                    .disabled(self.chats.loading || bot.paused)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reset_bot_chat(bot_reset.clone(), None, cx);
+                                    })),
+                            ),
+                    ),
+            );
+
+        if sessions.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::CHATS_EMPTY.get()),
+            );
+        } else {
+            for (idx, sess) in sessions.into_iter().enumerate() {
+                let sid = sess.session_id;
+                let bid_focus = bot.id.clone();
+                let bid_stop = bot.id.clone();
+                let bid_again = bot.id.clone();
+                let bid_take = bot.id.clone();
+                let bid_reset = bot.id.clone();
+                let label = if sess.label.trim().is_empty() {
+                    format!("Session #{}", sid.0)
+                } else {
+                    sess.label.clone()
+                };
+                panel = panel.child(
+                    div()
+                        .w_full()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(p.border)
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(ui::badge(
+                                    p,
+                                    if sess.live {
+                                        ui::BadgeTone::Success
+                                    } else {
+                                        ui::BadgeTone::Muted
+                                    },
+                                    if sess.live {
+                                        text::CHAT_SESSION_LIVE.get()
+                                    } else {
+                                        text::CHAT_SESSION_STOPPED.get()
+                                    },
+                                ))
+                                .when(sess.working, |d| {
+                                    d.child(ui::badge(
+                                        p,
+                                        ui::BadgeTone::Warning,
+                                        text::CHAT_SESSION_WORKING.get(),
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_XS)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.foreground)
+                                        .child(label),
+                                ),
+                        )
+                        .child(
+                            ui::controls()
+                                .child(
+                                    ui::secondary(
+                                        SharedString::from(format!("bots-chat-focus-{idx}")),
+                                        text::CHAT_FOCUS_BTN.get(),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |_, _, _, cx| {
+                                            cx.emit(OpenSession {
+                                                bot_id: bid_focus.clone(),
+                                                session_id: sid,
+                                            });
+                                        },
+                                    )),
+                                )
+                                .when(sess.live, |d| {
+                                    d.child(
+                                        ui::ghost(
+                                            SharedString::from(format!("bots-chat-stop-{idx}")),
+                                            text::CHAT_STOP_BTN.get(),
+                                        )
+                                        .disabled(self.chats.loading)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.stop_bot_session(bid_stop.clone(), sid, cx);
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    ui::ghost(
+                                        SharedString::from(format!("bots-chat-again-{idx}")),
+                                        text::CHAT_RUN_AGAIN_BTN.get(),
+                                    )
+                                    .disabled(self.chats.loading)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.send_bot_run_again(bid_again.clone(), sid, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    ui::ghost(
+                                        SharedString::from(format!("bots-chat-takeover-{idx}")),
+                                        text::CHAT_TAKEOVER_BTN.get(),
+                                    )
+                                    .disabled(self.chats.loading)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.take_over_workspace(bid_take.clone(), sid, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    ui::ghost(
+                                        SharedString::from(format!("bots-chat-reset-{idx}")),
+                                        text::CHAT_RESET_BTN.get(),
+                                    )
+                                    .disabled(self.chats.loading)
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.reset_bot_chat(bid_reset.clone(), Some(sid), cx);
+                                        },
+                                    )),
+                                ),
+                        ),
+                );
+            }
+        }
+        panel
+    }
+
     fn render_bot_detail_header(
         &self,
         bot: &BotConfig,
@@ -956,6 +1994,9 @@ impl View {
         let armed_delete = self.armed_delete_bot.as_ref() == Some(&bot.id);
         let runtime_label = rpc::runtime_display_label(&bot.agent_id);
         let emoji = bot.emoji.clone().unwrap_or_default();
+        let avatar_img = self.settings.avatar_cache.get(&bot.id).cloned();
+        let accent_color = parse_avatar_color(bot.avatar_color.as_deref());
+        let bot_session_count = self.sessions_for_bot(&bot.id).len();
 
         let tabs = [
             (DetailTab::Items, "bots-tab-items", text::TAB_ITEMS.get()),
@@ -973,6 +2014,11 @@ impl View {
                 DetailTab::ToolsSharing,
                 "bots-tab-tools-sharing",
                 text::TAB_TOOLS_SHARING.get(),
+            ),
+            (
+                DetailTab::Settings,
+                "bots-tab-settings",
+                text::TAB_SETTINGS.get(),
             ),
         ];
 
@@ -1007,8 +2053,23 @@ impl View {
                                     .min_w_0()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap_2()
-                                    .when(!emoji.is_empty(), |d| {
+                                    .when_some(accent_color, |d, tc| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .size(ui::STATE_DOT)
+                                                .rounded_full()
+                                                .bg(ui::tab_tag_color(tc)),
+                                        )
+                                    })
+                                    .when_some(avatar_img, |d, img| {
+                                        d.child(
+                                            gpui::img(img).size(px(24.)).rounded_full().flex_none(),
+                                        )
+                                    })
+                                    .when(bot.avatar.is_none() && !emoji.is_empty(), |d| {
                                         d.child(div().text_size(ui::TEXT_LG).child(emoji))
                                     })
                                     .child(
@@ -1045,13 +2106,19 @@ impl View {
                                                     .child(runtime_label),
                                             ),
                                     )
-                                    .when(paused, |d| {
-                                        d.child(ui::badge(
-                                            p,
-                                            ui::BadgeTone::Muted,
-                                            text::PAUSED_BADGE.get(),
-                                        ))
-                                    }),
+                                    .child(ui::badge(
+                                        p,
+                                        if paused {
+                                            ui::BadgeTone::Muted
+                                        } else {
+                                            ui::BadgeTone::Success
+                                        },
+                                        if paused {
+                                            text::PAUSED_BADGE.get()
+                                        } else {
+                                            text::ACTIVE_BADGE.get()
+                                        },
+                                    )),
                             )
                             .when(!bot.description.trim().is_empty(), |d| {
                                 d.child(
@@ -1065,20 +2132,37 @@ impl View {
                     )
                     .child(
                         ui::controls()
-                            .child(
-                                ui::primary(
+                            .child(ui::button_with_tooltip_when(
+                                paused,
+                                ui::button_with_reserved_label(
                                     "bots-open-chat",
-                                    if self.opening_chat {
-                                        text::OPENING_CHAT.get()
-                                    } else {
-                                        text::OPEN_CHAT.get()
-                                    },
+                                    text::OPEN_CHAT.get(),
+                                    text::OPENING_CHAT.get(),
+                                    self.chats.opening,
                                 )
+                                .small()
+                                .primary()
                                 .debug_selector(|| "bots-open-chat".into())
-                                .disabled(self.opening_chat)
+                                .disabled(self.chats.opening || paused)
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.start_bot_chat(bot_id_chat.clone(), cx);
+                                    },
+                                )),
+                                "bots-open-chat",
+                                text::OPEN_CHAT_PAUSED_TOOLTIP.get(),
+                            ))
+                            .child(
+                                ui::secondary(
+                                    "bots-chats-toggle",
+                                    text::CHAT_TOGGLE_BTN
+                                        .format(&[("n", &bot_session_count.to_string())]),
+                                )
+                                .debug_selector(|| "bots-chats-toggle".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.chats.expanded = !this.chats.expanded;
+                                        cx.notify();
                                     },
                                 )),
                             )
@@ -1134,6 +2218,9 @@ impl View {
                             )),
                     ),
             )
+            .when(self.chats.expanded, |d| {
+                d.child(self.render_chats_panel(bot, p, cx))
+            })
             .child(ui::segmented_control(
                 p,
                 tabs.into_iter().map(|(tab, id, label)| {
@@ -1157,8 +2244,26 @@ impl View {
     }
 }
 
+struct DetailBundle {
+    items_res: Result<Vec<BotItem>, String>,
+    soul_res: Result<Option<String>, String>,
+    memory_res: Result<Option<String>, String>,
+    statuses_res: Result<Vec<BotConnectorStatus>, String>,
+    access_res: Result<Vec<BotAccessRequest>, String>,
+    relay_res: Result<Option<krill_proto::bots::BotToolRelayStatus>, String>,
+    sessions_res: Result<Option<Vec<BotSessionSummary>>, String>,
+    suggestions_res: Result<Option<Vec<krill_proto::bots::BotSuggestion>>, String>,
+    history_res: Result<Option<Vec<krill_proto::bots::BotMemoryHistoryEntry>>, String>,
+    tidy_status_res: Result<Option<krill_proto::bots::BotMemoryTidyStatus>, String>,
+    topics_res: Result<Option<Vec<krill_proto::bots::BotMemoryTopicInfo>>, String>,
+    tracker_res: Result<Option<krill_proto::bots::DefaultTrackerBots>, String>,
+    composio_res: Result<Option<Vec<krill_proto::bots::ComposioConnectionInfo>>, String>,
+    avatar_img: Option<std::sync::Arc<gpui::Image>>,
+}
+
 impl Render for View {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window_handle = Some(window.window_handle());
         let p = ui::palette(cx);
         let lang_changed = self.language != crate::i18n::language();
         self.language = crate::i18n::language();
@@ -1168,12 +2273,70 @@ impl Render for View {
             self.soul_memory.refresh_placeholders(window, cx);
             self.connectors.refresh_placeholders(window, cx);
             self.tools.refresh_placeholders(window, cx);
+            self.import_state.refresh_placeholders(window, cx);
+            self.settings.refresh_placeholders(window, cx);
+            self.groups.refresh_placeholders(window, cx);
         }
+
+        let rem = window.rem_size();
+        let modal = ui::page_modal_size(window.viewport_size());
+        let compact = modal.width < rem * 42.5;
+        let narrow = modal.width < rem * 60.;
+        let rail_width = if narrow {
+            ui::SETTINGS_NAV_WIDTH_NARROW.to_pixels(rem)
+        } else {
+            ui::SETTINGS_NAV_WIDTH
+        };
+
+        let pending_switch_banner = self.pending_switch_bot.clone().map(|target_id| {
+            div().px_5().pt_3().child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.warning.opacity(0.4))
+                    .bg(p.warning.opacity(0.1))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.foreground)
+                            .child(format!(
+                                "{} — {}",
+                                text::DIRTY_LEAVE_TITLE.get(),
+                                text::DIRTY_LEAVE_DESC.get()
+                            )),
+                    )
+                    .child(
+                        ui::controls()
+                            .child(ui::ghost("bots-dirty-cancel", text::CANCEL.get()).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_switch_bot = None;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                ui::primary("bots-dirty-discard", text::DIRTY_DISCARD_BTN.get())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.confirm_select_bot(target_id.clone(), cx);
+                                    })),
+                            ),
+                    ),
+            )
+        });
 
         let selected_bot = self.selected_bot().cloned();
         let right_pane = match self.screen {
             Screen::Create => self.render_create_view(p, window, cx),
             Screen::Import => self.render_import_view(p, window, cx),
+            Screen::Groups => self.render_groups_view(p, window, cx),
             Screen::Detail => {
                 if let Some(bot) = selected_bot {
                     let tab_body = match self.detail_tab {
@@ -1183,6 +2346,7 @@ impl Render for View {
                         DetailTab::ToolsSharing => {
                             self.render_tools_sharing_tab(&bot, p, window, cx)
                         }
+                        DetailTab::Settings => self.render_settings_tab(&bot, p, window, cx),
                     };
                     div()
                         .id("bots-detail-pane")
@@ -1194,10 +2358,11 @@ impl Render for View {
                         .flex()
                         .flex_col()
                         .child(self.render_bot_detail_header(&bot, p, cx))
+                        .children(pending_switch_banner)
                         .children(
-                            self.error.as_ref().map(|err| {
-                                div().px_5().pt_3().child(ui::error_banner(p, err.clone()))
-                            }),
+                            self.error
+                                .clone()
+                                .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
                         .children(self.notice.as_ref().map(|msg| {
                             div().px_5().pt_3().child(
@@ -1251,14 +2416,29 @@ impl Render for View {
                                 )),
                         )
                         .children(
-                            self.error.as_ref().map(|err| {
-                                div().px_5().pt_3().child(ui::error_banner(p, err.clone()))
-                            }),
+                            self.error
+                                .clone()
+                                .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
                         // While the first load runs, an empty pane instead of a "no bots" flash.
                         .when(!self.loading, |d| d.child(Self::render_empty_state(p, cx)))
                 }
             }
+        };
+
+        let layout = if compact {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(self.render_compact_switcher(p, cx))
+                .child(right_pane)
+        } else {
+            div()
+                .size_full()
+                .flex()
+                .child(self.render_left_rail(rail_width, p, cx))
+                .child(right_pane)
         };
 
         ui::modal_focus_scope(
@@ -1275,15 +2455,35 @@ impl Render for View {
                     }
                 }))
                 .size_full()
-                .flex()
                 .bg(p.background)
                 .font_family(ui::FONT_UI)
                 .text_size(ui::TEXT_MD)
                 .text_color(p.foreground)
-                .child(self.render_left_rail(p, cx))
-                .child(right_pane),
+                .child(layout),
             &self.focus,
         )
+    }
+}
+
+/// Clears an `InputState` inside `Ok(...)` completion handlers using the cached window handle.
+pub(super) fn clear_input_on_window(
+    slot: &mut Option<Entity<InputState>>,
+    window_handle: Option<AnyWindowHandle>,
+    cx: &mut gpui::App,
+) {
+    if let Some(input) = slot.as_ref() {
+        if let Some(handle) = window_handle {
+            let input_c = input.clone();
+            if handle
+                .update(cx, |_, window, cx| {
+                    input_c.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        *slot = None;
     }
 }
 
@@ -1296,9 +2496,23 @@ pub(super) fn now_unix_ms() -> u64 {
 
 /// Checks whether an `Option<Entity<InputState>>` is currently composing IME text.
 pub(super) fn opt_input_composing(
-    input: Option<&Entity<gpui_component::input::InputState>>,
+    input: Option<&Entity<InputState>>,
     window: &mut Window,
     app: &mut gpui::App,
 ) -> bool {
     input.is_some_and(|i| crate::jump::entity_input_is_composing(i, window, app))
+}
+
+/// Checks whether an `Option<Entity<TextareaState>>` is currently composing IME text.
+pub(super) fn opt_textarea_composing(
+    input: Option<&Entity<gpui_component::input::TextareaState>>,
+    window: &mut Window,
+    app: &mut gpui::App,
+) -> bool {
+    input.is_some_and(|i| {
+        i.update(app, |state, cx| {
+            state.focus_handle(cx).is_focused(window)
+                && state.marked_text_range(window, cx).is_some()
+        })
+    })
 }

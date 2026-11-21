@@ -630,6 +630,7 @@ pub struct Shell {
     _layout_save_task: Task<()>,
     layout_loading: bool,
     restore_session: Option<(krill_app::hosts::HostId, krill_proto::SessionId)>,
+    pub(super) restore_session_chat: bool,
     restore_workspace: Option<(krill_app::hosts::HostId, PathBuf)>,
     local_generation: u64,
     ssh_generation: u64,
@@ -800,11 +801,12 @@ pub struct Shell {
     pub(super) bots_attention_count: usize,
     /// Rows of the sidebar Bots section, refreshed with the attention badge.
     pub(super) sidebar_bots: Vec<krill_app::bots::SidebarBot>,
-    #[cfg(not(test))]
     bots_badge_task: Option<Task<()>>,
     /// Picks up bots made outside the app (`krill bot new` in a pane) for the sidebar.
     #[cfg(not(test))]
     bots_poll: Option<Task<()>>,
+    #[cfg(test)]
+    pub(super) bot_rpc_override: Option<krill_app::bots::BotRpcCall>,
     modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
@@ -1331,6 +1333,7 @@ impl Shell {
             panel_collapsed,
             layout_loading: path.is_some(),
             restore_session: None,
+            restore_session_chat: false,
             restore_workspace: None,
             path,
             saver: persist::Saver::new(cx),
@@ -1453,10 +1456,11 @@ impl Shell {
             bots_cache: None,
             bots_attention_count: 0,
             sidebar_bots: Vec::new(),
-            #[cfg(not(test))]
             bots_badge_task: None,
             #[cfg(not(test))]
             bots_poll: None,
+            #[cfg(test)]
+            bot_rpc_override: None,
             modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
@@ -1624,8 +1628,13 @@ impl Shell {
                 this.sync(cx);
                 this.reconcile_workspace_sessions(cx);
                 this.sync_diff_workspace(cx);
+                let restore_chat = this.restore_session_chat;
+                this.restore_session_chat = false;
                 if let Some((host, session)) = this.restore_session.take() {
                     this.open_session_on(host, session, cx);
+                    if restore_chat && let Some(pane) = this.layout.focused() {
+                        this.set_pane_chat_view(pane, true, cx);
+                    }
                 }
                 if let Some((host, folder)) = this.restore_workspace.take() {
                     this.open_saved_workspace(host, &folder, cx);
@@ -3357,7 +3366,6 @@ impl Shell {
                 cx,
             );
             self.refresh_ssh_hosts(cx);
-            #[cfg(not(test))]
             self.refresh_bots_badge(cx);
             return;
         }
@@ -3455,6 +3463,7 @@ impl Shell {
             }
             self.sync(cx);
             self.refresh_detached(cx);
+            self.refresh_bots_badge(cx);
         }
         cx.notify();
     }
@@ -6288,6 +6297,7 @@ impl Shell {
     ) {
         if self.layout_loading {
             self.restore_session = Some((host, session));
+            self.restore_session_chat = false;
             return;
         }
         self.dashboard = None;

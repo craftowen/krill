@@ -31,6 +31,12 @@ use crate::session::lock;
 
 /// Minimum interval (ms) between consecutive in-place turn-activity status updates.
 pub const TURN_ACTIVITY_MIN_GAP_MS: u64 = 3_000;
+/// Cooldown (ms) before re-sending duplicate pending-approval notices to the same sender/channel.
+pub const PENDING_NOTICE_COOLDOWN_MS: u64 = 60_000;
+const MAX_HELD_MESSAGES_TOTAL: usize = 256;
+const MAX_HELD_MESSAGES_PER_BOT: usize = 50;
+const MAX_HELD_TEXT_BYTES: usize = 16 * 1024;
+const MAX_TRACKED_LINK_INBOUND_IDS: usize = 2_048;
 
 /// Platform-neutral delivery destination for outbound messages/edits/reactions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +68,23 @@ pub trait PlatformSender: Send + Sync {
     fn send_message(&self, target: &DeliveryTarget, text: &str) -> io::Result<String>;
     fn edit_message(&self, target: &DeliveryTarget, message_id: &str, text: &str)
     -> io::Result<()>;
+    fn split_chunks(&self, text: &str) -> Vec<String> {
+        chunk_text(text, self.max_chunk_chars())
+    }
+    fn send_files(
+        &self,
+        _target: &DeliveryTarget,
+        _files: &[String],
+        _caption: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{} attachment uploads are not supported",
+                self.source().as_str()
+            ),
+        ))
+    }
     fn add_reaction(
         &self,
         _target: &DeliveryTarget,
@@ -115,18 +138,30 @@ impl GateCallbackOutcome {
 struct ActiveTurnState {
     source: ExternalSource,
     target: DeliveryTarget,
+    last_inbound_message_id: Option<String>,
     status_message_id: Option<String>,
     last_activity_at_ms: Option<u64>,
     last_activity_text: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct HeldInboundMessage {
+    msg: InboundExternalMessage,
+    target: DeliveryTarget,
+    created_at_ms: u64,
+}
+
 type SenderMap = BTreeMap<(BotId, ExternalSource), Arc<dyn PlatformSender>>;
+type ThrottleKey = (BotId, ExternalSource, String, String);
 
 /// Shared conversation router coordinating allowlists, throttled status edits, and replies.
 pub struct ConversationRouter {
     bridge: Arc<dyn ConnectorBridge>,
     senders: Arc<Mutex<SenderMap>>,
     active_turns: Mutex<BTreeMap<(BotId, SessionId), ActiveTurnState>>,
+    link_last_inbound: Mutex<BTreeMap<String, String>>,
+    pending_notice_throttle: Mutex<BTreeMap<ThrottleKey, u64>>,
+    held_messages: Mutex<BTreeMap<String, HeldInboundMessage>>,
 }
 
 impl std::fmt::Debug for ConversationRouter {
@@ -147,6 +182,9 @@ impl ConversationRouter {
             bridge,
             senders: Arc::new(Mutex::new(BTreeMap::new())),
             active_turns: Mutex::new(BTreeMap::new()),
+            link_last_inbound: Mutex::new(BTreeMap::new()),
+            pending_notice_throttle: Mutex::new(BTreeMap::new()),
+            held_messages: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -166,6 +204,9 @@ impl ConversationRouter {
     pub fn clear_all(&self) {
         lock(&self.senders).clear();
         lock(&self.active_turns).clear();
+        lock(&self.link_last_inbound).clear();
+        lock(&self.pending_notice_throttle).clear();
+        lock(&self.held_messages).clear();
     }
 
     #[must_use]
@@ -184,27 +225,85 @@ impl ConversationRouter {
         target: DeliveryTarget,
         sender: &dyn PlatformSender,
     ) -> InboundRouteOutcome {
+        self.handle_inbound_message_at(msg, target, sender, now_ms())
+    }
+
+    /// Deterministic-clock version of [`Self::handle_inbound_message`] for testing throttling/replay.
+    pub fn handle_inbound_message_at(
+        &self,
+        msg: InboundExternalMessage,
+        target: DeliveryTarget,
+        sender: &dyn PlatformSender,
+        ts_ms: u64,
+    ) -> InboundRouteOutcome {
         let Some(bot) = self.bridge.get_bot_config(&msg.bot_id) else {
             return InboundRouteOutcome::Error(BotErrorCategory::NotSetUp);
         };
         if bot.paused {
             return InboundRouteOutcome::Paused;
         }
+        if !passes_independent_channel_gate(
+            &bot,
+            msg.source,
+            msg.workspace_id.as_deref(),
+            &msg.channel_id,
+        ) {
+            return InboundRouteOutcome::Denied;
+        }
 
-        match self.bridge.check_or_request_access(
+        let user_gate_denied = !passes_independent_user_gate(
+            &bot,
+            msg.source,
+            msg.workspace_id.as_deref(),
+            &msg.sender_id,
+        );
+        let bypass_possible = has_channel_or_bypass_overlap(&bot, msg.source);
+
+        match self.bridge.check_or_request_access_with_workspace(
             &msg.bot_id,
             msg.source,
+            msg.workspace_id.as_deref(),
             &msg.sender_id,
             &msg.sender_name,
             &msg.channel_id,
         ) {
-            Ok(AccessDecision::Allowed) => {}
+            Ok(AccessDecision::Allowed) => {
+                if user_gate_denied && bypass_possible {
+                    let notice = "You do not have access to this bot. Contact the bot owner if you need access.";
+                    send_chunked(sender, &target, notice).ok();
+                    return InboundRouteOutcome::Denied;
+                }
+            }
             Ok(AccessDecision::Pending(req)) => {
-                let notice = format!(
-                    "Access approval is required before messaging {}. Ask the owner to approve request token `{}` in Krill (or run `krill bot access approve {}`).",
-                    bot.name, req.token, req.token
+                self.record_held_message(&req.token, &msg, &target, ts_ms);
+                let throttle_key = (
+                    msg.bot_id.clone(),
+                    msg.source,
+                    msg.sender_id.clone(),
+                    msg.channel_id.clone(),
                 );
-                send_chunked(sender, &target, &notice).ok();
+                let should_notify = {
+                    let mut map = lock(&self.pending_notice_throttle);
+                    match map.get(&throttle_key).copied() {
+                        Some(last) if ts_ms.saturating_sub(last) < PENDING_NOTICE_COOLDOWN_MS => {
+                            false
+                        }
+                        _ => {
+                            if map.len() > 2_048 {
+                                map.clear();
+                            }
+                            map.insert(throttle_key, ts_ms);
+                            true
+                        }
+                    }
+                };
+                if should_notify {
+                    let notice = format!(
+                        "Access approval is required before messaging {}. Ask the owner to approve request token `{}` in Krill (or run `krill bot access approve {}`).",
+                        bot.name, req.token, req.token
+                    );
+                    send_chunked(sender, &target, &notice).ok();
+                }
                 return InboundRouteOutcome::PendingAccess(req);
             }
             Ok(AccessDecision::Denied(_)) => {
@@ -223,6 +322,118 @@ impl ConversationRouter {
             }
         }
 
+        self.dispatch_allowed_message(
+            msg,
+            target,
+            Some(sender),
+            &bot.name,
+            bot.notifications.could_not_finish,
+        )
+    }
+
+    fn record_held_message(
+        &self,
+        token: &str,
+        msg: &InboundExternalMessage,
+        target: &DeliveryTarget,
+        ts_ms: u64,
+    ) {
+        let mut held_msg = msg.clone();
+        if held_msg.text.len() > MAX_HELD_TEXT_BYTES {
+            let mut end = MAX_HELD_TEXT_BYTES;
+            while end > 0 && !held_msg.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            held_msg.text.truncate(end);
+        }
+        let mut map = lock(&self.held_messages);
+        let per_bot_count = map.values().filter(|h| h.msg.bot_id == msg.bot_id).count();
+        if !map.contains_key(token)
+            && per_bot_count >= MAX_HELD_MESSAGES_PER_BOT
+            && let Some(oldest_key) = map
+                .iter()
+                .filter(|(_, h)| h.msg.bot_id == msg.bot_id)
+                .min_by_key(|(_, h)| h.created_at_ms)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest_key);
+        }
+        if map.len() >= MAX_HELD_MESSAGES_TOTAL
+            && !map.contains_key(token)
+            && let Some(oldest_global) = map
+                .iter()
+                .min_by_key(|(_, h)| h.created_at_ms)
+                .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest_global);
+        }
+        map.insert(
+            token.to_owned(),
+            HeldInboundMessage {
+                msg: held_msg,
+                target: target.clone(),
+                created_at_ms: ts_ms,
+            },
+        );
+    }
+
+    /// Sends an approval notice and replays the sender's last blocked inbound message once.
+    pub fn on_access_approved(&self, req: &BotAccessRequest) {
+        let held = lock(&self.held_messages).remove(&req.token);
+        lock(&self.pending_notice_throttle).remove(&(
+            req.bot_id.clone(),
+            req.source,
+            req.sender_id.clone(),
+            req.channel_id.clone(),
+        ));
+        let Some(bot) = self.bridge.get_bot_config(&req.bot_id) else {
+            return;
+        };
+        if bot.paused {
+            return;
+        }
+        let sender_opt = self.sender_for(&req.bot_id, req.source);
+        let target = held.as_ref().map_or_else(
+            || DeliveryTarget {
+                source: req.source,
+                workspace_id: None,
+                channel_id: req.channel_id.clone(),
+                thread_id: None,
+                reply_to_message_id: None,
+            },
+            |h| h.target.clone(),
+        );
+        if let Some(ref sender) = sender_opt {
+            let notice = format!(
+                "Access approved! Processing your request for {} now.",
+                bot.name
+            );
+            send_chunked(sender.as_ref(), &target, &notice).ok();
+        }
+        if let Some(held) = held {
+            self.dispatch_allowed_message(
+                held.msg,
+                held.target,
+                sender_opt.as_deref(),
+                &bot.name,
+                bot.notifications.could_not_finish,
+            );
+        }
+    }
+
+    /// Drops any held message associated with a denied/expired access request token.
+    pub fn discard_held_message(&self, token: &str) {
+        lock(&self.held_messages).remove(token);
+    }
+
+    fn dispatch_allowed_message(
+        &self,
+        msg: InboundExternalMessage,
+        target: DeliveryTarget,
+        sender: Option<&dyn PlatformSender>,
+        bot_name: &str,
+        notify_could_not_finish: bool,
+    ) -> InboundRouteOutcome {
         // Ensure conversation link exists before dispatch.
         if let Err(err) = self.bridge.lookup_or_create_link(
             &msg.bot_id,
@@ -233,22 +444,34 @@ impl ConversationRouter {
             msg.acts_for.clone(),
         ) {
             let category = classify_error(&err.to_string());
-            if bot.notifications.could_not_finish {
-                let safe = user_safe_error_message(category, &bot.name);
-                send_chunked(sender, &target, &safe).ok();
+            if notify_could_not_finish && let Some(s) = sender {
+                let safe = user_safe_error_message(category, bot_name);
+                send_chunked(s, &target, &safe).ok();
             }
             return InboundRouteOutcome::Error(category);
         }
 
         let bot_id = msg.bot_id.clone();
         let source = msg.source;
+        let inbound_msg_id = msg.external_message_id.clone();
         match self.bridge.dispatch_external_message(msg) {
             Ok(outcome) => {
+                if let Some(ref ext_id) = inbound_msg_id {
+                    let mut links = lock(&self.link_last_inbound);
+                    if links.len() >= MAX_TRACKED_LINK_INBOUND_IDS
+                        && !links.contains_key(&outcome.link.id)
+                        && let Some(first_key) = links.keys().next().cloned()
+                    {
+                        links.remove(&first_key);
+                    }
+                    links.insert(outcome.link.id.clone(), ext_id.clone());
+                }
                 lock(&self.active_turns).insert(
                     (bot_id, outcome.session_id),
                     ActiveTurnState {
                         source,
                         target,
+                        last_inbound_message_id: inbound_msg_id,
                         status_message_id: None,
                         last_activity_at_ms: None,
                         last_activity_text: None,
@@ -258,9 +481,9 @@ impl ConversationRouter {
             }
             Err(err) => {
                 let category = classify_error(&err.to_string());
-                if bot.notifications.could_not_finish {
-                    let safe = user_safe_error_message(category, &bot.name);
-                    send_chunked(sender, &target, &safe).ok();
+                if notify_could_not_finish && let Some(s) = sender {
+                    let safe = user_safe_error_message(category, bot_name);
+                    send_chunked(s, &target, &safe).ok();
                 }
                 InboundRouteOutcome::Error(category)
             }
@@ -415,6 +638,7 @@ impl ConversationRouter {
                     "failed posting final turn reply"
                 );
             }
+            let _ = &turn.last_inbound_message_id;
             return;
         }
 
@@ -438,13 +662,21 @@ impl ConversationRouter {
     }
 
     /// Posts an explicit reply (`krill bot reply` / `BotRpcRequest::PostBotReply`).
+    /// Fails closed (`NotFound`) when no matching external conversation link exists,
+    /// propagates `add_reaction` errors and missing targets, and sends `--file` attachments.
     pub fn post_reply(
         &self,
         link: Option<&ExternalConversationLink>,
         reply: &OutboundBotReply,
     ) -> io::Result<Option<String>> {
         let Some(link) = link else {
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no external conversation link found for bot '{}'",
+                    reply.bot_id.as_str()
+                ),
+            ));
         };
         let Some(sender) = self.sender_for(&reply.bot_id, link.source) else {
             return Err(io::Error::new(
@@ -455,18 +687,50 @@ impl ConversationRouter {
                 ),
             ));
         };
-        let target = DeliveryTarget::from_link(link);
-        if let Some(ref reaction) = reply.reaction
-            && let Some(ref msg_id) = link.thread_id
-        {
-            sender.add_reaction(&target, msg_id, reaction).ok();
+        let mut target = DeliveryTarget::from_link(link);
+        let tracked_inbound_id = lock(&self.link_last_inbound).get(&link.id).cloned();
+        if let Some(ref msg_id) = tracked_inbound_id {
+            target.reply_to_message_id = Some(msg_id.clone());
         }
+
+        let mut last_ref: Option<String> = None;
+        if let Some(ref reaction) = reply.reaction {
+            let react_target_id = tracked_inbound_id
+                .or_else(|| link.thread_id.clone())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cannot add reaction: no inbound message_id or thread_id for this conversation link",
+                    )
+                })?;
+            sender.add_reaction(&target, &react_target_id, reaction)?;
+            last_ref = Some(react_target_id);
+        }
+
         let text = reply.text.trim();
-        if text.is_empty() {
-            return Ok(None);
+        if text.is_empty() && reply.files.is_empty() {
+            if reply.reaction.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "reply requires non-empty text, files, or reaction",
+                ));
+            }
+            return Ok(last_ref);
         }
-        let last_id = send_chunked(sender.as_ref(), &target, text)?;
-        Ok(last_id)
+
+        if !text.is_empty()
+            && let Some(msg_id) = send_chunked(sender.as_ref(), &target, text)?
+        {
+            last_ref = Some(msg_id);
+        }
+
+        if !reply.files.is_empty()
+            && let Some(file_id) = sender.send_files(&target, &reply.files, None)?
+        {
+            last_ref = Some(file_id);
+        }
+
+        Ok(last_ref)
     }
 }
 
@@ -476,13 +740,118 @@ pub fn send_chunked(
     target: &DeliveryTarget,
     text: &str,
 ) -> io::Result<Option<String>> {
-    let chunks = chunk_text(text, sender.max_chunk_chars());
+    let chunks = sender.split_chunks(text);
     let mut last_id = None;
     for chunk in chunks {
         let msg_id = sender.send_message(target, &chunk)?;
         last_id = Some(msg_id);
     }
     Ok(last_id)
+}
+
+fn passes_independent_channel_gate(
+    bot: &krill_proto::bots::BotConfig,
+    source: ExternalSource,
+    workspace_id: Option<&str>,
+    channel_id: &str,
+) -> bool {
+    match source {
+        ExternalSource::Slack => {
+            if bot.connectors.slack.allowed_channel_ids.is_empty() || channel_id.starts_with('D') {
+                return true;
+            }
+            bot.connectors
+                .slack
+                .allowed_channel_ids
+                .iter()
+                .any(|c| c == channel_id)
+        }
+        ExternalSource::Discord => {
+            if workspace_id.is_some()
+                && !bot.connectors.discord.allowed_guild_ids.is_empty()
+                && !workspace_id.is_some_and(|gid| {
+                    bot.connectors
+                        .discord
+                        .allowed_guild_ids
+                        .iter()
+                        .any(|g| g == gid)
+                })
+            {
+                return false;
+            }
+            if workspace_id.is_some() && !bot.connectors.discord.allowed_channel_ids.is_empty() {
+                return bot
+                    .connectors
+                    .discord
+                    .allowed_channel_ids
+                    .iter()
+                    .any(|c| c == channel_id);
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn is_bot_member(
+    bot: &krill_proto::bots::BotConfig,
+    source: ExternalSource,
+    workspace_id: Option<&str>,
+    sender_id: &str,
+) -> bool {
+    bot.members.iter().any(|m| {
+        m.source == source
+            && m.id == sender_id
+            && match (&m.workspace_id, workspace_id) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => true,
+            }
+    })
+}
+
+fn passes_independent_user_gate(
+    bot: &krill_proto::bots::BotConfig,
+    source: ExternalSource,
+    workspace_id: Option<&str>,
+    sender_id: &str,
+) -> bool {
+    if is_bot_member(bot, source, workspace_id, sender_id) {
+        return true;
+    }
+    match source {
+        ExternalSource::Slack => {
+            bot.connectors.slack.acts_for == krill_proto::bots::ActsFor::Anyone
+                || bot.connectors.slack.allowed_user_ids.is_empty()
+                || bot
+                    .connectors
+                    .slack
+                    .allowed_user_ids
+                    .iter()
+                    .any(|u| u == sender_id)
+        }
+        ExternalSource::Discord => {
+            bot.connectors.discord.acts_for == krill_proto::bots::ActsFor::Anyone
+                || bot.connectors.discord.allowed_user_ids.is_empty()
+                || bot
+                    .connectors
+                    .discord
+                    .allowed_user_ids
+                    .iter()
+                    .any(|u| u == sender_id)
+        }
+        _ => true,
+    }
+}
+
+fn has_channel_or_bypass_overlap(
+    bot: &krill_proto::bots::BotConfig,
+    source: ExternalSource,
+) -> bool {
+    match source {
+        ExternalSource::Slack => !bot.connectors.slack.allowed_channel_ids.is_empty(),
+        ExternalSource::Discord => !bot.connectors.discord.allowed_channel_ids.is_empty(),
+        _ => false,
+    }
 }
 
 /// Parses and strictly validates a gate callback payload of the form `gate:<gate_id>:<decision>`.
@@ -554,6 +923,73 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
         let rest = remaining.get(split_at..).unwrap_or_default().trim_start();
         if rest.len() == remaining.len() {
             // Defensive progress guarantee even if leading whitespace filled the slice.
+            let fallback = remaining.get(..hard_byte).unwrap_or_default();
+            if !fallback.is_empty() {
+                chunks.push(fallback.to_owned());
+            }
+            remaining = remaining.get(hard_byte..).unwrap_or_default().trim_start();
+        } else {
+            remaining = rest;
+        }
+    }
+    chunks
+}
+
+/// Splits UTF-8 `text` into chunks whose UTF-16 code-unit length never exceeds `max_utf16_units`
+/// (required by Telegram Bot API's 4,096 UTF-16 code-unit message cap).
+#[must_use]
+pub fn chunk_text_utf16(text: &str, max_utf16_units: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let limit = max_utf16_units.max(2);
+    if trimmed.encode_utf16().count() <= limit {
+        return vec![trimmed.to_owned()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = trimmed;
+    while !remaining.is_empty() {
+        if remaining.encode_utf16().count() <= limit {
+            chunks.push(remaining.to_owned());
+            break;
+        }
+        let mut u16_count = 0usize;
+        let mut hard_byte = 0usize;
+        for (idx, ch) in remaining.char_indices() {
+            let w = ch.len_utf16();
+            if u16_count.saturating_add(w) > limit {
+                break;
+            }
+            u16_count = u16_count.saturating_add(w);
+            hard_byte = idx.saturating_add(ch.len_utf8());
+        }
+        if hard_byte == 0 {
+            if let Some(first) = remaining.chars().next() {
+                hard_byte = first.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let window = remaining.get(..hard_byte).unwrap_or(remaining);
+        let min_break = hard_byte / 2;
+        let split_at = window
+            .rfind("\n\n")
+            .filter(|&pos| pos >= min_break)
+            .or_else(|| window.rfind('\n').filter(|&pos| pos >= min_break))
+            .or_else(|| {
+                window
+                    .rfind(char::is_whitespace)
+                    .filter(|&pos| pos >= min_break)
+            })
+            .unwrap_or(hard_byte);
+        let piece = remaining.get(..split_at).unwrap_or_default().trim_end();
+        if !piece.is_empty() {
+            chunks.push(piece.to_owned());
+        }
+        let rest = remaining.get(split_at..).unwrap_or_default().trim_start();
+        if rest.len() == remaining.len() {
             let fallback = remaining.get(..hard_byte).unwrap_or_default();
             if !fallback.is_empty() {
                 chunks.push(fallback.to_owned());
@@ -649,12 +1085,22 @@ pub fn sanitize_error_for_status(raw: &str) -> String {
     let lower = trimmed.to_ascii_lowercase();
     if lower.contains("/bot")
         || lower.contains("xoxb-")
+        || lower.contains("xoxp-")
+        || lower.contains("xoxe-")
         || lower.contains("xapp-")
+        || lower.contains("ghp_")
+        || lower.contains("gho_")
+        || lower.contains("ghs_")
+        || lower.contains("ghu_")
+        || lower.contains("lin_api_")
+        || lower.contains("ya29.")
+        || lower.contains("1//")
         || lower.contains("bearer ")
         || lower.contains("authorization")
         || lower.contains("/users/")
         || lower.contains("/home/")
         || lower.contains(":\\")
+        || contains_raw_telegram_token(trimmed)
     {
         return match classify_error(trimmed) {
             BotErrorCategory::SignedOut => "authentication failed".to_owned(),
@@ -665,6 +1111,26 @@ pub fn sanitize_error_for_status(raw: &str) -> String {
         };
     }
     truncate_chars(trimmed, 180)
+}
+
+fn contains_raw_telegram_token(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b != b':' {
+            continue;
+        }
+        let left = bytes.get(..idx).unwrap_or_default();
+        let digits_left = left.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+        let right = bytes.get(idx.saturating_add(1)..).unwrap_or_default();
+        let tok_right = right
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(**c, b'-' | b'_'))
+            .count();
+        if digits_left >= 5 && tok_right >= 35 {
+            return true;
+        }
+    }
+    false
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -992,5 +1458,221 @@ mod tests {
         );
         assert!(!sanitized.contains("SECRET"));
         assert!(!sanitized.contains("/bot"));
+
+        for secret in [
+            "xoxp-12345-secret failed 401",
+            "xoxe.xoxp-secret-token",
+            "token ghp_abc1234567890 failed",
+            "gho_oauth999 error",
+            "lin_api_xyz123 unauthorized",
+            "ya29.a0AfB_secret error",
+            "refresh 1//0gSecretRefresh failed",
+            "bad 123456789:AAHsecretTokenValueWithOverThirtyFiveCharsHere",
+        ] {
+            let red = sanitize_error_for_status(secret);
+            assert!(
+                !red.contains("secret") && !red.contains("Secret") && !red.contains("AAH"),
+                "{red}"
+            );
+        }
+    }
+
+    #[test]
+    fn fail_closed_reply_attachments_reactions_utf16_chunks_and_access_replay_work() {
+        #[derive(Default)]
+        struct FullMockSender {
+            sent: Mutex<Vec<String>>,
+            files: Mutex<Vec<Vec<String>>>,
+            reactions: Mutex<Vec<(String, String)>>,
+            fail_reaction: Mutex<bool>,
+        }
+        impl PlatformSender for FullMockSender {
+            fn source(&self) -> ExternalSource {
+                ExternalSource::Telegram
+            }
+            fn max_chunk_chars(&self) -> usize {
+                4096
+            }
+            fn send_message(&self, _target: &DeliveryTarget, text: &str) -> io::Result<String> {
+                lock(&self.sent).push(text.to_owned());
+                Ok("sent-1".to_owned())
+            }
+            fn edit_message(&self, _t: &DeliveryTarget, _id: &str, _txt: &str) -> io::Result<()> {
+                Ok(())
+            }
+            fn send_files(
+                &self,
+                _target: &DeliveryTarget,
+                files: &[String],
+                _caption: Option<&str>,
+            ) -> io::Result<Option<String>> {
+                lock(&self.files).push(files.to_vec());
+                Ok(Some("file-1".to_owned()))
+            }
+            fn add_reaction(
+                &self,
+                _target: &DeliveryTarget,
+                message_id: &str,
+                reaction: &str,
+            ) -> io::Result<()> {
+                if *lock(&self.fail_reaction) {
+                    return Err(io::Error::other("reaction HTTP 400"));
+                }
+                lock(&self.reactions).push((message_id.to_owned(), reaction.to_owned()));
+                Ok(())
+            }
+        }
+
+        let bot_id = BotId::new("router-replay").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "ReplayBot", "claude", 1_000).unwrap();
+        let bridge = Arc::new(MockBridge {
+            bot: Mutex::new(bot),
+            decision: Mutex::new(AccessDecision::Pending(BotAccessRequest {
+                token: "tok-1".to_owned(),
+                bot_id: bot_id.clone(),
+                source: ExternalSource::Telegram,
+                sender_id: "u-9".to_owned(),
+                sender_name: "Bob".to_owned(),
+                channel_id: "chat-9".to_owned(),
+                status: BotAccessRequestStatus::Pending,
+                created_at: 100,
+                decided_at: None,
+            })),
+            dispatched: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+        });
+        let router = ConversationRouter::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+        let sender = Arc::new(FullMockSender::default());
+        router.register_sender(
+            bot_id.clone(),
+            ExternalSource::Telegram,
+            Arc::clone(&sender) as Arc<dyn PlatformSender>,
+        );
+
+        // Fail closed when link is None.
+        let missing_err = router
+            .post_reply(
+                None,
+                &OutboundBotReply {
+                    bot_id: bot_id.clone(),
+                    link_id: None,
+                    text: "hi".to_owned(),
+                    files: Vec::new(),
+                    reaction: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(missing_err.kind(), io::ErrorKind::NotFound);
+
+        let target = DeliveryTarget {
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "chat-9".to_owned(),
+            thread_id: None,
+            reply_to_message_id: Some("msg-100".to_owned()),
+        };
+
+        // Pending throttling: burst within 60s sends notice only once, holds latest message.
+        let m1 = InboundExternalMessage {
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "chat-9".to_owned(),
+            thread_id: None,
+            sender_id: "u-9".to_owned(),
+            sender_name: "Bob".to_owned(),
+            text: "first blocked".to_owned(),
+            attachments: Vec::new(),
+            external_message_id: Some("msg-100".to_owned()),
+            acts_for: ActsFor::Anyone,
+        };
+        let mut m2 = m1.clone();
+        m2.text = "second blocked".to_owned();
+        m2.external_message_id = Some("msg-101".to_owned());
+
+        assert!(matches!(
+            router.handle_inbound_message_at(m1, target.clone(), sender.as_ref(), 10_000),
+            InboundRouteOutcome::PendingAccess(_)
+        ));
+        assert!(matches!(
+            router.handle_inbound_message_at(m2, target, sender.as_ref(), 20_000),
+            InboundRouteOutcome::PendingAccess(_)
+        ));
+        assert_eq!(lock(&sender.sent).len(), 1);
+        assert!(lock(&bridge.dispatched).is_empty());
+
+        // Approving replays the held message once and clears it.
+        *lock(&bridge.decision) = AccessDecision::Allowed;
+        let req = BotAccessRequest {
+            token: "tok-1".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            sender_id: "u-9".to_owned(),
+            sender_name: "Bob".to_owned(),
+            channel_id: "chat-9".to_owned(),
+            status: BotAccessRequestStatus::Approved,
+            created_at: 100,
+            decided_at: Some(30_000),
+        };
+        router.on_access_approved(&req);
+        assert_eq!(lock(&bridge.dispatched).len(), 1);
+        assert_eq!(lock(&bridge.dispatched)[0].text, "second blocked");
+
+        // link_last_inbound allows --react + --file when link.thread_id is None!
+        let link = ExternalConversationLink {
+            id: "link-1".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "chat-9".to_owned(),
+            thread_id: None,
+            session_id: Some(SessionId(9)),
+            acts_for: ActsFor::Anyone,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let out = router
+            .post_reply(
+                Some(&link),
+                &OutboundBotReply {
+                    bot_id: bot_id.clone(),
+                    link_id: Some("link-1".to_owned()),
+                    text: String::new(),
+                    files: vec!["/tmp/a.txt".to_owned()],
+                    reaction: Some("👍".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("file-1"));
+        assert_eq!(
+            *lock(&sender.reactions),
+            vec![("msg-101".to_owned(), "👍".to_owned())]
+        );
+        assert_eq!(*lock(&sender.files), vec![vec!["/tmp/a.txt".to_owned()]]);
+
+        // Reaction error propagates!
+        *lock(&sender.fail_reaction) = true;
+        assert!(
+            router
+                .post_reply(
+                    Some(&link),
+                    &OutboundBotReply {
+                        bot_id: bot_id.clone(),
+                        link_id: Some("link-1".to_owned()),
+                        text: "hello".to_owned(),
+                        files: Vec::new(),
+                        reaction: Some("👍".to_owned()),
+                    },
+                )
+                .is_err()
+        );
+
+        // UTF-16 chunking keeps surrogate pairs (2 code units each) within limit.
+        let emojis = "🚀".repeat(5); // 5 chars = 10 UTF-16 code units.
+        let u16_chunks = chunk_text_utf16(&emojis, 4);
+        assert!(u16_chunks.len() >= 3);
+        for c in u16_chunks {
+            assert!(c.encode_utf16().count() <= 4);
+        }
     }
 }

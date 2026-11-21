@@ -8,24 +8,31 @@
 //! `MESSAGE_CREATE`, `INTERACTION_CREATE`). Outbound replies use REST `POST`/`PATCH` with safe
 //! 2,000-character chunking.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use krill_proto::bots::{
-    BotConfig, BotConnectorStatus, BotErrorCategory, BotId, ConnectorHealthState, ExternalSource,
+    BotConfig, BotConnectorStatus, BotConnectorTestResult, BotErrorCategory, BotId,
+    ConnectorHealthState, ExternalSource,
 };
+use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use crate::bots::connectors::policy_for_api_base;
 use crate::bots::connectors::router::{
     ConversationRouter, DeliveryTarget, PlatformSender, classify_error, now_ms,
     sanitize_error_for_status,
 };
 use crate::bots::connectors::ws_client::{WsClient, WsEvent};
 use crate::bots::connectors::{ConnectorBridge, InboundExternalMessage, StopFlag};
-use crate::bots::http_client::{self, HttpMethod, HttpRequest};
+use crate::bots::http_client::{self, HttpMethod, HttpRequest, MultipartField, SsrfPolicy};
+use crate::session::lock;
 
 /// Production Discord REST API v10 base URL.
 pub const DEFAULT_DISCORD_API_BASE: &str = "https://discord.com/api/v10";
@@ -38,6 +45,8 @@ const WORKER_STACK_SIZE: usize = 128 * 1024;
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_POLL_SLICE: Duration = Duration::from_millis(100);
+const MAX_DISCORD_RATE_RETRIES: usize = 2;
+const MAX_OUTBOUND_DISCORD_FILE_BYTES: usize = 25 * 1024 * 1024;
 
 const OP_DISPATCH: u64 = 0;
 const OP_HEARTBEAT: u64 = 1;
@@ -48,10 +57,14 @@ const OP_INVALID_SESSION: u64 = 9;
 const OP_HELLO: u64 = 10;
 const OP_HEARTBEAT_ACK: u64 = 11;
 
+type ChannelMetaCache = Mutex<BTreeMap<String, (Option<u64>, Option<String>)>>;
+
 /// Discord REST API v10 client & [`PlatformSender`] implementation.
 pub struct DiscordSender {
     api_base: String,
     bot_token: Zeroizing<String>,
+    ssrf_policy: SsrfPolicy,
+    channel_cache: ChannelMetaCache,
 }
 
 impl std::fmt::Debug for DiscordSender {
@@ -65,10 +78,32 @@ impl std::fmt::Debug for DiscordSender {
 impl DiscordSender {
     #[must_use]
     pub fn new(api_base: &str, bot_token: Zeroizing<String>) -> Self {
+        let base = api_base.trim_end_matches('/').to_owned();
+        let ssrf_policy = policy_for_api_base(&base);
         Self {
-            api_base: api_base.trim_end_matches('/').to_owned(),
+            api_base: base,
             bot_token,
+            ssrf_policy,
+            channel_cache: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn send_with_rate_limit<F>(mut make_req: F) -> io::Result<http_client::HttpResponse>
+    where
+        F: FnMut() -> io::Result<HttpRequest>,
+    {
+        for attempt in 0..=MAX_DISCORD_RATE_RETRIES {
+            let req = make_req()?;
+            let resp = http_client::send(&req)
+                .map_err(|err| io::Error::new(err.kind(), "Discord REST transport error"))?;
+            if resp.status == 429 && attempt < MAX_DISCORD_RATE_RETRIES {
+                let wait = parse_discord_retry_after(&resp);
+                thread::sleep(wait);
+                continue;
+            }
+            return Ok(resp);
+        }
+        Err(io::Error::other("Discord API retry limit reached"))
     }
 
     fn request_json(
@@ -79,23 +114,30 @@ impl DiscordSender {
         with_auth: bool,
     ) -> io::Result<Value> {
         let url = format!("{}{path}", self.api_base);
-        let mut req = HttpRequest::new(method, url).with_timeout(API_REQUEST_TIMEOUT);
-        if with_auth {
-            req = req.with_header("Authorization", format!("Bot {}", self.bot_token.as_str()));
-        }
-        if let Some(payload) = body {
-            let encoded = serde_json::to_vec(payload).map_err(|_| {
+        let encoded_body = if let Some(payload) = body {
+            Some(serde_json::to_vec(payload).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "failed to encode Discord API payload",
                 )
-            })?;
-            req = req
-                .with_header("Content-Type", "application/json")
-                .with_body(encoded);
-        }
-        let resp = http_client::send(&req)
-            .map_err(|err| io::Error::new(err.kind(), "Discord REST transport error"))?;
+            })?)
+        } else {
+            None
+        };
+        let resp = Self::send_with_rate_limit(|| {
+            let mut req = HttpRequest::new(method, &url)
+                .with_timeout(API_REQUEST_TIMEOUT)
+                .with_ssrf_policy(self.ssrf_policy);
+            if with_auth {
+                req = req.with_header("Authorization", format!("Bot {}", self.bot_token.as_str()));
+            }
+            if let Some(ref bytes) = encoded_body {
+                req = req
+                    .with_header("Content-Type", "application/json")
+                    .with_body(bytes.clone());
+            }
+            Ok(req)
+        })?;
         if resp.is_success() {
             if resp.body.is_empty() {
                 return Ok(Value::Null);
@@ -119,6 +161,33 @@ impl DiscordSender {
         }
     }
 
+    /// Resolves `(channel_type, parent_id)` lazily via cached `GET /channels/{id}`.
+    fn resolve_channel_meta(&self, channel_id: &str) -> (Option<u64>, Option<String>) {
+        if let Some(cached) = lock(&self.channel_cache).get(channel_id).cloned() {
+            return cached;
+        }
+        let path = format!("/channels/{}", http_client::percent_encode(channel_id));
+        let resolved = self
+            .request_json(HttpMethod::Get, &path, None, true)
+            .ok()
+            .map_or((None, None), |val| {
+                let ctype = val.get("type").and_then(Value::as_u64);
+                let parent = val
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                (ctype, parent)
+            });
+        let mut cache = lock(&self.channel_cache);
+        if cache.len() >= 512
+            && let Some(first) = cache.keys().next().cloned()
+        {
+            cache.remove(&first);
+        }
+        cache.insert(channel_id.to_owned(), resolved.clone());
+        resolved
+    }
+
     /// Calls `GET /gateway/bot` to discover the Discord Gateway WebSocket URL.
     pub fn fetch_gateway_url(&self) -> io::Result<String> {
         let parsed = self.request_json(HttpMethod::Get, "/gateway/bot", None, true)?;
@@ -133,6 +202,34 @@ impl DiscordSender {
                     "Discord /gateway/bot omitted url field",
                 )
             })
+    }
+
+    /// Runs an on-demand connectivity check for `TestConnector` via `GET /users/@me`.
+    #[must_use]
+    pub fn test_connection(&self) -> BotConnectorTestResult {
+        match self.request_json(HttpMethod::Get, "/users/@me", None, true) {
+            Ok(user) => {
+                let username = user
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(|u| format!("@{u}"));
+                BotConnectorTestResult {
+                    source: ExternalSource::Discord,
+                    ok: true,
+                    account_label: username.clone(),
+                    detail: format!(
+                        "Connected to Discord ({})",
+                        username.unwrap_or_else(|| "bot ok".to_owned())
+                    ),
+                }
+            }
+            Err(err) => BotConnectorTestResult {
+                source: ExternalSource::Discord,
+                ok: false,
+                account_label: None,
+                detail: sanitize_error_for_status(&err.to_string()),
+            },
+        }
     }
 
     /// Sends an interaction callback response (type 4 `CHANNEL_MESSAGE_WITH_SOURCE`).
@@ -173,7 +270,16 @@ impl PlatformSender for DiscordSender {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&target.channel_id);
         let path = format!("/channels/{channel}/messages");
-        let payload = json!({ "content": text });
+        let mut payload = json!({ "content": text });
+        if let Some(ref reply_id) = target.reply_to_message_id
+            && !reply_id.trim().is_empty()
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert(
+                "message_reference".to_owned(),
+                json!({ "message_id": reply_id, "fail_if_not_exists": false }),
+            );
+        }
         let parsed = self.request_json(HttpMethod::Post, &path, Some(&payload), true)?;
         let id = parsed
             .get("id")
@@ -199,6 +305,132 @@ impl PlatformSender for DiscordSender {
         self.request_json(HttpMethod::Patch, &path, Some(&payload), true)?;
         Ok(())
     }
+
+    fn send_files(
+        &self,
+        target: &DeliveryTarget,
+        files: &[String],
+        caption: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let channel = target
+            .thread_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&target.channel_id);
+        let url = format!("{}/channels/{channel}/messages", self.api_base);
+
+        let mut json_meta = json!({});
+        if let Some(cap) = caption.filter(|c| !c.trim().is_empty())
+            && let Some(obj) = json_meta.as_object_mut()
+        {
+            obj.insert("content".to_owned(), json!(cap));
+        }
+        if let Some(ref reply_id) = target.reply_to_message_id
+            && !reply_id.trim().is_empty()
+            && let Some(obj) = json_meta.as_object_mut()
+        {
+            obj.insert(
+                "message_reference".to_owned(),
+                json!({ "message_id": reply_id, "fail_if_not_exists": false }),
+            );
+        }
+        let payload_bytes = serde_json::to_vec(&json_meta).unwrap_or_else(|_| b"{}".to_vec());
+        let mut fields = vec![MultipartField {
+            name: "payload_json".to_owned(),
+            filename: None,
+            content_type: Some("application/json".to_owned()),
+            data: payload_bytes,
+        }];
+        for (idx, raw_path) in files.iter().enumerate() {
+            let path = Path::new(raw_path);
+            let meta = fs::symlink_metadata(path)?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing non-regular attachment: {raw_path}"),
+                ));
+            }
+            if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_OUTBOUND_DISCORD_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attachment exceeds 25 MiB Discord limit",
+                ));
+            }
+            let data = fs::read(path)?;
+            let fname = path.file_name().map_or_else(
+                || format!("file_{idx}.bin"),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            fields.push(MultipartField {
+                name: format!("files[{idx}]"),
+                filename: Some(fname),
+                content_type: Some("application/octet-stream".to_owned()),
+                data,
+            });
+        }
+        let resp = Self::send_with_rate_limit(|| {
+            Ok(HttpRequest::post_multipart(&url, &fields)?
+                .with_header("Authorization", format!("Bot {}", self.bot_token.as_str()))
+                .with_timeout(API_REQUEST_TIMEOUT)
+                .with_ssrf_policy(self.ssrf_policy))
+        })?;
+        if !resp.is_success() {
+            return Err(io::Error::other(format!(
+                "Discord upload HTTP {}",
+                resp.status
+            )));
+        }
+        let parsed: Value = resp.json().unwrap_or(Value::Null);
+        Ok(parsed
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned))
+    }
+
+    fn add_reaction(
+        &self,
+        target: &DeliveryTarget,
+        message_id: &str,
+        reaction: &str,
+    ) -> io::Result<()> {
+        let emoji = reaction.trim();
+        if emoji.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reaction emoji cannot be empty",
+            ));
+        }
+        let channel = target
+            .thread_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&target.channel_id);
+        let path = format!(
+            "/channels/{channel}/messages/{message_id}/reactions/{}/@me",
+            http_client::percent_encode(emoji)
+        );
+        self.request_json(HttpMethod::Put, &path, None, true)?;
+        Ok(())
+    }
+}
+
+fn parse_discord_retry_after(resp: &http_client::HttpResponse) -> Duration {
+    if let Ok(val) = resp.json::<Value>()
+        && let Some(secs) = val.get("retry_after").and_then(Value::as_f64)
+        && secs.is_finite()
+    {
+        return Duration::from_secs_f64(secs.clamp(0.05, 30.0));
+    }
+    if let Some(raw_hdr) = resp.header("retry-after")
+        && let Ok(secs) = raw_hdr.trim().parse::<f64>()
+        && secs.is_finite()
+    {
+        return Duration::from_secs_f64(secs.clamp(0.05, 30.0));
+    }
+    Duration::from_secs(1)
 }
 
 #[derive(Default)]
@@ -270,7 +502,9 @@ fn run_discord_loop(
     stop: &Arc<StopFlag>,
 ) {
     let mut session = GatewaySession::default();
+    let mut participated_threads: BTreeSet<String> = BTreeSet::new();
     let mut backoff_ms: u64 = 1_000;
+    let mut consecutive_resume_failures: u32 = 0;
 
     while !stop.is_stopped() {
         report_status(
@@ -284,8 +518,8 @@ fn run_discord_loop(
             None,
         );
 
-        let raw_url = if session.can_resume()
-            && let Some(ref resume_url) = session.resume_gateway_url
+        let attempting_resume = session.can_resume() && session.resume_gateway_url.is_some();
+        let raw_url = if attempting_resume && let Some(ref resume_url) = session.resume_gateway_url
         {
             resume_url.clone()
         } else {
@@ -317,11 +551,23 @@ fn run_discord_loop(
         };
 
         let gateway_url = append_gateway_query(&raw_url);
-        let mut ws = match WsClient::connect(&gateway_url, &[], WS_CONNECT_TIMEOUT) {
+        let mut ws = match WsClient::connect_with_policy(
+            &gateway_url,
+            &[],
+            WS_CONNECT_TIMEOUT,
+            sender.ssrf_policy,
+        ) {
             Ok(client) => client,
             Err(err) => {
                 if stop.is_stopped() {
                     break;
+                }
+                if attempting_resume {
+                    consecutive_resume_failures = consecutive_resume_failures.saturating_add(1);
+                    if consecutive_resume_failures >= 2 {
+                        session.clear_resume();
+                        consecutive_resume_failures = 0;
+                    }
                 }
                 let raw = err.to_string();
                 let cat = classify_error(&raw);
@@ -347,7 +593,9 @@ fn run_discord_loop(
         let mut next_heartbeat: Option<Instant> = None;
         let mut awaiting_ack = false;
         let mut immediate_reconnect = false;
+        let mut custom_reconnect_wait: Option<Duration> = None;
         let mut fatal_close = false;
+        let mut resumed_or_ready = false;
 
         while !stop.is_stopped() {
             // Send scheduled heartbeat if due.
@@ -390,7 +638,10 @@ fn run_discord_loop(
                                 .clamp(50, 120_000);
                             let interval = Duration::from_millis(interval_ms);
                             heartbeat_interval = Some(interval);
-                            next_heartbeat = Some(Instant::now() + (interval / 2));
+                            // Jitter initial heartbeat across `[0..interval)` per Discord Gateway v10 spec.
+                            let initial_jitter_ms = discord_random_u64() % interval_ms.max(1);
+                            next_heartbeat =
+                                Some(Instant::now() + Duration::from_millis(initial_jitter_ms));
                             awaiting_ack = false;
 
                             let handshake = if let (Some(sid), Some(seq)) =
@@ -451,7 +702,8 @@ fn run_discord_loop(
                             if !resumable {
                                 session.clear_resume();
                             }
-                            immediate_reconnect = true;
+                            let wait_ms = 1_000 + (discord_random_u64() % 4_001);
+                            custom_reconnect_wait = Some(Duration::from_millis(wait_ms));
                             break;
                         }
                         OP_DISPATCH => {
@@ -466,9 +718,12 @@ fn run_discord_loop(
                                 sender,
                                 bridge,
                                 router,
+                                &mut participated_threads,
                             );
                             if event_name == "READY" || event_name == "RESUMED" {
                                 backoff_ms = 1_000;
+                                consecutive_resume_failures = 0;
+                                resumed_or_ready = true;
                             }
                         }
                         _ => {}
@@ -519,7 +774,18 @@ fn run_discord_loop(
         if stop.is_stopped() || fatal_close {
             break;
         }
-        if !immediate_reconnect {
+        if attempting_resume && !resumed_or_ready {
+            consecutive_resume_failures = consecutive_resume_failures.saturating_add(1);
+            if consecutive_resume_failures >= 2 {
+                session.clear_resume();
+                consecutive_resume_failures = 0;
+            }
+        }
+        if let Some(wait_dur) = custom_reconnect_wait {
+            if stop.wait(wait_dur) {
+                break;
+            }
+        } else if !immediate_reconnect {
             if stop.wait(Duration::from_millis(backoff_ms)) {
                 break;
             }
@@ -541,6 +807,7 @@ fn run_discord_loop(
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "Discord event dispatch context")]
 fn handle_dispatch(
     bot_id: &BotId,
     event_name: &str,
@@ -549,6 +816,7 @@ fn handle_dispatch(
     sender: &Arc<DiscordSender>,
     bridge: &Arc<dyn ConnectorBridge>,
     router: &Arc<ConversationRouter>,
+    participated_threads: &mut BTreeSet<String>,
 ) {
     match event_name {
         "READY" => {
@@ -601,6 +869,7 @@ fn handle_dispatch(
                 sender,
                 bridge,
                 router,
+                participated_threads,
             );
         }
         "INTERACTION_CREATE" => {
@@ -617,6 +886,7 @@ fn handle_message_create(
     sender: &Arc<DiscordSender>,
     bridge: &Arc<dyn ConnectorBridge>,
     router: &Arc<ConversationRouter>,
+    participated_threads: &mut BTreeSet<String>,
 ) {
     let Some(author) = data.get("author") else {
         return;
@@ -653,15 +923,79 @@ fn handle_message_create(
         return;
     }
 
+    let mut channel_type = data.get("channel_type").and_then(Value::as_u64);
+    let mut parent_id = data
+        .get("thread")
+        .and_then(|t| t.get("parent_id"))
+        .or_else(|| data.get("parent_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    if guild_id.is_some() && channel_type.is_none() && parent_id.is_none() {
+        let (fetched_type, fetched_parent) = sender.resolve_channel_meta(channel_id);
+        channel_type = fetched_type;
+        parent_id = fetched_parent;
+    }
+
+    let is_thread = matches!(channel_type, Some(10..=12)) || parent_id.is_some();
+    let gate_channel_id = if is_thread {
+        parent_id.as_deref().unwrap_or(channel_id)
+    } else {
+        channel_id
+    };
+
+    if let Some(ref cfg) = bot_cfg
+        && guild_id.is_some()
+        && !cfg.connectors.discord.allowed_channel_ids.is_empty()
+        && !cfg
+            .connectors
+            .discord
+            .allowed_channel_ids
+            .iter()
+            .any(|allowed| allowed == gate_channel_id || allowed == channel_id)
+    {
+        return;
+    }
+
     let raw_content = data
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let mentions_array_hit = bot_user_id.is_some_and(|uid| {
+        data.get("mentions")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(uid))
+            })
+    });
+    let mentions_text_hit = bot_user_id.is_some_and(|uid| {
+        raw_content.contains(&format!("<@{uid}>")) || raw_content.contains(&format!("<@!{uid}>"))
+    });
+    let mentions_bot = mentions_array_hit || mentions_text_hit;
+
+    if guild_id.is_some() {
+        let in_participated_thread = is_thread && participated_threads.contains(channel_id);
+        if !mentions_bot && !in_participated_thread {
+            return;
+        }
+    }
+
     let cleaned = strip_discord_bot_mention(raw_content, bot_user_id);
     if cleaned.is_empty() {
         return;
     }
 
+    if is_thread {
+        if participated_threads.len() >= 1_024
+            && let Some(first) = participated_threads.iter().next().cloned()
+        {
+            participated_threads.remove(&first);
+        }
+        participated_threads.insert(channel_id.to_owned());
+    }
+
+    let thread_id = is_thread.then(|| channel_id.to_owned());
     let sender_name = author
         .get("global_name")
         .or_else(|| author.get("username"))
@@ -676,16 +1010,16 @@ fn handle_message_create(
     let target = DeliveryTarget {
         source: ExternalSource::Discord,
         workspace_id: guild_id.clone(),
-        channel_id: channel_id.to_owned(),
-        thread_id: None,
+        channel_id: gate_channel_id.to_owned(),
+        thread_id: thread_id.clone(),
         reply_to_message_id: msg_id.clone(),
     };
     let inbound = InboundExternalMessage {
         bot_id: bot_id.clone(),
         source: ExternalSource::Discord,
         workspace_id: guild_id,
-        channel_id: channel_id.to_owned(),
-        thread_id: None,
+        channel_id: gate_channel_id.to_owned(),
+        thread_id,
         sender_id: sender_id.to_owned(),
         sender_name: sender_name.to_owned(),
         text: cleaned,
@@ -756,28 +1090,61 @@ fn handle_interaction_create(
 }
 
 fn append_gateway_query(base: &str) -> String {
-    if base.contains("v=10") {
-        return base.to_owned();
-    }
-    if base.contains('?') {
-        format!("{base}&v=10&encoding=json")
+    let mut out = if base.contains('?') {
+        base.to_owned()
     } else if base.ends_with('/') {
-        format!("{base}?v=10&encoding=json")
+        format!("{base}?")
     } else {
-        format!("{base}/?v=10&encoding=json")
+        format!("{base}/?")
+    };
+    let query = out.split('?').nth(1).unwrap_or_default().to_owned();
+    let mut has_v = false;
+    let mut has_enc = false;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let key = pair.split('=').next().unwrap_or_default();
+        if key == "v" {
+            has_v = true;
+        } else if key == "encoding" {
+            has_enc = true;
+        }
     }
+    if !has_v {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str("v=10");
+    }
+    if !has_enc {
+        if !out.ends_with('?') && !out.ends_with('&') {
+            out.push('&');
+        }
+        out.push_str("encoding=json");
+    }
+    out
 }
 
 fn strip_discord_bot_mention(text: &str, bot_user_id: Option<&str>) -> String {
-    let mut s = text.trim();
+    let mut s = text.trim().to_owned();
     if let Some(uid) = bot_user_id {
-        for prefix in [format!("<@{uid}>"), format!("<@!{uid}>")] {
-            if let Some(rest) = s.strip_prefix(&prefix) {
-                s = rest.trim_start_matches([' ', ':', ',', '-']);
+        for tok in [format!("<@{uid}>"), format!("<@!{uid}>")] {
+            if s.contains(&tok) {
+                s = s.replace(&tok, " ");
             }
         }
     }
-    s.trim().to_owned()
+    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized
+        .trim_start_matches([':', ',', '-'])
+        .trim()
+        .to_owned()
+}
+
+fn discord_random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    if SystemRandom::new().fill(&mut bytes).is_ok() {
+        return u64::from_le_bytes(bytes);
+    }
+    now_ms()
 }
 
 #[expect(
@@ -1074,12 +1441,13 @@ mod tests {
             assert!(target1.contains("v=10&encoding=json"));
             sock1.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
-            // Send Hello with short 120ms heartbeat interval.
+            // Send Hello with a 1500ms heartbeat interval so the initial jittered heartbeat
+            // fires promptly without triggering missed-ACK disconnects under Windows CI jitter.
             write_server_frame(
                 &mut sock1,
                 true,
                 1,
-                br#"{"op":10,"d":{"heartbeat_interval":120}}"#,
+                br#"{"op":10,"d":{"heartbeat_interval":1500}}"#,
             )
             .unwrap();
 
@@ -1164,8 +1532,12 @@ mod tests {
             .to_string();
             write_server_frame(&mut sock1, true, 1, interaction.as_bytes()).unwrap();
 
-            // Wait briefly for client to process dispatch before triggering op 7 Reconnect.
-            thread::sleep(Duration::from_millis(120));
+            // Wait until the client has processed s=4 (INTERACTION_CREATE) and posted the callback
+            // before triggering op 7 Reconnect, avoiding seq=3/4 races under CI scheduling jitter.
+            let wait_deadline = Instant::now() + Duration::from_secs(5);
+            while lock(&ws_state).interactions.is_empty() && Instant::now() < wait_deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
             write_server_frame(&mut sock1, true, 1, br#"{"op":7,"d":null}"#).unwrap();
             drop(sock1);
 
@@ -1247,7 +1619,7 @@ mod tests {
         );
         mgr.reload(None).unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while (lock(&state).resumed.is_empty()
             || lock(&state).interactions.is_empty()
             || lock(&bridge.dispatched).is_empty())
@@ -1294,6 +1666,82 @@ mod tests {
         stop.signal();
         ws_thread.join().unwrap();
         http_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discord_429_retry_query_params_multipart_and_reaction_work() {
+        assert_eq!(
+            append_gateway_query("wss://gateway.discord.gg?v=10"),
+            "wss://gateway.discord.gg?v=10&encoding=json"
+        );
+        assert_eq!(
+            strip_discord_bot_mention("yo <@!900> help", Some("900")),
+            "yo help"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!("krill-dc-w3-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fpath = dir.join("log.txt");
+        std::fs::write(&fpath, b"discord attachment").unwrap();
+
+        let srv = thread::spawn(move || {
+            for idx in 0..4 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let (method, path, _auth, body) = read_http(&mut sock);
+                let (status, resp_body) = if idx == 0 {
+                    (
+                        "429 Too Many Requests",
+                        r#"{"retry_after":0.05}"#.to_owned(),
+                    )
+                } else if idx == 1 {
+                    assert_eq!(method, "GET");
+                    assert_eq!(path, "/users/@me");
+                    ("200 OK", r#"{"id":"900","username":"krill_dc"}"#.to_owned())
+                } else if idx == 2 {
+                    assert_eq!(method, "POST");
+                    assert!(String::from_utf8_lossy(&body).contains("discord attachment"));
+                    ("200 OK", r#"{"id":"dc-file-msg-1"}"#.to_owned())
+                } else {
+                    assert_eq!(method, "PUT");
+                    assert!(path.contains("/reactions/"));
+                    ("204 No Content", String::new())
+                };
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+
+        let sender =
+            DiscordSender::new(&format!("http://{addr}"), Zeroizing::new("tok".to_owned()));
+        let test = sender.test_connection();
+        assert!(test.ok);
+        assert_eq!(test.account_label.as_deref(), Some("@krill_dc"));
+
+        let target = DeliveryTarget {
+            source: ExternalSource::Discord,
+            workspace_id: Some("g-1".to_owned()),
+            channel_id: "ch-1".to_owned(),
+            thread_id: Some("th-9".to_owned()),
+            reply_to_message_id: Some("m-1".to_owned()),
+        };
+        let fid = sender
+            .send_files(
+                &target,
+                &[fpath.to_string_lossy().into_owned()],
+                Some("logs"),
+            )
+            .unwrap();
+        assert_eq!(fid.as_deref(), Some("dc-file-msg-1"));
+        sender.add_reaction(&target, "m-1", "🔥").unwrap();
+
+        srv.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

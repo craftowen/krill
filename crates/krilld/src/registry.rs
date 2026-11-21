@@ -212,6 +212,7 @@ pub struct Registry {
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
     self_ref: OnceLock<std::sync::Weak<Self>>,
     bots: OnceLock<Arc<crate::bots::BotsManager>>,
+    bots_boot_started: OnceLock<()>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
     orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
@@ -302,6 +303,7 @@ impl Registry {
             mobile: OnceLock::new(),
             self_ref: OnceLock::new(),
             bots: OnceLock::new(),
+            bots_boot_started: OnceLock::new(),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
             orch_mail_notified_done: Mutex::default(),
@@ -527,9 +529,45 @@ impl Registry {
     }
 
     /// Binds a weak self-reference so lazy background subsystems (e.g., Bots connectors) can
-    /// upgrade back to this [`Registry`].
+    /// upgrade back to this [`Registry`], and triggers automatic Bot startup recovery if bots
+    /// already exist on disk.
     pub fn bind_self_arc(self: &Arc<Self>) {
         self.self_ref.set(Arc::downgrade(self)).ok();
+        self.maybe_spawn_bot_boot();
+    }
+
+    /// Spawns background Bot startup recovery once if `bots.json` already exists in `state_dir()`.
+    pub(crate) fn maybe_spawn_bot_boot(self: &Arc<Self>) {
+        let Some(dir) = self.state_dir() else {
+            return;
+        };
+        if !crate::bots::store::BotStore::index_exists_at(&dir) {
+            return;
+        }
+        if self.bots_boot_started.set(()).is_err() {
+            return;
+        }
+        let reg = Arc::clone(self);
+        if std::thread::Builder::new()
+            .name("bots-boot".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                crate::alloc::mobile_thread().ok();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Ok(mgr) = reg.bots() {
+                        mgr.boot_recover(&reg);
+                    }
+                }))
+                .is_err()
+                {
+                    tracing::warn!("bot startup recovery panicked");
+                }
+            })
+            .is_err()
+            && let Ok(mgr) = self.bots()
+        {
+            mgr.boot_recover(self);
+        }
     }
 
     /// 재결합 소켓 준비가 끝난 뒤 감시 클라이언트에 holder 상실을 알린다.
@@ -691,7 +729,8 @@ impl Registry {
                 | krill_proto::history::FEAT_HISTORY
                 | krill_proto::theme::FEAT_THEME
                 | krill_proto::usage::FEAT_USAGE
-                | krill_proto::mobile::FEAT_MOBILE)
+                | krill_proto::mobile::FEAT_MOBILE
+                | ipc::FEAT_BOTS)
             == 0
         {
             let app = peer.pid.filter(|_| client.role == ipc::ClientRole::App);
@@ -868,13 +907,22 @@ impl Registry {
         if k == krill_proto::bots::BOT_REQ && n.features & ipc::FEAT_BOTS != 0 {
             use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
             let req = BotRpcRequest::decode(k, &body)?;
-            let reply = if !peer.scope.full() || (role == Role::Observer && !req.is_read_only()) {
+            let is_observer = role == Role::Observer;
+            let reply = if !peer.scope.full() || (is_observer && !req.is_read_only()) {
                 peer.deny("bots", &self.audit);
                 BotRpcResponse::Error("permission denied".to_owned())
             } else {
-                self.on_bot_rpc(req)
+                self.on_bot_rpc_for_peer(&peer, is_observer, req)
             };
-            return s.write_all(&reply.encode()?);
+            let frame = match reply.encode() {
+                Ok(f) => f,
+                Err(krill_proto::ipc::Error::BadLength(bytes)) => {
+                    BotRpcResponse::Error(krill_proto::orchestration::frame_limit_error(bytes))
+                        .encode()?
+                }
+                Err(e) => return Err(e.into()),
+            };
+            return s.write_all(&frame);
         }
         if k != control::kind::REQUEST || n.features & FEAT_CONTROL == 0 {
             return Ok(());
@@ -1059,12 +1107,23 @@ impl Registry {
                     }
                 }
                 Ok(req) if role == Role::Observer && !read_only(&req) => {
+                    if matches!(req, Request::Bot(_)) {
+                        peer.deny("bots", &self.audit);
+                    }
                     Reply::Failed(Failure::Denied)
                 }
                 // 페이지 내용은 이 연결의 협상 기능으로 내려 보내야 하므로 여기서 다룬다.
                 Ok(Request::Orchestration(
                     krill_proto::orchestration::OrchAction::SnapshotPage { generation, offset },
                 )) => self.orchestration_page(&peer, generation, offset, n.features),
+                Ok(Request::Bot(req)) => {
+                    if peer.scope.full() {
+                        Reply::Bot(self.on_bot_rpc_for_peer(&peer, role == Role::Observer, req))
+                    } else {
+                        peer.deny("bots", &self.audit);
+                        Reply::Failed(Failure::Denied)
+                    }
+                }
                 Ok(req) => self.handle_as(&peer, &client.name, req, &mut clients),
                 Err(_) => Reply::Failed(Failure::BadRequest),
             };
@@ -1364,7 +1423,7 @@ impl Registry {
             }
             Request::Bot(req) => {
                 if peer.scope.full() {
-                    Ok(Reply::Bot(self.on_bot_rpc(req)))
+                    Ok(Reply::Bot(self.on_bot_rpc_for_peer(peer, false, req)))
                 } else {
                     peer.deny("bots", &self.audit);
                     Err(Failure::Denied)
@@ -2836,7 +2895,7 @@ impl Registry {
     }
 
     /// 자기 상태 폴더만 쓴다. 폴더 없는 레지스트리(단독 테스트)가 운영 폴더로 넘어가지 않게 기본값으로 폴백하지 않는다.
-    pub(crate) fn state_dir(&self) -> Option<PathBuf> {
+    pub fn state_dir(&self) -> Option<PathBuf> {
         self.dir.clone()
     }
 
@@ -3830,20 +3889,26 @@ impl Registry {
         Ok(self.bots.get_or_init(|| created))
     }
 
-    /// Dispatches a [`krill_proto::bots::BotRpcRequest`] through the lazy [`crate::bots::BotsManager`].
-    fn on_bot_rpc(
+    /// Dispatches a [`krill_proto::bots::BotRpcRequest`] carrying connection peer/observer context.
+    fn on_bot_rpc_for_peer(
         &self,
+        peer: &Peer,
+        is_observer: bool,
         req: krill_proto::bots::BotRpcRequest,
     ) -> krill_proto::bots::BotRpcResponse {
+        let peer_session = match peer.scope {
+            Scope::Session(sid) => Some(sid),
+            Scope::Full | Scope::Restricted => None,
+        };
         match self.bots() {
-            Ok(mgr) => mgr.handle_rpc(self, req),
+            Ok(mgr) => mgr.handle_rpc_for_peer(self, peer_session, is_observer, req),
             Err(msg) => krill_proto::bots::BotRpcResponse::Error(msg),
         }
     }
 
     /// Runs periodic bot tasks (memory tidy, look around, bot cron schedules, lazy poller reconcile)
     /// ONLY if bots already exist on disk or the bots subsystem is already active.
-    pub(crate) fn tick_bots_periodic(&self, dir: &Path, now: SystemTime) {
+    pub fn tick_bots_periodic(&self, dir: &Path, now: SystemTime) {
         if self.bots.get().is_none() && !crate::bots::store::BotStore::index_exists_at(dir) {
             return;
         }
@@ -3855,6 +3920,22 @@ impl Registry {
     /// Returns a [`Tap`] for a live session (internal daemon helper for Bots runtime).
     pub(crate) fn session_tap(&self, id: SessionId) -> Option<Tap> {
         lock(&self.state).sessions.get(&id).map(|e| e.session.tap())
+    }
+
+    /// Returns the OS root PID for `id`, if registered in `Registry`.
+    pub(crate) fn session_pid(&self, id: SessionId) -> Option<u32> {
+        lock(&self.state).sessions.get(&id).map(|e| e.pid)
+    }
+
+    /// Closes/terminates a bot-managed PTY session cleanly.
+    pub(crate) fn kill_bot_session(&self, id: SessionId) -> io::Result<()> {
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        self.close(&peer, id)
+            .map(|_| ())
+            .map_err(|fail| io::Error::other(format!("failed to close bot session: {fail:?}")))
     }
 
     /// Returns `true` if `id` is a live, non-exited session.
@@ -3880,7 +3961,8 @@ impl Registry {
         Self::deliver_input_to_tap(&tap, bytes, submit)
     }
 
-    /// Captures the trailing non-empty plain-text lines from a session's PTY screen (reply fallback).
+    /// Captures the trailing non-empty plain-text lines from a session's PTY screen (reply fallback),
+    /// stripping box-drawing borders and interactive agent TUI status chrome.
     pub(crate) fn capture_session_plain_tail(&self, id: SessionId) -> Option<String> {
         let tap = self.session_tap(id)?;
         let (_, bytes) = tap.capture_cli(control::CaptureFormat::Plain).ok()?;
@@ -3888,7 +3970,10 @@ impl Registry {
         let lines: Vec<&str> = text
             .lines()
             .map(str::trim_end)
-            .filter(|l| !l.trim().is_empty())
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.is_empty() && !is_tui_chrome_line(trimmed)
+            })
             .collect();
         if lines.is_empty() {
             return None;
@@ -3898,7 +3983,8 @@ impl Registry {
         (!joined.trim().is_empty()).then_some(joined)
     }
 
-    /// Launches a bot agent session via normal `holder::Spawn` (untouched!) with bot env vars.
+    /// Launches a bot agent session via normal `holder::Spawn` with bot env vars and optional MCP config.
+    #[expect(clippy::too_many_arguments, reason = "bot agent spawn configuration")]
     pub(crate) fn spawn_bot_agent_session(
         &self,
         agent_id: &str,
@@ -3907,6 +3993,7 @@ impl Registry {
         permission: krill_proto::agent::Permission,
         cwd: &Path,
         extra_env: Vec<(Vec<u8>, Vec<u8>)>,
+        bot_mcp: Option<&crate::agent::BotMcpLaunchConfig>,
     ) -> Result<(SessionId, u32), String> {
         use krill_proto::os::ffi::OsStrExt as _;
         let holder = self
@@ -3935,9 +4022,16 @@ impl Registry {
         let mut cwd_bytes = cwd.as_os_str().as_bytes().to_vec();
         sanitize_spawn_cwd(&mut cwd_bytes);
 
-        let (mut launch, session_id, account) =
-            crate::agent::launch_selected_in(&profile, permission, session, state.as_deref(), None)
-                .map_err(|err| format!("failed to prepare agent launch: {err}"))?;
+        let (mut launch, session_id, account) = crate::agent::launch_selected_in_with_bot_mcp(
+            &profile,
+            permission,
+            session,
+            state.as_deref(),
+            None,
+            Some(cwd),
+            bot_mcp,
+        )
+        .map_err(|err| format!("failed to prepare agent launch: {err}"))?;
         launch.env.extend(extra_env);
         crate::agent::pre_trust_workspace(&profile, &cwd_bytes, account.as_ref());
         let metadata = control::AgentLaunch {
@@ -4885,9 +4979,56 @@ fn record_session_start_failed(
     }
 }
 
+fn is_tui_chrome_line(trimmed: &str) -> bool {
+    let only_box_or_rule = trimmed.chars().all(|c| {
+        matches!(
+            c,
+            '─' | '│'
+                | '╭'
+                | '╮'
+                | '╰'
+                | '╯'
+                | '┌'
+                | '┐'
+                | '└'
+                | '┘'
+                | '├'
+                | '┤'
+                | '┬'
+                | '┴'
+                | '┼'
+                | '═'
+                | '║'
+                | '╔'
+                | '╗'
+                | '╚'
+                | '╝'
+                | '-'
+                | '_'
+                | '='
+                | ' '
+        )
+    });
+    if only_box_or_rule {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("esc to interrupt")
+        || lower.contains("shift+tab to")
+        || lower.contains("ctrl+c to")
+        || lower.contains("% context")
+        || lower == "?"
+        || lower == ">"
+        || lower == "›"
+}
+
 fn oversized_reply(reply: &Reply, bytes: u64) -> Reply {
     if matches!(reply, Reply::Orchestration(_)) {
         Reply::Orchestration(krill_proto::orchestration::OrchResponse::Error(
+            krill_proto::orchestration::frame_limit_error(bytes),
+        ))
+    } else if matches!(reply, Reply::Bot(_)) {
+        Reply::Bot(krill_proto::bots::BotRpcResponse::Error(
             krill_proto::orchestration::frame_limit_error(bytes),
         ))
     } else {

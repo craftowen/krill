@@ -13534,3 +13534,252 @@ fn rebind_after_daemon_upgrade_reconnects_before_wait_responsive() {
     drop(current_daemon);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[gpui::test]
+fn bots_open_session_sets_chat_view_and_tab_sidebar_identity(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bots-tab-identity"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+
+    let bot_id = krill_proto::bots::BotId::new("bot-pr").unwrap();
+    let mut bot_cfg =
+        krill_proto::bots::BotConfig::new(bot_id, "PR Bot", "claude", 1_700_000_000_000).unwrap();
+    bot_cfg.emoji = Some("🤖".to_owned());
+    bot_cfg.avatar_color = Some("#22c55e".to_owned());
+    let meta = krill_app::bots::BotSessionMeta::from_bot(&bot_cfg);
+
+    let bot_sid = SessionId(707);
+    let session = krill_app::sidebar::Session {
+        id: bot_sid,
+        status: krill_proto::control::AgentStatus {
+            state: krill_proto::control::AgentState::Done,
+            agent: "claude".to_owned(),
+            ..krill_proto::control::AgentStatus::UNKNOWN
+        },
+        worktree: None,
+        cwd: None,
+        account: None,
+    };
+
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            shell.sidebar.update(cx, |sb, cx| {
+                sb.register_bot_session(krill_app::hosts::HostId::Local, bot_sid, meta.clone(), cx);
+                let (label, _) = sb.session_label_on(&krill_app::hosts::HostId::Local, &session);
+                assert!(
+                    label.contains("PR Bot"),
+                    "sidebar session label should include bot name, got {label:?}"
+                );
+            });
+            shell.open_session_on(krill_app::hosts::HostId::Local, bot_sid, cx);
+            if let Some(pane) = shell.layout.focused() {
+                shell.set_pane_chat_view(pane, true, cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        let pane = shell.layout.focused().unwrap();
+        assert_eq!(shell.layout.session(pane), Some(bot_sid));
+        assert_eq!(
+            shell.layout.chat_view(pane),
+            Some(true),
+            "opening bot session must activate chat view"
+        );
+    });
+    assert!(cx.debug_bounds("tab-bot-1").is_some());
+    assert!(cx.debug_bounds("tab-bot-color-1").is_some());
+}
+
+#[gpui::test]
+fn bots_deferred_open_session_during_layout_loading_preserves_chat_view(cx: &mut TestAppContext) {
+    let path = state_path("bots-deferred-open");
+    let saved = Layout::default();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    saved.save(&path).unwrap();
+
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
+    });
+
+    let bot_sid = SessionId(808);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut shell = Shell::new(Some(path.clone()), cx);
+        assert!(shell.layout_loading);
+        shell.open_session_on(krill_app::hosts::HostId::Local, bot_sid, cx);
+        shell.restore_session_chat = true;
+        shell
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| s.flush_layout());
+
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        assert!(!shell.layout_loading);
+        let pane = shell.layout.focused().unwrap();
+        assert_eq!(shell.layout.session(pane), Some(bot_sid));
+        assert_eq!(
+            shell.layout.chat_view(pane),
+            Some(true),
+            "deferred OpenSession during layout_loading must preserve chat view"
+        );
+    });
+}
+
+#[gpui::test]
+fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppContext) {
+    use krill_proto::bots::{
+        BotAccessRequest, BotAccessRequestStatus, BotConfig, BotId, BotItem, BotItemStatus,
+        BotRpcRequest, BotRpcResponse, BotSessionSummary, ExternalSource,
+    };
+
+    let (view, cx) = open(cx, state_path("bots-link-up-badge"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    assert!(cx.debug_bounds("nav-bots-badge").is_none());
+
+    let bot_id = BotId::new("bot-badge").unwrap();
+    let mut bot_cfg =
+        BotConfig::new(bot_id.clone(), "Badge Bot", "claude", 1_700_000_000_000).unwrap();
+    bot_cfg.emoji = Some("🔔".to_owned());
+    bot_cfg.avatar_color = Some("#22c55e".to_owned());
+
+    let bot_sid = SessionId(909);
+    let rpc_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rpc_calls_cap = rpc_calls.clone();
+    let extra_needs_you = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let extra_cap = extra_needs_you.clone();
+
+    let mock_rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        rpc_calls_cap.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match req {
+            BotRpcRequest::ListItems { .. } => {
+                let mut items = vec![
+                    BotItem {
+                        uid: "i-1".to_owned(),
+                        number: 1,
+                        owner_bot_id: bot_id.clone(),
+                        title: "Approve deploy".to_owned(),
+                        description: None,
+                        done_means: None,
+                        status: BotItemStatus::NeedsYou,
+                        close_note: None,
+                        links: Vec::new(),
+                        events: Vec::new(),
+                        snoozed_until_ms: None,
+                        version: 1,
+                        last_activity_at_ms: 1_700_000_000_000,
+                        created_at_ms: 1_700_000_000_000,
+                        updated_at_ms: 1_700_000_000_000,
+                        closed_at_ms: None,
+                    },
+                    BotItem {
+                        uid: "i-2".to_owned(),
+                        number: 2,
+                        owner_bot_id: bot_id.clone(),
+                        title: "Completed check".to_owned(),
+                        description: None,
+                        done_means: None,
+                        status: BotItemStatus::Done,
+                        close_note: None,
+                        links: Vec::new(),
+                        events: Vec::new(),
+                        snoozed_until_ms: None,
+                        version: 1,
+                        last_activity_at_ms: 1_700_000_000_000,
+                        created_at_ms: 1_700_000_000_000,
+                        updated_at_ms: 1_700_000_000_000,
+                        closed_at_ms: None,
+                    },
+                ];
+                if extra_cap.load(std::sync::atomic::Ordering::SeqCst) {
+                    items.push(BotItem {
+                        uid: "i-3".to_owned(),
+                        number: 3,
+                        owner_bot_id: bot_id.clone(),
+                        title: "Second approval".to_owned(),
+                        description: None,
+                        done_means: None,
+                        status: BotItemStatus::NeedsYou,
+                        close_note: None,
+                        links: Vec::new(),
+                        events: Vec::new(),
+                        snoozed_until_ms: None,
+                        version: 1,
+                        last_activity_at_ms: 1_700_000_000_000,
+                        created_at_ms: 1_700_000_000_000,
+                        updated_at_ms: 1_700_000_000_000,
+                        closed_at_ms: None,
+                    });
+                }
+                Ok(BotRpcResponse::Items(items))
+            }
+            BotRpcRequest::ListAccessRequests { .. } => {
+                Ok(BotRpcResponse::AccessRequests(vec![BotAccessRequest {
+                    token: "tok-1".to_owned(),
+                    bot_id: bot_id.clone(),
+                    source: ExternalSource::Telegram,
+                    sender_id: "u1".to_owned(),
+                    sender_name: "Bob".to_owned(),
+                    channel_id: "c1".to_owned(),
+                    status: BotAccessRequestStatus::Pending,
+                    created_at: 1_700_000_000_000,
+                    decided_at: None,
+                }]))
+            }
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_cfg.clone()])),
+            BotRpcRequest::ListBotSessions { .. } => {
+                Ok(BotRpcResponse::BotSessions(vec![BotSessionSummary {
+                    session_id: bot_sid,
+                    bot_id: bot_id.clone(),
+                    link_id: None,
+                    pid: 5150,
+                    live: true,
+                    working: false,
+                    label: "Badge session".to_owned(),
+                    created_at_ms: 1_700_000_000_000,
+                }]))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        }
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            shell.bot_rpc_override = Some(mock_rpc);
+            shell.set_link(Link::Up, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        rpc_calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+        "set_link(Link::Up) must invoke bot badge/session RPCs"
+    );
+    assert!(cx.debug_bounds("nav-bots-badge").is_some());
+    cx.update(|_, cx| {
+        let shell = view.read(cx);
+        assert_eq!(shell.bots_attention_count, 2);
+        let meta = shell
+            .sidebar
+            .read(cx)
+            .bot_session_meta_on(&krill_app::hosts::HostId::Local, bot_sid)
+            .expect("bot session metadata must populate on Link::Up");
+        assert_eq!(meta.bot_name, "Badge Bot");
+    });
+
+    // Periodic refresh_bots_badge picks up newly arrived NeedsYou items while Link::Up.
+    extra_needs_you.store(true, std::sync::atomic::Ordering::SeqCst);
+    cx.update(|_, cx| {
+        view.update(cx, Shell::refresh_bots_badge);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).bots_attention_count),
+        3,
+        "refresh_bots_badge must update bots_attention_count when background items arrive"
+    );
+}
