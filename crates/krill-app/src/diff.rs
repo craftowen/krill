@@ -533,6 +533,8 @@ pub struct Panel {
     viewed: std::collections::HashSet<Vec<u8>>,
     /// 셸 메인 창 모드: 선택한 파일의 diff 본문을 패널 대신 화면 가운데에 그린다.
     split_center: bool,
+    /// A bot page draws its own tab bar (Home, Connectors, Chats, Files) above this panel.
+    embedded: bool,
     editing: edit::State,
     checks: checks::State,
     #[cfg(test)]
@@ -620,6 +622,7 @@ impl Panel {
             review: comments::Review::default(),
             viewed: std::collections::HashSet::new(),
             split_center: false,
+            embedded: false,
             editing,
             checks: checks::State::default(),
             #[cfg(test)]
@@ -633,6 +636,25 @@ impl Panel {
     /// 화면 가운데([`Self::render_center_diff`])에 그린다.
     pub fn set_split_center(&mut self, split_center: bool) {
         self.split_center = split_center;
+    }
+
+    /// The folder the panel shows (changes, files and search).
+    #[must_use]
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Hides this panel's tab bar while a bot page shows it as its Files tab.
+    pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        if self.embedded != embedded {
+            self.embedded = embedded;
+            cx.notify();
+        }
+    }
+
+    #[must_use]
+    pub const fn is_embedded(&self) -> bool {
+        self.embedded
     }
 
     /// 가운데에 그릴 선택된 변경 파일이 있는지.
@@ -2278,6 +2300,20 @@ impl Render for Panel {
         }
         let p = crate::ui::palette(cx);
         let top_bar = self.render_top_bar(cx);
+
+        if self.tab == PanelTab::Files && self.embedded {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .min_h_0()
+                .font_family(crate::ui::FONT_UI)
+                .text_size(crate::ui::TEXT_SM)
+                .bg(p.sidebar)
+                .text_color(p.sidebar_foreground)
+                .child(self.render_explorer_pane(window, cx));
+        }
 
         if self.tab == PanelTab::History {
             return div()

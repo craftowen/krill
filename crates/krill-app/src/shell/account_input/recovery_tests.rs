@@ -224,14 +224,20 @@ fn automatic_recovery_keeps_typing_and_enter_then_delivers_once_without_a_toast(
         watch.write_all(&hello.encode().unwrap()).unwrap();
         ipc::read_frame(&mut watch).unwrap().unwrap();
         drop(watch);
-        let (mut connection, _) = listener.accept().unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        connection.write_all(&hello.encode().unwrap()).unwrap();
-        let (kind, body) = ipc::read_frame(&mut connection).unwrap().unwrap();
-        let client = ClientHello::decode(kind, &body).unwrap();
-        let (kind, body) = ipc::read_frame(&mut connection).unwrap().unwrap();
+        // Other app clients (the right panel's git sync probe, capability checks) may connect
+        // and close first; only the connection that carries the account request matters.
+        let (mut connection, client, kind, body) = loop {
+            let (mut connection, _) = listener.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            connection.write_all(&hello.encode().unwrap()).unwrap();
+            let (kind, body) = ipc::read_frame(&mut connection).unwrap().unwrap();
+            let client = ClientHello::decode(kind, &body).unwrap();
+            if let Some((kind, body)) = ipc::read_frame(&mut connection).unwrap() {
+                break (connection, client, kind, body);
+            }
+        };
         assert_eq!(
             UsageRequest::decode(kind, &body).unwrap(),
             UsageRequest::RecoverAccountInput {

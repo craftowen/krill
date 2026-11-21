@@ -43,6 +43,8 @@ mod workspaces;
 // 앱의 마지막 생존 시각 저장.
 mod artifacts;
 mod away;
+mod bot_panel;
+mod bot_section;
 
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
@@ -805,6 +807,8 @@ pub struct Shell {
     pub(super) bots_attention_count: usize,
     /// Rows of the sidebar Bots section, refreshed with the attention badge.
     pub(super) sidebar_bots: Vec<krill_app::bots::SidebarBot>,
+    /// Orca's sidebar Bots section, New bot and templates dialogs.
+    bot_ui: bot_section::BotUi,
     bots_badge_task: Option<Task<()>>,
     /// Picks up bots made outside the app (`krill bot new` in a pane) for the sidebar.
     #[cfg(not(test))]
@@ -1460,6 +1464,7 @@ impl Shell {
             bots_cache: None,
             bots_attention_count: 0,
             sidebar_bots: Vec::new(),
+            bot_ui: bot_section::BotUi::default(),
             bots_badge_task: None,
             #[cfg(not(test))]
             bots_poll: None,
@@ -3213,14 +3218,16 @@ impl Shell {
             return;
         }
         let ws = self.active_workspace(cx);
-        let folder = {
+        // Orca's bot page: the bot folder is the workspace, whatever the chat's cwd says yet.
+        let bot_home = self.focused_bot().and_then(|b| self.bot_folder(b));
+        let folder = bot_home.unwrap_or_else(|| {
             let focused_folder = self.folder();
             if focused_folder.as_os_str().is_empty() {
                 ws.folder
             } else {
                 focused_folder
             }
-        };
+        });
         let target = self.target_for_host(&ws.host);
         self.diff.update(cx, |d, cx| {
             match target {
@@ -6636,7 +6643,8 @@ impl Shell {
     }
 
     fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page_open() {
+        // A bot page has no Changes tab (Orca hides it there).
+        if self.page_open() || self.focused_bot().is_some() {
             return;
         }
         if self.panel_collapsed {
@@ -6666,6 +6674,12 @@ impl Shell {
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
+        // A bot page shows its Files tab in place of the usual panel tabs.
+        let bot_page = self.focused_bot().is_some();
+        let files_tab_hidden = bot_page && self.bot_ui.panel.tab != bot_panel::BotPanelTab::Files;
+        if bot_page {
+            self.bot_ui.panel.tab = bot_panel::BotPanelTab::Files;
+        }
         if self.panel_collapsed {
             self.panel_collapsed = false;
             self.layout.panel_collapsed = false;
@@ -6679,7 +6693,8 @@ impl Shell {
             cx.notify();
             return;
         }
-        if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Files {
+        if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Files && !files_tab_hidden
+        {
             self.panel_collapsed = true;
             self.layout.panel_collapsed = true;
             self.save();
@@ -6695,6 +6710,10 @@ impl Shell {
     }
 
     fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A bot page has no Search tab (Orca hides it there).
+        if !self.page_open() && self.focused_bot().is_some() {
+            return;
+        }
         // OWE-860: 설정에서 ⌘⇧F를 누르면 설정을 닫고 작업공간 검색으로 전환한다.
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
@@ -8138,6 +8157,8 @@ impl Render for Shell {
         self.sync_notifications(window, cx);
         // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
         self.open_pending_overlays(window, cx);
+        self.open_pending_bot_dialogs(window, cx);
+        let bot_dialogs = self.bot_dialogs(window, cx);
         // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
         // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
@@ -8298,6 +8319,13 @@ impl Render for Shell {
                 0.
             },
         );
+        // Orca's bot page: a chat in a bot's folder gets the bot's own right sidebar.
+        let bot_page = self.focused_bot().cloned();
+        self.sync_bot_files_chrome(bot_page.is_some(), cx);
+        let panel_body = match bot_page.filter(|_| show_panel) {
+            Some(bot) => self.render_bot_panel(&bot, panel_width, window, cx),
+            None => self.diff.clone().into_any_element(),
+        };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
 
@@ -8815,6 +8843,8 @@ impl Render for Shell {
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))
                                 .child(self.render_agents(window, cx))
+                                .child(self.render_bots_section(cx))
+                                .child(self.bots_spinner_overlay())
                                 .child(
                                     div().flex_1().min_h_0().child(
                                         self.sidebar
@@ -8875,7 +8905,7 @@ impl Render for Shell {
                                 .flex()
                                 .flex_col()
                                 .bg(sidebar_bg)
-                                .child(div().flex_1().min_h_0().child(self.diff.clone())),
+                                .child(div().flex_1().min_h_0().child(panel_body)),
                         )
                     }),
             )
@@ -8957,6 +8987,7 @@ impl Render for Shell {
             }))
             .children(self.jump.as_ref().map(|(palette, _)| palette.clone()))
             .children(self.add_project.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(bot_dialogs)
             .children(
                 self.continue_session
                     .as_ref()

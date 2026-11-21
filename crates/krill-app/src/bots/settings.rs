@@ -15,12 +15,11 @@ use krill_proto::bots::{
 };
 
 use crate::i18n::catalog::bots as text;
-use crate::layout::TabColor;
 use crate::ui;
 
+use super::avatar;
 use super::rpc::{
-    BOT_AVATAR_COLOR_PALETTE, BOT_EFFORT_OPTIONS, BOT_RUNTIMES, avatar_color_hex, call_checked,
-    decode_png_avatar, effort_label, expect_variant, parse_avatar_color,
+    BOT_EFFORT_OPTIONS, BOT_RUNTIMES, call_checked, decode_png_avatar, effort_label, expect_variant,
 };
 use super::{View, clear_input_on_window, now_unix_ms, opt_input_composing};
 
@@ -36,7 +35,10 @@ pub(super) struct SettingsState {
     pub(super) agent_id: String,
     pub(super) effort: String,
     pub(super) permission_mode: Permission,
-    pub(super) avatar_color: Option<TabColor>,
+    /// Mascot background (`None` = Orca's default Sky). Any stored `#rrggbb` is kept as is.
+    pub(super) avatar_color: Option<u32>,
+    /// What the bot had when the tab loaded, so saving other fields leaves the colour alone.
+    pub(super) avatar_color_loaded: Option<u32>,
     pub(super) notifications: BotNotifications,
     pub(super) schedules: Vec<BotScheduleConfig>,
     pub(super) sched_name_input: Option<Entity<InputState>>,
@@ -52,7 +54,12 @@ impl SettingsState {
         self.agent_id.clone_from(&bot.agent_id);
         self.effort = bot.effort.clone().unwrap_or_default();
         self.permission_mode = bot.permission_mode;
-        self.avatar_color = parse_avatar_color(bot.avatar_color.as_deref());
+        self.avatar_color = bot
+            .avatar_color
+            .as_deref()
+            .and_then(avatar::parse_color)
+            .filter(|c| *c != avatar::DEFAULT_BACKGROUND);
+        self.avatar_color_loaded = self.avatar_color;
         self.notifications = bot.notifications;
         self.schedules.clone_from(&bot.schedules);
         self.needs_sync_from_bot = true;
@@ -232,14 +239,27 @@ impl View {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let refused = |e: avatar::PictureError| e.message().to_owned();
+                    let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+                    if usize::try_from(len).map_or(true, |n| n > avatar::PICTURE_MAX_BYTES) {
+                        return Err(refused(avatar::PictureError::TooBig));
+                    }
+                    let picked = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let bytes = avatar::prepare_picture(&picked).map_err(refused)?;
                     let image = decode_png_avatar(&bytes)?;
-                    let updated = expect_variant(
+                    // krilld answers with the stored picture, not the bot.
+                    expect_variant(
                         &rpc,
                         &BotRpcRequest::UploadBotAvatar {
-                            bot_id: bot_id_bg,
+                            bot_id: bot_id_bg.clone(),
                             png_bytes: bytes,
                         },
+                        |r| matches!(r, BotRpcResponse::BotAvatar(_)).then_some(()),
+                        "BotAvatar",
+                    )?;
+                    let updated = expect_variant(
+                        &rpc,
+                        &BotRpcRequest::GetBot { bot_id: bot_id_bg },
                         |r| match r {
                             BotRpcResponse::Bot(b) => Some(*b),
                             _ => None,
@@ -380,7 +400,8 @@ impl View {
             FieldPatch::Set(self.settings.effort.clone())
         };
         let avatar_color_patch = match self.settings.avatar_color {
-            Some(color) => FieldPatch::Set(avatar_color_hex(color).to_owned()),
+            c if c == self.settings.avatar_color_loaded => FieldPatch::Unchanged,
+            Some(color) => FieldPatch::Set(avatar::format_color(color)),
             None => FieldPatch::Clear,
         };
         let params = UpdateBotParams {
@@ -655,27 +676,33 @@ impl View {
             }),
         );
 
-        let mut color_swatches = div().flex().flex_wrap().items_center().gap_1p5().child(
-            ui::segment(
-                p,
-                "bots-settings-color-none",
-                text::SETTINGS_COLOR_NONE.get(),
-                self.settings.avatar_color.is_none(),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.settings.avatar_color = None;
-                cx.notify();
-            })),
-        );
-        for (idx, (color, _)) in BOT_AVATAR_COLOR_PALETTE.iter().enumerate() {
-            let color = *color;
-            let active = self.settings.avatar_color == Some(color);
+        // Orca's background swatches; a stored colour outside them shows as one more swatch.
+        let current = self
+            .settings
+            .avatar_color
+            .unwrap_or(avatar::DEFAULT_BACKGROUND);
+        let mut swatches: Vec<u32> = ui::BOT_AVATAR_BACKGROUNDS.iter().map(|(c, _)| *c).collect();
+        if !swatches.contains(&current) {
+            swatches.push(current);
+        }
+        let mut color_swatches = div().flex().flex_wrap().items_center().gap_1();
+        for rgb in swatches {
+            let active = rgb == current;
+            let name = ui::BOT_AVATAR_BACKGROUNDS
+                .iter()
+                .find(|(c, _)| *c == rgb)
+                .map_or_else(|| avatar::format_color(rgb), |(_, n)| (*n).to_owned());
             color_swatches = color_swatches.child(
                 div()
-                    .id(("bots-settings-color", idx))
+                    .id(SharedString::from(format!("bots-settings-color-{rgb:06x}")))
+                    .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .aria_label(name)
                     .size(px(20.))
                     .rounded_full()
-                    .bg(ui::tab_tag_color(color))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .border_2()
                     .border_color(if active {
                         p.foreground
@@ -684,9 +711,18 @@ impl View {
                     })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings.avatar_color = Some(color);
+                        this.settings.avatar_color =
+                            (rgb != avatar::DEFAULT_BACKGROUND).then_some(rgb);
                         cx.notify();
-                    })),
+                    }))
+                    .child(
+                        div()
+                            .size(px(14.))
+                            .rounded_full()
+                            .bg(ui::bot_avatar_background(rgb))
+                            .border_1()
+                            .border_color(p.border),
+                    ),
             );
         }
 
@@ -706,11 +742,23 @@ impl View {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_3()
-                    .when_some(avatar_preview, |d, img| {
-                        d.child(gpui::img(img).size(px(40.)).rounded_full().flex_none())
-                    })
+                    // Orca's settings card: the bot's face at 40 px, previewing the picked colour.
+                    .child(avatar::render(
+                        &avatar::Avatar::from_fields(
+                            bot.avatar.as_deref(),
+                            Some(&avatar::format_color(current)),
+                            bot.emoji.as_deref(),
+                            &bot.name,
+                        ),
+                        avatar_preview,
+                        &bot.name,
+                        px(40.),
+                        ui::RADIUS_LG,
+                        p,
+                    ))
                     .child(ui::field_label(text::SETTINGS_AVATAR_LABEL.get(), None, p))
                     .child(
                         ui::secondary(

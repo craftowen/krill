@@ -18,14 +18,12 @@ use krill_proto::bots::{
     generate_slack_socket_mode_manifest,
 };
 
-use crate::layout::TabColor;
-
-use super::create::{ModelChoice, filter_templates};
 use super::items::ItemFilter;
 use super::rpc::{
-    BOT_RUNTIMES, BotRpcCall, avatar_color_hex, format_csv_i64s, format_csv_strings,
-    parse_csv_i64s, parse_csv_strings, runtime_models, sidebar_snapshot,
+    BOT_RUNTIMES, BotRpcCall, format_csv_i64s, format_csv_strings, parse_csv_i64s,
+    parse_csv_strings, runtime_models, sidebar_snapshot,
 };
+use super::templates::filter_templates;
 use super::{BadgeChanged, Close, DetailTab, OpenSession, Screen, View};
 
 #[derive(Default)]
@@ -142,6 +140,7 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 }
                 cfg.description.clone_from(&base.description);
                 cfg.emoji.clone_from(&base.emoji);
+                cfg.avatar.clone_from(&base.avatar);
                 cfg.avatar_color.clone_from(&v2.avatar_color);
                 cfg.model.clone_from(&base.model);
                 cfg.effort.clone_from(&base.effort);
@@ -217,6 +216,18 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 Ok(BotRpcResponse::Deleted {
                     bot_id: bot_id.clone(),
                 })
+            }
+            BotRpcRequest::UploadBotAvatar { bot_id, png_bytes } => {
+                if let Some(b) = st.bots.iter_mut().find(|b| &b.id == bot_id) {
+                    b.avatar = Some("avatar.png".to_owned());
+                }
+                Ok(BotRpcResponse::BotAvatar(
+                    krill_proto::bots::BotAvatarData {
+                        bot_id: bot_id.clone(),
+                        mime: "image/png".to_owned(),
+                        png_bytes: png_bytes.clone(),
+                    },
+                ))
             }
             BotRpcRequest::StartBotSession { bot_id, .. } => {
                 let sid = SessionId(77 + st.sessions.len() as u64);
@@ -869,66 +880,6 @@ fn catalog_helpers_cover_24_templates_6_categories_8_runtimes_and_csv() {
 }
 
 #[gpui::test]
-fn create_view_filters_all_24_templates_and_creates_bot(cx: &mut TestAppContext) {
-    let state = Arc::new(Mutex::new(MockState::default()));
-    let (view, vcx) = open_view(cx, state.clone());
-
-    assert!(vcx.debug_bounds("bots-empty").is_some());
-    let new_btn = vcx.debug_bounds("bots-new-btn").unwrap();
-    vcx.simulate_click(new_btn.center(), Modifiers::default());
-    vcx.run_until_parked();
-
-    assert!(vcx.debug_bounds("bots-create-view").is_some());
-    assert!(vcx.debug_bounds("bots-runtime-picker").is_some());
-    assert!(vcx.debug_bounds("bots-model-picker").is_some());
-    assert!(vcx.debug_bounds("bots-create-pick-folder").is_some());
-    assert!(
-        vcx.debug_bounds("bots-template-pr-review").is_none(),
-        "templates stay folded until asked for"
-    );
-    let toggle = vcx.debug_bounds("bots-create-toggle-templates").unwrap();
-    vcx.simulate_click(toggle.center(), Modifiers::default());
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("bots-template-pr-review").is_some());
-
-    // Filter to Releases category (4 templates)
-    vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.set_template_category(Some(BotTemplateCategory::Releases), cx);
-        });
-    });
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("bots-template-pr-review").is_none());
-
-    // Select all categories, pick PR review template, choose Codex runtime, create
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            v.set_template_category(None, cx);
-            v.select_template(&BUILTIN_BOT_TEMPLATES[0], Some(window), cx);
-            v.set_create_model(ModelChoice::Preset("opus"), cx);
-            v.set_create_runtime("codex", cx);
-            assert_eq!(
-                v.create.model,
-                ModelChoice::Default,
-                "a Claude preset must not follow the bot to Codex"
-            );
-            v.set_create_model(ModelChoice::Preset("gpt-5.4"), cx);
-            v.submit_create_bot(cx);
-        });
-    });
-    vcx.run_until_parked();
-
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert_eq!(v.screen(), Screen::Detail);
-        assert_eq!(v.bots().len(), 1);
-        assert_eq!(v.bots()[0].agent_id, "codex");
-        assert_eq!(v.bots()[0].model.as_deref(), Some("gpt-5.4"));
-        assert_eq!(v.bots()[0].template_id.as_deref(), Some("pr-review"));
-    });
-}
-
-#[gpui::test]
 fn items_inbox_filters_status_snooze_comments_and_open_chat(cx: &mut TestAppContext) {
     let mut mock = MockState::default();
     mock.bots.push(sample_bot("bot-1", "PR Bot"));
@@ -1217,71 +1168,6 @@ fn connectors_slack_manifest_composio_access_and_tools_relay_and_escape(cx: &mut
     vcx.update(|_, cx| view.update(cx, View::handle_escape));
     vcx.run_until_parked();
     assert!(*closed.lock().unwrap());
-}
-
-#[gpui::test]
-fn create_v2_explicit_slug_blank_template_reopen_and_validation(cx: &mut TestAppContext) {
-    let state = Arc::new(Mutex::new(MockState::default()));
-    let (view, vcx) = open_view(cx, state.clone());
-
-    let new_btn = vcx.debug_bounds("bots-new-btn").unwrap();
-    vcx.simulate_click(new_btn.center(), Modifiers::default());
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("bots-create-view").is_some());
-    assert!(vcx.debug_bounds("bots-create-start-blank").is_some());
-
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            v.select_template(&BUILTIN_BOT_TEMPLATES[0], Some(window), cx);
-            v.start_blank_template(window, cx);
-            assert!(v.create.selected_template_id.is_none());
-            if let Some(slug) = &v.create.slug_input {
-                slug.update(cx, |s, cx| s.set_value("Invalid Slug!", window, cx));
-            }
-            if let Some(name) = &v.create.name_input {
-                name.update(cx, |s, cx| s.set_value("Custom Ops", window, cx));
-            }
-            v.submit_create_bot(cx);
-            assert!(v.error.is_some());
-            assert_eq!(v.screen(), Screen::Create);
-
-            if let Some(slug) = &v.create.slug_input {
-                slug.update(cx, |s, cx| s.set_value("custom-ops", window, cx));
-            }
-            v.create.avatar_color = Some(TabColor::Green);
-            v.submit_create_bot(cx);
-        });
-    });
-    vcx.run_until_parked();
-
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert_eq!(v.screen(), Screen::Detail);
-        assert_eq!(v.bots().len(), 1);
-        assert_eq!(v.bots()[0].slug.as_str(), "custom-ops");
-        assert_eq!(
-            v.bots()[0].avatar_color.as_deref(),
-            Some(avatar_color_hex(TabColor::Green))
-        );
-        let name_val = v
-            .create
-            .name_input
-            .as_ref()
-            .map(|i| i.read(cx).value().to_string())
-            .unwrap_or_default();
-        assert!(
-            name_val.is_empty(),
-            "CreateState must clear after Ok submit"
-        );
-
-        view.update(cx, |v, cx| {
-            v.open_create(cx);
-            assert_eq!(v.screen(), Screen::Create);
-            v.reopen(cx);
-        });
-    });
-    vcx.run_until_parked();
-    assert_eq!(view.read_with(vcx, |v, _| v.screen()), Screen::Detail);
 }
 
 #[gpui::test]
@@ -1703,7 +1589,7 @@ fn sidebar_snapshot_counts_attention_per_bot_and_offers_models_per_runtime() {
         sample_item("bot-a", "i2", 2, BotItemStatus::Working),
         sample_item("bot-gone", "i3", 3, BotItemStatus::NeedsYou),
     ];
-    let snap = sidebar_snapshot(&bots, &items, &[]);
+    let snap = sidebar_snapshot(&bots, &items, &[], &[]);
     let names: Vec<_> = snap
         .bots
         .iter()
@@ -1728,116 +1614,81 @@ fn sidebar_snapshot_counts_attention_per_bot_and_offers_models_per_runtime() {
 }
 
 #[gpui::test]
-fn create_form_submits_with_cmd_enter_and_custom_model(cx: &mut TestAppContext) {
+fn new_bot_dialog_saves_the_mascot_and_clears_unchecked_template_skills(cx: &mut TestAppContext) {
     let state = Arc::new(Mutex::new(MockState::default()));
-    let (view, vcx) = open_view(cx, state.clone());
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let tpl = krill_proto::bots::find_bot_template("pr-review").unwrap();
+    assert!(!tpl.skills.is_empty());
+    let (dialog, vcx) = cx.add_window_view(|window, cx| {
+        super::new_bot::NewBot::new(
+            rpc,
+            "My Mac".into(),
+            true,
+            Vec::new(),
+            Some(tpl),
+            window,
+            cx,
+        )
+    });
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| {
-            v.open_create(cx);
-            v.set_create_model(ModelChoice::Custom, cx);
+        dialog.update(cx, |d, cx| {
+            for skill in tpl.skills {
+                d.toggle_skill(skill, cx);
+            }
+            d.submit(cx);
         });
     });
     vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        let v = view.read(cx);
-        let name = v.create.name_input.clone().unwrap();
-        let model = v.create.model_input.clone().unwrap();
-        name.update(cx, |s, cx| s.set_value("Release bot", window, cx));
-        model.update(cx, |s, cx| s.set_value("claude-opus-5-5", window, cx));
-        name.update(cx, |input, cx| input.focus(window, cx));
-    });
-    vcx.run_until_parked();
-    // `secondary`는 macOS에서 Cmd, 그 밖에서는 Ctrl이다(폼 단축키와 같은 기준).
-    vcx.simulate_keystrokes("secondary-enter");
-    vcx.run_until_parked();
-
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert_eq!(v.screen(), Screen::Detail);
-        assert_eq!(v.bots().len(), 1);
-        assert_eq!(v.bots()[0].name, "Release bot");
-        assert_eq!(v.bots()[0].model.as_deref(), Some("claude-opus-5-5"));
-    });
-
-    // The next New bot starts empty instead of offering "Release bot" again.
-    vcx.update(|_, cx| view.update(cx, View::open_create));
-    vcx.run_until_parked();
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        let name = v
-            .create
-            .name_input
-            .as_ref()
-            .unwrap()
-            .read(cx)
-            .value()
-            .to_string();
-        assert_eq!(name, "");
-        assert_eq!(v.create.model, ModelChoice::Default);
-    });
+    let reqs = state.lock().unwrap().requests.clone();
+    assert!(reqs.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::CreateBotV2(p)
+            if p.base.template_id.as_deref() == Some("pr-review")
+                && p.base.avatar.as_deref() == Some(tpl.mascot)
+                && p.base.name == tpl.name
+    )));
+    // krilld would otherwise fill the template's skills back in.
+    assert!(reqs.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::UpdateBotExtras(p) if p.skills.as_deref() == Some(&[][..])
+    )));
 }
 
 #[gpui::test]
-fn create_form_rejects_empty_custom_model_and_missing_folder(cx: &mut TestAppContext) {
-    // One existing bot, so Escape from the in-modal form would go back to it.
-    let state = Arc::new(Mutex::new(MockState {
-        bots: vec![sample_bot("bot-a", "A")],
-        ..MockState::default()
-    }));
+fn saving_bot_settings_leaves_an_orca_background_alone(cx: &mut TestAppContext) {
+    let mut mock = MockState::default();
+    let mut bot = sample_bot("bot-1", "Lavender bot");
+    bot.avatar = Some("B1".to_owned());
+    bot.avatar_color = Some("#c9b8e8".to_owned());
+    mock.bots.push(bot);
+    let state = Arc::new(Mutex::new(mock));
     let (view, vcx) = open_view(cx, state.clone());
-    vcx.update(|_, cx| view.update(cx, View::open_create_alone));
-    vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        let v = view.read(cx);
-        let name = v.create.name_input.clone().unwrap();
-        let ws = v.create.workspace_input.clone().unwrap();
-        name.update(cx, |s, cx| s.set_value("Bot", window, cx));
-        ws.update(cx, |s, cx| {
-            s.set_value("/definitely/not/a/krill/dir", window, cx);
-        });
-        view.update(cx, View::submit_create_bot);
-    });
-    vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        let v = view.read(cx);
-        assert!(
-            v.error.is_some(),
-            "a missing folder is refused, not silently replaced"
-        );
-        assert_eq!(v.bots().len(), 1);
-        let ws = v.create.workspace_input.clone().unwrap();
-        ws.update(cx, |s, cx| s.set_value("", window, cx));
+    let bot_id = BotId::new("bot-1").unwrap();
+    vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
-            v.set_create_model(ModelChoice::Custom, cx);
-            v.submit_create_bot(cx);
+            v.select_bot(bot_id.clone(), cx);
+            v.set_detail_tab(DetailTab::Settings, cx);
         });
     });
     vcx.run_until_parked();
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert!(
-            v.error.is_some(),
-            "Custom with no id is refused, not sent as Default"
-        );
-        assert_eq!(v.bots().len(), 1);
-    });
-    assert!(
-        state.lock().unwrap().requests.iter().all(|r| !matches!(
-            r,
-            BotRpcRequest::CreateBot(_) | BotRpcRequest::CreateBotV2(_)
-        )),
-        "neither attempt reached the daemon"
-    );
-
-    // Opened alone (sidebar "+"), Escape closes the modal rather than showing a bot.
-    let closed = Arc::new(Mutex::new(false));
-    let closed_capture = closed.clone();
-    vcx.update(|_, cx| {
-        cx.subscribe(&view, move |_, _: &Close, _| {
-            *closed_capture.lock().unwrap() = true;
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.save_bot_settings(bot_id.clone(), cx)));
+    vcx.run_until_parked();
+    let st = state.lock().unwrap();
+    let extras = st
+        .requests
+        .iter()
+        .find_map(|r| match r {
+            BotRpcRequest::UpdateBotExtras(p) => Some(p.clone()),
+            _ => None,
         })
-        .detach();
-        view.update(cx, View::handle_escape);
-    });
-    assert!(*closed.lock().unwrap());
+        .expect("settings save sends extras");
+    assert_eq!(
+        extras.avatar_color,
+        krill_proto::bots::FieldPatch::Unchanged
+    );
+    assert_eq!(st.bots[0].avatar_color.as_deref(), Some("#c9b8e8"));
 }

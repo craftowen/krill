@@ -1,0 +1,128 @@
+{
+  "repository": "https://github.com/stablyai/orca",
+  "release": "1.4.266",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 Lovecast Inc.",
+  "files": [
+    {
+      "file": "A1.svg",
+      "source": "src/shared/bot-mascots/A1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "91b3433196f5fb8b8c5cf209106d1a4f6fcabf5da487a7eab3c38279c26b9ccb"
+    },
+    {
+      "file": "B1.svg",
+      "source": "src/shared/bot-mascots/B1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "baa5a0131dbc1a78cc5742704d2fb675cb2e4bd2db2cfaef53df927db5b508e8"
+    },
+    {
+      "file": "D1.svg",
+      "source": "src/shared/bot-mascots/D1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "c33cc1f8bb7ca02583147ace2fd914667a92316d86537df897d92e285b447ece"
+    },
+    {
+      "file": "E1.svg",
+      "source": "src/shared/bot-mascots/E1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "8c5dd530f31a5de83c7d77648fb8a2c1ff16abad946717ac656aff05a989b7d5"
+    },
+    {
+      "file": "F1.svg",
+      "source": "src/shared/bot-mascots/F1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "17e4e25a8b5dffdfb85e797e85c1c95fa0f640a13a0f1fbdb319a002f9595328"
+    },
+    {
+      "file": "G1.svg",
+      "source": "src/shared/bot-mascots/G1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "21b832c2883a0b042d2087a679fdc932eeeec1df02a84133849e8d799e9c479e"
+    },
+    {
+      "file": "H1.svg",
+      "source": "src/shared/bot-mascots/H1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "f8f0ab8d7322df69194b15d7a05ff15b871750c5c216f4a5219ceabdcbc23aee"
+    },
+    {
+      "file": "H2.svg",
+      "source": "src/shared/bot-mascots/H2.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "75f72aad76268e8b4d82bb0d4e2a566fea2a58dd90365f575c22e95e5ec07d6e"
+    },
+    {
+      "file": "I1.svg",
+      "source": "src/shared/bot-mascots/I1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "b09b8341e8ca1988935c0d76f33c612f7ef7baeda55dc2c0c5c9195ffcc135d9"
+    },
+    {
+      "file": "J1.svg",
+      "source": "src/shared/bot-mascots/J1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "34fefe08a305103f15b39c3eb71c1c51237e7069df28be9b03400e496dbeacb6"
+    },
+    {
+      "file": "K2.svg",
+      "source": "src/shared/bot-mascots/K2.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "6f98221aaa28d100968d8eb1bcaaea7f377221fd539d0a481fdd1faad92e12db"
+    },
+    {
+      "file": "L2.svg",
+      "source": "src/shared/bot-mascots/L2.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "16e34528e642d475ff5f2fba9b8e45d8d1dd42e7621ecbc382bf08a9255d591f"
+    },
+    {
+      "file": "M1.svg",
+      "source": "src/shared/bot-mascots/M1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "978eed5fe88b895b2bc6450681f71907bf2665e02937b0d1c9dbb68ac9aca34d"
+    },
+    {
+      "file": "N1.svg",
+      "source": "src/shared/bot-mascots/N1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "88850d5349168c02ddf47d25602ac9a0748b47ccf63956192e9a98cf81a6adc3"
+    },
+    {
+      "file": "O1.svg",
+      "source": "src/shared/bot-mascots/O1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "a636e763acd4715c8ab6192d60d242e8ca325a69cdad0fa915ca118b59090076"
+    },
+    {
+      "file": "P3.svg",
+      "source": "src/shared/bot-mascots/P3.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "9e0aba2fcd33eab5c89cbac3b515af99d40b212662c39873106cdcc512a2800b"
+    },
+    {
+      "file": "Q1.svg",
+      "source": "src/shared/bot-mascots/Q1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "d7b7fa495fcf2dd0886b32cb6d0fcbb7bf412d51197f9d7051e125a2134b911d"
+    },
+    {
+      "file": "R3.svg",
+      "source": "src/shared/bot-mascots/R3.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "f8c570205754ba8a5f833573bd1aee149743252721d5da539697d7044546f382"
+    },
+    {
+      "file": "S2.svg",
+      "source": "src/shared/bot-mascots/S2.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "aa26d6c43c203522c4d985dfb209b7e4a9e61a8e6d14d50e8fa2a48e1c6a7429"
+    },
+    {
+      "file": "T1.svg",
+      "source": "src/shared/bot-mascots/T1.svg",
+      "modifications": "none (copied verbatim from the Orca 1.4.266 app bundle)",
+      "sha256": "63d1d05346b5154fbdd3c07344ce31e3d76ae2d0933bf40fb264fba4d29f36cf"
+    }
+  ]
+}

@@ -60,6 +60,15 @@ pub fn is_installed(cx: &App, provider: ProviderKind) -> bool {
         .is_none_or(|found| found.contains(&provider))
 }
 
+/// 감지 전이면 `true`, 감지가 끝났으면 그 에이전트 실행 파일이 PATH에 있는지(새 봇의 에이전트 목록).
+#[must_use]
+pub fn agent_maybe_installed(cx: &App, agent_id: &str) -> bool {
+    cx.try_global::<InstalledAgents>()
+        .and_then(|i| i.0.as_ref())
+        .is_none()
+        || agent_detected(cx, agent_id, None)
+}
+
 /// 백그라운드 감지가 끝났다면 해당 에이전트(`agent_id` 또는 `program`) 실행 파일이 PATH에 있는지 돌려준다.
 #[must_use]
 pub fn agent_detected(cx: &App, agent_id: &str, program: Option<&str>) -> bool {

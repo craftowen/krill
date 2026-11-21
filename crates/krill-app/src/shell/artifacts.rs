@@ -240,44 +240,10 @@ impl Shell {
                     v.set_host_target(host.clone(), target.clone(), host_choices, cx);
                     v
                 });
+                Self::subscribe_bots_view(&created, true, cx);
                 cx.subscribe(&created, |this, _, _: &krill_app::bots::Close, cx| {
                     this.close_settings(None, cx);
                 })
-                .detach();
-                cx.subscribe(
-                    &created,
-                    |this, view, ev: &krill_app::bots::OpenSession, cx| {
-                        let host = view.read(cx).host().clone();
-                        if let Some(meta) = view.read(cx).session_meta_for(&ev.bot_id) {
-                            this.sidebar.update(cx, |sb, cx| {
-                                sb.register_bot_session(host.clone(), ev.session_id, meta, cx);
-                            });
-                        }
-                        let deferred = this.layout_loading;
-                        this.open_session_on(host, ev.session_id, cx);
-                        if deferred {
-                            this.restore_session_chat = true;
-                        } else if let Some(pane) = this.layout.focused() {
-                            this.set_pane_chat_view(pane, true, cx);
-                        }
-                    },
-                )
-                .detach();
-                cx.subscribe(
-                    &created,
-                    |this, _, ev: &krill_app::bots::BadgeChanged, cx| {
-                        this.apply_sidebar_bots(ev.attention_count, ev.bots.clone(), cx);
-                    },
-                )
-                .detach();
-                cx.subscribe(
-                    &created,
-                    |this, _, ev: &krill_app::bots::SessionsChanged, cx| {
-                        this.sidebar.update(cx, |sb, cx| {
-                            sb.set_bot_sessions(ev.host.clone(), ev.sessions.clone(), cx);
-                        });
-                    },
-                )
                 .detach();
                 self.bots_cache = Some(created.clone());
                 created
@@ -290,15 +256,74 @@ impl Shell {
         cx.notify();
     }
 
-    fn apply_sidebar_bots(
+    /// Events every Bots view sends the Shell (the modal and a bot page's right sidebar).
+    /// A view that doesn't `feed_sidebar` keeps an older bot list, so its changes only prompt a
+    /// fresh read from krilld instead of replacing the sidebar's bots.
+    pub(super) fn subscribe_bots_view(
+        view: &gpui::Entity<krill_app::bots::View>,
+        feed_sidebar: bool,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
+            this.request_new_bot(None, None, cx);
+        })
+        .detach();
+        cx.subscribe(view, |this, view, ev: &krill_app::bots::OpenSession, cx| {
+            let host = view.read(cx).host().clone();
+            if let Some(meta) = view.read(cx).session_meta_for(&ev.bot_id) {
+                this.sidebar.update(cx, |sb, cx| {
+                    sb.register_bot_session(host.clone(), ev.session_id, meta, cx);
+                });
+            }
+            let deferred = this.layout_loading;
+            this.open_session_on(host, ev.session_id, cx);
+            if deferred {
+                this.restore_session_chat = true;
+            } else if let Some(pane) = this.layout.focused() {
+                this.set_pane_chat_view(pane, true, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(
+            view,
+            move |this, _, ev: &krill_app::bots::BadgeChanged, cx| {
+                if feed_sidebar {
+                    this.apply_sidebar_bots(ev.attention_count, ev.bots.clone(), cx);
+                } else {
+                    this.refresh_bots_badge(cx);
+                }
+            },
+        )
+        .detach();
+        if feed_sidebar {
+            cx.subscribe(
+                view,
+                |this, _, ev: &krill_app::bots::SessionsChanged, cx| {
+                    this.sidebar.update(cx, |sb, cx| {
+                        sb.set_bot_sessions(ev.host.clone(), ev.sessions.clone(), cx);
+                    });
+                },
+            )
+            .detach();
+        }
+    }
+
+    pub(super) fn apply_sidebar_bots(
         &mut self,
         attention: usize,
         bots: Vec<krill_app::bots::SidebarBot>,
         cx: &mut Context<Self>,
     ) {
-        if self.bots_attention_count != attention || self.sidebar_bots != bots {
+        if self.bots_attention_count != attention
+            || self.sidebar_bots != bots
+            || !self.bot_ui.loaded
+        {
             self.bots_attention_count = attention;
             self.sidebar_bots = bots;
+            self.bot_ui.loaded = true;
+            self.bot_ui.panel.stale = true;
+            // A restored chat may only now turn out to be a bot's: root its Files there.
+            self.sync_diff_workspace(cx);
             cx.notify();
         }
     }
@@ -311,11 +336,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.open_bots(window, cx);
-        if let Some(view) = self.bots_cache.clone() {
-            view.update(cx, |v, cx| match bot_id {
-                Some(id) => v.select_bot(id, cx),
-                None => v.open_create_alone(cx),
-            });
+        if let Some(view) = self.bots_cache.clone()
+            && let Some(id) = bot_id
+        {
+            view.update(cx, |v, cx| v.select_bot(id, cx));
         }
     }
 
@@ -353,19 +377,24 @@ impl Shell {
             let target = self.target_for_host(&host);
             krill_app::bots::daemon_bot_rpc(target)
         };
+        let known = self.known_bot_avatars();
         self.bots_badge_task = Some(cx.spawn(async move |this, cx| {
-            let Some((snapshot, sessions)) = cx
+            let Some(state) = cx
                 .background_executor()
-                .spawn(async move { krill_app::bots::fetch_sidebar_state(&rpc) })
+                .spawn(async move { krill_app::bots::fetch_sidebar_state(&rpc, &known) })
                 .await
             else {
                 return;
             };
             this.update(cx, |this, cx| {
                 this.sidebar.update(cx, |sb, cx| {
-                    sb.set_bot_sessions(host, sessions, cx);
+                    sb.set_bot_sessions(host, state.sessions, cx);
                 });
-                this.apply_sidebar_bots(snapshot.attention, snapshot.bots, cx);
+                this.apply_sidebar_bots(state.snapshot.attention, state.snapshot.bots, cx);
+                if !state.avatars.is_empty() {
+                    this.store_bot_avatars(state.avatars);
+                    cx.notify();
+                }
             })
             .ok();
         }));

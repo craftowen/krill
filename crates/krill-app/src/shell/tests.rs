@@ -7174,105 +7174,481 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
     assert_eq!(layout_of(&view, cx), before);
 }
 
+fn section_bot(
+    id: &str,
+    name: &str,
+    sessions: Vec<krill_proto::bots::BotSessionSummary>,
+) -> krill_app::bots::SidebarBot {
+    let mut cfg = krill_proto::bots::BotConfig::new(
+        krill_proto::bots::BotId::new(id).unwrap(),
+        name,
+        "claude",
+        1_700_000_000_000,
+    )
+    .unwrap();
+    cfg.avatar = Some("B1".to_owned());
+    let mut row = krill_app::bots::rpc::sidebar_snapshot(&[cfg], &[], &[], &sessions)
+        .bots
+        .remove(0);
+    row.sessions = sessions;
+    row
+}
+
+fn live_chat(bot: &str, sid: u64, link: Option<&str>) -> krill_proto::bots::BotSessionSummary {
+    krill_proto::bots::BotSessionSummary {
+        session_id: SessionId(sid),
+        bot_id: krill_proto::bots::BotId::new(bot).unwrap(),
+        link_id: link.map(str::to_owned),
+        pid: 1,
+        live: true,
+        working: false,
+        label: "Slack thread".to_owned(),
+        created_at_ms: 1_700_000_000_000,
+    }
+}
+
 #[gpui::test]
-fn sidebar_bots_section_lists_bots_and_opens_them(cx: &mut TestAppContext) {
+fn sidebar_bots_section_lays_out_like_orca_and_opens_home_chat(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("bots-sidebar-section"));
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));
-    assert!(
-        cx.debug_bounds("nav-bots-list").is_none(),
-        "no bots, no list"
-    );
-    assert!(cx.debug_bounds("nav-bots-new").is_some());
+    // Before the list arrives there is no invitation to make a first bot.
+    assert!(cx.debug_bounds("bots-section-header").is_some());
+    assert!(cx.debug_bounds("bots-empty-card").is_none());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.apply_sidebar_bots(0, Vec::new(), cx));
+    });
+    cx.run_until_parked();
+    // No bots: Orca's "Meet your AI teammate" card, and no old "Bots" nav row.
+    assert!(cx.debug_bounds("bots-empty-card").is_some());
+    assert!(cx.debug_bounds("nav-bots").is_none());
 
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.sidebar_bots = vec![
-                krill_app::bots::SidebarBot {
-                    id: krill_proto::bots::BotId::new("bot-a").unwrap(),
-                    name: "Release bot".to_owned(),
-                    emoji: Some("🚀".to_owned()),
-                    paused: false,
-                    attention: 2,
-                },
-                krill_app::bots::SidebarBot {
-                    id: krill_proto::bots::BotId::new("bot-b").unwrap(),
-                    name: "Paused bot".to_owned(),
-                    emoji: None,
-                    paused: true,
-                    attention: 0,
-                },
-            ];
+            let mut a = section_bot(
+                "bot-a",
+                "Release bot",
+                vec![
+                    live_chat("bot-a", 77, None),
+                    live_chat("bot-a", 78, Some("slack:C1")),
+                ],
+            );
+            a.attention = 2;
+            let mut b = section_bot("bot-b", "Paused bot", Vec::new());
+            b.paused = true;
+            s.sidebar_bots = vec![a, b];
             cx.notify();
         });
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("nav-bots-list").is_some());
-    let row = cx.debug_bounds("nav-bot-bot-a").unwrap();
-    assert!(cx.debug_bounds("nav-bot-bot-b").is_some());
+    assert!(cx.debug_bounds("bots-empty-card").is_none());
+    let row = cx.debug_bounds("bot-row-bot-a").unwrap();
+    assert!(cx.debug_bounds("bot-row-bot-b").is_some());
+    // Home Chat first, then the Slack thread, indented under the bot.
+    let home = cx.debug_bounds("bot-chat-77").unwrap();
+    let thread = cx.debug_bounds("bot-chat-78").unwrap();
+    assert!(home.top() < thread.top());
+    assert!(home.left() > row.left(), "chats are indented under the bot");
 
-    // A bot row opens the Bots modal on that bot.
+    // Clicking the bot opens its live Home Chat as a chat tab (no modal).
     cx.simulate_click(row.center(), Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("bots-modal").is_some());
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
     assert!(cx.debug_bounds("bots-modal").is_none());
+    cx.update(|_, cx| {
+        assert_eq!(view.read(cx).focused_local_session(), Some(SessionId(77)));
+    });
 
-    // + opens New bot directly, with agent and model pickers.
-    let plus = cx.debug_bounds("nav-bots-new").unwrap();
-    cx.simulate_click(plus.center(), Modifiers::default());
+    // The title folds the whole section into a face pile.
+    let title = cx.debug_bounds("bots-section-title").unwrap();
+    cx.simulate_click(title.center(), Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("bots-create-view").is_some());
-    assert!(cx.debug_bounds("bots-runtime-picker").is_some());
-    assert!(cx.debug_bounds("bots-model-picker").is_some());
+    assert!(cx.debug_bounds("bot-row-bot-a").is_none());
+    assert!(cx.debug_bounds("bots-collapsed-bot-a").is_some());
 }
 
 #[gpui::test]
-fn bots_open_from_sidebar_shows_attention_badge_and_preserves_workspace(cx: &mut TestAppContext) {
+fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bots-new-dialog"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let requests: Arc<std::sync::Mutex<Vec<krill_proto::bots::BotRpcRequest>>> = Arc::default();
+    let seen = requests.clone();
+    // Like krilld, a created bot is in the next bot list.
+    let made: Arc<std::sync::Mutex<Vec<krill_proto::bots::BotConfig>>> = Arc::default();
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
+        seen.lock().unwrap().push(req.clone());
+        Ok(match req {
+            BotRpcRequest::CreateBotV2(p) => {
+                let mut cfg = BotConfig::new(
+                    BotId::new("bot-new").unwrap(),
+                    &p.base.name,
+                    &p.base.agent_id,
+                    1_700_000_000_000,
+                )
+                .unwrap();
+                cfg.avatar.clone_from(&p.base.avatar);
+                cfg.avatar_color.clone_from(&p.avatar_color);
+                made.lock().unwrap().push(cfg.clone());
+                BotRpcResponse::Bot(Box::new(cfg))
+            }
+            BotRpcRequest::StartBotSession { bot_id, .. } => BotRpcResponse::SessionStarted {
+                bot_id: bot_id.clone(),
+                session_id: SessionId(501),
+                pid: 9,
+            },
+            BotRpcRequest::ListBots => BotRpcResponse::Bots(made.lock().unwrap().clone()),
+            _ => BotRpcResponse::Ok,
+        })
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            s.apply_sidebar_bots(0, Vec::new(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let create = cx.debug_bounds("bots-empty-create").unwrap();
+    cx.simulate_click(create.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("new-bot-dialog").is_some());
+    assert!(cx.debug_bounds("new-bot-carousel").is_some());
+    assert!(cx.debug_bounds("new-bot-swatch-1f2126").is_some());
+    assert!(cx.debug_bounds("new-bot-runs-on").is_some());
+    assert!(
+        cx.debug_bounds("new-bot-start-from-template").is_some(),
+        "an empty form offers templates"
+    );
+
+    // Type a name (the field has focus), pick a background, create with the keyboard.
+    cx.simulate_input("Krill helper");
+    cx.run_until_parked();
+    let ink = cx.debug_bounds("new-bot-swatch-1f2126").unwrap();
+    cx.simulate_click(ink.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("new-bot-start-from-template").is_none(),
+        "typing hides the template link like Orca"
+    );
+    cx.simulate_keystrokes("cmd-enter");
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("new-bot-dialog").is_none());
+    let reqs = requests.lock().unwrap().clone();
+    let created = reqs
+        .iter()
+        .find_map(|r| match r {
+            krill_proto::bots::BotRpcRequest::CreateBotV2(p) => Some(p.clone()),
+            _ => None,
+        })
+        .expect("Create bot reached the daemon");
+    assert_eq!(created.base.name, "Krill helper");
+    assert_eq!(created.base.agent_id, "claude");
+    assert!(
+        created
+            .base
+            .avatar
+            .as_deref()
+            .and_then(krill_app::bots::avatar::mascot_id)
+            .is_some(),
+        "a mascot face is saved"
+    );
+    assert_eq!(created.avatar_color.as_deref(), Some("#1f2126"));
+    assert!(reqs.iter().any(|r| matches!(
+        r,
+        krill_proto::bots::BotRpcRequest::StartBotSession { prompt: Some(p), .. }
+            if p.contains("first-run")
+    )));
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.focused_local_session(), Some(SessionId(501)));
+        assert!(s.sidebar_bots.iter().any(|b| b.name == "Krill helper"));
+    });
+}
+
+#[gpui::test]
+fn bot_rows_start_one_home_chat_and_explain_a_paused_bot(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bots-row-guards"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = starts.clone();
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
+        Ok(match req {
+            BotRpcRequest::StartBotSession { bot_id, .. } => {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                BotRpcResponse::SessionStarted {
+                    bot_id: bot_id.clone(),
+                    session_id: SessionId(610),
+                    pid: 3,
+                }
+            }
+            _ => BotRpcResponse::Ok,
+        })
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            let mut paused = section_bot("bot-p", "Paused bot", Vec::new());
+            paused.paused = true;
+            s.apply_sidebar_bots(
+                0,
+                vec![section_bot("bot-a", "Idle bot", Vec::new()), paused],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // Two quick clicks start one Home Chat, and the second click focuses it.
+    let row = cx.debug_bounds("bot-row-bot-a").unwrap();
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    cx.update(|_, cx| {
+        assert_eq!(view.read(cx).focused_local_session(), Some(SessionId(610)));
+    });
+    assert!(
+        cx.debug_bounds("bot-chat-610").is_some(),
+        "the new Home Chat shows at once"
+    );
+    let row = cx.debug_bounds("bot-row-bot-a").unwrap();
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A paused bot with no live chat says so instead of asking krilld.
+    let paused = cx.debug_bounds("bot-row-bot-p").unwrap();
+    cx.simulate_click(paused.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    cx.update(|_, cx| assert!(view.read(cx).notice.is_some()));
+}
+
+#[gpui::test]
+fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppContext) {
+    use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
+    let (view, cx) = open(cx, state_path("bots-right-panel"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let chats = vec![
+        live_chat("bot-a", 77, None),
+        live_chat("bot-a", 78, Some("slack:C1")),
+    ];
+    let requests: Arc<std::sync::Mutex<Vec<BotRpcRequest>>> = Arc::default();
+    let seen = requests.clone();
+    let listed = chats.clone();
+    let config = |id: &str, name: &str| {
+        let mut cfg =
+            BotConfig::new(BotId::new(id).unwrap(), name, "claude", 1_700_000_000_000).unwrap();
+        cfg.avatar = Some("B1".to_owned());
+        cfg
+    };
+    let known = Arc::new(std::sync::Mutex::new(vec![config("bot-a", "Release bot")]));
+    let daemon_bots = known.clone();
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        seen.lock().unwrap().push(req.clone());
+        Ok(match req {
+            BotRpcRequest::ListBots => BotRpcResponse::Bots(daemon_bots.lock().unwrap().clone()),
+            BotRpcRequest::ListItems { .. } => BotRpcResponse::Items(Vec::new()),
+            BotRpcRequest::ConnectorStatus { .. } => BotRpcResponse::ConnectorStatuses(Vec::new()),
+            BotRpcRequest::ListAccessRequests { .. } => BotRpcResponse::AccessRequests(Vec::new()),
+            BotRpcRequest::ToolRelayStatus => {
+                BotRpcResponse::ToolRelayStatus(krill_proto::bots::BotToolRelayStatus::default())
+            }
+            BotRpcRequest::ListBotSessions { .. } => BotRpcResponse::BotSessions(listed.clone()),
+            BotRpcRequest::StartBotSession { bot_id, .. } => BotRpcResponse::SessionStarted {
+                bot_id: bot_id.clone(),
+                session_id: SessionId(811),
+                pid: 4,
+            },
+            _ => BotRpcResponse::Ok,
+        })
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            s.apply_sidebar_bots(0, vec![section_bot("bot-a", "Release bot", chats)], cx);
+        });
+    });
+    cx.run_until_parked();
+    // A plain workspace keeps the usual right panel.
+    assert!(cx.debug_bounds("bot-panel").is_none());
+    assert!(cx.debug_bounds("diff-collapse").is_some());
+
+    // Opening the bot makes its Home Chat the focused tab: the right sidebar is the bot's.
+    let row = cx.debug_bounds("bot-row-bot-a").unwrap();
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.run_until_parked();
+    let panel = cx.debug_bounds("panel-column").unwrap();
+    let bot_panel = cx
+        .debug_bounds("bot-panel")
+        .expect("bot page right sidebar");
+    assert!(panel.contains(&bot_panel.center()));
+    assert!(cx.debug_bounds("diff-collapse").is_none());
+    for tab in [
+        "bot-panel-tab-home",
+        "bot-panel-tab-connectors",
+        "bot-panel-tab-chats",
+        "bot-panel-tab-files",
+    ] {
+        assert!(cx.debug_bounds(tab).is_some(), "{tab}");
+    }
+    assert!(cx.debug_bounds("bot-panel-header").is_some());
+    assert!(
+        cx.debug_bounds("bots-tab-items-body").is_some(),
+        "Home lists the bot's items"
+    );
+
+    let click = |cx: &mut gpui::VisualTestContext, sel: &'static str| {
+        let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        cx.simulate_click(at.center(), Modifiers::default());
+        cx.run_until_parked();
+    };
+    click(cx, "bot-panel-tab-connectors");
+    assert!(cx.debug_bounds("bots-tab-connectors-body").is_some());
+
+    // Chats lists the Home Chat and the thread, and New chat starts and opens another.
+    click(cx, "bot-panel-tab-chats");
+    let home = cx.debug_bounds("bot-panel-chat-77").unwrap();
+    let thread = cx.debug_bounds("bot-panel-chat-78").unwrap();
+    assert!(home.top() < thread.top());
+    click(cx, "bot-chats-new");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::StartBotSession { prompt: None, .. }))
+    );
+    cx.update(|_, cx| {
+        assert_eq!(view.read(cx).focused_local_session(), Some(SessionId(811)));
+    });
+    assert!(
+        cx.debug_bounds("bot-panel").is_some(),
+        "a new chat stays on the bot page"
+    );
+    assert!(cx.debug_bounds("bot-panel-chat-811").is_some());
+
+    // Files is the usual explorer without its own tab bar.
+    click(cx, "bot-panel-tab-files");
+    assert!(cx.debug_bounds("explorer-pane").is_some());
+    assert!(cx.debug_bounds("diff-collapse").is_none());
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let home = s.bot_folder(&s.sidebar_bots[0]).expect("local bot folder");
+        assert_eq!(
+            s.diff.read(cx).repo(),
+            home.as_path(),
+            "Files is the bot folder"
+        );
+    });
+    // Files stays the explorer even when the panel's own tab moves (e.g. from another page).
+    cx.update(|_, cx| {
+        let diff = view.read(cx).diff.clone();
+        diff.update(cx, |d, cx| {
+            d.set_tab(krill_app::diff::PanelTab::Changes, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explorer-pane").is_some());
+    assert!(cx.debug_bounds("diff-collapse").is_none());
+
+    // Bot settings opens over Home and goes back.
+    click(cx, "bot-panel-tab-home");
+    click(cx, "bot-panel-settings");
+    assert!(cx.debug_bounds("bot-settings-page").is_some());
+    assert!(cx.debug_bounds("bots-tab-settings-body").is_some());
+    click(cx, "bot-settings-tab-soul");
+    assert!(cx.debug_bounds("bots-tab-soul-memory-body").is_some());
+    click(cx, "bot-settings-back");
+    assert!(cx.debug_bounds("bot-panel-header").is_some());
+
+    // A bot made after the panel first loaded gets its own page, and the panel's older list
+    // never replaces the sidebar's.
+    known.lock().unwrap().push(config("bot-b", "Second bot"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut bots = s.sidebar_bots.clone();
+            bots.push(section_bot(
+                "bot-b",
+                "Second bot",
+                vec![live_chat("bot-b", 90, None)],
+            ));
+            s.apply_sidebar_bots(0, bots, cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "bot-row-bot-b");
+    assert!(cx.debug_bounds("bots-tab-items-body").is_some());
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.focused_local_session(), Some(SessionId(90)));
+        let panel = s.bot_ui.panel.view.clone().unwrap();
+        assert_eq!(
+            panel
+                .read(cx)
+                .selected_bot()
+                .map(|b| b.id.as_str().to_owned()),
+            Some("bot-b".to_owned())
+        );
+        assert_eq!(s.sidebar_bots.len(), 2);
+    });
+
+    // When the chat is no longer a bot's, the usual panel comes back with its own tabs.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.apply_sidebar_bots(0, Vec::new(), cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bot-panel").is_none());
+    assert!(cx.debug_bounds("diff-collapse").is_some());
+}
+
+#[gpui::test]
+fn new_bot_dialog_closes_from_the_backdrop_not_from_its_own_clicks(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bots-new-backdrop"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(|_| Ok(krill_proto::bots::BotRpcResponse::Ok));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            s.request_new_bot(None, None, cx);
+        });
+    });
+    cx.run_until_parked();
+    let dialog = cx.debug_bounds("new-bot-dialog").unwrap();
+    // Inside the card (the Change line opens the agent pickers) keeps it open.
+    let runs_on = cx.debug_bounds("new-bot-runs-on").unwrap();
+    cx.simulate_click(runs_on.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("new-bot-dialog").is_some());
+    assert!(cx.debug_bounds("new-bot-change").is_some());
+    cx.simulate_click(
+        point(dialog.left() / 2., dialog.center().y),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("new-bot-dialog").is_none());
+}
+
+#[gpui::test]
+fn bots_modal_opens_from_shortcut_and_preserves_workspace(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("bots-default"));
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));
     let before = layout_of(&view, cx);
 
-    // Attention badge appears when bots have needs_you items or pending access requests.
-    assert!(cx.debug_bounds("nav-bots-badge").is_none());
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.bots_attention_count = 3;
-            cx.notify();
-        });
-    });
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("nav-bots-badge").is_some());
-
-    // Clicking nav-bots opens the Bots modal over the workspace without touching layout.
-    let nav = cx.debug_bounds("nav-bots").unwrap();
-    cx.simulate_click(nav.center(), Modifiers::default());
+    // Keyboard shortcut (cmd-shift-b) opens the Bots modal over the workspace without
+    // touching layout; Escape and a backdrop click close it.
+    cx.simulate_keystrokes("cmd-shift-b");
     cx.run_until_parked();
     assert!(cx.debug_bounds("bots-modal").is_some());
     assert!(cx.debug_bounds("bots-page").is_some());
     assert!(cx.debug_bounds("terminal-surface").is_some());
-    assert!(cx.debug_bounds("session-tab-0").is_some());
     cx.update(|_, cx| {
         let shell = view.read(cx);
         assert_eq!(shell.layout, before);
         assert_eq!(shell.nav_history.entries.last(), Some(&NavEntry::Bots));
     });
-
-    // Escape closes the modal cleanly and returns to workspace.
     cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("bots-modal").is_none());
-    assert_eq!(layout_of(&view, cx), before);
-
-    // Keyboard shortcut (cmd-shift-b) opens Bots modal and backdrop click closes it.
-    cx.simulate_keystrokes("cmd-shift-b");
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("bots-modal").is_some());
-    let modal = cx.debug_bounds("bots-modal").unwrap();
-    cx.simulate_click(
-        point(modal.left() / 2., modal.center().y),
-        Modifiers::default(),
-    );
     cx.run_until_parked();
     assert!(cx.debug_bounds("bots-modal").is_none());
     assert_eq!(layout_of(&view, cx), before);
@@ -13639,7 +14015,7 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
 
     let (view, cx) = open(cx, state_path("bots-link-up-badge"));
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));
-    assert!(cx.debug_bounds("nav-bots-badge").is_none());
+    assert!(cx.debug_bounds("bot-row-bot-badge").is_none());
 
     let bot_id = BotId::new("bot-badge").unwrap();
     let mut bot_cfg =
@@ -13759,10 +14135,15 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
         rpc_calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
         "set_link(Link::Up) must invoke bot badge/session RPCs"
     );
-    assert!(cx.debug_bounds("nav-bots-badge").is_some());
+    assert!(cx.debug_bounds("bot-row-bot-badge").is_some());
+    assert!(
+        cx.debug_bounds("bot-chat-909").is_some(),
+        "the bot's live Home Chat sits under its row"
+    );
     cx.update(|_, cx| {
         let shell = view.read(cx);
         assert_eq!(shell.bots_attention_count, 2);
+        assert_eq!(shell.sidebar_bots[0].attention, 2);
         let meta = shell
             .sidebar
             .read(cx)

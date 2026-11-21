@@ -5,13 +5,16 @@
 //! `ui::page_modal_size`, matching `Automations` and `Artifacts`. Active bot chats open
 //! as regular workspace `[Chat | Term]` tabs via [`OpenSession`].
 
+pub mod avatar;
 mod connectors;
-mod create;
 mod groups;
 mod items;
+pub mod new_bot;
+mod panel;
 pub mod rpc;
 mod settings;
 mod soul_memory;
+pub mod templates;
 mod tools_sharing;
 
 #[cfg(test)]
@@ -40,13 +43,17 @@ use crate::ui;
 
 pub use rpc::{
     BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
-    daemon_bot_rpc, fetch_sidebar_state,
+    SidebarState, daemon_bot_rpc, fetch_sidebar_state,
 };
-use rpc::{call_checked, decode_png_avatar, parse_avatar_color};
+use rpc::{call_checked, decode_png_avatar};
 
 /// Request the host `Shell` to close the Bots modal.
 #[derive(Debug)]
 pub struct Close;
+
+/// Request the host `Shell` to open the New bot dialog (Orca's single creation path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestNewBot;
 
 /// Request the host `Shell` to open/focus a bot's live session in a workspace `[Chat | Term]` tab.
 #[derive(Debug, Clone)]
@@ -86,7 +93,6 @@ pub enum DetailTab {
 pub enum Screen {
     #[default]
     Detail,
-    Create,
     Import,
     Groups,
 }
@@ -108,6 +114,9 @@ pub struct View {
     available_hosts: Vec<(HostId, String, Option<HostTarget>)>,
     default_cwd: Option<PathBuf>,
     bots: Vec<BotConfig>,
+    /// When `ListBots` last answered. Until then this view knows nothing about the bot list
+    /// and must not report one (an empty list would wipe the sidebar's bots).
+    bots_loaded_at_ms: Option<u64>,
     selected_bot_id: Option<BotId>,
     pending_switch_bot: Option<BotId>,
     screen: Screen,
@@ -122,7 +131,6 @@ pub struct View {
     all_connector_statuses: Vec<BotConnectorStatus>,
     all_access_requests: Vec<BotAccessRequest>,
     bot_sessions: Vec<BotSessionSummary>,
-    create: create::CreateState,
     items: items::ItemsState,
     soul_memory: soul_memory::SoulMemoryState,
     connectors: connectors::ConnectorsState,
@@ -149,9 +157,18 @@ pub struct View {
     oauth_poll_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     language: crate::i18n::Language,
+    /// Drawn as the modal or as a bot page's right-sidebar body (see `panel.rs`).
+    mode: Mode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Modal,
+    Panel,
 }
 
 impl EventEmitter<Close> for View {}
+impl EventEmitter<RequestNewBot> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<BadgeChanged> for View {}
 impl EventEmitter<SessionsChanged> for View {}
@@ -222,6 +239,7 @@ impl View {
             available_hosts: Vec::new(),
             default_cwd,
             bots: Vec::new(),
+            bots_loaded_at_ms: None,
             selected_bot_id: None,
             pending_switch_bot: None,
             screen: Screen::Detail,
@@ -236,7 +254,6 @@ impl View {
             all_connector_statuses: Vec::new(),
             all_access_requests: Vec::new(),
             bot_sessions: Vec::new(),
-            create: create::CreateState::default(),
             items: items::ItemsState::default(),
             soul_memory: soul_memory::SoulMemoryState::default(),
             connectors: connectors::ConnectorsState::default(),
@@ -263,6 +280,7 @@ impl View {
             oauth_poll_task: None,
             avatar_task: None,
             language: crate::i18n::language(),
+            mode: Mode::Modal,
         }
     }
 
@@ -326,6 +344,7 @@ impl View {
             self.rpc = daemon_bot_rpc(target);
             self.selected_bot_id = None;
             self.bots.clear();
+            self.bots_loaded_at_ms = None;
             self.bot_sessions.clear();
             self.settings.avatar_cache.clear();
             self.reload(cx);
@@ -363,10 +382,18 @@ impl View {
     /// Rows and attention total for the main window sidebar's Bots section.
     #[must_use]
     pub fn sidebar_snapshot(&self) -> SidebarSnapshot {
-        rpc::sidebar_snapshot(&self.bots, &self.all_open_items, &self.all_access_requests)
+        rpc::sidebar_snapshot(
+            &self.bots,
+            &self.all_open_items,
+            &self.all_access_requests,
+            &self.bot_sessions,
+        )
     }
 
     pub(super) fn emit_badge(&self, cx: &mut Context<Self>) {
+        if self.bots_loaded_at_ms.is_none() {
+            return;
+        }
         let snapshot = self.sidebar_snapshot();
         cx.emit(BadgeChanged {
             attention_count: snapshot.attention,
@@ -375,6 +402,9 @@ impl View {
     }
 
     pub(super) fn emit_sessions_changed(&self, cx: &mut Context<Self>) {
+        if self.bots_loaded_at_ms.is_none() {
+            return;
+        }
         let mut sessions = BTreeMap::new();
         for summary in &self.bot_sessions {
             if let Some(meta) = self.session_meta_for(&summary.bot_id) {
@@ -492,6 +522,7 @@ impl View {
                 match outcome {
                     Ok((bots, open_items, statuses, access, relay, sessions, warnings)) => {
                         this.bots = bots;
+                        this.bots_loaded_at_ms = Some(now_unix_ms());
                         this.all_open_items = open_items;
                         this.all_connector_statuses = statuses;
                         this.all_access_requests = access;
@@ -508,7 +539,8 @@ impl View {
                             .selected_bot_id
                             .as_ref()
                             .is_some_and(|id| this.bots.iter().any(|b| &b.id == id));
-                        if !still_valid {
+                        // A bot page keeps its bot (an empty body beats another bot's).
+                        if !still_valid && this.mode == Mode::Modal {
                             this.selected_bot_id = this.bots.first().map(|b| b.id.clone());
                         }
                         this.emit_badge(cx);
@@ -573,24 +605,13 @@ impl View {
         cx.notify();
     }
 
+    /// New bot always opens Orca's dialog over the workspace.
+    #[expect(
+        clippy::unused_self,
+        reason = "kept as a method for the modal's buttons"
+    )]
     pub fn open_create(&mut self, cx: &mut Context<Self>) {
-        self.armed_delete_bot = None;
-        self.pending_switch_bot = None;
-        self.error = None;
-        self.notice = None;
-        let handle = self.window_handle;
-        let default_cwd = self.default_cwd.clone();
-        self.create
-            .clear_form_fields(handle, default_cwd.as_deref(), cx);
-        self.screen = Screen::Create;
-        self.create.opened_alone = false;
-        cx.notify();
-    }
-
-    /// New bot as its own dialog (sidebar "+"): Escape closes the modal like Orca's.
-    pub fn open_create_alone(&mut self, cx: &mut Context<Self>) {
-        self.open_create(cx);
-        self.create.opened_alone = true;
+        cx.emit(RequestNewBot);
     }
 
     pub fn open_import(&mut self, cx: &mut Context<Self>) {
@@ -1277,8 +1298,7 @@ impl View {
 
     pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let app: &mut gpui::App = cx;
-        self.create.input_is_composing(window, app)
-            || self.items.input_is_composing(window, app)
+        self.items.input_is_composing(window, app)
             || self.soul_memory.input_is_composing(window, app)
             || self.connectors.input_is_composing(window, app)
             || self.tools.input_is_composing(window, app)
@@ -1300,13 +1320,7 @@ impl View {
             cx.notify();
             return;
         }
-        let alone = self.screen == Screen::Create && self.create.opened_alone;
-        if matches!(
-            self.screen,
-            Screen::Create | Screen::Import | Screen::Groups
-        ) && !self.bots.is_empty()
-            && !alone
-        {
+        if matches!(self.screen, Screen::Import | Screen::Groups) && !self.bots.is_empty() {
             self.screen = Screen::Detail;
             cx.notify();
             return;
@@ -1417,10 +1431,7 @@ impl View {
                         .map_or(ConnectorHealthState::Disconnected, |st| st.state)
                 })
                 .collect();
-            let display_emoji = bot.emoji.clone().unwrap_or_default();
-            let has_emoji = !display_emoji.is_empty();
             let avatar_img = self.settings.avatar_cache.get(&bot.id).cloned();
-            let accent_dot = parse_avatar_color(bot.avatar_color.as_deref());
             let runtime_label = rpc::runtime_display_label(&bot.agent_id);
             let row_id = format!("bots-rail-item-{bot_id_sel}");
             let row_sel = row_id.clone();
@@ -1463,35 +1474,15 @@ impl View {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
-                                    .when_some(accent_dot, |d, tc| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .size(ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(ui::tab_tag_color(tc)),
-                                        )
-                                    })
-                                    .when_some(avatar_img, |d, img| {
-                                        d.child(
-                                            gpui::img(img).size(px(16.)).rounded_full().flex_none(),
-                                        )
-                                    })
-                                    .when(bot.avatar.is_none() && has_emoji, |d| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .text_size(ui::TEXT_SM)
-                                                .child(display_emoji),
-                                        )
-                                    })
-                                    .when(bot.avatar.is_none() && !has_emoji, |d| {
-                                        d.child(ui::icons::svg_icon(
-                                            ui::icons::CUSTOM_AGENT_SVG,
-                                            ui::ICON_SM,
-                                            p.muted_foreground,
-                                        ))
-                                    })
+                                    // Same face as the sidebar row (mascot, picture, emoji or initial).
+                                    .child(avatar::render(
+                                        &avatar::Avatar::of(bot),
+                                        avatar_img,
+                                        &bot.name,
+                                        px(20.),
+                                        ui::RADIUS_XS,
+                                        p,
+                                    ))
                                     .child(
                                         div()
                                             .flex_1()
@@ -1993,9 +1984,7 @@ impl View {
         let paused = bot.paused;
         let armed_delete = self.armed_delete_bot.as_ref() == Some(&bot.id);
         let runtime_label = rpc::runtime_display_label(&bot.agent_id);
-        let emoji = bot.emoji.clone().unwrap_or_default();
         let avatar_img = self.settings.avatar_cache.get(&bot.id).cloned();
-        let accent_color = parse_avatar_color(bot.avatar_color.as_deref());
         let bot_session_count = self.sessions_for_bot(&bot.id).len();
 
         let tabs = [
@@ -2055,23 +2044,14 @@ impl View {
                                     .items_center()
                                     .flex_wrap()
                                     .gap_2()
-                                    .when_some(accent_color, |d, tc| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .size(ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(ui::tab_tag_color(tc)),
-                                        )
-                                    })
-                                    .when_some(avatar_img, |d, img| {
-                                        d.child(
-                                            gpui::img(img).size(px(24.)).rounded_full().flex_none(),
-                                        )
-                                    })
-                                    .when(bot.avatar.is_none() && !emoji.is_empty(), |d| {
-                                        d.child(div().text_size(ui::TEXT_LG).child(emoji))
-                                    })
+                                    .child(avatar::render(
+                                        &avatar::Avatar::of(bot),
+                                        avatar_img,
+                                        &bot.name,
+                                        px(36.),
+                                        ui::RADIUS_SM,
+                                        p,
+                                    ))
                                     .child(
                                         div()
                                             .min_w_0()
@@ -2231,64 +2211,13 @@ impl View {
             ))
     }
 
-    pub(super) fn source_label(source: ExternalSource) -> &'static str {
-        match source {
-            ExternalSource::Telegram => text::CONN_TELEGRAM.get(),
-            ExternalSource::Slack => text::CONN_SLACK.get(),
-            ExternalSource::Discord => text::CONN_DISCORD.get(),
-            ExternalSource::Google => text::CONN_GOOGLE.get(),
-            ExternalSource::GitHub => text::CONN_GITHUB.get(),
-            ExternalSource::Linear => text::CONN_LINEAR.get(),
-            ExternalSource::Composio => text::CONN_COMPOSIO.get(),
-        }
-    }
-}
-
-struct DetailBundle {
-    items_res: Result<Vec<BotItem>, String>,
-    soul_res: Result<Option<String>, String>,
-    memory_res: Result<Option<String>, String>,
-    statuses_res: Result<Vec<BotConnectorStatus>, String>,
-    access_res: Result<Vec<BotAccessRequest>, String>,
-    relay_res: Result<Option<krill_proto::bots::BotToolRelayStatus>, String>,
-    sessions_res: Result<Option<Vec<BotSessionSummary>>, String>,
-    suggestions_res: Result<Option<Vec<krill_proto::bots::BotSuggestion>>, String>,
-    history_res: Result<Option<Vec<krill_proto::bots::BotMemoryHistoryEntry>>, String>,
-    tidy_status_res: Result<Option<krill_proto::bots::BotMemoryTidyStatus>, String>,
-    topics_res: Result<Option<Vec<krill_proto::bots::BotMemoryTopicInfo>>, String>,
-    tracker_res: Result<Option<krill_proto::bots::DefaultTrackerBots>, String>,
-    composio_res: Result<Option<Vec<krill_proto::bots::ComposioConnectionInfo>>, String>,
-    avatar_img: Option<std::sync::Arc<gpui::Image>>,
-}
-
-impl Render for View {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.window_handle = Some(window.window_handle());
-        let p = ui::palette(cx);
-        let lang_changed = self.language != crate::i18n::language();
-        self.language = crate::i18n::language();
-        if lang_changed {
-            self.create.refresh_placeholders(window, cx);
-            self.items.refresh_placeholders(window, cx);
-            self.soul_memory.refresh_placeholders(window, cx);
-            self.connectors.refresh_placeholders(window, cx);
-            self.tools.refresh_placeholders(window, cx);
-            self.import_state.refresh_placeholders(window, cx);
-            self.settings.refresh_placeholders(window, cx);
-            self.groups.refresh_placeholders(window, cx);
-        }
-
-        let rem = window.rem_size();
-        let modal = ui::page_modal_size(window.viewport_size());
-        let compact = modal.width < rem * 42.5;
-        let narrow = modal.width < rem * 60.;
-        let rail_width = if narrow {
-            ui::SETTINGS_NAV_WIDTH_NARROW.to_pixels(rem)
-        } else {
-            ui::SETTINGS_NAV_WIDTH
-        };
-
-        let pending_switch_banner = self.pending_switch_bot.clone().map(|target_id| {
+    /// "Leave without saving?" while a bot switch waits on unsaved soul edits.
+    pub(super) fn render_pending_switch(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        self.pending_switch_bot.clone().map(|target_id| {
             div().px_5().pt_3().child(
                 div()
                     .px_3()
@@ -2330,11 +2259,89 @@ impl Render for View {
                             ),
                     ),
             )
-        });
+        })
+    }
+
+    pub(super) fn render_notice(&self, p: &ui::Palette) -> Option<gpui::Div> {
+        self.notice.as_ref().map(|msg| {
+            div().px_5().pt_3().child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.success.opacity(0.3))
+                    .bg(p.success.opacity(0.1))
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.success)
+                    .child(msg.clone()),
+            )
+        })
+    }
+
+    pub(super) fn source_label(source: ExternalSource) -> &'static str {
+        match source {
+            ExternalSource::Telegram => text::CONN_TELEGRAM.get(),
+            ExternalSource::Slack => text::CONN_SLACK.get(),
+            ExternalSource::Discord => text::CONN_DISCORD.get(),
+            ExternalSource::Google => text::CONN_GOOGLE.get(),
+            ExternalSource::GitHub => text::CONN_GITHUB.get(),
+            ExternalSource::Linear => text::CONN_LINEAR.get(),
+            ExternalSource::Composio => text::CONN_COMPOSIO.get(),
+        }
+    }
+}
+
+struct DetailBundle {
+    items_res: Result<Vec<BotItem>, String>,
+    soul_res: Result<Option<String>, String>,
+    memory_res: Result<Option<String>, String>,
+    statuses_res: Result<Vec<BotConnectorStatus>, String>,
+    access_res: Result<Vec<BotAccessRequest>, String>,
+    relay_res: Result<Option<krill_proto::bots::BotToolRelayStatus>, String>,
+    sessions_res: Result<Option<Vec<BotSessionSummary>>, String>,
+    suggestions_res: Result<Option<Vec<krill_proto::bots::BotSuggestion>>, String>,
+    history_res: Result<Option<Vec<krill_proto::bots::BotMemoryHistoryEntry>>, String>,
+    tidy_status_res: Result<Option<krill_proto::bots::BotMemoryTidyStatus>, String>,
+    topics_res: Result<Option<Vec<krill_proto::bots::BotMemoryTopicInfo>>, String>,
+    tracker_res: Result<Option<krill_proto::bots::DefaultTrackerBots>, String>,
+    composio_res: Result<Option<Vec<krill_proto::bots::ComposioConnectionInfo>>, String>,
+    avatar_img: Option<std::sync::Arc<gpui::Image>>,
+}
+
+impl Render for View {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window_handle = Some(window.window_handle());
+        let p = ui::palette(cx);
+        let lang_changed = self.language != crate::i18n::language();
+        self.language = crate::i18n::language();
+        if lang_changed {
+            self.items.refresh_placeholders(window, cx);
+            self.soul_memory.refresh_placeholders(window, cx);
+            self.connectors.refresh_placeholders(window, cx);
+            self.tools.refresh_placeholders(window, cx);
+            self.import_state.refresh_placeholders(window, cx);
+            self.settings.refresh_placeholders(window, cx);
+            self.groups.refresh_placeholders(window, cx);
+        }
+
+        let rem = window.rem_size();
+        let modal = ui::page_modal_size(window.viewport_size());
+        let compact = modal.width < rem * 42.5;
+        let narrow = modal.width < rem * 60.;
+        let rail_width = if narrow {
+            ui::SETTINGS_NAV_WIDTH_NARROW.to_pixels(rem)
+        } else {
+            ui::SETTINGS_NAV_WIDTH
+        };
+
+        if self.mode == Mode::Panel {
+            return self.render_panel(window, cx).into_any_element();
+        }
+        let pending_switch_banner = self.render_pending_switch(p, cx);
 
         let selected_bot = self.selected_bot().cloned();
         let right_pane = match self.screen {
-            Screen::Create => self.render_create_view(p, window, cx),
             Screen::Import => self.render_import_view(p, window, cx),
             Screen::Groups => self.render_groups_view(p, window, cx),
             Screen::Detail => {
@@ -2364,20 +2371,7 @@ impl Render for View {
                                 .clone()
                                 .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
-                        .children(self.notice.as_ref().map(|msg| {
-                            div().px_5().pt_3().child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(ui::RADIUS_SM)
-                                    .border_1()
-                                    .border_color(p.success.opacity(0.3))
-                                    .bg(p.success.opacity(0.1))
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.success)
-                                    .child(msg.clone()),
-                            )
-                        }))
+                        .children(self.render_notice(p))
                         .child(tab_body)
                 } else {
                     div()
@@ -2462,6 +2456,7 @@ impl Render for View {
                 .child(layout),
             &self.focus,
         )
+        .into_any_element()
     }
 }
 
