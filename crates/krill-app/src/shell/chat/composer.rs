@@ -892,13 +892,101 @@ impl Shell {
             super::ComposerSubmissionState::Ready
         };
         let agent_state = self.session_agent_state(&key.0, key.1, cx);
-        let interrupt_latched = self.is_chat_interrupt_latched(&key, cx);
+        let interrupt_latched =
+            self.is_chat_interrupt_latched(&key, cx) || self.is_chat_stop_cooldown(&key, cx);
         let draft_empty = input_state.read(cx).value().trim().is_empty() && !has_attachments;
         let primary_action = super::composer_primary_action(super::ComposerPrimaryInput {
             agent_state,
             submission,
             draft_empty,
             interrupt_latched,
+        });
+        let queued_prompts: Vec<_> = self
+            .chat
+            .logs
+            .get(&key)
+            .map(|log| log.queued_prompts.iter().cloned().collect())
+            .unwrap_or_default();
+        let queued_strip = (!queued_prompts.is_empty()).then(|| {
+            let q_key = key.clone();
+            div()
+                .id(SharedString::from(format!(
+                    "chat-queued-strip-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-queued-strip".into())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_1()
+                .pb_1()
+                .children(queued_prompts.into_iter().map(|queued| {
+                    let cancel_key = q_key.clone();
+                    let q_id = queued.id;
+                    let preview: String = queued.display_text.trim().chars().take(72).collect();
+                    let label = if preview.is_empty() {
+                        format!("+{} attachment", queued.attachments.len())
+                    } else {
+                        preview
+                    };
+                    div()
+                        .id(SharedString::from(format!("chat-queued-{q_id}")))
+                        .debug_selector(|| "chat-queued-item".into())
+                        .w_full()
+                        .min_w_0()
+                        .px_2()
+                        .py_1()
+                        .rounded(ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.muted)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(ui::RADIUS_SM)
+                                        .bg(palette.primary.opacity(0.14))
+                                        .text_size(ui::TEXT_2XS)
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(palette.primary)
+                                        .child(ctext::QUEUE_HINT.get()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(palette.foreground)
+                                        .child(label),
+                                ),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("chat-queued-cancel-{q_id}")))
+                                .debug_selector(|| "chat-queued-cancel".into())
+                                .icon(IconName::Close)
+                                .tooltip(ctext::REMOVE_QUEUED.get())
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_queued_chat_prompt(&cancel_key, q_id, cx);
+                                })),
+                        )
+                }))
         });
 
         let inner_card = div()
@@ -1007,7 +1095,9 @@ impl Shell {
             }))
             .on_action(cx.listener(
                 move |this, action: &gpui_component::input::Enter, window, cx| {
-                    if action.secondary || action.shift {
+                    if action.secondary && !action.shift {
+                        this.steer_chat_prompt(&submit_key, window, cx);
+                    } else if action.shift {
                         cx.propagate();
                     } else {
                         this.submit_chat_prompt(&submit_key, window, cx);
@@ -1079,6 +1169,7 @@ impl Shell {
             .children(quick_menu)
             .children(model_picker)
             .children(autocomplete_popover)
+            .children(queued_strip)
             .children(attachment_chips)
             .child(
                 Textarea::new(input_state)
@@ -1218,6 +1309,55 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .children(context_ring)
+                            .children(
+                                (matches!(
+                                    primary_action,
+                                    super::ComposerPrimaryAction::Stop { .. }
+                                ) && !draft_empty)
+                                    .then(|| {
+                                        let queue_key = key.clone();
+                                        let steer_key = key.clone();
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "chat-composer-queue-{}",
+                                                    pane.get()
+                                                )))
+                                                .debug_selector(|| "chat-composer-queue".into())
+                                                .label(ctext::QUEUE_HINT.get())
+                                                .xsmall()
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.submit_chat_prompt(
+                                                            &queue_key, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "chat-composer-steer-{}",
+                                                    pane.get()
+                                                )))
+                                                .debug_selector(|| "chat-composer-steer".into())
+                                                .label(ctext::STEER_HINT.get())
+                                                .xsmall()
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.steer_chat_prompt(
+                                                            &steer_key, window, cx,
+                                                        );
+                                                    },
+                                                )),
+                                            )
+                                    }),
+                            )
                             .child({
                                 match primary_action {
                                     super::ComposerPrimaryAction::Stop { latched } => Button::new(
@@ -1326,6 +1466,54 @@ impl Shell {
                 ui::error_banner(palette, ctext::MULTILINE_BLOCKED.get())
                     .id("chat-multiline-error")
                     .debug_selector(|| "chat-multiline-error".into())
+                    .into_any_element(),
+            );
+        }
+        if self
+            .chat
+            .logs
+            .get(key)
+            .is_some_and(|log| log.meta.rate_limited)
+        {
+            notices.push(
+                div()
+                    .id("chat-rate-limit-banner")
+                    .debug_selector(|| "chat-rate-limit-banner".into())
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(palette.warning)
+                    .bg(palette.warning.opacity(0.14))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(palette.warning_foreground)
+                            .child(ctext::RATE_LIMIT_BANNER.get()),
+                    )
+                    .child(
+                        Button::new("chat-switch-account")
+                            .debug_selector(|| "chat-switch-account".into())
+                            .label(ctext::SWITCH_ACCOUNT.get())
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(
+                                    krill_app::settings::AdminTab::Accounts,
+                                    Some(window),
+                                    cx,
+                                );
+                            })),
+                    )
                     .into_any_element(),
             );
         }

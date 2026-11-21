@@ -2334,6 +2334,17 @@ catalog! {
         FIND_COUNT => ("{cur}/{total}", "{cur}/{total}"),
         EARLIER_HISTORY_CAP => ("최근 {n}개 항목까지만 채팅에 표시됩니다.", "Showing the latest {n} items."),
         SWITCH_TO_CHAT => ("채팅 보기로 전환", "Switch to Chat view"),
+        QUEUED_N => ("대기 중 ({n})", "Queued ({n})"),
+        QUEUE_HINT => ("대기열 추가", "Queue"),
+        STEER_HINT => ("즉시 개입", "Steer"),
+        REMOVE_QUEUED => ("대기 메시지 취소", "Remove queued prompt"),
+        RUN_CHANGED_FILES => ("파일 {files}개 변경 (+{added} -{deleted})", "Changed {files} file(s) (+{added} -{deleted})"),
+        UNREAD_DIVIDER => ("새 메시지", "New"),
+        RATE_LIMIT_BANNER => ("사용량 한도에 도달했습니다. 다른 계정으로 전환해 계속하세요.", "Rate limit reached — switch accounts to continue."),
+        SWITCH_ACCOUNT => ("계정 전환", "Switch account"),
+        PLAN_APPROVAL_BADGE => ("계획 승인", "Plan approval"),
+        OTHER_OPTION_PLACEHOLDER => ("직접 입력…", "Other…"),
+        OTHER_SUBMIT => ("전송", "Send"),
     }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),

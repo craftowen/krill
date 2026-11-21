@@ -917,6 +917,121 @@ pub(super) fn user_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Parses a daemon `command_catalog` JSON workflow response into filtered `AutocompleteCandidate` items.
+pub(super) fn parse_remote_slash_items(
+    raw: &str,
+    query: &str,
+) -> Option<Vec<AutocompleteCandidate>> {
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let items = root.pointer("/data/items")?.as_array()?;
+    let query_lower = strip_control_chars(query).to_lowercase();
+    let mut candidates = Vec::new();
+    for entry in items {
+        let raw_name = entry
+            .get("text")
+            .or_else(|| entry.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let clean = strip_control_chars(raw_name).trim().to_owned();
+        if clean.is_empty() {
+            continue;
+        }
+        let label = if clean.starts_with('/') || clean.starts_with('$') {
+            clean
+        } else {
+            format!("/{clean}")
+        };
+        let desc = strip_control_chars(
+            entry
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        );
+        if !query_lower.is_empty()
+            && !label.to_lowercase().contains(&query_lower)
+            && !desc.to_lowercase().contains(&query_lower)
+        {
+            continue;
+        }
+        let source = match entry
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "skill" => AutocompleteSource::Skill,
+            "command"
+                if entry.get("scope").and_then(serde_json::Value::as_str) == Some("Built-in") =>
+            {
+                AutocompleteSource::Builtin
+            }
+            _ => AutocompleteSource::Command,
+        };
+        candidates.push(AutocompleteCandidate {
+            insert_text: format!("{label} "),
+            label,
+            detail: desc,
+            source,
+        });
+        if candidates.len() >= MAX_AUTOCOMPLETE_ITEMS {
+            break;
+        }
+    }
+    Some(candidates)
+}
+
+/// Parses a daemon `mention_files` JSON workflow response into safe relative `AutocompleteCandidate` items.
+pub(super) fn parse_remote_mention_items(
+    raw: &str,
+    query: &str,
+) -> Option<Vec<AutocompleteCandidate>> {
+    let root: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if root.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let items = root.pointer("/data/items")?.as_array()?;
+    let query_lower = strip_control_chars(query).to_lowercase();
+    let mut candidates = Vec::new();
+    for entry in items {
+        let raw_path = entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let clean = strip_control_chars(raw_path).trim().to_owned();
+        if clean.is_empty()
+            || clean.starts_with('/')
+            || clean.contains('\\')
+            || Path::new(&clean)
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            continue;
+        }
+        if !query_lower.is_empty() && !clean.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+        let insert_text = if clean.contains(char::is_whitespace) {
+            format!("@\"{clean}\" ")
+        } else {
+            format!("@{clean} ")
+        };
+        candidates.push(AutocompleteCandidate {
+            label: clean,
+            detail: String::new(),
+            insert_text,
+            source: AutocompleteSource::File,
+        });
+        if candidates.len() >= MAX_AUTOCOMPLETE_ITEMS {
+            break;
+        }
+    }
+    Some(candidates)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -84,11 +84,40 @@ fn screen_matches(item: &ChatItem, rows: &[Vec<Cell>]) -> bool {
                 .is_some()
         }
         ChatItemKind::Permission => {
-            text.chars().count() >= 8
+            if text.chars().count() >= 8
                 && screen.contains(&text)
                 && ["(y/n)", "[y/n]"]
                     .iter()
                     .any(|hint| screen.to_lowercase().contains(hint))
+            {
+                return true;
+            }
+            if let Some(detected) = krill_proto::screen::prompt::detect(rows) {
+                let prompt_text = match &detected {
+                    krill_proto::screen::prompt::PromptKind::YesNo { prompt }
+                    | krill_proto::screen::prompt::PromptKind::NumberedMenu { prompt, .. } => {
+                        normalized(prompt)
+                    }
+                };
+                if item.tool_name.eq_ignore_ascii_case("ExitPlanMode")
+                    && matches!(
+                        detected,
+                        krill_proto::screen::prompt::PromptKind::NumberedMenu {
+                            is_plan_approval: true,
+                            ..
+                        }
+                    )
+                {
+                    return true;
+                }
+                if (!text.is_empty() && (screen.contains(&text) || prompt_text.contains(&text)))
+                    || (!title.is_empty()
+                        && (screen.contains(&title) || prompt_text.contains(&title)))
+                {
+                    return true;
+                }
+            }
+            false
         }
         _ => false,
     }
@@ -279,6 +308,125 @@ impl Shell {
         self.start_chat_request(request, steps, cx);
     }
 
+    pub(super) fn answer_chat_question_other(
+        &mut self,
+        request: RequestIdentity,
+        option_index: usize,
+        custom_text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = custom_text.trim();
+        if request.item.kind != ChatItemKind::Question
+            || trimmed.is_empty()
+            || trimmed.len() > 4096
+            || trimmed.chars().any(char::is_control)
+            || option_index >= request.item.options.len()
+        {
+            return;
+        }
+        if !self.chat_request_is_current(&request, cx)
+            || self.chat.logs.get(&request.chat_key()).is_some_and(|log| {
+                log.submissions
+                    .get(&request.key)
+                    .is_some_and(Submission::blocks_input)
+            })
+        {
+            return;
+        }
+        let Some(live) = self.live.get(&request.pane) else {
+            return;
+        };
+        let rows = &live.pane.screen().rows;
+        let bracketed = live
+            .pane
+            .modes()
+            .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
+        let expected = if request.item.text.trim().is_empty() {
+            request.item.title.as_str()
+        } else {
+            request.item.text.as_str()
+        };
+        if let Ok(steps) = krill_proto::screen::prompt::verify_and_plan(
+            rows,
+            expected,
+            &krill_proto::screen::prompt::PromptReply::Other {
+                option_index,
+                text: trimmed.to_owned(),
+            },
+            bracketed,
+        ) {
+            self.start_chat_request(request, steps, cx);
+            return;
+        }
+        // Fallback for unnumbered AskUserQuestion menus matching exact option labels.
+        let labels: Vec<String> = request
+            .item
+            .options
+            .iter()
+            .map(|opt| opt.label.clone())
+            .collect();
+        let Some(mut cursor) = detect_question_cursor_index(rows, &labels) else {
+            return;
+        };
+        let mut steps = Vec::new();
+        step_cursor(&mut steps, &mut cursor, option_index);
+        if request.item.multi_select {
+            steps.push(b" ".to_vec());
+        } else {
+            steps.push(b"\r".to_vec());
+        }
+        let payload = if bracketed {
+            format!("\x1b[200~{trimmed}\x1b[201~").into_bytes()
+        } else {
+            trimmed.as_bytes().to_vec()
+        };
+        steps.push(payload);
+        steps.push(b"\r".to_vec());
+        self.start_chat_request(request, steps, cx);
+    }
+
+    pub(super) fn approve_chat_permission_choice(
+        &mut self,
+        request: RequestIdentity,
+        choice_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if request.item.kind != ChatItemKind::Permission {
+            return;
+        }
+        if !self.chat_request_is_current(&request, cx) {
+            return;
+        }
+        let Some(live) = self.live.get(&request.pane) else {
+            return;
+        };
+        let rows = &live.pane.screen().rows;
+        let bracketed = live
+            .pane
+            .modes()
+            .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
+        let Some(detected) = krill_proto::screen::prompt::detect(rows) else {
+            return;
+        };
+        let expected = match &detected {
+            krill_proto::screen::prompt::PromptKind::NumberedMenu { prompt, .. }
+                if !prompt.trim().is_empty() =>
+            {
+                prompt.clone()
+            }
+            _ => request.item.text.clone(),
+        };
+        let Ok(steps) = krill_proto::screen::prompt::verify_and_plan(
+            rows,
+            &expected,
+            &krill_proto::screen::prompt::PromptReply::Choice(choice_idx),
+            bracketed,
+        ) else {
+            return;
+        };
+        self.start_chat_request(request, steps, cx);
+    }
+
     pub(super) fn approve_chat_permission(
         &mut self,
         request: RequestIdentity,
@@ -287,6 +435,49 @@ impl Shell {
     ) {
         if request.item.kind != ChatItemKind::Permission {
             return;
+        }
+        if let Some(live) = self.live.get(&request.pane)
+            && let Some(krill_proto::screen::prompt::PromptKind::NumberedMenu {
+                prompt,
+                options,
+                ..
+            }) = krill_proto::screen::prompt::detect(&live.pane.screen().rows)
+            && !options.is_empty()
+        {
+            let choice_idx = if yes {
+                0
+            } else {
+                options
+                    .iter()
+                    .rposition(|opt| {
+                        let lower = opt.label.to_ascii_lowercase();
+                        lower == "no"
+                            || lower.starts_with("no,")
+                            || lower.contains("reject")
+                            || lower.contains("cancel")
+                            || lower.contains("keep planning")
+                    })
+                    .unwrap_or_else(|| options.len().saturating_sub(1))
+            };
+            let expected = if prompt.trim().is_empty() {
+                request.item.text.clone()
+            } else {
+                prompt
+            };
+            let rows = &live.pane.screen().rows;
+            let bracketed = live
+                .pane
+                .modes()
+                .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
+            if let Ok(steps) = krill_proto::screen::prompt::verify_and_plan(
+                rows,
+                &expected,
+                &krill_proto::screen::prompt::PromptReply::Choice(choice_idx),
+                bracketed,
+            ) {
+                self.start_chat_request(request, steps, cx);
+                return;
+            }
         }
         self.start_chat_request(
             request,

@@ -6,9 +6,9 @@
 //! 정규화된 `ChatItem` 카드 스트림·인터랙티브 질문 카드·권한 승인 카드·하단 Live Activity Strip을
 //! 렌더링하고 1-클릭으로 `[Chat | Term]` 양방향 전환을 제공한다.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement as _,
@@ -64,6 +64,10 @@ pub(crate) struct ComposerModelItem {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Tracks independent provider capability, loading, and rate-limit flags on ComposerMeta."
+)]
 pub(crate) struct ComposerMeta {
     pub model: Option<String>,
     pub model_label: Option<String>,
@@ -76,6 +80,8 @@ pub(crate) struct ComposerMeta {
     pub effort_supported: bool,
     pub reason: Option<String>,
     pub pending: bool,
+    pub rate_limited: bool,
+    pub live_prompt: Option<krill_proto::screen::prompt::PromptKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +146,14 @@ pub(crate) struct PendingChatPrompt {
     pub status: PendingStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedChatPrompt {
+    pub id: u64,
+    pub display_text: String,
+    pub submitted_payload: String,
+    pub attachments: Vec<DraftAttachment>,
+}
+
 #[derive(Default)]
 pub(crate) struct SessionChatLog {
     pub agent: String,
@@ -166,6 +180,8 @@ pub(crate) struct SessionChatLog {
     submissions: BTreeMap<String, Submission>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
     consumed_user_indices: BTreeSet<usize>,
+    pub queued_prompts: VecDeque<QueuedChatPrompt>,
+    pub unread_from: Option<usize>,
 }
 
 impl SessionChatLog {
@@ -174,7 +190,11 @@ impl SessionChatLog {
             if self.items.is_empty() {
                 work_run::DisplayFeed::empty()
             } else {
-                Arc::new(work_run::DisplayFeed::project(self.base_index, &self.items))
+                Arc::new(work_run::DisplayFeed::project_with_unread(
+                    self.base_index,
+                    &self.items,
+                    self.unread_from,
+                ))
             }
         }))
     }
@@ -261,6 +281,8 @@ impl SessionChatLog {
         self.multi_selected.clear();
         self.submissions.clear();
         self.consumed_user_indices.clear();
+        self.queued_prompts.clear();
+        self.unread_from = None;
     }
 
     pub(super) fn prepend_earlier(&mut self, older: Vec<ChatItem>, next_earlier: Option<u64>) {
@@ -501,6 +523,10 @@ pub(crate) struct ChatState {
     multiline_blocked: BTreeSet<ChatKey>,
     pub(super) interrupt_latched: std::collections::HashSet<ChatKey>,
     interrupt_turn_since: std::collections::HashMap<ChatKey, u64>,
+    pub(super) stop_cooldown_since: BTreeMap<ChatKey, u64>,
+    stop_cooldown_timers: BTreeMap<ChatKey, Task<()>>,
+    pub(super) question_other_inputs:
+        BTreeMap<String, gpui::Entity<gpui_component::input::InputState>>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
     #[cfg(test)]
@@ -582,11 +608,56 @@ fn parse_chat_page(raw: &str) -> Option<ChatPage> {
         return None;
     }
     let data = root.get("data")?;
+    let mut snapshot: ChatPollSnapshot = serde_json::from_value(data.clone()).ok()?;
+    if let Some(raw_items) = data.get("items").and_then(serde_json::Value::as_array) {
+        for (item, raw_item) in snapshot.items.iter_mut().zip(raw_items.iter()) {
+            if let Some(at) = raw_item
+                .get("at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                at.clone_into(&mut item.at);
+            }
+        }
+    }
     Some(ChatPage {
         start: data.get("page_start")?.as_u64()?,
         has_earlier: data.get("has_earlier")?.as_bool()?,
-        snapshot: serde_json::from_value(data.clone()).ok()?,
+        snapshot,
     })
+}
+
+/// Formats an RFC 3339 or numeric epoch timestamp string into a concise `HH:MM` clock label.
+pub(super) fn format_chat_timestamp(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((_, clock)) = trimmed.split_once(['T', 't'])
+        && clock.len() >= 5
+        && clock.as_bytes().get(2) == Some(&b':')
+        && clock
+            .get(..2)
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_digit()))
+        && clock
+            .get(3..5)
+            .is_some_and(|m| m.bytes().all(|b| b.is_ascii_digit()))
+        && trimmed.contains(['+', '-'])
+        && !trimmed.ends_with(['Z', 'z'])
+    {
+        return clock.get(..5).map(str::to_owned);
+    }
+    let parsed = krill_proto::time::parse_reset_epoch(trimmed)?;
+    let secs = if parsed > 10_000_000_000 {
+        parsed / 1_000
+    } else {
+        parsed
+    };
+    let day_secs = secs.rem_euclid(86_400);
+    let hour = day_secs / 3_600;
+    let minute = (day_secs % 3_600) / 60;
+    Some(format!("{hour:02}:{minute:02}"))
 }
 
 fn ratio_percent(used: u64, limit: u64) -> Option<u8> {
@@ -653,32 +724,90 @@ pub(crate) fn parse_transcript_record(record: &serde_json::Value, meta: &mut Com
     }
 }
 
+const TRANSCRIPT_META_TTL: Duration = Duration::from_secs(300);
+const TRANSCRIPT_META_CACHE_CAP: usize = 64;
+
+type TranscriptFileStamp = Option<(Option<SystemTime>, u64)>;
+
+#[derive(Clone)]
+struct CachedTranscriptMeta {
+    stamp: TranscriptFileStamp,
+    at: Instant,
+    meta: ComposerMeta,
+}
+
+type TranscriptMetaCache = Mutex<HashMap<String, CachedTranscriptMeta>>;
+
+fn transcript_meta_cache() -> &'static TranscriptMetaCache {
+    static CACHE: OnceLock<TranscriptMetaCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn observe_transcript_meta_cached(transcript_path: &str) -> ComposerMeta {
+    if transcript_path.is_empty() {
+        return ComposerMeta::default();
+    }
+    let Ok(mut file) = std::fs::File::open(transcript_path) else {
+        return ComposerMeta::default();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return ComposerMeta::default();
+    };
+    let len = metadata.len();
+    let stamp = Some((metadata.modified().ok(), len));
+    if let Ok(guard) = transcript_meta_cache().lock()
+        && let Some(cached) = guard.get(transcript_path)
+        && cached.at.elapsed() < TRANSCRIPT_META_TTL
+        && cached.stamp == stamp
+    {
+        return cached.meta.clone();
+    }
+
+    let mut meta = ComposerMeta::default();
+    let tail_bytes = 64 * 1024;
+    let start = len.saturating_sub(tail_bytes);
+    if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).is_ok() {
+        let mut buf = Vec::new();
+        if std::io::Read::read_to_end(&mut std::io::Read::take(file, tail_bytes), &mut buf).is_ok()
+        {
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines().skip(usize::from(start > 0)) {
+                if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+                    parse_transcript_record(&record, &mut meta);
+                }
+            }
+        }
+    }
+    if let Ok(mut guard) = transcript_meta_cache().lock() {
+        if guard.len() >= TRANSCRIPT_META_CACHE_CAP {
+            guard.retain(|_, v| v.at.elapsed() < TRANSCRIPT_META_TTL);
+            if guard.len() >= TRANSCRIPT_META_CACHE_CAP
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, v)| v.at)
+                    .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(
+            transcript_path.to_owned(),
+            CachedTranscriptMeta {
+                stamp,
+                at: Instant::now(),
+                meta: meta.clone(),
+            },
+        );
+    }
+    meta
+}
+
 pub(crate) fn observe_composer_meta(
     state_dir: Option<&std::path::Path>,
     session_id: &str,
     transcript_path: &str,
 ) -> ComposerMeta {
-    let mut meta = ComposerMeta::default();
-    if !transcript_path.is_empty()
-        && let Ok(mut file) = std::fs::File::open(transcript_path)
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        if let Ok(len) = file.metadata().map(|m| m.len()) {
-            let tail_bytes = 64 * 1024;
-            let start = len.saturating_sub(tail_bytes);
-            if file.seek(SeekFrom::Start(start)).is_ok() {
-                let mut buf = Vec::new();
-                if file.take(tail_bytes).read_to_end(&mut buf).is_ok() {
-                    let text = String::from_utf8_lossy(&buf);
-                    for line in text.lines().skip(usize::from(start > 0)) {
-                        if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                            parse_transcript_record(&record, &mut meta);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut meta = observe_transcript_meta_cached(transcript_path);
 
     if let Some(state_dir) = state_dir {
         // The statusline record is the agent's own report, so it beats the transcript. Session ids
@@ -832,6 +961,19 @@ pub(crate) fn apply_composer_status_json(raw: &str, meta: &mut ComposerMeta) -> 
         if !parsed.is_empty() {
             meta.efforts = parsed;
         }
+    }
+    if let Some(rate_limited) = data
+        .get("rate_limited")
+        .and_then(serde_json::Value::as_bool)
+    {
+        meta.rate_limited = rate_limited;
+    }
+    if let Some(live_prompt) = data.get("live_prompt") {
+        meta.live_prompt = if live_prompt.is_null() {
+            None
+        } else {
+            serde_json::from_value(live_prompt.clone()).ok()
+        };
     }
     agent
 }
@@ -1456,6 +1598,7 @@ impl Shell {
                         this.chat.poll_failed.remove(&key);
                         this.apply_chat_tail(session, host, page, meta, agent_state, now);
                         this.refresh_chat_composer(&key, false, cx);
+                        this.flush_queued_chat_prompt_if_ready(&key, cx);
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
                     {
@@ -1478,6 +1621,7 @@ impl Shell {
                         if refresh_composer {
                             this.refresh_chat_composer(&key, false, cx);
                         }
+                        this.flush_queued_chat_prompt_if_ready(&key, cx);
                     } else {
                         this.chat.poll_failed.insert(key.clone());
                     }
@@ -1730,8 +1874,23 @@ impl Shell {
                 log.meta.context_percent = observed.context_percent;
             }
         }
+        let is_scrolled_up = self.chat.lists.iter().any(|((_, sid), list)| {
+            *sid == session && list.host == key.0 && !list.state.is_following_tail()
+        });
+        let has_list_following = self.chat.lists.iter().any(|((_, sid), list)| {
+            *sid == session && list.host == key.0 && list.state.is_following_tail()
+        });
+        let log = self.chat.logs.entry(key.clone()).or_default();
         if !snap.items.is_empty() {
+            let old_end_abs = log.base_index.saturating_add(log.items.len());
+            if !initial_bind && !reset && is_scrolled_up {
+                log.unread_from.get_or_insert(old_end_abs);
+            } else if has_list_following {
+                log.unread_from = None;
+            }
             log.append_and_trim(snap.items, MAX_CHAT_KEPT);
+        } else if has_list_following && log.unread_from.take().is_some() {
+            log.cached_feed = None;
         }
         log.sync_timing(agent_state, now);
         log.offset = snap.next_offset;
@@ -2200,16 +2359,106 @@ impl Shell {
         }
     }
 
+    pub(super) fn ensure_question_other_input(
+        &mut self,
+        answer_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<gpui_component::input::InputState> {
+        if let Some(existing) = self.chat.question_other_inputs.get(answer_key) {
+            return existing.clone();
+        }
+        let state = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(ctext::OTHER_OPTION_PLACEHOLDER.get())
+        });
+        self.chat
+            .question_other_inputs
+            .insert(answer_key.to_owned(), state.clone());
+        state
+    }
+
+    pub(super) fn mark_chat_read(&mut self, key: &ChatKey) {
+        if let Some(log) = self.chat.logs.get_mut(key)
+            && log.unread_from.take().is_some()
+        {
+            log.cached_feed = None;
+            log.revision = log.revision.wrapping_add(1);
+        }
+    }
+
+    pub(super) fn steer_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_chat_prompt_with_mode(key, true, window, cx);
+    }
+
     pub(super) fn submit_chat_prompt(
         &mut self,
         key: &ChatKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.submit_chat_prompt_with_mode(key, false, window, cx);
+    }
+
+    fn submit_chat_prompt_with_mode(
+        &mut self,
+        key: &ChatKey,
+        steer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_state = self.session_agent_state(&key.0, key.1, cx);
+        let working = agent_state == krill_proto::control::AgentState::Working;
+        if working && !steer {
+            let Some((input, _)) = self.chat.inputs.get(key) else {
+                return;
+            };
+            let input = input.clone();
+            if Self::chat_input_is_composing(&input, window, cx) {
+                return;
+            }
+            let display_text = input.read(cx).value().to_string();
+            let attachments = self
+                .chat
+                .draft_attachments
+                .get(key)
+                .cloned()
+                .unwrap_or_default();
+            let Some(submitted_payload) = build_submitted_chat_payload(&display_text, &attachments)
+            else {
+                return;
+            };
+            self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
+            let queued_id = self.chat.next_pending_id;
+            input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+            self.chat.draft_attachments.remove(key);
+            if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                ac.close();
+                ac.dismissed = None;
+            }
+            self.chat
+                .logs
+                .entry(key.clone())
+                .or_default()
+                .queued_prompts
+                .push_back(QueuedChatPrompt {
+                    id: queued_id,
+                    display_text,
+                    submitted_payload,
+                    attachments,
+                });
+            self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+            cx.notify();
+            return;
+        }
         if self.chat.prompt_tasks.contains_key(key)
             || self.chat.prompt_review.contains(key)
-            || self.session_agent_state(&key.0, key.1, cx)
-                == krill_proto::control::AgentState::Working
+            || (!steer && working)
             || self
                 .chat_pane(key)
                 .is_some_and(|pane| self.paste_queue.has_pending_for(pane))
@@ -2432,6 +2681,135 @@ impl Shell {
                 .is_none_or(|&latched_since| latched_since == since)
     }
 
+    pub(super) fn remove_queued_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        queued_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(log) = self.chat.logs.get_mut(key) {
+            let before = log.queued_prompts.len();
+            log.queued_prompts.retain(|q| q.id != queued_id);
+            if log.queued_prompts.len() != before {
+                self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn flush_queued_chat_prompt_if_ready(
+        &mut self,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.prompt_tasks.contains_key(key) || self.chat.prompt_review.contains(key) {
+            return;
+        }
+        let agent_state = self.session_agent_state(&key.0, key.1, cx);
+        if matches!(
+            agent_state,
+            krill_proto::control::AgentState::Working
+                | krill_proto::control::AgentState::Waiting
+                | krill_proto::control::AgentState::Blocked
+                | krill_proto::control::AgentState::Exited
+        ) {
+            return;
+        }
+        let Some(pane) = self.chat_pane(key) else {
+            return;
+        };
+        if self.paste_queue.has_pending_for(pane) {
+            return;
+        }
+        let Some(queued) = self
+            .chat
+            .logs
+            .get_mut(key)
+            .and_then(|log| log.queued_prompts.pop_front())
+        else {
+            return;
+        };
+        let session = key.1;
+        let modes = self
+            .live
+            .get(&pane)
+            .map_or_else(Default::default, |live| live.pane.modes());
+        let krill_app::security::PastePlan::Immediate(mut bytes) =
+            self.plan_terminal_paste(pane, queued.submitted_payload.as_bytes(), modes, cx)
+        else {
+            if let Some(log) = self.chat.logs.get_mut(key) {
+                log.queued_prompts.push_front(queued);
+            }
+            self.chat.multiline_blocked.insert(key.clone());
+            cx.notify();
+            return;
+        };
+        self.chat.multiline_blocked.remove(key);
+        let (origin_epoch, origin_item) = self.chat.logs.get(key).map_or((0, 0), |l| {
+            (l.epoch, l.base_index.saturating_add(l.items.len()))
+        });
+        let pending_id = queued.id;
+        let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
+            || queued.submitted_payload.contains(['\n', '\r']);
+        self.chat
+            .pending_prompts
+            .entry(key.clone())
+            .or_default()
+            .push(PendingChatPrompt {
+                id: pending_id,
+                origin_item,
+                submitted_payload: queued.submitted_payload,
+                display_text: queued.display_text,
+                attachments: queued.attachments,
+                status: PendingStatus::Sending,
+            });
+        self.chat
+            .pending_epochs
+            .insert((key.clone(), pending_id), origin_epoch);
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        if !bracketed {
+            bytes.push(b'\r');
+        }
+        if !self.send_to_chat_pane(pane, session, &bytes, cx) {
+            self.confirm_pending_prompt(key, pending_id);
+            self.chat.prompt_failed.insert(key.clone());
+            cx.notify();
+            return;
+        }
+        if bracketed {
+            let task_key = key.clone();
+            let task = cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(krill_proto::input::PASTE_SUBMIT_DELAY)
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.chat.prompt_tasks.remove(&task_key);
+                    let ok = this.send_to_chat_pane(pane, session, b"\r", cx);
+                    if ok {
+                        this.confirm_pending_prompt(&task_key, pending_id);
+                    } else {
+                        this.chat.prompt_failed.insert(task_key.clone());
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.chat.prompt_tasks.insert(key.clone(), task);
+        } else {
+            self.confirm_pending_prompt(key, pending_id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn is_chat_stop_cooldown(&self, key: &ChatKey, cx: &gpui::App) -> bool {
+        let Some(&cooldown_since) = self.chat.stop_cooldown_since.get(key) else {
+            return false;
+        };
+        self.session_status(key, cx).is_some_and(|(state, since)| {
+            state == krill_proto::control::AgentState::Working && since == cooldown_since
+        })
+    }
+
     pub(super) fn is_chat_interrupt_latched(&self, key: &ChatKey, cx: &gpui::App) -> bool {
         self.chat.interrupt_latched.contains(key)
             && self.session_status(key, cx).is_some_and(|(state, since)| {
@@ -2440,7 +2818,10 @@ impl Shell {
     }
 
     pub(super) fn sync_chat_interrupt_latches(&mut self, cx: &gpui::App) {
-        if self.chat.interrupt_latched.is_empty() && self.chat.interrupt_turn_since.is_empty() {
+        if self.chat.interrupt_latched.is_empty()
+            && self.chat.interrupt_turn_since.is_empty()
+            && self.chat.stop_cooldown_since.is_empty()
+        {
             return;
         }
         let sidebar = self.sidebar.read(cx);
@@ -2454,6 +2835,12 @@ impl Shell {
         self.chat
             .interrupt_turn_since
             .retain(|key, _| latched.contains(key));
+        self.chat.stop_cooldown_since.retain(|key, &mut cd_since| {
+            sidebar.session_on(&key.0, key.1).is_some_and(|s| {
+                s.status.state == krill_proto::control::AgentState::Working
+                    && s.status.since_unix_ns == cd_since
+            })
+        });
     }
 
     pub(super) fn interrupt_chat_turn(&mut self, key: &ChatKey, cx: &mut Context<Self>) -> bool {
@@ -2463,7 +2850,10 @@ impl Shell {
         else {
             return false;
         };
-        if self.chat.interrupt_latched.contains(key) || self.chat.prompt_tasks.contains_key(key) {
+        if self.chat.interrupt_latched.contains(key)
+            || self.is_chat_stop_cooldown(key, cx)
+            || self.chat.prompt_tasks.contains_key(key)
+        {
             return false;
         }
         let Some(pane) = self.chat_pane(key) else {
@@ -2479,6 +2869,20 @@ impl Shell {
         self.chat
             .interrupt_turn_since
             .insert(key.clone(), since_unix_ns);
+        self.chat
+            .stop_cooldown_since
+            .insert(key.clone(), since_unix_ns);
+        let cd_key = key.clone();
+        let cd_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| {
+                this.chat.stop_cooldown_since.remove(&cd_key);
+                this.chat.stop_cooldown_timers.remove(&cd_key);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.chat.stop_cooldown_timers.insert(key.clone(), cd_task);
         cx.notify();
         true
     }
@@ -3396,12 +3800,17 @@ impl Shell {
             }
         }
         let is_local = key.0.is_local();
+        let remote_call = (!is_local)
+            .then(|| self.workflow_call_for_key(key))
+            .flatten();
+        let session_u64 = key.1.0;
         let cwd = if is_local {
             self.chat_pane(key).and_then(|pane| self.pane_cwd(pane, cx))
         } else {
             None
         };
-        if trigger.kind == catalog::AutocompleteKind::File && cwd.is_none() {
+        if trigger.kind == catalog::AutocompleteKind::File && cwd.is_none() && remote_call.is_none()
+        {
             if let Some(ac) = self.chat.autocomplete.get_mut(key) {
                 ac.close();
             }
@@ -3455,15 +3864,40 @@ impl Shell {
                     match trigger_kind {
                         catalog::AutocompleteKind::File => match cwd {
                             Some(dir) => catalog::scan_workspace_files(&dir, &query),
-                            None => Vec::new(),
+                            None => remote_call
+                                .and_then(|call| {
+                                    let req = serde_json::json!({
+                                        "action": "mention_files",
+                                        "session": session_u64,
+                                        "query": query,
+                                    })
+                                    .to_string();
+                                    catalog::parse_remote_mention_items(&call(&req).ok()?, &query)
+                                })
+                                .unwrap_or_default(),
                         },
-                        catalog::AutocompleteKind::Slash => catalog::scan_slash_catalog(
-                            home.as_deref(),
-                            cwd.as_deref(),
-                            &agent,
-                            is_local,
-                            &query,
-                        ),
+                        catalog::AutocompleteKind::Slash => {
+                            if let Some(call) = remote_call {
+                                let req = serde_json::json!({
+                                    "action": "command_catalog",
+                                    "session": session_u64,
+                                })
+                                .to_string();
+                                if let Some(remote_items) = call(&req)
+                                    .ok()
+                                    .and_then(|raw| catalog::parse_remote_slash_items(&raw, &query))
+                                {
+                                    return remote_items;
+                                }
+                            }
+                            catalog::scan_slash_catalog(
+                                home.as_deref(),
+                                cwd.as_deref(),
+                                &agent,
+                                is_local,
+                                &query,
+                            )
+                        }
                     }
                 })
                 .await;
@@ -3798,5 +4232,6 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
                     .iter()
                     .any(|sec| sec.text.to_lowercase().contains(query_lower))
         }),
+        work_run::DisplayRow::UnreadDivider { .. } => false,
     }
 }
