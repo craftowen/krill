@@ -10,6 +10,7 @@ mod connectors;
 mod groups;
 mod items;
 pub mod new_bot;
+mod panel;
 pub mod rpc;
 mod settings;
 mod soul_memory;
@@ -113,6 +114,9 @@ pub struct View {
     available_hosts: Vec<(HostId, String, Option<HostTarget>)>,
     default_cwd: Option<PathBuf>,
     bots: Vec<BotConfig>,
+    /// When `ListBots` last answered. Until then this view knows nothing about the bot list
+    /// and must not report one (an empty list would wipe the sidebar's bots).
+    bots_loaded_at_ms: Option<u64>,
     selected_bot_id: Option<BotId>,
     pending_switch_bot: Option<BotId>,
     screen: Screen,
@@ -153,6 +157,14 @@ pub struct View {
     oauth_poll_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     language: crate::i18n::Language,
+    /// Drawn as the modal or as a bot page's right-sidebar body (see `panel.rs`).
+    mode: Mode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Modal,
+    Panel,
 }
 
 impl EventEmitter<Close> for View {}
@@ -227,6 +239,7 @@ impl View {
             available_hosts: Vec::new(),
             default_cwd,
             bots: Vec::new(),
+            bots_loaded_at_ms: None,
             selected_bot_id: None,
             pending_switch_bot: None,
             screen: Screen::Detail,
@@ -267,6 +280,7 @@ impl View {
             oauth_poll_task: None,
             avatar_task: None,
             language: crate::i18n::language(),
+            mode: Mode::Modal,
         }
     }
 
@@ -376,6 +390,9 @@ impl View {
     }
 
     pub(super) fn emit_badge(&self, cx: &mut Context<Self>) {
+        if self.bots_loaded_at_ms.is_none() {
+            return;
+        }
         let snapshot = self.sidebar_snapshot();
         cx.emit(BadgeChanged {
             attention_count: snapshot.attention,
@@ -384,6 +401,9 @@ impl View {
     }
 
     pub(super) fn emit_sessions_changed(&self, cx: &mut Context<Self>) {
+        if self.bots_loaded_at_ms.is_none() {
+            return;
+        }
         let mut sessions = BTreeMap::new();
         for summary in &self.bot_sessions {
             if let Some(meta) = self.session_meta_for(&summary.bot_id) {
@@ -501,6 +521,7 @@ impl View {
                 match outcome {
                     Ok((bots, open_items, statuses, access, relay, sessions, warnings)) => {
                         this.bots = bots;
+                        this.bots_loaded_at_ms = Some(now_unix_ms());
                         this.all_open_items = open_items;
                         this.all_connector_statuses = statuses;
                         this.all_access_requests = access;
@@ -2188,6 +2209,74 @@ impl View {
             ))
     }
 
+    /// "Leave without saving?" while a bot switch waits on unsaved soul edits.
+    pub(super) fn render_pending_switch(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        self.pending_switch_bot.clone().map(|target_id| {
+            div().px_5().pt_3().child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.warning.opacity(0.4))
+                    .bg(p.warning.opacity(0.1))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.foreground)
+                            .child(format!(
+                                "{} — {}",
+                                text::DIRTY_LEAVE_TITLE.get(),
+                                text::DIRTY_LEAVE_DESC.get()
+                            )),
+                    )
+                    .child(
+                        ui::controls()
+                            .child(ui::ghost("bots-dirty-cancel", text::CANCEL.get()).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_switch_bot = None;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                ui::primary("bots-dirty-discard", text::DIRTY_DISCARD_BTN.get())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.confirm_select_bot(target_id.clone(), cx);
+                                    })),
+                            ),
+                    ),
+            )
+        })
+    }
+
+    pub(super) fn render_notice(&self, p: &ui::Palette) -> Option<gpui::Div> {
+        self.notice.as_ref().map(|msg| {
+            div().px_5().pt_3().child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.success.opacity(0.3))
+                    .bg(p.success.opacity(0.1))
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.success)
+                    .child(msg.clone()),
+            )
+        })
+    }
+
     pub(super) fn source_label(source: ExternalSource) -> &'static str {
         match source {
             ExternalSource::Telegram => text::CONN_TELEGRAM.get(),
@@ -2244,49 +2333,10 @@ impl Render for View {
             ui::SETTINGS_NAV_WIDTH
         };
 
-        let pending_switch_banner = self.pending_switch_bot.clone().map(|target_id| {
-            div().px_5().pt_3().child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .rounded(ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(p.warning.opacity(0.4))
-                    .bg(p.warning.opacity(0.1))
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.foreground)
-                            .child(format!(
-                                "{} — {}",
-                                text::DIRTY_LEAVE_TITLE.get(),
-                                text::DIRTY_LEAVE_DESC.get()
-                            )),
-                    )
-                    .child(
-                        ui::controls()
-                            .child(ui::ghost("bots-dirty-cancel", text::CANCEL.get()).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.pending_switch_bot = None;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(
-                                ui::primary("bots-dirty-discard", text::DIRTY_DISCARD_BTN.get())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.confirm_select_bot(target_id.clone(), cx);
-                                    })),
-                            ),
-                    ),
-            )
-        });
+        if self.mode == Mode::Panel {
+            return self.render_panel(window, cx).into_any_element();
+        }
+        let pending_switch_banner = self.render_pending_switch(p, cx);
 
         let selected_bot = self.selected_bot().cloned();
         let right_pane = match self.screen {
@@ -2319,20 +2369,7 @@ impl Render for View {
                                 .clone()
                                 .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
-                        .children(self.notice.as_ref().map(|msg| {
-                            div().px_5().pt_3().child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(ui::RADIUS_SM)
-                                    .border_1()
-                                    .border_color(p.success.opacity(0.3))
-                                    .bg(p.success.opacity(0.1))
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.success)
-                                    .child(msg.clone()),
-                            )
-                        }))
+                        .children(self.render_notice(p))
                         .child(tab_body)
                 } else {
                     div()
@@ -2417,6 +2454,7 @@ impl Render for View {
                 .child(layout),
             &self.focus,
         )
+        .into_any_element()
     }
 }
 

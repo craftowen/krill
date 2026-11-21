@@ -742,6 +742,7 @@ impl View {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_3()
                     // Orca's settings card: the bot's face at 40 px, previewing the picked colour.

@@ -62,6 +62,8 @@ pub(super) struct BotUi {
     pub delete: Option<SidebarBot>,
     pub delete_focus: Option<FocusHandle>,
     pub spinners: ui::status::SpinnerSlots,
+    /// The right sidebar of a bot page.
+    pub panel: super::bot_panel::BotPanel,
 }
 
 impl Shell {
@@ -104,7 +106,7 @@ impl Shell {
     }
 
     /// `<state>/bots/<slug>` for bots on this Mac.
-    fn bot_folder(&self, bot: &SidebarBot) -> Option<std::path::PathBuf> {
+    pub(super) fn bot_folder(&self, bot: &SidebarBot) -> Option<std::path::PathBuf> {
         self.launch_host
             .is_local()
             .then(krill_proto::daemon::state_dir)
@@ -248,6 +250,16 @@ impl Shell {
             self.open_bot_session(&bot_id, session, cx);
             return;
         }
+        self.start_bot_session(bot_id, kickoff, cx);
+    }
+
+    /// Starts a new chat for a bot (with `kickoff` as its first turn) and opens it.
+    pub(super) fn start_bot_session(
+        &mut self,
+        bot_id: BotId,
+        kickoff: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(rpc) = self.bot_rpc() else {
             return;
         };
@@ -287,8 +299,10 @@ impl Shell {
                     }) => {
                         // Show the new Home Chat under the bot now; the poll fills in the rest.
                         if let Some(row) = this.sidebar_bots.iter_mut().find(|b| b.id == bot_id) {
+                            // krilld lists the Home Chat first, then newest.
+                            let at = usize::from(row.home_session().is_some());
                             row.sessions.insert(
-                                0,
+                                at,
                                 krill_proto::bots::BotSessionSummary {
                                     session_id,
                                     bot_id: bot_id.clone(),
@@ -317,7 +331,7 @@ impl Shell {
     }
 
     /// Shows one of a bot's sessions as a chat tab, labelled with the bot's identity.
-    fn open_bot_session(
+    pub(super) fn open_bot_session(
         &mut self,
         bot_id: &BotId,
         session: krill_proto::SessionId,
@@ -343,7 +357,7 @@ impl Shell {
         }
     }
 
-    fn set_bot_paused(&mut self, bot_id: BotId, paused: bool, cx: &mut Context<Self>) {
+    pub(super) fn set_bot_paused(&mut self, bot_id: BotId, paused: bool, cx: &mut Context<Self>) {
         let Some(rpc) = self.bot_rpc() else {
             return;
         };
@@ -459,7 +473,7 @@ impl Shell {
             .collect()
     }
 
-    fn bot_avatar(
+    pub(super) fn bot_avatar(
         &self,
         bot: &SidebarBot,
         size: f32,
@@ -475,7 +489,7 @@ impl Shell {
     }
 
     /// Orca's activity line: paused, then needs you, then working, then the bot's job.
-    fn bot_activity(bot: &SidebarBot) -> (String, bool) {
+    pub(super) fn bot_activity(bot: &SidebarBot) -> (String, bool) {
         if bot.paused {
             return (text::PAUSED_BADGE.get().to_owned(), false);
         }
@@ -654,13 +668,7 @@ impl Shell {
         for s in &bot.sessions {
             let active = focused == Some(s.session_id);
             let home = s.link_id.is_none();
-            let title: SharedString = if home {
-                text::SB_HOME_CHAT.get().into()
-            } else if !s.label.trim().is_empty() {
-                s.label.clone().into()
-            } else {
-                s.link_id.clone().unwrap_or_default().into()
-            };
+            let title = super::bot_panel::chat_title(bot, s);
             let bot_id = bot.id.clone();
             let session = s.session_id;
             let id = SharedString::from(format!("bot-chat-{}", s.session_id.0));
@@ -868,7 +876,9 @@ impl Shell {
                     };
                     let id = bot.id.clone();
                     let settings = act(Box::new(move |s, window, cx| {
-                        s.open_bot(Some(id.clone()), Some(window), cx);
+                        if !s.open_bot_settings_in_panel(&id, cx) {
+                            s.open_bot(Some(id.clone()), Some(window), cx);
+                        }
                     }));
                     let id = bot.id.clone();
                     let paused = bot.paused;
@@ -1225,7 +1235,7 @@ impl Shell {
     }
 }
 
-fn now_secs() -> u64 {
+pub(super) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

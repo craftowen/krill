@@ -43,6 +43,7 @@ mod workspaces;
 // 앱의 마지막 생존 시각 저장.
 mod artifacts;
 mod away;
+mod bot_panel;
 mod bot_section;
 
 use krill_proto::os::ffi::OsStringExt as _;
@@ -3203,14 +3204,16 @@ impl Shell {
             return;
         }
         let ws = self.active_workspace(cx);
-        let folder = {
+        // Orca's bot page: the bot folder is the workspace, whatever the chat's cwd says yet.
+        let bot_home = self.focused_bot().and_then(|b| self.bot_folder(b));
+        let folder = bot_home.unwrap_or_else(|| {
             let focused_folder = self.folder();
             if focused_folder.as_os_str().is_empty() {
                 ws.folder
             } else {
                 focused_folder
             }
-        };
+        });
         let target = self.target_for_host(&ws.host);
         self.diff.update(cx, |d, cx| {
             match target {
@@ -6624,6 +6627,10 @@ impl Shell {
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
         }
+        // A bot page shows its Files tab in place of the usual panel tabs.
+        let files_tab_hidden =
+            self.focused_bot().is_some() && self.bot_ui.panel.tab != bot_panel::BotPanelTab::Files;
+        self.bot_ui.panel.tab = bot_panel::BotPanelTab::Files;
         if self.panel_collapsed {
             self.panel_collapsed = false;
             self.layout.panel_collapsed = false;
@@ -6637,7 +6644,8 @@ impl Shell {
             cx.notify();
             return;
         }
-        if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Files {
+        if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Files && !files_tab_hidden
+        {
             self.panel_collapsed = true;
             self.layout.panel_collapsed = true;
             self.save();
@@ -8258,6 +8266,13 @@ impl Render for Shell {
                 0.
             },
         );
+        // Orca's bot page: a chat in a bot's folder gets the bot's own right sidebar.
+        let bot_page = self.focused_bot().cloned();
+        self.sync_bot_files_chrome(bot_page.is_some(), cx);
+        let panel_body = match bot_page.filter(|_| show_panel) {
+            Some(bot) => self.render_bot_panel(&bot, panel_width, window, cx),
+            None => self.diff.clone().into_any_element(),
+        };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
 
@@ -8804,7 +8819,7 @@ impl Render for Shell {
                                 .flex()
                                 .flex_col()
                                 .bg(sidebar_bg)
-                                .child(div().flex_1().min_h_0().child(self.diff.clone())),
+                                .child(div().flex_1().min_h_0().child(panel_body)),
                         )
                     }),
             )

@@ -7271,6 +7271,8 @@ fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mu
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));
     let requests: Arc<std::sync::Mutex<Vec<krill_proto::bots::BotRpcRequest>>> = Arc::default();
     let seen = requests.clone();
+    // Like krilld, a created bot is in the next bot list.
+    let made: Arc<std::sync::Mutex<Vec<krill_proto::bots::BotConfig>>> = Arc::default();
     let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
         use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
         seen.lock().unwrap().push(req.clone());
@@ -7285,6 +7287,7 @@ fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mu
                 .unwrap();
                 cfg.avatar.clone_from(&p.base.avatar);
                 cfg.avatar_color.clone_from(&p.avatar_color);
+                made.lock().unwrap().push(cfg.clone());
                 BotRpcResponse::Bot(Box::new(cfg))
             }
             BotRpcRequest::StartBotSession { bot_id, .. } => BotRpcResponse::SessionStarted {
@@ -7292,7 +7295,7 @@ fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mu
                 session_id: SessionId(501),
                 pid: 9,
             },
-            BotRpcRequest::ListBots => BotRpcResponse::Bots(Vec::new()),
+            BotRpcRequest::ListBots => BotRpcResponse::Bots(made.lock().unwrap().clone()),
             _ => BotRpcResponse::Ok,
         })
     });
@@ -7420,6 +7423,145 @@ fn bot_rows_start_one_home_chat_and_explain_a_paused_bot(cx: &mut TestAppContext
     cx.run_until_parked();
     assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
     cx.update(|_, cx| assert!(view.read(cx).notice.is_some()));
+}
+
+#[gpui::test]
+fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppContext) {
+    use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
+    let (view, cx) = open(cx, state_path("bots-right-panel"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    let chats = vec![
+        live_chat("bot-a", 77, None),
+        live_chat("bot-a", 78, Some("slack:C1")),
+    ];
+    let requests: Arc<std::sync::Mutex<Vec<BotRpcRequest>>> = Arc::default();
+    let seen = requests.clone();
+    let listed = chats.clone();
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        seen.lock().unwrap().push(req.clone());
+        Ok(match req {
+            BotRpcRequest::ListBots => {
+                let mut cfg = BotConfig::new(
+                    BotId::new("bot-a").unwrap(),
+                    "Release bot",
+                    "claude",
+                    1_700_000_000_000,
+                )
+                .unwrap();
+                cfg.avatar = Some("B1".to_owned());
+                BotRpcResponse::Bots(vec![cfg])
+            }
+            BotRpcRequest::ListItems { .. } => BotRpcResponse::Items(Vec::new()),
+            BotRpcRequest::ConnectorStatus { .. } => BotRpcResponse::ConnectorStatuses(Vec::new()),
+            BotRpcRequest::ListAccessRequests { .. } => BotRpcResponse::AccessRequests(Vec::new()),
+            BotRpcRequest::ToolRelayStatus => {
+                BotRpcResponse::ToolRelayStatus(krill_proto::bots::BotToolRelayStatus::default())
+            }
+            BotRpcRequest::ListBotSessions { .. } => BotRpcResponse::BotSessions(listed.clone()),
+            BotRpcRequest::StartBotSession { bot_id, .. } => BotRpcResponse::SessionStarted {
+                bot_id: bot_id.clone(),
+                session_id: SessionId(811),
+                pid: 4,
+            },
+            _ => BotRpcResponse::Ok,
+        })
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            s.apply_sidebar_bots(0, vec![section_bot("bot-a", "Release bot", chats)], cx);
+        });
+    });
+    cx.run_until_parked();
+    // A plain workspace keeps the usual right panel.
+    assert!(cx.debug_bounds("bot-panel").is_none());
+    assert!(cx.debug_bounds("diff-collapse").is_some());
+
+    // Opening the bot makes its Home Chat the focused tab: the right sidebar is the bot's.
+    let row = cx.debug_bounds("bot-row-bot-a").unwrap();
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.run_until_parked();
+    let panel = cx.debug_bounds("panel-column").unwrap();
+    let bot_panel = cx
+        .debug_bounds("bot-panel")
+        .expect("bot page right sidebar");
+    assert!(panel.contains(&bot_panel.center()));
+    assert!(cx.debug_bounds("diff-collapse").is_none());
+    for tab in [
+        "bot-panel-tab-home",
+        "bot-panel-tab-connectors",
+        "bot-panel-tab-chats",
+        "bot-panel-tab-files",
+    ] {
+        assert!(cx.debug_bounds(tab).is_some(), "{tab}");
+    }
+    assert!(cx.debug_bounds("bot-panel-header").is_some());
+    assert!(
+        cx.debug_bounds("bots-tab-items-body").is_some(),
+        "Home lists the bot's items"
+    );
+
+    let click = |cx: &mut gpui::VisualTestContext, sel: &'static str| {
+        let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        cx.simulate_click(at.center(), Modifiers::default());
+        cx.run_until_parked();
+    };
+    click(cx, "bot-panel-tab-connectors");
+    assert!(cx.debug_bounds("bots-tab-connectors-body").is_some());
+
+    // Chats lists the Home Chat and the thread, and New chat starts and opens another.
+    click(cx, "bot-panel-tab-chats");
+    let home = cx.debug_bounds("bot-panel-chat-77").unwrap();
+    let thread = cx.debug_bounds("bot-panel-chat-78").unwrap();
+    assert!(home.top() < thread.top());
+    click(cx, "bot-chats-new");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::StartBotSession { prompt: None, .. }))
+    );
+    cx.update(|_, cx| {
+        assert_eq!(view.read(cx).focused_local_session(), Some(SessionId(811)));
+    });
+    assert!(
+        cx.debug_bounds("bot-panel").is_some(),
+        "a new chat stays on the bot page"
+    );
+    assert!(cx.debug_bounds("bot-panel-chat-811").is_some());
+
+    // Files is the usual explorer without its own tab bar.
+    click(cx, "bot-panel-tab-files");
+    assert!(cx.debug_bounds("explorer-pane").is_some());
+    assert!(cx.debug_bounds("diff-collapse").is_none());
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let home = s.bot_folder(&s.sidebar_bots[0]).expect("local bot folder");
+        assert_eq!(
+            s.diff.read(cx).repo(),
+            home.as_path(),
+            "Files is the bot folder"
+        );
+    });
+
+    // Bot settings opens over Home and goes back.
+    click(cx, "bot-panel-tab-home");
+    click(cx, "bot-panel-settings");
+    assert!(cx.debug_bounds("bot-settings-page").is_some());
+    assert!(cx.debug_bounds("bots-tab-settings-body").is_some());
+    click(cx, "bot-settings-tab-soul");
+    assert!(cx.debug_bounds("bots-tab-soul-memory-body").is_some());
+    click(cx, "bot-settings-back");
+    assert!(cx.debug_bounds("bot-panel-header").is_some());
+
+    // When the chat is no longer a bot's, the usual panel comes back with its own tabs.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.apply_sidebar_bots(0, Vec::new(), cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bot-panel").is_none());
+    assert!(cx.debug_bounds("diff-collapse").is_some());
 }
 
 #[gpui::test]

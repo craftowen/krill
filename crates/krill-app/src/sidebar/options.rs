@@ -831,7 +831,10 @@ pub(super) fn is_bot_home(path: &Path) -> bool {
         || (named(Some(state), "Krill")
             && named(state.parent(), "Local")
             && named(state.parent().and_then(Path::parent), "AppData"))
-        || krill_proto::daemon::state_dir().is_some_and(|s| s == state)
+        || krill_proto::daemon::state_dir().is_some_and(|s| {
+            // krilld stores resolved paths (`/tmp` is `/private/tmp` on macOS).
+            s == state || s.canonicalize().is_ok_and(|real| real == state)
+        })
 }
 
 pub(super) fn rows_with_options<'a>(
