@@ -17,14 +17,27 @@ impl View {
         self
     }
 
-    /// Shows `tab` for `bot_id`, the bot whose folder the focused chat runs in.
-    pub fn show_in_panel(&mut self, bot_id: &BotId, tab: DetailTab, cx: &mut Context<Self>) {
+    /// Shows `tab` for `bot_id`, the bot whose folder the focused chat runs in. Returns
+    /// whether `bot_id` is now the selected bot (unsaved Soul edits can hold the switch back).
+    pub fn show_in_panel(
+        &mut self,
+        bot_id: &BotId,
+        tab: DetailTab,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.selected_bot_id.as_ref() != Some(bot_id) {
             self.select_bot(bot_id.clone(), cx);
+            // A bot newer than this view's list: fetch the list again.
+            if self.selected_bot_id.as_ref() == Some(bot_id)
+                && !self.bots.iter().any(|b| &b.id == bot_id)
+            {
+                self.reload(cx);
+            }
         }
         if self.detail_tab != tab {
             self.set_detail_tab(tab, cx);
         }
+        self.selected_bot_id.as_ref() == Some(bot_id)
     }
 
     pub(super) fn render_panel(

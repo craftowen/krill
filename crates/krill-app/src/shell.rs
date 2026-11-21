@@ -6597,7 +6597,8 @@ impl Shell {
     }
 
     fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page_open() {
+        // A bot page has no Changes tab (Orca hides it there).
+        if self.page_open() || self.focused_bot().is_some() {
             return;
         }
         if self.panel_collapsed {
@@ -6628,9 +6629,11 @@ impl Shell {
             self.close_settings(Some(&mut *window), cx);
         }
         // A bot page shows its Files tab in place of the usual panel tabs.
-        let files_tab_hidden =
-            self.focused_bot().is_some() && self.bot_ui.panel.tab != bot_panel::BotPanelTab::Files;
-        self.bot_ui.panel.tab = bot_panel::BotPanelTab::Files;
+        let bot_page = self.focused_bot().is_some();
+        let files_tab_hidden = bot_page && self.bot_ui.panel.tab != bot_panel::BotPanelTab::Files;
+        if bot_page {
+            self.bot_ui.panel.tab = bot_panel::BotPanelTab::Files;
+        }
         if self.panel_collapsed {
             self.panel_collapsed = false;
             self.layout.panel_collapsed = false;
@@ -6661,6 +6664,10 @@ impl Shell {
     }
 
     fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A bot page has no Search tab (Orca hides it there).
+        if !self.page_open() && self.focused_bot().is_some() {
+            return;
+        }
         // OWE-860: 설정에서 ⌘⇧F를 누르면 설정을 닫고 작업공간 검색으로 전환한다.
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);

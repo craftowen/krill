@@ -240,7 +240,7 @@ impl Shell {
                     v.set_host_target(host.clone(), target.clone(), host_choices, cx);
                     v
                 });
-                Self::subscribe_bots_view(&created, cx);
+                Self::subscribe_bots_view(&created, true, cx);
                 cx.subscribe(&created, |this, _, _: &krill_app::bots::Close, cx| {
                     this.close_settings(None, cx);
                 })
@@ -257,8 +257,11 @@ impl Shell {
     }
 
     /// Events every Bots view sends the Shell (the modal and a bot page's right sidebar).
+    /// A view that doesn't `feed_sidebar` keeps an older bot list, so its changes only prompt a
+    /// fresh read from krilld instead of replacing the sidebar's bots.
     pub(super) fn subscribe_bots_view(
         view: &gpui::Entity<krill_app::bots::View>,
+        feed_sidebar: bool,
         cx: &mut Context<Self>,
     ) {
         cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
@@ -281,19 +284,28 @@ impl Shell {
             }
         })
         .detach();
-        cx.subscribe(view, |this, _, ev: &krill_app::bots::BadgeChanged, cx| {
-            this.apply_sidebar_bots(ev.attention_count, ev.bots.clone(), cx);
-        })
-        .detach();
         cx.subscribe(
             view,
-            |this, _, ev: &krill_app::bots::SessionsChanged, cx| {
-                this.sidebar.update(cx, |sb, cx| {
-                    sb.set_bot_sessions(ev.host.clone(), ev.sessions.clone(), cx);
-                });
+            move |this, _, ev: &krill_app::bots::BadgeChanged, cx| {
+                if feed_sidebar {
+                    this.apply_sidebar_bots(ev.attention_count, ev.bots.clone(), cx);
+                } else {
+                    this.refresh_bots_badge(cx);
+                }
             },
         )
         .detach();
+        if feed_sidebar {
+            cx.subscribe(
+                view,
+                |this, _, ev: &krill_app::bots::SessionsChanged, cx| {
+                    this.sidebar.update(cx, |sb, cx| {
+                        sb.set_bot_sessions(ev.host.clone(), ev.sessions.clone(), cx);
+                    });
+                },
+            )
+            .detach();
+        }
     }
 
     pub(super) fn apply_sidebar_bots(
@@ -309,6 +321,7 @@ impl Shell {
             self.bots_attention_count = attention;
             self.sidebar_bots = bots;
             self.bot_ui.loaded = true;
+            self.bot_ui.panel.stale = true;
             // A restored chat may only now turn out to be a bot's: root its Files there.
             self.sync_diff_workspace(cx);
             cx.notify();

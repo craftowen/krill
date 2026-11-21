@@ -79,6 +79,8 @@ pub(super) struct BotPanel {
     pub view: Option<Entity<krill_app::bots::View>>,
     /// What `view` was last told to show, so a render doesn't repeat it.
     pub shown: Option<(BotId, DetailTab)>,
+    /// The bot list changed since `view` last loaded it.
+    pub stale: bool,
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
     pub chat_query: String,
 }
@@ -103,11 +105,18 @@ pub(super) fn chat_title(bot: &SidebarBot, s: &BotSessionSummary) -> SharedStrin
 }
 
 impl Shell {
-    /// The bot whose folder the focused chat runs in (Orca's bot page).
+    /// The bot whose page is on screen: the focused chat is one of its chats or runs in its
+    /// folder, or the focused file is in its folder (Orca's bot workspace).
     pub(super) fn focused_bot(&self) -> Option<&SidebarBot> {
         let pane = self.layout.focused()?;
-        if self.layout.file(pane).is_some() || self.layout.host(pane) != &self.launch_host {
+        if self.layout.host(pane) != &self.launch_host {
             return None;
+        }
+        if let Some(file) = self.layout.file(pane) {
+            return self
+                .sidebar_bots
+                .iter()
+                .find(|b| self.bot_folder(b).is_some_and(|f| file.starts_with(f)));
         }
         let session = self.layout.session(pane);
         let cwd = self.folder();
@@ -135,14 +144,7 @@ impl Shell {
         true
     }
 
-    /// The Bots view behind the panel bodies, built once per host.
-    #[cfg_attr(
-        not(test),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "tests have no daemon without an override"
-        )
-    )]
+    /// The Bots view behind the panel bodies, built once per host (once its connection is up).
     fn bot_panel_view(&mut self, cx: &mut Context<Self>) -> Option<Entity<krill_app::bots::View>> {
         if let Some(view) = &self.bot_ui.panel.view
             && view.read(cx).host() == &self.launch_host
@@ -158,19 +160,32 @@ impl Shell {
         let view = {
             let host = self.launch_host.clone();
             let target = self.target_for_host(&host);
+            // A remote host still connecting has no target yet; don't fall back to this Mac.
+            if !host.is_local() && target.is_none() {
+                return None;
+            }
             cx.new(|cx| krill_app::bots::View::new_on_host(host, target, None, cx).into_panel())
         };
-        Self::subscribe_bots_view(&view, cx);
+        Self::subscribe_bots_view(&view, false, cx);
         self.bot_ui.panel.view = Some(view.clone());
         self.bot_ui.panel.shown = None;
+        self.bot_ui.panel.stale = false;
         Some(view)
     }
 
-    /// Keeps the diff panel's own tab bar hidden only while it is a bot page's Files tab.
+    /// While a bot page shows Files, the diff panel is its file explorer and nothing else:
+    /// its own tab bar hidden and its tab held on Files.
     pub(super) fn sync_bot_files_chrome(&self, bot_page: bool, cx: &mut Context<Self>) {
         let embedded = bot_page && self.bot_ui.panel.tab == BotPanelTab::Files;
-        if self.diff.read(cx).is_embedded() != embedded {
-            self.diff.update(cx, |d, cx| d.set_embedded(embedded, cx));
+        let off_files = self.diff.read(cx).active_tab() != krill_app::diff::PanelTab::Files;
+        if self.diff.read(cx).is_embedded() != embedded || (embedded && off_files) {
+            self.diff.update(cx, |d, cx| {
+                d.set_embedded(embedded, cx);
+                if embedded && off_files {
+                    d.set_tab(krill_app::diff::PanelTab::Files, cx);
+                    d.ensure_explorer_loaded_async(cx);
+                }
+            });
         }
     }
 
@@ -203,10 +218,16 @@ impl Shell {
         };
         let view = detail.and_then(|page| {
             let view = self.bot_panel_view(cx)?;
+            if std::mem::take(&mut self.bot_ui.panel.stale) {
+                view.update(cx, krill_app::bots::View::reload);
+            }
             let want = (bot.id.clone(), page);
             if self.bot_ui.panel.shown.as_ref() != Some(&want) {
-                view.update(cx, |v, cx| v.show_in_panel(&bot.id, page, cx));
-                self.bot_ui.panel.shown = Some(want);
+                // Held back by unsaved Soul edits: ask again next time instead of showing the
+                // other bot under this one's page.
+                if view.update(cx, |v, cx| v.show_in_panel(&bot.id, page, cx)) {
+                    self.bot_ui.panel.shown = Some(want);
+                }
             }
             Some(view)
         });

@@ -7437,20 +7437,18 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
     let requests: Arc<std::sync::Mutex<Vec<BotRpcRequest>>> = Arc::default();
     let seen = requests.clone();
     let listed = chats.clone();
+    let config = |id: &str, name: &str| {
+        let mut cfg =
+            BotConfig::new(BotId::new(id).unwrap(), name, "claude", 1_700_000_000_000).unwrap();
+        cfg.avatar = Some("B1".to_owned());
+        cfg
+    };
+    let known = Arc::new(std::sync::Mutex::new(vec![config("bot-a", "Release bot")]));
+    let daemon_bots = known.clone();
     let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
         seen.lock().unwrap().push(req.clone());
         Ok(match req {
-            BotRpcRequest::ListBots => {
-                let mut cfg = BotConfig::new(
-                    BotId::new("bot-a").unwrap(),
-                    "Release bot",
-                    "claude",
-                    1_700_000_000_000,
-                )
-                .unwrap();
-                cfg.avatar = Some("B1".to_owned());
-                BotRpcResponse::Bots(vec![cfg])
-            }
+            BotRpcRequest::ListBots => BotRpcResponse::Bots(daemon_bots.lock().unwrap().clone()),
             BotRpcRequest::ListItems { .. } => BotRpcResponse::Items(Vec::new()),
             BotRpcRequest::ConnectorStatus { .. } => BotRpcResponse::ConnectorStatuses(Vec::new()),
             BotRpcRequest::ListAccessRequests { .. } => BotRpcResponse::AccessRequests(Vec::new()),
@@ -7544,6 +7542,16 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
             "Files is the bot folder"
         );
     });
+    // Files stays the explorer even when the panel's own tab moves (e.g. from another page).
+    cx.update(|_, cx| {
+        let diff = view.read(cx).diff.clone();
+        diff.update(cx, |d, cx| {
+            d.set_tab(krill_app::diff::PanelTab::Changes, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explorer-pane").is_some());
+    assert!(cx.debug_bounds("diff-collapse").is_none());
 
     // Bot settings opens over Home and goes back.
     click(cx, "bot-panel-tab-home");
@@ -7554,6 +7562,37 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
     assert!(cx.debug_bounds("bots-tab-soul-memory-body").is_some());
     click(cx, "bot-settings-back");
     assert!(cx.debug_bounds("bot-panel-header").is_some());
+
+    // A bot made after the panel first loaded gets its own page, and the panel's older list
+    // never replaces the sidebar's.
+    known.lock().unwrap().push(config("bot-b", "Second bot"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut bots = s.sidebar_bots.clone();
+            bots.push(section_bot(
+                "bot-b",
+                "Second bot",
+                vec![live_chat("bot-b", 90, None)],
+            ));
+            s.apply_sidebar_bots(0, bots, cx);
+        });
+    });
+    cx.run_until_parked();
+    click(cx, "bot-row-bot-b");
+    assert!(cx.debug_bounds("bots-tab-items-body").is_some());
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.focused_local_session(), Some(SessionId(90)));
+        let panel = s.bot_ui.panel.view.clone().unwrap();
+        assert_eq!(
+            panel
+                .read(cx)
+                .selected_bot()
+                .map(|b| b.id.as_str().to_owned()),
+            Some("bot-b".to_owned())
+        );
+        assert_eq!(s.sidebar_bots.len(), 2);
+    });
 
     // When the chat is no longer a bot's, the usual panel comes back with its own tabs.
     cx.update(|_, cx| {

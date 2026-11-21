@@ -344,6 +344,7 @@ impl View {
             self.rpc = daemon_bot_rpc(target);
             self.selected_bot_id = None;
             self.bots.clear();
+            self.bots_loaded_at_ms = None;
             self.bot_sessions.clear();
             self.settings.avatar_cache.clear();
             self.reload(cx);
@@ -538,7 +539,8 @@ impl View {
                             .selected_bot_id
                             .as_ref()
                             .is_some_and(|id| this.bots.iter().any(|b| &b.id == id));
-                        if !still_valid {
+                        // A bot page keeps its bot (an empty body beats another bot's).
+                        if !still_valid && this.mode == Mode::Modal {
                             this.selected_bot_id = this.bots.first().map(|b| b.id.clone());
                         }
                         this.emit_badge(cx);

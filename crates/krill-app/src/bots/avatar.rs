@@ -62,7 +62,7 @@ const PICTURE_MIN_SIDE: u32 = 128;
 const PICTURE_SIDE: u32 = 512;
 /// Decode guard: a 10 MB JPEG can still unpack to gigabytes.
 const PICTURE_MAX_DECODE_SIDE: u32 = 8192;
-const PICTURE_MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+const PICTURE_MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Why a picked picture was refused (Orca's three messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,20 +107,23 @@ pub fn prepare_picture(bytes: &[u8]) -> Result<Vec<u8>, PictureError> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut picture = image::DynamicImage::from_decoder(decoder).map_err(too_big_or_unreadable)?;
-    picture.apply_orientation(orientation);
+    let picture = image::DynamicImage::from_decoder(decoder).map_err(too_big_or_unreadable)?;
     let (w, h) = (picture.width(), picture.height());
     let side = w.min(h);
     if side < PICTURE_MIN_SIDE {
         return Err(PictureError::TooSmall);
     }
-    let square = picture
+    // The centre square turns with the picture, so crop and shrink first and turn the small
+    // copy: one full-size copy at most.
+    let mut square = picture
         .crop_imm((w - side) / 2, (h - side) / 2, side, side)
         .resize_exact(
             PICTURE_SIDE,
             PICTURE_SIDE,
             image::imageops::FilterType::Lanczos3,
         );
+    drop(picture);
+    square.apply_orientation(orientation);
     let mut png = Vec::new();
     square
         .to_rgba8()
