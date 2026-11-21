@@ -7,12 +7,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::control::{RemoveWorktree, RemovedWorktree, Reply};
 
-use crate::child::PipeReader;
+use crate::child::{AsFd, PipeReader, kill_and_reap};
 
 use super::{GitQueue, git, output_path, queue, text, transaction};
 
@@ -667,16 +666,44 @@ fn run_bounded_command(
     let mut err = Vec::new();
     let mut buf = [0u8; 8192];
     let deadline = Instant::now() + timeout;
+    let mut out_eof = false;
+    let mut err_eof = false;
     loop {
-        let a = drain_capped(&mut stdout, &mut out, &mut buf);
-        let b = drain_capped(&mut stderr, &mut err, &mut buf);
-        if let Err(e) = a.and(b) {
-            return Err(format!("archive hook failed: {e}"));
+        if !out_eof {
+            match drain_capped(&mut stdout, &mut out, &mut buf) {
+                Ok(eof) => out_eof = eof,
+                Err(e) => {
+                    terminate_gracefully(&mut child);
+                    return Err(format!("archive hook failed: {e}"));
+                }
+            }
+        }
+        if !err_eof {
+            match drain_capped(&mut stderr, &mut err, &mut buf) {
+                Ok(eof) => err_eof = eof,
+                Err(e) => {
+                    terminate_gracefully(&mut child);
+                    return Err(format!("archive hook failed: {e}"));
+                }
+            }
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                drain_capped(&mut stdout, &mut out, &mut buf).ok();
-                drain_capped(&mut stderr, &mut err, &mut buf).ok();
+                if !out_eof || !err_eof {
+                    if Instant::now() >= deadline {
+                        terminate_gracefully(&mut child);
+                        return Err("archive hook failed: timed out".to_owned());
+                    }
+                    crate::child::wait_readable(
+                        &[
+                            (!out_eof).then_some(&stdout as &dyn AsFd),
+                            (!err_eof).then_some(&stderr as &dyn AsFd),
+                        ],
+                        Duration::from_millis(5),
+                    );
+                    continue;
+                }
+                kill_and_reap(&mut child);
                 return Ok(Output {
                     status,
                     stdout: out,
@@ -684,21 +711,30 @@ fn run_bounded_command(
                 });
             }
             Ok(None) => {}
-            Err(e) => return Err(format!("archive hook failed: {e}")),
+            Err(e) => {
+                terminate_gracefully(&mut child);
+                return Err(format!("archive hook failed: {e}"));
+            }
         }
         if Instant::now() >= deadline {
             terminate_gracefully(&mut child);
             return Err("archive hook failed: timed out".to_owned());
         }
-        thread::sleep(Duration::from_millis(5));
+        crate::child::wait_readable(
+            &[
+                (!out_eof).then_some(&stdout as &dyn AsFd),
+                (!err_eof).then_some(&stderr as &dyn AsFd),
+            ],
+            Duration::from_millis(5),
+        );
     }
 }
 
-fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<()> {
+fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<bool> {
     let mut read = 0;
     while read < super::super::DRAIN_BYTES {
         match pipe.read(buf) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(true),
             Ok(n) => {
                 read += n;
                 let remaining = MAX_ARCHIVE_OUTPUT_BYTES.saturating_sub(dst.len());
@@ -712,12 +748,12 @@ fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> 
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
-                return Ok(());
+                return Ok(false);
             }
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn terminate_gracefully(child: &mut Child) {
@@ -1072,5 +1108,54 @@ exec git "$@"
             drop(Request::decode(krill_proto::control::kind::REQUEST, &bytes));
             drop(Reply::decode(krill_proto::control::kind::REPLY, &bytes));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_command_drains_until_eof_and_terminates_lingering_pipe_writer() {
+        let dir = std::env::temp_dir().join(format!("krill-remove-bounded-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. A short-lived subshell that writes to stderr shortly after the leader exits must
+        //    still be drained until EOF before returning.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        crate::child::own_group(&mut cmd)
+            .args([
+                "-c",
+                "(sleep 0.04; printf 'late-stderr-detail\\n' >&2) & exit 7",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = run_bounded_command(&mut cmd, Duration::from_secs(2)).unwrap();
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            "late-stderr-detail"
+        );
+
+        // 2. If a descendant keeps stdout/stderr open past the deadline after the leader exits,
+        //    run_bounded_command must time out and terminate the descendant process group.
+        let pid_file = dir.join("lingering.pid");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        crate::child::own_group(&mut cmd)
+            .args([
+                "-c",
+                &format!("sleep 30 &\necho $! > '{}'\nexit 0\n", pid_file.display()),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let err = run_bounded_command(&mut cmd, Duration::from_millis(120)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        if let Ok(pid_text) = fs::read_to_string(&pid_file)
+            && let Ok(pid) = pid_text.trim().parse::<i32>()
+        {
+            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+        }
+        fs::remove_dir_all(dir).ok();
     }
 }
