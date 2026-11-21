@@ -8447,6 +8447,101 @@ fn empty_tabs_actions_and_guide_never_panic(cx: &mut TestAppContext) {
 }
 
 /// OWE-866: 더블클릭 단어 선택·트리플클릭 줄 선택·Shift+클릭 확장이 동작하고,
+#[gpui::test]
+fn word_and_line_reverse_and_wrapped_drag_keep_origin_selected(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+
+    let (view, cx) = open(cx, state_path("mouse-word-line-reverse"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(4), ours, cx);
+            let modes = Modes {
+                kitty: 0,
+                flags: Modes::BRACKETED_PASTE,
+            };
+            let body = postcard::to_stdvec(&modes).unwrap();
+            assert!(s.on_frame(pane, TERM_MODES, &body, cx));
+            let row = |t: &str| -> Vec<Cell> {
+                t.chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect()
+            };
+            let mut wrap0 = row("wrapped012");
+            wrap0[9].flags = Flags::WRAPLINE;
+            let ops = vec![
+                Op::Reset { cols: 10, lines: 4 },
+                Op::Line {
+                    line: 0,
+                    cells: wrap0,
+                },
+                Op::Line {
+                    line: 1,
+                    cells: row("tail"),
+                },
+                Op::Line {
+                    line: 2,
+                    cells: row("alpha beta"),
+                },
+                Op::Line {
+                    line: 3,
+                    cells: row("third line"),
+                },
+            ];
+            let (k, b) =
+                ipc::read_frame(&mut &encode_update(Revision(1), Seq(0), ops).unwrap()[0][..])
+                    .unwrap()
+                    .unwrap();
+            assert!(s.on_frame(pane, k, &b, cx));
+        });
+    });
+    cx.run_until_parked();
+    let text_of = |view: &Entity<Shell>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).live[&pane].selection_text.clone())
+    };
+    let pos_on = |view: &Entity<Shell>, cx: &mut VisualTestContext, col: f32, line: f32| {
+        cx.update(|_, cx| {
+            let (bounds, cell) = view.read(cx).live[&pane].painted.get();
+            point(
+                bounds.origin.x + cell.width * (col + 0.5),
+                bounds.origin.y + cell.height * (line + 0.5),
+            )
+        })
+    };
+
+    // 더블클릭("beta") 후 앞 단어("alpha")로 역방향 드래그 → 원점 단어 끝까지 유지.
+    let start_word = pos_on(&view, cx, 7., 2.);
+    let back_word = pos_on(&view, cx, 1., 2.);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_begin(pane, start_word, 2, gpui::Modifiers::default(), cx);
+            s.select_move(pane, back_word, cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("alpha beta"));
+
+    // 트리플클릭("alpha beta", 2행) 후 줄바꿈된 논리 행(0~1행)으로 위쪽 드래그 → 0행 시작부터 2행 끝까지 포함.
+    let start_line = pos_on(&view, cx, 2., 2.);
+    let up_wrapped = pos_on(&view, cx, 1., 1.);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_begin(pane, start_line, 3, gpui::Modifiers::default(), cx);
+            s.select_move(pane, up_wrapped, cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(
+        text_of(&view, cx).as_deref(),
+        Some("wrapped012tail\nalpha beta")
+    );
+}
+
 /// 단어·줄 선택은 한 칸짜리라도 클릭 해제에 지워지지 않는다.
 #[gpui::test]
 fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {

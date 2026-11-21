@@ -214,6 +214,8 @@ struct Live {
     selecting: bool,
     /// 끄는 중인 선택 단위(OWE-866).
     selecting_kind: SelectKind,
+    /// 더블·트리플 클릭 시작 시점의 정규화된 원점 범위(역방향·줄바꿈 드래그용).
+    selecting_origin: Option<((i64, u16), (i64, u16))>,
     /// 프로그램 마우스 보고로 누른 버튼 비트마스크(bit b = button b).
     mouse_down: u8,
     task: Task<()>,
@@ -245,6 +247,7 @@ impl Live {
             selection_text: None,
             selecting: false,
             selecting_kind: SelectKind::Char,
+            selecting_origin: None,
             mouse_down: 0,
             task,
             creation: Arc::default(),
@@ -264,6 +267,7 @@ impl Live {
         self.selection = None;
         self.selection_text = None;
         self.selecting_kind = SelectKind::Char;
+        self.selecting_origin = None;
     }
 
     /// 보이는 화면 칸을 버퍼 기준 끝점으로.
@@ -6040,6 +6044,7 @@ impl Shell {
             l.selection_text = None;
             l.selecting = true;
             l.selecting_kind = SelectKind::Char;
+            l.selecting_origin = None;
             cx.notify();
             return;
         }
@@ -6052,7 +6057,15 @@ impl Shell {
         } else {
             (Selection::new(at), SelectKind::Char)
         };
-        l.selection = Some(Anchored::from_view(selection, l.pane.scroll_offset()));
+        let anchored = Anchored::from_view(selection, l.pane.scroll_offset());
+        l.selecting_origin = (kind != SelectKind::Char).then(|| {
+            if anchored.anchor <= anchored.head {
+                (anchored.anchor, anchored.head)
+            } else {
+                (anchored.head, anchored.anchor)
+            }
+        });
+        l.selection = Some(anchored);
         l.selection_text = None;
         l.selecting = true;
         l.selecting_kind = kind;
@@ -6076,25 +6089,45 @@ impl Shell {
             return;
         }
         let point = l.anchor_point(at);
-        sel.head = match kind {
-            SelectKind::Char => point,
+        match kind {
+            SelectKind::Char => {
+                sel.head = point;
+            }
             SelectKind::Word => {
                 let word = Selection::word_at(&screen, at);
-                l.anchor_point(if point >= sel.anchor {
-                    word.head
+                let ws = l.anchor_point(word.anchor);
+                let we = l.anchor_point(word.head);
+                let (ws, we) = if ws <= we { (ws, we) } else { (we, ws) };
+                if let Some((os, oe)) = l.selecting_origin {
+                    if point >= os {
+                        sel.anchor = os;
+                        sel.head = we.max(oe);
+                    } else {
+                        sel.anchor = oe;
+                        sel.head = ws.min(os);
+                    }
                 } else {
-                    word.anchor
-                })
+                    sel.head = if point >= sel.anchor { we } else { ws };
+                }
             }
             SelectKind::Line => {
-                let column = if point.0 >= sel.anchor.0 {
-                    screen.cols.saturating_sub(1)
+                let line = Selection::line_at(&screen, at);
+                let ls = l.anchor_point(line.anchor);
+                let le = l.anchor_point(line.head);
+                let (ls, le) = if ls <= le { (ls, le) } else { (le, ls) };
+                if let Some((os, oe)) = l.selecting_origin {
+                    if ls >= os {
+                        sel.anchor = os;
+                        sel.head = le.max(oe);
+                    } else {
+                        sel.anchor = oe;
+                        sel.head = ls.min(os);
+                    }
                 } else {
-                    0
-                };
-                (point.0, column)
+                    sel.head = if point.0 >= sel.anchor.0 { le } else { ls };
+                }
             }
-        };
+        }
         l.selection = Some(sel);
         cx.notify();
     }
@@ -6108,6 +6141,7 @@ impl Shell {
         l.selecting = false;
         let keep_single = l.selecting_kind != SelectKind::Char;
         l.selecting_kind = SelectKind::Char;
+        l.selecting_origin = None;
         if l.selection.is_some_and(|s| s.anchor == s.head) && !keep_single {
             l.clear_selection();
         } else {
