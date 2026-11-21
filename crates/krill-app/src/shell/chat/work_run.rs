@@ -67,10 +67,22 @@ impl DisplayFeed {
             let item = &items[rel_idx];
             if !is_work_or_foldable(item.kind, foldable[rel_idx]) {
                 let abs_idx = base_index + rel_idx;
-                rows.push(DisplayRow::Item {
-                    abs_idx,
-                    item: Arc::clone(item),
-                });
+                // A bot's launch preamble is its instructions, not something its owner said.
+                let item = match (
+                    item.kind,
+                    krill_proto::bots::strip_launch_preamble(&item.text),
+                ) {
+                    (ChatItemKind::User, Some("")) => {
+                        rel_idx += 1;
+                        continue;
+                    }
+                    (ChatItemKind::User, Some(words)) => Arc::new(ChatItem {
+                        text: words.to_owned(),
+                        ..(**item).clone()
+                    }),
+                    _ => Arc::clone(item),
+                };
+                rows.push(DisplayRow::Item { abs_idx, item });
                 rel_idx += 1;
                 continue;
             }

@@ -4057,7 +4057,7 @@ impl Registry {
         cwd: &Path,
         extra_env: Vec<(Vec<u8>, Vec<u8>)>,
         bot_mcp: Option<&crate::agent::BotMcpLaunchConfig>,
-    ) -> Result<(SessionId, u32), String> {
+    ) -> Result<(SessionId, u32, bool), String> {
         use krill_proto::os::ffi::OsStrExt as _;
         let holder = self
             .holder
@@ -4107,7 +4107,15 @@ impl Registry {
                 self.discard_settings(session);
                 format!("failed to persist session metadata: {err}")
             })?;
+        // 지침이 시스템 프롬프트로 갔는지: 아니면 호출자가 첫 입력으로 보낸다.
+        let instructions_given = crate::agent::takes_bot_instructions(&profile)
+            && bot_mcp.is_some_and(|m| {
+                m.instructions
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+            });
         self.spawn_holder(holder, session, launch.argv, launch.env, cwd_bytes, 120, 40)
+            .map(|(sid, pid)| (sid, pid, instructions_given))
             .map_err(|fail| format!("failed to spawn bot session: {fail:?}"))
     }
 

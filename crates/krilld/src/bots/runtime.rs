@@ -364,7 +364,8 @@ impl BotRuntime {
             ));
         }
 
-        let mcp_cfg = build_bot_mcp_launch_config(&bot, &home, grant.as_ref(), secrets);
+        let mut mcp_cfg = build_bot_mcp_launch_config(&bot, &home, grant.as_ref(), secrets);
+        mcp_cfg.instructions = Some(preamble.clone());
 
         let spawn_res = registry.spawn_bot_agent_session(
             &bot.agent_id,
@@ -375,7 +376,7 @@ impl BotRuntime {
             extra_env,
             Some(&mcp_cfg),
         );
-        let (session_id, pid) = match spawn_res {
+        let (session_id, pid, instructions_given) = match spawn_res {
             Ok(ok) => ok,
             Err(err) => {
                 if let Some(ref g) = grant {
@@ -416,12 +417,15 @@ impl BotRuntime {
 
         // Deliver launch preamble (+ optional initial prompt) once the agent PTY is ready, holding
         // `ctrl.delivery_lock` until `ctrl.preamble_gate` flips ready so concurrent dispatches wait cleanly.
-        let initial_input = match trimmed_prompt {
-            Some(user_prompt) => format!("{preamble}\n\n---\n\n{user_prompt}"),
-            None => preamble,
+        // Agents that took the preamble as their system prompt get only the owner's prompt (or nothing:
+        // the bot speaks first when its owner does, as in Orca). Others still get it as their first input.
+        let initial_input = match (instructions_given, trimmed_prompt) {
+            (true, prompt) => prompt,
+            (false, Some(user_prompt)) => Some(format!("{preamble}\n\n---\n\n{user_prompt}")),
+            (false, None) => Some(preamble),
         };
         if let Some(tap) = registry.session_tap(session_id) {
-            let bytes = initial_input.into_bytes();
+            let bytes = initial_input.map(String::into_bytes);
             let ctrl_thread = Arc::clone(&ctrl);
             let spawn_res = std::thread::Builder::new()
                 .name(format!("bot-preamble-{}", session_id.0))
@@ -437,7 +441,9 @@ impl BotRuntime {
                         }
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    if !tap.pulse().closed {
+                    if let Some(bytes) = bytes
+                        && !tap.pulse().closed
+                    {
                         drop(Registry::deliver_input_to_tap(&tap, &bytes, true));
                     }
                 });
@@ -1291,6 +1297,7 @@ fn build_bot_mcp_launch_config(
         bot_home: Some(home.to_path_buf()),
         http_servers,
         stdio_servers,
+        instructions: None,
     }
 }
 

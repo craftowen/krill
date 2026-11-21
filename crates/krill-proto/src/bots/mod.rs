@@ -25,7 +25,8 @@ pub use home::{
     assert_bot_owns_home, build_launch_preamble, build_launch_preamble_in, cap_memory_index,
     count_memory_lines, fence_quoted_text, forget_memory_fact, init_bot_home,
     materialize_bot_skills, parse_memory_facts, render_bot_agents_md, render_bot_claude_md,
-    restore_deleted_memory_facts, soul_description, starter_soul, validate_memory_edit,
+    restore_deleted_memory_facts, soul_description, starter_soul, strip_launch_preamble,
+    validate_memory_edit,
 };
 pub use package::{
     BOT_PACKAGE_SCHEMA_VERSION, BotPackageData, BotPackageExportOptions, MAX_AVATAR_PNG_BYTES,

@@ -25,9 +25,6 @@ use super::Shell;
 /// A right-click menu action on the Shell.
 type ShellAction = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
 
-/// Orca's "you were just created" first turn, sent with a new bot's first Home Chat.
-const FIRST_RUN_PROMPT: &str = "Krill: you were just created. Start your first-run setup.";
-
 /// A dialog to build at the start of the next render (it needs the window).
 #[derive(Debug, Clone)]
 pub(super) enum BotDialogRequest {
@@ -157,7 +154,7 @@ impl Shell {
                     d
                 });
                 let sub = cx.subscribe_in(&dialog, window, move |this, _, ev, window, cx| {
-                    this.on_new_bot_event(ev, template, window, cx);
+                    this.on_new_bot_event(ev, window, cx);
                 });
                 dialog.update(cx, |d, cx| d.focus_name(window, cx));
                 self.bot_ui.new_bot = Some((dialog, sub));
@@ -187,7 +184,6 @@ impl Shell {
     fn on_new_bot_event(
         &mut self,
         ev: &new_bot::Event,
-        template: Option<&'static BotTemplate>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -221,11 +217,9 @@ impl Shell {
                         self.sidebar_bots.insert(0, r);
                     }
                 }
-                let kickoff = template
-                    .map(|t| t.first_chat.to_owned())
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| FIRST_RUN_PROMPT.to_owned());
-                self.open_bot_home(bot.id.clone(), Some(kickoff), cx);
+                // No kickoff turn: the chat opens empty and the bot first answers its owner's
+                // first message (its instructions ride in the agent's system prompt).
+                self.open_bot_home(bot.id.clone(), None, cx);
                 self.refresh_bots_badge(cx);
                 cx.notify();
             }
