@@ -22,6 +22,7 @@ mod chat;
 mod close;
 mod commands;
 mod diff;
+mod external_switch;
 pub(crate) mod files;
 mod fit;
 mod folder;
@@ -689,6 +690,8 @@ pub struct Shell {
     /// 이미 알린 계정 전환 실패. 데몬이 매 스냅샷마다 같은 실패를 다시 보내도 한 번만 띄운다.
     handoff_errors: HashSet<String>,
     notifications: notifications::Notifications,
+    /// CLI·모바일·원격 호스트가 바꾼 기본 계정 감지.
+    external_switch: external_switch::ExternalSwitchTracker,
     /// 마지막 생존 시각 주기 저장([`away::HEARTBEAT`]).
     heartbeat: Option<Task<()>>,
     app_quit: Option<Subscription>,
@@ -1392,6 +1395,7 @@ impl Shell {
             notice,
             handoff_errors: HashSet::new(),
             notifications: notifications::Notifications::default(),
+            external_switch: external_switch::ExternalSwitchTracker::default(),
             heartbeat: None,
             app_quit: None,
             window: None,
@@ -3733,6 +3737,22 @@ impl Shell {
         if mutating {
             self.invalidate_account_cancel(&host);
         }
+        if let krill_proto::usage::UsageRequest::SwitchAccount {
+            provider,
+            account_id,
+        }
+        | krill_proto::usage::UsageRequest::SwitchAccountOnly {
+            provider,
+            account_id,
+        } = &req
+        {
+            krill_app::accounts::mark_in_app_switch(
+                host.clone(),
+                *provider,
+                account_id.clone(),
+                cx,
+            );
+        }
         if host.is_remote() {
             let Some(target) = self.target_for_host(&host) else {
                 if mutating {
@@ -4013,6 +4033,7 @@ impl Shell {
         snap: krill_proto::usage::AccountsSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.observe_external_switches(&host, &snap, cx);
         if snap.details.supported {
             for handoff in &snap.details.handoffs {
                 if handoff.to.is_none() {

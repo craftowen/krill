@@ -31,6 +31,35 @@ use krill_proto::usage::{
     Window,
 };
 
+/// 이 앱(셸·설정 창)이 방금 요청한 기본 계정 전환. 외부 전환 알림이 자기 요청을 외부로 오인하지 않게
+/// 창 사이에서 공유한다. 셸이 스냅샷에서 같은 전환을 보면 소비하고, 오래된 표식은 버린다.
+#[derive(Debug, Default)]
+pub struct InAppSwitches(
+    pub  Vec<(
+        crate::hosts::HostId,
+        ProviderKind,
+        String,
+        std::time::Instant,
+    )>,
+);
+
+impl gpui::Global for InAppSwitches {}
+
+/// `SwitchAccount`·`SwitchAccountOnly`를 보내기 직전에 부른다.
+pub fn mark_in_app_switch(
+    host: crate::hosts::HostId,
+    provider: ProviderKind,
+    account_id: String,
+    cx: &mut gpui::App,
+) {
+    cx.default_global::<InAppSwitches>().0.push((
+        host,
+        provider,
+        account_id,
+        std::time::Instant::now(),
+    ));
+}
+
 /// [`UsageRequest::ConsumeResetCredit`] 결과. 스냅샷과 소진 결과를 함께 들고 온다.
 #[derive(Debug, Clone)]
 pub struct ResetConsumed {
