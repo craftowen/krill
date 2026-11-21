@@ -3029,7 +3029,7 @@ searchHits = [],
 searchIdx = -1;
 function applySearch() {
 const q = searchOpen ? String(searchQuery || "").trim().toLowerCase() : "";
-const cardsList = (feed.children || []).filter((n) =>
+const cardsList = Array.from(feed.children || []).filter((n) =>
 String(n.className || "").split(/\s+/).includes("chat-card"),
 );
 for (const n of cardsList) {

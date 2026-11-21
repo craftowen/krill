@@ -2352,37 +2352,20 @@ async function main() {
   };
   replace("Waiting", "main");
   actions.action();
-  let entries = f.sheets.at(-1);
-  assert(entries.some((e) => e.label === "Review in Terminal"));
-  assert(
-    !entries.some(
-      (e) => e.label === "Approve (Yes)" || e.label === "Deny (No)",
-    ),
+  assert.deepEqual(
+    Array.from(f.sheets.at(-1), (e) => e.label),
+    ["Quick actions", "Select text"],
   );
-  assert(entries.some((e) => e.label === "Git changes"));
-  replace("Working");
-  entries.find((e) => e.label === "Review in Terminal").action();
-  assert.equal(f.calls.length, 0);
-  assert.equal(f.mounts[0].focused, 1);
+  f.state.snapshot = { capabilities: { session_close: true } };
   actions.action();
-  assert(!f.sheets.at(-1).some((e) => e.label === "Review in Terminal"));
-  assert(
-    !f.sheets.at(-1).some((e) => e.label === "Git changes"),
-    "git changes need a branch",
+  assert.deepEqual(
+    Array.from(f.sheets.at(-1), (e) => e.label),
+    ["Quick actions", "Select text", "Close terminal"],
   );
-  replace("Blocked");
-  actions.action();
-  entries = f.sheets.at(-1);
-  entries.find((e) => e.label === "Review in Terminal").action();
-  assert.equal(f.calls.length, 0);
-  f.state.sessions.delete(7);
-  assert.throws(
-    () => entries.find((e) => e.label === "Review in Terminal").action(),
-    /no longer available/,
-  );
+  assert.equal(f.sheets.at(-1).at(-1).danger, true);
   f.view.cleanup();
   console.log(
-    "PASS latest approval context opens Terminal review without unchecked approve RPC, stale target rejection and branch controls",
+    "PASS simplified Terminal actions menu keeps Quick actions, Select text and capability-gated danger Close terminal",
   );
   f = fixture([
     {
@@ -2393,10 +2376,7 @@ async function main() {
     },
   ]);
   {
-    let inserted, reveal;
-    f.mounts.at(-1).loadHistory = (r) => {
-      reveal = r;
-    };
+    let inserted;
     f.buttons.find((b) => b.textContent === "Terminal actions").action();
     const sheet = f.sheets.at(-1);
     sheet.render({
@@ -2411,16 +2391,12 @@ async function main() {
     });
     assert.equal(inserted.className, "sheet-context");
     assert.equal(inserted.textContent, "Do you want to proceed?\n❯ 1. Yes");
-    await sheet.find((e) => e.label === "Load earlier output").action();
-    assert.equal(reveal, true);
     f.state.sessions.get(7).state = "Working";
     f.buttons.find((b) => b.textContent === "Terminal actions").action();
     assert.equal(f.sheets.at(-1).render, undefined);
     f.view.cleanup();
   }
-  console.log(
-    "PASS approval sheet shows latest lines above actions; Load earlier output reveals history",
-  );
+  console.log("PASS approval sheet shows latest lines above actions");
   f = fixture(undefined, { capabilities: { session_create: true } });
   f.ctx.rpc = async (r) => {
     f.calls.push(r);
@@ -3157,100 +3133,19 @@ async function testInstantCreate() {
   );
 }
 async function testPromptDraftAndInactiveMenu() {
-  const flush = async () => {
-      for (let i = 0; i < 12; i++) await Promise.resolve();
-    },
-    event = (el, type, props = {}) => {
-      const e = new Event(type, { cancelable: true });
-      Object.assign(e, props);
-      el.dispatchEvent(e);
-      return e;
-    };
-  let f = fixture(),
-    closed = 0,
-    resolve;
-  f.ctx.closeSheet = () => closed++;
-  f.ctx.act = (fn) => fn();
-  f.ctx.rpc = (req) => {
-    f.calls.push(req);
-    return new Promise((r) => (resolve = r));
+  const event = (el, type, props = {}) => {
+    const e = new Event(type, { cancelable: true });
+    Object.assign(e, props);
+    el.dispatchEvent(e);
+    return e;
   };
-  let activeBody;
-  const open = () => {
-    f.buttons.find((b) => b.textContent === "Terminal actions").action();
-    f.sheets
-      .at(-1)
-      .find((e) => e.label === "Send prompt")
-      .action();
-    const body = (activeBody = new Element("div"));
-    f.sheets.at(-1).render(body);
-    const form = body.children[0];
-    return { form, input: form.children[0], send: form.children[1] };
-  };
-  let { form, input, send } = open();
-  input.value = "first";
-  event(input, "input");
-  event(form, "submit");
-  event(form, "submit");
-  assert.equal(f.calls.length, 1);
-  assert.equal(send.disabled, true);
-  input.value = "second";
-  event(input, "input");
-  resolve({ sent: true });
-  await flush();
-  assert.equal(input.value, "second");
-  assert.equal(f.state.drafts.get(7), "second");
-  assert.equal(closed, 0);
-  assert.equal(send.disabled, false);
-  // Even editing back to the sent value is a new draft revision.
-  event(form, "submit");
-  input.value = "other";
-  event(input, "input");
-  input.value = "second";
-  event(input, "input");
-  resolve({ sent: true });
-  await flush();
-  assert.equal(f.state.drafts.get(7), "second");
-  assert.equal(closed, 0);
-  event(form, "submit");
-  const oldResolve = resolve;
-  ({ form, input, send } = open());
-  input.value = "new sheet draft";
-  event(input, "input");
-  oldResolve({ sent: true });
-  await flush();
-  assert.equal(f.state.drafts.get(7), "new sheet draft");
-  assert.equal(closed, 0);
-  event(form, "submit");
-  resolve({ sent: true });
-  await flush();
-  assert.equal(f.state.drafts.has(7), false);
-  assert.equal(input.value, "");
-  assert.equal(closed, 1);
-  input.value = "closed sheet";
-  event(input, "input");
-  event(form, "submit");
-  activeBody.closest = () => ({ open: false });
-  f.state.drafts.set(7, "closed sheet");
-  resolve({ sent: true });
-  await flush();
-  assert.equal(f.state.drafts.get(7), "closed sheet");
-  assert.equal(closed, 1);
-  input.value = "retain after cleanup";
-  event(input, "input");
-  event(form, "submit");
-  f.view.cleanup();
-  resolve({ sent: true });
-  await flush();
-  assert.equal(f.state.drafts.get(7), "retain after cleanup");
-  assert.equal(closed, 1);
-  console.log(
-    "PASS TR-A02 prompt sheet single submit, versioned edits, replacement sheet, successful clear and unmounted draft protection",
+  const f = fixture(
+    [
+      { id: 7, state: "Working" },
+      { id: 8, state: "Waiting" },
+    ],
+    { capabilities: { session_close: true } },
   );
-  f = fixture([
-    { id: 7, state: "Working" },
-    { id: 8, state: "Waiting" },
-  ]);
   f.sandbox.KrillMobile.chat = {
     mount() {
       return {};
@@ -3258,17 +3153,20 @@ async function testPromptDraftAndInactiveMenu() {
   };
   f.ctx.groupRoute = (_, id) => `/s/${id}`;
   f.buttons.find((b) => b.textContent === "Terminal actions").action();
-  assert.equal(f.sheets.at(-1)[0].label, "Switch to Chat");
+  assert.deepEqual(
+    Array.from(f.sheets.at(-1), (e) => e.label),
+    ["Quick actions", "Select text", "Close terminal"],
+  );
   const tab = f.buttons.filter((b) => b.className === "session-tab").at(-1);
   event(tab, "contextmenu");
-  const menu = f.sheets.at(-1);
-  assert(!menu.some((e) => /^Switch to /.test(e.label)));
-  menu.find((e) => e.label === "Review in Terminal").action();
-  assert.equal(f.routes.at(-1), "/s/8");
+  assert.deepEqual(
+    Array.from(f.sheets.at(-1), (e) => e.label),
+    ["Close terminal"],
+  );
   assert.equal(f.calls.length, 0);
   f.view.cleanup();
   console.log(
-    "PASS TR-A13 inactive tab menu cannot switch active view and approval review routes to the targeted tab",
+    "PASS inactive tab menu restricts actions to Close terminal without view or active-session entries",
   );
 }
 async function testHybridChatToggleAndQuestionCards() {
@@ -3454,8 +3352,11 @@ async function testHybridChatToggleAndQuestionCards() {
     .descendants()
     .find((n) => n.className === "chat-card chat-question");
   buttons.find((b) => b.textContent === "Terminal actions").action();
-  assert.equal(sheets.at(-1).entries[0].label, "Switch to Chat");
-  sheets.at(-1).entries[0].action();
+  assert.deepEqual(
+    Array.from(sheets.at(-1).entries, (e) => e.label),
+    ["Quick actions", "Select text"],
+  );
+  toggleBtn.action();
   assert.equal(toggleBtn.textContent, "Term");
   assert.equal(toggleBtn.getAttribute("aria-label"), "Term");
   assert.equal(state.preferences.sessionViewModes[7], "chat");
@@ -3503,25 +3404,11 @@ async function testHybridChatToggleAndQuestionCards() {
   await flush();
   assert(calls.some((c) => c.action === "git" && c.path === "src/lib.rs"));
   buttons.find((b) => b.textContent === "Terminal actions").action();
-  const selectTextEntry = sheets
-    .at(-1)
-    .entries.find((e) => e.label === "Select text");
-  assert(selectTextEntry);
-  selectTextEntry.action();
-  const textSheetBody = new Element("div");
-  sheets.at(-1).render(textSheetBody);
-  const screenTextArea = textSheetBody
-    .descendants()
-    .find((n) => n.className === "screen-text");
-  assert(screenTextArea);
-  assert(
-    screenTextArea.value.includes("Fix bug") &&
-      screenTextArea.value.includes("Pick one"),
-    "Chat mode Select text falls back to .chat-feed card texts",
+  assert.deepEqual(
+    Array.from(sheets.at(-1).entries, (e) => e.label),
+    ["Quick actions"],
   );
-  buttons.find((b) => b.textContent === "Terminal actions").action();
-  assert.equal(sheets.at(-1).entries[0].label, "Switch to Terminal");
-  sheets.at(-1).entries[0].action();
+  toggleBtn.action();
   assert.equal(toggleBtn.textContent, "Chat");
   assert.equal(mounts[0].visible, true);
   // [Chat | Term] 전환 시 TerminalAdapter를 언마운트하지 않고 그대로 유지해야 한다(0ms 전환).

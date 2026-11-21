@@ -24,7 +24,7 @@ for(const size of [0,1,15,16,17,63,64,65,1024,512*1024]){
  }
 }
 const vector=new C.Channel(new Uint8Array(32).fill(7),new Uint8Array(64).fill(9));assert.equal(C.hex(vector.seal(new TextEncoder().encode('prompt'))),'0000000000000000ca8c87d414301b7fc3a6a3f09a5fb977fb9422ea97cb');
-// Mobile screens without a browser: account usage values, Needs You, connection log, toast and same-tab pairing links.
+// Mobile screens without a browser: account usage values, Needs You, toast and same-tab pairing links.
 for(const name of ['screens/details.js','screens/home.js','screens/settings.js'])vm.runInContext(fs.readFileSync(path.join(assets,name),'utf8'),sandbox);
 {const A=sandbox.KrillMobile.accounts,now=1_000_000;
  assert.deepEqual({...A.usageWindow(null,now)},{percent:null,text:'—',reset:null});assert.equal(A.usageWindow({percent:23,resets_at:String(now+3*3600+54*60)},now).reset,'3h');
@@ -34,14 +34,13 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  const v=A.accountView({id:'w',provider:'Claude',label:'Work',email:'w@example.com',profile_dir:'',active:false,host_default:false,stale:false,usage:{five_hour:{percent:5,resets_at:null},seven_day:null}},data,now);
  assert.equal(v.title,'w@example.com');assert.equal(v.switchable,false);assert.equal(v.error,'Run claude login');assert.match(v.meta,/Usage only · Sign-in required/);assert.equal(v.windows[0][1].text,'5%');assert.equal(v.windows[1][1].text,'—');assert.equal(v.windows[1][1].percent,null);}
 {const sessions=new Map([[1,{id:1,state:'Blocked'}],[2,{id:2,state:'Waiting'}],[3,{id:3,state:'Waiting',exited:1}],[4,{id:4,state:'Working'}]]),need=sandbox.KrillMobile.needsYou({sessions,snapshot:{orchestration:{gates:[{status:'pending'}],questions:[{to:'user'},{to:'mobile'},{to:'coordinator'}]}}});assert.equal(need.total,5);assert.deepEqual([...need.sessions.map(s=>s.id)],[2,1]);}
-{const L=sandbox.KrillMobile.connectionLog;assert.equal(L.elapsed(1234),'+1.23s');assert.equal(L.elapsed(12345),'+12.3s');assert.equal(L.elapsed(123456),'+123s');assert.match(L.clock(0),/^\d\d:\d\d:\d\d$/);}
 {const lines=fs.readFileSync(path.join(assets,'app.js'),'utf8').split('\n'),timers=[],notice=new EventTarget();notice.hidden=true;notice.textContent='';
  const context=vm.createContext({notice,dialog:{open:false},t:s=>s,URLSearchParams,setTimeout:fn=>timers.push({fn}),clearTimeout:id=>{if(timers[id-1])timers[id-1].fn=()=>{};}});
  vm.runInContext(lines.find(l=>l.includes('let noticeTimer'))+lines.find(l=>l.includes('const pairingLink='))+'globalThis.T={toast,error,pairingLink};',context);const T=context.T;
  T.error(Error('RPC failed'));assert.equal(notice.hidden,false);assert.equal(notice.textContent,'RPC failed');T.error(Error('RPC failed'));timers[0].fn();assert.equal(notice.hidden,false);timers.at(-1).fn();assert.equal(notice.hidden,true);
  T.toast('Photo attached',3000);notice.dispatchEvent(new Event('click'));assert.equal(notice.hidden,true);
  assert.equal(T.pairingLink('#p=abc&key=def'),true);assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#r=rid'),true);assert.equal(T.pairingLink('#t=krill.example.com'),false);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
-console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
+console.log('PASS mobile screens: account usage/reset/status, Needs You, toast auto-hide and same-tab pairing link detection');
 for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','storage.js','client.js','terminal.js','qr.js','sw.js','screens/bots.js','screens/chat.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
 const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','storage.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
 // Direct-origin offline shell service worker: v6 icon inventory, 5xx fallback and fetch timeout.

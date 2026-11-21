@@ -1304,51 +1304,18 @@
         ...(target.id === activeSession().id
           ? [
               { label: t("Quick actions"), action: quickActions },
-              { label: t("Select text"), action: screenText },
               ...(viewMode === "term"
-                ? [
-                    {
-                      label: t("Load earlier output"),
-                      action: () => M.activeTerminal?.loadHistory(true),
-                    },
-                  ]
+                ? [{ label: t("Select text"), action: screenText }]
                 : []),
             ]
           : []),
-        { label: t("Send prompt"), action: () => prompt(target) },
-        {
-          label: t("Hand off to {0}", "Codex"),
-          action: () => handoff(target, "codex"),
-        },
-        {
-          label: t("Hand off to {0}", "Claude"),
-          action: () => handoff(target, "claude"),
-        },
       ];
-      if (target.branch !== null && target.branch !== undefined)
-        entries.unshift({
-          label: t("Git changes"),
-          action: () => go(`/git/${target.id}`),
-        });
-      if (["Waiting", "Blocked"].includes(target.state)) {
-        entries.unshift({
-          label: t("Review in Terminal"),
-          action: () => reviewTerminal(target.id),
-        });
-      }
       if (state.snapshot?.capabilities?.session_close)
         entries.push({
           label: t("Close terminal"),
           danger: true,
           action: () => confirmCloseSession(target),
         }); // 승인 전 맥락: 스냅샷의 마지막 줄(lines)을 시트 제목 아래에 보여 터미널을 열지 않고도 무엇을 승인하는지 확인한다.
-      if (M.chat?.mount && target.id === activeSession().id)
-        entries.unshift({
-          label: t(
-            viewMode === "chat" ? "Switch to Terminal" : "Switch to Chat",
-          ),
-          action: () => toggleViewMode(),
-        });
       const context =
         ["Waiting", "Blocked"].includes(target.state) && target.lines?.length
           ? target.lines.join("\n")
@@ -1587,157 +1554,11 @@
         },
       );
     }
-    function reviewTerminal(id) {
-      if (!state.sessions.has(id))
-        throw Error("This terminal is no longer available.");
-      ctx.closeSheet();
-      if (id === activeSession().id) {
-        setViewMode("term");
-        M.activeTerminal?.focus();
-      } else {
-        ctx.savePreferences?.({
-          sessionViewModes: {
-            ...state.preferences?.sessionViewModes,
-            [ctx.sessionKey?.(id) ?? id]: "term",
-          },
-        });
-        go(ctx.groupRoute(group, id));
-      }
-    }
-    const promptDraftVersions = (M.promptDraftVersions ||= new WeakMap());
-    let promptGeneration = 0;
-    function prompt(target) {
-      const sheetGeneration = ++promptGeneration;
-      ctx.sheet(t("Send prompt"), [], undefined, (body) => {
-        const form = el("form"),
-          input = el("textarea");
-        input.id = "prompt";
-        input.placeholder = t("Write a prompt…");
-        input.setAttribute("aria-label", t("Prompt"));
-        input.value = state.drafts.get(target.id) || "";
-        let pending = false,
-          version = 0;
-        const versions = promptDraftVersions.get(state.drafts) || new Map();
-        promptDraftVersions.set(state.drafts, versions);
-        const edit = () => {
-          version++;
-          versions.set(target.id, (versions.get(target.id) || 0) + 1);
-          input.value
-            ? state.drafts.set(target.id, input.value)
-            : state.drafts.delete(target.id);
-        };
-        input.addEventListener("input", edit);
-        const send = el("button", t("Send prompt"), "primary");
-        send.type = "submit";
-        form.id = "composer";
-        form.append(input, send);
-        form.addEventListener("submit", (e) => {
-          e.preventDefault();
-          if (pending || disposed || ctx.signal.aborted) return;
-          const text = input.value,
-            sentVersion = version,
-            draftVersion = versions.get(target.id);
-          if (!text) return;
-          pending = true;
-          send.disabled = true;
-          ctx.act(async () => {
-            try {
-              await ctx.rpc({ action: "prompt", session: target.id, text });
-              const current =
-                !disposed &&
-                !ctx.signal.aborted &&
-                sheetGeneration === promptGeneration &&
-                input.isConnected !== false &&
-                body.closest?.("dialog")?.open !== false &&
-                version === sentVersion &&
-                versions.get(target.id) === draftVersion &&
-                input.value === text &&
-                state.drafts.get(target.id) === text;
-              if (current) {
-                state.drafts.delete(target.id);
-                input.value = "";
-                ctx.closeSheet();
-              }
-              ctx.refresh().catch(ctx.error);
-            } finally {
-              pending = false;
-              send.disabled = false;
-            }
-          });
-        });
-        body.append(form);
-      });
-    }
-    async function handoff(target, agent) {
-      const initialHash = globalThis.location?.hash,
-        result = await ctx.rpc({
-          action: "handoff",
-          session: target.id,
-          agent,
-        });
-      await ctx.refresh?.();
-      if (
-        disposed ||
-        ctx.signal?.aborted ||
-        (globalThis.location?.hash && globalThis.location.hash !== initialHash)
-      )
-        return;
-      const id = Number(result.to_session),
-        next = state.sessions.get(id);
-      if (Number.isSafeInteger(id) && id > 0) {
-        go(ctx.groupRoute(state.groups.get(next?.groupKey) || group, id));
-        ctx.toast?.(
-          t("Handed off to {0}.", agent === "codex" ? "Codex" : "Claude"),
-        );
-      }
-    }
     function agentIcon(agent) {
       return M.agentIcon(agent, ctx);
     }
-    function nodeText(n) {
-      if (!n || n.className === "chat-meta") return "";
-      if (n.childNodes)
-        return Array.from(n.childNodes, (c) =>
-          c.nodeType === 3
-            ? c.textContent
-            : c.nodeType === 1
-              ? nodeText(c)
-              : "",
-        ).join("");
-      const self = typeof n._text === "string" ? n._text : n.textContent || "";
-      const sep =
-        String(n.className || "").includes("chat-card") ||
-        n.className === "chat-md"
-          ? "\n"
-          : "";
-      return [self, ...(n.children || []).map(nodeText)]
-        .filter(Boolean)
-        .join(sep);
-    }
     function screenText() {
-      let text = M.activeTerminal?.text?.() || "";
-      if (!text) {
-        const nodes = chatMount.descendants
-          ? chatMount.descendants()
-          : Array.from(chatMount.querySelectorAll?.("*") || []);
-        const feed = nodes.find((n) =>
-          String(n.className || "")
-            .split(/\s+/)
-            .includes("chat-feed"),
-        );
-        const cards = (
-          feed
-            ? feed.descendants
-              ? feed.descendants()
-              : Array.from(feed.querySelectorAll?.("*") || [])
-            : []
-        ).filter((n) =>
-          String(n.className || "")
-            .split(/\s+/)
-            .includes("chat-card"),
-        );
-        text = cards.map(nodeText).filter(Boolean).join("\n\n");
-      }
+      const text = M.activeTerminal?.text?.() || "";
       ctx.sheet(
         t("Terminal text"),
         [],

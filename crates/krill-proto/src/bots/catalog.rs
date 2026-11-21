@@ -1147,19 +1147,47 @@ pub fn find_composio_app(slug: &str) -> Option<&'static ComposioAppCatalogEntry>
     COMPOSIO_CURATED_APPS.iter().find(|app| app.slug == trimmed)
 }
 
+/// Slack rejects a manifest whose `bot_user.display_name` has any non-ASCII character (Korean
+/// included); spaces and capitals are fine. Keeps the ASCII words, else falls back to `Krill Bot`.
+fn slack_bot_display_name(name: &str) -> String {
+    let ascii: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words = ascii.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.chars().any(|c| c.is_ascii_alphanumeric()) {
+        words
+    } else {
+        "Krill Bot".to_owned()
+    }
+}
+
 /// Generates a ready-to-paste Slack App Manifest YAML configured for local Socket Mode
 /// (no public webhook URL or hosted cloud relay required).
 #[must_use]
 pub fn generate_slack_socket_mode_manifest(bot_name: &str) -> String {
     let clean_name = sanitize_yaml_single_line(bot_name, 35, "Krill Bot");
     let escaped = escape_yaml_double_quoted(&clean_name);
+    let display = escape_yaml_double_quoted(&slack_bot_display_name(&clean_name));
     [
         "display_information:".to_owned(),
         format!("  name: \"{escaped}\""),
         "  description: \"Local Krill Bot connected over Slack Socket Mode\"".to_owned(),
         "features:".to_owned(),
+        // Without a writable Messages tab Slack makes the bot's DM read-only
+        // (`restricted_action_read_only_channel`), so nobody can DM the bot.
+        "  app_home:".to_owned(),
+        "    home_tab_enabled: false".to_owned(),
+        "    messages_tab_enabled: true".to_owned(),
+        "    messages_tab_read_only_enabled: false".to_owned(),
         "  bot_user:".to_owned(),
-        format!("    display_name: \"{escaped}\""),
+        format!("    display_name: \"{display}\""),
         "    always_online: true".to_owned(),
         "oauth_config:".to_owned(),
         "  scopes:".to_owned(),
