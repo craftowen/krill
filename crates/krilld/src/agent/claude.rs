@@ -125,6 +125,27 @@ impl Settings {
         Ok(Self { id, path })
     }
 
+    /// 추가 작업 폴더를 `--add-dir` 대신 이 세션 설정의 `permissions.additionalDirectories`로 연다.
+    /// Claude Code 2.1.330은 `--add-dir`로 받은 신뢰 안 된 폴더(예: `~/Library/Application Support`
+    /// 아래 봇 홈)에 첫 메시지 때 신뢰 확인 창을 띄운다. 설정 파일로 준 폴더에는 묻지 않는다.
+    pub(crate) fn add_directories(&self, dirs: &[&Path]) -> io::Result<()> {
+        let mut root: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&self.path)?)?;
+        let list = dirs
+            .iter()
+            .map(|d| {
+                d.to_str().map(serde_json::Value::from).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "directory is not utf-8")
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        root.insert(
+            "permissions".to_owned(),
+            serde_json::json!({ "additionalDirectories": list }),
+        );
+        std::fs::write(&self.path, serde_json::to_vec(&root)?)
+    }
+
     pub(crate) fn launch(
         self,
         profile: &Profile,

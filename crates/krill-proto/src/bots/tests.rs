@@ -467,6 +467,40 @@ fn slack_socket_mode_manifest_is_valid_yaml_and_escapes_names() {
             .and_then(serde_json::Value::as_str),
         Some("My \"Quote\" Bot\\1")
     );
+    assert_eq!(
+        parsed
+            .pointer("/features/app_home/messages_tab_read_only_enabled")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        parsed
+            .pointer("/features/app_home/messages_tab_enabled")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    // Slack refuses non-ASCII bot display names; the app name keeps the Korean.
+    for (name, display) in [
+        ("Krill 테스트봇", "Krill"),
+        ("슬랙테스트봇", "Krill Bot"),
+        ("Release Bot", "Release Bot"),
+    ] {
+        let parsed: serde_json::Value =
+            serde_saphyr::from_str(&generate_slack_socket_mode_manifest(name)).unwrap();
+        assert_eq!(
+            parsed
+                .pointer("/features/bot_user/display_name")
+                .and_then(serde_json::Value::as_str),
+            Some(display),
+            "{name}"
+        );
+        assert_eq!(
+            parsed
+                .pointer("/display_information/name")
+                .and_then(serde_json::Value::as_str),
+            Some(name)
+        );
+    }
     let fallback_yaml = generate_slack_socket_mode_manifest("   \n\t  ");
     let fallback_parsed: serde_json::Value = serde_saphyr::from_str(&fallback_yaml).unwrap();
     assert_eq!(

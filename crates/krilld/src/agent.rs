@@ -414,8 +414,8 @@ pub(crate) fn launch_selected_in(
     launch_selected_in_with_bot_mcp(profile, permission, session, state, selected, None, None)
 }
 
-/// Bot-aware extension of [`launch_selected_in`] that injects MCP servers, `--add-dir` for
-/// separated bot homes, and loopback entries in `NO_PROXY`/`no_proxy`.
+/// Bot-aware extension of [`launch_selected_in`] that injects MCP servers, the separated bot home
+/// (Claude: settings `additionalDirectories`, no trust prompt), and loopback entries in `NO_PROXY`/`no_proxy`.
 pub(crate) fn launch_selected_in_with_bot_mcp(
     profile: &Profile,
     permission: Permission,
@@ -460,27 +460,21 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
         let version = claude::probe(profile, &login);
         let settings = claude::Settings::create(state, &krill, session, version.as_deref())?;
         let id = settings.id.clone();
+        if let Some(home) = bot_mcp.and_then(|m| m.bot_home.as_deref())
+            && cwd.is_none_or(|c| !same_workspace_dir(c, home))
+        {
+            settings.add_directories(&[home])?;
+        }
         let mut launch = settings.launch(profile, permission, login)?;
-        if let Some(mcp) = bot_mcp {
-            if !mcp.http_servers.is_empty() || !mcp.stdio_servers.is_empty() {
-                let mcp_path = claude::create_mcp_config(
-                    state,
-                    session,
-                    &mcp.http_servers,
-                    &mcp.stdio_servers,
-                )?;
-                launch.argv.extend([
-                    b"--mcp-config".to_vec(),
-                    mcp_path.as_os_str().as_bytes().to_vec(),
-                ]);
-            }
-            if let Some(ref home) = mcp.bot_home
-                && cwd.is_none_or(|c| !same_workspace_dir(c, home))
-            {
-                launch
-                    .argv
-                    .extend([b"--add-dir".to_vec(), home.as_os_str().as_bytes().to_vec()]);
-            }
+        if let Some(mcp) = bot_mcp
+            && (!mcp.http_servers.is_empty() || !mcp.stdio_servers.is_empty())
+        {
+            let mcp_path =
+                claude::create_mcp_config(state, session, &mcp.http_servers, &mcp.stdio_servers)?;
+            launch.argv.extend([
+                b"--mcp-config".to_vec(),
+                mcp_path.as_os_str().as_bytes().to_vec(),
+            ]);
         }
         return Ok((launch, Some(id), account));
     }

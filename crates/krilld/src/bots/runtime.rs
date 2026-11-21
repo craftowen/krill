@@ -291,7 +291,7 @@ impl BotRuntime {
 
     /// Starts a new bot session via normal `Registry` + `holder::Spawn`, injects bot env vars,
     /// `BotMcpLaunchConfig` (`/bot-tools/krill/mcp`, relayed HTTP & enabled stdio MCP tools,
-    /// `--add-dir`, `NO_PROXY`/`no_proxy`), and delivers the launch preamble + optional prompt.
+    /// bot home directory access, `NO_PROXY`/`no_proxy`), and delivers the launch preamble + optional prompt.
     #[expect(clippy::too_many_arguments, reason = "bot launch orchestration inputs")]
     pub fn start_bot_session(
         &self,

@@ -2083,7 +2083,7 @@ fn bot_mcp_launch_injects_claude_and_codex_mcp_add_dir_and_no_proxy() {
         }],
     };
 
-    // 1. Claude gets `--mcp-config <0600 file>`, `--add-dir <bot_home>`, and NO_PROXY loopback.
+    // 1. Claude gets `--mcp-config <0600 file>`, the bot home in its settings, and NO_PROXY loopback.
     let claude_prof = profile(&["claude"]);
     let (claude_launch, _, _) = launch_selected_in_with_bot_mcp(
         &claude_prof,
@@ -2116,8 +2116,17 @@ fn bot_mcp_launch_injects_claude_and_codex_mcp_add_dir_and_no_proxy() {
         mcp_json["mcpServers"]["gh-local"]["env"]["GH_TOKEN"],
         "ghp_abc"
     );
-    let add_dir_pos = claude_argv.iter().position(|a| a == "--add-dir").unwrap();
-    assert_eq!(Path::new(&claude_argv[add_dir_pos + 1]), bot_home);
+    // `--add-dir` makes Claude Code ask a trust question nobody on Slack can answer; the bot
+    // home goes through the session settings instead.
+    assert!(!claude_argv.iter().any(|a| a == "--add-dir"));
+    let settings_pos = claude_argv.iter().position(|a| a == "--settings").unwrap();
+    let settings_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&claude_argv[settings_pos + 1]).unwrap()).unwrap();
+    assert_eq!(
+        settings_json["permissions"]["additionalDirectories"],
+        serde_json::json!([bot_home.to_str().unwrap()])
+    );
+    assert!(settings_json["hooks"].is_object());
     assert!(
         claude_launch.env.iter().any(|(k, v)| k == b"NO_PROXY"
             && String::from_utf8_lossy(v).contains("127.0.0.1,localhost,::1"))
