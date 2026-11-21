@@ -792,6 +792,8 @@ mod tests {
             IconName::TextWrap,
             IconName::Eye,
             IconName::ArrowUp,
+            IconName::Image,
+            IconName::Terminal,
         ] {
             let path = icon.path();
             assert!(
@@ -837,6 +839,7 @@ gpui_kit_assets::icon_assets!(
         FolderOpen,
         Gauge,
         Globe,
+        Image,
         Info,
         Keyboard,
         Layers,
@@ -871,6 +874,7 @@ gpui_kit_assets::icon_assets!(
         SquareTerminal,
         Star,
         StarFill,
+        Terminal,
         TextWrap,
         TriangleAlert,
         User,
