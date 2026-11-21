@@ -5824,6 +5824,12 @@ impl Shell {
             return;
         };
         let active_drag = bit != 0 && (l.mouse_down & bit) != 0;
+        // 왼쪽 클릭을 프로그램에 넘기면(pi 전체 화면처럼 앱이 직접 선택·복사) 이전 Krill 선택은 끝난 것이다.
+        // 남겨 두면 화면 밖이라 안 보이는 옛 선택 글자를 ⌘C가 다시 복사해 앱이 복사한 내용을 덮는다.
+        if matches!(event, keys::tui::Mouse::Press(0)) && l.selection.is_some() {
+            l.clear_selection();
+            cx.notify();
+        }
         if matches!(event, keys::tui::Mouse::Release(_)) {
             l.mouse_down &= !bit;
         } else if matches!(event, keys::tui::Mouse::Move(None)) {
