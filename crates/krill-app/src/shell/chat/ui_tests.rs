@@ -1579,6 +1579,55 @@ fn chat_top_right_term_pill_context_menu_turn_status_and_empty_state(cx: &mut Te
     assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
 }
 
+#[gpui::test]
+fn chat_overlay_split_right_button_splits_and_closes_pane(cx: &mut TestAppContext) {
+    let (shell, cx) = open(cx, state_path("chat-overlay-split"));
+    let pane = shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: false,
+                ..Default::default()
+            },
+        );
+        cx.notify();
+        pane
+    });
+    cx.run_until_parked();
+
+    let overlay = cx.debug_bounds("desktop-chat-overlay").unwrap();
+    let split_sel: &'static str =
+        Box::leak(format!("chat-split-right-{}", pane.get()).into_boxed_str());
+    let close_sel: &'static str =
+        Box::leak(format!("chat-pane-close-{}", pane.get()).into_boxed_str());
+    let split_btn = cx.debug_bounds(split_sel).expect("chat split-right button");
+    assert!(
+        split_btn.left() >= overlay.left() && split_btn.right() <= overlay.right(),
+        "chat split button must sit inside overlay: {split_btn:?} vs {overlay:?}"
+    );
+    assert!(
+        cx.debug_bounds(close_sel).is_none(),
+        "single chat pane hides close button"
+    );
+
+    cx.simulate_click(split_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let visible_count = shell.read_with(cx, |shell, _| shell.layout.visible().len());
+    assert_eq!(visible_count, 2);
+    let close_btn = cx
+        .debug_bounds(close_sel)
+        .expect("split chat pane exposes close button");
+    cx.simulate_click(close_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let visible_count = shell.read_with(cx, |shell, _| shell.layout.visible().len());
+    assert_eq!(visible_count, 1);
+}
+
 fn attach_live_test_pane(
     shell: &mut Shell,
     pane: super::super::PaneId,

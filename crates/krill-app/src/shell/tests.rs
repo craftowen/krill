@@ -2055,6 +2055,21 @@ fn titlebar_collapse_toggles_and_status_bar(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(cx.debug_bounds("sidebar-column").is_some());
 
+    assert!(cx.debug_bounds("split-right").is_none());
+    let panel_btn = cx.debug_bounds("toggle-panel").unwrap();
+    cx.simulate_mouse_down(panel_btn.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(panel_btn.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("panel-column").is_none());
+    assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
+
+    let panel_btn = cx.debug_bounds("toggle-panel").unwrap();
+    cx.simulate_mouse_down(panel_btn.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(panel_btn.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("panel-column").is_some());
+    assert!(cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
+
     pick_overflow(cx, "down down down enter");
     assert!(cx.debug_bounds("panel-column").is_none());
     assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
@@ -5476,8 +5491,8 @@ fn close_tabs_to_left_keeps_pinned_and_records(cx: &mut TestAppContext) {
     assert_eq!(l.active(), 1);
 }
 
-/// OWE-653: 단일 칸은 패인 헤더 줄을 숨기고(분할하면 보인다), 저장 명령·맥락 복사는 별도 툴바 줄이 아니라
-/// 탭 바 안의 아이콘으로 남는다.
+/// OWE-653: 단일 칸에서도 활성 패인 우상단의 분할 버튼은 보이고(호버 시 상하 분할·닫기 노출),
+/// 오른쪽 패널 토글·저장 명령·맥락 복사는 탭 바 안의 아이콘으로 남는다.
 #[gpui::test]
 fn single_pane_hides_header_and_commands_live_in_titlebar(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("pane-header"));
@@ -5485,31 +5500,65 @@ fn single_pane_hides_header_and_commands_live_in_titlebar(cx: &mut TestAppContex
     let header = "pane-header-0";
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds(header).is_none(),
-        "single pane shows no header row"
+        cx.debug_bounds(header).is_some(),
+        "single focused pane mounts chromeless split header"
+    );
+    assert!(
+        cx.debug_bounds("pane-split-right-0").is_some(),
+        "single focused pane shows split-right button inside the pane"
+    );
+    assert!(
+        cx.debug_bounds("pane-split-down-0").is_none(),
+        "split-down button stays hidden until hovered"
+    );
+    assert!(
+        cx.debug_bounds("pane-close-0").is_none(),
+        "single pane shows no close button"
+    );
+    assert!(
+        cx.debug_bounds("split-right").is_none(),
+        "titlebar must not carry a split-right button"
     );
     let bar = cx.debug_bounds("titlebar").expect("titlebar");
-    for id in ["titlebar-more", "new-tab"] {
+    for id in ["toggle-panel", "titlebar-more", "new-tab"] {
         let b = cx.debug_bounds(id).expect("command button stays reachable");
         assert!(
             bar.contains(&b.center()),
             "{id} must sit inside the tab bar, got {b:?} vs {bar:?}"
         );
     }
-    view.update(cx, |s, cx| {
-        s.change(true, cx, |l| l.split(Axis::Horizontal));
-    });
+    let split_btn = cx
+        .debug_bounds("pane-split-right-0")
+        .expect("pane split-right button");
+    cx.simulate_click(split_btn.center(), Modifiers::default());
     cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+    assert!(
+        cx.debug_bounds("pane-split-right-1").is_some(),
+        "newly focused split pane shows its split-right button"
+    );
+    assert!(
+        cx.debug_bounds("pane-split-right-0").is_none(),
+        "unfocused split pane hides split-right until hovered"
+    );
     let header_bounds = cx.debug_bounds(header).expect("split panes mount header");
     assert!(
         cx.debug_bounds("pane-close-0").is_none(),
-        "floating pane header auto-hides until hovered"
+        "floating pane header auto-hides close button until hovered"
     );
     cx.simulate_mouse_move(header_bounds.center(), None, Modifiers::default());
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("pane-close-0").is_some(),
         "hovering floating pane header reveals controls"
+    );
+    assert!(
+        cx.debug_bounds("pane-split-right-0").is_some(),
+        "hovering floating pane header reveals split-right"
+    );
+    assert!(
+        cx.debug_bounds("pane-split-down-0").is_some(),
+        "hovering floating pane header reveals split-down"
     );
     cx.simulate_mouse_move(point(px(120.), px(240.)), None, Modifiers::default());
     cx.run_until_parked();
@@ -12784,7 +12833,9 @@ fn pane_card_focus_ring_tracks_terminal_file_and_chat_panes(cx: &mut TestAppCont
     let p0 = layout_of(&view, cx).active_tab().focused;
     let p0_header: &'static str = Box::leak(format!("pane-header-{}", p0.get()).into_boxed_str());
     assert!(card_bounds(cx, p0, "active").is_some());
-    assert!(cx.debug_bounds(p0_header).is_none());
+    assert!(cx.debug_bounds(p0_header).is_some());
+    assert!(cx.debug_bounds("pane-split-right-0").is_some());
+    assert!(cx.debug_bounds("pane-close-0").is_none());
 
     cx.simulate_keystrokes("cmd-d");
     cx.run_until_parked();

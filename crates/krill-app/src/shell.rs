@@ -6996,18 +6996,23 @@ impl Shell {
         let focus_state = self.pane_focus_state(id, window, cx);
         let solid_cursor = focus_state.shows_solid_terminal_cursor();
         let is_split = self.layout.visible().len() > 1;
-        let show_header = is_split || self.layout.host(id).is_remote();
         let ended = self.live.get(&id).is_some_and(|live| {
             live.pane.session().is_some() && (live.pane.is_cold() || live.pane.is_closed())
         });
+        let show_ended_header = is_split || self.layout.host(id).is_remote();
+        let show_floating_header = !ended
+            && (self.role == WindowRole::Main || is_split || self.layout.host(id).is_remote());
         let p = krill_app::ui::palette(cx);
         // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.layout.zoomed_pane() == Some(id);
+        let hover_bg = p.sidebar.opacity(0.92);
+        let hover_border = p.border;
         // 실행 중인 패인은 터미널 우상단의 플로팅 오버레이 칩에 컨트롤만 두고
-        // 평소에는 자동 숨김으로 비워 두었다가 마우스를 올릴 때만 드러낸다.
+        // 현재 활성(포커스) 패인의 오른쪽 분할 버튼만 Orca처럼 은은히 드러낸 채
+        // 나머지 컨트롤은 마우스를 올릴 때만 드러낸다.
         // 종료·콜드 패인은 헤더를 일반 흐름에 넣어 UI 배율에 맞는 높이를 확보하고
         // 아래 배너와 겹치지 않게 한다. 탭 바의 제목은 중복하지 않는다.
         let pane_header_chip = div()
@@ -7023,93 +7028,157 @@ impl Shell {
             .px_1()
             .py_0p5()
             .rounded(krill_app::ui::RADIUS_SM)
-            .bg(p.sidebar.opacity(0.92))
             .border_1()
-            .border_color(p.border)
+            .when(ended, |d| d.bg(hover_bg).border_color(hover_border))
             .when(!ended, |d| {
-                d.invisible()
-                    .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                d.bg(krill_app::ui::transparent())
+                    .border_color(krill_app::ui::transparent())
+                    .group_hover(PANE_HEADER_GROUP, move |d| {
+                        d.bg(hover_bg).border_color(hover_border)
+                    })
             })
-            .children(host_badge)
+            .when_some(host_badge, |d, badge| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(badge),
+                )
+            })
             .when(zoomed, |d| {
                 d.child(
                     div()
-                        .id(("pane-zoom-badge", id.get()))
-                        .debug_selector(move || format!("pane-zoom-badge-{}", id.get()))
-                        .aria_label(text::ZOOMED_BADGE.get())
                         .flex_none()
-                        .px_1()
-                        .rounded(krill_app::ui::RADIUS_XS)
-                        .bg(p.muted)
-                        .font_family(krill_app::ui::FONT_UI)
-                        .text_size(krill_app::ui::TEXT_2XS)
-                        .text_color(p.muted_foreground)
-                        .child(text::ZOOMED_BADGE.get()),
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(
+                            div()
+                                .id(("pane-zoom-badge", id.get()))
+                                .debug_selector(move || format!("pane-zoom-badge-{}", id.get()))
+                                .aria_label(text::ZOOMED_BADGE.get())
+                                .flex_none()
+                                .px_1()
+                                .rounded(krill_app::ui::RADIUS_XS)
+                                .bg(p.muted)
+                                .font_family(krill_app::ui::FONT_UI)
+                                .text_size(krill_app::ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::ZOOMED_BADGE.get()),
+                        )
+                        .child(krill_app::ui::button_with_tooltip(
+                            krill_app::ui::ghost(
+                                ("pane-unzoom", id.get()),
+                                text::PANE_UNZOOM.get(),
+                            )
+                            .xsmall()
+                            .debug_selector(move || format!("pane-unzoom-{}", id.get()))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.layout.set_zoomed_pane(None);
+                                    this.save();
+                                    cx.notify();
+                                },
+                            )),
+                            format!("pane-unzoom-{}", id.get()),
+                            text::PANE_UNZOOM.get(),
+                        )),
                 )
-                .child(krill_app::ui::button_with_tooltip(
-                    krill_app::ui::ghost(("pane-unzoom", id.get()), text::PANE_UNZOOM.get())
-                        .xsmall()
-                        .debug_selector(move || format!("pane-unzoom-{}", id.get()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.layout.set_zoomed_pane(None);
-                            this.save();
-                            cx.notify();
-                        })),
-                    format!("pane-unzoom-{}", id.get()),
-                    text::PANE_UNZOOM.get(),
-                ))
             })
-            .child(krill_app::ui::button_with_tooltip(
-                Button::new(("pane-split-right", id.get()))
-                    .icon(IconName::PanelRight)
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                        this.layout.set_zoomed_pane(None);
-                        this.change(true, cx, |l| {
-                            l.focus(id);
-                            l.split(Axis::Horizontal);
-                        });
-                    })),
-                format!("pane-split-right-{}", id.get()),
-                text::SPLIT_RIGHT.get(),
-            ))
-            .child(krill_app::ui::button_with_tooltip(
-                Button::new(("pane-split-down", id.get()))
-                    .icon(IconName::PanelBottom)
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                        this.layout.set_zoomed_pane(None);
-                        this.change(true, cx, |l| {
-                            l.focus(id);
-                            l.split(Axis::Vertical);
-                        });
-                    })),
-                format!("pane-split-down-{}", id.get()),
-                text::SPLIT_DOWN.get(),
-            ))
+            .child(
+                div()
+                    .flex_none()
+                    .when(!ended, |d| {
+                        d.invisible()
+                            .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                    })
+                    .child(krill_app::ui::button_with_tooltip(
+                        Button::new(("pane-split-down", id.get()))
+                            .debug_selector(move || format!("pane-split-down-{}", id.get()))
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(krill_app::ui::icons::SPLIT_VERTICAL_SVG),
+                            )
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
+                                this.layout.set_zoomed_pane(None);
+                                this.change(true, cx, |l| {
+                                    l.focus(id);
+                                    l.split(Axis::Vertical);
+                                });
+                            })),
+                        format!("pane-split-down-{}", id.get()),
+                        text::SPLIT_DOWN.get(),
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .when(!ended && !focused, |d| {
+                        d.invisible()
+                            .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                    })
+                    .when(!ended && focused, |d| {
+                        d.opacity(0.7)
+                            .group_hover(PANE_HEADER_GROUP, |s| s.opacity(1.0))
+                    })
+                    .child(krill_app::ui::button_with_tooltip(
+                        Button::new(("pane-split-right", id.get()))
+                            .debug_selector(move || format!("pane-split-right-{}", id.get()))
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(krill_app::ui::icons::SPLIT_HORIZONTAL_SVG),
+                            )
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
+                                this.layout.set_zoomed_pane(None);
+                                this.change(true, cx, |l| {
+                                    l.focus(id);
+                                    l.split(Axis::Horizontal);
+                                });
+                            })),
+                        format!("pane-split-right-{}", id.get()),
+                        text::SPLIT_RIGHT.get(),
+                    )),
+            )
             .when(is_split, |d| {
-                d.child(krill_app::ui::button_with_tooltip(
-                    Button::new(("pane-close", id.get()))
-                        .debug_selector(move || format!("pane-close-{}", id.get()))
-                        .icon(IconName::Close)
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
-                            // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
-                            this.maybe_close_pane(id, cx);
-                        })),
-                    format!("pane-close-{}", id.get()),
-                    text::CLOSE_PANE.get(),
-                ))
+                d.child(
+                    div()
+                        .flex_none()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(krill_app::ui::button_with_tooltip(
+                            Button::new(("pane-close", id.get()))
+                                .debug_selector(move || format!("pane-close-{}", id.get()))
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
+                                    // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
+                                    this.maybe_close_pane(id, cx);
+                                })),
+                            format!("pane-close-{}", id.get()),
+                            text::CLOSE_PANE.get(),
+                        )),
+                )
             });
         let pane_header = div()
             .id(("pane-header", id.get()))
@@ -7164,7 +7233,7 @@ impl Shell {
                         .flex()
                         .flex_col()
                         // Ended/cold panes reserve the header's measured height, including UI zoom.
-                        .when(show_header, |d| d.children(pane_header.take()))
+                        .when(show_ended_header, |d| d.children(pane_header.take()))
                         // OWE-653: 배너는 테두리 있는 띠로, 문구는 본문 색·왼쪽, 버튼은 오른쪽 끝(다시 시작=주 버튼).
                         .child(
                             div()
@@ -7303,7 +7372,7 @@ impl Shell {
                             .children(self.scroll_chrome(id, cx))
                             // 실행 중인 패인의 헤더만 터미널 위 오버레이로 남는다.
                             // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
-                            .children(pane_header.filter(|_| show_header)),
+                            .children(pane_header.filter(|_| show_floating_header)),
                     )
                     .children(self.render_pane_chat_overlay(id, has_sticky_bar, window, cx))
                     .children(sticky_popover),
