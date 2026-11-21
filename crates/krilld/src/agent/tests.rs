@@ -1664,6 +1664,7 @@ fn account_for_stored_in_prefers_transcript_path_and_detects_agy_conversations_d
         cwd: Vec::new(),
         hibernation_blocked: false,
         account: None,
+        bot_instructions: None,
     };
     let resolved = super::account_for_stored_in(&home, &agy, Some(&state), &stored_in_profile)
         .expect("resolved from transcript_path");
@@ -1773,6 +1774,7 @@ fn codex_no_daemon_probe_and_zsh_wrapper_isolate_sessions() {
         cwd: Vec::new(),
         hibernation_blocked: false,
         account: None,
+        bot_instructions: None,
     };
     let resolved = super::account_for_stored_in(&home, &codex_prof, Some(&state), &stored)
         .expect("resolved symlinked codex sessions dir");
@@ -2287,5 +2289,80 @@ fn bot_instructions_reach_each_agent_system_prompt_not_first_input() {
     assert!(!Path::new(&file).exists());
     assert!(!added.exists() && !oc_dir.exists());
     assert!(oc_config.join("opencode.jsonc").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 봇 지침은 대화 기록이 아니라 시스템 프롬프트에 있으니 재개(cold resume) 때도 다시 넘긴다.
+#[test]
+fn resume_passes_bot_instructions_again_and_plain_resume_is_unchanged() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-resume-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    let claude_exe = dir.join("claude");
+    std::fs::write(&claude_exe, "#!/bin/sh\nprintf '2.1.299\\n'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&claude_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let text = "You are Shop, a bot that runs in Krill.";
+    let argv_of = |launch: &Launch| -> Vec<String> {
+        launch
+            .argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect()
+    };
+    let resume = |p: &Profile, sid: u64, conv: Option<&str>, instr: Option<&str>| {
+        let (launch, _, _) = resume_in_with_bot_instructions(
+            p,
+            Permission::Manual,
+            krill_proto::SessionId(sid),
+            Some(&dir),
+            conv,
+            None,
+            instr,
+        )
+        .unwrap();
+        argv_of(&launch)
+    };
+
+    let claude = profile(&[claude_exe.to_str().unwrap()]);
+    let conv = "11111111-2222-4333-8444-555555555555";
+    let resumed = resume(&claude, 931, Some(conv), Some(text));
+    let at = resumed
+        .iter()
+        .position(|a| a == "--append-system-prompt-file")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&resumed[at + 1]).unwrap(), text);
+    assert_eq!(resumed.last().unwrap(), &format!("--resume={conv}"));
+
+    let pi = resume(&profile(&["pi"]), 932, None, Some(text));
+    let at = pi
+        .iter()
+        .position(|a| a == "--append-system-prompt")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&pi[at + 1]).unwrap(), text);
+
+    let agy = resume(&profile(&["agy"]), 933, Some("conv-1"), Some(text));
+    let at = agy.iter().position(|a| a == "--add-dir").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&agy[at + 1]).join("AGENTS.md")).unwrap(),
+        text
+    );
+    assert!(agy.ends_with(&["--conversation".to_owned(), "conv-1".to_owned()]));
+
+    // A chat that never took bot instructions resumes exactly as before.
+    let plain = resume(&profile(&["pi"]), 934, None, None);
+    let (before, _, _) = resume_in(
+        &profile(&["pi"]),
+        Permission::Manual,
+        krill_proto::SessionId(934),
+        Some(&dir),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plain, argv_of(&before));
+    assert!(!plain.iter().any(|a| a.contains("append-system-prompt")));
     std::fs::remove_dir_all(&dir).ok();
 }

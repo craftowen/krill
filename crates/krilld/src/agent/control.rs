@@ -37,6 +37,9 @@ pub(crate) struct StoredLaunch {
     /// 실행에 쓴 계정(OWE-698). 구 기록은 `None`이라 재개가 대화가 든 프로필을 찾는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<LaunchAccount>,
+    /// 시스템 프롬프트로 넘긴 봇 지침. 재개 때 다시 넘긴다(대화 기록에 없어서).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_instructions: Option<String>,
 }
 
 /// 실행 당시 적용한 계정 프로필(OWE-698). 재개·휴면 깨우기는 지금 활성 계정이 아니라 이 프로필로 이어 간다.
@@ -273,7 +276,19 @@ impl Control {
             cwd,
             hibernation_blocked: false,
             account,
+            bot_instructions: None,
         };
+        let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
+        write_atomic_0600(&self.launch_path(session)?, &bytes)
+    }
+
+    /// 이 세션이 시스템 프롬프트로 받은 봇 지침을 실행 기록에 남긴다.
+    pub fn remember_bot_instructions(&self, session: SessionId, text: &str) -> io::Result<()> {
+        let _guard = lock(&self.config);
+        let Some(mut stored) = self.read_stored(session)? else {
+            return Ok(());
+        };
+        stored.bot_instructions = Some(text.to_owned());
         let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
         write_atomic_0600(&self.launch_path(session)?, &bytes)
     }
@@ -497,6 +512,7 @@ impl Control {
                     cwd,
                     hibernation_blocked: true,
                     account: None,
+                    bot_instructions: None,
                 };
                 if let Ok(path) = self.launch_path(session)
                     && let Ok(bytes) = serde_json::to_vec(&bound)

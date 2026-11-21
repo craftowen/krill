@@ -761,6 +761,7 @@ impl Registry {
             cwd,
             hibernation_blocked: true,
             account: None,
+            bot_instructions: None,
         })
     }
 

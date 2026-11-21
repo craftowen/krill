@@ -155,6 +155,7 @@ mod owner_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         }
     }
 

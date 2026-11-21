@@ -1901,23 +1901,32 @@ impl Registry {
                 )
                 .map_err(|e| os(&e))?;
                 crate::agent::pre_trust_workspace(profile, &c.cwd, account.as_ref());
-                let (launch, session_id, account) = crate::agent::resume_in(
+                let (launch, session_id, account) = crate::agent::resume_in_with_bot_instructions(
                     profile,
                     s.permission,
                     session,
                     state.as_deref(),
                     resume_id.as_deref(),
                     account.as_ref(),
+                    s.bot_instructions.as_deref(),
                 )
-                .map_err(|e| os(&e))?;
+                .map_err(|e| {
+                    self.discard_settings(session);
+                    os(&e)
+                })?;
                 let metadata = control::AgentLaunch {
                     profile: canonical.to_owned(),
                     permission: s.permission,
                 };
                 self.agents
                     .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
+                    .and_then(|()| match s.bot_instructions.as_deref() {
+                        Some(text) => self.agents.remember_bot_instructions(session, text),
+                        None => Ok(()),
+                    })
                     .map_err(|e| {
                         self.discard_settings(session);
+                        self.agents.forget(session);
                         os(&e)
                     })?;
                 launch
@@ -3517,6 +3526,7 @@ impl Registry {
                 cwd: cwd.clone(),
                 hibernation_blocked: true,
                 account: None,
+                bot_instructions: None,
             })
         });
 
@@ -4107,13 +4117,20 @@ impl Registry {
                 self.discard_settings(session);
                 format!("failed to persist session metadata: {err}")
             })?;
-        // 지침이 시스템 프롬프트로 갔는지: 아니면 호출자가 첫 입력으로 보낸다.
-        let instructions_given = crate::agent::takes_bot_instructions(&profile)
-            && bot_mcp.is_some_and(|m| {
-                m.instructions
-                    .as_deref()
-                    .is_some_and(|t| !t.trim().is_empty())
-            });
+        // 지침이 시스템 프롬프트로 갔는지: 아니면 호출자가 첫 입력으로 보낸다. 재개 때 다시 넘기도록 남긴다.
+        let given = bot_mcp
+            .and_then(|m| m.instructions.as_deref())
+            .filter(|t| !t.trim().is_empty() && crate::agent::takes_bot_instructions(&profile));
+        if let Some(text) = given {
+            self.agents
+                .remember_bot_instructions(session, text)
+                .map_err(|err| {
+                    self.discard_settings(session);
+                    self.agents.forget(session);
+                    format!("failed to persist session metadata: {err}")
+                })?;
+        }
+        let instructions_given = given.is_some();
         self.spawn_holder(holder, session, launch.argv, launch.env, cwd_bytes, 120, 40)
             .map(|(sid, pid)| (sid, pid, instructions_given))
             .map_err(|fail| format!("failed to spawn bot session: {fail:?}"))

@@ -863,6 +863,7 @@ esac
                 cwd: b"/same/project".to_vec(),
                 hibernation_blocked: false,
                 account: Some(source.clone()),
+                bot_instructions: None,
             });
         }
         for stored in &sessions {
@@ -917,6 +918,7 @@ esac
             cwd: b"/same/project".to_vec(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         assert_eq!(
             session_id(ProviderKind::Codex, &stored).unwrap_err().kind(),
@@ -1180,6 +1182,7 @@ mod bound_path_tests {
             cwd: Vec::new(),
             account: Some(source.clone()),
             hibernation_blocked: false,
+            bot_instructions: None,
         };
         assert!(!has_claude_transcript(&root, Some(&source), &stored));
         fs::write(&transcript, b"").unwrap();

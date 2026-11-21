@@ -465,12 +465,9 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
         if let Some(text) = instructions
             && !effective.launch.is_empty()
         {
-            // TOML 기본 문자열: JSON 문자열 이스케이프는 TOML에서도 그대로 유효하다.
-            let value = serde_json::to_string(text).map_err(io::Error::other)?;
-            effective.launch.splice(
-                1..1,
-                ["-c".to_owned(), format!("developer_instructions={value}")],
-            );
+            let state = state.ok_or(io::ErrorKind::NotFound)?;
+            let args = instruction_args(&effective, &mut login.env, state, session, text)?;
+            effective.launch.splice(1..1, args);
         }
         return Ok((
             wrap_account(&effective, permission, login, account.as_ref()),
@@ -502,11 +499,8 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
             ]);
         }
         if let Some(text) = instructions {
-            let path = claude::create_instructions_file(state, session, text)?;
-            launch.argv.extend([
-                b"--append-system-prompt-file".to_vec(),
-                path.as_os_str().as_bytes().to_vec(),
-            ]);
+            let args = instruction_args(profile, &mut launch.env, state, session, text)?;
+            launch.argv.extend(args.into_iter().map(String::into_bytes));
         }
         return Ok((launch, Some(id), account));
     }
@@ -538,7 +532,7 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
     ))
 }
 
-/// Pi·OMP·Antigravity·OpenCode가 봇 지침을 받는 인자(프로그램 바로 뒤에 넣는다)와 env.
+/// 각 에이전트가 봇 지침을 시스템 프롬프트로 받는 인자(프로그램 바로 뒤에 넣는다)와 env.
 fn instruction_args(
     profile: &Profile,
     env: &mut Vec<(Vec<u8>, Vec<u8>)>,
@@ -551,6 +545,21 @@ fn instruction_args(
             .map(ToOwned::to_owned)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path is not utf-8"))
     };
+    if is(profile, "claude") {
+        let file = claude::create_instructions_file(state, session, text)?;
+        return Ok(vec![
+            "--append-system-prompt-file".to_owned(),
+            path_text(&file)?,
+        ]);
+    }
+    if is(profile, "codex") {
+        // TOML 기본 문자열: JSON 문자열 이스케이프는 TOML에서도 그대로 유효하다.
+        let value = serde_json::to_string(text).map_err(io::Error::other)?;
+        return Ok(vec![
+            "-c".to_owned(),
+            format!("developer_instructions={value}"),
+        ]);
+    }
     if is(profile, "pi") {
         let file = claude::create_instructions_file(state, session, text)?;
         return Ok(vec!["--append-system-prompt".to_owned(), path_text(&file)?]);
@@ -789,6 +798,38 @@ pub(crate) fn resume_in(
         kept_id,
         account,
     ))
+}
+
+/// [`resume_in`]에 봇 지침을 다시 붙인다. 지침은 대화 기록이 아니라 시스템 프롬프트에 있어서
+/// 재개(holder까지 죽은 뒤 cold resume 등) 때 다시 넘기지 않으면 봇 정체성을 잃는다.
+pub(crate) fn resume_in_with_bot_instructions(
+    profile: &Profile,
+    permission: Permission,
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    session_id: Option<&str>,
+    account: Option<&LaunchAccount>,
+    instructions: Option<&str>,
+) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
+    let Some(text) =
+        instructions.filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile))
+    else {
+        return resume_in(profile, permission, session, state, session_id, account);
+    };
+    let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
+    let mut env = Vec::new();
+    let mut with_args = profile.clone();
+    let args = instruction_args(profile, &mut env, state_dir, session, text)?;
+    if !with_args.launch.is_empty() {
+        with_args.launch.splice(1..1, args);
+    }
+    let (mut launch, kept, account) =
+        resume_in(&with_args, permission, session, state, session_id, account)?;
+    for (k, v) in env {
+        launch.env.retain(|(ek, _)| ek != &k);
+        launch.env.push((k, v));
+    }
+    Ok((launch, kept, account))
 }
 
 /// 실행 중이거나 기록이 남은 에이전트 세션의 대화를 포크해 새 세션으로 띄우는 실행 argv·env를 만든다(OWE-736, MK-182).
