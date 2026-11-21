@@ -683,6 +683,7 @@ catalog! {
         ACT_TOGGLE_SIDEBAR => ("사이드바 전환", "Toggle sidebar"),
         ACT_TOGGLE_EXPLORER => ("파일 탐색기 전환", "Toggle file explorer"),
         ACT_TOGGLE_SEARCH => ("파일 내용 검색 전환", "Toggle search in files"),
+        ACT_TOGGLE_CHAT_VIEW => ("채팅 / 터미널 보기 전환", "Toggle Chat / Terminal view"),
         ACT_OPEN_CHECKS => ("환경 점검 열기", "Open environment checks"),
         ACT_OPEN_DISK => ("디스크 용량 열기", "Open disk usage"),
         ACT_OPEN_AUTOMATIONS => ("자동화 열기", "Open automations"),
@@ -1829,6 +1830,7 @@ catalog! {
         SC_CHANGES => ("변경 사항", "Changes"),
         SC_EXPLORER => ("파일 탐색기", "File explorer"),
         SC_WORKSPACE_SEARCH => ("파일 내용 검색", "Search in files"),
+        SC_TOGGLE_CHAT => ("채팅 / 터미널 보기 전환", "Toggle Chat / Terminal view"),
         SC_JUMP => ("빠른 이동", "Jump"),
         SC_COMMAND_PALETTE => ("명령 팔레트", "Command palette"),
         SC_PREV_SESSION => ("이전 세션", "Previous session"),
@@ -2327,6 +2329,11 @@ catalog! {
         SLASH_INIT_CLAUDE_DESC => ("CLAUDE.md 가이드 초기화", "Initialize CLAUDE.md codebase guide"),
         SLASH_COST_DESC => ("세션 토큰 사용량 보기", "Show session token usage"),
         SLASH_DOCTOR_DESC => ("설치 및 연결 상태 점검", "Check installation health"),
+        FIND_PLACEHOLDER => ("채팅에서 검색", "Search in chat"),
+        FIND_NO_MATCH => ("0건", "0"),
+        FIND_COUNT => ("{cur}/{total}", "{cur}/{total}"),
+        EARLIER_HISTORY_CAP => ("최근 {n}개 항목까지만 채팅에 표시됩니다.", "Showing the latest {n} items."),
+        SWITCH_TO_CHAT => ("채팅 보기로 전환", "Switch to Chat view"),
     }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),

@@ -310,7 +310,7 @@ pub(super) fn sort_effort_choices(mut efforts: Vec<String>) -> Vec<String> {
     efforts
 }
 
-fn resolved_composer_choices(
+pub(super) fn resolved_composer_choices(
     agent: &str,
     meta: Option<&ComposerMeta>,
 ) -> (Vec<ComposerModelItem>, Vec<String>) {
@@ -360,6 +360,9 @@ impl Shell {
         let is_pending = meta.is_some_and(|m| m.pending);
 
         let supported = meta.is_some_and(|m| m.supported);
+        let effort_supported = meta.is_some_and(|m| m.supported && m.effort_supported);
+        let show_effort =
+            !effort_choices.is_empty() && meta.is_none_or(|m| !m.supported || m.effort_supported);
         let model_label = if let Some(label) = meta.and_then(|m| m.model_label.as_deref()) {
             short_model_name(label)
         } else if let Some(m) = current_model {
@@ -372,7 +375,9 @@ impl Shell {
         } else {
             "Agent".to_string()
         };
-        let filled_bars = current_effort.and_then(effort_bars);
+        let filled_bars = show_effort
+            .then(|| current_effort.and_then(effort_bars))
+            .flatten();
 
         let context_ring = meta.and_then(|m| m.context_percent).map(|pct| {
             let color = if pct >= 85 {
@@ -500,94 +505,119 @@ impl Shell {
                 )
         });
 
-        let model_picker =
-            model_picker_open.then(|| {
-                let active_model = current_model.map(str::to_owned);
-                let active_effort = current_effort.map(str::to_owned);
-                let reason = meta.and_then(|m| m.reason.as_deref());
-                let waiting = !supported || reason.is_some_and(|text| text.starts_with("Wait for"));
-                let notice = if waiting {
-                    Some(SharedString::from(ctext::PICKER_WAIT.get()))
-                } else {
-                    reason.map(|text| SharedString::from(text.to_owned()))
-                };
-                let close_key = key.clone();
-                composer_popup(palette)
-                    .id(SharedString::from(format!(
-                        "chat-model-picker-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-model-picker".into())
-                    .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                        this.chat.model_picker.remove(&close_key);
-                        cx.notify();
-                    }))
-                    .child(popup_heading(palette, ctext::PICKER_MODEL.get()))
-                    .children(model_choices.into_iter().map(|item| {
-                        let id = item.id;
-                        let is_selected = model_is_selected(active_model.as_deref(), &id);
-                        let key = key.clone();
-                        let option_id = id.clone();
-                        let selector_id = id.clone();
-                        let enabled = supported && !is_pending;
-                        popup_row(
-                            palette,
-                            SharedString::from(format!("chat-model-option-{id}-{}", pane.get())),
-                            enabled,
-                        )
-                        .debug_selector(move || format!("chat-model-option-{selector_id}"))
-                        .child(item.label)
-                        .when(is_selected, |row| {
-                            row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
-                        })
-                        .when(enabled, |row| {
-                            row.on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_chat_model(&key, &option_id, cx);
-                            }))
-                        })
-                    }))
-                    .child(popup_heading(palette, ctext::PICKER_EFFORT.get()))
-                    .child(div().flex().flex_wrap().gap_0p5().children(
-                        effort_choices.into_iter().map(|effort| {
-                            let is_selected = active_effort.as_deref() == Some(effort.as_str());
+        let kbd_selected_idx = self.chat.model_picker_selected.get(&key).copied();
+        let model_picker = model_picker_open.then(|| {
+            let active_model = current_model.map(str::to_owned);
+            let active_effort = current_effort.map(str::to_owned);
+            let reason = meta.and_then(|m| m.reason.as_deref());
+            let waiting = !supported || reason.is_some_and(|text| text.starts_with("Wait for"));
+            let notice = if waiting {
+                Some(SharedString::from(ctext::PICKER_WAIT.get()))
+            } else {
+                reason.map(|text| SharedString::from(text.to_owned()))
+            };
+            let close_key = key.clone();
+            composer_popup(palette)
+                .id(SharedString::from(format!(
+                    "chat-model-picker-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-model-picker".into())
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    this.chat.model_picker.remove(&close_key);
+                    this.chat.model_picker_selected.remove(&close_key);
+                    cx.notify();
+                }))
+                .child(popup_heading(palette, ctext::PICKER_MODEL.get()))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-model-list-{}",
+                            pane.get()
+                        )))
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .children(model_choices.into_iter().enumerate().map(|(idx, item)| {
+                            let id = item.id;
+                            let is_selected = model_is_selected(active_model.as_deref(), &id);
+                            let is_kbd = kbd_selected_idx == Some(idx);
                             let key = key.clone();
-                            let option_effort = effort.clone();
-                            let selector_effort = effort.clone();
-                            Button::new(SharedString::from(format!(
-                                "chat-effort-option-{effort}-{}",
-                                pane.get()
-                            )))
-                            .debug_selector(move || format!("chat-effort-option-{selector_effort}"))
-                            .label(effort_text(&effort))
-                            .selected(is_selected)
-                            .disabled(is_pending || !supported)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener({
-                                let focus_input = input_state.clone();
-                                move |this, _, window, cx| {
-                                    this.select_chat_effort(&key, &option_effort, cx);
-                                    if !focus_input.read(cx).focus_handle(cx).is_focused(window) {
-                                        focus_input.update(cx, |state, cx| state.focus(window, cx));
+                            let option_id = id.clone();
+                            let selector_id = id.clone();
+                            let enabled = supported && !is_pending;
+                            popup_row(
+                                palette,
+                                SharedString::from(format!(
+                                    "chat-model-option-{id}-{}",
+                                    pane.get()
+                                )),
+                                enabled,
+                            )
+                            .debug_selector(move || format!("chat-model-option-{selector_id}"))
+                            .when(is_kbd, |row| row.bg(palette.muted))
+                            .child(item.label)
+                            .when(is_selected, |row| {
+                                row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
+                            })
+                            .when(enabled, |row| {
+                                row.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_chat_model(&key, &option_id, cx);
+                                }))
+                            })
+                        })),
+                )
+                .when(show_effort, |popup| {
+                    popup
+                        .child(popup_heading(palette, ctext::PICKER_EFFORT.get()))
+                        .child(div().flex().flex_wrap().gap_0p5().children(
+                            effort_choices.into_iter().map(|effort| {
+                                let is_selected = active_effort.as_deref() == Some(effort.as_str());
+                                let key = key.clone();
+                                let option_effort = effort.clone();
+                                let selector_effort = effort.clone();
+                                Button::new(SharedString::from(format!(
+                                    "chat-effort-option-{effort}-{}",
+                                    pane.get()
+                                )))
+                                .debug_selector(move || {
+                                    format!("chat-effort-option-{selector_effort}")
+                                })
+                                .label(effort_text(&effort))
+                                .selected(is_selected)
+                                .disabled(is_pending || !effort_supported)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener({
+                                    let focus_input = input_state.clone();
+                                    move |this, _, window, cx| {
+                                        this.select_chat_effort(&key, &option_effort, cx);
+                                        if !focus_input.read(cx).focus_handle(cx).is_focused(window)
+                                        {
+                                            focus_input
+                                                .update(cx, |state, cx| state.focus(window, cx));
+                                        }
                                     }
-                                }
-                            }))
-                        }),
-                    ))
-                    .children(notice.map(|notice| {
-                        div()
-                            .id(SharedString::from(format!(
-                                "chat-model-picker-reason-{}",
-                                pane.get()
-                            )))
-                            .debug_selector(|| "chat-model-picker-reason".into())
-                            .px_2()
-                            .pt_1()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(muted_fg)
-                            .child(notice)
-                    }))
-            });
+                                }))
+                            }),
+                        ))
+                })
+                .children(notice.map(|notice| {
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-model-picker-reason-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-model-picker-reason".into())
+                        .px_2()
+                        .pt_1()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .child(notice)
+                }))
+        });
 
         let attachments = self
             .chat
@@ -599,11 +629,12 @@ impl Shell {
             .chat
             .autocomplete
             .get(&key)
-            .is_some_and(super::catalog::AutocompleteState::is_open);
+            .is_some_and(super::catalog::AutocompleteState::should_render_popover);
 
         let autocomplete_popover = autocomplete_open.then(|| {
             let ac = &self.chat.autocomplete[&key];
             let items = ac.items.clone();
+            let loading = ac.loading;
             let selected = ac.selected.min(items.len().saturating_sub(1));
             let kind = ac
                 .trigger
@@ -744,7 +775,35 @@ impl Shell {
                         .text_color(palette.muted_foreground)
                         .child(heading),
                 )
-                .child(list_box)
+                .child(if loading {
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-autocomplete-loading-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-autocomplete-loading".into())
+                        .px_2()
+                        .py_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(palette.muted_foreground)
+                        .child(ctext::AUTOCOMPLETE_LOADING.get())
+                        .into_any_element()
+                } else if items.is_empty() {
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-autocomplete-empty-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-autocomplete-empty".into())
+                        .px_2()
+                        .py_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(palette.muted_foreground)
+                        .child(ctext::AUTOCOMPLETE_EMPTY.get())
+                        .into_any_element()
+                } else {
+                    list_box.into_any_element()
+                })
         });
 
         let attachment_chips = (!attachments.is_empty()).then(|| {
@@ -854,6 +913,9 @@ impl Shell {
                         ac.step_selection(-1);
                         cx.stop_propagation();
                         cx.notify();
+                    } else if this.step_chat_model_picker(&up_key, -1) {
+                        cx.stop_propagation();
+                        cx.notify();
                     }
                 }
             }))
@@ -864,6 +926,9 @@ impl Shell {
                         && ac.is_open()
                     {
                         ac.step_selection(1);
+                        cx.stop_propagation();
+                        cx.notify();
+                    } else if this.step_chat_model_picker(&down_key, 1) {
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -886,7 +951,9 @@ impl Shell {
                         if super::Shell::chat_input_is_composing(&enter_input, window, cx) {
                             return;
                         }
-                        if this.accept_chat_autocomplete(&enter_key, None, window, cx) {
+                        if this.accept_chat_autocomplete(&enter_key, None, window, cx)
+                            || this.accept_chat_model_picker(&enter_key, cx)
+                        {
                             window.prevent_default();
                             cx.stop_propagation();
                         }
@@ -948,6 +1015,56 @@ impl Shell {
                 },
             ))
             .relative()
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener({
+                    let sync_key = key.clone();
+                    move |_, _, window, cx| {
+                        let sync_key = sync_key.clone();
+                        let weak = cx.weak_entity();
+                        window.defer(cx, move |window, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.sync_chat_autocomplete(&sync_key, window, cx);
+                            })
+                            .ok();
+                        });
+                    }
+                }),
+            )
+            .on_key_up(cx.listener({
+                let sync_key = key.clone();
+                move |_, e: &gpui::KeyUpEvent, window, cx| {
+                    if matches!(
+                        e.keystroke.key.as_str(),
+                        "left" | "right" | "up" | "down" | "home" | "end"
+                    ) {
+                        let sync_key = sync_key.clone();
+                        let weak = cx.weak_entity();
+                        window.defer(cx, move |window, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.sync_chat_autocomplete(&sync_key, window, cx);
+                            })
+                            .ok();
+                        });
+                    }
+                }
+            }))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener({
+                    let focus_input = input_state.clone();
+                    move |this, _, window, cx| {
+                        if this.layout.focused() != Some(pane) {
+                            this.change(false, cx, |l| l.focus(pane));
+                            this.files.refocus = false;
+                        }
+                        if !focus_input.read(cx).focus_handle(cx).is_focused(window) {
+                            focus_input.update(cx, |state, cx| state.focus(window, cx));
+                        }
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .w_full()
             .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
             .min_w_0()

@@ -5,11 +5,37 @@ use std::fs;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub(super) const MAX_AUTOCOMPLETE_ITEMS: usize = 80;
 const MAX_WALK_VISITS: usize = 6_000;
 const MAX_ANCESTOR_DEPTH: usize = 8;
 const MAX_MD_HEAD_BYTES: usize = 4_096;
+const WORKSPACE_CACHE_TTL: Duration = Duration::from_secs(10);
+const WORKSPACE_CACHE_CAP: usize = 8;
+
+#[derive(Clone)]
+struct CachedWorkspaceFiles {
+    cwd: PathBuf,
+    cached_at: Instant,
+    files: Vec<String>,
+}
+
+fn workspace_file_cache() -> &'static Mutex<Vec<CachedWorkspaceFiles>> {
+    static CACHE: OnceLock<Mutex<Vec<CachedWorkspaceFiles>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(super) fn has_fresh_workspace_files_cache(cwd: &Path) -> bool {
+    let Ok(guard) = workspace_file_cache().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    guard
+        .iter()
+        .any(|entry| entry.cwd == cwd && now.duration_since(entry.cached_at) < WORKSPACE_CACHE_TTL)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutocompleteKind {
@@ -55,6 +81,10 @@ pub(crate) struct AutocompleteState {
 impl AutocompleteState {
     pub(super) fn is_open(&self) -> bool {
         self.trigger.is_some() && !self.items.is_empty()
+    }
+
+    pub(super) fn should_render_popover(&self) -> bool {
+        self.trigger.is_some()
     }
 
     pub(super) fn close(&mut self) {
@@ -380,14 +410,39 @@ fn file_match_rank(path: &str, query_lower: &str) -> Option<u8> {
     }
 }
 
+fn load_or_collect_workspace_files(cwd: &Path) -> Vec<String> {
+    let now = Instant::now();
+    if let Ok(mut guard) = workspace_file_cache().lock() {
+        guard.retain(|entry| now.duration_since(entry.cached_at) < WORKSPACE_CACHE_TTL);
+        if let Some(entry) = guard.iter().find(|entry| entry.cwd == cwd) {
+            return entry.files.clone();
+        }
+    }
+    let collected =
+        collect_git_workspace_files(cwd).unwrap_or_else(|| collect_walk_workspace_files(cwd));
+    if let Ok(mut guard) = workspace_file_cache().lock() {
+        guard.retain(|entry| {
+            entry.cwd != cwd && now.duration_since(entry.cached_at) < WORKSPACE_CACHE_TTL
+        });
+        guard.push(CachedWorkspaceFiles {
+            cwd: cwd.to_path_buf(),
+            cached_at: now,
+            files: collected.clone(),
+        });
+        while guard.len() > WORKSPACE_CACHE_CAP {
+            guard.remove(0);
+        }
+    }
+    collected
+}
+
 /// 로컬 워크스페이스 `cwd` 기준 `@<검색어>` 상대 경로 파일 자동완성 후보를 최대 80개까지 반환한다.
 pub(super) fn scan_workspace_files(cwd: &Path, query: &str) -> Vec<AutocompleteCandidate> {
     let query_clean = strip_control_chars(query);
     if query_clean.contains("..") {
         return Vec::new();
     }
-    let raw_files =
-        collect_git_workspace_files(cwd).unwrap_or_else(|| collect_walk_workspace_files(cwd));
+    let raw_files = load_or_collect_workspace_files(cwd);
     let query_lower = query_clean.to_lowercase();
     let mut ranked: Vec<(u8, usize, usize, String)> = raw_files
         .into_iter()
@@ -424,6 +479,50 @@ fn normalize_agent_family(agent: &str) -> &'static str {
     } else {
         "claude"
     }
+}
+
+/// Returns true when a bare slash command executes locally inside the CLI
+/// without echoing a `ChatItemKind::User` turn in the saved transcript.
+pub(super) fn slash_command_is_local_non_echoed(_agent: &str, payload: &str) -> bool {
+    let trimmed = payload.trim();
+    if !trimmed.starts_with('/') || trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+    let cmd = trimmed.trim_start_matches('/').to_ascii_lowercase();
+    matches!(
+        cmd.as_str(),
+        "clear"
+            | "compact"
+            | "cost"
+            | "doctor"
+            | "status"
+            | "help"
+            | "model"
+            | "models"
+            | "theme"
+            | "themes"
+            | "permissions"
+            | "mcp"
+            | "mcps"
+            | "memory"
+            | "memories"
+            | "undo"
+            | "redo"
+            | "share"
+            | "diff"
+            | "plugins"
+            | "vim"
+            | "hooks"
+            | "config"
+            | "hotkeys"
+            | "agents"
+            | "rename"
+            | "fork"
+            | "branch"
+            | "tree"
+            | "export"
+            | "connect"
+    )
 }
 
 /// Returns true when a bare slash command opens a TUI dialog that Chat cannot render inline,

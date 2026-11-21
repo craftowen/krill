@@ -38,6 +38,7 @@ pub(super) fn local_key(session: SessionId) -> ChatKey {
 mod actions;
 mod body;
 mod catalog;
+mod code_view;
 mod composer;
 mod prompt;
 #[cfg(test)]
@@ -456,6 +457,14 @@ pub(super) struct CopiedCodeTarget {
     pub block_idx: usize,
 }
 
+pub(super) struct ChatFindState {
+    pub query: String,
+    pub input: gpui::Entity<gpui_component::input::InputState>,
+    _sub: Subscription,
+    pub matches: Vec<usize>,
+    pub active: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct ChatState {
     poll_timer: Option<Task<()>>,
@@ -473,8 +482,11 @@ pub(crate) struct ChatState {
     copied_code_timer: Option<Task<()>>,
     pub quick_menu: BTreeSet<ChatKey>,
     pub model_picker: BTreeSet<ChatKey>,
+    pub model_picker_selected: BTreeMap<ChatKey, usize>,
+    pub(super) finds: BTreeMap<ChatKey, ChatFindState>,
     composer_tasks: BTreeMap<ChatKey, Task<()>>,
     earlier_tasks: BTreeMap<ChatKey, Task<()>>,
+    earlier_retry_after: BTreeMap<ChatKey, Task<()>>,
     last_composer_poll: BTreeMap<ChatKey, std::time::Instant>,
     #[cfg(test)]
     pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -504,7 +516,9 @@ pub(crate) struct ChatState {
     pub copied_pending: Option<(ChatKey, u64, std::time::Instant)>,
     copied_pending_timer: Option<Task<()>>,
     pub autocomplete: BTreeMap<ChatKey, catalog::AutocompleteState>,
-    attach_tasks: BTreeMap<ChatKey, Task<()>>,
+    autocomplete_missed_at: BTreeMap<ChatKey, std::time::Instant>,
+    attach_tasks: BTreeMap<(ChatKey, u64), Task<()>>,
+    next_attach_id: u64,
 }
 
 impl ChatState {
@@ -1112,8 +1126,11 @@ impl Shell {
         chat.inputs.retain(|key, _| keep(key));
         chat.quick_menu.retain(keep);
         chat.model_picker.retain(keep);
+        chat.model_picker_selected.retain(|key, _| keep(key));
+        chat.finds.retain(|key, _| keep(key));
         chat.composer_tasks.retain(|key, _| keep(key));
         chat.earlier_tasks.retain(|key, _| keep(key));
+        chat.earlier_retry_after.retain(|key, _| keep(key));
         chat.last_composer_poll.retain(|key, _| keep(key));
         chat.request_tasks.retain(|key, _| keep(key));
         chat.prompt_failed.retain(keep);
@@ -1128,7 +1145,8 @@ impl Shell {
         chat.prompt_review.retain(keep_flight);
         chat.draft_attachments.retain(|key, _| keep(key));
         chat.autocomplete.retain(|key, _| keep(key));
-        chat.attach_tasks.retain(|key, _| keep(key));
+        chat.autocomplete_missed_at.retain(|key, _| keep(key));
+        chat.attach_tasks.retain(|(key, _), _| keep(key));
         chat.pending_prompts.retain(|key, _| keep_flight(key));
         chat.pending_epochs.retain(|(key, _), _| keep_flight(key));
         if chat
@@ -1531,6 +1549,9 @@ impl Shell {
         let Some(before) = log.earlier else {
             return;
         };
+        if self.chat.earlier_retry_after.contains_key(key) {
+            return;
+        }
         let near_top = log.items.len() < CHAT_PRELOAD_ITEMS
             || self
                 .chat
@@ -1564,9 +1585,26 @@ impl Shell {
                     return;
                 }
                 let Some(page) = page else {
-                    log.earlier = None;
+                    let retry_key = task_key.clone();
+                    let cooldown = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        this.update(cx, |this, cx| {
+                            if this.chat.earlier_retry_after.remove(&retry_key).is_some()
+                                && let Some(retry_pane) = this.chat_pane(&retry_key)
+                            {
+                                this.load_earlier_chat(retry_pane, &retry_key, cx);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    });
+                    this.chat
+                        .earlier_retry_after
+                        .insert(task_key.clone(), cooldown);
+                    cx.notify();
                     return;
                 };
+                this.chat.earlier_retry_after.remove(&task_key);
                 let snapshot = page.snapshot;
                 if log.binding != (snapshot.session_id, snapshot.transcript_path) {
                     return;
@@ -1575,11 +1613,21 @@ impl Shell {
                     snapshot.items,
                     (page.has_earlier && page.start < before).then_some(page.start),
                 );
+                this.recompute_chat_find(&task_key);
                 cx.notify();
             })
             .ok();
         });
         self.chat.earlier_tasks.insert(key.clone(), task);
+    }
+
+    pub(super) fn trigger_load_earlier_if_near_top(
+        &mut self,
+        pane: super::PaneId,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_earlier_chat(pane, key, cx);
     }
 
     #[cfg(test)]
@@ -1706,6 +1754,7 @@ impl Shell {
             log.submissions.insert(resolved_key, Submission::Confirmed);
         }
         self.reconcile_pending_prompts_on_poll(&key);
+        self.recompute_chat_find(&key);
     }
 
     fn send_to_session(&mut self, key: &ChatKey, bytes: &[u8], cx: &mut Context<Self>) -> bool {
@@ -1787,14 +1836,91 @@ impl Shell {
         }
         if self.chat.model_picker.contains(key) {
             self.chat.model_picker.remove(key);
+            self.chat.model_picker_selected.remove(key);
         } else {
             if let Some(log) = self.chat.logs.get_mut(key) {
                 log.meta.reason = None;
             }
             self.chat.model_picker.insert(key.clone());
+            self.chat.model_picker_selected.insert(key.clone(), 0);
             self.refresh_chat_composer(key, true, cx);
         }
         cx.notify();
+    }
+
+    pub(super) fn step_chat_model_picker(&mut self, key: &ChatKey, delta: isize) -> bool {
+        if !self.chat.model_picker.contains(key) {
+            return false;
+        }
+        let log = self.chat.logs.get(key);
+        let meta = log.map(|l| &l.meta);
+        let agent = log.map_or("claude", |l| {
+            if l.agent.is_empty() {
+                "claude"
+            } else {
+                l.agent.as_str()
+            }
+        });
+        let (models, _) = composer::resolved_composer_choices(agent, meta);
+        let len = models.len();
+        if len == 0 {
+            return false;
+        }
+        let cur = self
+            .chat
+            .model_picker_selected
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .min(len - 1);
+        let next = if delta >= 0 {
+            (cur + 1) % len
+        } else if cur == 0 {
+            len - 1
+        } else {
+            cur - 1
+        };
+        self.chat.model_picker_selected.insert(key.clone(), next);
+        true
+    }
+
+    pub(super) fn accept_chat_model_picker(
+        &mut self,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.chat.model_picker.contains(key) {
+            return false;
+        }
+        let log = self.chat.logs.get(key);
+        let meta = log.map(|l| &l.meta);
+        if !meta.is_some_and(|m| m.supported && !m.pending) {
+            return false;
+        }
+        let agent = log.map_or("claude", |l| {
+            if l.agent.is_empty() {
+                "claude"
+            } else {
+                l.agent.as_str()
+            }
+        });
+        let (models, _) = composer::resolved_composer_choices(agent, meta);
+        if models.is_empty() {
+            return false;
+        }
+        let idx = self
+            .chat
+            .model_picker_selected
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .min(models.len() - 1);
+        let model_id = models[idx].id.clone();
+        self.select_chat_model(key, &model_id, cx);
+        self.chat.model_picker.remove(key);
+        self.chat.model_picker_selected.remove(key);
+        cx.notify();
+        true
     }
 
     pub(super) fn select_chat_model(
@@ -2015,6 +2141,7 @@ impl Shell {
                     }
                 }
                 InputEvent::Change => {
+                    this.chat.prompt_review.remove(&focus_key);
                     this.sync_chat_autocomplete(&focus_key, window, cx);
                     cx.notify();
                 }
@@ -2125,28 +2252,40 @@ impl Shell {
             return;
         };
         self.chat.multiline_blocked.remove(key);
-        let (origin_epoch, origin_item, opens_terminal) = self.chat.logs.get(key).map_or_else(
-            || {
-                (
-                    0,
-                    0,
-                    attachments.is_empty()
-                        && catalog::slash_command_opens_in_terminal("", &submitted_payload, false),
-                )
-            },
-            |l| {
-                (
-                    l.epoch,
-                    l.base_index.saturating_add(l.items.len()),
-                    attachments.is_empty()
+        let (origin_epoch, origin_item, opens_terminal, local_slash) =
+            self.chat.logs.get(key).map_or_else(
+                || {
+                    (
+                        0,
+                        0,
+                        attachments.is_empty()
+                            && catalog::slash_command_opens_in_terminal(
+                                "",
+                                &submitted_payload,
+                                false,
+                            ),
+                        attachments.is_empty()
+                            && catalog::slash_command_is_local_non_echoed("", &submitted_payload),
+                    )
+                },
+                |l| {
+                    let opens = attachments.is_empty()
                         && catalog::slash_command_opens_in_terminal(
                             &l.agent,
                             &submitted_payload,
                             l.meta.supported,
-                        ),
-                )
-            },
-        );
+                        );
+                    let local = attachments.is_empty()
+                        && !opens
+                        && catalog::slash_command_is_local_non_echoed(&l.agent, &submitted_payload);
+                    (
+                        l.epoch,
+                        l.base_index.saturating_add(l.items.len()),
+                        opens,
+                        local,
+                    )
+                },
+            );
         self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
         let pending_id = self.chat.next_pending_id;
         input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
@@ -2184,6 +2323,7 @@ impl Shell {
                 bytes,
                 modes,
                 opens_terminal,
+                local_slash,
             },
             window,
             cx,
@@ -2459,6 +2599,7 @@ struct PendingDispatch {
     bytes: Vec<u8>,
     modes: krill_proto::term_modes::Modes,
     opens_terminal: bool,
+    local_slash: bool,
 }
 
 struct UnbracketedWatch {
@@ -2512,6 +2653,7 @@ impl Shell {
         if self.chat.quick_menu.contains(key) || self.chat.model_picker.contains(key) {
             self.chat.quick_menu.remove(key);
             self.chat.model_picker.remove(key);
+            self.chat.model_picker_selected.remove(key);
             return true;
         }
         false
@@ -2547,6 +2689,7 @@ impl Shell {
                     pending_id: dispatch.pending_id,
                     bytes: dispatch.bytes,
                     opens_terminal: dispatch.opens_terminal,
+                    local_slash: dispatch.local_slash,
                 },
                 window,
                 cx,
@@ -2556,7 +2699,7 @@ impl Shell {
         dispatch.bytes.push(b'\r');
         if self.send_to_session(&dispatch.key, &dispatch.bytes, cx) {
             self.chat.prompt_failed.remove(&dispatch.key);
-            if dispatch.opens_terminal {
+            if dispatch.opens_terminal || dispatch.local_slash {
                 let origin = prompt::Origin {
                     pane: dispatch.pane,
                     session: dispatch.session,
@@ -2587,7 +2730,9 @@ impl Shell {
                 match self.chat_prompt_delivery(&origin, receipt, cx) {
                     krill_proto::input::Delivery::Applied => {
                         self.confirm_pending_prompt(&dispatch.key, dispatch.pending_id);
-                        self.switch_pane_to_terminal(dispatch.pane, window, cx);
+                        if dispatch.opens_terminal {
+                            self.switch_pane_to_terminal(dispatch.pane, window, cx);
+                        }
                     }
                     krill_proto::input::Delivery::Uncertain => {
                         self.transition_pending_to_review_required(
@@ -2601,10 +2746,11 @@ impl Shell {
                         );
                     }
                     krill_proto::input::Delivery::Pending => {
-                        self.spawn_unbracketed_terminal_switch_watcher(
+                        self.spawn_unbracketed_receipt_watcher(
                             origin,
                             dispatch.pending_id,
                             receipt,
+                            dispatch.opens_terminal,
                             window,
                             cx,
                         );
@@ -2636,11 +2782,12 @@ impl Shell {
         cx.notify();
     }
 
-    fn spawn_unbracketed_terminal_switch_watcher(
+    fn spawn_unbracketed_receipt_watcher(
         &mut self,
         origin: prompt::Origin,
         pending_id: u64,
         receipt: krill_proto::input::Receipt,
+        switch_to_terminal: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2674,7 +2821,7 @@ impl Shell {
                     Step::Applied(current) => {
                         this.update_in(cx, |this, window, cx| {
                             this.confirm_pending_prompt(&task_key, pending_id);
-                            if current {
+                            if current && switch_to_terminal {
                                 this.switch_pane_to_terminal(pane, window, cx);
                             } else {
                                 cx.notify();
@@ -2991,28 +3138,40 @@ impl Shell {
             return;
         };
         self.chat.multiline_blocked.remove(key);
-        let (origin_epoch, origin_item, opens_terminal) = self.chat.logs.get(key).map_or_else(
-            || {
-                (
-                    0,
-                    0,
-                    no_attachments
-                        && catalog::slash_command_opens_in_terminal("", &submitted_payload, false),
-                )
-            },
-            |l| {
-                (
-                    l.epoch,
-                    l.base_index.saturating_add(l.items.len()),
-                    no_attachments
+        let (origin_epoch, origin_item, opens_terminal, local_slash) =
+            self.chat.logs.get(key).map_or_else(
+                || {
+                    (
+                        0,
+                        0,
+                        no_attachments
+                            && catalog::slash_command_opens_in_terminal(
+                                "",
+                                &submitted_payload,
+                                false,
+                            ),
+                        no_attachments
+                            && catalog::slash_command_is_local_non_echoed("", &submitted_payload),
+                    )
+                },
+                |l| {
+                    let opens = no_attachments
                         && catalog::slash_command_opens_in_terminal(
                             &l.agent,
                             &submitted_payload,
                             l.meta.supported,
-                        ),
-                )
-            },
-        );
+                        );
+                    let local = no_attachments
+                        && !opens
+                        && catalog::slash_command_is_local_non_echoed(&l.agent, &submitted_payload);
+                    (
+                        l.epoch,
+                        l.base_index.saturating_add(l.items.len()),
+                        opens,
+                        local,
+                    )
+                },
+            );
         if let Some(entries) = self.chat.pending_prompts.get_mut(key)
             && let Some(entry) = entries.iter_mut().find(|p| p.id == pending_id)
         {
@@ -3035,6 +3194,7 @@ impl Shell {
                 bytes,
                 modes,
                 opens_terminal,
+                local_slash,
             },
             window,
             cx,
@@ -3050,6 +3210,7 @@ impl Shell {
         if attachments.is_empty() {
             return;
         }
+        self.chat.prompt_review.remove(key);
         let list = self.chat.draft_attachments.entry(key.clone()).or_default();
         for att in attachments {
             if !list.iter().any(|existing| existing.path == att.path) {
@@ -3065,6 +3226,7 @@ impl Shell {
         index: usize,
         cx: &mut Context<Self>,
     ) {
+        self.chat.prompt_review.remove(key);
         if let Some(list) = self.chat.draft_attachments.get_mut(key) {
             if index < list.len() {
                 list.remove(index);
@@ -3101,11 +3263,14 @@ impl Shell {
             multiple: true,
             prompt: Some(ctext::ATTACH_FILE.get().into()),
         });
+        self.chat.next_attach_id = self.chat.next_attach_id.wrapping_add(1);
+        let attach_id = self.chat.next_attach_id;
         let task_key = key.clone();
+        let entry_key = (task_key.clone(), attach_id);
         let task = cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = chosen.await else {
                 this.update(cx, |this, _| {
-                    this.chat.attach_tasks.remove(&task_key);
+                    this.chat.attach_tasks.remove(&(task_key, attach_id));
                 })
                 .ok();
                 return;
@@ -3120,12 +3285,14 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.chat.attach_tasks.remove(&task_key);
+                this.chat
+                    .attach_tasks
+                    .remove(&(task_key.clone(), attach_id));
                 this.stage_chat_attachments(&task_key, staged, cx);
             })
             .ok();
         });
-        self.chat.attach_tasks.insert(key.clone(), task);
+        self.chat.attach_tasks.insert(entry_key, task);
     }
 
     pub(super) fn intercept_chat_clipboard_paste(
@@ -3135,14 +3302,17 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let read = cx.read_from_clipboard_async();
+        self.chat.next_attach_id = self.chat.next_attach_id.wrapping_add(1);
+        let attach_id = self.chat.next_attach_id;
         let task_key = key.clone();
+        let entry_key = (task_key.clone(), attach_id);
         let task = cx.spawn_in(window, async move |this, cx| {
             let item = read.await.ok().flatten();
             #[cfg(not(test))]
             let item = super::security::augment_clipboard_item_from_pasteboard(item);
             let Some(item) = item else {
                 this.update_in(cx, |this, _, _| {
-                    this.chat.attach_tasks.remove(&task_key);
+                    this.chat.attach_tasks.remove(&(task_key, attach_id));
                 })
                 .ok();
                 return;
@@ -3152,7 +3322,9 @@ impl Shell {
                 .spawn(async move { classify_chat_clipboard_item(&item) })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                this.chat.attach_tasks.remove(&task_key);
+                this.chat
+                    .attach_tasks
+                    .remove(&(task_key.clone(), attach_id));
                 match classified {
                     ChatClipboardContent::Attachments(atts) => {
                         this.stage_chat_attachments(&task_key, atts, cx);
@@ -3173,22 +3345,32 @@ impl Shell {
             })
             .ok();
         });
-        self.chat.attach_tasks.insert(key.clone(), task);
+        self.chat.attach_tasks.insert(entry_key, task);
     }
 
     pub(super) fn sync_chat_autocomplete(
         &mut self,
         key: &ChatKey,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some((input, _)) = self.chat.inputs.get(key) else {
             return;
         };
-        let (text, cursor) = {
-            let state = input.read(cx);
-            (state.value().to_string(), state.cursor())
-        };
+        let input = input.clone();
+        let (text, cursor, ime_composing) = input.update(cx, |state, cx| {
+            (
+                state.value().to_string(),
+                state.cursor(),
+                gpui::EntityInputHandler::marked_text_range(state, window, cx).is_some(),
+            )
+        });
+        if ime_composing {
+            if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                ac.close();
+            }
+            return;
+        }
         let Some(trigger) = catalog::detect_autocomplete_trigger(&text, cursor) else {
             if let Some(ac) = self.chat.autocomplete.get_mut(key) {
                 ac.close();
@@ -3231,6 +3413,25 @@ impl Shell {
             .get(key)
             .map(|l| l.agent.clone())
             .unwrap_or_default();
+        let now = std::time::Instant::now();
+        let cache_miss = trigger.kind == catalog::AutocompleteKind::File
+            && cwd
+                .as_deref()
+                .is_some_and(|dir| !catalog::has_fresh_workspace_files_cache(dir));
+        let debounce = if cache_miss
+            && self
+                .chat
+                .autocomplete_missed_at
+                .get(key)
+                .is_some_and(|at| now.duration_since(*at) < Duration::from_millis(120))
+        {
+            Some(Duration::from_millis(120))
+        } else {
+            None
+        };
+        if cache_miss {
+            self.chat.autocomplete_missed_at.insert(key.clone(), now);
+        }
         let ac = self.chat.autocomplete.entry(key.clone()).or_default();
         ac.generation = ac.generation.wrapping_add(1);
         let generation = ac.generation;
@@ -3245,6 +3446,9 @@ impl Shell {
         };
         let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
+            if let Some(delay) = debounce {
+                cx.background_executor().timer(delay).await;
+            }
             let items = cx
                 .background_executor()
                 .spawn(async move {
@@ -3279,6 +3483,7 @@ impl Shell {
                 if !ac.items.is_empty() {
                     this.chat.quick_menu.remove(&task_key);
                     this.chat.model_picker.remove(&task_key);
+                    this.chat.model_picker_selected.remove(&task_key);
                 }
                 cx.notify();
             })
@@ -3333,5 +3538,265 @@ impl Shell {
         }
         cx.notify();
         true
+    }
+
+    pub(super) fn chat_find_is_open(&self, _cx: &gpui::App) -> bool {
+        let Some(pane) = self.layout.focused() else {
+            return false;
+        };
+        let Some(key) = self.chat_key(pane) else {
+            return false;
+        };
+        self.chat.finds.contains_key(&key)
+    }
+
+    pub(super) fn toggle_chat_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let Some(key) = self.chat_key(pane) else {
+            return;
+        };
+        if let Some(find) = self.chat.finds.get(&key) {
+            let input = find.input.clone();
+            input.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(ctext::FIND_PLACEHOLDER.get())
+        });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        let find_key = key.clone();
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            move |this, state, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let next_query = state.read(cx).value().to_string();
+                    if let Some(find) = this.chat.finds.get_mut(&find_key)
+                        && find.query != next_query
+                    {
+                        find.query = next_query;
+                        this.recompute_chat_find(&find_key);
+                        this.reveal_active_chat_find(&find_key);
+                        cx.notify();
+                    }
+                }
+            },
+        );
+        self.chat.finds.insert(
+            key.clone(),
+            ChatFindState {
+                query: String::new(),
+                input,
+                _sub: sub,
+                matches: Vec::new(),
+                active: 0,
+            },
+        );
+        cx.notify();
+    }
+
+    pub(super) fn close_chat_find(
+        &mut self,
+        key: &ChatKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.finds.remove(key).is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn step_chat_find(
+        &mut self,
+        direction: krill_proto::search::Direction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let Some(key) = self.chat_key(pane) else {
+            return;
+        };
+        let Some(find) = self.chat.finds.get_mut(&key) else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        let len = find.matches.len();
+        find.active = match direction {
+            krill_proto::search::Direction::Next => (find.active + 1) % len,
+            krill_proto::search::Direction::Previous => {
+                if find.active == 0 {
+                    len - 1
+                } else {
+                    find.active - 1
+                }
+            }
+        };
+        self.reveal_active_chat_find(&key);
+        cx.notify();
+    }
+
+    pub(super) fn step_chat_find_for_key(
+        &mut self,
+        key: &ChatKey,
+        direction: krill_proto::search::Direction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(find) = self.chat.finds.get_mut(key) else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        let len = find.matches.len();
+        find.active = match direction {
+            krill_proto::search::Direction::Next => (find.active + 1) % len,
+            krill_proto::search::Direction::Previous => {
+                if find.active == 0 {
+                    len - 1
+                } else {
+                    find.active - 1
+                }
+            }
+        };
+        self.reveal_active_chat_find(key);
+        cx.notify();
+    }
+
+    pub(super) fn active_chat_find_row(&self, key: &ChatKey) -> Option<usize> {
+        let find = self.chat.finds.get(key)?;
+        if find.query.trim().is_empty() {
+            return None;
+        }
+        find.matches.get(find.active).copied()
+    }
+
+    fn recompute_chat_find(&mut self, key: &ChatKey) {
+        let Some(query) = self.chat.finds.get(key).map(|f| f.query.trim().to_owned()) else {
+            return;
+        };
+        let matches = if query.is_empty() {
+            Vec::new()
+        } else if let Some(log) = self.chat.logs.get_mut(key) {
+            let feed = log.display_feed();
+            let q_lower = query.to_lowercase();
+            feed.rows()
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, row)| display_row_matches_query(row, &q_lower).then_some(ix))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(find) = self.chat.finds.get_mut(key) {
+            find.matches = matches;
+            if find.active >= find.matches.len() {
+                find.active = 0;
+            }
+        }
+    }
+
+    fn reveal_active_chat_find(&self, key: &ChatKey) {
+        let Some(row_ix) = self.active_chat_find_row(key) else {
+            return;
+        };
+        let Some(pane) = self.chat_pane(key) else {
+            return;
+        };
+        if let Some(list) = self.chat.lists.get(&(pane, key.1)) {
+            list.state.scroll_to(gpui::ListOffset {
+                item_ix: row_ix,
+                offset_in_item: gpui::px(0.),
+            });
+        }
+    }
+
+    pub(super) fn scroll_chat_overlay_home(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let Some(session) = self.layout.session(pane) else {
+            return;
+        };
+        if let Some(list) = self.chat.lists.get(&(pane, session)) {
+            list.state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: gpui::px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    pub(super) fn scroll_chat_overlay_end(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let Some(session) = self.layout.session(pane) else {
+            return;
+        };
+        if let Some(list) = self.chat.lists.get(&(pane, session)) {
+            list.state.set_follow_mode(gpui::FollowMode::Tail);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn scroll_chat_overlay_page(&mut self, delta_dir: isize, cx: &mut Context<Self>) {
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let Some(session) = self.layout.session(pane) else {
+            return;
+        };
+        if let Some(list) = self.chat.lists.get(&(pane, session)) {
+            let total = list.state.item_count();
+            if total == 0 {
+                return;
+            }
+            if delta_dir < 0 {
+                let top = list.state.logical_scroll_top().item_ix;
+                let target = top.saturating_sub(6);
+                list.state.scroll_to(gpui::ListOffset {
+                    item_ix: target,
+                    offset_in_item: gpui::px(0.),
+                });
+            } else {
+                let top = list.state.logical_scroll_top().item_ix;
+                let target = top.saturating_add(6);
+                if target + 1 >= total {
+                    list.state.set_follow_mode(gpui::FollowMode::Tail);
+                } else {
+                    list.state.scroll_to(gpui::ListOffset {
+                        item_ix: target,
+                        offset_in_item: gpui::px(0.),
+                    });
+                }
+            }
+            cx.notify();
+        }
+    }
+}
+
+fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> bool {
+    match row {
+        work_run::DisplayRow::Item { item, .. } => {
+            item.text.to_lowercase().contains(query_lower)
+                || item.title.to_lowercase().contains(query_lower)
+                || item.file_path.to_lowercase().contains(query_lower)
+        }
+        work_run::DisplayRow::WorkRun(run) => run.steps.iter().any(|step| {
+            step.headline().to_lowercase().contains(query_lower)
+                || step.file_path().to_lowercase().contains(query_lower)
+                || step
+                    .body_sections()
+                    .iter()
+                    .any(|sec| sec.text.to_lowercase().contains(query_lower))
+        }),
     }
 }

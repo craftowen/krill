@@ -1131,6 +1131,8 @@ impl Shell {
             .any(|&i| !self.layout.is_tab_pinned(i) && self.layout.is_editor_tab(i));
         // OWE-736: 데몬이 세션 포크를 협상했을 때만 포크·이어하기 항목을 보인다.
         let pane = tab.focused;
+        let is_session_tab =
+            self.layout.file(pane).is_none() && self.layout.session(pane).is_some();
         let peer_supports_fork = self.peer_supports_fork(pane);
         let can_fork = self.can_fork_pane(pane, cx);
         let can_continue = self.can_continue_pane(pane);
@@ -1338,241 +1340,259 @@ impl Shell {
             );
         }
 
-        let menu =
-            div()
-                .id("tab-context-menu")
-                .track_focus(&self.tab_menu_focus)
-                .role(gpui::Role::Menu)
-                .tab_group()
-                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.tab_context_menu = None;
-                        cx.stop_propagation();
-                        cx.notify();
-                    } else if matches!(event.keystroke.key.as_str(), "down" | "up" | "home" | "end")
-                        && !event.keystroke.modifiers.control
-                        && !event.keystroke.modifiers.alt
-                        && !event.keystroke.modifiers.platform
-                    {
-                        navigate_menu(
-                            &this.tab_menu_focus,
-                            &event.keystroke.key,
-                            key_item_count.get(),
-                            window,
-                            cx,
-                        );
-                        cx.stop_propagation();
-                        window.prevent_default();
-                    } else if event.keystroke.key == "tab"
-                        && !event.keystroke.modifiers.control
-                        && !event.keystroke.modifiers.alt
-                        && !event.keystroke.modifiers.platform
-                    {
-                        let key = if event.keystroke.modifiers.shift {
-                            "up"
-                        } else {
-                            "down"
-                        };
-                        navigate_menu(&this.tab_menu_focus, key, key_item_count.get(), window, cx);
-                        cx.stop_propagation();
-                        window.prevent_default();
-                    }
-                }))
-                .debug_selector(|| "tab-context-menu".into())
-                .occlude()
-                .absolute()
-                .left(x)
-                .when(below, |d| d.top(pos.y.max(ui::SPACE_2)))
-                .when(!below, |d| {
-                    d.bottom((viewport.height - pos.y).max(ui::SPACE_2))
-                })
-                .w(menu_w)
-                .max_w(max_w)
-                .max_h(available_h.max(px(0.)).min(max_h))
-                .overflow_y_scroll()
-                .p_1()
-                .rounded(ui::RADIUS_MD)
-                .bg(p.popover)
-                .text_color(p.popover_foreground)
-                .border_1()
-                .border_color(p.border)
-                .shadow_lg()
-                .font_family(ui::FONT_UI)
-                .text_size(ui::TEXT_SM)
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                .children(file_items)
-                .child(
-                    div()
-                        .id("tab-menu-pin")
-                        .role(gpui::Role::MenuItem)
-                        .tab_index(0)
-                        .focus_visible(|d| d.border_1().border_color(p.ring))
-                        .debug_selector(|| "tab-menu-pin".into())
-                        .px_2()
-                        .py_1()
-                        .rounded(ui::RADIUS_SM)
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-                        .child(ui::icons::svg_box(pin_svg, 13., p.popover_foreground))
-                        .child(pin_label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let Some(index) = this.take_tab_menu_target(cx) else {
-                                return;
-                            };
-                            this.change(true, cx, |l| {
-                                l.toggle_pin_tab(index);
-                            });
-                        })),
-                )
-                .child(div().my_1().h(px(1.)).w_full().bg(p.border))
-                // OWE-870: 탭 이름 변경(더블클릭과 같은 대화상자).
-                .child(
-                    menu_item("tab-menu-rename", text::RENAME_TAB.get(), true, None).on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            let Some(index) = this.take_tab_menu_target(cx) else {
-                                return;
-                            };
-                            this.begin_tab_rename(index, window, cx);
-                        }),
-                    ),
-                )
-                .child(
-                    menu_item(
-                        "tab-menu-close",
-                        text::CLOSE_TAB_MENU.get(),
-                        !is_pinned,
-                        krill_app::keys::shortcut_label(window, &super::CloseTab),
-                    )
+        let menu = div()
+            .id("tab-context-menu")
+            .track_focus(&self.tab_menu_focus)
+            .role(gpui::Role::Menu)
+            .tab_group()
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.tab_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if matches!(event.keystroke.key.as_str(), "down" | "up" | "home" | "end")
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.platform
+                {
+                    navigate_menu(
+                        &this.tab_menu_focus,
+                        &event.keystroke.key,
+                        key_item_count.get(),
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                    window.prevent_default();
+                } else if event.keystroke.key == "tab"
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !event.keystroke.modifiers.platform
+                {
+                    let key = if event.keystroke.modifiers.shift {
+                        "up"
+                    } else {
+                        "down"
+                    };
+                    navigate_menu(&this.tab_menu_focus, key, key_item_count.get(), window, cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                }
+            }))
+            .debug_selector(|| "tab-context-menu".into())
+            .occlude()
+            .absolute()
+            .left(x)
+            .when(below, |d| d.top(pos.y.max(ui::SPACE_2)))
+            .when(!below, |d| {
+                d.bottom((viewport.height - pos.y).max(ui::SPACE_2))
+            })
+            .w(menu_w)
+            .max_w(max_w)
+            .max_h(available_h.max(px(0.)).min(max_h))
+            .overflow_y_scroll()
+            .p_1()
+            .rounded(ui::RADIUS_MD)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .children(file_items)
+            .child(
+                div()
+                    .id("tab-menu-pin")
+                    .role(gpui::Role::MenuItem)
+                    .tab_index(0)
+                    .focus_visible(|d| d.border_1().border_color(p.ring))
+                    .debug_selector(|| "tab-menu-pin".into())
+                    .px_2()
+                    .py_1()
+                    .rounded(ui::RADIUS_SM)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+                    .child(ui::icons::svg_box(pin_svg, 13., p.popover_foreground))
+                    .child(pin_label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let Some(index) = this.take_tab_menu_target(cx) else {
                             return;
                         };
-                        if !this.layout.is_tab_pinned(index) {
-                            this.request_close_tab(index, cx);
+                        this.change(true, cx, |l| {
+                            l.toggle_pin_tab(index);
+                        });
+                    })),
+            )
+            .child(div().my_1().h(px(1.)).w_full().bg(p.border))
+            // OWE-870: 탭 이름 변경(더블클릭과 같은 대화상자).
+            .child(
+                menu_item("tab-menu-rename", text::RENAME_TAB.get(), true, None).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        let Some(index) = this.take_tab_menu_target(cx) else {
+                            return;
+                        };
+                        this.begin_tab_rename(index, window, cx);
+                    }),
+                ),
+            )
+            .child(
+                menu_item(
+                    "tab-menu-close",
+                    text::CLOSE_TAB_MENU.get(),
+                    !is_pinned,
+                    krill_app::keys::shortcut_label(window, &super::CloseTab),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let Some(index) = this.take_tab_menu_target(cx) else {
+                        return;
+                    };
+                    if !this.layout.is_tab_pinned(index) {
+                        this.request_close_tab(index, cx);
+                    }
+                })),
+            )
+            .child(
+                menu_item(
+                    "tab-menu-close-others",
+                    text::CLOSE_OTHER_TABS.get(),
+                    has_closable_others,
+                    None,
+                )
+                .when(has_closable_others, |d| {
+                    d.on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(index) = this.take_tab_menu_target(cx) else {
+                            return;
+                        };
+                        this.close_other_tabs(index, cx);
+                    }))
+                }),
+            )
+            .child(
+                menu_item(
+                    "tab-menu-close-right",
+                    text::CLOSE_TABS_TO_RIGHT.get(),
+                    has_closable_right,
+                    None,
+                )
+                .when(has_closable_right, |d| {
+                    d.on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(index) = this.take_tab_menu_target(cx) else {
+                            return;
+                        };
+                        this.close_tabs_to_right(index, cx);
+                    }))
+                }),
+            )
+            // OWE-870: 왼쪽 탭 닫기(핀 고정 탭은 유지).
+            .child(
+                menu_item(
+                    "tab-menu-close-left",
+                    text::CLOSE_TABS_TO_LEFT.get(),
+                    has_closable_left,
+                    None,
+                )
+                .when(has_closable_left, |d| {
+                    d.on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(index) = this.take_tab_menu_target(cx) else {
+                            return;
+                        };
+                        this.close_tabs_to_left(index, cx);
+                    }))
+                }),
+            )
+            .child(
+                menu_item(
+                    "tab-menu-close-editors",
+                    text::CLOSE_ALL_EDITOR_TABS.get(),
+                    has_closable_editors,
+                    None,
+                )
+                .when(has_closable_editors, |d| {
+                    d.on_click(cx.listener(|this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.close_all_editor_tabs(cx);
+                    }))
+                }),
+            )
+            .when(is_session_tab, |d| {
+                d.child(div().my_1().h(px(1.)).w_full().bg(p.border)).child(
+                    menu_item(
+                        "tab-menu-toggle-chat",
+                        text::TOGGLE_CHAT_VIEW.get(),
+                        true,
+                        krill_app::keys::shortcut_label(window, &super::ToggleChatView),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.tab_context_menu = None;
+                        if this.layout.focused() != Some(pane) {
+                            this.change(false, cx, |l| l.focus(pane));
                         }
+                        this.toggle_chat_view_with_focus(window, cx);
                     })),
                 )
-                .child(
-                    menu_item(
-                        "tab-menu-close-others",
-                        text::CLOSE_OTHER_TABS.get(),
-                        has_closable_others,
-                        None,
-                    )
-                    .when(has_closable_others, |d| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            let Some(index) = this.take_tab_menu_target(cx) else {
-                                return;
-                            };
-                            this.close_other_tabs(index, cx);
-                        }))
-                    }),
-                )
-                .child(
-                    menu_item(
-                        "tab-menu-close-right",
-                        text::CLOSE_TABS_TO_RIGHT.get(),
-                        has_closable_right,
-                        None,
-                    )
-                    .when(has_closable_right, |d| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            let Some(index) = this.take_tab_menu_target(cx) else {
-                                return;
-                            };
-                            this.close_tabs_to_right(index, cx);
-                        }))
-                    }),
-                )
-                // OWE-870: 왼쪽 탭 닫기(핀 고정 탭은 유지).
-                .child(
-                    menu_item(
-                        "tab-menu-close-left",
-                        text::CLOSE_TABS_TO_LEFT.get(),
-                        has_closable_left,
-                        None,
-                    )
-                    .when(has_closable_left, |d| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            let Some(index) = this.take_tab_menu_target(cx) else {
-                                return;
-                            };
-                            this.close_tabs_to_left(index, cx);
-                        }))
-                    }),
-                )
-                .child(
-                    menu_item(
-                        "tab-menu-close-editors",
-                        text::CLOSE_ALL_EDITOR_TABS.get(),
-                        has_closable_editors,
-                        None,
-                    )
-                    .when(has_closable_editors, |d| {
-                        d.on_click(cx.listener(|this, _, _, cx| {
-                            this.tab_context_menu = None;
-                            this.close_all_editor_tabs(cx);
-                        }))
-                    }),
-                )
-                .when(peer_supports_fork, |d| {
-                    d.child(div().my_1().h(px(1.)).w_full().bg(p.border))
-                        .child(
-                            menu_item("tab-menu-fork", text::FORK_SESSION.get(), can_fork, None)
-                                .when(can_fork, |d| {
-                                    d.on_click(cx.listener(move |this, _, _, cx| {
-                                        this.tab_context_menu = None;
-                                        this.fork_pane_session(pane, cx);
-                                    }))
-                                }),
-                        )
-                        .child(
-                            menu_item(
-                                "tab-menu-continue",
-                                text::CONTINUE_IN_NEW_SESSION.get(),
-                                can_continue,
-                                None,
-                            )
-                            .when(can_continue, |d| {
-                                d.on_click(cx.listener(move |this, _, window, cx| {
+            })
+            .when(peer_supports_fork, |d| {
+                d.child(div().my_1().h(px(1.)).w_full().bg(p.border))
+                    .child(
+                        menu_item("tab-menu-fork", text::FORK_SESSION.get(), can_fork, None).when(
+                            can_fork,
+                            |d| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
                                     this.tab_context_menu = None;
-                                    this.open_continue_session(pane, window, cx);
+                                    this.fork_pane_session(pane, cx);
                                 }))
-                            }),
-                        )
-                })
-                .child(div().my_1().h(px(1.)).w_full().bg(p.border))
-                .child(
-                    div()
-                        .px_2()
-                        .pt_1()
-                        .pb_1p5()
-                        .flex()
-                        .flex_col()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .text_size(ui::TEXT_XS)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(p.muted_foreground)
-                                .child(text::TAB_COLOR.get()),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_1()
-                                .children(swatches),
+                            },
                         ),
-                );
+                    )
+                    .child(
+                        menu_item(
+                            "tab-menu-continue",
+                            text::CONTINUE_IN_NEW_SESSION.get(),
+                            can_continue,
+                            None,
+                        )
+                        .when(can_continue, |d| {
+                            d.on_click(cx.listener(move |this, _, window, cx| {
+                                this.tab_context_menu = None;
+                                this.open_continue_session(pane, window, cx);
+                            }))
+                        }),
+                    )
+            })
+            .child(div().my_1().h(px(1.)).w_full().bg(p.border))
+            .child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .pb_1p5()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(p.muted_foreground)
+                            .child(text::TAB_COLOR.get()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_1()
+                            .children(swatches),
+                    ),
+            );
 
         Some(
             gpui::deferred(

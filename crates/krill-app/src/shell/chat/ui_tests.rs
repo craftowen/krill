@@ -2302,3 +2302,130 @@ fn chat_attachments_stage_from_drop_and_paste_remove_individually_and_submit_she
     );
     assert!(payload.contains("please inspect"));
 }
+
+#[gpui::test]
+fn chat_selection_copy_find_shortcuts_reasoning_copy_effort_and_discoverability(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (shell, cx) = open(cx, state_path("chat-ux-phase1a"));
+    let pane = shell.read_with(cx, |s, _| s.layout.focused().unwrap());
+    shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                agent: "claude".into(),
+                bound: true,
+                items: vec![
+                    ChatItem {
+                        kind: ChatItemKind::User,
+                        text: "alpha user question".into(),
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::Reasoning,
+                        text: "thinking about alpha".into(),
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text:
+                            "First rust block:\n```rs\nfn hello() {}\n```\nFindable Needle phrase"
+                                .into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let log = shell.chat.logs.get_mut(&local_key(SESSION)).unwrap();
+        log.meta = ComposerMeta {
+            model: Some("haiku".into()),
+            current_model_id: Some("haiku".into()),
+            supported: true,
+            effort_supported: false,
+            ..Default::default()
+        };
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // 1. effort_supported: false hides effort options in model picker.
+    let model_btn = cx.debug_bounds("chat-composer-model").unwrap();
+    cx.simulate_click(model_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-model-picker").is_some());
+    assert!(
+        cx.debug_bounds("chat-effort-option-low").is_none(),
+        "effort options must be hidden when effort_supported is false"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // 2. Expand Solo Reasoning card -> Copy button writes reasoning text to clipboard.
+    let disclosure = cx.debug_bounds("chat-disclosure").unwrap();
+    cx.simulate_click(disclosure.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let copy_btn = cx.debug_bounds("chat-reasoning-copy").unwrap();
+    cx.simulate_click(copy_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(
+        copied.contains("thinking about alpha"),
+        "expected reasoning copy on clipboard, got {copied:?}"
+    );
+
+    // 3. Cmd+F opens Chat Find Bar, matches row, and Esc dismisses.
+    let feed = cx.debug_bounds("desktop-chat-feed").unwrap();
+    cx.simulate_click(feed.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-find-bar").is_some());
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let find = &shell.chat.finds[&local_key(SESSION)];
+            find.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                gpui::EntityInputHandler::replace_text_in_range(state, None, "Needle", window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        let find = &s.chat.finds[&local_key(SESSION)];
+        assert_eq!(find.matches.len(), 1);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-find-bar").is_none());
+
+    // 4. SelectAll (Cmd+A) + Copy (Cmd+C) copies chat text, Cmd+K is safe, Cmd+Shift+J toggles view.
+    cx.simulate_keystrokes("cmd-a cmd-c");
+    cx.run_until_parked();
+    let selected_clip = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(
+        selected_clip.contains("Needle") || selected_clip.contains("alpha"),
+        "Cmd+A + Cmd+C in Chat View must copy selected chat text, got {selected_clip:?}"
+    );
+    cx.simulate_keystrokes("cmd-k");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.logs[&local_key(SESSION)].items.len(), 3);
+    });
+    cx.simulate_keystrokes("cmd-shift-j");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+    cx.simulate_keystrokes("cmd-shift-j");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-overlay").is_some());
+}

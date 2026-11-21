@@ -11,7 +11,6 @@ use gpui::Styled;
 use gpui::prelude::FluentBuilder as _;
 use gpui_component::menu::ContextMenuExt as _;
 use gpui_kit_assets::IconName;
-use std::hash::{Hash as _, Hasher as _};
 
 const CHAT_TOP_CONTROLS_GROUP: &str = "chat-top-controls";
 
@@ -21,6 +20,7 @@ struct SegmentStyle<'a> {
     key: &'a ChatKey,
     abs_idx: usize,
     markdown: bool,
+    stream_fade: bool,
     full_width: bool,
     text_size: gpui::Rems,
     text_color: gpui::Hsla,
@@ -59,25 +59,25 @@ impl Shell {
                             .text_color(style.text_color)
                             .child(if style.markdown {
                                 gpui_component::text::TextView::markdown(
-                                    {
-                                        let mut hash = std::hash::DefaultHasher::new();
-                                        text.hash(&mut hash);
-                                        SharedString::from(format!(
-                                            "chat-markdown-{}-{epoch}-{abs_idx}-{seg_idx}-{:x}",
-                                            pane.get(),
-                                            hash.finish()
-                                        ))
-                                    },
+                                    SharedString::from(format!(
+                                        "chat-markdown-{}-{epoch}-{abs_idx}-{seg_idx}",
+                                        pane.get()
+                                    )),
                                     text,
                                 )
                                 .scrollable(false)
+                                .selectable(true)
+                                .stream_fade(style.stream_fade)
                                 .into_any_element()
                             } else {
-                                div()
-                                    .min_w_0()
-                                    .whitespace_normal()
-                                    .child(text)
-                                    .into_any_element()
+                                gpui_component::SelectableText::new(
+                                    SharedString::from(format!(
+                                        "chat-text-{}-{epoch}-{abs_idx}-{seg_idx}",
+                                        pane.get()
+                                    )),
+                                    text,
+                                )
+                                .into_any_element()
                             }),
                     )
                 }
@@ -139,7 +139,15 @@ impl Shell {
                         .font_family(ui::FONT_MONO)
                         .text_size(ui::TEXT_SM)
                         .text_color(fg)
-                        .child(code);
+                        .child(super::code_view::SelectableHighlightedText::new(
+                            SharedString::from(format!(
+                                "chat-code-text-{}-{epoch}-{abs_idx}-{code_idx}",
+                                pane.get()
+                            )),
+                            &lang,
+                            code,
+                            cx,
+                        ));
 
                     let mut block = div()
                         .relative()
@@ -293,7 +301,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_last_row = row_ix + 1 == total_rows;
-        match row {
+        let key = (self.layout.host(pane).clone(), session);
+        let is_find_match = self.active_chat_find_row(&key) == Some(row_ix);
+        let row_el = match row {
             work_run::DisplayRow::Item { abs_idx, item } => self.render_chat_item(
                 pane,
                 session,
@@ -308,6 +318,20 @@ impl Shell {
             work_run::DisplayRow::WorkRun(run) => {
                 self.render_work_run(pane, session, run, is_last_row, agent_state, cx)
             }
+        };
+        if is_find_match {
+            let palette = ui::palette(cx);
+            div()
+                .w_full()
+                .min_w_0()
+                .rounded(ui::RADIUS_MD)
+                .border_l_2()
+                .border_color(palette.ring)
+                .bg(palette.accent.opacity(0.25))
+                .child(row_el)
+                .into_any_element()
+        } else {
+            row_el
         }
     }
 
@@ -548,10 +572,15 @@ impl Shell {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .whitespace_normal()
                         .text_size(ui::TEXT_XS)
                         .text_color(muted_fg)
-                        .child(item.text.trim().to_owned()),
+                        .child(gpui_component::SelectableText::new(
+                            SharedString::from(format!(
+                                "chat-work-note-text-{}-{step_abs_idx}",
+                                pane.get()
+                            )),
+                            item.text.trim().to_owned(),
+                        )),
                 )
                 .into_any_element();
         }
@@ -766,6 +795,8 @@ impl Shell {
                 .debug_selector(|| "chat-message-body".into())
                 .w_full()
                 .min_w_0()
+                .max_h(gpui::px(360.))
+                .overflow_y_scroll()
                 .pl(gpui::px(22.))
                 .pr_1()
                 .pb_2()
@@ -793,6 +824,7 @@ impl Shell {
                         key: &key,
                         abs_idx: section.abs_idx,
                         markdown: false,
+                        stream_fade: false,
                         full_width: true,
                         text_size: ui::TEXT_SM,
                         text_color: muted_fg,
@@ -838,6 +870,7 @@ impl Shell {
             });
 
         let open_file_button = (!item.file_path.is_empty()).then(|| {
+            let open_host = self.layout.host(pane).clone();
             let raw_path = std::path::PathBuf::from(&item.file_path);
             let path = if raw_path.is_relative() {
                 self.pane_cwd(pane, cx)
@@ -865,18 +898,24 @@ impl Shell {
             .ghost()
             .xsmall()
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_file_at(path.clone(), 1, 1, cx);
+                this.open_file_on_at(open_host.clone(), path.clone(), 1, 1, cx);
             }))
         });
 
+        let is_reasoning = matches!(item.kind, ChatItemKind::Reasoning);
         let copy_button = (!item.text.trim().is_empty()).then(|| {
             let copy_text = krill_term::select::clean_text(&item.text);
             let copy_key = key.clone();
+            let debug_name: &'static str = if is_reasoning {
+                "chat-reasoning-copy"
+            } else {
+                "chat-copy-item"
+            };
             Button::new(SharedString::from(format!(
                 "chat-copy-{}-{abs_idx}",
                 pane.get()
             )))
-            .debug_selector(|| "chat-copy-item".into())
+            .debug_selector(move || debug_name.into())
             .icon(if is_copied {
                 IconName::Check
             } else {
@@ -930,6 +969,7 @@ impl Shell {
                         key: &key,
                         abs_idx,
                         markdown: false,
+                        stream_fade: false,
                         full_width: false,
                         text_size: ui::TEXT_MD,
                         text_color: fg,
@@ -1046,6 +1086,8 @@ impl Shell {
                         key: &key,
                         abs_idx,
                         markdown: true,
+                        stream_fade: is_last_row
+                            && agent_state == krill_proto::control::AgentState::Working,
                         full_width: true,
                         text_size: ui::TEXT_MD,
                         text_color: fg,
@@ -1218,6 +1260,7 @@ impl Shell {
                             key: &key,
                             abs_idx,
                             markdown: false,
+                            stream_fade: false,
                             full_width: true,
                             text_size: ui::TEXT_SM,
                             text_color: muted_fg,
@@ -1226,19 +1269,28 @@ impl Shell {
                         },
                         cx,
                     );
-                    reasoning_el = reasoning_el.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "chat-reasoning-scroll-{}-{abs_idx}",
-                                pane.get()
-                            )))
-                            .w_full()
-                            .min_w_0()
-                            .pl(gpui::px(22.))
-                            .max_h(gpui::px(320.))
-                            .overflow_y_scroll()
-                            .child(body),
-                    );
+                    reasoning_el = reasoning_el
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "chat-reasoning-scroll-{}-{abs_idx}",
+                                    pane.get()
+                                )))
+                                .w_full()
+                                .min_w_0()
+                                .pl(gpui::px(22.))
+                                .max_h(gpui::px(320.))
+                                .overflow_y_scroll()
+                                .child(body),
+                        )
+                        .children(copy_button.map(|btn| {
+                            div()
+                                .pl(gpui::px(22.))
+                                .pt_1()
+                                .flex()
+                                .items_center()
+                                .child(btn)
+                        }));
                 }
 
                 return div()
@@ -1357,6 +1409,7 @@ impl Shell {
                     key: &key,
                     abs_idx,
                     markdown: false,
+                    stream_fade: false,
                     full_width: true,
                     text_size: ui::TEXT_MD,
                     text_color: fg,
@@ -1871,6 +1924,20 @@ impl Shell {
                 div()
                     .id("chat-empty")
                     .debug_selector(|| "chat-empty".into())
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if this.layout.focused() != Some(pane) {
+                                this.change(false, cx, |l| l.focus(pane));
+                                this.files.refocus = false;
+                            }
+                            if let Some(chat_key) = this.chat_key(pane) {
+                                let input = this.ensure_chat_input(chat_key, window, cx);
+                                input.update(cx, |state, cx| state.focus(window, cx));
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
                     .flex_1()
                     .w_full()
                     .min_w_0()
@@ -1918,6 +1985,32 @@ impl Shell {
                     ),
             );
         } else {
+            let at_history_cap = self.chat.logs.get(&key).is_some_and(|log| {
+                log.items.len() >= super::MAX_CHAT_KEPT && log.earlier.is_some()
+            });
+            if at_history_cap {
+                feed = feed.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-history-cap-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-history-cap".into())
+                        .w_full()
+                        .flex_none()
+                        .py_1()
+                        .px_3()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div().text_size(ui::TEXT_XS).text_color(muted_fg).child(
+                                ctext::EARLIER_HISTORY_CAP
+                                    .get()
+                                    .replace("{n}", &super::MAX_CHAT_KEPT.to_string()),
+                            ),
+                        ),
+                );
+            }
             let owner = cx.weak_entity();
             let list = self.chat.lists.entry((pane, session)).or_insert_with(|| {
                 ChatList::new(
@@ -1931,6 +2024,7 @@ impl Shell {
                 )
             });
             let list_state = list.sync(&display_feed, pending_len, pending_rev, revision, epoch);
+            self.trigger_load_earlier_if_near_top(pane, &key, cx);
             let owner = cx.weak_entity();
             let rows = Arc::clone(&display_feed);
             let pending_rows = Arc::clone(&pending_cards);
@@ -2007,66 +2101,61 @@ impl Shell {
 
         let composer = self.render_chat_composer(pane, key.clone(), &input_state, cx);
 
-        let live_line = self.pane_live_status_line(pane);
-        let turn_status_line = (agent_state == krill_proto::control::AgentState::Working
-            || live_line.is_some())
-        .then(|| {
-            let status_text = match (agent_state, &live_line) {
-                (krill_proto::control::AgentState::Working, Some(line)) => {
-                    format!("{} · {line}", ctext::STATE_WORKING.get())
-                }
-                (krill_proto::control::AgentState::Working, None) => {
-                    ctext::STATE_WORKING.get().to_owned()
-                }
-                (_, Some(line)) => line.clone(),
-                _ => String::new(),
-            };
-            div()
-                .id(SharedString::from(format!(
-                    "chat-turn-status-{}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-turn-status".into())
-                .flex_none()
-                .w_full()
-                .min_w_0()
-                .px_3()
-                .pt_1()
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(ui::status::status_glyph(
-                            agent_state,
-                            unread,
-                            ui::status::Size::Sm,
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(ui::TEXT_XS)
-                                .text_color(muted_fg)
-                                .child(status_text),
-                        )
-                        .children(active_elapsed_label.map(|elapsed| {
-                            div()
-                                .flex_none()
-                                .font_family(ui::FONT_MONO)
-                                .text_size(ui::TEXT_XS)
-                                .text_color(muted_fg)
-                                .child(elapsed)
-                        })),
-                )
-        });
+        let live_line = (agent_state == krill_proto::control::AgentState::Working)
+            .then(|| self.pane_live_status_line(pane))
+            .flatten();
+        let turn_status_line =
+            (agent_state == krill_proto::control::AgentState::Working).then(|| {
+                let status_text = match &live_line {
+                    Some(line) => format!("{} · {line}", ctext::STATE_WORKING.get()),
+                    None => ctext::STATE_WORKING.get().to_owned(),
+                };
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-turn-status-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-turn-status".into())
+                    .flex_none()
+                    .w_full()
+                    .min_w_0()
+                    .px_3()
+                    .pt_1()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(ui::status::status_glyph(
+                                agent_state,
+                                unread,
+                                ui::status::Size::Sm,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(muted_fg)
+                                    .child(status_text),
+                            )
+                            .children(active_elapsed_label.map(|elapsed| {
+                                div()
+                                    .flex_none()
+                                    .font_family(ui::FONT_MONO)
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(muted_fg)
+                                    .child(elapsed)
+                            })),
+                    )
+            });
 
         let is_split = self.layout.visible().len() > 1;
         let focused = self.layout.focused() == Some(pane);
@@ -2223,6 +2312,121 @@ impl Shell {
             .child(hover_controls)
             .child(primary_pill);
 
+        let find_bar = self.chat.finds.get(&key).map(|find| {
+            let find_key = key.clone();
+            let count_text = if find.query.trim().is_empty() {
+                String::new()
+            } else if find.matches.is_empty() {
+                ctext::FIND_NO_MATCH.get().to_owned()
+            } else {
+                ctext::FIND_COUNT
+                    .get()
+                    .replace("{cur}", &(find.active + 1).to_string())
+                    .replace("{total}", &find.matches.len().to_string())
+            };
+            let has_matches = !find.matches.is_empty();
+            let prev_key = key.clone();
+            let next_key = key.clone();
+            let close_key = key.clone();
+            div()
+                .id(SharedString::from(format!("chat-find-bar-{}", pane.get())))
+                .debug_selector(|| "chat-find-bar".into())
+                .key_context(krill_app::search::CONTEXT)
+                .occlude()
+                .absolute()
+                .top_12()
+                .right_3()
+                .w(gpui::px(320.))
+                .max_w(gpui::relative(0.9))
+                .p_1()
+                .rounded(ui::RADIUS_MD)
+                .border_1()
+                .border_color(border)
+                .bg(palette.popover)
+                .shadow_lg()
+                .flex()
+                .items_center()
+                .gap_1()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .capture_action(cx.listener({
+                    let key = find_key.clone();
+                    move |this, _: &gpui_component::input::Enter, window, cx| {
+                        let dir = if window.modifiers().shift {
+                            krill_proto::search::Direction::Previous
+                        } else {
+                            krill_proto::search::Direction::Next
+                        };
+                        cx.stop_propagation();
+                        this.step_chat_find_for_key(&key, dir, cx);
+                    }
+                }))
+                .capture_action(cx.listener({
+                    let key = find_key.clone();
+                    move |this, _: &gpui_component::input::Escape, window, cx| {
+                        cx.stop_propagation();
+                        this.close_chat_find(&key, window, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(gpui_component::input::Input::new(&find.input)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .font_family(ui::FONT_MONO)
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .child(count_text),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("chat-find-prev-{}", pane.get())))
+                        .debug_selector(|| "chat-find-prev".into())
+                        .icon(IconName::ChevronUp)
+                        .ghost()
+                        .xsmall()
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.step_chat_find_for_key(
+                                &prev_key,
+                                krill_proto::search::Direction::Previous,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("chat-find-next-{}", pane.get())))
+                        .debug_selector(|| "chat-find-next".into())
+                        .icon(IconName::ChevronDown)
+                        .ghost()
+                        .xsmall()
+                        .disabled(!has_matches)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.step_chat_find_for_key(
+                                &next_key,
+                                krill_proto::search::Direction::Next,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "chat-find-close-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-find-close".into())
+                    .icon(IconName::Close)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_chat_find(&close_key, window, cx);
+                    })),
+                )
+        });
+
         let in_card = self.workspace_stage() == super::super::pane_frame::WorkspaceStage::CardStage;
         let overlay_weak = cx.weak_entity();
         let inner = div()
@@ -2260,7 +2464,8 @@ impl Shell {
             .children(self.render_chat_prompt_notices(&key, cx))
             .children(turn_status_line)
             .child(composer)
-            .child(top_controls);
+            .child(top_controls)
+            .children(find_bar);
 
         Some(
             div()
@@ -2288,13 +2493,8 @@ impl Shell {
                             this.change(false, cx, |l| l.focus(pane));
                             this.files.refocus = false;
                         }
-                        if !this.chat_pane_has_focus(pane, window, cx) {
-                            if let Some(chat_key) = this.chat_key(pane) {
-                                let input = this.ensure_chat_input(chat_key, window, cx);
-                                input.update(cx, |state, cx| state.focus(window, cx));
-                            } else if !this.focus.is_focused(window) {
-                                window.focus(&this.focus, cx);
-                            }
+                        if !this.focus.is_focused(window) {
+                            window.focus(&this.focus, cx);
                         }
                     }),
                 )
