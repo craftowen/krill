@@ -881,6 +881,7 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .settings-list{padding:8px 16px calc(24px + env(safe-area-inset-bottom))}.settings-menu{margin-bottom:16px;padding:0}
 .settings-menu>.setting-link{min-height:52px;margin:0;padding:0 16px;gap:16px;border:0;border-radius:0;background-color:transparent}
 .settings-menu>*+*:before{left:52px;right:0}.settings-group.settings-menu{border-radius:16px}
+.settings-inline{margin-bottom:16px;border-radius:16px}
 .settings-menu>.setting-link strong{font-size:calc(16px * var(--ui-scale,1));font-weight:400}.settings-menu>.setting-link small{display:none}
 .settings-menu>.setting-link>svg:first-child{width:20px;height:20px;color:var(--muted-foreground)}
 .page-header.large.title-header{padding:8px 20px 4px}.page-header.title-header .header-sub{font-size:calc(13px * var(--ui-scale,1))}

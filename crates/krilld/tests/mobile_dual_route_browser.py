@@ -289,18 +289,18 @@ def main():
                 until(lambda: 'got:' + command in cli('read', str(sid)))
                 assert cli('read', str(sid)).count('got:' + command) == 1
                 shot('fallback-terminal')
-                click('Terminal actions')
-                click('Send prompt')
+                click('Chat')
+                wait(f'!!document.querySelector(".chat-input") && KrillMobile.store.sessions.get({sid})?.state!=="Working"')
                 mutation = 'dual-unknown-once-' + order
-                browser('fill', '#prompt', mutation)
-                evaluate('dualProbe.blocked=[];dualProbe.dropNextSend=true;document.getElementById("composer").requestSubmit();true')
+                browser('fill', '.chat-input', mutation)
+                evaluate('dualProbe.blocked=[];dualProbe.dropNextSend=true;document.querySelector(".chat-composer").requestSubmit();true')
                 wait('dualProbe.dropped?.readyState===3 && KrillMobile.store.connection.phase==="ready"')
                 until(lambda: 'got:' + mutation in cli('read', str(sid)))
                 assert cli('read', str(sid)).count('got:' + mutation) == 1
                 assert evaluate('KrillMobile.app.transport.updateBusy'), 'uncertain mutation guard was cleared'
                 assert any('not resent' in text for text in evaluate('dualProbe.notices'))
-                assert evaluate('document.getElementById("prompt").value') == mutation
-                click('Cancel')
+                assert evaluate('document.querySelector(".chat-input").value') == mutation
+                click('Term')
                 assert evaluate('dualProbe.violations') == [], evaluate('dualProbe.violations')
                 observations['orders'].append({'order': order, 'profiles': len(second['hosts']), 'device_count_unchanged': True, 'same_origin': True, 'fallback': other_kind, 'pty_input_count': 1, 'uncertain_rpc_input_count': 1, 'csp_violations': [], 'blocked_owner_recovered': order == 'blocked-relay-first'})
                 shot('no-replay')

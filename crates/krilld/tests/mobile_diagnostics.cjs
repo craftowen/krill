@@ -781,8 +781,8 @@ test("disconnected Settings control uses automatic diagnostics directly, with En
             connection: { phase: "disconnected" },
             snapshot: null,
           },
-          // The control lives on the Settings → Privacy page (Orca-style settings menu).
-          route: { subpage: "privacy" },
+          // Error collection lives inline on the root Settings page.
+          route: {},
           header: () => el("header"),
           t: h.context.KrillMobile.i18n.t,
           button: (label) => el("button", label),
@@ -824,6 +824,10 @@ test("disconnected Settings control uses automatic diagnostics directly, with En
         route: { subpage: "about" },
       });
       const aboutNodes = descendants(about);
+      const aboutToggle = aboutNodes.find(
+        (n) => n.dataset.focusKey === "error-reporting",
+      );
+      assert(aboutToggle);
       assert(
         aboutNodes.some(
           (n) => n.href === "https://krill.page/privacy#mobile-errors",
@@ -831,7 +835,15 @@ test("disconnected Settings control uses automatic diagnostics directly, with En
       );
       assert(
         aboutNodes.some((n) =>
-          n.text.includes(lang === "ko" ? "메모리에만" : "only in memory"),
+          n.text.includes(
+            blocked
+              ? lang === "ko"
+                ? "추적 방지"
+                : "privacy signal"
+              : lang === "ko"
+                ? "메모리에만"
+                : "in memory",
+          ),
         ),
       );
       if (!blocked) {
