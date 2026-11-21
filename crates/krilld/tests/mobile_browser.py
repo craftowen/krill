@@ -93,24 +93,25 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 shot('session-direct')
                 browser('find','role','button','click','--name','Terminal actions','--exact')
                 shot('action-sheet')
-                browser('find','role','button','click','--name','Send prompt','--exact')
-                browser('fill','#prompt','mobile-reconnect-once')
+                browser('find','role','button','click','--name','Cancel','--exact')
+                browser('find','role','button','click','--name','Chat','--exact')
+                wait(f'!!document.querySelector(".chat-input") && KrillMobile.store.sessions.get({cfg["session"]})?.state!=="Working"')
+                browser('fill','.chat-input','mobile-reconnect-once')
                 # Observe the user-facing uncertainty notice before a successful
                 # reconnect replaces transient connection status text.
                 evaluate('globalThis.mutationNotices=[];globalThis.noticeObserver=new MutationObserver(()=>{const n=document.getElementById("notice");if(!n.hidden&&n.textContent)mutationNotices.push(n.textContent);});noticeObserver.observe(document.getElementById("notice"),{subtree:true,childList:true,characterData:true,attributes:true});true')
-                evaluate('globalThis.dropNextSend=true;globalThis.beforeDropSockets=recoverySockets.length;document.getElementById("composer").requestSubmit();true')
+                evaluate('globalThis.dropNextSend=true;globalThis.beforeDropSockets=recoverySockets.length;document.querySelector(".chat-composer").requestSubmit();true')
                 wait('globalThis.droppedSocket?.readyState===3&&recoverySockets.length>beforeDropSockets&&KrillMobile.store.connection.phase==="ready"')
                 until(lambda:'got:mobile-reconnect-once' in cli('read',str(cfg['session'])))
                 assert cli('read',str(cfg['session'])).count('got:mobile-reconnect-once') == 1
-                assert evaluate('document.getElementById("prompt").value') == 'mobile-reconnect-once'
+                assert evaluate('document.querySelector(".chat-input").value') == 'mobile-reconnect-once'
                 # Host-pool reconnection may replace transient status copy; the
                 # transport must retain the uncertain-mutation update guard.
                 assert evaluate('KrillMobile.app.transport.updateBusy')
                 assert any('not resent' in text for text in evaluate('mutationNotices'))
                 evaluate('noticeObserver.disconnect();true')
-                browser('find','role','button','click','--name','Cancel','--exact')
-                browser('find','role','button','click','--name','Terminal actions','--exact')
-                browser('find','role','button','click','--name','Review in Terminal','--exact')
+                browser('find','role','button','click','--name','Term','--exact')
+                wait('!!document.querySelector(".terminal-grid")')
                 # Approval is reviewed in the live terminal; the menu sends no
                 # unchecked affirmative byte on the user's behalf.
                 assert 'got:y' not in cli('read',str(cfg['session']))

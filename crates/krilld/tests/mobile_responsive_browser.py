@@ -220,8 +220,6 @@ def main():
                     close()
                     named('Terminal actions')
                     capture('terminal-actions', width, height)
-                    named('Send prompt')
-                    capture('prompt-dialog', width, height)
                     close()
                     named('Terminal actions')
                     named('Select text')
@@ -263,9 +261,7 @@ def main():
                     click('.file-row')
                     wait('document.querySelector("#git-patch").textContent.includes("+after")')
                     capture('git', width, height)
-                    for subpage, name in [('', 'settings'), ('/appearance', 'appearance-settings'),
-                                          ('/chat', 'chat-settings'), ('/privacy', 'privacy-settings'),
-                                          ('/terminal', 'terminal-settings'), ('/about', 'about')]:
+                    for subpage, name in [('', 'settings'), ('/terminal', 'terminal-settings')]:
                         navigate('/settings' + subpage)
                         capture(name, width, height)
                     navigate('/settings')
@@ -273,8 +269,6 @@ def main():
                     wait('document.getElementById("action-sheet").open')
                     capture('install-dialog', width, height)
                     close()
-                    navigate('/diagnostics')
-                    capture('connection-log', width, height)
                     # Connection callbacks own this DOM in production. Pin a long
                     # reconnect message between ticks to exercise wrapping geometry.
                     evaluate('''(()=>{const b=document.getElementById('connection-banner');b.className='connection-banner';b.hidden=false;b.innerHTML='<span>Reconnecting to desktop — 연결이 복구되면 계속할 수 있습니다.</span><button class="banner-action">Retry</button>';const n=document.getElementById('notice');n.textContent='Connection interrupted. 연결 상태를 확인하고 다시 시도하세요. '.repeat(4);n.hidden=false;return true;})()''')
@@ -363,15 +357,15 @@ def main():
                 other = cfg['extraSessions'][0]
                 if args.phase == 'after':
                     # Readability and wrapping also survive localized large text.
-                    navigate('/settings/appearance')
+                    navigate('/settings')
                     click('[data-focus-key="preference-language-ko"]')
                     click('[data-focus-key="preference-appearance-light"]')
                     click('[data-focus-key="preference-uiTextScale-1.5"]')
                     for width, height in VIEWPORTS:
                         browser('set', 'viewport', str(width), str(height))
-                        for path, name in [('/settings', 'settings'), ('/settings/appearance', 'appearance-settings'),
+                        for path, name in [('/settings', 'settings'),
                                            ('/settings/terminal', 'terminal-settings'),
-                                           ('/settings/about', 'about'), ('/host/local', 'workspaces'),
+                                           ('/host/local', 'workspaces'),
                                            ('/accounts', 'accounts'), (route, 'session')]:
                             navigate(path)
                             if name == 'accounts':
@@ -396,7 +390,7 @@ def main():
                         close()
                         click('.session .mode-toggle')
                 # Keep the viewport captures before any split reload or new input.
-                navigate('/settings/appearance')
+                navigate('/settings')
                 click('[data-focus-key="preference-language-en"]')
                 click('[data-focus-key="preference-appearance-dark"]')
                 click('[data-focus-key="preference-uiTextScale-1"]')

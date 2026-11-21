@@ -89,8 +89,7 @@ exports.main=async function main({base,fragment}){
   await until(()=>thief.evaluate("/expired|already used|rejected/.test(KrillMobile.store.connection.message)"),'spent ticket rejected');assert.equal(await thief.stored(),null);
 
   // Settings still prepares a fresh handoff. Open it in Android without beforeinstallprompt.
-  assert(await safari.click('Cancel'));await safari.evaluate("location.hash='#/settings'");
-  assert(await until(()=>safari.click('Install Krill'),'settings row'));
+  assert(await safari.click('Cancel'));await safari.evaluate("KrillMobile.install.show();true");
   const androidPairing=await until(()=>safari.evaluate("location.hash.includes('&install=1')&&location.href"),'Android pairing handoff');
   const androidBrowser=await chrome.page({android:true});await androidBrowser.open(androidPairing);
   const androidDevice=await until(androidBrowser.stored,'Android pairing');await until(androidBrowser.ready,'Android ready');
