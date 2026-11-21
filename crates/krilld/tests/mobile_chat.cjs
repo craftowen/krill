@@ -182,6 +182,9 @@ function fixture(options = {}) {
       return handler(request);
     },
     photo: (...args) => prepare(...args),
+    error(e) {
+      errors.push(e?.message || String(e));
+    },
     act(fn) {
       const p = Promise.resolve()
         .then(fn)
@@ -5980,6 +5983,107 @@ async function unboundEmptyAndVisibilityTransitions() {
       "dispose should unsubscribe chat push",
     );
     console.log("PASS Phase 3A: chat_subscribe/unsubscribe and chat_delta/chat_stale push client");
+  }
+
+  // Phase 3B: In-chat search bar, multi-photo attachments (<=4), and message actions <dialog>.
+  {
+    const p3b = fixture({
+      lang: "en",
+      capabilities: { chat_tail: true, chat_composer: true },
+      handler: async () => ({
+        generation: "g-3b",
+        agent: "claude",
+        bound: true,
+        page_start: 0,
+        next_offset: 50,
+        items: [
+          { id: "0:0", kind: "assistant", text: "alpha first finding" },
+          { id: "0:1", kind: "user", text: "alpha second turn" },
+          { id: "0:2", kind: "assistant", text: "gamma summary" },
+        ],
+      }),
+    });
+    await flush();
+
+    // 1. In-chat search bar toggles, counts, highlights, and navigates hits.
+    const searchBar = p3b.find("chat-search-bar");
+    assert.equal(searchBar.hidden, true);
+    p3b.find("icon-button composer-icon chat-search-toggle").action();
+    assert.equal(searchBar.hidden, false);
+    const searchInput = p3b.find("chat-search-input");
+    searchInput.value = "alpha";
+    searchInput.dispatchEvent(new Event("input"));
+    assert.equal(p3b.find("chat-search-count muted").textContent, "1 / 2");
+    assert.equal(
+      p3b.root.descendants().filter((n) => String(n.className || "").includes("chat-search-hit")).length,
+      2,
+    );
+    p3b.button("Next").action();
+    assert.equal(p3b.find("chat-search-count muted").textContent, "2 / 2");
+    p3b.button("Close").action();
+    assert.equal(searchBar.hidden, true);
+    assert.equal(
+      p3b.root.descendants().filter((n) => String(n.className || "").includes("chat-search-hit")).length,
+      0,
+    );
+
+    // 2. Multi-attachment (<= 4 photos) sends `photos`, rejects/caps 5th.
+    const picker = p3b.root
+      .descendants()
+      .find((n) => n.tag === "input" && n.type === "file");
+    assert.equal(picker.multiple, true);
+    let picSeq = 0;
+    p3b.prepare = async (_s, file) => ({
+      mime: "image/png",
+      data: `img-${++picSeq}-${file.name}`,
+    });
+    picker.files = [{ name: "a.png" }, { name: "b.png" }];
+    picker.dispatchEvent(new Event("change"));
+    await flush();
+    assert.equal(p3b.entry.photo.name, "a.png");
+    assert.equal(
+      p3b.root.descendants().filter((n) => n.className === "chat-attachment-chip").length,
+      2,
+    );
+    picker.files = [
+      { name: "c.png" },
+      { name: "d.png" },
+      { name: "e.png" },
+    ];
+    picker.dispatchEvent(new Event("change"));
+    await flush();
+    assert.equal(p3b.entry.attachments.length, 4);
+    assert(p3b.errors.some((e) => e.includes("Maximum 4 photos")));
+    p3b.input("send multi");
+    p3b.submit();
+    await flush();
+    const multiPrompt = p3b.calls.find(
+      (c) => c.action === "prompt" && c.text === "send multi",
+    );
+    assert(multiPrompt, "multi-photo prompt must submit");
+    assert.equal(multiPrompt.photos.length, 4);
+    assert.equal(multiPrompt.photo, undefined);
+    assert.equal(p3b.entry.photo, null);
+
+    // 3. Message actions <dialog> sheet quotes into composer and switches to Term.
+    const moreButtons = p3b.root
+      .descendants()
+      .filter((n) => n.className === "icon-button chat-msg-more");
+    assert(moreButtons.length >= 2);
+    moreButtons[0].action();
+    const sheet = p3b.find("chat-actions-sheet");
+    assert.equal(sheet.open, true);
+    p3b.button("Quote").action();
+    assert.equal(sheet.open, false);
+    assert.equal(p3b.find("chat-input").value, "> alpha first finding\n\n");
+
+    const termBefore = p3b.term;
+    moreButtons[0].action();
+    p3b.button("Jump to Term").action();
+    assert.equal(p3b.term, termBefore + 1);
+
+    p3b.dispose();
+    console.log("PASS Phase 3B: in-chat search, multi-attachment (<=4), and message actions <dialog>");
   }
 }
 main().catch((error) => {

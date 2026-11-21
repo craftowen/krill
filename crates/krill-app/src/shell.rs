@@ -368,6 +368,7 @@ actions!(
         FindPrev,
         Copy,
         CopyClean,
+        QuoteChat,
         Paste,
         ForkSession,
         ContinueInNewSession,
@@ -555,6 +556,7 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
         krill_app::keys::bind("cmd-c", Copy, ctx),
         krill_app::keys::bind("cmd-shift-c", CopyClean, ctx),
+        krill_app::keys::bind("cmd-shift-l", QuoteChat, ctx),
         krill_app::keys::bind("cmd-v", Paste, ctx),
     ]);
     #[cfg(target_os = "windows")]
@@ -8710,6 +8712,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &Copy, window, cx| this.copy(window, cx)))
             .on_action(cx.listener(|this, _: &CopyClean, window, cx| this.copy_clean(window, cx)))
+            .on_action(cx.listener(|this, _: &QuoteChat, window, cx| {
+                this.quote_chat_selection(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste(window, cx)))
             .on_action(cx.listener(|this, _: &ForkSession, _, cx| {
                 if let Some(pane) = this.layout.focused() {

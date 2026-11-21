@@ -1086,3 +1086,30 @@ fn composer_meta_cache_and_composer_status_json_parse_rate_limit_and_live_prompt
             if prompt == "Continue deploy?"
     ));
 }
+
+#[test]
+fn long_clipboard_text_paste_saves_private_txt_attachment_and_quotes_cleanly() {
+    let long = "line\n".repeat(7000);
+    assert!(long.len() >= 32 * 1024);
+    let item = gpui::ClipboardItem::new_string(long);
+    let classified = classify_chat_clipboard_item(&item);
+    let ChatClipboardContent::Attachments(atts) = classified else {
+        panic!("expected long paste >= 32 KiB to become a file attachment");
+    };
+    assert_eq!(atts.len(), 1);
+    let path = &atts[0].path;
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("txt"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    std::fs::remove_file(path).ok();
+
+    assert_eq!(
+        format_chat_quote("hello\n\nworld\x1b[31m!").as_deref(),
+        Some("> hello\n>\n> world!\n\n")
+    );
+    assert_eq!(format_chat_quote("   "), None);
+}

@@ -2746,3 +2746,149 @@ fn chat_phase2b_diffs_timestamps_unread_divider_and_prompt_cards(cx: &mut TestAp
     cx.run_until_parked();
     assert!(!sent.lock().unwrap().is_empty());
 }
+
+#[gpui::test]
+fn phase3b_minimap_quote_history_long_paste_reuse_and_conditional_fork(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::control::AgentState;
+
+    let (shell, cx) = open(cx, state_path("chat-phase3b"));
+    let key = local_key(SESSION);
+    let pane = shell.update(cx, |s, cx| {
+        s.sidebar_collapsed = true;
+        s.panel_collapsed = true;
+        let pane = s.layout.focused().unwrap();
+        attach_live_test_pane(s, pane, SESSION, cx);
+        if let Some(live) = s.live.get_mut(&pane) {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            live.pane.link(
+                SESSION,
+                1,
+                krill_app::pane::Writer::spawn(ours).unwrap(),
+                krill_proto::input::FEAT_INPUT | krill_proto::control::FEAT_SESSION_FORK,
+                krill_proto::input::Now::get(),
+            );
+            live.sock = Some(theirs);
+        }
+        s.layout.set_session(pane, SESSION);
+        s.layout.set_chat_view(pane, true);
+        pane
+    });
+
+    let make_user = |text: &str| ChatItem {
+        kind: ChatItemKind::User,
+        text: text.into(),
+        ..Default::default()
+    };
+
+    // 3 user turns: minimap remains hidden; fork hidden when agent is not claude/codex.
+    let mut snap = ChatPollSnapshot {
+        agent: "opencode".into(),
+        session_id: "s-3b".into(),
+        transcript_path: "/tmp/3b.jsonl".into(),
+        bound: true,
+        next_offset: 30,
+        items: vec![
+            make_user("turn one"),
+            make_user("turn two"),
+            make_user("turn three"),
+        ],
+        ..Default::default()
+    };
+    shell.update(cx, |s, cx| {
+        s.apply_chat_poll(SESSION, snap.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-turn-minimap").is_none());
+    assert!(cx.debug_bounds("chat-fork-item").is_none());
+    assert!(cx.debug_bounds("chat-quote-item").is_some());
+    assert!(cx.debug_bounds("chat-reuse-item").is_some());
+
+    // 4th user turn: minimap rail appears; claude agent reveals Fork button.
+    snap.agent = "claude".into();
+    snap.next_offset = 40;
+    snap.items = vec![make_user("turn four prompt preview")];
+    set_phase2b_session_state(&shell, cx, AgentState::Done, 400);
+    shell.update(cx, |s, cx| {
+        let log = s.chat.logs.entry(key.clone()).or_default();
+        log.agent = "claude".into();
+        s.apply_chat_poll(SESSION, snap);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-turn-minimap").is_some());
+    assert!(cx.debug_bounds("chat-minimap-turn-4").is_some());
+    assert!(cx.debug_bounds("chat-fork-item").is_some());
+    let reuse_bounds = cx.debug_bounds("chat-reuse-item").unwrap();
+    cx.simulate_click(reuse_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, cx| {
+        let (input, _) = s.chat.inputs.get(&key).expect("reuse creates input");
+        assert!(!input.read(cx).value().trim().is_empty());
+    });
+
+    // Quote inserts `> `-prefixed lines and focuses composer.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.chat.inputs.get(&key).unwrap().0.clone();
+            input.update(cx, |st, cx| st.set_value(String::new(), window, cx));
+            s.quote_text_into_chat_composer(&key, "line A\nline B", window, cx);
+            let value = s.chat.inputs[&key].0.read(cx).value().to_string();
+            assert_eq!(value, "> line A\n> line B\n\n");
+
+            // Prompt history cycling preserves WIP draft on Down past newest.
+            s.record_chat_prompt_history(&key, "first sent");
+            s.record_chat_prompt_history(&key, "second sent");
+            s.chat.inputs[&key]
+                .0
+                .update(cx, |st, cx| st.set_value("draft wip", window, cx));
+            assert!(s.step_chat_prompt_history(&key, -1, window, cx));
+            assert_eq!(
+                s.chat.inputs[&key].0.read(cx).value().as_ref(),
+                "second sent"
+            );
+            assert!(s.step_chat_prompt_history(&key, -1, window, cx));
+            assert_eq!(
+                s.chat.inputs[&key].0.read(cx).value().as_ref(),
+                "first sent"
+            );
+            assert!(s.step_chat_prompt_history(&key, 1, window, cx));
+            assert_eq!(
+                s.chat.inputs[&key].0.read(cx).value().as_ref(),
+                "second sent"
+            );
+            assert!(s.step_chat_prompt_history(&key, 1, window, cx));
+            assert_eq!(s.chat.inputs[&key].0.read(cx).value().as_ref(), "draft wip");
+        });
+    });
+
+    // >= 32 KiB text paste creates a .txt attachment instead of pasting inline.
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("A".repeat(33 * 1024)));
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.intercept_chat_clipboard_paste(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let attached_paths: Vec<std::path::PathBuf> = shell.read_with(cx, |s, _| {
+        s.chat
+            .draft_attachments
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.path)
+            .collect()
+    });
+    assert_eq!(attached_paths.len(), 1);
+    assert_eq!(
+        attached_paths[0].extension().and_then(|e| e.to_str()),
+        Some("txt")
+    );
+    for p in attached_paths {
+        std::fs::remove_file(p).ok();
+    }
+    let _ = pane;
+}

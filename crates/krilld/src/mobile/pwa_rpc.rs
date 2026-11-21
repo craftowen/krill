@@ -362,6 +362,8 @@ enum Action {
         #[serde(default)]
         photo: Option<PreparedPhoto>,
         #[serde(default)]
+        photos: Vec<PreparedPhoto>,
+        #[serde(default)]
         mode: PromptMode,
     },
     LivePromptReply {
@@ -889,10 +891,18 @@ impl Backend {
                 session,
                 text,
                 photo,
+                photos,
                 mode,
             } => {
                 if text.len() >= krill_proto::input::MAX_INPUT {
                     return Err(invalid());
+                }
+                let all_photos: Vec<PreparedPhoto> = photo.into_iter().chain(photos).collect();
+                if all_photos.len() > 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Maximum 4 photos per message.",
+                    ));
                 }
                 if let Some(status) = self
                     .registry
@@ -911,25 +921,33 @@ impl Backend {
                 } else {
                     let _ = mode;
                 }
-                // Prepare the image before sending anything, then submit image and text in order.
-                let path = photo
-                    .map(|photo| save_photo(&photo.mime, &photo.data))
-                    .transpose()?;
-                let combined = path.as_ref().map_or_else(
-                    || text.clone(),
-                    |path| {
-                        format!(
-                            "{} {}",
-                            krill_proto::agent::hooks::shell_quote(&path.to_string_lossy()),
-                            text
-                        )
-                    },
-                );
+                // Prepare images before sending anything, then submit image paths and text in order.
+                let mut saved_paths = Vec::with_capacity(all_photos.len());
+                for item in all_photos {
+                    match save_photo(&item.mime, &item.data) {
+                        Ok(path) => saved_paths.push(path),
+                        Err(err) => {
+                            for saved in saved_paths {
+                                fs::remove_file(saved).ok();
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                let combined = if saved_paths.is_empty() {
+                    text
+                } else {
+                    let quoted: Vec<String> = saved_paths
+                        .iter()
+                        .map(|path| krill_proto::agent::hooks::shell_quote(&path.to_string_lossy()))
+                        .collect();
+                    format!("{} {text}", quoted.join(" "))
+                };
                 let result = self.send_prompt(session, &combined);
-                if result.is_err()
-                    && let Some(path) = path
-                {
-                    fs::remove_file(path).ok();
+                if result.is_err() {
+                    for path in saved_paths {
+                        fs::remove_file(path).ok();
+                    }
                 }
                 result?;
                 Ok(json!({"sent":true}))
@@ -5237,5 +5255,65 @@ mod revision_tests {
             serde_json::from_str(&json!({"action": "chat_unsubscribe", "session": 42}).to_string())
                 .unwrap();
         assert!(matches!(unsub, Action::ChatUnsubscribe { session: 42 }));
+    }
+
+    #[test]
+    fn prompt_accepts_up_to_four_photos_and_rejects_five() {
+        let one = |i: u8| {
+            json!({
+                "mime": "image/png",
+                "data": hex(&[i]),
+            })
+        };
+        let valid: Action = serde_json::from_str(
+            &json!({
+                "action": "prompt",
+                "session": 1,
+                "text": "check screenshots",
+                "photos": [one(1), one(2), one(3), one(4)]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            valid,
+            Action::Prompt {
+                session: 1,
+                photo: None,
+                ref photos,
+                ..
+            } if photos.len() == 4
+        ));
+
+        let registry = Arc::new(Registry::new(None, None));
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let too_many: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "prompt",
+                    "session": 1,
+                    "text": "too many",
+                    "photos": [one(1), one(2), one(3), one(4), one(5)]
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(too_many["ok"], false);
+        assert!(
+            too_many["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("Maximum 4 photos"))
+        );
     }
 }

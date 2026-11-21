@@ -203,6 +203,15 @@
     chevronRight: [{ tag: "path", d: "m9 18 6-6-6-6" }],
     arrowDown: [{ tag: "path", d: "M12 5v14m-7-7 7 7 7-7" }],
     check: [{ tag: "path", d: "M20 6 9 17l-5-5" }],
+    search: [
+      { tag: "circle", cx: "11", cy: "11", r: "8" },
+      { tag: "path", d: "m21 21-4.3-4.3" },
+    ],
+    moreHorizontal: [
+      { tag: "circle", cx: "12", cy: "12", r: "1.5" },
+      { tag: "circle", cx: "19", cy: "12", r: "1.5" },
+      { tag: "circle", cx: "5", cy: "12", r: "1.5" },
+    ],
   };
   function svgIcon(name) {
     const doc = globalThis.document,
@@ -797,10 +806,26 @@
       rem = String(whole % 60).padStart(2, "0");
     return `${mins}m ${rem}s`;
   }
+  function setClass(node, cls, on) {
+    if (!node) return;
+    if (node.classList) {
+      if (on) node.classList.add(cls);
+      else node.classList.remove(cls);
+      return;
+    }
+    const parts = String(node.className || "")
+      .split(/\s+/)
+      .filter(Boolean);
+    const idx = parts.indexOf(cls);
+    if (on && idx < 0) parts.push(cls);
+    else if (!on && idx >= 0) parts.splice(idx, 1);
+    node.className = parts.join(" ");
+  }
   const cacheLimit = 8,
     cacheByteLimit = 8 * 1024 * 1024,
     pageLimit = 2048,
-    itemByteLimit = 2 * 1024 * 1024;
+    itemByteLimit = 2 * 1024 * 1024,
+    MAX_PHOTOS = 4;
   const isEntryPinned = (e) =>
       e.mounts > 0 ||
       e.sending ||
@@ -810,6 +835,7 @@
       e.questionDraft?.changed ||
       e.questionDraft?.selected?.length ||
       e.photo ||
+      (e.attachments?.length > 0) ||
       e.live,
     pinned = (state, id, e) => isEntryPinned(e) || !!state.drafts?.get(id);
   function pruneCache(state) {
@@ -845,6 +871,7 @@
     };
     entry.pages ||= [];
     entry.photoVersion ||= 0;
+    entry.attachments ||= entry.photo ? [entry.photo] : [];
     entry.mounts = (entry.mounts || 0) + 1;
     cacheMap.delete(sessionId);
     cacheMap.set(sessionId, entry);
@@ -1267,21 +1294,57 @@
       composing = false;
       suggest();
     });
-    const attachment = el("div", undefined, "chat-actions");
+    function currentAttachments() {
+      if (Array.isArray(entry.attachments) && entry.attachments.length)
+        return entry.attachments;
+      return entry.photo ? [entry.photo] : [];
+    }
+    function syncEntryPhoto() {
+      entry.attachments ||= [];
+      entry.photo = entry.attachments[0] || null;
+    }
+    const attachment = el("div", undefined, "chat-actions chat-attachments-list");
     attachment.setAttribute("role", "status");
+    const searchBar = el("div", undefined, "chat-search-bar"),
+      searchInput = el("input", undefined, "chat-search-input"),
+      searchCount = el("span", "", "chat-search-count muted"),
+      searchPrevBtn = button(t("Previous"), () => stepSearch(-1), "ghost small"),
+      searchNextBtn = button(t("Next"), () => stepSearch(1), "ghost small"),
+      searchCloseBtn = button(t("Close"), () => closeSearch(), "ghost small"),
+      actionsDialog = el("dialog", undefined, "chat-actions-sheet");
+    searchBar.hidden = true;
+    searchInput.type = "search";
+    searchInput.placeholder = t("Search messages");
+    searchInput.setAttribute("aria-label", t("Search messages"));
+    searchPrevBtn.disabled = true;
+    searchNextBtn.disabled = true;
+    searchBar.append(
+      searchInput,
+      searchCount,
+      searchPrevBtn,
+      searchNextBtn,
+      searchCloseBtn,
+    );
+    actionsDialog.setAttribute("aria-modal", "true");
+    actionsDialog.setAttribute("aria-label", t("Actions"));
     const photoPicker = el("input");
     photoPicker.type = "file";
     photoPicker.accept = "image/*";
+    photoPicker.multiple = true;
     photoPicker.hidden = true;
     photoPicker.addEventListener("change", () => {
-      const f = photoPicker.files?.[0];
+      const files = [...(photoPicker.files || [])];
       photoPicker.value = "";
-      if (f) preparePhoto(f);
+      if (!files.length) return;
+      const room = Math.max(0, MAX_PHOTOS - currentAttachments().length);
+      if (files.length > room)
+        ctx.error?.(Error(t("Maximum 4 photos per message.")));
+      for (const f of files.slice(0, room)) preparePhoto(f);
     });
     const attachBtn = button(
       t("Photo"),
       () => {
-        if (entry.photo || entry.sending) return;
+        if (currentAttachments().length >= MAX_PHOTOS || entry.sending) return;
         photoPicker.value = "";
         if (M.updates?.pickFile) M.updates.pickFile(photoPicker);
         else photoPicker.click?.();
@@ -1289,6 +1352,14 @@
       "icon-button composer-icon",
       "plus",
     );
+    const searchToggleBtn = button(
+      t("Search messages"),
+      () => toggleSearch(),
+      "icon-button composer-icon chat-search-toggle",
+    );
+    const searchToggleGlyph = svgIcon("search");
+    if (searchToggleGlyph) searchToggleBtn.replaceChildren(searchToggleGlyph);
+    searchToggleBtn.type = "button";
     const sendBtn = el("button", undefined, "primary composer-send");
     sendBtn.dataset.mode = "send";
     sendBtn.type = "submit";
@@ -1421,7 +1492,13 @@
       ),
       steerBtn = button(
         t("Steer"),
-        () => dispatchPrompt({ text: input.value, photo: entry.photo, steer: true, fromDraft: true }),
+        () =>
+          dispatchPrompt({
+            text: input.value,
+            photos: currentAttachments(),
+            steer: true,
+            fromDraft: true,
+          }),
         "secondary small composer-steer",
       ),
       rateLimitBanner = el("div", undefined, "chat-rate-limit-banner");
@@ -1443,7 +1520,7 @@
         "secondary small",
       ),
     );
-    leading.append(attachBtn, modelBtn, statusLine);
+    leading.append(attachBtn, modelBtn, searchToggleBtn, statusLine);
     statusRow.append(leading, contextMeter, queueBtn, steerBtn, sendBtn);
     box.append(suggestions, queuedStrip, attachment, input, statusRow);
     composer.append(box, photoPicker);
@@ -1900,11 +1977,11 @@
             typeof globalThis.matchMedia !== "function" ||
             !globalThis.matchMedia("(pointer: coarse)")?.matches;
         if (modSubmit && isStopMode()) {
-          if (input.value.trim() || entry.photo) {
+          if (input.value.trim() || currentAttachments().length) {
             event.preventDefault();
             dispatchPrompt({
               text: input.value,
-              photo: entry.photo,
+              photos: currentAttachments(),
               steer: true,
               fromDraft: true,
             });
@@ -2368,6 +2445,80 @@
             },
       );
     }
+    function insertQuote(text) {
+      const cleaned = String(text ?? "")
+        .replace(/\r\n?/g, "\n")
+        .trim();
+      if (!cleaned) return false;
+      const quoted =
+        cleaned
+          .split("\n")
+          .map((line) => (line ? `> ${line}` : ">"))
+          .join("\n") + "\n\n";
+      const current = input.value || "";
+      const prefix = !current
+        ? ""
+        : current.endsWith("\n\n")
+          ? current
+          : current.endsWith("\n")
+            ? `${current}\n`
+            : `${current}\n\n`;
+      input.value = `${prefix}${quoted}`;
+      input.selectionStart = input.selectionEnd = input.value.length;
+      entry.draftVersion = (entry.draftVersion || 0) + 1;
+      drafts.set(sessionId, input.value);
+      saveDrafts();
+      sizeInput(true);
+      updateComposer();
+      input.focus?.();
+      return true;
+    }
+    function closeActionsSheet() {
+      if (actionsDialog.open && typeof actionsDialog.close === "function")
+        actionsDialog.close();
+      actionsDialog.open = false;
+      actionsDialog.replaceChildren();
+    }
+    function openMessageActions(item) {
+      if (!item || disposed) return;
+      const list = el("div", undefined, "chat-actions-sheet-list");
+      const text = String(item.text || "");
+      if (text.trim()) {
+        list.append(
+          button(
+            t("Copy"),
+            () => {
+              closeActionsSheet();
+              copyText(text);
+            },
+            "ghost",
+          ),
+          button(
+            t("Quote"),
+            () => {
+              closeActionsSheet();
+              insertQuote(text);
+            },
+            "ghost",
+          ),
+        );
+      }
+      list.append(
+        button(
+          t("Jump to Term"),
+          () => {
+            closeActionsSheet();
+            onSwitchTerm?.();
+          },
+          "ghost",
+        ),
+        button(t("Close"), () => closeActionsSheet(), "secondary"),
+      );
+      actionsDialog.replaceChildren(el("div", undefined, "sheet-handle"), list);
+      if (!actionsDialog.open && typeof actionsDialog.showModal === "function")
+        actionsDialog.showModal();
+      actionsDialog.open = true;
+    }
     function messageMeta(item) {
       const meta = el("footer", undefined, "chat-meta"),
         copy = button(
@@ -2387,6 +2538,17 @@
           ).toISOString(),
         );
         meta.append(time);
+      }
+      if (capability("chat_tail") || capability("chat_composer")) {
+        const more = button(
+          t("Actions"),
+          () => openMessageActions(item),
+          "icon-button chat-msg-more",
+        );
+        const moreGlyph = svgIcon("moreHorizontal");
+        if (moreGlyph) more.replaceChildren(moreGlyph);
+        more.setAttribute("aria-label", t("Actions"));
+        meta.append(more);
       }
       return meta;
     }
@@ -2441,15 +2603,18 @@
       !!liveQuestion ||
       state.connection?.phase !== "ready";
     function syncQueueButtons() {
+      const atts = currentAttachments(),
+        hasReady = atts.some((a) => a.status === "ready"),
+        hasBusyOrErr = atts.some(
+          (a) => a.status === "pending" || a.status === "error",
+        );
       const show =
-          isStopMode() &&
-          (Boolean(input.value.trim()) || entry.photo?.status === "ready"),
+          isStopMode() && (Boolean(input.value.trim()) || hasReady),
         disabled =
           !!liveQuestion ||
           !!entry.modelPending ||
           !!entry.sending ||
-          entry.photo?.status === "pending" ||
-          entry.photo?.status === "error" ||
+          hasBusyOrErr ||
           state.connection?.phase !== "ready";
       queueBtn.hidden = !show;
       steerBtn.hidden = !show;
@@ -2481,26 +2646,31 @@
       }
     }
     function enqueuePrompt() {
+      const atts = currentAttachments();
       if (
         !active() ||
         liveQuestion ||
         entry.modelPending ||
-        entry.photo?.status === "pending" ||
-        entry.photo?.status === "error"
+        atts.some((a) => a.status === "pending" || a.status === "error")
       )
         return;
-      const text = input.value,
-        photo = entry.photo;
-      if (!text.trim() && !photo) return;
+      const text = input.value;
+      if (!text.trim() && !atts.length) return;
       entry.queuedPrompts ||= [];
-      entry.queuedPrompts.push({ id: ++queueSeq, text, photo: photo || null });
+      entry.queuedPrompts.push({
+        id: ++queueSeq,
+        text,
+        attachments: atts.slice(),
+        photo: atts[0] || null,
+      });
       entry.draftVersion = (entry.draftVersion || 0) + 1;
       input.value = "";
       drafts.delete(sessionId);
       saveDrafts();
-      if (photo && entry.photo === photo) {
+      if (atts.length) {
         entry.photoVersion++;
-        entry.photo = null;
+        entry.attachments = [];
+        syncEntryPhoto();
       }
       closeSuggestions();
       sizeInput();
@@ -2523,33 +2693,40 @@
       dispatchPrompt({
         text: next.text,
         photo: next.photo,
+        photos: next.attachments,
         steer: false,
         fromDraft: false,
       });
     }
-    function dispatchPrompt({ text, photo, steer, fromDraft }) {
+    function dispatchPrompt({ text, photo, photos, steer, fromDraft }) {
+      const attList =
+        Array.isArray(photos) && photos.length ? photos : photo ? [photo] : [];
       if (
         !active() ||
         liveQuestion ||
         entry.modelPending ||
         entry.sending ||
-        photo?.status === "pending" ||
-        photo?.status === "error" ||
+        attList.some((a) => a.status === "pending" || a.status === "error") ||
         (!steer && isStopMode())
       )
         return;
       const version = entry.draftVersion || 0;
-      if (fromDraft && text.trim() === "/model" && !photo && capability("composer_models")) {
+      if (
+        fromDraft &&
+        text.trim() === "/model" &&
+        !attList.length &&
+        capability("composer_models")
+      ) {
         openModelCommand(0, text.length);
         return;
       }
-      if (!String(text || "").trim() && !photo) return;
+      if (!String(text || "").trim() && !attList.length) return;
       const hadLive = !!entry.live;
       followLatest();
       entry.progress = {
         phase: "sending",
         text,
-        photo: !!photo,
+        photo: attList.length > 0,
         at: Date.now(),
         canConfirm: entry.loaded && entry.bound,
         generation: entry.generation,
@@ -2565,12 +2742,18 @@
       run(async () => {
         try {
           if (!active()) return;
+          const photoFields =
+            attList.length > 1
+              ? { photos: attList.map((a) => a.prepared) }
+              : attList.length === 1
+                ? { photo: attList[0].prepared }
+                : {};
           await ctx.rpc({
             action: "prompt",
             session: sessionId,
             text,
             ...(steer && capability("prompt_steer") ? { mode: "steer" } : {}),
-            ...(photo ? { photo: photo.prepared } : {}),
+            ...photoFields,
           });
           entry.progress.phase = "accepted";
           entry.notifyComposer?.();
@@ -2583,7 +2766,13 @@
               saveDrafts();
               entry.notifyComposer?.({ version, text });
             }
-            if (photo && entry.photo === photo) entry.photo = null;
+            if (attList.length) {
+              const sentSet = new Set(attList);
+              entry.attachments = (entry.attachments || []).filter(
+                (a) => !sentSet.has(a),
+              );
+              syncEntryPhoto();
+            }
           }
           if (!disposed) {
             await pollNow();
@@ -2639,86 +2828,98 @@
         if (glyph) sendBtn.replaceChildren(glyph);
         else sendBtn.textContent = label;
       }
+      const atts = currentAttachments();
       sendBtn.disabled = stopMode
         ? stopDisabled()
         : !!entry.modelPending ||
           !!liveQuestion ||
           entry.sending ||
-          entry.photo?.status === "pending" ||
-          entry.photo?.status === "error";
-      attachBtn.disabled = !!liveQuestion || entry.sending || !!entry.photo;
+          atts.some((a) => a.status === "pending" || a.status === "error");
+      attachBtn.disabled =
+        !!liveQuestion || entry.sending || atts.length >= MAX_PHOTOS;
       syncQueueButtons();
       renderQueuedStrip();
       flushQueued();
       attachment.replaceChildren();
-      const photo = entry.photo;
-      if (!photo) return;
-      if (photo.status === "ready" && photo.prepared?.data) {
-        const img = el("img", undefined, "chat-photo-thumb"),
-          src = `data:${photo.prepared.mime || "image/jpeg"};base64,${photo.prepared.data}`;
-        img.alt = "";
-        img.src = src;
-        img.setAttribute("alt", "");
-        img.setAttribute("src", src);
-        attachment.append(img);
-      }
-      const text =
-        photo.status === "pending"
-          ? t("Preparing photo…")
-          : photo.status === "error"
-            ? t("Photo preparation failed. Retry or remove it.")
-            : t("Photo ready. It will be sent with this message.");
-      attachment.append(
-        el(
-          "span",
-          `${photo.name}: ${text}`,
-          photo.status === "error" ? "danger" : "muted",
-        ),
-      );
-      if (photo.status === "error")
-        attachment.append(
+      if (!atts.length) return;
+      for (const att of atts) {
+        const chip = el("div", undefined, "chat-attachment-chip");
+        if (att.status === "ready" && att.prepared?.data) {
+          const img = el("img", undefined, "chat-photo-thumb"),
+            src = `data:${att.prepared.mime || "image/jpeg"};base64,${att.prepared.data}`;
+          img.alt = "";
+          img.src = src;
+          img.setAttribute("alt", "");
+          img.setAttribute("src", src);
+          chip.append(img);
+        }
+        const text =
+          att.status === "pending"
+            ? t("Preparing photo…")
+            : att.status === "error"
+              ? t("Photo preparation failed. Retry or remove it.")
+              : t("Photo ready. It will be sent with this message.");
+        chip.append(
+          el(
+            "span",
+            `${att.name}: ${text}`,
+            att.status === "error" ? "danger" : "muted",
+          ),
+        );
+        if (att.status === "error")
+          chip.append(
+            button(
+              t("Retry photo"),
+              () => preparePhoto(att.file, att),
+              "ghost small",
+            ),
+          );
+        chip.append(
           button(
-            t("Retry photo"),
-            () => preparePhoto(photo.file),
+            t("Remove photo"),
+            () => {
+              if (entry.sending) return;
+              entry.photoVersion++;
+              entry.attachments = (entry.attachments || []).filter(
+                (a) => a !== att,
+              );
+              syncEntryPhoto();
+              updateComposer();
+            },
             "ghost small",
           ),
         );
-      attachment.append(
-        button(
-          t("Remove photo"),
-          () => {
-            if (entry.sending) return;
-            entry.photoVersion++;
-            entry.photo = null;
-            updateComposer();
-          },
-          "ghost small",
-        ),
-      );
+        attachment.append(chip);
+      }
     }
-    async function preparePhoto(file) {
+    async function preparePhoto(file, targetAtt = null) {
+      entry.attachments ||= [];
+      if (!targetAtt && entry.attachments.length >= MAX_PHOTOS) return;
       const version = ++entry.photoVersion;
-      entry.photo = {
+      const att = targetAtt || {
         file,
         name: file.name || t("Photo"),
-        status: "pending",
-        version,
       };
+      att.status = "pending";
+      att.version = version;
+      delete att.error;
+      if (!targetAtt) entry.attachments.push(att);
+      syncEntryPhoto();
       updateComposer();
       try {
         const prepared = await ctx.photo?.(sessionId, file, { prepare: true });
-        if (entry.photoVersion !== version) return;
+        if (att.version !== version || !entry.attachments.includes(att)) return;
         if (!prepared?.mime || !prepared?.data)
           throw new Error(t("Photo preparation unavailable"));
-        entry.photo = { ...entry.photo, status: "ready", prepared };
+        att.status = "ready";
+        att.prepared = prepared;
       } catch (error) {
-        if (entry.photoVersion === version)
-          entry.photo = {
-            ...entry.photo,
-            status: "error",
-            error: cleanRpcError(error, t),
-          };
+        if (att.version === version && entry.attachments.includes(att)) {
+          att.status = "error";
+          att.error = cleanRpcError(error, t);
+        }
       }
+      syncEntryPhoto();
       entry.notifyComposer?.();
     }
     sendBtn.addEventListener("click", (e) => {
@@ -2753,7 +2954,7 @@
       if (!suggestions.hidden) return;
       dispatchPrompt({
         text: input.value,
-        photo: entry.photo,
+        photos: currentAttachments(),
         steer: false,
         fromDraft: true,
       });
@@ -2785,7 +2986,104 @@
     streamingDots.setAttribute("aria-hidden", "true");
     streamingDots.append(el("span"), el("span"), el("span"));
     streamingDots.hidden = true;
-    shell.append(history, pollStatus, feed, skeleton, streamingDots, jumpBtn, liveCard, rateLimitBanner, composer);
+    actionsDialog.addEventListener("cancel", (e) => {
+      e.preventDefault();
+      closeActionsSheet();
+    });
+    actionsDialog.addEventListener("click", (e) => {
+      if (e.target === actionsDialog) closeActionsSheet();
+    });
+    let searchOpen = false,
+      searchQuery = "",
+      searchHits = [],
+      searchIdx = -1;
+    function applySearch() {
+      const q = searchOpen ? String(searchQuery || "").trim().toLowerCase() : "";
+      const cardsList = (feed.children || []).filter((n) =>
+        String(n.className || "").split(/\s+/).includes("chat-card"),
+      );
+      for (const n of cardsList) {
+        setClass(n, "chat-search-hit", false);
+        setClass(n, "chat-search-active", false);
+      }
+      if (!q) {
+        searchHits = [];
+        searchIdx = -1;
+        searchCount.textContent = searchOpen && searchInput.value ? t("No matches") : "";
+        searchPrevBtn.disabled = true;
+        searchNextBtn.disabled = true;
+        return;
+      }
+      searchHits = cardsList.filter((n) =>
+        String(n.textContent || "").toLowerCase().includes(q),
+      );
+      for (const n of searchHits) setClass(n, "chat-search-hit", true);
+      if (!searchHits.length) {
+        searchIdx = -1;
+        searchCount.textContent = t("No matches");
+        searchPrevBtn.disabled = true;
+        searchNextBtn.disabled = true;
+        return;
+      }
+      if (searchIdx < 0 || searchIdx >= searchHits.length) searchIdx = 0;
+      const activeCard = searchHits[searchIdx];
+      setClass(activeCard, "chat-search-active", true);
+      searchCount.textContent = `${searchIdx + 1} / ${searchHits.length}`;
+      searchPrevBtn.disabled = false;
+      searchNextBtn.disabled = false;
+      activeCard.scrollIntoView?.({ block: "center" });
+    }
+    function stepSearch(delta) {
+      if (!searchHits.length) return;
+      searchIdx = (searchIdx + delta + searchHits.length) % searchHits.length;
+      applySearch();
+    }
+    function openSearch() {
+      searchOpen = true;
+      searchBar.hidden = false;
+      applySearch();
+      searchInput.focus?.();
+    }
+    function closeSearch() {
+      searchOpen = false;
+      searchQuery = "";
+      searchInput.value = "";
+      searchBar.hidden = true;
+      applySearch();
+      input.focus?.();
+    }
+    function toggleSearch() {
+      if (searchOpen) closeSearch();
+      else openSearch();
+    }
+    searchInput.addEventListener("input", () => {
+      searchQuery = searchInput.value;
+      searchIdx = 0;
+      applySearch();
+    });
+    searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault?.();
+        closeSearch();
+      } else if (e.key === "Enter") {
+        e.preventDefault?.();
+        stepSearch(e.shiftKey ? -1 : 1);
+      }
+    });
+    const onDocKeyDown = (e) => {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        String(e.key || "").toLowerCase() === "f" &&
+        active() &&
+        isVisible()
+      ) {
+        e.preventDefault?.();
+        openSearch();
+      }
+    };
+    globalThis.document?.addEventListener?.("keydown", onDocKeyDown);
+    shell.append(history, pollStatus, searchBar, feed, skeleton, streamingDots, jumpBtn, liveCard, rateLimitBanner, composer, actionsDialog);
     root.replaceChildren(shell);
     // Only a complete live terminal screen supplies an answer target. Historical cards stay inert.
     let liveQuestion = null,
@@ -3572,6 +3870,7 @@
         feed.append(empty);
       }
       syncJumpButton();
+      applySearch();
       const first = entry.items[0];
       const start = first?._pageStart || 0;
       earlierBtn.hidden =
@@ -5069,6 +5368,8 @@
           "visibilitychange",
           visibilityChanged,
         );
+        globalThis.document?.removeEventListener?.("keydown", onDocKeyDown);
+        closeActionsSheet();
         unsubscribeKeyboard?.();
         resize?.disconnect();
         pruneCache(state);

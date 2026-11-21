@@ -994,7 +994,8 @@ impl Shell {
             .debug_selector(|| "desktop-chat-composer".into())
             .capture_action(cx.listener({
                 let up_key = key.clone();
-                move |this, _: &gpui_component::input::MoveUp, _, cx| {
+                let up_input = input_state.clone();
+                move |this, _: &gpui_component::input::MoveUp, window, cx| {
                     if let Some(ac) = this.chat.autocomplete.get_mut(&up_key)
                         && ac.is_open()
                     {
@@ -1004,12 +1005,19 @@ impl Shell {
                     } else if this.step_chat_model_picker(&up_key, -1) {
                         cx.stop_propagation();
                         cx.notify();
+                    } else if up_input.read(cx).focus_handle(cx).is_focused(window)
+                        && this.step_chat_prompt_history(&up_key, -1, window, cx)
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
                     }
                 }
             }))
             .capture_action(cx.listener({
                 let down_key = key.clone();
-                move |this, _: &gpui_component::input::MoveDown, _, cx| {
+                let down_input = input_state.clone();
+                move |this, _: &gpui_component::input::MoveDown, window, cx| {
                     if let Some(ac) = this.chat.autocomplete.get_mut(&down_key)
                         && ac.is_open()
                     {
@@ -1017,6 +1025,12 @@ impl Shell {
                         cx.stop_propagation();
                         cx.notify();
                     } else if this.step_chat_model_picker(&down_key, 1) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    } else if down_input.read(cx).focus_handle(cx).is_focused(window)
+                        && this.step_chat_prompt_history(&down_key, 1, window, cx)
+                    {
+                        window.prevent_default();
                         cx.stop_propagation();
                         cx.notify();
                     }

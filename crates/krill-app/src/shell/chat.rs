@@ -545,6 +545,9 @@ pub(crate) struct ChatState {
     autocomplete_missed_at: BTreeMap<ChatKey, std::time::Instant>,
     attach_tasks: BTreeMap<(ChatKey, u64), Task<()>>,
     next_attach_id: u64,
+    sent_history: BTreeMap<ChatKey, Vec<String>>,
+    history_cursor: BTreeMap<ChatKey, usize>,
+    history_saved_draft: BTreeMap<ChatKey, String>,
 }
 
 impl ChatState {
@@ -2455,6 +2458,7 @@ impl Shell {
             };
             self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
             let queued_id = self.chat.next_pending_id;
+            self.record_chat_prompt_history(key, &display_text);
             input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
             self.chat.draft_attachments.remove(key);
             if let Some(ac) = self.chat.autocomplete.get_mut(key) {
@@ -2557,6 +2561,7 @@ impl Shell {
             );
         self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
         let pending_id = self.chat.next_pending_id;
+        self.record_chat_prompt_history(key, &display_text);
         input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
         self.chat.draft_attachments.remove(key);
         if let Some(ac) = self.chat.autocomplete.get_mut(key) {
@@ -2968,6 +2973,13 @@ fn classify_chat_clipboard_item(item: &gpui::ClipboardItem) -> ChatClipboardCont
             && let Some(text) = item.text()
             && !text.is_empty()
         {
+            const LONG_PASTE_BYTES: usize = 32 * 1024;
+            if text.len() >= LONG_PASTE_BYTES
+                && let Ok(path) = super::security::save_clipboard_text(&text)
+                && let Some(att) = DraftAttachment::from_path(path)
+            {
+                return ChatClipboardContent::Attachments(vec![att]);
+            }
             return ChatClipboardContent::Text(text);
         }
     }
@@ -3014,6 +3026,27 @@ pub(super) struct PendingReview<'a> {
     pub immediate_send_failure: bool,
 }
 
+fn format_chat_quote(text: &str) -> Option<String> {
+    let stripped = krill_app::pull_request::checks::strip_ansi_codes(text);
+    let cleaned = krill_term::select::clean_text(&stripped);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut quoted = String::new();
+    for line in trimmed.lines() {
+        if line.is_empty() {
+            quoted.push_str(">\n");
+        } else {
+            quoted.push_str("> ");
+            quoted.push_str(line);
+            quoted.push('\n');
+        }
+    }
+    quoted.push('\n');
+    Some(quoted)
+}
+
 struct PendingDispatch {
     key: ChatKey,
     pane: super::PaneId,
@@ -3034,6 +3067,190 @@ struct UnbracketedWatch {
 }
 
 impl Shell {
+    pub(super) fn record_chat_prompt_history(&mut self, key: &ChatKey, text: &str) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let history = self.chat.sent_history.entry(key.clone()).or_default();
+            if history.last().is_none_or(|prev| prev != trimmed) {
+                history.push(text.to_owned());
+                if history.len() > 50 {
+                    let overflow = history.len() - 50;
+                    history.drain(..overflow);
+                }
+            }
+        }
+        self.chat.history_cursor.remove(key);
+        self.chat.history_saved_draft.remove(key);
+    }
+
+    pub(super) fn step_chat_prompt_history(
+        &mut self,
+        key: &ChatKey,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if delta == 0
+            || self
+                .chat
+                .autocomplete
+                .get(key)
+                .is_some_and(catalog::AutocompleteState::is_open)
+            || self.chat.quick_menu.contains(key)
+            || self.chat.model_picker.contains(key)
+        {
+            return false;
+        }
+        let Some(history) = self
+            .chat
+            .sent_history
+            .get(key)
+            .filter(|h| !h.is_empty())
+            .cloned()
+        else {
+            return false;
+        };
+        let Some((input, _)) = self.chat.inputs.get(key) else {
+            return false;
+        };
+        let input = input.clone();
+        if Self::chat_input_is_composing(&input, window, cx) {
+            return false;
+        }
+        let (value, cursor) = {
+            let state = input.read(cx);
+            (state.value().to_string(), state.cursor())
+        };
+        let clamped = value
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= cursor)
+            .unwrap_or(value.len());
+        let on_first_line = value
+            .get(..clamped)
+            .is_none_or(|before| !before.contains('\n'));
+        let on_last_line = value
+            .get(clamped..)
+            .is_none_or(|after| !after.contains('\n'));
+
+        let next_text = if delta < 0 {
+            let current = self.chat.history_cursor.get(key).copied();
+            if current.is_none() && !value.is_empty() && !on_first_line {
+                return false;
+            }
+            if current.is_none() {
+                self.chat.history_saved_draft.insert(key.clone(), value);
+            }
+            let next_idx = current.unwrap_or(history.len()).saturating_sub(1);
+            self.chat.history_cursor.insert(key.clone(), next_idx);
+            history.get(next_idx).cloned().unwrap_or_default()
+        } else {
+            let Some(current) = self.chat.history_cursor.get(key).copied() else {
+                return false;
+            };
+            if !on_last_line {
+                return false;
+            }
+            let next_idx = current.saturating_add(1);
+            if next_idx >= history.len() {
+                self.chat.history_cursor.remove(key);
+                self.chat
+                    .history_saved_draft
+                    .remove(key)
+                    .unwrap_or_default()
+            } else {
+                self.chat.history_cursor.insert(key.clone(), next_idx);
+                history.get(next_idx).cloned().unwrap_or_default()
+            }
+        };
+        input.update(cx, |state, cx| {
+            state.set_value(next_text, window, cx);
+        });
+        true
+    }
+
+    pub(super) fn quote_text_into_chat_composer(
+        &mut self,
+        key: &ChatKey,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(quoted) = format_chat_quote(text) else {
+            return;
+        };
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        input.update(cx, |state, cx| {
+            let current = state.value().to_string();
+            let mut next = String::new();
+            if !current.is_empty() {
+                next.push_str(&current);
+                if !current.ends_with("\n\n") {
+                    if current.ends_with('\n') {
+                        next.push('\n');
+                    } else {
+                        next.push_str("\n\n");
+                    }
+                }
+            }
+            next.push_str(&quoted);
+            state.set_value(next, window, cx);
+            state.focus(window, cx);
+        });
+        self.chat.history_cursor.remove(key);
+        self.chat.history_saved_draft.remove(key);
+        cx.notify();
+    }
+
+    pub(super) fn quote_chat_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_open() || self.dashboard.is_some() || !self.is_active_chat_view_in(cx) {
+            return;
+        }
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let Some(session) = self.layout.session(pane) else {
+            return;
+        };
+        let key = (self.layout.host(pane).clone(), session);
+        let selected = gpui_component::TextSelection::selected_text(window, cx);
+        let fallback = if selected.trim().is_empty() {
+            self.chat.logs.get(&key).and_then(|log| {
+                log.items
+                    .iter()
+                    .rev()
+                    .find(|item| {
+                        matches!(item.kind, ChatItemKind::User | ChatItemKind::Assistant)
+                            && !item.text.trim().is_empty()
+                    })
+                    .map(|item| item.text.clone())
+            })
+        } else {
+            Some(selected)
+        };
+        if let Some(text) = fallback {
+            self.quote_text_into_chat_composer(&key, &text, window, cx);
+        }
+    }
+
+    pub(super) fn reuse_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        let text = text.to_owned();
+        input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.focus(window, cx);
+        });
+        self.chat.history_cursor.remove(key);
+        self.chat.history_saved_draft.remove(key);
+        cx.notify();
+    }
+
     pub(super) fn mark_chat_pending_copied(
         &mut self,
         key: ChatKey,

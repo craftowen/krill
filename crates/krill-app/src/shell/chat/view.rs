@@ -1062,6 +1062,25 @@ impl Shell {
             }))
         });
 
+        let quote_button = (!item.text.trim().is_empty()
+            && matches!(item.kind, ChatItemKind::User | ChatItemKind::Assistant))
+        .then(|| {
+            let quote_text = krill_term::select::clean_text(&item.text);
+            let quote_key = key.clone();
+            Button::new(SharedString::from(format!(
+                "chat-quote-{}-{abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-quote-item".into())
+            .label(ctext::QUOTE_MESSAGE.get())
+            .tooltip(ctext::QUOTE_MESSAGE.get())
+            .ghost()
+            .xsmall()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.quote_text_into_chat_composer(&quote_key, &quote_text, window, cx);
+            }))
+        });
+
         let item_selector = format!("chat-item-{}-{abs_idx}", pane.get());
         let debug_selector = item_selector.clone();
 
@@ -1163,8 +1182,42 @@ impl Shell {
                         .text_color(muted_fg)
                         .child(ts)
                 });
-                let has_meta =
-                    time_badge.is_some() || open_file_button.is_some() || copy_button.is_some();
+                let reuse_button = (!item.text.trim().is_empty()).then(|| {
+                    let reuse_text = krill_term::select::clean_text(&item.text);
+                    let reuse_key = key.clone();
+                    Button::new(SharedString::from(format!(
+                        "chat-reuse-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-reuse-item".into())
+                    .label(ctext::REUSE_PROMPT.get())
+                    .tooltip(ctext::REUSE_PROMPT.get())
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.reuse_chat_prompt(&reuse_key, &reuse_text, window, cx);
+                    }))
+                });
+                let fork_button = self.can_fork_pane(pane, cx).then(|| {
+                    Button::new(SharedString::from(format!(
+                        "chat-fork-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-fork-item".into())
+                    .label(ctext::FORK_SESSION.get())
+                    .tooltip(ctext::FORK_SESSION.get())
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fork_pane_session(pane, cx);
+                    }))
+                });
+                let has_meta = time_badge.is_some()
+                    || open_file_button.is_some()
+                    || copy_button.is_some()
+                    || quote_button.is_some()
+                    || reuse_button.is_some()
+                    || fork_button.is_some();
                 let user_col = div()
                     .w_full()
                     .min_w_0()
@@ -1182,6 +1235,9 @@ impl Shell {
                             .children(time_badge)
                             .children(open_file_button)
                             .children(copy_button)
+                            .children(quote_button)
+                            .children(reuse_button)
+                            .children(fork_button)
                     }));
 
                 return div()
@@ -1282,6 +1338,7 @@ impl Shell {
                             .gap_1()
                             .children(time_badge)
                             .children(copy_button)
+                            .children(quote_button)
                             .children(open_file_button)
                             .child(scroll_top_btn)
                     }));
@@ -2342,6 +2399,103 @@ impl Shell {
                 })
                 .size_full(),
             );
+            // Vertical turn minimap rail when there are >= 4 user turns.
+            let mut user_turns = Vec::new();
+            for row_ix in 0..display_feed.len() {
+                if let Some(work_run::DisplayRow::Item { item, .. }) = display_feed.get(row_ix)
+                    && item.kind == ChatItemKind::User
+                {
+                    let turn_num = user_turns.len() + 1;
+                    let preview: String = item
+                        .text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(48)
+                        .collect();
+                    user_turns.push((turn_num, row_ix, preview));
+                }
+            }
+            if user_turns.len() >= 4 {
+                let sampled: Vec<(usize, usize, String)> = if user_turns.len() <= 16 {
+                    user_turns
+                } else {
+                    const MAX_PIPS: usize = 16;
+                    (0..MAX_PIPS)
+                        .filter_map(|i| {
+                            let idx = (i * (user_turns.len() - 1)) / (MAX_PIPS - 1);
+                            user_turns.get(idx).cloned()
+                        })
+                        .collect()
+                };
+                feed = feed.child(
+                    div()
+                        .absolute()
+                        .right_2()
+                        .top_16()
+                        .bottom_4()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "chat-turn-minimap-{}",
+                                    pane.get()
+                                )))
+                                .debug_selector(|| "chat-turn-minimap".into())
+                                .rounded_full()
+                                .border_1()
+                                .border_color(border)
+                                .bg(palette.popover.opacity(0.9))
+                                .shadow_lg()
+                                .px_1()
+                                .py_1p5()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_1()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .children(sampled.into_iter().map(
+                                    |(turn_num, row_ix, preview)| {
+                                        let jump_list = list_state.clone();
+                                        let turn_label = ctext::MINIMAP_TURN
+                                            .get()
+                                            .replace("{n}", &turn_num.to_string());
+                                        let tip = if preview.is_empty() {
+                                            turn_label
+                                        } else {
+                                            format!("{turn_label}: {preview}")
+                                        };
+                                        let id =
+                                            format!("chat-minimap-turn-{}-{turn_num}", pane.get());
+                                        ui::button_with_tooltip(
+                                            Button::new(SharedString::from(id.clone()))
+                                                .debug_selector(move || {
+                                                    format!("chat-minimap-turn-{turn_num}")
+                                                })
+                                                .label(turn_num.to_string())
+                                                .rounded_full()
+                                                .ghost()
+                                                .xsmall()
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    jump_list.scroll_to(gpui::ListOffset {
+                                                        item_ix: row_ix,
+                                                        offset_in_item: gpui::px(0.),
+                                                    });
+                                                    cx.notify();
+                                                })),
+                                            id,
+                                            tip,
+                                        )
+                                    },
+                                )),
+                        ),
+                );
+            }
+
             // Floating affordance occupies no feed space, so it cannot move the composer.
             if !list_state.is_following_tail() {
                 feed = feed.child(

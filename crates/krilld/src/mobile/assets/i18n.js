@@ -871,6 +871,15 @@
     "Send other": "직접 입력 전송",
     "Changed {0} files (+{1} -{2})": "파일 {0}개 변경 (+{1} -{2})",
     "Remove queued": "대기 메시지 삭제",
+    "Search messages": "메시지 검색",
+    "No matches": "일치하는 항목 없음",
+    "Quote": "인용",
+    "Actions": "작업",
+    "Jump to Term": "터미널로 이동",
+    "Maximum 4 photos per message.": "메시지당 최대 4장의 사진만 첨부할 수 있습니다.",
+    "Clear": "지우기",
+    "Previous": "이전",
+    "Next": "다음",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;
