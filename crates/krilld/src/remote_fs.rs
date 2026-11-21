@@ -11,6 +11,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::child::{
+    AsFd, PipeReader, kill_and_reap, own_group, spawn, terminate_gracefully, wait_readable,
+};
 use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use krill_proto::os::net::UnixStream;
 use krill_proto::remote_fs::{
@@ -561,11 +564,57 @@ fn scan_worktree_listing(repo: &Path, limit: u32) -> io::Result<WireDirListing> 
     Ok(WireDirListing { entries, ignored })
 }
 
+const GIT_TERMINATE_GRACE: Duration = Duration::from_millis(200);
+const MAX_LS_FILES_BYTES: usize = 1024 * 1024;
+const MAX_IGNORED_STDOUT_BYTES: usize = 256 * 1024;
+
+fn drain_pipe_capped(
+    pipe: &mut impl io::Read,
+    dst: &mut Vec<u8>,
+    max_bytes: usize,
+    buf: &mut [u8],
+) -> io::Result<(bool, bool)> {
+    loop {
+        match pipe.read(buf) {
+            Ok(0) => return Ok((true, false)),
+            Ok(n) => {
+                let remaining = max_bytes.saturating_sub(dst.len());
+                let take = n.min(remaining);
+                if let Some(chunk) = buf.get(..take) {
+                    dst.extend_from_slice(chunk);
+                }
+                if dst.len() >= max_bytes {
+                    return Ok((false, true));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok((false, false));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
+    query_git_ignored_with(Path::new("git"), repo, relative_paths, GIT_TIMEOUT)
+}
+
+fn query_git_ignored_with(
+    program: &Path,
+    repo: &Path,
+    relative_paths: &[String],
+    timeout: Duration,
+) -> Vec<String> {
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return Vec::new();
     }
-    let Ok(mut child) = krill_proto::os::background_command("git")
+    let mut cmd = krill_proto::os::background_command(program);
+    own_group(&mut cmd)
         .current_dir(krill_proto::os::shell_path(repo))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -578,46 +627,83 @@ fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    let Ok(mut child) = spawn(&mut cmd) else {
         return Vec::new();
     };
-    if let Some(mut stdin) = child.stdin.take() {
+    let Some(stdout_raw) = child.stdout.take() else {
+        kill_and_reap(&mut child);
+        return Vec::new();
+    };
+    let Ok(mut stdout) = PipeReader::new(stdout_raw) else {
+        kill_and_reap(&mut child);
+        return Vec::new();
+    };
+    let stdin_handle = child.stdin.take().and_then(|mut stdin| {
         let mut payload = Vec::new();
         for rel in relative_paths {
             payload.extend_from_slice(rel.as_bytes());
             payload.push(0);
         }
-        std::thread::spawn(move || {
-            stdin.write_all(&payload).ok();
-        });
-    }
-    let Some(stdout) = child.stdout.take() else {
-        child.kill().ok();
-        child.wait().ok();
-        return Vec::new();
-    };
-    let reader_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout.take(256 * 1024).read_to_end(&mut buf).ok();
-        buf
+        std::thread::Builder::new()
+            .name("remote-fs-git-stdin".into())
+            .spawn(move || {
+                stdin.write_all(&payload).ok();
+            })
+            .ok()
     });
-    let deadline = Instant::now() + GIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
+    let mut stdout_bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut eof = false;
     loop {
+        if !eof {
+            if let Ok((hit_eof, hit_cap)) = drain_pipe_capped(
+                &mut stdout,
+                &mut stdout_bytes,
+                MAX_IGNORED_STDOUT_BYTES,
+                &mut buf,
+            ) {
+                eof |= hit_eof;
+                if hit_cap {
+                    terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
+                    break;
+                }
+            } else {
+                terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
+                break;
+            }
+        }
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(Some(_)) => {
+                if !eof {
+                    if Instant::now() >= deadline {
+                        terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
+                        break;
+                    }
+                    wait_readable(&[Some(&stdout as &dyn AsFd)], Duration::from_millis(5));
+                    continue;
+                }
+                kill_and_reap(&mut child);
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                wait_readable(
+                    &[(!eof).then_some(&stdout as &dyn AsFd)],
+                    Duration::from_millis(5),
+                );
+            }
             Ok(None) | Err(_) => {
-                child.kill().ok();
-                child.wait().ok();
+                terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
                 break;
             }
         }
     }
-    let Ok(stdout_bytes) = reader_handle.join() else {
-        return Vec::new();
-    };
+    drop(stdout);
+    drop(child);
+    if let Some(handle) = stdin_handle {
+        handle.join().ok();
+    }
     let mut ignored = Vec::new();
     let mut used = 0usize;
     for part in stdout_bytes.split(|b| *b == 0) {
@@ -928,10 +1014,15 @@ fn list_quick_open(root: &Path) -> io::Result<Vec<Vec<u8>>> {
 }
 
 fn git_ls_files(root: &Path, deadline: Instant) -> Option<Vec<PathBuf>> {
+    git_ls_files_with(Path::new("git"), root, deadline)
+}
+
+fn git_ls_files_with(program: &Path, root: &Path, deadline: Instant) -> Option<Vec<PathBuf>> {
     if !root.join(".git").exists() {
         return None;
     }
-    let mut child = krill_proto::os::background_command("git")
+    let mut cmd = krill_proto::os::background_command(program);
+    own_group(&mut cmd)
         .current_dir(krill_proto::os::shell_path(root))
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -946,31 +1037,67 @@ fn git_ls_files(root: &Path, deadline: Instant) -> Option<Vec<PathBuf>> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout.take(1024 * 1024).read_to_end(&mut buf).ok();
-        buf
-    });
+        .stderr(Stdio::null());
+    let mut child = spawn(&mut cmd).ok()?;
+    let stdout_raw = child.stdout.take()?;
+    let mut stdout = PipeReader::new(stdout_raw).ok()?;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut eof = false;
+    let mut truncated = false;
     let ok = loop {
+        if !eof {
+            if let Ok((hit_eof, hit_cap)) =
+                drain_pipe_capped(&mut stdout, &mut output, MAX_LS_FILES_BYTES, &mut buf)
+            {
+                eof |= hit_eof;
+                if hit_cap {
+                    truncated = true;
+                    terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
+                    break true;
+                }
+            } else {
+                terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
+                break false;
+            }
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(Some(status)) => {
+                if !eof {
+                    if Instant::now() >= deadline {
+                        terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
+                        break false;
+                    }
+                    wait_readable(&[Some(&stdout as &dyn AsFd)], Duration::from_millis(5));
+                    continue;
+                }
+                kill_and_reap(&mut child);
+                break status.success();
+            }
+            Ok(None) if Instant::now() < deadline => {
+                wait_readable(
+                    &[(!eof).then_some(&stdout as &dyn AsFd)],
+                    Duration::from_millis(5),
+                );
+            }
             Ok(None) | Err(_) => {
-                child.kill().ok();
-                child.wait().ok();
+                terminate_gracefully(&mut child, GIT_TERMINATE_GRACE);
                 break false;
             }
         }
     };
+    drop(stdout);
+    drop(child);
     if !ok {
         return None;
     }
-    let output = reader.join().ok()?;
-    let mut files: Vec<PathBuf> = output
+    let slice = if truncated {
+        let end = output.iter().rposition(|&b| b == 0)?;
+        output.get(..end).unwrap_or_default()
+    } else {
+        output.as_slice()
+    };
+    let mut files: Vec<PathBuf> = slice
         .split(|&b| b == 0)
         .filter(|p| !p.is_empty())
         .take(MAX_QUICK_OPEN_FILES)
@@ -1329,5 +1456,84 @@ mod tests {
             WireWriteOutcome::Failed(_)
         ));
         assert_eq!(fs::read(&stage).unwrap(), b"0123456789");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_ls_files_survives_output_over_cap_and_kills_lingering_descendant_groups() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TestDir::new("git-ls-cap-and-group");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let kept = repo.join("kept-first.rs");
+        fs::write(&kept, b"fn main() {}\n").unwrap();
+
+        // 1. Over-1-MiB NUL output: previously closed stdout triggered SIGPIPE and returned None.
+        let large_git = dir.path().join("large-git.sh");
+        fs::write(
+            &large_git,
+            "#!/bin/sh\nprintf 'kept-first.rs\\0'\nawk 'BEGIN { pad = sprintf(\"%0200d\", 0); for (i = 0; i < 6000; i++) printf \"dir/%s-%d.txt\\0\", pad, i }'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&large_git, fs::Permissions::from_mode(0o700)).unwrap();
+        let files = git_ls_files_with(&large_git, &repo, Instant::now() + Duration::from_secs(5))
+            .expect("capped git ls-files output must not return None on cap truncation");
+        assert_eq!(files, vec![PathBuf::from("kept-first.rs")]);
+
+        // 2. Child exits after spawning a background sleep holding stdout open: both helpers must
+        //    terminate the process group cleanly after the deadline instead of hanging forever.
+        let pid_file_ls = dir.path().join("ls.pid");
+        let lingering_ls = dir.path().join("lingering-ls.sh");
+        fs::write(
+            &lingering_ls,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nprintf 'kept-first.rs\\0'\nexit 0\n",
+                pid_file_ls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&lingering_ls, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        assert!(
+            git_ls_files_with(
+                &lingering_ls,
+                &repo,
+                Instant::now() + Duration::from_millis(120)
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        if let Ok(pid_text) = fs::read_to_string(&pid_file_ls)
+            && let Ok(pid) = pid_text.trim().parse::<i32>()
+        {
+            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+        }
+
+        let pid_file_ignored = dir.path().join("ignored.pid");
+        let lingering_ignored = dir.path().join("lingering-ignored.sh");
+        fs::write(
+            &lingering_ignored,
+            format!(
+                "#!/bin/sh\ncat >/dev/null &\nsleep 30 &\necho $! > '{}'\nexit 0\n",
+                pid_file_ignored.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&lingering_ignored, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let ignored = query_git_ignored_with(
+            &lingering_ignored,
+            &repo,
+            &["kept-first.rs".to_owned()],
+            Duration::from_millis(120),
+        );
+        assert!(ignored.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        if let Ok(pid_text) = fs::read_to_string(&pid_file_ignored)
+            && let Ok(pid) = pid_text.trim().parse::<i32>()
+        {
+            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+        }
     }
 }
