@@ -3929,6 +3929,105 @@ fn key_up_without_shell_focus_sends_nothing(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn toggle_search_routes_to_editor_and_skips_center_diff_over_open_terminal_bar(
+    cx: &mut TestAppContext,
+) {
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let repo_dir = std::env::temp_dir().join(format!("krill-search-diff-{suffix}"));
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(repo_dir.join("hello.rs"), "pub fn hello() {}\n").unwrap();
+    let code_file = repo_dir.join("target.rs");
+    std::fs::write(&code_file, "fn search_target() {}\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("toggle-search-routing"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let term_pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(term_pane, krill_proto::SessionId(21), ours, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 1. 터미널 탭에서 검색 바를 연다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_search(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("search-bar").is_some());
+
+    // 2. center diff가 열리면 기존 터미널 검색 바는 가리고 새 ⌘F도 터미널 검색 바를 열지 않는다.
+    let diff_dir = repo_dir.clone();
+    cx.update(|_, cx| {
+        let panel = view.read(cx).diff.clone();
+        panel.update(cx, |p, cx| {
+            p.open_diff_file(diff_dir, "hello.rs", false, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("center-diff-view").is_some());
+    assert!(
+        cx.debug_bounds("search-bar").is_none(),
+        "terminal search bar must stay hidden while center diff is open"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.search = None;
+            s.toggle_search(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).search.is_none()));
+    assert!(cx.debug_bounds("search-bar").is_none());
+
+    // 3. center diff를 닫고 터미널 검색 바를 연 상태에서 에디터 탭으로 전환하면 검색 바가 숨고,
+    // ⌘F는 숨은 터미널 바가 아니라 에디터 내장 검색을 연다.
+    cx.update(|_, cx| {
+        let panel = view.read(cx).diff.clone();
+        panel.update(cx, krill_app::diff::Panel::clear_selection);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_search(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("search-bar").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.open_file(code_file.clone(), cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("search-bar").is_none(),
+        "terminal search bar must not render over an editor tab"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_search(window, cx));
+    });
+    cx.run_until_parked();
+    let editor_active = cx.update(|_, cx| {
+        let s = view.read(cx);
+        let pane = s.layout.focused().expect("editor pane");
+        s.editor_search_active(pane, cx)
+    });
+    assert!(
+        editor_active,
+        "Cmd+F on focused editor tab must open editor search even when terminal search exists"
+    );
+    assert!(cx.debug_bounds("search-bar").is_none());
+
+    std::fs::remove_dir_all(&repo_dir).ok();
+}
+
 /// AS-17: 출력으로 선택 자리 글자가 바뀌면 선택을 지우고, 그대로면 유지한다.
 #[gpui::test]
 fn stale_selection_clears_on_new_output(cx: &mut TestAppContext) {

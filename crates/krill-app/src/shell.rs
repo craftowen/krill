@@ -2525,6 +2525,14 @@ impl Shell {
 
     /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 파일 탭이 포커스면
     /// 에디터 내장 검색을 열며(OWE-874), 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
+    fn terminal_search_visible(&self, cx: &App) -> bool {
+        !self.diff.read(cx).has_center_diff()
+            && !self.is_active_chat_view_in(cx)
+            && self.layout.focused().is_some_and(|pane| {
+                self.live.contains_key(&pane) && self.layout.file(pane).is_none()
+            })
+    }
+
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard.is_some() {
             return;
@@ -2533,8 +2541,7 @@ impl Shell {
             settings.update(cx, |v, cx| v.focus_search(window, cx));
             return;
         }
-        if let Some((bar, _)) = &self.search {
-            bar.clone().update(cx, |bar, cx| bar.focus(window, cx));
+        if self.diff.read(cx).has_center_diff() {
             return;
         }
         if let Some(pane) = self.layout.focused()
@@ -2549,6 +2556,10 @@ impl Shell {
         // OWE-868: 빈 탭에서는 터미널 검색 바를 열지 않는다(열어도 동작하지 않는다).
         // 파일 탭은 위에서 에디터 내장 검색으로 처리된다(OWE-874).
         if self.focused_live().is_none() {
+            return;
+        }
+        if let Some((bar, _)) = &self.search {
+            bar.clone().update(cx, |bar, cx| bar.focus(window, cx));
             return;
         }
         if let Some(pane) = self.layout.focused() {
@@ -8961,7 +8972,13 @@ impl Render for Shell {
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
                                     // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
                                     // 너비·접힘과 무관하게 항상 터미널 우측에 붙는다.
-                                    .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
+                                    .children(
+                                        self.terminal_search_visible(cx)
+                                            .then(|| {
+                                                self.search.as_ref().map(|(bar, _)| bar.clone())
+                                            })
+                                            .flatten(),
+                                    ),
                             ),
                     )
                     .when(show_panel, |d| {
