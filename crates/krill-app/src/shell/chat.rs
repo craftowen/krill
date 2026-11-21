@@ -182,21 +182,34 @@ pub(crate) struct SessionChatLog {
     consumed_user_indices: BTreeSet<usize>,
     pub queued_prompts: VecDeque<QueuedChatPrompt>,
     pub unread_from: Option<usize>,
+    /// A bot chat's item changes and its newest owner turns' times (newest first).
+    item_notes: (Vec<Arc<work_run::ItemNote>>, Vec<u64>),
 }
 
 impl SessionChatLog {
     fn display_feed(&mut self) -> Arc<work_run::DisplayFeed> {
         Arc::clone(self.cached_feed.get_or_insert_with(|| {
-            if self.items.is_empty() {
+            if self.items.is_empty() && self.item_notes.0.is_empty() {
                 work_run::DisplayFeed::empty()
             } else {
-                Arc::new(work_run::DisplayFeed::project_with_unread(
+                Arc::new(work_run::DisplayFeed::project_with_notes(
                     self.base_index,
                     &self.items,
                     self.unread_from,
+                    &self.item_notes.0,
+                    &self.item_notes.1,
                 ))
             }
         }))
+    }
+
+    /// Shows a bot's item changes between the turns of its chat (Orca's item note rows).
+    pub(super) fn set_item_notes(&mut self, notes: Vec<Arc<work_run::ItemNote>>, turns: Vec<u64>) {
+        if self.item_notes.0 != notes || self.item_notes.1 != turns {
+            self.item_notes = (notes, turns);
+            self.cached_feed = None;
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 
     pub(super) fn sync_timing(
@@ -489,6 +502,9 @@ pub(super) struct ChatFindState {
 
 #[derive(Default)]
 pub(crate) struct ChatState {
+    /// Each bot's item changes, as chat lines, and when they were read (Orca's item note rows).
+    bot_notes: BTreeMap<krill_proto::bots::BotId, (std::time::Instant, Vec<BotNote>)>,
+    bot_notes_tasks: BTreeMap<krill_proto::bots::BotId, Task<()>>,
     poll_timer: Option<Task<()>>,
     poll_failed: BTreeSet<ChatKey>,
     lists: BTreeMap<(PaneId, SessionId), ChatList>,
@@ -1226,6 +1242,92 @@ impl Shell {
             .focused()
             .and_then(|pane| self.layout.chat_view(pane))
             .unwrap_or(false)
+    }
+
+    /// Keeps a bot chat's item lines current: the Home Chat shows every change since it began,
+    /// another chat the changes it made. The bot's items are read again every few seconds.
+    pub(super) fn sync_bot_item_notes(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
+        const REFRESH: Duration = Duration::from_secs(5);
+        let Some(bot) = self.chat_bot(key) else {
+            return;
+        };
+        let bot_id = bot.id.clone();
+        let home = bot.home_session().is_some_and(|h| h.session_id == key.1);
+        let since = bot
+            .sessions
+            .iter()
+            .find(|s| s.session_id == key.1)
+            .map_or(0, |s| s.created_at_ms);
+        let stale = self
+            .chat
+            .bot_notes
+            .get(&bot_id)
+            .is_none_or(|(at, _)| at.elapsed() >= REFRESH);
+        if stale
+            && !self.chat.bot_notes_tasks.contains_key(&bot_id)
+            && let Some(rpc) = self.bot_rpc()
+        {
+            let id = bot_id.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let request = krill_proto::bots::BotRpcRequest::ListItems {
+                    bot_id: Some(id.clone()),
+                    include_closed: true,
+                };
+                let items = cx
+                    .background_executor()
+                    .spawn(async move { rpc(&request) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.chat.bot_notes_tasks.remove(&id);
+                    let notes = match items {
+                        Ok(krill_proto::bots::BotRpcResponse::Items(items)) => bot_notes(&items),
+                        _ => this
+                            .chat
+                            .bot_notes
+                            .remove(&id)
+                            .map(|(_, n)| n)
+                            .unwrap_or_default(),
+                    };
+                    this.chat
+                        .bot_notes
+                        .insert(id, (std::time::Instant::now(), notes));
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.chat.bot_notes_tasks.insert(bot_id.clone(), task);
+        }
+        let notes: Vec<Arc<work_run::ItemNote>> = self
+            .chat
+            .bot_notes
+            .get(&bot_id)
+            .map(|(_, notes)| {
+                notes
+                    .iter()
+                    .filter(|n| n.note.at_ms >= since && (home || n.session == Some(key.1)))
+                    .map(|n| Arc::clone(&n.note))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let turns: Vec<u64> = self
+            .sidebar
+            .read(cx)
+            .session_prompt_history_on(&key.0, key.1)
+            .map(|h| h.turns.iter().map(|t| t.unix_ns / 1_000_000).collect())
+            .unwrap_or_default();
+        if let Some(log) = self.chat.logs.get_mut(key) {
+            log.set_item_notes(notes, turns);
+        }
+    }
+
+    /// The bot whose chat this is (Orca's bot chat: persona, permission chip, its folder).
+    pub(super) fn chat_bot(&self, key: &ChatKey) -> Option<&krill_app::bots::SidebarBot> {
+        if key.0 != self.launch_host {
+            return None;
+        }
+        self.sidebar_bots
+            .iter()
+            .find(|b| b.sessions.iter().any(|s| s.session_id == key.1))
     }
 
     pub(super) fn chat_key(&self, pane: PaneId) -> Option<ChatKey> {
@@ -4496,5 +4598,78 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
                     .any(|sec| sec.text.to_lowercase().contains(query_lower))
         }),
         work_run::DisplayRow::UnreadDivider { .. } => false,
+        work_run::DisplayRow::ItemNote { note, .. } => {
+            note.title.to_lowercase().contains(query_lower)
+                || note.detail.to_lowercase().contains(query_lower)
+        }
     }
+}
+
+/// An item change and the chat that made it.
+#[derive(Clone, Debug)]
+pub(crate) struct BotNote {
+    pub note: Arc<work_run::ItemNote>,
+    pub session: Option<SessionId>,
+}
+
+/// A bot's item events as chat lines, oldest first (snoozes are not said in chat).
+fn bot_notes(items: &[krill_proto::bots::BotItem]) -> Vec<BotNote> {
+    use krill_proto::bots::{BotItemActor, BotItemEventKind, BotItemStatus};
+    use work_run::{ItemNote, NoteAction, NoteActor};
+    let mut out = Vec::new();
+    for item in items {
+        for event in &item.events {
+            let action = match event.kind {
+                BotItemEventKind::Made => NoteAction::Added,
+                BotItemEventKind::Edited => NoteAction::Updated,
+                BotItemEventKind::Commented => NoteAction::Commented,
+                BotItemEventKind::Linked => NoteAction::Linked(
+                    event
+                        .text
+                        .split_once(':')
+                        .map_or(event.text.as_str(), |(_, target)| target)
+                        .to_owned(),
+                ),
+                BotItemEventKind::Status => {
+                    let to = event.text.rsplit("-> ").next().unwrap_or_default().trim();
+                    let Some(status) = [
+                        BotItemStatus::Planned,
+                        BotItemStatus::Working,
+                        BotItemStatus::NeedsYou,
+                        BotItemStatus::Done,
+                        BotItemStatus::Canceled,
+                    ]
+                    .into_iter()
+                    .find(|s| s.as_str() == to) else {
+                        continue;
+                    };
+                    NoteAction::Status(status)
+                }
+                BotItemEventKind::Snoozed | BotItemEventKind::Unsnoozed => continue,
+            };
+            let (actor, session) = match &event.actor {
+                BotItemActor::Owner { .. } => (NoteActor::Owner, None),
+                BotItemActor::Bot { session_id, .. } => (NoteActor::Bot, *session_id),
+                BotItemActor::System { .. } => (NoteActor::Bot, None),
+            };
+            let detail = if event.kind == BotItemEventKind::Commented {
+                event.text.split_whitespace().collect::<Vec<_>>().join(" ")
+            } else {
+                String::new()
+            };
+            out.push(BotNote {
+                note: Arc::new(ItemNote {
+                    at_ms: event.created_at_ms,
+                    actor,
+                    action,
+                    title: item.title.clone(),
+                    status: item.status,
+                    detail,
+                }),
+                session,
+            });
+        }
+    }
+    out.sort_by_key(|n| n.note.at_ms);
+    out
 }

@@ -967,3 +967,121 @@ fn daemon_version_probe_does_not_start_listener() {
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     fs::remove_dir_all(dir).ok();
 }
+
+/// 봇 지침은 시스템 프롬프트로만 가므로, 에이전트가 죽은 뒤 재개(cold resume)할 때도 다시 넘긴다.
+/// 실제 krilld·holder로 봇 세션을 띄우고 끝낸 뒤 `Resume`한다. 인자를 찍는 fixture만 실행한다.
+#[test]
+fn bot_session_resume_passes_the_bot_instructions_again() {
+    use krill_proto::bots::{BotRpcRequest, BotRpcResponse, CreateBotParams};
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = env::temp_dir().join(format!("bot-resume-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let fake = dir.join("bin/pi");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nfor a in \"$@\"; do printf 'PIARG:%s\\n' \"$a\"; done\n/bin/cat\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        dir.join("agents.toml"),
+        format!("[agent.pi]\nname = 'Pi'\nlaunch = ['{}']\n", fake.display()),
+    )
+    .unwrap();
+    let (daemon, mut c) = Daemon::start(&dir);
+    let Reply::Bot(BotRpcResponse::Bot(bot)) = request(
+        &mut c,
+        &Request::Bot(BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+            name: "Shop".into(),
+            agent_id: "pi".into(),
+            description: String::new(),
+            emoji: None,
+            avatar: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            workspace: None,
+            template_id: None,
+            initial_soul: None,
+        }))),
+    ) else {
+        panic!("create bot");
+    };
+    let Reply::Bot(BotRpcResponse::SessionStarted {
+        session_id: old,
+        pid: old_pid,
+        ..
+    }) = request(
+        &mut c,
+        &Request::Bot(BotRpcRequest::StartBotSession {
+            bot_id: bot.id,
+            cwd: None,
+            prompt: None,
+        }),
+    )
+    else {
+        panic!("start bot session");
+    };
+    // The instructions file the agent was given, and that it is the bot's own preamble.
+    let instructions_of = |c: &mut UnixStream, session: SessionId| {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let rows = cold(c, session).map(|(rows, _)| rows);
+            assert!(
+                Instant::now() < deadline,
+                "no instructions argument: {rows:?}"
+            );
+            // Rows wrap a long path: join them, then read the argument after the flag.
+            let args: Vec<String> = rows
+                .iter()
+                .flatten()
+                .map(|r| r.trim_end())
+                .collect::<String>()
+                .split("PIARG:")
+                .map(ToOwned::to_owned)
+                .collect();
+            if let Some(at) = args.iter().position(|a| a == "--append-system-prompt")
+                && let Some(file) = args.get(at + 1)
+                && let Ok(text) = fs::read_to_string(file)
+            {
+                break text;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let first = instructions_of(&mut c, old);
+    assert!(first.contains("Shop"), "{first}");
+    rustix::process::kill_process_group(pid(old_pid), Signal::TERM).unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Reply::Sessions(rows) = request(&mut c, &Request::List)
+            && rows.iter().any(|r| r.session == old && r.status.is_some())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "bot session never exited");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let Reply::Resumed { session: new, .. } = request(
+        &mut c,
+        &Request::Resume {
+            session: old,
+            create: Create {
+                account: None,
+                program: Program::Login,
+                cwd: vec![],
+                cols: 200,
+                rows: 24,
+            },
+        },
+    ) else {
+        panic!("resume");
+    };
+    assert_eq!(instructions_of(&mut c, new), first);
+    let sock = daemon.sock.clone();
+    drop((c, daemon));
+    assert_no_holders(&sock);
+    fs::remove_dir_all(dir).unwrap();
+}

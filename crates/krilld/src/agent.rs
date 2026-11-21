@@ -401,6 +401,18 @@ pub(crate) struct BotMcpLaunchConfig {
     pub bot_home: Option<PathBuf>,
     pub http_servers: Vec<BotMcpHttpServer>,
     pub stdio_servers: Vec<BotMcpStdioServer>,
+    /// 봇 지침(Tools·SOUL·MEMORY·Rules). [`takes_bot_instructions`]인 에이전트는 첫 사용자 메시지가 아니라
+    /// 자기 시스템 프롬프트로 받는다(Orca `bot-session-instructions`).
+    pub instructions: Option<String>,
+}
+
+/// 봇 지침을 시스템 프롬프트로 받을 길이 있는 에이전트인지. 아니면 호출자가 첫 입력으로 보낸다.
+/// Claude `--append-system-prompt-file`, Codex `developer_instructions`, Pi·OMP `--append-system-prompt`,
+/// Antigravity `--add-dir`한 폴더의 `AGENTS.md`, `OpenCode` 2.x 전용 설정 폴더의 `AGENTS.md`(Orca `acp-instructions`).
+pub(crate) fn takes_bot_instructions(profile: &Profile) -> bool {
+    ["claude", "codex", "pi", "omp", "agy", "opencode"]
+        .into_iter()
+        .any(|name| is(profile, name))
 }
 
 /// OWE-712: 새 세션 하나에만 선택 계정을 적용한다. 전역 활성 계정은 바꾸지 않는다.
@@ -433,6 +445,9 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
     if bot_mcp.is_some() {
         merge_loopback_no_proxy(&mut login.env);
     }
+    let instructions = bot_mcp
+        .and_then(|m| m.instructions.as_deref())
+        .filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile));
 
     if is(profile, "codex") {
         let hooked = codex_hooks(profile, state, &login.env)?;
@@ -446,6 +461,13 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
                 login.env.retain(|(ek, _)| ek != &k);
                 login.env.push((k, v));
             }
+        }
+        if let Some(text) = instructions
+            && !effective.launch.is_empty()
+        {
+            let state = state.ok_or(io::ErrorKind::NotFound)?;
+            let args = instruction_args(&effective, &mut login.env, state, session, text)?;
+            effective.launch.splice(1..1, args);
         }
         return Ok((
             wrap_account(&effective, permission, login, account.as_ref()),
@@ -476,8 +498,22 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
                 mcp_path.as_os_str().as_bytes().to_vec(),
             ]);
         }
+        if let Some(text) = instructions {
+            let args = instruction_args(profile, &mut launch.env, state, session, text)?;
+            launch.argv.extend(args.into_iter().map(String::into_bytes));
+        }
         return Ok((launch, Some(id), account));
     }
+
+    let mut profile = std::borrow::Cow::Borrowed(profile);
+    if let Some(text) = instructions {
+        let state = state.ok_or(io::ErrorKind::NotFound)?;
+        let args = instruction_args(&profile, &mut login.env, state, session, text)?;
+        if !args.is_empty() && !profile.launch.is_empty() {
+            profile.to_mut().launch.splice(1..1, args);
+        }
+    }
+    let profile = profile.as_ref();
 
     if let Some(mcp) = bot_mcp {
         for srv in &mcp.stdio_servers {
@@ -494,6 +530,118 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
         None,
         account,
     ))
+}
+
+/// 각 에이전트가 봇 지침을 시스템 프롬프트로 받는 인자(프로그램 바로 뒤에 넣는다)와 env.
+fn instruction_args(
+    profile: &Profile,
+    env: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    state: &Path,
+    session: krill_proto::SessionId,
+    text: &str,
+) -> io::Result<Vec<String>> {
+    let path_text = |p: &Path| {
+        p.to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path is not utf-8"))
+    };
+    if is(profile, "claude") {
+        let file = claude::create_instructions_file(state, session, text)?;
+        return Ok(vec![
+            "--append-system-prompt-file".to_owned(),
+            path_text(&file)?,
+        ]);
+    }
+    if is(profile, "codex") {
+        // TOML 기본 문자열: JSON 문자열 이스케이프는 TOML에서도 그대로 유효하다.
+        let value = serde_json::to_string(text).map_err(io::Error::other)?;
+        return Ok(vec![
+            "-c".to_owned(),
+            format!("developer_instructions={value}"),
+        ]);
+    }
+    if is(profile, "pi") {
+        let file = claude::create_instructions_file(state, session, text)?;
+        return Ok(vec!["--append-system-prompt".to_owned(), path_text(&file)?]);
+    }
+    if is(profile, "omp") {
+        let file = claude::create_instructions_file(state, session, text)?;
+        return Ok(vec![format!(
+            "--append-system-prompt={}",
+            path_text(&file)?
+        )]);
+    }
+    if is(profile, "agy") {
+        // Antigravity CLI는 시스템 프롬프트 인자가 없고, 작업 폴더와 `--add-dir` 폴더의 AGENTS.md를 규칙으로 읽는다.
+        let dir = claude::create_instructions_dir(state, session)?;
+        claude::write_new_0600(&dir.join("AGENTS.md"), text.as_bytes())?;
+        return Ok(vec!["--add-dir".to_owned(), path_text(&dir)?]);
+    }
+    if is(profile, "opencode") {
+        // OpenCode 2.x는 설정의 instructions를 읽지 않고 설정 폴더의 AGENTS.md만 읽는다. 사용자 설정 폴더의
+        // 항목을 링크한 전용 폴더에 사용자 AGENTS.md + 지침을 둔다(Orca `opencode-instructions-config-dir`).
+        let source = opencode_config_dir(env);
+        let dir = claude::create_instructions_dir(state, session)?;
+        let own = std::fs::read_to_string(source.join("AGENTS.md")).ok();
+        let combined = [own.as_deref().map(str::trim), Some(text)]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        claude::write_new_0600(&dir.join("AGENTS.md"), format!("{combined}\n").as_bytes())?;
+        if let Ok(entries) = std::fs::read_dir(&source) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name == "AGENTS.md" {
+                    continue;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(entry.path(), dir.join(&name)).ok();
+                #[cfg(windows)]
+                {
+                    let target = entry.path();
+                    if target.is_dir() {
+                        std::os::windows::fs::symlink_dir(&target, dir.join(&name)).ok();
+                    } else {
+                        std::fs::hard_link(&target, dir.join(&name)).ok();
+                    }
+                }
+            }
+        }
+        env.retain(|(k, _)| k.as_slice() != b"OPENCODE_CONFIG_DIR");
+        env.push((
+            b"OPENCODE_CONFIG_DIR".to_vec(),
+            dir.as_os_str().as_bytes().to_vec(),
+        ));
+        return Ok(Vec::new());
+    }
+    Ok(Vec::new())
+}
+
+/// 이 실행이 Krill 없이 읽을 `OpenCode` 설정 폴더: `OPENCODE_CONFIG_DIR`, 아니면 XDG 폴더.
+fn opencode_config_dir(env: &[(Vec<u8>, Vec<u8>)]) -> PathBuf {
+    let var = |key: &str| {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k.as_slice() == key.as_bytes())
+            .and_then(|(_, v)| std::str::from_utf8(v).ok().map(ToOwned::to_owned))
+            .or_else(|| std::env::var(key).ok())
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(dir) = var("OPENCODE_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    let base = var("XDG_CONFIG_HOME").map_or_else(
+        || {
+            krill_proto::os::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        },
+        PathBuf::from,
+    );
+    base.join("opencode")
 }
 
 fn merge_loopback_no_proxy(env: &mut Vec<(Vec<u8>, Vec<u8>)>) {
@@ -650,6 +798,38 @@ pub(crate) fn resume_in(
         kept_id,
         account,
     ))
+}
+
+/// [`resume_in`]에 봇 지침을 다시 붙인다. 지침은 대화 기록이 아니라 시스템 프롬프트에 있어서
+/// 재개(holder까지 죽은 뒤 cold resume 등) 때 다시 넘기지 않으면 봇 정체성을 잃는다.
+pub(crate) fn resume_in_with_bot_instructions(
+    profile: &Profile,
+    permission: Permission,
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    session_id: Option<&str>,
+    account: Option<&LaunchAccount>,
+    instructions: Option<&str>,
+) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
+    let Some(text) =
+        instructions.filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile))
+    else {
+        return resume_in(profile, permission, session, state, session_id, account);
+    };
+    let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
+    let mut env = Vec::new();
+    let mut with_args = profile.clone();
+    let args = instruction_args(profile, &mut env, state_dir, session, text)?;
+    if !with_args.launch.is_empty() {
+        with_args.launch.splice(1..1, args);
+    }
+    let (mut launch, kept, account) =
+        resume_in(&with_args, permission, session, state, session_id, account)?;
+    for (k, v) in env {
+        launch.env.retain(|(ek, _)| ek != &k);
+        launch.env.push((k, v));
+    }
+    Ok((launch, kept, account))
 }
 
 /// 실행 중이거나 기록이 남은 에이전트 세션의 대화를 포크해 새 세션으로 띄우는 실행 argv·env를 만든다(OWE-736, MK-182).

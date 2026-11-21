@@ -273,6 +273,12 @@ pub struct SidebarBot {
     /// Folder name under the bots root (`<state>/bots/<slug>`).
     pub slug: String,
     pub paused: bool,
+    /// The agent runtime its chats launch (`claude`, `codex`, …).
+    pub agent_id: String,
+    /// Whether its chats ask before edits and commands (shown in the chat composer).
+    pub permission: krill_proto::agent::Permission,
+    /// The folder its chats run in when it isn't the bot's own home.
+    pub workspace: Option<String>,
     /// `needs_you` items plus pending access requests owned by this bot.
     pub attention: usize,
     /// Live chats, Home Chat (no external link) first, then newest.
@@ -348,6 +354,14 @@ pub fn sidebar_snapshot(
                     description: bot.description.trim().to_owned(),
                     slug: bot.slug.as_str().to_owned(),
                     paused: bot.paused,
+                    agent_id: bot.agent_id.clone(),
+                    permission: bot.permission_mode,
+                    workspace: bot
+                        .workspace
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_owned),
                     attention: needs.iter().filter(|id| **id == &bot.id).count(),
                     sessions: live,
                     updated_at_ms: bot.updated_at_ms,

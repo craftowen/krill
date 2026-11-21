@@ -78,6 +78,7 @@ fn switch_identity_merge_keeps_late_hook_and_source_account_across_restart() {
             env_key: "CODEX_HOME".into(),
             dir: "/source".into(),
         }),
+        bot_instructions: None,
     };
     let first = c.bind_switch_identity(session, &discovered).unwrap();
     assert_eq!(first, discovered);
@@ -334,6 +335,8 @@ fn stored_session_id_and_hook_payload_persist_across_restart() {
     c.remember_session(SessionId(3), &launch, None, b"/tmp/work".to_vec(), None)
         .unwrap();
     assert!(c.has(SessionId(3)));
+    c.remember_bot_instructions(SessionId(3), "You are Shop.")
+        .unwrap();
     c.record_hook_session(
         SessionId(3),
         br#"{"hook_event_name":"SessionStart","session_id":"0197-codex-sid"}"#,
@@ -345,6 +348,8 @@ fn stored_session_id_and_hook_payload_persist_across_restart() {
     assert_eq!(stored.permission, Permission::Yolo);
     assert_eq!(stored.session_id.as_deref(), Some("0197-codex-sid"));
     assert_eq!(stored.cwd, b"/tmp/work");
+    // Bot instructions outlive the hook's session-id update, so a cold resume can pass them again.
+    assert_eq!(stored.bot_instructions.as_deref(), Some("You are Shop."));
     restarted.forget(SessionId(3));
     assert!(!restarted.has(SessionId(3)));
     fs::remove_dir_all(dir).unwrap();

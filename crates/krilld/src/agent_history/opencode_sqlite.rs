@@ -716,6 +716,7 @@ mod tests {
             cwd: b"/workspace/sqlite".to_vec(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         let page = chat::poll_session_in(&roots, Some(&stored), b"", 0);
         assert!(page.bound);

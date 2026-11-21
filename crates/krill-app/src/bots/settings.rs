@@ -46,6 +46,8 @@ pub(super) struct SettingsState {
     pub(super) sched_prompt_input: Option<Entity<InputState>>,
     pub(super) avatar_cache: BTreeMap<BotId, Arc<gpui::Image>>,
     pub(super) saving: bool,
+    /// The panel's settings list or one of its pages (Orca's settings view).
+    pub(super) page: super::settings_root::SettingsPage,
 }
 
 impl SettingsState {
@@ -612,6 +614,11 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        if self.mode == super::Mode::Panel
+            && self.settings.page == super::settings_root::SettingsPage::Root
+        {
+            return self.render_settings_root(bot, p, cx);
+        }
         self.ensure_settings_inputs(bot, window, cx);
         let bot_id_save = bot.id.clone();
         let bot_id_avatar = bot.id.clone();

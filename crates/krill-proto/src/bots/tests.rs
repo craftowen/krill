@@ -355,6 +355,17 @@ fn launch_preamble_fences_memory_and_toggles_first_run_rules() {
         soul_description("# Helper\n\nReviews Rust PRs.\n\n## Never\n- Push.\n").as_deref(),
         Some("Reviews Rust PRs.")
     );
+
+    // A first turn that still carries the preamble shows only the owner's words.
+    for preamble in [&first_run, &steady] {
+        assert_eq!(strip_launch_preamble(preamble), Some(""));
+        let with_prompt = format!("{preamble}\n\n---\n\n쿠팡에서 우산 찾아줘");
+        assert_eq!(
+            strip_launch_preamble(&with_prompt),
+            Some("쿠팡에서 우산 찾아줘")
+        );
+    }
+    assert_eq!(strip_launch_preamble("You are great, thanks"), None);
 }
 
 // ---------- Catalog ----------

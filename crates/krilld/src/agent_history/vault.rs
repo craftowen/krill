@@ -3227,6 +3227,7 @@ mod agy_title_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
 
         let ann_dir = agy_root.join("annotations");
@@ -3293,6 +3294,7 @@ mod agy_title_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
 
         let (title, _) =
@@ -3350,6 +3352,7 @@ mod agy_title_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         let missing_transcript = crate::agent::control::StoredLaunch {
             session_id: Some(conv_id.into()),
@@ -3864,6 +3867,7 @@ mod injected_transcript_filter_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         let (live_title, _) =
             resolve_live_agy_title(krill_proto::SessionId(9099), 0, None, false, Some(&stored));

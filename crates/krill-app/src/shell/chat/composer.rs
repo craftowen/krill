@@ -240,9 +240,15 @@ fn effort_bars_icon(palette: &ui::Palette, filled: usize) -> gpui::Div {
 }
 
 fn composer_popup(palette: &ui::Palette) -> gpui::Div {
+    composer_popup_at(palette, false)
+}
+
+/// Above the composer, under the control that opened it (Orca's model picker sits at the right).
+fn composer_popup_at(palette: &ui::Palette, right: bool) -> gpui::Div {
     div()
         .absolute()
-        .left_0()
+        .when(right, gpui::Styled::right_0)
+        .when(!right, gpui::Styled::left_0)
         .bottom_full()
         .mb_1p5()
         .w(px(280.))
@@ -517,7 +523,7 @@ impl Shell {
                 reason.map(|text| SharedString::from(text.to_owned()))
             };
             let close_key = key.clone();
-            composer_popup(palette)
+            composer_popup_at(palette, true)
                 .id(SharedString::from(format!(
                     "chat-model-picker-{}",
                     pane.get()
@@ -989,6 +995,114 @@ impl Shell {
                 }))
         });
 
+        // Orca's bot chat: its permission mode in the toolbar and where it runs under the card.
+        let bot = self.chat_bot(&key).map(|bot| {
+            let path = bot
+                .workspace
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| self.bot_folder(bot));
+            let folder = bot.workspace.as_deref().map_or_else(
+                || bot.name.clone(),
+                |w| {
+                    std::path::Path::new(w)
+                        .file_name()
+                        .map_or_else(|| w.to_owned(), |n| n.to_string_lossy().into_owned())
+                },
+            );
+            (bot.id.clone(), bot.permission, folder, path)
+        });
+        let permission_chip = bot.as_ref().map(|(bot_id, permission, _, _)| {
+            let full = *permission == krill_proto::agent::Permission::Yolo;
+            let (icon, label, tip) = if full {
+                (
+                    ui::icons::SHIELD_ALERT_SVG,
+                    ctext::PERMISSION_FULL_ACCESS.get(),
+                    ctext::PERMISSION_FULL_ACCESS_DESC.get(),
+                )
+            } else {
+                (
+                    ui::icons::HAND_SVG,
+                    ctext::PERMISSION_ASK.get(),
+                    ctext::PERMISSION_ASK_DESC.get(),
+                )
+            };
+            let bot_id = bot_id.clone();
+            Button::new(SharedString::from(format!(
+                "chat-composer-permission-{}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-composer-permission".into())
+            .icon(Icon::default().data(icon).size(px(ui::ICON_MD)))
+            .label(label)
+            .dropdown_caret(true)
+            .tooltip(tip)
+            .ghost()
+            .xsmall()
+            .when(full, |b| b.text_color(palette.warning))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_bot_settings_in_panel(&bot_id, cx);
+            }))
+        });
+        let workspace_footer = bot.map(|(_, _, folder, path)| {
+            let path_text = path.map(|p| p.display().to_string()).unwrap_or_default();
+            div()
+                .id(SharedString::from(format!(
+                    "chat-composer-workspace-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-composer-workspace".into())
+                .w_full()
+                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                .min_w_0()
+                .mt_1()
+                .h(px(22.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_size(ui::TEXT_2XS)
+                .text_color(muted_fg)
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(160.))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Icon::default()
+                                .data(ui::icons::SERVER_SVG)
+                                .size(px(ui::ICON_XS)),
+                        )
+                        .child(div().truncate().child(self.bot_host_label())),
+                )
+                .child(ui::button_with_tooltip(
+                    Button::new(SharedString::from(format!(
+                        "chat-composer-folder-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-composer-folder".into())
+                    .icon(
+                        Icon::default()
+                            .data(ui::icons::FOLDER_SVG)
+                            .size(px(ui::ICON_XS)),
+                    )
+                    .label(format!("{folder} · {}", ctext::WORKSPACE_FOLDER.get()))
+                    .ghost()
+                    .xsmall()
+                    .on_click({
+                        let path_text = path_text.clone();
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                path_text.clone(),
+                            ));
+                        }
+                    }),
+                    format!("chat-composer-folder-tip-{}", pane.get()),
+                    path_text,
+                ))
+        });
         let inner_card = div()
             .id("desktop-chat-composer")
             .debug_selector(|| "desktop-chat-composer".into())
@@ -1264,6 +1378,14 @@ impl Shell {
                                 "chat-composer-plus",
                                 krill_app::i18n::catalog::settings::TAB_QUICK_COMMANDS.get(),
                             ))
+                            .children(permission_chip),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
                             .child(
                                 Button::new(SharedString::from(format!(
                                     "chat-composer-model-{}",
@@ -1314,14 +1436,7 @@ impl Shell {
                                         }
                                     }
                                 })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_2()
+                            )
                             .children(context_ring)
                             .children(
                                 (matches!(
@@ -1447,8 +1562,10 @@ impl Shell {
             .pb_3()
             .bg(palette.background)
             .flex()
-            .justify_center()
+            .flex_col()
+            .items_center()
             .child(inner_card)
+            .children(workspace_footer)
             .into_any_element()
     }
 

@@ -386,6 +386,9 @@ impl Shell {
             work_run::DisplayRow::WorkRun(run) => {
                 self.render_work_run(pane, session, run, is_last_row, agent_state, cx)
             }
+            work_run::DisplayRow::ItemNote { note, .. } => {
+                Self::render_item_note(pane, row_ix, note, cx)
+            }
             work_run::DisplayRow::UnreadDivider { first_abs_idx } => {
                 let palette = ui::palette(cx);
                 div()
@@ -1946,6 +1949,165 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Orca's bot item note row: a list mark, then the change with the item as a chip that
+    /// opens the bot's items, and a comment's words after it.
+    fn render_item_note(
+        pane: super::super::PaneId,
+        row_ix: usize,
+        note: &work_run::ItemNote,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use krill_proto::bots::BotItemStatus;
+        use work_run::{NoteAction, NoteActor};
+        let palette = ui::palette(cx);
+        let status_name = |s: BotItemStatus| match s {
+            BotItemStatus::Planned => krill_app::i18n::catalog::bots::STATUS_PLANNED.get(),
+            BotItemStatus::Working => krill_app::i18n::catalog::bots::STATUS_WORKING.get(),
+            BotItemStatus::NeedsYou => krill_app::i18n::catalog::bots::STATUS_NEEDS_YOU.get(),
+            BotItemStatus::Done => krill_app::i18n::catalog::bots::STATUS_DONE.get(),
+            BotItemStatus::Canceled => krill_app::i18n::catalog::bots::STATUS_CANCELED.get(),
+        };
+        let owner = note.actor == NoteActor::Owner;
+        let line = match (&note.action, owner) {
+            (NoteAction::Added, false) => ctext::NOTE_ADDED.get().to_owned(),
+            (NoteAction::Added, true) => ctext::NOTE_YOU_ADDED.get().to_owned(),
+            (NoteAction::Commented, false) => ctext::NOTE_COMMENTED.get().to_owned(),
+            (NoteAction::Commented, true) => ctext::NOTE_YOU_COMMENTED.get().to_owned(),
+            (NoteAction::Linked(link), _) => ctext::NOTE_LINKED.get().replace("{link}", link),
+            (NoteAction::Updated, false) => ctext::NOTE_UPDATED.get().to_owned(),
+            (NoteAction::Updated, true) => ctext::NOTE_YOU_CHANGED.get().to_owned(),
+            (NoteAction::Status(BotItemStatus::Working), false) => {
+                ctext::NOTE_STARTED.get().to_owned()
+            }
+            (NoteAction::Status(BotItemStatus::Done), false) => ctext::NOTE_MARKED.get().to_owned(),
+            (NoteAction::Status(BotItemStatus::Done), true) => {
+                ctext::NOTE_YOU_MARKED.get().to_owned()
+            }
+            (NoteAction::Status(BotItemStatus::Canceled), false) => {
+                ctext::NOTE_CANCELED.get().to_owned()
+            }
+            (NoteAction::Status(BotItemStatus::Canceled), true) => {
+                ctext::NOTE_YOU_CANCELED.get().to_owned()
+            }
+            (NoteAction::Status(BotItemStatus::NeedsYou), false) => {
+                ctext::NOTE_ASKED.get().to_owned()
+            }
+            (NoteAction::Status(status), false) => ctext::NOTE_MOVED
+                .get()
+                .replace("{status}", status_name(*status)),
+            (NoteAction::Status(status), true) => ctext::NOTE_YOU_MOVED
+                .get()
+                .replace("{status}", status_name(*status)),
+        };
+        let (lead, tail) = line.split_once("{item}").unwrap_or((line.as_str(), ""));
+        let (glyph, glyph_color): (&'static [u8], gpui::Hsla) = match note.status {
+            BotItemStatus::Planned => (ui::icons::CIRCLE_SVG, palette.muted_foreground),
+            BotItemStatus::Working => (ui::icons::CIRCLE_SVG, palette.warning),
+            BotItemStatus::NeedsYou => (ui::icons::TRIANGLE_ALERT_SVG, palette.warning),
+            BotItemStatus::Done => (ui::icons::CIRCLE_CHECK_SVG, palette.success),
+            BotItemStatus::Canceled => (ui::icons::CIRCLE_X_SVG, palette.muted_foreground),
+        };
+        let chip = div()
+            .id(SharedString::from(format!(
+                "chat-item-note-chip-{}-{row_ix}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-item-note-chip".into())
+            .flex_none()
+            .max_w(gpui::px(256.))
+            .min_w_0()
+            .px_1p5()
+            .rounded(ui::RADIUS_SM)
+            .bg(palette.foreground.opacity(0.07))
+            .hover(|d| d.bg(palette.foreground.opacity(0.12)))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(ui::TEXT_XS)
+            .text_color(palette.foreground)
+            .child(
+                gpui_component::Icon::default()
+                    .data(glyph)
+                    .with_size(ui::ICON_XS)
+                    .text_color(glyph_color),
+            )
+            .child(div().min_w_0().truncate().child(note.title.clone()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                // The chip opens the bot's items (Orca opens the item in its Items tab).
+                if this.panel_collapsed {
+                    this.toggle_panel(cx);
+                }
+                this.bot_ui.panel.tab = super::super::bot_panel::BotPanelTab::Home;
+                this.bot_ui.panel.settings = None;
+                cx.notify();
+            }));
+        let muted = palette.muted_foreground;
+        div()
+            .id(SharedString::from(format!(
+                "chat-item-note-{}-{row_ix}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-item-note".into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .min_h(gpui::px(24.))
+                    .flex()
+                    .items_start()
+                    .gap_1p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(muted)
+                    .child(
+                        div().flex_none().mt(gpui::px(4.)).child(
+                            gpui_component::Icon::default()
+                                .data(ui::icons::LIST_TODO_SVG)
+                                .with_size(ui::ICON_MD)
+                                .text_color(muted),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h(gpui::px(24.))
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .when(!lead.trim().is_empty(), |d| d.child(lead.trim().to_owned()))
+                            .child(chip)
+                            .when(!tail.trim().is_empty() || !note.detail.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .child(div().flex_none().child(tail.trim().to_owned()))
+                                        .when(!note.detail.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex_1()
+                                                    .truncate()
+                                                    .text_color(palette.foreground)
+                                                    .child(format!(": {}", note.detail)),
+                                            )
+                                        }),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_pending_chat_card(
         &self,
         key: ChatKey,
@@ -2153,6 +2315,7 @@ impl Shell {
             input_state.update(cx, |state, cx| state.focus(window, cx));
             self.chat.focus_pending = None;
         }
+        self.sync_bot_item_notes(&key, cx);
         let palette = ui::palette(cx);
         let bg = palette.background;
         let border = palette.border;
@@ -2173,7 +2336,8 @@ impl Shell {
                                 .run_elapsed_secs(run.span.start(), std::time::Instant::now())
                                 .map(work_run::format_elapsed_secs),
                             work_run::DisplayRow::Item { .. }
-                            | work_run::DisplayRow::UnreadDivider { .. } => None,
+                            | work_run::DisplayRow::UnreadDivider { .. }
+                            | work_run::DisplayRow::ItemNote { .. } => None,
                         })
                     } else {
                         None
@@ -2239,6 +2403,19 @@ impl Shell {
             hasher.finish()
         };
 
+        let persona = (!poll_failed)
+            .then(|| self.chat_bot(&key))
+            .flatten()
+            .map(|bot| {
+                let avatar = self.bot_avatar(bot, 56., ui::RADIUS_XL, palette);
+                let name = [("name", bot.name.as_str())];
+                let subtitle = if bot.description.is_empty() {
+                    ctext::BOT_EMPTY_SUBTITLE.format(&name)
+                } else {
+                    bot.description.clone()
+                };
+                (avatar, ctext::BOT_EMPTY_TITLE.format(&name), subtitle)
+            });
         if display_feed.is_empty() && pending_len == 0 {
             let badge_bg = if poll_failed {
                 palette.destructive.opacity(0.1)
@@ -2282,42 +2459,64 @@ impl Shell {
                     .items_center()
                     .gap_3()
                     .p_4()
-                    .child(
-                        div()
-                            .size(gpui::px(48.))
-                            .rounded_full()
-                            .bg(badge_bg)
-                            .flex()
-                            .items_center()
-                            .justify_center()
+                    .map(|empty| match persona {
+                        // Orca: a chat in a bot's home greets as the bot (picture, name, SOUL.md line).
+                        Some((avatar, title, subtitle)) => empty
+                            .child(avatar)
                             .child(
-                                gpui_component::Icon::new(badge_icon)
-                                    .with_size(ui::ICON_XL)
-                                    .text_color(badge_fg),
+                                div()
+                                    .text_align(gpui::TextAlign::Center)
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(palette.foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .max_w(gpui::px(384.))
+                                    .text_align(gpui::TextAlign::Center)
+                                    .text_size(ui::TEXT_SM)
+                                    .text_color(muted_fg)
+                                    .child(subtitle),
                             ),
-                    )
-                    .child(
-                        div()
-                            .text_align(gpui::TextAlign::Center)
-                            .text_size(ui::TEXT_LG)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(palette.foreground)
-                            .child(ctext::EMPTY_TITLE.get()),
-                    )
-                    .child(
-                        div()
-                            .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                            .text_align(gpui::TextAlign::Center)
-                            .text_size(ui::TEXT_SM)
-                            .text_color(muted_fg)
-                            .child(if poll_failed {
-                                ctext::POLL_FAILED.get()
-                            } else if bound {
-                                ctext::EMPTY_BOUND.get()
-                            } else {
-                                ctext::EMPTY_UNBOUND.get()
-                            }),
-                    ),
+                        None => empty
+                            .child(
+                                div()
+                                    .size(gpui::px(48.))
+                                    .rounded_full()
+                                    .bg(badge_bg)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        gpui_component::Icon::new(badge_icon)
+                                            .with_size(ui::ICON_XL)
+                                            .text_color(badge_fg),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_align(gpui::TextAlign::Center)
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(palette.foreground)
+                                    .child(ctext::EMPTY_TITLE.get()),
+                            )
+                            .child(
+                                div()
+                                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                                    .text_align(gpui::TextAlign::Center)
+                                    .text_size(ui::TEXT_SM)
+                                    .text_color(muted_fg)
+                                    .child(if poll_failed {
+                                        ctext::POLL_FAILED.get()
+                                    } else if bound {
+                                        ctext::EMPTY_BOUND.get()
+                                    } else {
+                                        ctext::EMPTY_UNBOUND.get()
+                                    }),
+                            ),
+                    }),
             );
         } else {
             let at_history_cap = self.chat.logs.get(&key).is_some_and(|log| {

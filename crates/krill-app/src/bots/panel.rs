@@ -35,6 +35,8 @@ impl View {
             }
         }
         if self.detail_tab != tab {
+            // Settings opens on Orca's list, not on the page it was last left at.
+            self.settings.page = super::settings_root::SettingsPage::Root;
             self.set_detail_tab(tab, cx);
         }
         self.selected_bot_id.as_ref() == Some(bot_id)

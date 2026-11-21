@@ -266,7 +266,7 @@ pub(crate) fn discard(state: &Path, id: SessionId) {
     };
     for entry in dir.flatten() {
         if owner(&entry.file_name()) == Some(id) {
-            std::fs::remove_file(entry.path()).ok();
+            remove_entry(&entry.path()).ok();
         }
     }
 }
@@ -286,11 +286,56 @@ pub(crate) fn sweep(state: &Path, live: &[SessionId]) -> usize {
         if live.contains(&sid) {
             continue;
         }
-        if std::fs::remove_file(entry.path()).is_ok() {
+        if remove_entry(&entry.path()).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// 파일은 지우고, 봇 지침 폴더는 안의 링크를 따라가지 않고 통째로 지운다.
+fn remove_entry(path: &Path) -> io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// 봇 지침을 `claude-settings/<세션 id>-instructions-<uuid>.md`(`0o600`)에 쓴다. 세션이 끝나면
+/// [`discard`]·[`sweep`]이 지운다. 경로로 넘겨 프로세스 목록과 인자 길이 제한을 피한다(Orca `acp-instructions`).
+pub(crate) fn create_instructions_file(
+    state: &Path,
+    session: SessionId,
+    text: &str,
+) -> io::Result<PathBuf> {
+    let dir = state.join(DIR);
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let path = dir.join(format!("{}-instructions-{}.md", session.0, uuid()?));
+    write_new_0600(&path, text.as_bytes())?;
+    Ok(path)
+}
+
+/// 봇 지침용 빈 폴더 `claude-settings/<세션 id>-instructions-<uuid>/`(`0o700`). 세션이 끝나면 지운다.
+pub(crate) fn create_instructions_dir(state: &Path, session: SessionId) -> io::Result<PathBuf> {
+    let dir = state.join(DIR);
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let path = dir.join(format!("{}-instructions-{}", session.0, uuid()?));
+    DirBuilder::new().mode(0o700).create(&path)?;
+    Ok(path)
+}
+
+pub(crate) fn write_new_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(e) = file.write_all(bytes) {
+        std::fs::remove_file(path).ok();
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Creates a `0o600` per-session `--mcp-config <path>` file inside `claude-settings/` named
@@ -368,12 +413,21 @@ fn is_uuid(uuid: &str) -> bool {
 /// `<세션 id>-<uuid>.json`, `<세션 id>-fork-<uuid>.json`, 또는 `<세션 id>-mcp-<uuid>.json`의 세션 id.
 /// uuid 자리가 36자 `8-4-4-4-12` 16진이 아니면 `None`이라
 /// 첫 덩어리가 전부 숫자인 구버전 `<uuid>.json`을 세션 파일로 오인하지 않는다.
+/// 봇 지침 파일(`<세션 id>-instructions-<uuid>.md`)과 폴더(`<세션 id>-instructions-<uuid>`)도 같은 세션 것이다.
 fn owner(name: &OsStr) -> Option<SessionId> {
-    let (sid, rest) = name.to_str()?.strip_suffix(".json")?.split_once('-')?;
-    let uuid = rest
-        .strip_prefix("fork-")
-        .or_else(|| rest.strip_prefix("mcp-"))
-        .unwrap_or(rest);
+    let name = name.to_str()?;
+    let (sid, uuid) = if let Some(stem) = name.strip_suffix(".json") {
+        let (sid, rest) = stem.split_once('-')?;
+        let uuid = rest
+            .strip_prefix("fork-")
+            .or_else(|| rest.strip_prefix("mcp-"))
+            .unwrap_or(rest);
+        (sid, uuid)
+    } else {
+        let stem = name.strip_suffix(".md").unwrap_or(name);
+        let (sid, rest) = stem.split_once('-')?;
+        (sid, rest.strip_prefix("instructions-")?)
+    };
     if !is_uuid(uuid) || !sid.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

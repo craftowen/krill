@@ -62,13 +62,6 @@ impl BotPanelTab {
 /// Below this panel width only the current tab keeps its name (Orca hides labels when narrow).
 const LABELLED_TABS_MIN_WIDTH: f32 = 360.;
 
-/// Bot settings sub-pages, in Orca's order (identity and agent, soul and memory, access).
-const SETTINGS_TABS: [(DetailTab, &str); 3] = [
-    (DetailTab::Settings, "bot-settings-tab-settings"),
-    (DetailTab::SoulMemory, "bot-settings-tab-soul"),
-    (DetailTab::ToolsSharing, "bot-settings-tab-tools"),
-];
-
 /// Right-sidebar state for bot pages.
 #[derive(Default)]
 pub(super) struct BotPanel {
@@ -476,6 +469,20 @@ impl Shell {
     }
 
     /// Bot settings over Home: back to Home, the three settings pages, Delete bot at the end.
+    /// A settings row opened another page: Connectors is its own tab, the rest open over Home.
+    pub(super) fn open_bot_settings_page(&mut self, page: DetailTab, cx: &mut Context<Self>) {
+        if page == DetailTab::Connectors {
+            self.bot_ui.panel.tab = BotPanelTab::Connectors;
+            self.bot_ui.panel.settings = None;
+        } else {
+            self.bot_ui.panel.tab = BotPanelTab::Home;
+            self.bot_ui.panel.settings = Some(page);
+        }
+        cx.notify();
+    }
+
+    /// Orca's settings view: `< {bot} / Settings` over the list, `< Settings / {page}` over a
+    /// page it opened. Back climbs one level.
     fn render_bot_settings_page(
         bot: &SidebarBot,
         page: DetailTab,
@@ -483,7 +490,23 @@ impl Shell {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let deleting = bot.clone();
+        let subpage = view.as_ref().and_then(|v| v.read(cx).settings_subpage());
+        let (parent, current): (SharedString, SharedString) = match (page, subpage) {
+            (DetailTab::Settings, None) => {
+                (bot.name.clone().into(), text::SV_SETTINGS.get().into())
+            }
+            (DetailTab::Settings, Some(sub)) => (text::SV_SETTINGS.get().into(), sub.into()),
+            (DetailTab::SoulMemory, _) => (
+                text::SV_SETTINGS.get().into(),
+                text::SV_SOUL_MEMORY.get().into(),
+            ),
+            (DetailTab::ToolsSharing, _) => (
+                text::SV_SETTINGS.get().into(),
+                text::TAB_TOOLS_SHARING.get().into(),
+            ),
+            _ => (bot.name.clone().into(), text::SV_SETTINGS.get().into()),
+        };
+        let back_view = view.clone();
         div()
             .id("bot-settings-page")
             .debug_selector(|| "bot-settings-page".into())
@@ -507,8 +530,21 @@ impl Shell {
                             .icon(IconName::ChevronLeft)
                             .tooltip(text::BP_BACK_HOME.get())
                             .accessibility_label(text::BP_BACK_HOME.get())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.bot_ui.panel.settings = None;
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match (page, subpage) {
+                                    (DetailTab::Settings, None) => {
+                                        this.bot_ui.panel.settings = None;
+                                    }
+                                    (DetailTab::Settings, Some(_)) => {
+                                        if let Some(v) = &back_view {
+                                            v.update(
+                                                cx,
+                                                krill_app::bots::View::close_settings_subpage,
+                                            );
+                                        }
+                                    }
+                                    _ => this.bot_ui.panel.settings = Some(DetailTab::Settings),
+                                }
                                 cx.notify();
                             })),
                     )
@@ -517,45 +553,21 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .text_size(ui::TEXT_SM)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(text::BP_SETTINGS_TITLE.get()),
+                            .child(div().text_color(p.muted_foreground).child(parent))
+                            .child(div().text_color(p.muted_foreground).child("/"))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.sidebar_foreground)
+                                    .child(current),
+                            ),
                     ),
             )
-            .child(div().flex_none().px_2().pb_1().child(ui::segmented_control(
-                p,
-                SETTINGS_TABS.into_iter().map(|(tab, id)| {
-                    let label = match tab {
-                        DetailTab::SoulMemory => text::TAB_SOUL_MEMORY.get(),
-                        DetailTab::ToolsSharing => text::TAB_TOOLS_SHARING.get(),
-                        _ => text::TAB_SETTINGS.get(),
-                    };
-                    ui::segment(p, id, label, tab == page)
-                        .debug_selector(move || id.into())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.bot_ui.panel.settings = Some(tab);
-                            cx.notify();
-                        }))
-                }),
-            )))
-            .child(div().flex_1().min_h_0().children(view))
-            .child(
-                div()
-                    .flex_none()
-                    .px_2()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(p.sidebar_border)
-                    .child(
-                        ui::ghost("bot-settings-delete", text::BP_DELETE.get())
-                            .debug_selector(|| "bot-settings-delete".into())
-                            .icon(IconName::Delete)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.bot_ui.delete = Some(deleting.clone());
-                                cx.notify();
-                            })),
-                    ),
-            )
+            .child(div().flex_1().min_h_0().flex().flex_col().children(view))
     }
 
     /// Orca's Chats tab: search, New chat, then the bot's live chats (newest first after the

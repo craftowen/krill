@@ -8,6 +8,7 @@ fn stored(profile: &str, account: Option<LaunchAccount>) -> StoredLaunch {
         cwd: Vec::new(),
         hibernation_blocked: true,
         account,
+        bot_instructions: None,
     }
 }
 #[test]

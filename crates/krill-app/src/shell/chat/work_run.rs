@@ -55,10 +55,25 @@ impl DisplayFeed {
         Self::project_with_unread(base_index, items, None)
     }
 
+    #[cfg(test)]
     pub(super) fn project_with_unread(
         base_index: usize,
         items: &[Arc<ChatItem>],
         unread_from: Option<usize>,
+    ) -> Self {
+        Self::project_with_notes(base_index, items, unread_from, &[], &[])
+    }
+
+    /// Projects the transcript with a bot's item changes as lines between its turns (Orca's bot
+    /// item note rows). Desktop chat rows carry no time, so a change goes just before the first
+    /// owner turn sent after it (`turn_times`: the newest turns' times, newest first), or at
+    /// the end when it is newer than all of them.
+    pub(super) fn project_with_notes(
+        base_index: usize,
+        items: &[Arc<ChatItem>],
+        unread_from: Option<usize>,
+        notes: &[Arc<ItemNote>],
+        turn_times: &[u64],
     ) -> Self {
         let foldable = compute_foldable_notes(items);
         let mut rows = Vec::new();
@@ -67,10 +82,22 @@ impl DisplayFeed {
             let item = &items[rel_idx];
             if !is_work_or_foldable(item.kind, foldable[rel_idx]) {
                 let abs_idx = base_index + rel_idx;
-                rows.push(DisplayRow::Item {
-                    abs_idx,
-                    item: Arc::clone(item),
-                });
+                // A bot's launch preamble is its instructions, not something its owner said.
+                let item = match (
+                    item.kind,
+                    krill_proto::bots::strip_launch_preamble(&item.text),
+                ) {
+                    (ChatItemKind::User, Some("")) => {
+                        rel_idx += 1;
+                        continue;
+                    }
+                    (ChatItemKind::User, Some(words)) => Arc::new(ChatItem {
+                        text: words.to_owned(),
+                        ..(**item).clone()
+                    }),
+                    _ => Arc::clone(item),
+                };
+                rows.push(DisplayRow::Item { abs_idx, item });
                 rel_idx += 1;
                 continue;
             }
@@ -101,6 +128,9 @@ impl DisplayFeed {
                 rows.push(DisplayRow::WorkRun(WorkRun::from_slice(span, slice)));
             }
             rel_idx = rel_end;
+        }
+        if !notes.is_empty() {
+            rows = interleave_notes(rows, notes, turn_times, base_index + items.len());
         }
         if let Some(cutoff) = unread_from
             && cutoff > base_index
@@ -136,9 +166,19 @@ impl DisplayFeed {
 
 #[derive(Clone, Debug)]
 pub(super) enum DisplayRow {
-    Item { abs_idx: usize, item: Arc<ChatItem> },
+    Item {
+        abs_idx: usize,
+        item: Arc<ChatItem>,
+    },
     WorkRun(WorkRun),
-    UnreadDivider { first_abs_idx: usize },
+    UnreadDivider {
+        first_abs_idx: usize,
+    },
+    /// A change to one of the bot's items, drawn before the transcript row at `anchor_abs_idx`.
+    ItemNote {
+        anchor_abs_idx: usize,
+        note: Arc<ItemNote>,
+    },
 }
 
 impl DisplayRow {
@@ -147,8 +187,96 @@ impl DisplayRow {
             Self::Item { abs_idx, .. } => RawSpan::single(*abs_idx),
             Self::WorkRun(run) => run.span,
             Self::UnreadDivider { first_abs_idx } => RawSpan::single(*first_abs_idx),
+            Self::ItemNote { anchor_abs_idx, .. } => RawSpan::single(*anchor_abs_idx),
         }
     }
+}
+
+/// Who changed a bot item, as its chat line says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoteActor {
+    Bot,
+    Owner,
+}
+
+/// What happened to a bot item (Orca's `bots.items.chat.*` lines).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NoteAction {
+    Added,
+    Commented,
+    Linked(String),
+    Status(krill_proto::bots::BotItemStatus),
+    Updated,
+}
+
+/// One change to a bot's item shown in its chat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ItemNote {
+    pub at_ms: u64,
+    pub actor: NoteActor,
+    pub action: NoteAction,
+    pub title: String,
+    /// The item's current status (its chip glyph).
+    pub status: krill_proto::bots::BotItemStatus,
+    /// A comment's words.
+    pub detail: String,
+}
+
+fn interleave_notes(
+    rows: Vec<DisplayRow>,
+    notes: &[Arc<ItemNote>],
+    turn_times: &[u64],
+    end_abs: usize,
+) -> Vec<DisplayRow> {
+    // Owner turns, oldest first, paired with their times from the newest end.
+    let users: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, row)| match row {
+            DisplayRow::Item { item, .. } if item.kind == ChatItemKind::User => Some(pos),
+            _ => None,
+        })
+        .collect();
+    let anchors: Vec<(usize, u64)> = users
+        .iter()
+        .rev()
+        .zip(turn_times)
+        .map(|(&pos, &at)| (pos, at))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let mut before: Vec<Vec<Arc<ItemNote>>> = vec![Vec::new(); rows.len() + 1];
+    let mut sorted: Vec<&Arc<ItemNote>> = notes.iter().collect();
+    sorted.sort_by_key(|n| n.at_ms);
+    for note in sorted {
+        let at = anchors
+            .iter()
+            .find(|(_, turn_at)| *turn_at > note.at_ms)
+            .map_or(rows.len(), |(pos, _)| *pos);
+        if let Some(slot) = before.get_mut(at) {
+            slot.push(Arc::clone(note));
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len() + notes.len());
+    let mut slots = before.into_iter();
+    for row in rows {
+        let anchor_abs_idx = row.span().start();
+        for note in slots.next().unwrap_or_default() {
+            out.push(DisplayRow::ItemNote {
+                anchor_abs_idx,
+                note,
+            });
+        }
+        out.push(row);
+    }
+    for note in slots.next().unwrap_or_default() {
+        out.push(DisplayRow::ItemNote {
+            anchor_abs_idx: end_abs.saturating_sub(1),
+            note,
+        });
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -13,6 +13,7 @@ pub mod new_bot;
 mod panel;
 pub mod rpc;
 mod settings;
+mod settings_root;
 mod soul_memory;
 pub mod templates;
 mod tools_sharing;
@@ -46,6 +47,7 @@ pub use rpc::{
     SidebarState, daemon_bot_rpc, fetch_sidebar_state,
 };
 use rpc::{call_checked, decode_png_avatar};
+pub use settings_root::{OpenSettingsPage, RequestDeleteBot};
 
 /// Request the host `Shell` to close the Bots modal.
 #[derive(Debug)]
@@ -172,6 +174,8 @@ impl EventEmitter<RequestNewBot> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<BadgeChanged> for View {}
 impl EventEmitter<SessionsChanged> for View {}
+impl EventEmitter<OpenSettingsPage> for View {}
+impl EventEmitter<RequestDeleteBot> for View {}
 
 impl std::fmt::Debug for View {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

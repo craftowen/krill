@@ -3081,6 +3081,7 @@ mod tests {
                 cwd: dir.as_os_str().as_bytes().to_vec(),
                 hibernation_blocked: false,
                 account: None,
+                bot_instructions: None,
             };
             let roots = VaultRoots {
                 claude: vec![dir.clone()],
@@ -3451,6 +3452,7 @@ mod tests {
             cwd: b"/tmp/agy-demo".to_vec(),
             hibernation_blocked: true,
             account: None,
+            bot_instructions: None,
         };
         let snap = poll_session_in(&roots, Some(&stored), b"/tmp/agy-demo", 0);
         assert!(snap.bound);
@@ -3590,6 +3592,7 @@ mod cross_platform_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         let snap1 = poll_session_in(&roots1, Some(&stored_exe), br"D:\work\App", 0);
         assert!(
@@ -3815,6 +3818,7 @@ mod performance_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         let empty_ids = BTreeSet::new();
         let empty_paths = BTreeSet::new();
@@ -3867,6 +3871,7 @@ mod performance_tests {
             cwd: Vec::new(),
             hibernation_blocked: false,
             account: None,
+            bot_instructions: None,
         };
         let empty_ids = BTreeSet::new();
         let empty_paths = BTreeSet::new();
@@ -3967,6 +3972,7 @@ mod performance_tests {
             cwd: cwd.as_bytes().to_vec(),
             hibernation_blocked: true,
             account: None,
+            bot_instructions: None,
         };
         let empty_ids = BTreeSet::new();
         let empty_paths = BTreeSet::new();
@@ -4074,6 +4080,7 @@ mod performance_tests {
             cwd: b"/tmp/agy-iso".to_vec(),
             hibernation_blocked: true,
             account: None,
+            bot_instructions: None,
         };
 
         // 1) 이미 다른 세션이 선점(claimed)한 대화 ID면 바인딩하지 않는다.

@@ -667,6 +667,28 @@ Which command for which job. What a command prints now is current; an earlier li
     sections.join("\n\n")
 }
 
+/// The owner's words in a first turn that still carries a launch preamble (sessions started before
+/// the preamble moved into the agent's system prompt, or agents without one): `Some("")` when the
+/// turn was the preamble alone, `None` when `text` is not a preamble turn.
+#[must_use]
+pub fn strip_launch_preamble(text: &str) -> Option<&str> {
+    const TAILS: [&str; 2] = [
+        "when a task belongs to another bot or needs input from one.",
+        "Explain a feature when it comes up.",
+    ];
+    let body = text.trim_start();
+    let first = body.lines().next()?;
+    if !(first.starts_with("You are ") && first.contains(", a bot that runs in Krill.")) {
+        return None;
+    }
+    let end = TAILS
+        .iter()
+        .filter_map(|tail| body.find(tail).map(|at| at.saturating_add(tail.len())))
+        .max();
+    let rest = end.and_then(|at| body.get(at..)).unwrap_or_default();
+    Some(rest.strip_prefix("\n\n---\n\n").unwrap_or(rest).trim())
+}
+
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;

@@ -1664,6 +1664,7 @@ fn account_for_stored_in_prefers_transcript_path_and_detects_agy_conversations_d
         cwd: Vec::new(),
         hibernation_blocked: false,
         account: None,
+        bot_instructions: None,
     };
     let resolved = super::account_for_stored_in(&home, &agy, Some(&state), &stored_in_profile)
         .expect("resolved from transcript_path");
@@ -1773,6 +1774,7 @@ fn codex_no_daemon_probe_and_zsh_wrapper_isolate_sessions() {
         cwd: Vec::new(),
         hibernation_blocked: false,
         account: None,
+        bot_instructions: None,
     };
     let resolved = super::account_for_stored_in(&home, &codex_prof, Some(&state), &stored)
         .expect("resolved symlinked codex sessions dir");
@@ -2081,6 +2083,7 @@ fn bot_mcp_launch_injects_claude_and_codex_mcp_add_dir_and_no_proxy() {
             command: vec!["gh-mcp".to_owned(), "--readonly".to_owned()],
             env: vec![("GH_TOKEN".to_owned(), "ghp_abc".to_owned())],
         }],
+        instructions: None,
     };
 
     // 1. Claude gets `--mcp-config <0600 file>`, the bot home in its settings, and NO_PROXY loopback.
@@ -2178,5 +2181,188 @@ fn bot_mcp_launch_injects_claude_and_codex_mcp_add_dir_and_no_proxy() {
             .any(|(k, v)| k == b"NO_PROXY" && String::from_utf8_lossy(v).contains("::1"))
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 봇 지침은 첫 사용자 메시지가 아니라 각 에이전트의 시스템 프롬프트 경로로 간다(Orca `bot-session-instructions`).
+#[test]
+fn bot_instructions_reach_each_agent_system_prompt_not_first_input() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-instr-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let bot_home = dir.join("bot-home");
+    let xdg = dir.join("xdg");
+    let oc_config = xdg.join("opencode");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&bot_home).unwrap();
+    std::fs::create_dir_all(&oc_config).unwrap();
+    std::fs::write(oc_config.join("AGENTS.md"), "user global rules\n").unwrap();
+    std::fs::write(oc_config.join("opencode.jsonc"), "{}").unwrap();
+    let text = "You are Shop, a bot that runs in Krill.\n\"quoted\" \\ line";
+    let mcp = BotMcpLaunchConfig {
+        bot_home: Some(bot_home.clone()),
+        instructions: Some(text.to_owned()),
+        ..BotMcpLaunchConfig::default()
+    };
+    let launch = |argv: &[&str], sid: u64, env: &[(&str, &Path)]| {
+        let mut p = profile(argv);
+        for (k, v) in env {
+            p.env
+                .insert((*k).to_owned(), v.to_str().unwrap().to_owned());
+        }
+        let (l, _, _) = launch_selected_in_with_bot_mcp(
+            &p,
+            Permission::Manual,
+            krill_proto::SessionId(sid),
+            Some(&state),
+            None,
+            Some(&bot_home),
+            Some(&mcp),
+        )
+        .unwrap();
+        let argv: Vec<String> = l
+            .argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        (argv, l.env)
+    };
+    let after = |argv: &[String], flag: &str| {
+        let at = argv.iter().position(|a| a == flag).unwrap();
+        argv[at + 1].clone()
+    };
+
+    let (claude, _) = launch(&["claude"], 911, &[]);
+    let file = after(&claude, "--append-system-prompt-file");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+    let (codex, _) = launch(&["codex"], 912, &[]);
+    let toml = codex
+        .iter()
+        .find_map(|a| a.strip_prefix("developer_instructions="))
+        .unwrap();
+    assert_eq!(serde_json::from_str::<String>(toml).unwrap(), text);
+
+    let (pi, _) = launch(&["pi"], 913, &[]);
+    assert_eq!(
+        std::fs::read_to_string(after(&pi, "--append-system-prompt")).unwrap(),
+        text
+    );
+
+    let (omp, _) = launch(&["omp"], 914, &[]);
+    let arg = omp
+        .iter()
+        .find_map(|a| a.strip_prefix("--append-system-prompt="))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(arg).unwrap(), text);
+
+    let (agy, _) = launch(&["agy"], 915, &[]);
+    let added = PathBuf::from(after(&agy, "--add-dir"));
+    assert_eq!(
+        std::fs::read_to_string(added.join("AGENTS.md")).unwrap(),
+        text
+    );
+
+    let (_, oc_env) = launch(&["opencode"], 916, &[("XDG_CONFIG_HOME", &xdg)]);
+    let oc_dir = oc_env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == b"OPENCODE_CONFIG_DIR")
+        .map(|(_, v)| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
+        .unwrap();
+    assert_ne!(oc_dir, oc_config);
+    assert_eq!(
+        std::fs::read_to_string(oc_dir.join("AGENTS.md")).unwrap(),
+        format!("user global rules\n\n{text}\n")
+    );
+    assert!(oc_dir.join("opencode.jsonc").exists());
+
+    // No system-prompt channel: the caller still sends it as the first input.
+    assert!(!takes_bot_instructions(&profile(&["cursor-agent"])));
+    let (cursor, _) = launch(&["cursor-agent"], 917, &[]);
+    assert!(!cursor.iter().any(|a| a.contains("You are Shop")));
+
+    // Session close removes the files and folders, never what a folder links to.
+    for sid in 911..=916 {
+        claude::discard(&state, krill_proto::SessionId(sid));
+    }
+    assert!(!Path::new(&file).exists());
+    assert!(!added.exists() && !oc_dir.exists());
+    assert!(oc_config.join("opencode.jsonc").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 봇 지침은 대화 기록이 아니라 시스템 프롬프트에 있으니 재개(cold resume) 때도 다시 넘긴다.
+#[test]
+fn resume_passes_bot_instructions_again_and_plain_resume_is_unchanged() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-resume-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    let claude_exe = dir.join("claude");
+    std::fs::write(&claude_exe, "#!/bin/sh\nprintf '2.1.299\\n'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&claude_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let text = "You are Shop, a bot that runs in Krill.";
+    let argv_of = |launch: &Launch| -> Vec<String> {
+        launch
+            .argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect()
+    };
+    let resume = |p: &Profile, sid: u64, conv: Option<&str>, instr: Option<&str>| {
+        let (launch, _, _) = resume_in_with_bot_instructions(
+            p,
+            Permission::Manual,
+            krill_proto::SessionId(sid),
+            Some(&dir),
+            conv,
+            None,
+            instr,
+        )
+        .unwrap();
+        argv_of(&launch)
+    };
+
+    let claude = profile(&[claude_exe.to_str().unwrap()]);
+    let conv = "11111111-2222-4333-8444-555555555555";
+    let resumed = resume(&claude, 931, Some(conv), Some(text));
+    let at = resumed
+        .iter()
+        .position(|a| a == "--append-system-prompt-file")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&resumed[at + 1]).unwrap(), text);
+    assert_eq!(resumed.last().unwrap(), &format!("--resume={conv}"));
+
+    let pi = resume(&profile(&["pi"]), 932, None, Some(text));
+    let at = pi
+        .iter()
+        .position(|a| a == "--append-system-prompt")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&pi[at + 1]).unwrap(), text);
+
+    let agy = resume(&profile(&["agy"]), 933, Some("conv-1"), Some(text));
+    let at = agy.iter().position(|a| a == "--add-dir").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&agy[at + 1]).join("AGENTS.md")).unwrap(),
+        text
+    );
+    assert!(agy.ends_with(&["--conversation".to_owned(), "conv-1".to_owned()]));
+
+    // A chat that never took bot instructions resumes exactly as before.
+    let plain = resume(&profile(&["pi"]), 934, None, None);
+    let (before, _, _) = resume_in(
+        &profile(&["pi"]),
+        Permission::Manual,
+        krill_proto::SessionId(934),
+        Some(&dir),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plain, argv_of(&before));
+    assert!(!plain.iter().any(|a| a.contains("append-system-prompt")));
     std::fs::remove_dir_all(&dir).ok();
 }

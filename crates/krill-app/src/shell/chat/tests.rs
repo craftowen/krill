@@ -964,6 +964,71 @@ fn work_run_unified_diff_summary_and_unread_divider_projection() {
     assert!(summary.contains("-1"));
 }
 
+/// Bot chats: a launch preamble turn is not drawn, and item changes sit between the turns sent
+/// around them (Orca's bot item note rows).
+#[test]
+fn bot_chat_hides_preamble_turn_and_interleaves_item_notes_by_turn_time() {
+    use krill_proto::bots::BotItemStatus;
+    let user = |text: &str| {
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: text.into(),
+            ..Default::default()
+        })
+    };
+    let reply = |text: &str| {
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: text.into(),
+            ..Default::default()
+        })
+    };
+    let preamble = "You are Shop, a bot that runs in Krill. Your home is the current folder.\n\n- Coordinate with other bots using `krill bot send --to <name>` when a task belongs to another bot or needs input from one.";
+    let items = vec![
+        user(preamble),
+        reply("ready"),
+        user("first"),
+        reply("one"),
+        user("second"),
+        reply("two"),
+    ];
+    let note = |at_ms: u64, title: &str| {
+        Arc::new(work_run::ItemNote {
+            at_ms,
+            actor: work_run::NoteActor::Bot,
+            action: work_run::NoteAction::Status(BotItemStatus::Working),
+            title: title.into(),
+            status: BotItemStatus::Working,
+            detail: String::new(),
+        })
+    };
+    // Turns: "first" at 100, "second" at 200 (newest first).
+    let notes = [note(150, "between"), note(250, "after"), note(50, "before")];
+    let feed = work_run::DisplayFeed::project_with_notes(0, &items, None, &notes, &[200, 100]);
+    let shape: Vec<String> = feed
+        .rows()
+        .iter()
+        .map(|row| match row {
+            work_run::DisplayRow::Item { item, .. } => item.text.clone(),
+            work_run::DisplayRow::ItemNote { note, .. } => format!("note:{}", note.title),
+            _ => "other".into(),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "ready",
+            "note:before",
+            "first",
+            "one",
+            "note:between",
+            "second",
+            "two",
+            "note:after"
+        ]
+    );
+}
+
 #[test]
 fn chat_page_parses_timestamps_and_remote_autocomplete_items_validate_paths() {
     let page_json = serde_json::json!({
@@ -1112,4 +1177,41 @@ fn long_clipboard_text_paste_saves_private_txt_attachment_and_quotes_cleanly() {
         Some("> hello\n>\n> world!\n\n")
     );
     assert_eq!(format_chat_quote("   "), None);
+}
+
+/// Every key of a typed sentence reaches the composer: none is taken by a chat shortcut
+/// (a PR screenshot once showed "Who. re. ou?", which turned out to be the synthetic typing tool
+/// under the Korean input method, not the composer).
+#[cfg(unix)]
+#[gpui::test]
+fn composer_keeps_every_typed_key(cx: &mut TestAppContext) {
+    use crate::shell::tests::{open, state_path};
+    let (shell, cx) = open(cx, state_path("chat-typed-keys"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SessionId(446));
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SessionId(446),
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                ..ChatPollSnapshot::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let key = local_key(SessionId(446));
+    let input = shell.update(cx, |shell, _| {
+        shell.chat.inputs.get(&key).unwrap().0.clone()
+    });
+    cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
+    cx.run_until_parked();
+    let sentence = "Hi! Who are you? Answer in one short sentence.";
+    cx.simulate_input(sentence);
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(input.read(cx).value().as_ref(), sentence));
 }
