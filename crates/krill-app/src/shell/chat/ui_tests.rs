@@ -2892,3 +2892,237 @@ fn phase3b_minimap_quote_history_long_paste_reuse_and_conditional_fork(
     }
     let _ = pane;
 }
+
+type SentBytes = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+const RL_NOW: u64 = 1_900_000_000;
+const RL_RESET: u64 = RL_NOW + 60;
+
+/// A rate-limited chat on account `main` whose weekly window resets in a minute.
+fn rate_limited_fixture<'a>(
+    cx: &'a mut TestAppContext,
+    name: &str,
+    with_alternative: bool,
+    auto_continue_setting: bool,
+) -> (Entity<Shell>, &'a mut VisualTestContext, SentBytes) {
+    use krill_proto::usage::{
+        AccountInfo, AccountsSnapshot, FEAT_PROVIDER_DETAILS, FEAT_SESSION_ACCOUNT_SWITCH,
+        FEAT_USAGE, ProviderKind, Snapshot, Window,
+    };
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (shell, cx) = open(cx, state_path(name));
+    if auto_continue_setting {
+        // Settings edits reload accounts; settle that before injecting the snapshot below.
+        cx.update(|_, cx| {
+            krill_app::settings::edit(cx, |s| s.chat_auto_continue_after_rate_limit = true);
+        });
+        cx.run_until_parked();
+    }
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    let account = |id: &str, seven_day: Option<Window>| AccountInfo {
+        id: id.into(),
+        provider: ProviderKind::Claude,
+        label: id.into(),
+        email: None,
+        profile_dir: format!("/synthetic/{id}"),
+        active: id == "main",
+        host_default: false,
+        stale: false,
+        usage: Snapshot {
+            five_hour: None,
+            seven_day,
+        },
+    };
+    let mut accounts = vec![account(
+        "main",
+        Some(Window {
+            percent: 100,
+            resets_at: Some(RL_RESET.to_string()),
+        }),
+    )];
+    if with_alternative {
+        accounts.push(account("other", None));
+    }
+    let snap = AccountsSnapshot {
+        accounts,
+        ..AccountsSnapshot::default()
+    };
+    let sessions = krill_app::sidebar::Snapshot {
+        sessions: vec![krill_app::sidebar::Session {
+            id: SESSION,
+            status: krill_proto::control::AgentStatus {
+                state: krill_proto::control::AgentState::Done,
+                agent: "claude".into(),
+                since_unix_ns: 1,
+                ..krill_proto::control::AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: Some(krill_proto::control::SessionAccount {
+                session: SESSION,
+                account_id: "main".into(),
+                label: "main".into(),
+            }),
+        }],
+        trees: std::collections::BTreeMap::new(),
+    };
+    shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        let pane = shell.layout.focused().unwrap();
+        attach_live_test_pane(shell, pane, SESSION, cx);
+        shell.layout.set_session(pane, SESSION);
+        shell.layout.set_chat_view(pane, true);
+        shell.chat.now_override = Some(RL_NOW);
+        shell.chat.send_input = Some(Box::new(move |bytes| {
+            recorded.lock().unwrap().push(bytes);
+            true
+        }));
+        shell.apply_chat_poll(SESSION, snapshot(Vec::new()));
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(std::sync::Arc::new(StateSource(sessions)), cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_session_account_features(
+                krill_app::hosts::HostId::Local,
+                FEAT_USAGE | FEAT_SESSION_ACCOUNT_SWITCH | FEAT_PROVIDER_DETAILS,
+                cx,
+            );
+        });
+        shell.apply_accounts_snapshot_for_host(krill_app::hosts::HostId::Local, snap, cx);
+        if let Some(log) = shell.chat.logs.get_mut(&local_key(SESSION)) {
+            log.meta.rate_limited = true;
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    (shell, cx, sent)
+}
+
+fn sent_text(sent: &std::sync::Mutex<Vec<Vec<u8>>>) -> String {
+    sent.lock()
+        .unwrap()
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect()
+}
+
+#[gpui::test]
+fn rate_limit_banner_names_weekly_limit_and_switches_inline_without_settings(
+    cx: &mut TestAppContext,
+) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let (shell, cx, _) = rate_limited_fixture(cx, "chat-rate-limit-inline", true, false);
+    let clock = super::rate_limit::reset_clock(RL_RESET).unwrap();
+    let expected = ctext::RATE_LIMIT_RESETS_AT.format(&[
+        ("kind", ctext::RATE_LIMIT_KIND_WEEKLY.get()),
+        ("time", &clock),
+    ]);
+    shell.read_with(cx, |s, cx| {
+        let info = s.chat_limit_info(&local_key(SESSION), cx);
+        assert_eq!(super::rate_limit::banner_text(info, RL_NOW), expected);
+    });
+    assert!(cx.debug_bounds("chat-rate-limit-text").is_some());
+    assert!(cx.debug_bounds("chat-auto-continue-arm").is_some());
+
+    let switched = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|_, cx| {
+        let sidebar = shell.read(cx).sidebar.clone();
+        let switched = switched.clone();
+        cx.subscribe(
+            &sidebar,
+            move |_, e: &krill_app::sidebar::SwitchSessionAccount, _| {
+                switched.borrow_mut().push(e.clone());
+            },
+        )
+        .detach();
+    });
+    let switch_btn = cx.debug_bounds("chat-switch-account").unwrap();
+    cx.simulate_click(switch_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| shell.read(cx).settings().is_none()));
+    assert_eq!(
+        *switched.borrow(),
+        vec![krill_app::sidebar::SwitchSessionAccount {
+            host: krill_app::hosts::HostId::Local,
+            session: SESSION,
+            provider: krill_proto::usage::ProviderKind::Claude,
+            account_id: "other".into(),
+        }]
+    );
+}
+
+#[gpui::test]
+fn rate_limit_banner_without_alternatives_opens_account_settings(cx: &mut TestAppContext) {
+    let (shell, cx, _) = rate_limited_fixture(cx, "chat-rate-limit-add-account", false, false);
+    let switch_btn = cx.debug_bounds("chat-switch-account").unwrap();
+    cx.simulate_click(switch_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| shell.read(cx).settings().is_some()));
+    assert!(cx.debug_bounds("admin-center").is_some());
+}
+
+#[gpui::test]
+fn auto_continue_arms_from_setting_cancels_and_sends_once_after_reset(cx: &mut TestAppContext) {
+    use std::time::Duration;
+    let (shell, cx, sent) = rate_limited_fixture(cx, "chat-auto-continue", false, true);
+    let key = local_key(SESSION);
+    // Setting on: the next composer sync schedules it and the banner offers Cancel.
+    shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.chat.auto_continue.contains_key(&key)));
+    assert!(cx.debug_bounds("chat-auto-continue-scheduled").is_some());
+    let cancel = cx.debug_bounds("chat-auto-continue-cancel").unwrap();
+    assert!(cx.debug_bounds("chat-auto-continue-arm").is_none());
+
+    // Cancel drops it and the same cycle is not re-armed automatically.
+    cx.simulate_click(cancel.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
+    assert!(shell.read_with(cx, |s, _| !s.chat.auto_continue.contains_key(&key)));
+    assert!(cx.debug_bounds("chat-auto-continue-arm").is_some());
+
+    // A hand-sent prompt cancels a manual schedule too.
+    let arm = cx.debug_bounds("chat-auto-continue-arm").unwrap();
+    cx.simulate_click(arm.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.chat.auto_continue.contains_key(&key)));
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |state, cx| state.set_value("by hand", window, cx));
+            s.submit_chat_prompt(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| !s.chat.auto_continue.contains_key(&key)));
+    assert!(sent_text(&sent).contains("by hand"));
+
+    // Re-armed by hand, the reset passes and the continue prompt goes out exactly once.
+    sent.lock().unwrap().clear();
+    let arm = cx.debug_bounds("chat-auto-continue-arm").unwrap();
+    cx.simulate_click(arm.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.update(cx, |s, _| s.chat.now_override = Some(RL_RESET + 5));
+    cx.executor().advance_clock(Duration::from_secs(65));
+    cx.run_until_parked();
+    let prompt = ctext::AUTO_CONTINUE_PROMPT.get();
+    assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+    assert!(shell.read_with(cx, |s, _| !s.chat.auto_continue.contains_key(&key)));
+    cx.executor().advance_clock(Duration::from_secs(120));
+    cx.run_until_parked();
+    shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
+    assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+}

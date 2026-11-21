@@ -539,6 +539,24 @@ impl Sidebar {
             .collect()
     }
 
+    /// Accounts other than the current one that `session` can switch to, with menu labels.
+    pub fn session_account_alternatives(
+        &self,
+        host: &HostId,
+        session: SessionId,
+    ) -> Vec<(AccountInfo, String)> {
+        let Some(row) = self.session_on(host, session) else {
+            return Vec::new();
+        };
+        let current = row.account.as_ref().map(|a| a.account_id.as_str());
+        let choices = self.session_account_choices(host, row);
+        choices
+            .iter()
+            .filter(|a| Some(a.id.as_str()) != current)
+            .map(|a| (a.clone(), account_label(a, &choices)))
+            .collect()
+    }
+
     pub fn finish_session_account_switch(
         &mut self,
         host: &HostId,

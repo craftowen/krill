@@ -1606,47 +1606,7 @@ impl Shell {
             .get(key)
             .is_some_and(|log| log.meta.rate_limited)
         {
-            notices.push(
-                div()
-                    .id("chat-rate-limit-banner")
-                    .debug_selector(|| "chat-rate-limit-banner".into())
-                    .w_full()
-                    .min_w_0()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(palette.warning)
-                    .bg(palette.warning.opacity(0.14))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_size(ui::TEXT_SM)
-                            .text_color(palette.warning_foreground)
-                            .child(ctext::RATE_LIMIT_BANNER.get()),
-                    )
-                    .child(
-                        Button::new("chat-switch-account")
-                            .debug_selector(|| "chat-switch-account".into())
-                            .label(ctext::SWITCH_ACCOUNT.get())
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings(
-                                    krill_app::settings::AdminTab::Accounts,
-                                    Some(window),
-                                    cx,
-                                );
-                            })),
-                    )
-                    .into_any_element(),
-            );
+            notices.push(self.render_rate_limit_banner(key, cx));
         }
         if self.chat.prompt_review.contains(key) {
             notices.push(
@@ -1680,6 +1640,150 @@ impl Shell {
             );
         }
         notices
+    }
+}
+
+impl Shell {
+    fn render_rate_limit_banner(&self, key: &ChatKey, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        let palette = ui::palette(cx);
+        let now = self.chat_now_secs();
+        let info = self.chat_limit_info(key, cx);
+        let resumable = info.is_some_and(|i| {
+            i.reset_at.saturating_sub(now) <= rate_limit::RESET_HORIZON_SECS
+                && rate_limit::reset_clock(i.reset_at).is_some()
+        });
+        let scheduled = self.chat.auto_continue.get(key).map(|e| e.reset_at);
+        let text = |message: String| {
+            div()
+                .min_w_0()
+                .text_size(ui::TEXT_SM)
+                .text_color(palette.warning_foreground)
+                .child(message)
+        };
+        let mut actions = div().flex_none().flex().items_center().gap_1();
+        if let Some(reset_at) = scheduled {
+            let time = rate_limit::reset_clock(reset_at).unwrap_or_default();
+            actions = actions
+                .child(
+                    text(ctext::AUTO_CONTINUE_SCHEDULED.format(&[("time", &time)]))
+                        .debug_selector(|| "chat-auto-continue-scheduled".into()),
+                )
+                .child(
+                    Button::new("chat-auto-continue-cancel")
+                        .debug_selector(|| "chat-auto-continue-cancel".into())
+                        .label(ctext::AUTO_CONTINUE_CANCEL.get())
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener({
+                            let key = key.clone();
+                            move |this, _, _, cx| this.cancel_auto_continue(&key, cx)
+                        })),
+                );
+        } else if resumable {
+            actions = actions.child(
+                Button::new("chat-auto-continue-arm")
+                    .debug_selector(|| "chat-auto-continue-arm".into())
+                    .label(ctext::AUTO_CONTINUE_ARM.get())
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener({
+                        let key = key.clone();
+                        move |this, _, _, cx| {
+                            this.arm_auto_continue(&key, cx);
+                        }
+                    })),
+            );
+        }
+        let alternatives = self
+            .sidebar
+            .read(cx)
+            .session_account_alternatives(&key.0, key.1);
+        let switch = Button::new("chat-switch-account")
+            .debug_selector(|| "chat-switch-account".into())
+            .small()
+            .ghost();
+        let switch = if alternatives.is_empty() {
+            switch
+                .label(ctext::ADD_ACCOUNT.get())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_settings(krill_app::settings::AdminTab::Accounts, Some(window), cx);
+                }))
+                .into_any_element()
+        } else {
+            let shell = cx.weak_entity();
+            let key = key.clone();
+            switch
+                .label(ctext::SWITCH_ACCOUNT.get())
+                .dropdown_menu(move |mut menu, _, _| {
+                    let now = krill_app::accounts::display::now();
+                    for (account, label) in &alternatives {
+                        let usage = krill_app::accounts::display::summary(&account.usage, now);
+                        let target = krill_app::sidebar::SwitchSessionAccount {
+                            host: key.0.clone(),
+                            session: key.1,
+                            provider: account.provider,
+                            account_id: account.id.clone(),
+                        };
+                        let (shell, key) = (shell.clone(), key.clone());
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("{label} · {usage}"))
+                                .icon(ui::icons::provider_menu_icon(account.provider))
+                                .on_click(move |_, _, cx| {
+                                    shell
+                                        .update(cx, |this, cx| {
+                                            this.cancel_auto_continue(&key, cx);
+                                            this.sidebar.update(cx, |s, cx| {
+                                                s.switch_session_account(target.clone(), cx);
+                                            });
+                                        })
+                                        .ok();
+                                }),
+                        );
+                    }
+                    let shell = shell.clone();
+                    menu.separator().item(
+                        PopupMenuItem::new(ctext::MANAGE_ACCOUNTS.get()).on_click(
+                            move |_, window, cx| {
+                                shell
+                                    .update(cx, |this, cx| {
+                                        this.open_settings(
+                                            krill_app::settings::AdminTab::Accounts,
+                                            Some(window),
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            },
+                        ),
+                    )
+                })
+                .into_any_element()
+        };
+        div()
+            .id("chat-rate-limit-banner")
+            .debug_selector(|| "chat-rate-limit-banner".into())
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .px_3()
+            .py_2()
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .border_color(palette.warning)
+            .bg(palette.warning.opacity(0.14))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                text(rate_limit::banner_text(info, now))
+                    .flex_1()
+                    .debug_selector(|| "chat-rate-limit-text".into()),
+            )
+            .child(actions.child(switch))
+            .into_any_element()
     }
 }
 

@@ -43,6 +43,7 @@ mod composer;
 mod prompt;
 #[cfg(test)]
 mod prompt_tests;
+mod rate_limit;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -565,6 +566,10 @@ pub(crate) struct ChatState {
     sent_history: BTreeMap<ChatKey, Vec<String>>,
     history_cursor: BTreeMap<ChatKey, usize>,
     history_saved_draft: BTreeMap<ChatKey, String>,
+    auto_continue: HashMap<ChatKey, rate_limit::AutoContinue>,
+    auto_continue_declined: HashMap<ChatKey, rate_limit::Declined>,
+    #[cfg(test)]
+    pub now_override: Option<u64>,
 }
 
 impl ChatState {
@@ -1390,6 +1395,8 @@ impl Shell {
         chat.multiline_blocked.retain(keep);
         chat.interrupt_latched.retain(keep);
         chat.interrupt_turn_since.retain(|key, _| keep(key));
+        chat.auto_continue.retain(|key, _| keep(key));
+        chat.auto_continue_declined.retain(|key, _| keep(key));
         let sending = &chat.prompt_tasks;
         let turn_tasks = &chat.turn_tasks;
         let keep_flight = |key: &ChatKey| {
@@ -2130,6 +2137,7 @@ impl Shell {
                 if let Some(raw) = models_raw {
                     apply_composer_models_json(&raw, &mut log.meta);
                 }
+                this.sync_auto_continue(&task_key, cx);
                 cx.notify();
             })
             .ok();
@@ -2584,6 +2592,7 @@ impl Shell {
             else {
                 return;
             };
+            self.cancel_auto_continue(key, cx);
             self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
             let queued_id = self.chat.next_pending_id;
             self.record_chat_prompt_history(key, &display_text);
@@ -2687,6 +2696,7 @@ impl Shell {
                     )
                 },
             );
+        self.cancel_auto_continue(key, cx);
         self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
         let pending_id = self.chat.next_pending_id;
         self.record_chat_prompt_history(key, &display_text);
