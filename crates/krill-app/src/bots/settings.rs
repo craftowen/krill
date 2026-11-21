@@ -239,7 +239,13 @@ impl View {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let refused = |e: avatar::PictureError| e.message().to_owned();
+                    let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+                    if usize::try_from(len).map_or(true, |n| n > avatar::PICTURE_MAX_BYTES) {
+                        return Err(refused(avatar::PictureError::TooBig));
+                    }
+                    let picked = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let bytes = avatar::prepare_picture(&picked).map_err(refused)?;
                     let image = decode_png_avatar(&bytes)?;
                     // krilld answers with the stored picture, not the bot.
                     expect_variant(

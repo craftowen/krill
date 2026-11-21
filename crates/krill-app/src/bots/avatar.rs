@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use gpui::{AnyElement, Image, ImageFormat, ObjectFit, Pixels, StyledImage as _, div, prelude::*};
 
+use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 /// Every bundled mascot, in Orca's order.
@@ -53,6 +54,80 @@ pub const DEFAULT_BACKGROUND: u32 = ui::BOT_AVATAR_BACKGROUNDS[0].0;
 
 /// What the stored file name of an uploaded picture looks like (`avatar.png` in the bot folder).
 pub const UPLOAD_AVATAR: &str = "avatar.png";
+
+/// Orca's picture rules: up to 10 MB, at least 128 px on the short side, stored as a
+/// 512 px square PNG.
+pub const PICTURE_MAX_BYTES: usize = 10 * 1024 * 1024;
+const PICTURE_MIN_SIDE: u32 = 128;
+const PICTURE_SIDE: u32 = 512;
+/// Decode guard: a 10 MB JPEG can still unpack to gigabytes.
+const PICTURE_MAX_DECODE_SIDE: u32 = 8192;
+const PICTURE_MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Why a picked picture was refused (Orca's three messages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PictureError {
+    TooBig,
+    Unreadable,
+    TooSmall,
+}
+
+impl PictureError {
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::TooBig => text::NB_IMG_TOO_BIG.get(),
+            Self::Unreadable => text::NB_IMG_UNREADABLE.get(),
+            Self::TooSmall => text::NB_IMG_TOO_SMALL.get(),
+        }
+    }
+}
+
+/// Turns a PNG, JPEG, WebP or GIF into the picture krilld stores, as Orca does: honour the
+/// camera orientation, crop the centre square, scale it to 512 px and save it as PNG.
+pub fn prepare_picture(bytes: &[u8]) -> Result<Vec<u8>, PictureError> {
+    use image::ImageDecoder as _;
+
+    if bytes.len() > PICTURE_MAX_BYTES {
+        return Err(PictureError::TooBig);
+    }
+    let too_big_or_unreadable = |e: image::ImageError| match e {
+        image::ImageError::Limits(_) => PictureError::TooBig,
+        _ => PictureError::Unreadable,
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(PICTURE_MAX_DECODE_SIDE);
+    limits.max_image_height = Some(PICTURE_MAX_DECODE_SIDE);
+    limits.max_alloc = Some(PICTURE_MAX_DECODE_BYTES);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| PictureError::Unreadable)?;
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(too_big_or_unreadable)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut picture = image::DynamicImage::from_decoder(decoder).map_err(too_big_or_unreadable)?;
+    picture.apply_orientation(orientation);
+    let (w, h) = (picture.width(), picture.height());
+    let side = w.min(h);
+    if side < PICTURE_MIN_SIDE {
+        return Err(PictureError::TooSmall);
+    }
+    let square = picture
+        .crop_imm((w - side) / 2, (h - side) / 2, side, side)
+        .resize_exact(
+            PICTURE_SIDE,
+            PICTURE_SIDE,
+            image::imageops::FilterType::Lanczos3,
+        );
+    let mut png = Vec::new();
+    square
+        .to_rgba8()
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|_| PictureError::Unreadable)?;
+    Ok(png)
+}
 
 /// Canonical mascot ID for a stored avatar value (`B1` or Orca's `mascot:B1`).
 #[must_use]
@@ -327,5 +402,45 @@ mod tests {
             );
         }
         assert!(PICKER_MASCOTS.iter().all(|m| *m != "S2"));
+    }
+
+    #[test]
+    fn pictures_become_a_512_px_centre_square_png() {
+        let encode = |w: u32, h: u32, format: image::ImageFormat| {
+            // Left third red, middle green, right third blue: the crop must keep the middle.
+            let img = image::RgbImage::from_fn(w, h, |x, _| match x * 3 / w {
+                0 => image::Rgb([255, 0, 0]),
+                1 => image::Rgb([0, 255, 0]),
+                _ => image::Rgb([0, 0, 255]),
+            });
+            let mut out = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut out), format)
+                .unwrap();
+            out
+        };
+        for format in [image::ImageFormat::Jpeg, image::ImageFormat::Png] {
+            let png = prepare_picture(&encode(600, 200, format)).unwrap();
+            let back = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(back.dimensions(), (512, 512), "{format:?}");
+            let centre = back.get_pixel(256, 256);
+            assert!(
+                centre[1] > 200 && centre[0] < 60 && centre[2] < 60,
+                "{centre:?}"
+            );
+        }
+        assert_eq!(
+            prepare_picture(&encode(300, 100, image::ImageFormat::Png)),
+            Err(PictureError::TooSmall)
+        );
+        assert_eq!(
+            prepare_picture(b"definitely not a picture"),
+            Err(PictureError::Unreadable)
+        );
+        assert_eq!(
+            prepare_picture(&vec![0; PICTURE_MAX_BYTES + 1]),
+            Err(PictureError::TooBig)
+        );
     }
 }

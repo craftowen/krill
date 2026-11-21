@@ -20,7 +20,7 @@ use krill_proto::bots::{
     BotConfig, BotRpcRequest, BotRpcResponse, BotTemplate, CreateBotParams, CreateBotV2Params,
 };
 
-use super::avatar::{self, PICKER_MASCOTS};
+use super::avatar::{self, PICKER_MASCOTS, PICTURE_MAX_BYTES, PictureError, prepare_picture};
 use super::rpc::{BOT_RUNTIMES, BotRpcCall, call_checked, runtime_display_label, runtime_models};
 use crate::i18n::catalog::bots as text;
 use crate::ui;
@@ -28,12 +28,6 @@ use crate::ui;
 /// Orca's job-line limit; the name follows krilld's byte cap.
 const NAME_MAX_BYTES: usize = krill_proto::bots::BOT_NAME_MAX_BYTES;
 const PURPOSE_MAX: usize = 200;
-/// Largest picture side we decode (a 4 MB PNG can still be enormous once unpacked).
-const PICTURE_MAX_SIDE: u32 = 4096;
-/// Picture limits: krilld stores PNG up to its avatar cap; Orca's minimum of 128 px on the
-/// short side. The square crop is the avatar's `object-fit: cover`, as in Orca.
-const PICTURE_MAX_BYTES: usize = krill_proto::bots::MAX_AVATAR_PNG_BYTES;
-const PICTURE_MIN_SIDE: u32 = 128;
 
 /// Carousel geometry (Orca `size-28`, neighbours scaled to 72 px, ±110 px from the centre).
 const FACE: f32 = 112.;
@@ -61,52 +55,6 @@ enum Face {
     Mascot(&'static str),
     /// The uploaded picture.
     Custom,
-}
-
-/// Why a picked picture was refused (Orca's three messages).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PictureError {
-    TooBig,
-    Unreadable,
-    TooSmall,
-}
-
-impl PictureError {
-    fn message(self) -> &'static str {
-        match self {
-            Self::TooBig => text::NB_IMG_TOO_BIG.get(),
-            Self::Unreadable => text::NB_IMG_UNREADABLE.get(),
-            Self::TooSmall => text::NB_IMG_TOO_SMALL.get(),
-        }
-    }
-}
-
-/// Checks a picked picture the way krilld will: a PNG within its size cap, at least 128 px
-/// on the short side (read from the IHDR header).
-pub fn prepare_picture(bytes: &[u8]) -> Result<Vec<u8>, PictureError> {
-    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    if bytes.len() > PICTURE_MAX_BYTES {
-        return Err(PictureError::TooBig);
-    }
-    if bytes.get(..8) != Some(&PNG_MAGIC[..]) || bytes.get(12..16) != Some(&b"IHDR"[..]) {
-        return Err(PictureError::Unreadable);
-    }
-    let side = |at: usize| {
-        bytes
-            .get(at..at + 4)
-            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map(u32::from_be_bytes)
-    };
-    let (Some(w), Some(h)) = (side(16), side(20)) else {
-        return Err(PictureError::Unreadable);
-    };
-    if w.min(h) < PICTURE_MIN_SIDE {
-        return Err(PictureError::TooSmall);
-    }
-    if w.max(h) > PICTURE_MAX_SIDE {
-        return Err(PictureError::TooBig);
-    }
-    Ok(bytes.to_vec())
 }
 
 /// First free "New bot", "New bot 2", … (Orca fills an empty name the same way).
@@ -1372,28 +1320,5 @@ mod tests {
         assert_eq!(unique_name("New bot", &[]), "New bot");
         let taken = vec!["new bot".to_owned(), "New bot 2".to_owned()];
         assert_eq!(unique_name("New bot", &taken), "New bot 3");
-    }
-
-    #[test]
-    fn pictures_are_checked_like_krilld_will() {
-        // A PNG signature and IHDR header are all the check reads.
-        let png = |w: u32, h: u32| {
-            let mut b = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
-            b.extend_from_slice(b"IHDR");
-            b.extend_from_slice(&w.to_be_bytes());
-            b.extend_from_slice(&h.to_be_bytes());
-            b.extend_from_slice(&[8, 6, 0, 0, 0]);
-            b
-        };
-        assert_eq!(prepare_picture(&png(300, 200)), Ok(png(300, 200)));
-        assert_eq!(prepare_picture(&png(200, 100)), Err(PictureError::TooSmall));
-        assert_eq!(
-            prepare_picture(b"GIF89a not a png"),
-            Err(PictureError::Unreadable)
-        );
-        assert_eq!(
-            prepare_picture(&vec![0; PICTURE_MAX_BYTES + 1]),
-            Err(PictureError::TooBig)
-        );
     }
 }
