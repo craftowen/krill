@@ -342,8 +342,8 @@ def main():
                         env=dict(env, KRILL_STATE_DIR=cfg['dir']), text=True)
 
                 def pane_ready():
-                    wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===2')
-                    wait('[...document.querySelectorAll(".terminal-mount .terminal-scroll")].every(p=>Math.round(parseFloat(p.querySelector(".terminal-grid").style.width)/8)===Math.floor((p.clientWidth-2)/8))')
+                    wait('document.querySelectorAll(".terminal-mount:not([hidden])[data-phase=ready]").length===2')
+                    wait('[...document.querySelectorAll(".terminal-mount:not([hidden]) .terminal-scroll")].every(p=>Math.round(parseFloat(p.querySelector(".terminal-grid").style.width)/8)===Math.floor((p.clientWidth-2)/8))')
 
                 def direction(value):
                     click('.split-direction')
@@ -434,7 +434,7 @@ def main():
                 pane_ready()
                 assert evaluate('getComputedStyle(document.querySelector(".terminal-pane[data-active=true]"),"::after").borderTopWidth') == '2px'
                 assert evaluate('document.getElementById("notice").hidden || !document.getElementById("notice").textContent.includes("Wait for the live terminal")')
-                assert evaluate('getComputedStyle(document.querySelector(".primary-pane .command-dock")).visibility==="hidden" && getComputedStyle(document.querySelector(".primary-pane .command-dock")).pointerEvents==="none" && getComputedStyle(document.querySelector(".secondary-pane .command-dock")).visibility==="visible"')
+                assert evaluate('getComputedStyle(document.querySelector(".primary-pane .terminal-mount:not([hidden]) .command-dock")).visibility==="hidden" && getComputedStyle(document.querySelector(".primary-pane .terminal-mount:not([hidden]) .command-dock")).pointerEvents==="none" && getComputedStyle(document.querySelector(".secondary-pane .command-dock")).visibility==="visible"')
                 capture('tablet-split-columns-active-second', 1180, 820)
                 assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'row'
                 assert evaluate('document.querySelectorAll(".is-split > .terminal-pane > .pane-header").length') == 2
@@ -465,8 +465,8 @@ def main():
                 assert evaluate(f'document.querySelector(".primary-pane").dataset.session==="{third}"')
                 assert evaluate(f'document.querySelector(".secondary-pane").dataset.session==="{other}"')
                 evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
-                browser('fill', '.primary-pane .command-input', 'active-primary-tab-only')
-                evaluate('document.querySelector(".primary-pane .buffered-command").requestSubmit();true')
+                browser('fill', '.primary-pane .terminal-mount:not([hidden]) .command-input', 'active-primary-tab-only')
+                evaluate('document.querySelector(".primary-pane .terminal-mount:not([hidden]) .buffered-command").requestSubmit();true')
                 until(lambda: 'active-primary-tab-only' in cli('read', str(third)))
                 assert 'active-primary-tab-only' not in cli('read', str(other))
                 click(f'.session-tab[data-session="{sid}"]')
@@ -511,21 +511,21 @@ def main():
                 evaluate('document.querySelector(".secondary-pane .buffered-command").requestSubmit();true')
                 until(lambda: 'tablet-second-only' in cli('read', str(other)))
                 assert 'tablet-second-only' not in cli('read', str(sid))
-                browser('click', '.primary-pane .terminal-scroll')
+                browser('click', '.primary-pane .terminal-mount:not([hidden]) .terminal-scroll')
                 assert evaluate('secondHandle!==KrillMobile.activeTerminal')
                 evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
-                browser('fill', '.primary-pane .command-input', 'tablet-first-only')
-                evaluate('document.querySelector(".primary-pane .buffered-command").requestSubmit();true')
+                browser('fill', '.primary-pane .terminal-mount:not([hidden]) .command-input', 'tablet-first-only')
+                evaluate('document.querySelector(".primary-pane .terminal-mount:not([hidden]) .buffered-command").requestSubmit();true')
                 until(lambda: 'tablet-first-only' in cli('read', str(sid)))
                 assert 'tablet-first-only' not in cli('read', str(other))
-                browser('fill', '.primary-pane .command-input', 'primary fold draft 한글')
+                browser('fill', '.primary-pane .terminal-mount:not([hidden]) .command-input', 'primary fold draft 한글')
                 evaluate('document.querySelector(".secondary-pane .command-input").value="second fold draft 한글";globalThis.firstHandle=KrillMobile.activeTerminal;globalThis.splitSocketCount=tabletSockets.filter(s=>s.readyState===1).length;true')
                 capture('tablet-split-columns-active-first', 1180, 820)
                 browser('set', 'viewport', '830', '690')
                 pane_ready()
                 assert evaluate('tabletSockets.filter(s=>s.readyState===1).length===splitSocketCount')
                 assert evaluate('firstHandle===KrillMobile.activeTerminal')
-                assert evaluate('document.querySelector(".primary-pane .command-input").value') == 'primary fold draft 한글'
+                assert evaluate('document.querySelector(".primary-pane .terminal-mount:not([hidden]) .command-input").value') == 'primary fold draft 한글'
                 browser('set', 'viewport', '1180', '820')
                 pane_ready()
                 assert evaluate('firstHandle===KrillMobile.activeTerminal')
@@ -538,7 +538,7 @@ def main():
                 assert evaluate('secondHandle===KrillMobile.activeTerminal')
                 browser('set', 'viewport', '1180', '820')
                 pane_ready()
-                assert evaluate('document.querySelector(".primary-pane .command-input").value') == 'primary fold draft 한글'
+                assert evaluate('document.querySelector(".primary-pane .terminal-mount:not([hidden]) .command-input").value') == 'primary fold draft 한글'
                 browser('set', 'viewport', '1032', '1376')
                 pane_ready()
                 assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'column'
@@ -549,7 +549,7 @@ def main():
                 capture('tablet-split-restored', 1032, 1376)
                 count_before_close = len(cli('ls').splitlines())
                 click('.secondary-pane .pane-close')
-                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                wait('document.querySelectorAll(".terminal-mount:not([hidden])[data-phase=ready]").length===1')
                 assert evaluate('!document.querySelector(".secondary-pane")')
                 assert len(cli('ls').splitlines()) == count_before_close
                 assert str(other) in [line.split('\t')[0] for line in cli('ls').splitlines()]
@@ -558,7 +558,7 @@ def main():
                 evaluate(f'[...document.querySelectorAll(".sheet-action")].find(n=>n.textContent.endsWith("#{other}")).click();true')
                 pane_ready()
                 click('.primary-pane .pane-close')
-                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                wait('document.querySelectorAll(".terminal-mount:not([hidden])[data-phase=ready]").length===1')
                 assert evaluate(f'location.hash.endsWith("/s/{other}")')
                 assert len(cli('ls').splitlines()) == count_before_close
                 assert 'tablet-first-only' in cli('read', str(sid))

@@ -53,7 +53,8 @@ globalThis.snapshot=()=>({top:port.scrollTop,height:port.scrollHeight,client:por
   async function record(name,before,at){const after=await evaluate('snapshot()');assert(after.trace.some(t=>t.type==='touchmove'&&t.trusted),'requires trusted browser input');results.push({name,before,point:at,after});return after;}
   for(const flags of [0,20]){
    await evaluate(`setup(${flags},false,100,0)`);const before=await evaluate('snapshot()'),at=await point('history');
-   assert.match(await evaluate(`document.elementFromPoint(${at.x},${at.y}).className`),/terminal-history/);
+   // 맨 아래에서는 스크롤백이 clip-path로 가려져 적중 판정에서 빠지므로 위치로 확인한다.
+   assert(await evaluate(`(()=>{const r=document.querySelector('.terminal-history').getBoundingClientRect();return ${at.y}>=r.top&&${at.y}<r.bottom&&/terminal-(history|scroll)/.test(document.elementFromPoint(${at.x},${at.y}).className)})()`),'touch starts over the scrollback');
    await drag(at,96);const after=await record(`history-native-${flags}`,before,at);assert(after.top<before.top-50,'history must move even while the inline TUI has mouse mode');assert.equal(after.inputs.length,0,'history never sends TUI input');
   }
   for(const fit of [false,true])for(const flags of [20,84,192,193])for(const gap of [1,8,320]){
