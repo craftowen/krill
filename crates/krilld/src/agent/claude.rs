@@ -272,6 +272,67 @@ pub(crate) fn sweep(state: &Path, live: &[SessionId]) -> usize {
     removed
 }
 
+/// Creates a `0o600` per-session `--mcp-config <path>` file inside `claude-settings/` named
+/// `<session_id>-mcp-<uuid>.json` so `discard`/`sweep` automatically clean it up on exit.
+pub(crate) fn create_mcp_config(
+    state: &Path,
+    session: SessionId,
+    http_servers: &[crate::agent::BotMcpHttpServer],
+    stdio_servers: &[crate::agent::BotMcpStdioServer],
+) -> io::Result<PathBuf> {
+    let dir = state.join(DIR);
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let mut servers = serde_json::Map::new();
+    for srv in http_servers {
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".to_owned(), serde_json::json!("http"));
+        obj.insert("url".to_owned(), serde_json::json!(srv.url));
+        if !srv.bearer_token.is_empty() {
+            obj.insert(
+                "headers".to_owned(),
+                serde_json::json!({
+                    "Authorization": format!("Bearer {}", srv.bearer_token)
+                }),
+            );
+        }
+        servers.insert(srv.id.clone(), serde_json::Value::Object(obj));
+    }
+    for srv in stdio_servers {
+        let Some((prog, args)) = srv.command.split_first() else {
+            continue;
+        };
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".to_owned(), serde_json::json!("stdio"));
+        obj.insert("command".to_owned(), serde_json::json!(prog));
+        if !args.is_empty() {
+            obj.insert("args".to_owned(), serde_json::json!(args));
+        }
+        if !srv.env.is_empty() {
+            let env_map: serde_json::Map<String, serde_json::Value> = srv
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            obj.insert("env".to_owned(), serde_json::Value::Object(env_map));
+        }
+        servers.insert(srv.id.clone(), serde_json::Value::Object(obj));
+    }
+    let payload = serde_json::json!({ "mcpServers": servers });
+    let bytes = serde_json::to_vec(&payload)?;
+    let id = uuid()?;
+    let path = state.join(DIR).join(format!("{}-mcp-{id}.json", session.0));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    if let Err(e) = file.write_all(&bytes) {
+        std::fs::remove_file(&path).ok();
+        return Err(e);
+    }
+    Ok(path)
+}
+
 fn is_uuid(uuid: &str) -> bool {
     uuid.len() == 36
         && uuid.bytes().enumerate().all(|(i, b)| {
@@ -283,12 +344,15 @@ fn is_uuid(uuid: &str) -> bool {
         })
 }
 
-/// `<세션 id>-<uuid>.json` 또는 `<세션 id>-fork-<uuid>.json`의 세션 id.
+/// `<세션 id>-<uuid>.json`, `<세션 id>-fork-<uuid>.json`, 또는 `<세션 id>-mcp-<uuid>.json`의 세션 id.
 /// uuid 자리가 36자 `8-4-4-4-12` 16진이 아니면 `None`이라
 /// 첫 덩어리가 전부 숫자인 구버전 `<uuid>.json`을 세션 파일로 오인하지 않는다.
 fn owner(name: &OsStr) -> Option<SessionId> {
     let (sid, rest) = name.to_str()?.strip_suffix(".json")?.split_once('-')?;
-    let uuid = rest.strip_prefix("fork-").unwrap_or(rest);
+    let uuid = rest
+        .strip_prefix("fork-")
+        .or_else(|| rest.strip_prefix("mcp-"))
+        .unwrap_or(rest);
     if !is_uuid(uuid) || !sid.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

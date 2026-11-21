@@ -5,39 +5,98 @@
 //! `offset`, exponential backoff on errors, responsive exit on stop signal). Handles DMs, group
 //! messages, forum `message_thread_id`, and `callback_query` inline-keyboard gate approvals.
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::io;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use krill_proto::bots::{
-    BotConfig, BotConnectorStatus, BotErrorCategory, BotId, ConnectorHealthState, ExternalSource,
+    BotConfig, BotConnectorStatus, BotConnectorTestResult, BotErrorCategory, BotId,
+    ConnectorHealthState, ExternalSource,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use crate::bots::connectors::policy_for_api_base;
 use crate::bots::connectors::router::{
-    ConversationRouter, DeliveryTarget, PlatformSender, classify_error, now_ms,
+    ConversationRouter, DeliveryTarget, PlatformSender, chunk_text_utf16, classify_error, now_ms,
     sanitize_error_for_status,
 };
 use crate::bots::connectors::{ConnectorBridge, InboundExternalMessage, StopFlag};
-use crate::bots::http_client::{self, HttpRequest};
+use crate::bots::http_client::{self, HttpRequest, MultipartField, RequestCancelSlot, SsrfPolicy};
+use crate::session::lock;
 
 /// Production Telegram Bot API base URL.
 pub const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
-/// Safe single-message length under Telegram's 4,096-character limit.
-pub const TELEGRAM_MAX_MESSAGE_CHARS: usize = 4_000;
+/// Telegram's hard single-message limit (4,096 UTF-16 code units).
+pub const TELEGRAM_MAX_MESSAGE_CHARS: usize = 4_096;
 /// Long-polling server-side wait duration (`timeout=30`) sent to `getUpdates`.
 pub const TELEGRAM_POLL_TIMEOUT_SECS: u64 = 30;
 const WORKER_STACK_SIZE: usize = 128 * 1024;
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(TELEGRAM_POLL_TIMEOUT_SECS + 10);
+const MAX_INBOUND_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_OUTBOUND_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+const CONNECTORS_STATE_FILE: &str = "connectors-state.json";
+static INBOX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ConnectorsStateFile {
+    #[serde(default)]
+    telegram_offsets: BTreeMap<BotId, i64>,
+}
+
+fn state_file_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn load_persisted_offset(state_root: Option<&Path>, bot_id: &BotId) -> Option<i64> {
+    let root = state_root?;
+    let _g = lock(state_file_lock());
+    let path = root.join(CONNECTORS_STATE_FILE);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    let parsed: ConnectorsStateFile = serde_json::from_str(&raw).ok()?;
+    parsed.telegram_offsets.get(bot_id).copied()
+}
+
+fn persist_offset(state_root: Option<&Path>, bot_id: &BotId, offset: i64) {
+    let Some(root) = state_root else {
+        return;
+    };
+    let _g = lock(state_file_lock());
+    let path = root.join(CONNECTORS_STATE_FILE);
+    let mut state: ConnectorsStateFile = fs::symlink_metadata(&path)
+        .ok()
+        .filter(|m| !m.file_type().is_symlink())
+        .and_then(|_| fs::read_to_string(&path).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let prev = state.telegram_offsets.get(bot_id).copied().unwrap_or(0);
+    if offset <= prev && state.telegram_offsets.contains_key(bot_id) {
+        return;
+    }
+    state.telegram_offsets.insert(bot_id.clone(), offset);
+    if let Ok(mut bytes) = serde_json::to_vec_pretty(&state) {
+        bytes.push(b'\n');
+        krill_proto::os::write_atomic_0600(&path, &bytes).ok();
+    }
+}
 
 /// Telegram Bot API HTTP client & [`PlatformSender`] implementation.
 pub struct TelegramSender {
     api_base: String,
     token: Zeroizing<String>,
+    ssrf_policy: SsrfPolicy,
 }
 
 impl std::fmt::Debug for TelegramSender {
@@ -48,12 +107,20 @@ impl std::fmt::Debug for TelegramSender {
     }
 }
 
+enum TgCallError {
+    RetryAfter(u64, io::Error),
+    Other(io::Error),
+}
+
 impl TelegramSender {
     #[must_use]
     pub fn new(api_base: &str, token: Zeroizing<String>) -> Self {
+        let base = api_base.trim_end_matches('/').to_owned();
+        let ssrf_policy = policy_for_api_base(&base);
         Self {
-            api_base: api_base.trim_end_matches('/').to_owned(),
+            api_base: base,
             token,
+            ssrf_policy,
         }
     }
 
@@ -62,32 +129,62 @@ impl TelegramSender {
     }
 
     fn call_json(&self, method: &str, payload: &Value, timeout: Duration) -> io::Result<Value> {
+        self.call_json_internal(method, payload, timeout, None, None)
+            .map_err(|err| match err {
+                TgCallError::RetryAfter(_, e) | TgCallError::Other(e) => e,
+            })
+    }
+
+    fn call_json_internal(
+        &self,
+        method: &str,
+        payload: &Value,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+        socket: Option<&RequestCancelSlot>,
+    ) -> Result<Value, TgCallError> {
         let body = serde_json::to_vec(payload).map_err(|_| {
-            io::Error::new(
+            TgCallError::Other(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "failed to encode Telegram API payload",
-            )
+            ))
         })?;
-        let req = HttpRequest::post_json(self.endpoint(method), body).with_timeout(timeout);
-        let resp = http_client::send(&req).map_err(|err| {
-            io::Error::new(err.kind(), format!("Telegram {method} transport error"))
+        let req = HttpRequest::post_json(self.endpoint(method), body)
+            .with_timeout(timeout)
+            .with_ssrf_policy(self.ssrf_policy);
+        let resp = http_client::send_interruptible(&req, cancel, socket).map_err(|err| {
+            TgCallError::Other(io::Error::new(
+                err.kind(),
+                format!("Telegram {method} transport error"),
+            ))
         })?;
         let parsed: TgEnvelope = resp.json().unwrap_or(TgEnvelope {
             ok: false,
             result: None,
             description: Some(format!("HTTP {}", resp.status)),
             error_code: Some(u32::from(resp.status)),
+            parameters: None,
         });
         if resp.is_success() && parsed.ok {
-            Ok(parsed.result.unwrap_or(Value::Null))
-        } else {
-            let code = parsed.error_code.unwrap_or(u32::from(resp.status));
-            let desc = parsed
-                .description
-                .unwrap_or_else(|| format!("Telegram API HTTP {code}"));
-            let sanitized = sanitize_error_for_status(&desc);
-            Err(io::Error::other(format!("HTTP {code}: {sanitized}")))
+            return Ok(parsed.result.unwrap_or(Value::Null));
         }
+        let code = parsed.error_code.unwrap_or(u32::from(resp.status));
+        if code == 409 {
+            return Err(TgCallError::Other(io::Error::other(
+                "Telegram 409 Conflict: another poller or active webhook is running; deleteWebhook or stop duplicate instance",
+            )));
+        }
+        let desc = parsed
+            .description
+            .unwrap_or_else(|| format!("Telegram API HTTP {code}"));
+        let sanitized = sanitize_error_for_status(&desc);
+        let io_err = io::Error::other(format!("HTTP {code}: {sanitized}"));
+        if code == 429
+            && let Some(wait) = parsed.parameters.and_then(|p| p.retry_after)
+        {
+            return Err(TgCallError::RetryAfter(wait, io_err));
+        }
+        Err(TgCallError::Other(io_err))
     }
 
     /// Calls `getMe` to validate the bot token and obtain `@username`.
@@ -99,8 +196,42 @@ impl TelegramSender {
             .map(|u| format!("@{u}")))
     }
 
+    /// Runs an on-demand connectivity check for `TestConnector`.
+    #[must_use]
+    pub fn test_connection(&self) -> BotConnectorTestResult {
+        match self.get_me() {
+            Ok(label) => BotConnectorTestResult {
+                source: ExternalSource::Telegram,
+                ok: true,
+                account_label: label.clone(),
+                detail: format!(
+                    "Connected to Telegram ({})",
+                    label.unwrap_or_else(|| "bot ok".to_owned())
+                ),
+            },
+            Err(err) => BotConnectorTestResult {
+                source: ExternalSource::Telegram,
+                ok: false,
+                account_label: None,
+                detail: sanitize_error_for_status(&err.to_string()),
+            },
+        }
+    }
+
     /// Calls `POST /bot<token>/getUpdates` with `timeout=30` and monotonic `offset`.
     pub fn get_updates(&self, offset: Option<i64>) -> io::Result<Vec<TgUpdate>> {
+        self.get_updates_with_retry_info(offset, None, None)
+            .map_err(|err| match err {
+                TgCallError::RetryAfter(_, e) | TgCallError::Other(e) => e,
+            })
+    }
+
+    fn get_updates_with_retry_info(
+        &self,
+        offset: Option<i64>,
+        cancel: Option<&AtomicBool>,
+        socket: Option<&RequestCancelSlot>,
+    ) -> Result<Vec<TgUpdate>, TgCallError> {
         let mut payload = json!({
             "timeout": TELEGRAM_POLL_TIMEOUT_SECS,
             "allowed_updates": ["message", "callback_query"],
@@ -110,13 +241,69 @@ impl TelegramSender {
         {
             obj.insert("offset".to_owned(), json!(off));
         }
-        let result = self.call_json("getUpdates", &payload, POLL_HTTP_TIMEOUT)?;
+        let result =
+            self.call_json_internal("getUpdates", &payload, POLL_HTTP_TIMEOUT, cancel, socket)?;
         serde_json::from_value(result).map_err(|_| {
-            io::Error::new(
+            TgCallError::Other(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Telegram getUpdates payload",
-            )
+            ))
         })
+    }
+
+    /// Downloads a bounded Telegram file by `file_id` into `<bot_home>/inbox/` cleanly.
+    fn download_attachment_to_inbox(
+        &self,
+        file_id: &str,
+        suggested_name: &str,
+        expected_mime: Option<&str>,
+        declared_size: Option<u64>,
+        bot_home: &Path,
+    ) -> Option<String> {
+        if let Some(sz) = declared_size
+            && usize::try_from(sz).unwrap_or(usize::MAX) > MAX_INBOUND_ATTACHMENT_BYTES
+        {
+            return None;
+        }
+        if let Some(mime) = expected_mime
+            && !is_safe_attachment_mime(mime)
+        {
+            return None;
+        }
+        let meta = self
+            .call_json(
+                "getFile",
+                &json!({ "file_id": file_id }),
+                API_REQUEST_TIMEOUT,
+            )
+            .ok()?;
+        let file_path = meta.get("file_path").and_then(Value::as_str)?;
+        if file_path.contains("..") || file_path.trim().is_empty() {
+            return None;
+        }
+        let download_url = format!(
+            "{}/file/bot{}/{}",
+            self.api_base,
+            self.token.as_str(),
+            file_path.trim_start_matches('/')
+        );
+        let resp = http_client::send(
+            &HttpRequest::get(download_url)
+                .with_timeout(API_REQUEST_TIMEOUT)
+                .with_max_response_bytes(MAX_INBOUND_ATTACHMENT_BYTES)
+                .with_ssrf_policy(self.ssrf_policy),
+        )
+        .ok()?;
+        if !resp.is_success() || resp.body.is_empty() {
+            return None;
+        }
+        let inbox = bot_home.join("inbox");
+        fs::create_dir_all(&inbox).ok()?;
+        let safe_name = sanitize_attachment_filename(suggested_name, file_path);
+        let seq = INBOX_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dest = inbox.join(format!("{}-{seq}-{safe_name}", now_ms()));
+        krill_proto::os::write_atomic_0600(&dest, &resp.body).ok()?;
+        Some(dest.to_string_lossy().into_owned())
     }
 
     /// Acknowledges an inline-keyboard `callback_query` click.
@@ -145,6 +332,10 @@ impl PlatformSender for TelegramSender {
         TELEGRAM_MAX_MESSAGE_CHARS
     }
 
+    fn split_chunks(&self, text: &str) -> Vec<String> {
+        chunk_text_utf16(text, self.max_chunk_chars())
+    }
+
     fn send_message(&self, target: &DeliveryTarget, text: &str) -> io::Result<String> {
         let chat_id_val = chat_id_value(&target.channel_id);
         let mut payload = json!({
@@ -158,6 +349,17 @@ impl PlatformSender for TelegramSender {
             && let Some(obj) = payload.as_object_mut()
         {
             obj.insert("message_thread_id".to_owned(), json!(tid));
+        }
+        if let Some(reply_id) = target
+            .reply_to_message_id
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok())
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert(
+                "reply_parameters".to_owned(),
+                json!({ "message_id": reply_id, "allow_sending_without_reply": true }),
+            );
         }
         let result = self.call_json("sendMessage", &payload, API_REQUEST_TIMEOUT)?;
         let msg_id = result
@@ -194,12 +396,150 @@ impl PlatformSender for TelegramSender {
             Err(err) => Err(err),
         }
     }
+
+    fn send_files(
+        &self,
+        target: &DeliveryTarget,
+        files: &[String],
+        caption: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let mut last_id = None;
+        for (idx, raw_path) in files.iter().enumerate() {
+            let path = Path::new(raw_path);
+            let meta = fs::symlink_metadata(path)?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing non-regular file attachment: {raw_path}"),
+                ));
+            }
+            if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_OUTBOUND_DOCUMENT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attachment exceeds 50 MiB Telegram limit",
+                ));
+            }
+            let data = fs::read(path)?;
+            let fname = path.file_name().map_or_else(
+                || "attachment.bin".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let mut fields = vec![MultipartField {
+                name: "chat_id".to_owned(),
+                filename: None,
+                content_type: None,
+                data: target.channel_id.as_bytes().to_vec(),
+            }];
+            if let Some(tid) = target
+                .thread_id
+                .as_deref()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                fields.push(MultipartField {
+                    name: "message_thread_id".to_owned(),
+                    filename: None,
+                    content_type: None,
+                    data: tid.to_string().into_bytes(),
+                });
+            }
+            if let Some(reply_id) = target
+                .reply_to_message_id
+                .as_deref()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                let rp = json!({ "message_id": reply_id, "allow_sending_without_reply": true });
+                if let Ok(rp_bytes) = serde_json::to_vec(&rp) {
+                    fields.push(MultipartField {
+                        name: "reply_parameters".to_owned(),
+                        filename: None,
+                        content_type: Some("application/json".to_owned()),
+                        data: rp_bytes,
+                    });
+                }
+            }
+            if idx == 0
+                && let Some(cap) = caption.filter(|c| !c.trim().is_empty())
+            {
+                fields.push(MultipartField {
+                    name: "caption".to_owned(),
+                    filename: None,
+                    content_type: None,
+                    data: cap.as_bytes().to_vec(),
+                });
+            }
+            fields.push(MultipartField {
+                name: "document".to_owned(),
+                filename: Some(fname),
+                content_type: Some("application/octet-stream".to_owned()),
+                data,
+            });
+            let req = HttpRequest::post_multipart(self.endpoint("sendDocument"), &fields)?
+                .with_timeout(API_REQUEST_TIMEOUT)
+                .with_ssrf_policy(self.ssrf_policy);
+            let resp = http_client::send(&req).map_err(|err| {
+                io::Error::new(err.kind(), "Telegram sendDocument transport error")
+            })?;
+            let parsed: TgEnvelope = resp.json().unwrap_or(TgEnvelope {
+                ok: false,
+                result: None,
+                description: Some(format!("HTTP {}", resp.status)),
+                error_code: Some(u32::from(resp.status)),
+                parameters: None,
+            });
+            if !(resp.is_success() && parsed.ok) {
+                let desc = parsed
+                    .description
+                    .unwrap_or_else(|| format!("HTTP {}", resp.status));
+                return Err(io::Error::other(sanitize_error_for_status(&desc)));
+            }
+            if let Some(mid) = parsed
+                .result
+                .as_ref()
+                .and_then(|r| r.get("message_id"))
+                .and_then(Value::as_i64)
+            {
+                last_id = Some(mid.to_string());
+            }
+        }
+        Ok(last_id)
+    }
+
+    fn add_reaction(
+        &self,
+        target: &DeliveryTarget,
+        message_id: &str,
+        reaction: &str,
+    ) -> io::Result<()> {
+        let msg_id = message_id.parse::<i64>().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid Telegram message_id")
+        })?;
+        let emoji = reaction.trim();
+        if emoji.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reaction emoji cannot be empty",
+            ));
+        }
+        let payload = json!({
+            "chat_id": chat_id_value(&target.channel_id),
+            "message_id": msg_id,
+            "reaction": [{ "type": "emoji", "emoji": emoji }],
+        });
+        self.call_json("setMessageReaction", &payload, API_REQUEST_TIMEOUT)?;
+        Ok(())
+    }
 }
 
 fn chat_id_value(channel_id: &str) -> Value {
     channel_id
         .parse::<i64>()
         .map_or_else(|_| json!(channel_id), |id| json!(id))
+}
+
+#[derive(Debug, Deserialize)]
+struct TgParameters {
+    #[serde(default)]
+    retry_after: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +551,8 @@ struct TgEnvelope {
     description: Option<String>,
     #[serde(default)]
     error_code: Option<u32>,
+    #[serde(default)]
+    parameters: Option<TgParameters>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +576,73 @@ pub struct TgMessage {
     pub text: Option<String>,
     #[serde(default)]
     pub caption: Option<String>,
+    #[serde(default)]
+    pub document: Option<TgDocument>,
+    #[serde(default)]
+    pub photo: Option<Vec<TgPhotoSize>>,
+    #[serde(default)]
+    pub audio: Option<TgMediaFile>,
+    #[serde(default)]
+    pub voice: Option<TgMediaFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TgDocument {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TgPhotoSize {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TgMediaFile {
+    pub file_id: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+fn is_safe_attachment_mime(mime: &str) -> bool {
+    let lower = mime.trim().to_ascii_lowercase();
+    !lower.contains("x-msdownload") && !lower.contains("x-executable") && !lower.contains("x-sh")
+}
+
+fn sanitize_attachment_filename(suggested: &str, file_path: &str) -> String {
+    let raw = if suggested.trim().is_empty() {
+        Path::new(file_path).file_name().map_or_else(
+            || "attachment.bin".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    } else {
+        suggested.to_owned()
+    };
+    let clean: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    if clean.is_empty() || clean.starts_with('.') {
+        format!("file{clean}")
+    } else {
+        clean
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,11 +735,16 @@ fn run_telegram_loop(
         }
     };
 
-    let mut offset: Option<i64> = None;
+    let state_root = bridge.connector_state_root();
+    let mut offset: Option<i64> = load_persisted_offset(state_root.as_deref(), &bot.id);
     let mut backoff_ms: u64 = 1_000;
 
     while !stop.is_stopped() {
-        match sender.get_updates(offset) {
+        match sender.get_updates_with_retry_info(
+            offset,
+            Some(stop.cancel_flag()),
+            Some(stop.cancel_slot()),
+        ) {
             Ok(updates) => {
                 backoff_ms = 1_000;
                 if account_label.is_none()
@@ -350,7 +764,9 @@ fn run_telegram_loop(
                 );
                 for update in updates {
                     let next = update.update_id.saturating_add(1);
-                    offset = Some(offset.map_or(next, |prev| prev.max(next)));
+                    let updated_off = offset.map_or(next, |prev| prev.max(next));
+                    offset = Some(updated_off);
+                    persist_offset(state_root.as_deref(), &bot.id, updated_off);
                     if stop.is_stopped() {
                         break;
                     }
@@ -361,7 +777,10 @@ fn run_telegram_loop(
                 if stop.is_stopped() {
                     break;
                 }
-                let raw = err.to_string();
+                let (retry_after_secs, raw) = match err {
+                    TgCallError::RetryAfter(secs, io_err) => (Some(secs), io_err.to_string()),
+                    TgCallError::Other(io_err) => (None, io_err.to_string()),
+                };
                 let cat = classify_error(&raw);
                 report_status(
                     bridge,
@@ -373,10 +792,16 @@ fn run_telegram_loop(
                     Some(sanitize_error_for_status(&raw)),
                     Some(cat),
                 );
-                if stop.wait(Duration::from_millis(backoff_ms)) {
+                let sleep_dur = if let Some(secs) = retry_after_secs {
+                    Duration::from_secs(secs.clamp(1, 300))
+                } else {
+                    let cur = Duration::from_millis(backoff_ms);
+                    backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+                    cur
+                };
+                if stop.wait(sleep_dur) {
                     break;
                 }
-                backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
             }
         }
     }
@@ -430,12 +855,60 @@ fn handle_update(
     if from.is_bot {
         return;
     }
+    let mut attachments = Vec::new();
+    if let Some(bot_home) = bridge.bot_home_dir(bot_id) {
+        if let Some(ref doc) = msg.document
+            && let Some(path) = sender.download_attachment_to_inbox(
+                &doc.file_id,
+                doc.file_name.as_deref().unwrap_or("document.bin"),
+                doc.mime_type.as_deref(),
+                doc.file_size,
+                &bot_home,
+            )
+        {
+            attachments.push(path);
+        } else if let Some(ref photos) = msg.photo
+            && let Some(largest) = photos.iter().max_by_key(|p| p.file_size.unwrap_or(0))
+            && let Some(path) = sender.download_attachment_to_inbox(
+                &largest.file_id,
+                "photo.jpg",
+                Some("image/jpeg"),
+                largest.file_size,
+                &bot_home,
+            )
+        {
+            attachments.push(path);
+        } else if let Some(ref audio) = msg.audio
+            && let Some(path) = sender.download_attachment_to_inbox(
+                &audio.file_id,
+                "audio.mp3",
+                audio.mime_type.as_deref(),
+                audio.file_size,
+                &bot_home,
+            )
+        {
+            attachments.push(path);
+        } else if let Some(ref voice) = msg.voice
+            && let Some(path) = sender.download_attachment_to_inbox(
+                &voice.file_id,
+                "voice.ogg",
+                voice.mime_type.as_deref(),
+                voice.file_size,
+                &bot_home,
+            )
+        {
+            attachments.push(path);
+        }
+    }
+
     let text = msg
         .text
         .as_deref()
         .or(msg.caption.as_deref())
         .map(str::trim)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| (!attachments.is_empty()).then(|| "[Attachment received]".to_owned()));
     let Some(text) = text else {
         return;
     };
@@ -461,8 +934,8 @@ fn handle_update(
         thread_id,
         sender_id: from.id.to_string(),
         sender_name: format_tg_user_name(&from),
-        text: text.to_owned(),
-        attachments: Vec::new(),
+        text,
+        attachments,
         external_message_id: Some(msg.message_id.to_string()),
         acts_for,
     };
@@ -939,6 +1412,94 @@ mod tests {
         mgr.shutdown();
         server_stop.signal();
         server_handle.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn telegram_offset_persistence_409_429_interruptible_poll_and_media_work() {
+        let dir = std::env::temp_dir().join(format!("krill-tg-w3-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bot_id = BotId::new("tg-w3").unwrap();
+        persist_offset(Some(&dir), &bot_id, 555);
+        assert_eq!(load_persisted_offset(Some(&dir), &bot_id), Some(555));
+
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let cap_bg = Arc::clone(&captured);
+
+        let srv = thread::spawn(move || {
+            for idx in 0..4 {
+                let (mut sock, _) = mock.accept().unwrap();
+                let (path, body) = read_http_req(&mut sock);
+                let txt = String::from_utf8_lossy(&body).into_owned();
+                lock(&cap_bg).push((path.clone(), txt));
+                let (status, resp_body) = if idx == 0 {
+                    // 409 conflict
+                    (
+                        "409 Conflict",
+                        r#"{"ok":false,"error_code":409,"description":"terminated by other getUpdates"}"#,
+                    )
+                } else if idx == 1 {
+                    // 429 retry_after
+                    (
+                        "429 Too Many Requests",
+                        r#"{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":7}}"#,
+                    )
+                } else if idx == 2 {
+                    // sendDocument response
+                    ("200 OK", r#"{"ok":true,"result":{"message_id":901}}"#)
+                } else {
+                    // setMessageReaction response
+                    ("200 OK", r#"{"ok":true,"result":true}"#)
+                };
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+
+        let sender = TelegramSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("123456:tok".to_owned()),
+        );
+        let err409 = sender.get_updates(None).unwrap_err();
+        assert!(err409.to_string().contains("409 Conflict"));
+
+        match sender.get_updates_with_retry_info(None, None, None) {
+            Err(TgCallError::RetryAfter(secs, _)) => assert_eq!(secs, 7),
+            _ => panic!("expected TgCallError::RetryAfter"),
+        }
+
+        let attach = dir.join("note.txt");
+        std::fs::write(&attach, b"hello document").unwrap();
+        let target = DeliveryTarget {
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "-1001".to_owned(),
+            thread_id: Some("9".to_owned()),
+            reply_to_message_id: Some("88".to_owned()),
+        };
+        let fid = sender
+            .send_files(
+                &target,
+                &[attach.to_string_lossy().into_owned()],
+                Some("cap"),
+            )
+            .unwrap();
+        assert_eq!(fid.as_deref(), Some("901"));
+        sender.add_reaction(&target, "88", "👍").unwrap();
+
+        srv.join().unwrap();
+        let reqs = lock(&captured);
+        assert!(reqs[2].0.ends_with("/sendDocument"));
+        assert!(reqs[2].1.contains("hello document"));
+        assert!(reqs[3].0.ends_with("/setMessageReaction"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

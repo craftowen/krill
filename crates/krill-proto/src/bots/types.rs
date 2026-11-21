@@ -1130,6 +1130,224 @@ pub struct ExternalBotCandidate {
     pub soul_preview: Option<String>,
 }
 
+/// Event-triggered automation rule attached to a bot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotEventRuleConfig {
+    pub id: String,
+    pub source: String,
+    pub event: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Sanitized PNG avatar payload returned by `GetBotAvatar`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotAvatarData {
+    pub bot_id: BotId,
+    pub mime: String,
+    #[serde(deserialize_with = "super::rpc::rpc_avatar_bytes")]
+    pub png_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for BotAvatarData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotAvatarData")
+            .field("bot_id", &self.bot_id)
+            .field("mime", &self.mime)
+            .field("bytes", &self.png_bytes.len())
+            .finish()
+    }
+}
+
+/// Paginated item list returned by `ListItemsPage`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotItemsPage {
+    #[serde(default)]
+    pub items: Vec<BotItem>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub unseen_count: usize,
+}
+
+/// Single audit diff entry in a bot's `MEMORY.md` change history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMemoryHistoryEntry {
+    pub entry_id: String,
+    pub bot_id: BotId,
+    pub timestamp_ms: u64,
+    pub actor: String,
+    pub action: String,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(default)]
+    pub before_content: String,
+    #[serde(default)]
+    pub after_content: String,
+    #[serde(default)]
+    pub undoable: bool,
+    #[serde(default)]
+    pub undone: bool,
+}
+
+/// Runtime status of automatic and manual `MEMORY.md` tidy-up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMemoryTidyStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub interval_secs: u64,
+    #[serde(default)]
+    pub last_run_ms: Option<u64>,
+    #[serde(default)]
+    pub last_tidy_id: Option<String>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub auto_disabled: bool,
+    #[serde(default)]
+    pub undoable: bool,
+}
+
+/// Metadata for a topic markdown file stored under `memory/<topic>.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMemoryTopicInfo {
+    pub topic: String,
+    pub bytes: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Live or recently tracked PTY session associated with a bot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotSessionSummary {
+    pub session_id: crate::SessionId,
+    pub bot_id: BotId,
+    #[serde(default)]
+    pub link_id: Option<String>,
+    pub pid: u32,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub working: bool,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub created_at_ms: u64,
+}
+
+/// Reply target selection mode when sending a message in a bot group chat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotGroupReplyMode {
+    #[default]
+    Mentions,
+    All,
+    Selected,
+}
+
+/// Conversation thread inside a [`BotGroupChat`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotGroupThread {
+    pub thread_id: String,
+    pub group_id: String,
+    #[serde(default)]
+    pub title: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Message posted inside a [`BotGroupThread`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotGroupMessage {
+    pub message_id: String,
+    pub group_id: String,
+    pub thread_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub body: String,
+    #[serde(default)]
+    pub mentions: Vec<BotId>,
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub in_progress: bool,
+}
+
+/// Hydrated view of a bot group chat, its threads, and messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotGroupView {
+    pub group: BotGroupChat,
+    #[serde(default)]
+    pub threads: Vec<BotGroupThread>,
+    #[serde(default)]
+    pub messages: Vec<BotGroupMessage>,
+    #[serde(default)]
+    pub active_run: bool,
+}
+
+/// OAuth sign-in state for a `BrowserOAuth` MCP tool attached to a bot.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMcpOAuthState {
+    pub bot_id: BotId,
+    pub tool_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub auth_url: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+impl fmt::Debug for BotMcpOAuthState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotMcpOAuthState")
+            .field("bot_id", &self.bot_id)
+            .field("tool_id", &self.tool_id)
+            .field("status", &self.status)
+            .field("auth_url", &self.auth_url.as_ref().map(|_| "<redacted>"))
+            .field("error", &self.error)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
+    }
+}
+
+/// Connected third-party app account reported by Composio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposioConnectionInfo {
+    pub id: String,
+    pub app_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub account_label: Option<String>,
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
+}
+
+/// Default bot assignments for GitHub and Linear tracker routing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultTrackerBots {
+    #[serde(default)]
+    pub github: Option<BotId>,
+    #[serde(default)]
+    pub linear: Option<BotId>,
+}
+
+/// Result of a live connector connectivity test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotConnectorTestResult {
+    pub source: ExternalSource,
+    pub ok: bool,
+    #[serde(default)]
+    pub account_label: Option<String>,
+    #[serde(default)]
+    pub detail: String,
+}
+
 const fn default_true() -> bool {
     true
 }

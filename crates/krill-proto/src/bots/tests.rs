@@ -339,7 +339,9 @@ fn launch_preamble_fences_memory_and_toggles_first_run_rules() {
     assert!(first_run.contains("krill bot memory forget"));
     assert!(first_run.contains("krill bot reply"));
     assert!(first_run.contains("krill bot suggest"));
-    assert!(first_run.contains("krill orchestration send --to bot:<name>"));
+    assert!(first_run.contains("krill bot send --to <name>"));
+    assert!(!first_run.contains("krill orchestration send"));
+    assert!(first_run.contains("/bot-tools/krill/mcp"));
     assert!(first_run.contains("<<<<<\n"));
     assert!(first_run.contains("\n>>>>>"));
     assert!(first_run.contains(BOT_FIRST_RUN_RULES));
@@ -1105,6 +1107,1180 @@ fn bot_rpc_feature_bit_kinds_control_wiring_and_secret_redaction() {
     };
     let wire = postcard::to_stdvec(&oversized).unwrap();
     assert!(BotRpcRequest::decode(BOT_REQ, &wire).is_err());
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        write!(s, "{b:02x}").unwrap();
+        s
+    })
+}
+
+fn hex_decode(hex: &str) -> Vec<u8> {
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn v0317_wire_golden_bytes_unchanged() {
+    const GOLDEN_CFG: &str = "08626f742d70722d310b70722d72657669657765720b50522052657669657765721a52657669657773206f70656e2070756c6c2072657175657374730104f09fa496010242310006636c617564650111636c617564652d736f6e6e65742d342d3500010b70722d726576696577657200010970722d7265766965770000010101010d7765656b6461792d636865636b155765656b646179206d6f726e696e6720636865636b0b302039202a202a20312d351c5265766965772077616974696e672070756c6c20726571756573747301010355544301c0700501000180a305020673656e7472790653656e747279013b68747470733a2f2f757365723a70617373406d63702e73656e7472792e6465762f6d63703f6170695f6b65793d73656372657431323323667261670000010d417574686f72697a6174696f6e011c6b6579636861696e3a626f742d70722d313a6d63703a73656e74727901096c6f63616c2d636d640c4c6f63616c2068656c7065720001152f7573722f6c6f63616c2f62696e2f68656c7065720200000101011a6b6579636861696e3a626f742d70722d313a74656c656772616d01ff8cbe5f01540001011b6b6579636861696e3a626f742d70722d313a736c61636b2d617070011b6b6579636861696e3a626f742d70722d313a736c61636b2d626f74010743303132333435010755303132333435010207553031323334350000000000000000003c0000000000000101186b6579636861696e3a626f742d70722d313a67697468756201010f63726166746f77656e2f6b72696c6c3c0000003c000000011370722d7265766965772d636865636b6c6973740080d095ffbc3180d095ffbc31";
+    const GOLDEN_ITEM: &str = "0a6974656d2d7569642d310105626f742d310d526576696577205052202334320110436865636b20656467652063617365730108417070726f766564020001011263726166746f77656e2f6b72696c6c23343201010a6974656d2d7569642d31030105626f742d31010712526561647920666f72206465636973696f6e010a4d65726765206e6f773f0203596573024e6f010080d095ffbc31000280d095ffbc3180d095ffbc3180d095ffbc3100";
+    const GOLDEN_REQ_LIST: &str = "020000004800";
+    const GOLDEN_REQ_CREATE: &str =
+        "2800000048020648656c70657206636c617564650548656c7073000000000000010970722d72657669657700";
+    const GOLDEN_REQ_UPDATE: &str = "35000000480305626f742d31010848656c7065722032000002000111636c617564652d736f6e6e65742d342d35000000010001010000000000";
+    const GOLDEN_REQ_EXT: &str = "06000000482201030001";
+    const GOLDEN_RESP_OK: &str = "020000006800";
+    const GOLDEN_RESP_BOT: &str = "72020000680308626f742d70722d310b70722d72657669657765720b50522052657669657765721a52657669657773206f70656e2070756c6c2072657175657374730104f09fa496010242310006636c617564650111636c617564652d736f6e6e65742d342d3500010b70722d726576696577657200010970722d7265766965770000010101010d7765656b6461792d636865636b155765656b646179206d6f726e696e6720636865636b0b302039202a202a20312d351c5265766965772077616974696e672070756c6c20726571756573747301010355544301c0700501000180a305020673656e7472790653656e747279013b68747470733a2f2f757365723a70617373406d63702e73656e7472792e6465762f6d63703f6170695f6b65793d73656372657431323323667261670000010d417574686f72697a6174696f6e011c6b6579636861696e3a626f742d70722d313a6d63703a73656e74727901096c6f63616c2d636d640c4c6f63616c2068656c7065720001152f7573722f6c6f63616c2f62696e2f68656c7065720200000101011a6b6579636861696e3a626f742d70722d313a74656c656772616d01ff8cbe5f01540001011b6b6579636861696e3a626f742d70722d313a736c61636b2d617070011b6b6579636861696e3a626f742d70722d313a736c61636b2d626f74010743303132333435010755303132333435010207553031323334350000000000000000003c0000000000000101186b6579636861696e3a626f742d70722d313a67697468756201010f63726166746f77656e2f6b72696c6c3c0000003c000000011370722d7265766965772d636865636b6c6973740080d095ffbc3180d095ffbc31";
+    const GOLDEN_RESP_ITEM: &str = "b0000000680b0a6974656d2d7569642d310105626f742d310d526576696577205052202334320110436865636b20656467652063617365730108417070726f766564020001011263726166746f77656e2f6b72696c6c23343201010a6974656d2d7569642d31030105626f742d31010712526561647920666f72206465636973696f6e010a4d65726765206e6f773f0203596573024e6f010080d095ffbc31000280d095ffbc3180d095ffbc3180d095ffbc3100";
+    const GOLDEN_RESP_EXT: &str = "a902000068170103046d61696e08496d706f72746564157e2f2e6f7263612f626f74732f696d706f72746564010e48656c70732077697468205052730108626f742d70722d310b70722d72657669657765720b50522052657669657765721a52657669657773206f70656e2070756c6c2072657175657374730104f09fa496010242310006636c617564650111636c617564652d736f6e6e65742d342d3500010b70722d726576696577657200010970722d7265766965770000010101010d7765656b6461792d636865636b155765656b646179206d6f726e696e6720636865636b0b302039202a202a20312d351c5265766965772077616974696e672070756c6c20726571756573747301010355544301c0700501000180a305020673656e7472790653656e747279013b68747470733a2f2f757365723a70617373406d63702e73656e7472792e6465762f6d63703f6170695f6b65793d73656372657431323323667261670000010d417574686f72697a6174696f6e011c6b6579636861696e3a626f742d70722d313a6d63703a73656e74727901096c6f63616c2d636d640c4c6f63616c2068656c7065720001152f7573722f6c6f63616c2f62696e2f68656c7065720200000101011a6b6579636861696e3a626f742d70722d313a74656c656772616d01ff8cbe5f01540001011b6b6579636861696e3a626f742d70722d313a736c61636b2d617070011b6b6579636861696e3a626f742d70722d313a736c61636b2d626f74010743303132333435010755303132333435010207553031323334350000000000000000003c0000000000000101186b6579636861696e3a626f742d70722d313a67697468756201010f63726166746f77656e2f6b72696c6c3c0000003c000000011370722d7265766965772d636865636b6c6973740080d095ffbc3180d095ffbc31";
+
+    let bot_id = BotId::new("bot-1").unwrap();
+    let cfg = sample_bot_config();
+    let item = BotItem {
+        uid: "item-uid-1".to_owned(),
+        number: 1,
+        owner_bot_id: bot_id.clone(),
+        title: "Review PR #42".to_owned(),
+        description: Some("Check edge cases".to_owned()),
+        done_means: Some("Approved".to_owned()),
+        status: BotItemStatus::NeedsYou,
+        close_note: None,
+        links: vec![BotItemLink::Pr("craftowen/krill#42".to_owned())],
+        events: vec![BotItemEvent {
+            id: 1,
+            item_uid: "item-uid-1".to_owned(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Bot {
+                bot_id: bot_id.clone(),
+                session_id: Some(crate::SessionId(7)),
+            },
+            text: "Ready for decision".to_owned(),
+            decisions: vec![BotItemDecision {
+                question: "Merge now?".to_owned(),
+                options: vec!["Yes".to_owned(), "No".to_owned()],
+                recommended: Some(0),
+            }],
+            created_at_ms: 1_700_000_000_000,
+        }],
+        snoozed_until_ms: None,
+        version: 2,
+        last_activity_at_ms: 1_700_000_000_000,
+        created_at_ms: 1_700_000_000_000,
+        updated_at_ms: 1_700_000_000_000,
+        closed_at_ms: None,
+    };
+    let req_create = BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+        name: "Helper".to_owned(),
+        agent_id: "claude".to_owned(),
+        description: "Helps".to_owned(),
+        emoji: None,
+        avatar: None,
+        model: None,
+        effort: None,
+        permission_mode: None,
+        workspace: None,
+        template_id: Some("pr-review".to_owned()),
+        initial_soul: None,
+    }));
+    let req_update = BotRpcRequest::UpdateBot(Box::new(UpdateBotParams {
+        bot_id,
+        name: Some("Helper 2".to_owned()),
+        description: None,
+        emoji: FieldPatch::Unchanged,
+        avatar: FieldPatch::Clear,
+        agent_id: None,
+        model: FieldPatch::Set("claude-sonnet-4-5".to_owned()),
+        effort: FieldPatch::Unchanged,
+        permission_mode: None,
+        workspace: FieldPatch::Unchanged,
+        paused: Some(false),
+        first_run_completed: Some(true),
+        notifications: None,
+        schedules: None,
+        look_around: None,
+        memory_tidy: None,
+        mcp_tools: None,
+    }));
+    let req_ext = BotRpcRequest::ImportExternalBots {
+        source: Some(ExternalBotSourceApp::Orca),
+        path: None,
+        dry_run: true,
+    };
+    let resp_ext = BotRpcResponse::ImportedExternalBots {
+        candidates: vec![ExternalBotCandidate {
+            app: ExternalBotSourceApp::Orca,
+            agent: "main".to_owned(),
+            name: "Imported".to_owned(),
+            path: "~/.orca/bots/imported".to_owned(),
+            soul_preview: Some("Helps with PRs".to_owned()),
+        }],
+        imported: vec![cfg.clone()],
+    };
+
+    assert_eq!(hex_encode(&postcard::to_stdvec(&cfg).unwrap()), GOLDEN_CFG);
+    assert_eq!(
+        postcard::from_bytes::<BotConfig>(&hex_decode(GOLDEN_CFG)).unwrap(),
+        cfg
+    );
+
+    assert_eq!(
+        hex_encode(&postcard::to_stdvec(&item).unwrap()),
+        GOLDEN_ITEM
+    );
+    assert_eq!(
+        postcard::from_bytes::<BotItem>(&hex_decode(GOLDEN_ITEM)).unwrap(),
+        item
+    );
+
+    for (encoded, golden) in [
+        (BotRpcRequest::ListBots.encode().unwrap(), GOLDEN_REQ_LIST),
+        (req_create.encode().unwrap(), GOLDEN_REQ_CREATE),
+        (req_update.encode().unwrap(), GOLDEN_REQ_UPDATE),
+        (req_ext.encode().unwrap(), GOLDEN_REQ_EXT),
+    ] {
+        assert_eq!(hex_encode(&encoded), golden);
+        let (kind, body) = read_frame(&mut hex_decode(golden).as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, BOT_REQ);
+        let decoded = BotRpcRequest::decode(kind, &body).unwrap();
+        assert_eq!(hex_encode(&decoded.encode().unwrap()), golden);
+    }
+
+    for (encoded, golden) in [
+        (BotRpcResponse::Ok.encode().unwrap(), GOLDEN_RESP_OK),
+        (
+            BotRpcResponse::Bot(Box::new(cfg)).encode().unwrap(),
+            GOLDEN_RESP_BOT,
+        ),
+        (
+            BotRpcResponse::Item(Box::new(item)).encode().unwrap(),
+            GOLDEN_RESP_ITEM,
+        ),
+        (resp_ext.encode().unwrap(), GOLDEN_RESP_EXT),
+    ] {
+        assert_eq!(hex_encode(&encoded), golden);
+        let (kind, body) = read_frame(&mut hex_decode(golden).as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, BOT_REPLY);
+        let decoded = BotRpcResponse::decode(kind, &body).unwrap();
+        assert_eq!(hex_encode(&decoded.encode().unwrap()), golden);
+    }
+}
+
+#[test]
+fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
+    let bot_id = BotId::new("bot-v2").unwrap();
+    let slug = BotSlug::new("bot-v2").unwrap();
+    let sid = crate::SessionId(42);
+    let sample_item = BotItem {
+        uid: "item-v2".to_owned(),
+        number: 3,
+        owner_bot_id: bot_id.clone(),
+        title: "Investigate".to_owned(),
+        description: None,
+        done_means: None,
+        status: BotItemStatus::NeedsYou,
+        close_note: None,
+        links: Vec::new(),
+        events: Vec::new(),
+        snoozed_until_ms: None,
+        version: 1,
+        last_activity_at_ms: 100,
+        created_at_ms: 100,
+        updated_at_ms: 100,
+        closed_at_ms: None,
+    };
+
+    let v2_requests = vec![
+        (
+            BotRpcRequest::CreateBotV2(Box::new(CreateBotV2Params {
+                base: CreateBotParams {
+                    name: "V2 Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: "v2".to_owned(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                slug: Some(slug.clone()),
+                avatar_color: Some("#336699".to_owned()),
+                skills: vec!["pr-review-checklist".to_owned()],
+                events: vec![BotEventRuleConfig {
+                    id: "ev-1".to_owned(),
+                    source: "github".to_owned(),
+                    event: "review_requested".to_owned(),
+                    prompt: "Review it".to_owned(),
+                    enabled: true,
+                }],
+            })),
+            false,
+        ),
+        (
+            BotRpcRequest::UpdateBotExtras(Box::new(UpdateBotExtrasParams {
+                bot_id: bot_id.clone(),
+                avatar_color: FieldPatch::Set("#112233".to_owned()),
+                skills: Some(vec!["bug-reproduction".to_owned()]),
+                events: Some(Vec::new()),
+            })),
+            false,
+        ),
+        (
+            BotRpcRequest::ImportBotZipV2 {
+                zip_bytes: vec![0x50, 0x4b, 0x05, 0x06],
+                name_override: Some("Renamed".to_owned()),
+                slug_override: Some(slug),
+                agent_override: Some("codex".to_owned()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::UploadBotAvatar {
+                bot_id: bot_id.clone(),
+                png_bytes: build_test_png(&[]),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::GetBotAvatar {
+                bot_id: bot_id.clone(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::ListItemsPage {
+                bot_id: Some(bot_id.clone()),
+                include_closed: false,
+                include_snoozed: false,
+                limit: Some(25),
+                cursor: Some("cur-1".to_owned()),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::GetBotItem {
+                item_id: "item-v2".to_owned(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::AnswerBotItem {
+                item_id: "item-v2".to_owned(),
+                answer_text: Some("Proceed".to_owned()),
+                option_index: Some(0),
+                decision_id: Some("dec-1".to_owned()),
+                request_id: Some("req-1".to_owned()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::MarkBotItemsOpened {
+                bot_id: bot_id.clone(),
+                up_to_event_id: Some("99".to_owned()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::GetMemoryHistory {
+                bot_id: bot_id.clone(),
+                limit: Some(20),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::EditMemoryFact {
+                bot_id: bot_id.clone(),
+                old_fact: "old secret fact".to_owned(),
+                new_fact: "new fact".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::UndoMemoryChange {
+                bot_id: bot_id.clone(),
+                entry_id: "hist-1".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::GetMemoryTidyStatus {
+                bot_id: bot_id.clone(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::UndoMemoryTidy {
+                bot_id: bot_id.clone(),
+                tidy_id: Some("tidy-1".to_owned()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::ListMemoryTopics {
+                bot_id: bot_id.clone(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::GetMemoryTopic {
+                bot_id: bot_id.clone(),
+                topic: "repos".to_owned(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::SetMemoryTopic {
+                bot_id: bot_id.clone(),
+                topic: "repos".to_owned(),
+                content: "# Repos\n".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::ListSuggestions {
+                bot_id: Some(bot_id.clone()),
+                include_dismissed: false,
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::DismissSuggestion {
+                bot_id: bot_id.clone(),
+                suggestion_id: "sug-1".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::StartSuggestion {
+                bot_id: bot_id.clone(),
+                suggestion_id: "sug-1".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::MarkUpNextSeen {
+                bot_id: Some(bot_id.clone()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::ListBotSessions {
+                bot_id: Some(bot_id.clone()),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::ResetBotChat {
+                bot_id: bot_id.clone(),
+                session_id: Some(sid),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::StopBotSession {
+                bot_id: bot_id.clone(),
+                session_id: sid,
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::RetryBotKickoff {
+                bot_id: bot_id.clone(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::TakeOverWorkspace {
+                bot_id: bot_id.clone(),
+                session_id: sid,
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::SendBotRunAgain {
+                bot_id: bot_id.clone(),
+                session_id: sid,
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::UpdateGroup {
+                group_id: "grp-1".to_owned(),
+                name: Some("Eng".to_owned()),
+                description: Some("Team".to_owned()),
+                bot_ids: Some(vec![bot_id.clone()]),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::DeleteGroup {
+                group_id: "grp-1".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::ReorderGroups {
+                group_ids: vec!["grp-2".to_owned(), "grp-1".to_owned()],
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::NewGroupThread {
+                group_id: "grp-1".to_owned(),
+                title: Some("Release".to_owned()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::ReadGroup {
+                group_id: "grp-1".to_owned(),
+                thread_id: Some("thr-1".to_owned()),
+                limit: Some(50),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::SendGroupMessage {
+                group_id: "grp-1".to_owned(),
+                thread_id: Some("thr-1".to_owned()),
+                sender: "owner".to_owned(),
+                text: "SENSITIVE_MESSAGE_TEXT".to_owned(),
+                reply_mode: Some(BotGroupReplyMode::Mentions),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::StopGroup {
+                group_id: "grp-1".to_owned(),
+                thread_id: Some("thr-1".to_owned()),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::TestConnector {
+                bot_id: bot_id.clone(),
+                source: ExternalSource::Slack,
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::RedeemPairingCode {
+                code: "TOP_SECRET_PAIR_CODE".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::StartMcpOAuth {
+                bot_id: bot_id.clone(),
+                tool_id: "sentry".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::McpOAuthStatus {
+                bot_id: bot_id.clone(),
+                tool_id: "sentry".to_owned(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::CancelMcpOAuth {
+                bot_id: bot_id.clone(),
+                tool_id: "sentry".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::ListComposioConnections {
+                bot_id: bot_id.clone(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::StartComposioConnect {
+                bot_id: bot_id.clone(),
+                app_id: "notion".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::DisconnectComposioAccount {
+                bot_id: bot_id.clone(),
+                connection_id: "conn-1".to_owned(),
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::SetDefaultTrackerBot {
+                source: ExternalSource::GitHub,
+                bot_id: Some(bot_id.clone()),
+            },
+            false,
+        ),
+        (BotRpcRequest::GetDefaultTrackerBots, true),
+    ];
+    assert_eq!(v2_requests.len(), 44);
+
+    for (req, expected_ro) in v2_requests {
+        assert_eq!(
+            req.is_read_only(),
+            expected_ro,
+            "read-only mismatch for {req:?}"
+        );
+        let frame = req.encode().unwrap();
+        let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(kind, BOT_REQ);
+        assert_eq!(BotRpcRequest::decode(kind, &body).unwrap(), req);
+
+        let ctrl = Request::Bot(req.clone());
+        let ctrl_frame = ctrl.encode().unwrap();
+        let (ck, cb) = read_frame(&mut ctrl_frame.as_slice()).unwrap().unwrap();
+        assert_eq!(Request::decode(ck, &cb).unwrap(), ctrl);
+    }
+
+    // Security: ListAccessRequests leaks tokens and must NOT be read-only.
+    assert!(
+        !BotRpcRequest::ListAccessRequests {
+            bot_id: Some(bot_id.clone())
+        }
+        .is_read_only()
+    );
+
+    let group = BotGroupChat {
+        id: "grp-1".to_owned(),
+        name: "Core".to_owned(),
+        bot_ids: vec![bot_id.clone()],
+        description: "Core".to_owned(),
+        created_at_ms: 10,
+        updated_at_ms: 20,
+    };
+    let group_msg = BotGroupMessage {
+        message_id: "msg-1".to_owned(),
+        group_id: "grp-1".to_owned(),
+        thread_id: "thr-1".to_owned(),
+        sender_id: "owner".to_owned(),
+        sender_name: "Owner".to_owned(),
+        body: "SENSITIVE_GROUP_BODY".to_owned(),
+        mentions: vec![bot_id.clone()],
+        created_at_ms: 30,
+        in_progress: false,
+    };
+
+    let v2_responses = vec![
+        BotRpcResponse::BotAvatar(BotAvatarData {
+            bot_id: bot_id.clone(),
+            mime: "image/png".to_owned(),
+            png_bytes: build_test_png(&[]),
+        }),
+        BotRpcResponse::ItemsPage(BotItemsPage {
+            items: vec![sample_item],
+            next_cursor: Some("cur-2".to_owned()),
+            total_count: 1,
+            unseen_count: 1,
+        }),
+        BotRpcResponse::MemoryHistory(vec![BotMemoryHistoryEntry {
+            entry_id: "hist-1".to_owned(),
+            bot_id: bot_id.clone(),
+            timestamp_ms: 100,
+            actor: "owner".to_owned(),
+            action: "edit".to_owned(),
+            added: vec!["added line".to_owned()],
+            removed: vec!["removed line".to_owned()],
+            before_content: "before".to_owned(),
+            after_content: "after".to_owned(),
+            undoable: true,
+            undone: false,
+        }]),
+        BotRpcResponse::MemoryTidyStatus(BotMemoryTidyStatus {
+            enabled: true,
+            interval_secs: 86_400,
+            last_run_ms: Some(1_000),
+            last_tidy_id: Some("tidy-1".to_owned()),
+            consecutive_failures: 0,
+            auto_disabled: false,
+            undoable: true,
+        }),
+        BotRpcResponse::MemoryTopics(vec![BotMemoryTopicInfo {
+            topic: "repos".to_owned(),
+            bytes: 128,
+            updated_at_ms: 1_234,
+        }]),
+        BotRpcResponse::Suggestions(vec![BotSuggestion {
+            id: "sug-1".to_owned(),
+            bot_id: bot_id.clone(),
+            title: "Check PR".to_owned(),
+            why: "Stale".to_owned(),
+            ask: "Review".to_owned(),
+            link: None,
+            source: Some(ExternalSource::GitHub),
+            dismissed: false,
+            created_at_ms: 100,
+        }]),
+        BotRpcResponse::BotSessions(vec![BotSessionSummary {
+            session_id: sid,
+            bot_id: bot_id.clone(),
+            link_id: Some("link-1".to_owned()),
+            pid: 999,
+            live: true,
+            working: false,
+            label: "Main".to_owned(),
+            created_at_ms: 500,
+        }]),
+        BotRpcResponse::GroupView(BotGroupView {
+            group,
+            threads: vec![BotGroupThread {
+                thread_id: "thr-1".to_owned(),
+                group_id: "grp-1".to_owned(),
+                title: "Release".to_owned(),
+                created_at_ms: 10,
+                updated_at_ms: 30,
+            }],
+            messages: vec![group_msg.clone()],
+            active_run: false,
+        }),
+        BotRpcResponse::GroupMessagePosted {
+            message: group_msg,
+            dispatched_bots: vec![bot_id.clone()],
+        },
+        BotRpcResponse::ConnectorTest(BotConnectorTestResult {
+            source: ExternalSource::Slack,
+            ok: true,
+            account_label: Some("@krill".to_owned()),
+            detail: "Connected".to_owned(),
+        }),
+        BotRpcResponse::McpOAuth(BotMcpOAuthState {
+            bot_id: bot_id.clone(),
+            tool_id: "sentry".to_owned(),
+            status: "pending".to_owned(),
+            auth_url: Some("https://auth.example.com/oauth?code=SECRET_OAUTH_URL".to_owned()),
+            error: None,
+            updated_at_ms: 1_000,
+        }),
+        BotRpcResponse::ComposioConnections(vec![ComposioConnectionInfo {
+            id: "conn-1".to_owned(),
+            app_id: "notion".to_owned(),
+            status: "active".to_owned(),
+            account_label: Some("owen@example.com".to_owned()),
+            created_at_ms: Some(1_000),
+        }]),
+        BotRpcResponse::ComposioConnectStarted {
+            connection_id: "conn-2".to_owned(),
+            redirect_url: "https://connect.composio.dev/link?token=SECRET_REDIRECT".to_owned(),
+        },
+        BotRpcResponse::DefaultTrackerBots(DefaultTrackerBots {
+            github: Some(bot_id.clone()),
+            linear: None,
+        }),
+    ];
+    assert_eq!(v2_responses.len(), 14);
+
+    for reply in v2_responses {
+        let raw_reply = reply.encode().unwrap();
+        let (rk, rb) = read_frame(&mut raw_reply.as_slice()).unwrap().unwrap();
+        assert_eq!(rk, BOT_REPLY);
+        assert_eq!(BotRpcResponse::decode(rk, &rb).unwrap(), reply);
+
+        let ctrl_reply = Reply::Bot(reply);
+        let ctrl_raw = ctrl_reply.encode().unwrap();
+        let (crk, crb) = read_frame(&mut ctrl_raw.as_slice()).unwrap().unwrap();
+        assert_eq!(Reply::decode(crk, &crb).unwrap(), ctrl_reply);
+    }
+
+    // Debug redaction checks for secrets, pairing codes, URLs, and raw bytes
+    let pair = BotRpcRequest::RedeemPairingCode {
+        code: "PAIR_SECRET_999".to_owned(),
+    };
+    assert!(!format!("{pair:?}").contains("PAIR_SECRET_999"));
+
+    let avatar_req = BotRpcRequest::UploadBotAvatar {
+        bot_id: bot_id.clone(),
+        png_bytes: vec![0xde, 0xad, 0xbe, 0xef],
+    };
+    assert!(!format!("{avatar_req:?}").contains("222"));
+
+    let avatar_data = BotAvatarData {
+        bot_id: bot_id.clone(),
+        mime: "image/png".to_owned(),
+        png_bytes: vec![0xca, 0xfe, 0xba, 0xbe],
+    };
+    assert!(!format!("{avatar_data:?}").contains("202"));
+
+    let mcp_oauth = BotMcpOAuthState {
+        bot_id: bot_id.clone(),
+        tool_id: "sentry".to_owned(),
+        status: "pending".to_owned(),
+        auth_url: Some("https://secret.example/auth?state=SECRET_URL_TOKEN".to_owned()),
+        error: None,
+        updated_at_ms: 42,
+    };
+    assert!(!format!("{mcp_oauth:?}").contains("SECRET_URL_TOKEN"));
+    let mcp_resp = BotRpcResponse::McpOAuth(mcp_oauth);
+    assert!(!format!("{mcp_resp:?}").contains("SECRET_URL_TOKEN"));
+
+    let composio_resp = BotRpcResponse::ComposioConnectStarted {
+        connection_id: "conn-1".to_owned(),
+        redirect_url: "https://composio.example/connect?token=SECRET_COMPOSIO_URL".to_owned(),
+    };
+    assert!(!format!("{composio_resp:?}").contains("SECRET_COMPOSIO_URL"));
+
+    let group_send = BotRpcRequest::SendGroupMessage {
+        group_id: "grp-1".to_owned(),
+        thread_id: None,
+        sender: "owner".to_owned(),
+        text: "PRIVATE_CHAT_BODY".to_owned(),
+        reply_mode: None,
+    };
+    assert!(!format!("{group_send:?}").contains("PRIVATE_CHAT_BODY"));
+
+    let answer_req = BotRpcRequest::AnswerBotItem {
+        item_id: "item-1".to_owned(),
+        answer_text: Some("PRIVATE_ANSWER_BODY".to_owned()),
+        option_index: None,
+        decision_id: None,
+        request_id: None,
+    };
+    assert!(!format!("{answer_req:?}").contains("PRIVATE_ANSWER_BODY"));
+
+    // Bounded deserialization on UploadBotAvatar and ImportBotZipV2
+    let oversize_avatar = BotRpcRequest::UploadBotAvatar {
+        bot_id,
+        png_bytes: vec![0u8; MAX_AVATAR_PNG_BYTES.saturating_add(1)],
+    };
+    let wire_avatar = postcard::to_stdvec(&oversize_avatar).unwrap();
+    assert!(BotRpcRequest::decode(BOT_REQ, &wire_avatar).is_err());
+
+    let oversize_zip_v2 = BotRpcRequest::ImportBotZipV2 {
+        zip_bytes: vec![0u8; MAX_RPC_ZIP_BYTES.saturating_add(1)],
+        name_override: None,
+        slug_override: None,
+        agent_override: None,
+    };
+    let wire_zip_v2 = postcard::to_stdvec(&oversize_zip_v2).unwrap();
+    assert!(BotRpcRequest::decode(BOT_REQ, &wire_zip_v2).is_err());
+}
+
+#[test]
+fn home_preamble_workspace_differs_and_skill_materialization_guards_symlinks() {
+    let mut cfg = sample_bot_config();
+    cfg.workspace = Some("/tmp/repo-workspace".to_owned());
+    let home_path = std::path::Path::new("/tmp/bots/pr-reviewer");
+    let preamble = build_launch_preamble_in(
+        &cfg,
+        Some("# Soul"),
+        Some("# Memory"),
+        Some(home_path),
+        Some(std::path::Path::new("/tmp/repo-workspace")),
+    );
+    assert!(preamble.contains("/tmp/bots/pr-reviewer"));
+    assert!(preamble.contains("SOUL.md"));
+    assert!(preamble.contains("MEMORY.md"));
+    assert!(preamble.contains("AGENTS.md"));
+    assert!(preamble.contains("/bot-tools/krill/mcp"));
+    assert!(!preamble.contains("Your home is the current folder."));
+
+    let same_dir = build_launch_preamble_in(
+        &cfg,
+        Some("# Soul"),
+        Some("# Memory"),
+        Some(home_path),
+        Some(home_path),
+    );
+    assert!(same_dir.contains("Your home is the current folder."));
+
+    // Skill materialization seeds once, preserves edits, ignores unknown valid slugs, blocks traversal
+    let root = fresh_temp_dir("skills");
+    let bot_home = root.join("bot-home");
+    fs::create_dir_all(&bot_home).unwrap();
+
+    let written = materialize_bot_skills(
+        &bot_home,
+        &[
+            "pr-review-checklist".to_owned(),
+            "unknown-custom-skill".to_owned(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(written.len(), 1);
+    let skill_md = bot_home.join("skills/pr-review-checklist/SKILL.md");
+    assert!(skill_md.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(&skill_md).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    fs::write(&skill_md, "custom user edit").unwrap();
+    let written_again =
+        materialize_bot_skills(&bot_home, &["pr-review-checklist".to_owned()]).unwrap();
+    assert!(written_again.is_empty());
+    assert_eq!(fs::read_to_string(&skill_md).unwrap(), "custom user edit");
+
+    assert!(materialize_bot_skills(&bot_home, &["../escape".to_owned()]).is_err());
+    assert!(materialize_bot_skills(&bot_home, &["con".to_owned()]).is_err());
+
+    #[cfg(unix)]
+    {
+        let target = root.join("outside");
+        fs::create_dir_all(&target).unwrap();
+
+        // Symlinked <home>/skills/<skill>/SKILL.md rejected
+        let sym_skill_home = root.join("sym-skill-file");
+        fs::create_dir_all(sym_skill_home.join("skills/bug-reproduction")).unwrap();
+        std::os::unix::fs::symlink(
+            target.join("pwn.md"),
+            sym_skill_home.join("skills/bug-reproduction/SKILL.md"),
+        )
+        .unwrap();
+        assert!(materialize_bot_skills(&sym_skill_home, &["bug-reproduction".to_owned()]).is_err());
+
+        // Symlinked <home>/skills/<skill> rejected
+        let sym_skill_dir_home = root.join("sym-skill-dir");
+        fs::create_dir_all(sym_skill_dir_home.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&target, sym_skill_dir_home.join("skills/bug-reproduction"))
+            .unwrap();
+        assert!(
+            materialize_bot_skills(&sym_skill_dir_home, &["bug-reproduction".to_owned()]).is_err()
+        );
+
+        // Symlinked <home>/skills rejected
+        let sym_skills_root = root.join("sym-skills-root");
+        fs::create_dir_all(&sym_skills_root).unwrap();
+        std::os::unix::fs::symlink(&target, sym_skills_root.join("skills")).unwrap();
+        assert!(
+            materialize_bot_skills(&sym_skills_root, &["bug-reproduction".to_owned()]).is_err()
+        );
+
+        // init_bot_home rejects symlinked memory/ and skills/
+        let bots_root = root.join("bots-root");
+        let mut cfg_sym = sample_bot_config();
+        cfg_sym.slug = BotSlug::new("sym-mem-bot").unwrap();
+        cfg_sym.folder = "sym-mem-bot".to_owned();
+        fs::create_dir_all(bots_root.join("sym-mem-bot")).unwrap();
+        std::os::unix::fs::symlink(&target, bots_root.join("sym-mem-bot/memory")).unwrap();
+        assert!(init_bot_home(&bots_root, &cfg_sym, None).is_err());
+
+        cfg_sym.slug = BotSlug::new("sym-skills-bot").unwrap();
+        cfg_sym.folder = "sym-skills-bot".to_owned();
+        fs::create_dir_all(bots_root.join("sym-skills-bot")).unwrap();
+        std::os::unix::fs::symlink(&target, bots_root.join("sym-skills-bot/skills")).unwrap();
+        assert!(init_bot_home(&bots_root, &cfg_sym, None).is_err());
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn package_export_symlink_rejection_avatar_clearing_secret_scan_and_memory_topics() {
+    // 1. avatar.png cleared when has_avatar_png == false, mascot IDs preserved
+    let mut cfg = sample_bot_config();
+    cfg.avatar = Some("avatar.png".to_owned());
+    let no_avatar_manifest = SanitizedBotManifest::from_config(&cfg, false);
+    assert_eq!(no_avatar_manifest.avatar, None);
+    let with_avatar_manifest = SanitizedBotManifest::from_config(&cfg, true);
+    assert_eq!(with_avatar_manifest.avatar.as_deref(), Some("avatar.png"));
+    cfg.avatar = Some("B1".to_owned());
+    assert_eq!(
+        SanitizedBotManifest::from_config(&cfg, false)
+            .avatar
+            .as_deref(),
+        Some("B1")
+    );
+
+    // 2. scan_export_secrets catches all key shapes and avoids common false positives
+    let leaked = [
+        "openai=sk-proj123456 slack=xoxb-123456-abcdef xoxp-123456-abcdef ",
+        "xapp-1-abcdefg github=ghp_abcdef123456 gho_abcdef123456 ",
+        "linear=lin_api_abcdef12 google=",
+        "ya",
+        "29.a0AfH6SM123 refresh=1//0gabcdef12 ",
+        "tg=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+    ]
+    .concat();
+    let findings = scan_export_secrets(&leaked);
+    for expected in [
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "xapp-",
+        "ghp_",
+        "gho_",
+        "lin_api_",
+        "ya29.",
+        "1//",
+        "telegram_bot_token",
+    ] {
+        assert!(
+            findings.contains(&expected),
+            "missing secret finding {expected} in {findings:?}"
+        );
+    }
+    assert!(scan_export_secrets("ask-me about disk-clean and sk-SK locale").is_empty());
+
+    // 3. Memory topic round-trip with underscore, spaces, uppercase, UTF-8, and traversal rejection
+    let mut topics = BTreeMap::new();
+    topics.insert(
+        "team_notes.md".to_owned(),
+        "# Team\n\n- Use cargo nextest.\n".to_owned(),
+    );
+    topics.insert("Project Notes.md".to_owned(), "# Project\n".to_owned());
+    topics.insert("회의록_2026.md".to_owned(), "# 회의록\n".to_owned());
+    let zip = export_bot_zip(
+        &cfg,
+        "# Soul\n",
+        &BTreeMap::new(),
+        Some("# Memory\n"),
+        &topics,
+        None,
+        BotPackageExportOptions {
+            include_memory: true,
+            include_avatar: false,
+        },
+    )
+    .unwrap();
+    let imported = import_bot_zip(&zip).unwrap();
+    assert_eq!(imported.memory_topics, topics);
+
+    for bad_topic in [
+        "memory/.hidden.md",
+        "memory/../evil.md",
+        "memory/sub/topic.md",
+        "memory/CON.md",
+        "memory/nul.md",
+        "memory/   .md",
+        "memory/a\\b.md",
+    ] {
+        assert!(
+            validate_bot_package_path(bad_topic).is_err(),
+            "expected rejected memory topic path: {bad_topic}"
+        );
+    }
+
+    // 4. export_bot_home_zip refuses symlinks on SOUL.md, MEMORY.md, avatar.png
+    #[cfg(unix)]
+    {
+        let root = fresh_temp_dir("export-symlink");
+        let secret_file = root.join("secret.txt");
+        fs::write(&secret_file, "TOP_SECRET").unwrap();
+
+        let make_home = |label: &str| {
+            let h = root.join(label);
+            fs::create_dir_all(&h).unwrap();
+            fs::write(h.join("SOUL.md"), "# Soul\n").unwrap();
+            h
+        };
+
+        let h_soul = root.join("sym-soul");
+        fs::create_dir_all(&h_soul).unwrap();
+        std::os::unix::fs::symlink(&secret_file, h_soul.join("SOUL.md")).unwrap();
+        assert!(export_bot_home_zip(&h_soul, &cfg, BotPackageExportOptions::default()).is_err());
+
+        let h_mem = make_home("sym-mem");
+        std::os::unix::fs::symlink(&secret_file, h_mem.join("MEMORY.md")).unwrap();
+        assert!(
+            export_bot_home_zip(
+                &h_mem,
+                &cfg,
+                BotPackageExportOptions {
+                    include_memory: true,
+                    include_avatar: false,
+                }
+            )
+            .is_err()
+        );
+
+        let h_avatar = make_home("sym-avatar");
+        std::os::unix::fs::symlink(&secret_file, h_avatar.join("avatar.png")).unwrap();
+        assert!(
+            export_bot_home_zip(
+                &h_avatar,
+                &cfg,
+                BotPackageExportOptions {
+                    include_memory: false,
+                    include_avatar: true,
+                }
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[test]
+fn external_discovery_cross_platform_dedup_tilde_and_symlinks() {
+    let root = fresh_temp_dir("ext-disc");
+    let home = root.join("home");
+    let appdata = root.join("appdata");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&appdata).unwrap();
+
+    // Orca across ~/.orca/bots, macOS Application Support, and %APPDATA%/Orca/bots
+    fs::create_dir_all(home.join(".orca/bots/alpha")).unwrap();
+    fs::write(
+        home.join(".orca/bots/alpha/bot.json"),
+        r#"{"name":"Alpha","agent":"codex"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(home.join("Library/Application Support/Orca/bots/beta")).unwrap();
+    fs::write(
+        home.join("Library/Application Support/Orca/bots/beta/SOUL.md"),
+        "# Beta\n\nHelps beta.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(appdata.join("Orca/bots/gamma")).unwrap();
+    fs::write(
+        appdata.join("Orca/bots/gamma/SOUL.md"),
+        "# Gamma\n\nHelps gamma.\n",
+    )
+    .unwrap();
+
+    // OpenClaw via OPENCLAW_STATE_DIR with IDENTITY.md + agents->workspace pairing dedup + secret openclaw.json
+    let oc_dir = root.join("openclaw-state");
+    fs::create_dir_all(oc_dir.join("agents/main/agent")).unwrap();
+    fs::create_dir_all(oc_dir.join("agents/scout")).unwrap();
+    fs::create_dir_all(oc_dir.join("workspace")).unwrap();
+    fs::create_dir_all(oc_dir.join("workspace-scout")).unwrap();
+    fs::write(
+        oc_dir.join("openclaw.json"),
+        r#"{"slack":{"botToken":"xoxb-NEVER-READ-THIS"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        oc_dir.join("workspace/IDENTITY.md"),
+        "# ID\n\n- **Name:** Molty\n",
+    )
+    .unwrap();
+    fs::write(
+        oc_dir.join("workspace/SOUL.md"),
+        "# Molty\n\nPaired workspace.\n",
+    )
+    .unwrap();
+
+    // Hermes via HERMES_HOME with config.yaml-only profile and skipped .deleted dir
+    let hermes_dir = root.join("hermes-home");
+    fs::create_dir_all(hermes_dir.join("profiles/ops-bot")).unwrap();
+    fs::create_dir_all(hermes_dir.join("profiles/.deleted/old")).unwrap();
+    fs::write(hermes_dir.join("SOUL.md"), "# Hermes\n\nRoot hermes.\n").unwrap();
+    fs::write(
+        hermes_dir.join("profiles/ops-bot/config.yaml"),
+        "model: x\n",
+    )
+    .unwrap();
+    fs::write(
+        hermes_dir.join("profiles/.deleted/old/SOUL.md"),
+        "# Deleted\n",
+    )
+    .unwrap();
+
+    // OpenBot across ~/.openbot, ~/OpenBot/Agents, macOS Application Support/OpenBot, and %APPDATA%/OpenBot
+    fs::create_dir_all(home.join(".openbot/helper-one")).unwrap();
+    fs::write(
+        home.join(".openbot/helper-one/SOUL.md"),
+        "# Helper One\n\nAssists.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(home.join("OpenBot/Agents/agent-research")).unwrap();
+    fs::create_dir_all(home.join("Library/Application Support/OpenBot/Agents/agent-mac")).unwrap();
+    fs::create_dir_all(appdata.join("OpenBot/Agents/bot-win")).unwrap();
+
+    let found = discover_external_bots_in(&home, None, |key| match key {
+        "APPDATA" => Some(appdata.to_string_lossy().into_owned()),
+        "OPENCLAW_STATE_DIR" => Some(oc_dir.to_string_lossy().into_owned()),
+        "HERMES_HOME" => Some(hermes_dir.to_string_lossy().into_owned()),
+        _ => None,
+    });
+
+    let serialized = serde_json::to_string(&found).unwrap();
+    assert!(!serialized.contains("xoxb-NEVER-READ-THIS"));
+
+    let orca: Vec<_> = found
+        .iter()
+        .filter(|c| c.app == ExternalBotSourceApp::Orca)
+        .collect();
+    assert_eq!(orca.len(), 3);
+    assert!(orca.iter().any(|c| c.name == "Alpha" && c.agent == "codex"));
+    assert!(orca.iter().any(|c| c.name == "Beta"));
+    assert!(orca.iter().any(|c| c.name == "Gamma"));
+
+    // OpenClaw must pair agents/main -> workspace and agents/scout -> workspace-scout (2 total, not 4)
+    let openclaw: Vec<_> = found
+        .iter()
+        .filter(|c| c.app == ExternalBotSourceApp::OpenClaw)
+        .collect();
+    assert_eq!(openclaw.len(), 2);
+    assert!(
+        openclaw
+            .iter()
+            .any(|c| c.agent == "main" && c.name == "Molty")
+    );
+    assert!(
+        openclaw
+            .iter()
+            .any(|c| c.agent == "scout" && c.name == "Scout")
+    );
+
+    let hermes: Vec<_> = found
+        .iter()
+        .filter(|c| c.app == ExternalBotSourceApp::Hermes)
+        .collect();
+    assert_eq!(hermes.len(), 2);
+    assert!(hermes.iter().any(|c| c.agent == "default"));
+    assert!(hermes.iter().any(|c| c.agent == "ops-bot"));
+    assert!(!hermes.iter().any(|c| c.path.contains(".deleted")));
+
+    let openbot: Vec<_> = found
+        .iter()
+        .filter(|c| c.app == ExternalBotSourceApp::OpenBot)
+        .collect();
+    assert_eq!(openbot.len(), 4);
+
+    // ~/ and ~\ tilde expansion
+    assert_eq!(
+        expand_tilde(&home, "~/.orca/bots"),
+        home.join(".orca").join("bots")
+    );
+    assert_eq!(
+        expand_tilde(&home, r"~\.orca\bots"),
+        home.join(".orca").join("bots")
+    );
+    let custom_backslash =
+        discover_external_bots_in(&home, Some(std::path::Path::new(r"~\.orca\bots")), |_| None);
+    assert_eq!(custom_backslash.len(), 1);
+    assert_eq!(
+        custom_backslash.first().map(|c| c.name.as_str()),
+        Some("Alpha")
+    );
+
+    // Symlinked roots must be skipped via symlink_metadata
+    #[cfg(unix)]
+    {
+        let sym_home = root.join("sym-home");
+        fs::create_dir_all(&sym_home).unwrap();
+        let target_bots = root.join("outside-bots");
+        fs::create_dir_all(target_bots.join("sneaky")).unwrap();
+        fs::write(target_bots.join("sneaky/SOUL.md"), "# Sneaky\n").unwrap();
+        fs::create_dir_all(sym_home.join(".orca")).unwrap();
+        std::os::unix::fs::symlink(&target_bots, sym_home.join(".orca/bots")).unwrap();
+        let sym_found = discover_external_bots_in(&sym_home, None, |_| None);
+        assert!(sym_found.is_empty());
+
+        let sym_custom =
+            discover_external_bots_in(&sym_home, Some(&sym_home.join(".orca/bots")), |_| None);
+        assert!(sym_custom.is_empty());
+    }
+
+    fs::remove_dir_all(&root).ok();
 }
 
 proptest::proptest! {

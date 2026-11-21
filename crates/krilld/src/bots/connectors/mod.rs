@@ -15,14 +15,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash as _, Hasher as _};
 use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use krill_proto::SessionId;
 use krill_proto::bots::{
-    ActsFor, BotAccessRequest, BotConfig, BotConnectorStatus, BotErrorCategory, BotId,
-    ConnectorHealthState, ExternalConversationLink, ExternalSource,
+    ActsFor, BotAccessRequest, BotConfig, BotConnectorStatus, BotConnectorTestResult,
+    BotErrorCategory, BotId, ConnectorHealthState, ExternalConversationLink, ExternalSource,
 };
 use ring::digest;
 use zeroize::Zeroizing;
@@ -97,6 +99,30 @@ pub trait ConnectorBridge: Send + Sync {
         channel_id: &str,
     ) -> io::Result<AccessDecision>;
 
+    /// Verifies sender access including external workspace/team/guild context.
+    fn check_or_request_access_with_workspace(
+        &self,
+        bot_id: &BotId,
+        source: ExternalSource,
+        workspace_id: Option<&str>,
+        sender_id: &str,
+        sender_name: &str,
+        channel_id: &str,
+    ) -> io::Result<AccessDecision> {
+        let _ = workspace_id;
+        self.check_or_request_access(bot_id, source, sender_id, sender_name, channel_id)
+    }
+
+    /// Optional bot home directory path for staging bounded inbound attachments (`<bot_home>/inbox/`).
+    fn bot_home_dir(&self, _bot_id: &BotId) -> Option<PathBuf> {
+        None
+    }
+
+    /// Optional persistent directory root (`bots_root`) for connector cursor/offset persistence.
+    fn connector_state_root(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Resolves a secret from `SecretVault` (checking `explicit_ref` then `<bot_id>:<fallback_key>`).
     fn resolve_secret(
         &self,
@@ -153,11 +179,29 @@ impl Default for ConnectorEndpoints {
     }
 }
 
-/// Condvar-backed cooperative stop signal waking backoff sleeps immediately.
+/// Determines outbound SSRF policy for a connector HTTP/WS API base URL.
+pub(crate) fn policy_for_api_base(api_base: &str) -> http_client::SsrfPolicy {
+    if cfg!(test)
+        && (api_base.starts_with("http://127.0.0.1")
+            || api_base.starts_with("http://localhost")
+            || api_base.starts_with("http://[::1]")
+            || api_base.starts_with("ws://127.0.0.1")
+            || api_base.starts_with("ws://localhost")
+            || api_base.starts_with("ws://[::1]"))
+    {
+        http_client::SsrfPolicy::AllowLoopback
+    } else {
+        http_client::SsrfPolicy::StrictExternal
+    }
+}
+
+/// Condvar-backed cooperative stop signal waking backoff sleeps AND aborting blocking polls.
 #[derive(Debug, Default)]
 pub(crate) struct StopFlag {
     stopped: Mutex<bool>,
     changed: Condvar,
+    cancel_flag: Arc<AtomicBool>,
+    active_socket: http_client::RequestCancelSlot,
 }
 
 impl StopFlag {
@@ -165,9 +209,19 @@ impl StopFlag {
         *lock(&self.stopped)
     }
 
+    pub(crate) fn cancel_flag(&self) -> &Arc<AtomicBool> {
+        &self.cancel_flag
+    }
+
+    pub(crate) fn cancel_slot(&self) -> &http_client::RequestCancelSlot {
+        &self.active_socket
+    }
+
     pub(crate) fn signal(&self) {
+        self.cancel_flag.store(true, Ordering::Release);
         *lock(&self.stopped) = true;
         self.changed.notify_all();
+        http_client::cancel_active_request(&self.active_socket);
     }
 
     pub(crate) fn wait(&self, delay: Duration) -> bool {
@@ -537,6 +591,117 @@ impl ConnectorManager {
     /// Receives live tool/activity updates from a bot turn (3s-throttled in-place status edit).
     pub fn on_turn_activity(&self, bot_id: &BotId, session_id: SessionId, activity: &str) {
         self.router.on_turn_activity(bot_id, session_id, activity);
+    }
+
+    /// Runs an on-demand live connectivity test (`TestConnector`) for `(bot, source)`.
+    pub fn test_connector(
+        &self,
+        bot: &BotConfig,
+        source: ExternalSource,
+    ) -> BotConnectorTestResult {
+        let endpoints = &self.endpoints;
+        match source {
+            ExternalSource::Telegram => {
+                let tok = match resolve_with_fallback(
+                    self.bridge.as_ref(),
+                    &bot.id,
+                    bot.connectors.telegram.secret_ref.as_deref(),
+                    "telegram",
+                    "telegram_token",
+                ) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: "Missing Telegram bot token in secret vault".to_owned(),
+                        };
+                    }
+                    Err(err) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: format!("Failed reading Telegram secret: {}", err.kind()),
+                        };
+                    }
+                };
+                TelegramSender::new(&endpoints.telegram, tok).test_connection()
+            }
+            ExternalSource::Slack => {
+                let bot_tok = match resolve_with_fallback(
+                    self.bridge.as_ref(),
+                    &bot.id,
+                    bot.connectors.slack.bot_token_secret_ref.as_deref(),
+                    "slack-bot",
+                    "slack_bot_token",
+                ) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: "Missing Slack bot token (xoxb-) in secret vault".to_owned(),
+                        };
+                    }
+                    Err(err) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: format!("Failed reading Slack secret: {}", err.kind()),
+                        };
+                    }
+                };
+                SlackSender::new(&endpoints.slack, bot_tok).test_connection()
+            }
+            ExternalSource::Discord => {
+                let tok = match resolve_with_fallback(
+                    self.bridge.as_ref(),
+                    &bot.id,
+                    bot.connectors.discord.bot_token_secret_ref.as_deref(),
+                    "discord",
+                    "discord_token",
+                ) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: "Missing Discord bot token in secret vault".to_owned(),
+                        };
+                    }
+                    Err(err) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: format!("Failed reading Discord secret: {}", err.kind()),
+                        };
+                    }
+                };
+                DiscordSender::new(&endpoints.discord, tok).test_connection()
+            }
+            other => BotConnectorTestResult {
+                source: other,
+                ok: false,
+                account_label: None,
+                detail: "handled by connector subsystem".to_owned(),
+            },
+        }
+    }
+
+    /// Notifies a newly approved sender and replays their held blocked message once.
+    pub fn on_access_approved(&self, req: &BotAccessRequest) {
+        self.router.on_access_approved(req);
+    }
+
+    /// Discards any held inbound message associated with a denied access request.
+    pub fn discard_held_message(&self, token: &str) {
+        self.router.discard_held_message(token);
     }
 
     /// Receives turn-completion notifications with the extracted final reply text (if not quiet).

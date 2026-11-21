@@ -16,7 +16,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -25,17 +25,24 @@ use krill_proto::bots::{
     BotConfig, BotId, BotMcpAuthKind, BotToolRelayStatus, BotToolServerStatus,
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
+use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::bots::http_client::{self, HttpMethod, HttpRequest};
+use crate::bots::http_client::{self, HttpMethod, HttpRequest, SsrfPolicy};
+use crate::bots::mcp_oauth;
 use crate::bots::secrets::SecretVault;
 use crate::session::lock;
+use krill_proto::SessionId;
 
 const STACK_SIZE: usize = 128 * 1024;
 const ACCEPT_POLL_SLEEP: Duration = Duration::from_millis(25);
 const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LOCAL_HEADER_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RELAY_WORKERS: usize = 32;
+pub const BUILTIN_KRILL_CRED_ID: &str = "krill";
+pub const BUILTIN_MCP_TOOL_COUNT: u32 = 13;
 
 /// A single registered upstream MCP endpoint served through `/bot-tools/<cred_id>/mcp`.
 #[derive(Clone)]
@@ -62,12 +69,52 @@ impl fmt::Debug for ToolRoute {
     }
 }
 
+/// Caller identity bound to a built-in `/bot-tools/krill/mcp` JSON-RPC call.
+#[derive(Debug, Clone)]
+pub struct BuiltinMcpCallContext {
+    pub bot_id: BotId,
+    pub session_id: Option<SessionId>,
+    pub link: Option<String>,
+}
+
+/// Callback handler invoked by `/bot-tools/krill/mcp` for built-in bot tool calls.
+pub trait BuiltinMcpHandler: Send + Sync {
+    fn call_tool(
+        &self,
+        ctx: &BuiltinMcpCallContext,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Result<String, String>;
+}
+
+/// Resolved stdio MCP server ready to be handed cleanly to agent launch configuration.
+#[derive(Clone)]
+pub struct ResolvedStdioMcpTool {
+    pub id: String,
+    pub name: String,
+    pub command: Vec<String>,
+    pub env: Vec<(String, Zeroizing<String>)>,
+}
+
+impl fmt::Debug for ResolvedStdioMcpTool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_keys: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
+        f.debug_struct("ResolvedStdioMcpTool")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("command_len", &self.command.len())
+            .field("env_keys", &env_keys)
+            .finish()
+    }
+}
+
 /// Ephemeral per-session credentials handed to a launched bot process.
 #[derive(Clone)]
 pub struct BotToolLaunchGrant {
     pub base_url: String,
     pub token: Zeroizing<String>,
     pub cred_ids: Vec<String>,
+    pub stdio_tools: Vec<ResolvedStdioMcpTool>,
 }
 
 impl fmt::Debug for BotToolLaunchGrant {
@@ -76,6 +123,7 @@ impl fmt::Debug for BotToolLaunchGrant {
             .field("base_url", &self.base_url)
             .field("token", &"<redacted>")
             .field("cred_ids", &self.cred_ids)
+            .field("stdio_tools", &self.stdio_tools.len())
             .finish()
     }
 }
@@ -85,14 +133,32 @@ struct TokenGrant {
     bot_id: BotId,
     token: Zeroizing<String>,
     allowed_creds: BTreeSet<String>,
+    session_id: Option<SessionId>,
+    link_id: Option<String>,
 }
 
-#[derive(Default)]
 struct RelayState {
     routes: BTreeMap<String, ToolRoute>,
     grants: Vec<TokenGrant>,
     last_errors: BTreeMap<String, String>,
+    tool_counts: BTreeMap<String, u32>,
     last_relay_error: Option<String>,
+    builtin_handler: Option<Arc<dyn BuiltinMcpHandler>>,
+    upstream_ssrf_policy: SsrfPolicy,
+}
+
+impl Default for RelayState {
+    fn default() -> Self {
+        Self {
+            routes: BTreeMap::new(),
+            grants: Vec::new(),
+            last_errors: BTreeMap::new(),
+            tool_counts: BTreeMap::new(),
+            last_relay_error: None,
+            builtin_handler: None,
+            upstream_ssrf_policy: SsrfPolicy::StrictExternal,
+        }
+    }
 }
 
 struct RunningServer {
@@ -136,6 +202,16 @@ impl BotToolRelay {
         }
     }
 
+    /// Attaches the built-in `/bot-tools/krill/mcp` handler (called once on daemon startup).
+    pub fn set_builtin_handler(&self, handler: Arc<dyn BuiltinMcpHandler>) {
+        lock(&self.state).builtin_handler = Some(handler);
+    }
+
+    /// Configures outbound SSRF validation policy for proxied remote MCP endpoints (tests only).
+    pub fn set_upstream_ssrf_policy(&self, policy: SsrfPolicy) {
+        lock(&self.state).upstream_ssrf_policy = policy;
+    }
+
     /// Registers a single upstream MCP route (used by MCP tools and Composio).
     pub fn register_route(&self, route: ToolRoute) {
         let mut st = lock(&self.state);
@@ -143,14 +219,97 @@ impl BotToolRelay {
         st.routes.insert(route.cred_id.clone(), route);
     }
 
-    /// Synchronizes all enabled HTTP MCP tool routes for `bot` and mints an ephemeral launch token
-    /// if any routes (including Composio) are registered for `bot`. Starts the listener lazily.
+    /// Removes a single registered route by `cred_id` and stops the relay if unused.
+    pub fn unregister_route(&self, cred_id: &str) {
+        {
+            let mut st = lock(&self.state);
+            st.routes.remove(cred_id);
+            st.last_errors.remove(cred_id);
+            st.tool_counts.remove(cred_id);
+        }
+        self.stop_if_unused();
+    }
+
+    /// Updates `(session_id, link_id)` metadata attached to an active launch grant token.
+    pub fn bind_grant_session(&self, token: &str, session_id: SessionId, link_id: Option<&str>) {
+        let mut st = lock(&self.state);
+        for grant in &mut st.grants {
+            if constant_time_eq(grant.token.as_bytes(), token.as_bytes()) {
+                grant.session_id = Some(session_id);
+                if let Some(id) = link_id {
+                    grant.link_id = Some(id.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Updates `link_id` on grants matching `(bot_id, session_id)`.
+    pub fn update_session_link(&self, bot_id: &BotId, session_id: SessionId, link_id: &str) {
+        let mut st = lock(&self.state);
+        for grant in &mut st.grants {
+            if &grant.bot_id == bot_id && grant.session_id == Some(session_id) {
+                grant.link_id = Some(link_id.to_owned());
+            }
+        }
+    }
+
+    /// Resolves enabled stdio [`BotMcpToolConfig`] servers and their secret env vars cleanly.
+    #[must_use]
+    pub fn resolve_stdio_tools(&self, bot: &BotConfig) -> Vec<ResolvedStdioMcpTool> {
+        let mut out = Vec::new();
+        for tool in &bot.mcp_tools {
+            if !tool.enabled || tool.command.is_empty() {
+                continue;
+            }
+            let mut env = Vec::new();
+            if let Ok(Some(secret_val)) = self.secrets.resolve_secret(
+                &bot.id,
+                tool.secret_ref.as_deref(),
+                &format!("mcp:{}", tool.id),
+            ) {
+                if tool.header_names.is_empty() {
+                    let fallback_var = format!(
+                        "KRILL_MCP_{}_TOKEN",
+                        tool.id
+                            .chars()
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() {
+                                    c.to_ascii_uppercase()
+                                } else {
+                                    '_'
+                                }
+                            })
+                            .collect::<String>()
+                    );
+                    env.push((fallback_var, secret_val));
+                } else {
+                    for env_name in &tool.header_names {
+                        let trimmed = env_name.trim();
+                        if !trimmed.is_empty() {
+                            env.push((trimmed.to_owned(), secret_val.clone()));
+                        }
+                    }
+                }
+            }
+            out.push(ResolvedStdioMcpTool {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                command: tool.command.clone(),
+                env,
+            });
+        }
+        out
+    }
+
+    /// Synchronizes all enabled HTTP and stdio MCP tool routes for `bot` and mints an ephemeral
+    /// launch token if any HTTP/Composio routes, stdio tools, or built-in handler are active.
     pub fn prepare_launch_for_bot(
         &self,
         bot: &BotConfig,
     ) -> io::Result<Option<BotToolLaunchGrant>> {
+        let stdio_tools = self.resolve_stdio_tools(bot);
         let mut cred_ids = Vec::new();
-        {
+        let has_builtin = {
             let mut st = lock(&self.state);
             // Replace non-composio MCP routes for this bot.
             st.routes
@@ -188,9 +347,10 @@ impl BotToolRelay {
                     cred_ids.push(cid.clone());
                 }
             }
-        }
+            st.builtin_handler.is_some()
+        };
 
-        if cred_ids.is_empty() {
+        if cred_ids.is_empty() && stdio_tools.is_empty() && !has_builtin {
             self.stop_if_unused();
             return Ok(None);
         }
@@ -199,10 +359,14 @@ impl BotToolRelay {
         let token = mint_ephemeral_token()?;
         {
             let mut st = lock(&self.state);
+            let mut allowed_creds: BTreeSet<String> = cred_ids.iter().cloned().collect();
+            allowed_creds.insert(BUILTIN_KRILL_CRED_ID.to_owned());
             st.grants.push(TokenGrant {
                 bot_id: bot.id.clone(),
                 token: token.clone(),
-                allowed_creds: cred_ids.iter().cloned().collect(),
+                allowed_creds,
+                session_id: None,
+                link_id: None,
             });
         }
 
@@ -210,6 +374,7 @@ impl BotToolRelay {
             base_url: format!("http://{addr}"),
             token,
             cred_ids,
+            stdio_tools,
         }))
     }
 
@@ -224,16 +389,21 @@ impl BotToolRelay {
         let token = mint_ephemeral_token()?;
         {
             let mut st = lock(&self.state);
+            let mut allowed_creds: BTreeSet<String> = cred_ids.iter().cloned().collect();
+            allowed_creds.insert(BUILTIN_KRILL_CRED_ID.to_owned());
             st.grants.push(TokenGrant {
                 bot_id: bot_id.clone(),
                 token: token.clone(),
-                allowed_creds: cred_ids.iter().cloned().collect(),
+                allowed_creds,
+                session_id: None,
+                link_id: None,
             });
         }
         Ok(BotToolLaunchGrant {
             base_url: format!("http://{addr}"),
             token,
             cred_ids,
+            stdio_tools: Vec::new(),
         })
     }
 
@@ -262,24 +432,34 @@ impl BotToolRelay {
     pub fn status(&self) -> BotToolRelayStatus {
         let addr = lock(&self.server).as_ref().map(|s| s.addr);
         let st = lock(&self.state);
-        let connected_tools = st
-            .routes
-            .values()
-            .map(|r| {
-                let err = st.last_errors.get(&r.cred_id).cloned();
-                BotToolServerStatus {
-                    id: r.cred_id.clone(),
-                    name: r.name.clone(),
-                    endpoint_url: addr.map_or_else(
-                        || r.upstream_url.clone(),
-                        |a| format!("http://{a}/bot-tools/{}/mcp", r.cred_id),
-                    ),
-                    connected: addr.is_some() && err.is_none(),
-                    tool_count: 0,
-                    last_error: err,
-                }
-            })
-            .collect();
+        let mut connected_tools: Vec<BotToolServerStatus> = Vec::new();
+        if let Some(a) = addr
+            && (st.builtin_handler.is_some() || !st.grants.is_empty())
+        {
+            connected_tools.push(BotToolServerStatus {
+                id: BUILTIN_KRILL_CRED_ID.to_owned(),
+                name: "Krill Built-in Bot Tools".to_owned(),
+                endpoint_url: format!("http://{a}/bot-tools/{BUILTIN_KRILL_CRED_ID}/mcp"),
+                connected: true,
+                tool_count: BUILTIN_MCP_TOOL_COUNT,
+                last_error: None,
+            });
+        }
+        for r in st.routes.values() {
+            let err = st.last_errors.get(&r.cred_id).cloned();
+            let tool_count = st.tool_counts.get(&r.cred_id).copied().unwrap_or(0);
+            connected_tools.push(BotToolServerStatus {
+                id: r.cred_id.clone(),
+                name: r.name.clone(),
+                endpoint_url: addr.map_or_else(
+                    || r.upstream_url.clone(),
+                    |a| format!("http://{a}/bot-tools/{}/mcp", r.cred_id),
+                ),
+                connected: addr.is_some() && err.is_none(),
+                tool_count,
+                last_error: err,
+            });
+        }
         BotToolRelayStatus {
             running: addr.is_some(),
             listen_addr: addr.map(|a| a.to_string()),
@@ -308,7 +488,7 @@ impl BotToolRelay {
             .name("bot-tool-relay".to_owned())
             .stack_size(STACK_SIZE)
             .spawn(move || {
-                run_relay_loop(&listener, &stop_bg, &state_bg, &secrets_bg);
+                run_relay_loop(&listener, addr, &stop_bg, &state_bg, &secrets_bg);
             })?;
 
         *guard = Some(RunningServer {
@@ -385,22 +565,59 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+struct WorkerSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn run_relay_loop(
     listener: &TcpListener,
+    bound_addr: SocketAddr,
     stop: &AtomicBool,
     state: &Arc<Mutex<RelayState>>,
     secrets: &Arc<SecretVault>,
 ) {
+    let active_workers = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _peer)) => {
-                let state = Arc::clone(state);
-                let secrets = Arc::clone(secrets);
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(stream, &state, &secrets);
-                }));
-                if res.is_err() {
-                    tracing::warn!("bot tool relay handler panicked; continuing");
+            Ok((mut stream, _peer)) => {
+                let prev = active_workers.fetch_add(1, Ordering::AcqRel);
+                if prev >= MAX_RELAY_WORKERS {
+                    active_workers.fetch_sub(1, Ordering::AcqRel);
+                    stream.set_nonblocking(false).ok();
+                    write_simple_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        b"relay worker limit reached",
+                    )
+                    .ok();
+                    continue;
+                }
+                let state_w = Arc::clone(state);
+                let secrets_w = Arc::clone(secrets);
+                let stop_w = Arc::new(AtomicBool::new(false));
+                let stop_ref = stop.load(Ordering::Acquire);
+                stop_w.store(stop_ref, Ordering::Release);
+                let workers_w = Arc::clone(&active_workers);
+                let spawned = thread::Builder::new()
+                    .name("bot-tool-relay-worker".to_owned())
+                    .stack_size(STACK_SIZE)
+                    .spawn(move || {
+                        let _slot = WorkerSlotGuard(workers_w);
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_connection(stream, bound_addr, &state_w, &secrets_w);
+                        }));
+                        if res.is_err() {
+                            tracing::warn!("bot tool relay handler panicked; continuing");
+                        }
+                    });
+                if let Err(err) = spawned {
+                    active_workers.fetch_sub(1, Ordering::AcqRel);
+                    tracing::warn!(kind = ?err.kind(), "failed to spawn bot tool relay worker");
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -421,7 +638,36 @@ struct ParsedLocalRequest {
     body: Vec<u8>,
 }
 
-fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: &SecretVault) {
+fn validate_local_host_and_origin(
+    headers: &[(String, String)],
+    bound_addr: SocketAddr,
+) -> Result<(), &'static str> {
+    if headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("origin"))
+    {
+        return Err("Origin header forbidden on local tool relay");
+    }
+    let Some((_, host_raw)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")) else {
+        return Err("missing Host header");
+    };
+    let host = host_raw.trim();
+    let port = bound_addr.port();
+    let ok = host == format!("127.0.0.1:{port}")
+        || host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+        || host == format!("[::1]:{port}");
+    if !ok {
+        return Err("Host header mismatch");
+    }
+    Ok(())
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    bound_addr: SocketAddr,
+    state: &Mutex<RelayState>,
+    secrets: &SecretVault,
+) {
     stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(LOCAL_IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(LOCAL_IO_TIMEOUT)).ok();
@@ -430,6 +676,11 @@ fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: 
         write_simple_response(&mut stream, 400, "Bad Request", b"bad request").ok();
         return;
     };
+
+    if let Err(reason) = validate_local_host_and_origin(&req.headers, bound_addr) {
+        write_simple_response(&mut stream, 403, "Forbidden", reason.as_bytes()).ok();
+        return;
+    }
 
     let Some((cred_id, suffix_and_query)) = parse_relay_target(&req.target) else {
         write_simple_response(&mut stream, 404, "Not Found", b"unknown tool route").ok();
@@ -441,20 +692,30 @@ fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: 
         return;
     };
 
-    let route = {
+    let (grant_opt, route_opt, builtin_handler, upstream_policy) = {
         let st = lock(state);
-        let authorized = st.grants.iter().any(|g| {
-            g.allowed_creds.contains(cred_id)
-                && constant_time_eq(g.token.as_bytes(), token.as_bytes())
-        });
-        if authorized {
+        let grant = st
+            .grants
+            .iter()
+            .find(|g| {
+                constant_time_eq(g.token.as_bytes(), token.as_bytes())
+                    && (cred_id == BUILTIN_KRILL_CRED_ID || g.allowed_creds.contains(cred_id))
+            })
+            .cloned();
+        let route = if grant.is_some() && cred_id != BUILTIN_KRILL_CRED_ID {
             st.routes.get(cred_id).cloned()
         } else {
             None
-        }
+        };
+        (
+            grant,
+            route,
+            st.builtin_handler.clone(),
+            st.upstream_ssrf_policy,
+        )
     };
 
-    let Some(route) = route else {
+    let Some(grant) = grant_opt else {
         write_simple_response(
             &mut stream,
             401,
@@ -465,8 +726,27 @@ fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: 
         return;
     };
 
+    if cred_id == BUILTIN_KRILL_CRED_ID {
+        handle_builtin_mcp_request(&mut stream, &req, &grant, builtin_handler.as_deref());
+        return;
+    }
+
+    let Some(route) = route_opt else {
+        write_simple_response(
+            &mut stream,
+            401,
+            "Unauthorized",
+            b"invalid token or tool route",
+        )
+        .ok();
+        return;
+    };
+
+    let is_tools_list = request_is_tools_list(&req.body);
     let upstream_url = combine_upstream_url(&route.upstream_url, suffix_and_query);
-    let mut upstream_req = HttpRequest::new(req.method, upstream_url).with_body(req.body);
+    let mut upstream_req = HttpRequest::new(req.method, upstream_url)
+        .with_body(req.body)
+        .with_ssrf_policy(upstream_policy);
 
     for (name, value) in &req.headers {
         if is_hop_by_hop_or_auth_header(name) {
@@ -476,16 +756,31 @@ fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: 
     }
 
     if route.auth_kind != BotMcpAuthKind::None {
-        match secrets.resolve_secret(
-            &route.bot_id,
-            route.secret_ref.as_deref(),
-            &route.fallback_secret_key,
-        ) {
+        let secret_res = if route.auth_kind == BotMcpAuthKind::BrowserOAuth {
+            mcp_oauth::resolve_or_refresh_token(
+                secrets,
+                &route.bot_id,
+                &route.tool_id,
+                route.secret_ref.as_deref(),
+                &route.fallback_secret_key,
+                upstream_policy,
+            )
+        } else {
+            secrets.resolve_secret(
+                &route.bot_id,
+                route.secret_ref.as_deref(),
+                &route.fallback_secret_key,
+            )
+        };
+        match secret_res {
             Ok(Some(secret_val)) => {
                 inject_auth_header(&mut upstream_req.headers, &route, &secret_val);
             }
             Ok(None) => {
-                if route.auth_kind == BotMcpAuthKind::BearerHeader {
+                if matches!(
+                    route.auth_kind,
+                    BotMcpAuthKind::BearerHeader | BotMcpAuthKind::BrowserOAuth
+                ) {
                     lock(state)
                         .last_errors
                         .insert(route.cred_id.clone(), "missing tool credential".to_owned());
@@ -515,10 +810,60 @@ fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: 
         }
     }
 
-    match http_client::send(&upstream_req) {
-        Ok(resp) => {
-            lock(state).last_errors.remove(&route.cred_id);
-            write_forwarded_response(&mut stream, resp.status, &resp.headers, &resp.body).ok();
+    match http_client::send_streaming(&upstream_req) {
+        Ok(mut streaming) => {
+            if (300..400).contains(&streaming.status) {
+                lock(state).last_errors.insert(
+                    route.cred_id.clone(),
+                    format!("upstream redirect blocked (HTTP {})", streaming.status),
+                );
+                write_simple_response(
+                    &mut stream,
+                    502,
+                    "Bad Gateway",
+                    b"upstream MCP redirect blocked",
+                )
+                .ok();
+                return;
+            }
+            if streaming.is_event_stream() {
+                lock(state).last_errors.remove(&route.cred_id);
+                if write_streaming_response_head(&mut stream, streaming.status, &streaming.headers)
+                    .is_err()
+                {
+                    return;
+                }
+                while let Ok(Some(chunk)) = streaming.read_next_stream_chunk(SSE_IDLE_TIMEOUT, None)
+                {
+                    if stream.write_all(&chunk).is_err() || stream.flush().is_err() {
+                        break;
+                    }
+                }
+                return;
+            }
+            match streaming.into_response(MAX_LOCAL_BODY_BYTES) {
+                Ok(resp) => {
+                    if is_tools_list && let Some(count) = extract_tools_list_count(&resp.body) {
+                        lock(state).tool_counts.insert(route.cred_id.clone(), count);
+                    }
+                    lock(state).last_errors.remove(&route.cred_id);
+                    write_forwarded_response(&mut stream, resp.status, &resp.headers, &resp.body)
+                        .ok();
+                }
+                Err(err) => {
+                    lock(state).last_errors.insert(
+                        route.cred_id.clone(),
+                        format!("upstream read error: {}", err.kind()),
+                    );
+                    write_simple_response(
+                        &mut stream,
+                        502,
+                        "Bad Gateway",
+                        b"upstream MCP response error",
+                    )
+                    .ok();
+                }
+            }
         }
         Err(err) => {
             lock(state).last_errors.insert(
@@ -534,6 +879,340 @@ fn handle_connection(mut stream: TcpStream, state: &Mutex<RelayState>, secrets: 
             .ok();
         }
     }
+}
+
+fn handle_builtin_mcp_request(
+    stream: &mut TcpStream,
+    req: &ParsedLocalRequest,
+    grant: &TokenGrant,
+    handler: Option<&dyn BuiltinMcpHandler>,
+) {
+    let mcp_session_id = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+        .map_or_else(
+            || format!("krill-{}", grant.bot_id.as_str()),
+            |(_, v)| v.clone(),
+        );
+    let extra_headers = vec![
+        ("Content-Type".to_owned(), "application/json".to_owned()),
+        ("Mcp-Session-Id".to_owned(), mcp_session_id),
+        ("Cache-Control".to_owned(), "no-store".to_owned()),
+    ];
+
+    if req.method != HttpMethod::Post {
+        let err = json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": { "code": -32600, "message": "HTTP POST required for /bot-tools/krill/mcp" }
+        });
+        let body = serde_json::to_vec(&err).unwrap_or_default();
+        write_forwarded_response(stream, 405, &extra_headers, &body).ok();
+        return;
+    }
+
+    let Ok(rpc) = serde_json::from_slice::<Value>(&req.body) else {
+        let err = json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": { "code": -32700, "message": "Parse error" }
+        });
+        let body = serde_json::to_vec(&err).unwrap_or_default();
+        write_forwarded_response(stream, 400, &extra_headers, &body).ok();
+        return;
+    };
+
+    let id = rpc.get("id").cloned();
+    let method = rpc
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let params = rpc.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    if (method.starts_with("notifications/")
+        || id.is_none()
+        || id.as_ref().is_some_and(Value::is_null))
+        && (method == "notifications/initialized" || id.is_none())
+    {
+        write_forwarded_response(stream, 202, &extra_headers, b"").ok();
+        return;
+    }
+    let resp_id = id.unwrap_or(Value::Null);
+
+    let payload = match method {
+        "initialize" => {
+            let client_ver = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("2024-11-05");
+            json!({
+                "jsonrpc": "2.0",
+                "id": resp_id,
+                "result": {
+                    "protocolVersion": client_ver,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "krill-bot-mcp",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }
+            })
+        }
+        "ping" => json!({ "jsonrpc": "2.0", "id": resp_id, "result": {} }),
+        "tools/list" => json!({
+            "jsonrpc": "2.0",
+            "id": resp_id,
+            "result": { "tools": builtin_tools_schema() }
+        }),
+        "tools/call" => {
+            let tool_name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if tool_name.is_empty() {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": resp_id,
+                    "error": { "code": -32602, "message": "missing tool name" }
+                })
+            } else if !is_builtin_tool_name(tool_name) {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": resp_id,
+                    "error": { "code": -32602, "message": format!("unknown built-in tool: {tool_name}") }
+                })
+            } else if let Some(h) = handler {
+                let ctx = BuiltinMcpCallContext {
+                    bot_id: grant.bot_id.clone(),
+                    session_id: grant.session_id,
+                    link: grant.link_id.clone(),
+                };
+                match h.call_tool(&ctx, tool_name, &arguments) {
+                    Ok(text) => json!({
+                        "jsonrpc": "2.0",
+                        "id": resp_id,
+                        "result": {
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": false
+                        }
+                    }),
+                    Err(err_text) => json!({
+                        "jsonrpc": "2.0",
+                        "id": resp_id,
+                        "result": {
+                            "content": [{ "type": "text", "text": err_text }],
+                            "isError": true
+                        }
+                    }),
+                }
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": resp_id,
+                    "error": { "code": -32603, "message": "built-in MCP handler not attached" }
+                })
+            }
+        }
+        other => json!({
+            "jsonrpc": "2.0",
+            "id": resp_id,
+            "error": { "code": -32601, "message": format!("Method not found: {other}") }
+        }),
+    };
+
+    let body = serde_json::to_vec(&payload).unwrap_or_default();
+    write_forwarded_response(stream, 200, &extra_headers, &body).ok();
+}
+
+fn is_builtin_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "items_list"
+            | "items_create"
+            | "items_update"
+            | "memory_get"
+            | "memory_update"
+            | "memory_forget"
+            | "memory_history"
+            | "mail_send"
+            | "group_list"
+            | "group_send"
+            | "access_list"
+            | "ask_owner"
+            | "reply"
+    )
+}
+
+fn builtin_tools_schema() -> Value {
+    json!([
+        {
+            "name": "items_list",
+            "description": "List tracked deliverables and owner-decision items for this bot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_closed": { "type": "boolean" },
+                    "include_snoozed": { "type": "boolean" },
+                    "limit": { "type": "integer" },
+                    "cursor": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "items_create",
+            "description": "Create a tracked deliverable/work item for this bot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "done_means": { "type": "string" },
+                    "status": { "type": "string", "enum": ["planned", "working", "needs_you", "done", "canceled"] }
+                },
+                "required": ["title"]
+            }
+        },
+        {
+            "name": "items_update",
+            "description": "Update an existing tracked item (status, comment, title, description, done_means, close_note).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "done_means": { "type": "string" },
+                    "status": { "type": "string", "enum": ["planned", "working", "needs_you", "done", "canceled"] },
+                    "comment": { "type": "string" },
+                    "close_note": { "type": "string" }
+                },
+                "required": ["item_id"]
+            }
+        },
+        {
+            "name": "memory_get",
+            "description": "Read this bot's durable MEMORY.md contents.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "memory_update",
+            "description": "Update this bot's MEMORY.md (deletions blocked unless allow_deletions=true).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "allow_deletions": { "type": "boolean" }
+                },
+                "required": ["content"]
+            }
+        },
+        {
+            "name": "memory_forget",
+            "description": "Explicitly forget facts matching a text query from MEMORY.md.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "fact": { "type": "string" } },
+                "required": ["fact"]
+            }
+        },
+        {
+            "name": "memory_history",
+            "description": "Inspect audit history entries for MEMORY.md changes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "mail_send",
+            "description": "Send asynchronous bot-to-bot mail to another bot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to_bot": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" },
+                    "thread_id": { "type": "string" }
+                },
+                "required": ["to_bot", "subject", "body"]
+            }
+        },
+        {
+            "name": "group_list",
+            "description": "List bot group chat rooms available to this bot.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "group_send",
+            "description": "Post a message into a multi-bot group chat room.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "group_id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "thread_id": { "type": "string" },
+                    "reply_mode": { "type": "string", "enum": ["mentions", "all", "selected"] }
+                },
+                "required": ["group_id", "text"]
+            }
+        },
+        {
+            "name": "access_list",
+            "description": "List pending or resolved external access requests for this bot.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "ask_owner",
+            "description": "Escalate a question or structured decision gate (NeedsYou item) to the human owner.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "question": { "type": "string" },
+                    "options": { "type": "array", "items": { "type": "string" } },
+                    "recommended": { "type": "integer" },
+                    "done_means": { "type": "string" }
+                },
+                "required": ["question"]
+            }
+        },
+        {
+            "name": "reply",
+            "description": "Send an explicit reply, file attachment, or reaction back to the active external conversation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "files": { "type": "array", "items": { "type": "string" } },
+                    "reaction": { "type": "string" },
+                    "link_id": { "type": "string" }
+                }
+            }
+        }
+    ])
+}
+
+fn request_is_tools_list(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("method")
+                .and_then(Value::as_str)
+                .map(|m| m == "tools/list")
+        })
+        .unwrap_or(false)
+}
+
+fn extract_tools_list_count(body: &[u8]) -> Option<u32> {
+    let val = serde_json::from_slice::<Value>(body).ok()?;
+    let tools = val.get("result")?.get("tools")?.as_array()?;
+    u32::try_from(tools.len()).ok()
 }
 
 fn inject_auth_header(
@@ -722,14 +1401,40 @@ fn write_simple_response(
     stream.flush()
 }
 
-fn write_forwarded_response(
+fn http_status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Response",
+    }
+}
+
+fn sanitize_header_token(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+        .collect()
+}
+
+fn write_streaming_response_head(
     stream: &mut TcpStream,
     status: u16,
     headers: &[(String, String)],
-    body: &[u8],
 ) -> io::Result<()> {
+    let reason = http_status_reason(status);
     let mut head = String::with_capacity(256);
-    write!(head, "HTTP/1.1 {status} OK\r\n").ok();
+    write!(head, "HTTP/1.1 {status} {reason}\r\n").ok();
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("transfer-encoding")
             || k.eq_ignore_ascii_case("content-length")
@@ -737,7 +1442,38 @@ fn write_forwarded_response(
         {
             continue;
         }
-        write!(head, "{k}: {v}\r\n").ok();
+        let ck = sanitize_header_token(k);
+        let cv = sanitize_header_token(v);
+        if !ck.is_empty() {
+            write!(head, "{ck}: {cv}\r\n").ok();
+        }
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.flush()
+}
+
+fn write_forwarded_response(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> io::Result<()> {
+    let reason = http_status_reason(status);
+    let mut head = String::with_capacity(256);
+    write!(head, "HTTP/1.1 {status} {reason}\r\n").ok();
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("transfer-encoding")
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        let ck = sanitize_header_token(k);
+        let cv = sanitize_header_token(v);
+        if !ck.is_empty() {
+            write!(head, "{ck}: {cv}\r\n").ok();
+        }
     }
     write!(
         head,
@@ -776,6 +1512,7 @@ mod tests {
         let dir = temp_dir("inject");
         let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x55; 32]));
         let relay = BotToolRelay::new(Arc::clone(&secrets));
+        relay.set_upstream_ssrf_policy(SsrfPolicy::AllowLoopback);
         assert!(!relay.status().running);
 
         // Mock upstream MCP server capturing received Authorization / x-api-key header.
@@ -784,18 +1521,23 @@ mod tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let captured_bg = Arc::clone(&captured);
         let upstream_thread = thread::spawn(move || {
-            let (mut sock, _) = upstream.accept().unwrap();
-            let mut req_buf = [0u8; 4096];
-            let n = sock.read(&mut req_buf).unwrap();
-            *lock(&captured_bg) =
-                String::from_utf8_lossy(req_buf.get(..n).unwrap_or_default()).into_owned();
-            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            sock.write_all(resp.as_bytes()).unwrap();
+            for idx in 0..2 {
+                let (mut sock, _) = upstream.accept().unwrap();
+                let mut req_buf = [0u8; 4096];
+                let n = sock.read(&mut req_buf).unwrap();
+                let txt =
+                    String::from_utf8_lossy(req_buf.get(..n).unwrap_or_default()).into_owned();
+                if idx == 0 {
+                    *lock(&captured_bg) = txt;
+                }
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search"},{"name":"create"}]}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: up-sess-42\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
         });
 
         let bot_id = BotId::new("bot-mcp").unwrap();
@@ -823,32 +1565,223 @@ mod tests {
         let cred_id = grant.cred_ids.first().unwrap();
         let relay_url = format!("{}/bot-tools/{cred_id}/mcp", grant.base_url);
 
+        // Rejects wrong Host or present Origin with 403 Forbidden.
+        let origin_bad = http_client::send(
+            &HttpRequest::post_json(&relay_url, b"{}".to_vec())
+                .with_header("Authorization", format!("Bearer {}", *grant.token))
+                .with_header("Origin", "https://evil.example")
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(origin_bad.status, 403);
+
         // Rejects wrong bearer token.
         let bad = http_client::send(
             &HttpRequest::post_json(&relay_url, b"{}".to_vec())
-                .with_header("Authorization", "Bearer wrong-token"),
+                .with_header("Authorization", "Bearer wrong-token")
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
         )
         .unwrap();
         assert_eq!(bad.status, 401);
 
-        // Accepts valid launch token and injects `x-api-key` without forwarding launch token.
+        // Accepts valid launch token, forwards Mcp-Session-Id, injects key, updates tool_count.
         let ok = http_client::send(
-            &HttpRequest::post_json(&relay_url, br#"{"jsonrpc":"2.0"}"#.to_vec())
-                .with_header("Authorization", format!("Bearer {}", *grant.token)),
+            &HttpRequest::post_json(
+                &relay_url,
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec(),
+            )
+            .with_header("Authorization", format!("Bearer {}", *grant.token))
+            .with_header("Mcp-Session-Id", "client-sess-9")
+            .with_ssrf_policy(SsrfPolicy::AllowLoopback),
         )
         .unwrap();
         assert_eq!(ok.status, 200);
+        assert_eq!(ok.header("Mcp-Session-Id"), Some("up-sess-42"));
         assert!(ok.text().contains("tools"));
+
+        // Verify tool_count updated to 2 for linear route.
+        let st = relay.status();
+        let linear_st = st
+            .connected_tools
+            .iter()
+            .find(|t| t.id == *cred_id)
+            .unwrap();
+        assert_eq!(linear_st.tool_count, 2);
+
+        // Also send second request so mock finishes cleanly.
+        let ok2 = http_client::send(
+            &HttpRequest::post_json(
+                &relay_url,
+                br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#.to_vec(),
+            )
+            .with_header("Authorization", format!("Bearer {}", *grant.token))
+            .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(ok2.status, 200);
 
         upstream_thread.join().unwrap();
         let seen = lock(&captured).clone();
         assert!(seen.contains("x-api-key: upstream-api-key-xyz"));
+        assert!(seen.contains("Mcp-Session-Id: client-sess-9"));
         assert!(!seen.contains(&*grant.token));
 
-        // Cleanup stops relay when unused.
         relay.unregister_bot(&bot_id);
         assert!(!relay.status().running);
+        fs::remove_dir_all(&dir).ok();
+    }
 
+    #[test]
+    fn relay_builtin_krill_mcp_redirect_block_sse_stream_and_stdio_work() {
+        struct MockBuiltin;
+        impl BuiltinMcpHandler for MockBuiltin {
+            fn call_tool(
+                &self,
+                ctx: &BuiltinMcpCallContext,
+                tool_name: &str,
+                arguments: &Value,
+            ) -> Result<String, String> {
+                Ok(format!(
+                    "bot={} link={:?} tool={} args={arguments}",
+                    ctx.bot_id.as_str(),
+                    ctx.link,
+                    tool_name
+                ))
+            }
+        }
+
+        let dir = temp_dir("builtin-sse");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x77; 32]));
+        let relay = BotToolRelay::new(Arc::clone(&secrets));
+        relay.set_builtin_handler(Arc::new(MockBuiltin));
+
+        // Mock upstream that serves a 302 redirect on first call and SSE stream on second call.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        let up_thread = thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut sock, _) = upstream.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                assert!(n > 0);
+                if idx == 0 {
+                    sock.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .unwrap();
+                } else {
+                    sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: sse-1\r\nTransfer-Encoding: chunked\r\n\r\n19\r\nevent: message\ndata: ok\n\n\r\n0\r\n\r\n",
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        let bot_id = BotId::new("bot-k").unwrap();
+        secrets
+            .set_ref("stdio-tok", Zeroizing::new("std-secret-val".to_owned()))
+            .unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "Krill Builtin Bot", "claude", 1_000).unwrap();
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "redir".to_owned(),
+            name: "Redir".to_owned(),
+            endpoint_url: Some(format!("http://{up_addr}/mcp")),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::None,
+            header_names: Vec::new(),
+            secret_ref: None,
+            enabled: true,
+        });
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "local-fs".to_owned(),
+            name: "Local FS".to_owned(),
+            endpoint_url: None,
+            command: vec!["npx".to_owned(), "-y".to_owned(), "mcp-fs".to_owned()],
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["FS_API_TOKEN".to_owned()],
+            secret_ref: Some("stdio-tok".to_owned()),
+            enabled: true,
+        });
+
+        let grant = relay.prepare_launch_for_bot(&bot).unwrap().unwrap();
+        assert_eq!(grant.stdio_tools.len(), 1);
+        assert_eq!(grant.stdio_tools[0].command, vec!["npx", "-y", "mcp-fs"]);
+        assert_eq!(grant.stdio_tools[0].env[0].0, "FS_API_TOKEN");
+        assert_eq!(&*grant.stdio_tools[0].env[0].1, "std-secret-val");
+        relay.bind_grant_session(&grant.token, SessionId(55), Some("link-abc"));
+
+        // 1. StrictExternal blocks loopback upstream by default -> 502 Bad Gateway.
+        let cred_id = make_cred_id(&bot_id, "redir");
+        let blocked = http_client::send(
+            &HttpRequest::post_json(
+                format!("{}/bot-tools/{cred_id}/mcp", grant.base_url),
+                b"{}".to_vec(),
+            )
+            .with_header("Authorization", format!("Bearer {}", *grant.token))
+            .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(blocked.status, 502);
+
+        // 2. Allow loopback on upstream -> 302 redirect still blocked with 502; SSE streamed cleanly.
+        relay.set_upstream_ssrf_policy(SsrfPolicy::AllowLoopback);
+        let redir = http_client::send(
+            &HttpRequest::post_json(
+                format!("{}/bot-tools/{cred_id}/mcp", grant.base_url),
+                b"{}".to_vec(),
+            )
+            .with_header("Authorization", format!("Bearer {}", *grant.token))
+            .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(redir.status, 502);
+        assert!(redir.text().contains("redirect blocked"));
+
+        let sse = http_client::send(
+            &HttpRequest::get(format!("{}/bot-tools/{cred_id}/mcp", grant.base_url))
+                .with_header("Authorization", format!("Bearer {}", *grant.token))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(sse.status, 200);
+        assert_eq!(sse.header("Mcp-Session-Id"), Some("sse-1"));
+        assert_eq!(sse.text(), "event: message\ndata: ok\n\n");
+
+        // 3. Built-in /bot-tools/krill/mcp JSON-RPC initialize, tools/list, tools/call.
+        let krill_url = format!("{}/bot-tools/krill/mcp", grant.base_url);
+        let list_resp = http_client::send(
+            &HttpRequest::post_json(
+                &krill_url,
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec(),
+            )
+            .with_header("Authorization", format!("Bearer {}", *grant.token))
+            .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(list_resp.status, 200);
+        let list_json: Value = list_resp.json().unwrap();
+        assert_eq!(
+            list_json["result"]["tools"].as_array().unwrap().len(),
+            BUILTIN_MCP_TOOL_COUNT as usize
+        );
+
+        let call_resp = http_client::send(
+            &HttpRequest::post_json(
+                &krill_url,
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reply","arguments":{"text":"hi"}}}"#.to_vec(),
+            )
+            .with_header("Authorization", format!("Bearer {}", *grant.token))
+            .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(call_resp.status, 200);
+        let call_json: Value = call_resp.json().unwrap();
+        let text = call_json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("bot=bot-k link=Some(\"link-abc\") tool=reply"));
+
+        up_thread.join().unwrap();
+        relay.unregister_bot(&bot_id);
         fs::remove_dir_all(&dir).ok();
     }
 }

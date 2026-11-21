@@ -213,6 +213,92 @@ fn no_daemon_supported_cached(exe: &Path) -> bool {
     supported
 }
 
+/// Pair of Codex `-c` CLI override arguments and corresponding child process env vars.
+pub(crate) type CodexMcpArgsAndEnv = (Vec<String>, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// Generates Codex `-c mcp_servers.<id>.*` flags and accompanying env vars (keeping bearer tokens
+/// out of argv by passing them via `bearer_token_env_var` / `env_vars`).
+pub(crate) fn mcp_args_and_env(cfg: &crate::agent::BotMcpLaunchConfig) -> CodexMcpArgsAndEnv {
+    let mut args = Vec::new();
+    let mut env = Vec::new();
+
+    for (idx, srv) in cfg.http_servers.iter().enumerate() {
+        let key = sanitize_toml_key(&srv.id);
+        let url_literal = toml_basic_string(&srv.url);
+        args.push("-c".to_owned());
+        args.push(format!("mcp_servers.{key}.url={url_literal}"));
+        if !srv.bearer_token.is_empty() {
+            let env_name = format!(
+                "KRILL_BOT_MCP_TOKEN_{}_{}",
+                idx,
+                key.to_ascii_uppercase().replace('-', "_")
+            );
+            env.push((
+                env_name.as_bytes().to_vec(),
+                srv.bearer_token.as_bytes().to_vec(),
+            ));
+            args.push("-c".to_owned());
+            args.push(format!(
+                "mcp_servers.{key}.bearer_token_env_var={}",
+                toml_basic_string(&env_name)
+            ));
+        }
+    }
+
+    for srv in &cfg.stdio_servers {
+        let Some((prog, cmd_args)) = srv.command.split_first() else {
+            continue;
+        };
+        let key = sanitize_toml_key(&srv.id);
+        args.push("-c".to_owned());
+        args.push(format!(
+            "mcp_servers.{key}.command={}",
+            toml_basic_string(prog)
+        ));
+        if !cmd_args.is_empty() {
+            let encoded: Vec<String> = cmd_args.iter().map(|a| toml_basic_string(a)).collect();
+            args.push("-c".to_owned());
+            args.push(format!("mcp_servers.{key}.args=[{}]", encoded.join(",")));
+        }
+        if !srv.env.is_empty() {
+            let mut env_names = Vec::with_capacity(srv.env.len());
+            for (k, v) in &srv.env {
+                env.push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+                env_names.push(toml_basic_string(k));
+            }
+            args.push("-c".to_owned());
+            args.push(format!(
+                "mcp_servers.{key}.env_vars=[{}]",
+                env_names.join(",")
+            ));
+        }
+    }
+
+    (args, env)
+}
+
+fn sanitize_toml_key(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "server".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+fn toml_basic_string(raw: &str) -> String {
+    serde_json::to_string(raw).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
 pub(super) fn no_daemon_supported_with(exe: &Path) -> bool {
     let mut cmd = Command::new(exe);
     cmd.arg("--help")

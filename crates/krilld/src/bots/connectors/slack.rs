@@ -7,25 +7,30 @@
 //! (`block_actions` gate approvals), and sends outbound Web API calls (`chat.postMessage`,
 //! `chat.update`, `reactions.add`) with the bot token (`xoxb-`).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::io;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use krill_proto::bots::{
-    BotConfig, BotConnectorStatus, BotErrorCategory, BotId, ConnectorHealthState, ExternalSource,
+    BotConfig, BotConnectorStatus, BotConnectorTestResult, BotErrorCategory, BotId,
+    ConnectorHealthState, ExternalSource,
 };
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use crate::bots::connectors::policy_for_api_base;
 use crate::bots::connectors::router::{
     ConversationRouter, DeliveryTarget, PlatformSender, classify_error, now_ms,
     sanitize_error_for_status,
 };
 use crate::bots::connectors::ws_client::{WsClient, WsEvent};
 use crate::bots::connectors::{ConnectorBridge, InboundExternalMessage, StopFlag};
-use crate::bots::http_client::{self, HttpRequest};
+use crate::bots::http_client::{self, HttpRequest, SsrfPolicy};
+use crate::session::lock;
 
 /// Production Slack Web API base URL.
 pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
@@ -36,11 +41,15 @@ const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const DEDUP_RING_CAPACITY: usize = 256;
+const MAX_SLACK_USER_CACHE: usize = 256;
+const MAX_OUTBOUND_SLACK_FILE_BYTES: usize = 25 * 1024 * 1024;
 
 /// Slack Web API HTTP client & [`PlatformSender`] implementation.
 pub struct SlackSender {
     api_base: String,
     bot_token: Zeroizing<String>,
+    ssrf_policy: SsrfPolicy,
+    user_cache: Mutex<(VecDeque<String>, BTreeMap<String, String>)>,
 }
 
 impl std::fmt::Debug for SlackSender {
@@ -54,9 +63,13 @@ impl std::fmt::Debug for SlackSender {
 impl SlackSender {
     #[must_use]
     pub fn new(api_base: &str, bot_token: Zeroizing<String>) -> Self {
+        let base = api_base.trim_end_matches('/').to_owned();
+        let ssrf_policy = policy_for_api_base(&base);
         Self {
-            api_base: api_base.trim_end_matches('/').to_owned(),
+            api_base: base,
             bot_token,
+            ssrf_policy,
+            user_cache: Mutex::new((VecDeque::new(), BTreeMap::new())),
         }
     }
 
@@ -70,7 +83,8 @@ impl SlackSender {
         let url = format!("{}/{method}", self.api_base);
         let req = HttpRequest::post_json(url, body)
             .with_header("Authorization", format!("Bearer {token}"))
-            .with_timeout(API_REQUEST_TIMEOUT);
+            .with_timeout(API_REQUEST_TIMEOUT)
+            .with_ssrf_policy(self.ssrf_policy);
         let resp = http_client::send(&req)
             .map_err(|err| io::Error::new(err.kind(), format!("Slack {method} transport error")))?;
         let parsed: Value = resp
@@ -89,6 +103,83 @@ impl SlackSender {
                 sanitize_error_for_status(err_code)
             )))
         }
+    }
+
+    fn get_api(&self, method_and_query: &str, token: &str) -> io::Result<Value> {
+        let url = format!("{}/{method_and_query}", self.api_base);
+        let req = HttpRequest::get(url)
+            .with_header("Authorization", format!("Bearer {token}"))
+            .with_timeout(API_REQUEST_TIMEOUT)
+            .with_ssrf_policy(self.ssrf_policy);
+        let resp = http_client::send(&req)
+            .map_err(|err| io::Error::new(err.kind(), "Slack API transport error"))?;
+        let parsed: Value = resp
+            .json()
+            .unwrap_or_else(|_| json!({"ok": false, "error": format!("HTTP {}", resp.status)}));
+        if resp.is_success() && parsed.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(parsed)
+        } else {
+            let err_code = parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("slack_api_error");
+            Err(io::Error::other(format!(
+                "HTTP {}: {}",
+                resp.status,
+                sanitize_error_for_status(err_code)
+            )))
+        }
+    }
+
+    /// Resolves a human-readable Slack sender display name via bounded LRU cache over `users.info`.
+    #[must_use]
+    pub fn resolve_sender_name(&self, user_id: &str) -> String {
+        {
+            let mut cache = lock(&self.user_cache);
+            if let Some(cached) = cache.1.get(user_id).cloned() {
+                cache.0.retain(|u| u != user_id);
+                cache.0.push_back(user_id.to_owned());
+                return cached;
+            }
+        }
+        let query = format!("users.info?user={}", http_client::percent_encode(user_id));
+        let resolved = self
+            .get_api(&query, self.bot_token.as_str())
+            .ok()
+            .and_then(|v| {
+                let u = v.get("user")?;
+                let display = u
+                    .get("profile")
+                    .and_then(|p| p.get("display_name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let real = u
+                    .get("real_name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let name = u
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                display.or(real).or(name).map(ToOwned::to_owned)
+            });
+        if let Some(ref name) = resolved {
+            let mut cache = lock(&self.user_cache);
+            if !cache.1.contains_key(user_id) && cache.0.len() >= MAX_SLACK_USER_CACHE {
+                if let Some(evicted) = cache.0.pop_front() {
+                    cache.1.remove(&evicted);
+                }
+            } else {
+                cache.0.retain(|u| u != user_id);
+            }
+            cache.0.push_back(user_id.to_owned());
+            cache.1.insert(user_id.to_owned(), name.clone());
+            return name.clone();
+        }
+        user_id.to_owned()
     }
 
     /// Calls `POST /apps.connections.open` using the app-level `xapp-` token to obtain a Socket Mode URL.
@@ -119,6 +210,28 @@ impl SlackSender {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         Ok((bot_user_id, team))
+    }
+
+    /// Runs an on-demand connectivity check for `TestConnector`.
+    #[must_use]
+    pub fn test_connection(&self) -> BotConnectorTestResult {
+        match self.auth_test() {
+            Ok((_uid, team)) => BotConnectorTestResult {
+                source: ExternalSource::Slack,
+                ok: true,
+                account_label: team.clone(),
+                detail: format!(
+                    "Connected to Slack ({})",
+                    team.unwrap_or_else(|| "auth.test ok".to_owned())
+                ),
+            },
+            Err(err) => BotConnectorTestResult {
+                source: ExternalSource::Slack,
+                ok: false,
+                account_label: None,
+                detail: sanitize_error_for_status(&err.to_string()),
+            },
+        }
     }
 }
 
@@ -187,6 +300,118 @@ impl PlatformSender for SlackSender {
             Err(err) => Err(err),
         }
     }
+
+    fn send_files(
+        &self,
+        target: &DeliveryTarget,
+        files: &[String],
+        caption: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let mut uploaded: Vec<Value> = Vec::with_capacity(files.len());
+        for raw_path in files {
+            let path = Path::new(raw_path);
+            let meta = fs::symlink_metadata(path)?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing non-regular attachment: {raw_path}"),
+                ));
+            }
+            if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_OUTBOUND_SLACK_FILE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attachment exceeds 25 MiB Slack limit",
+                ));
+            }
+            let bytes = fs::read(path)?;
+            let filename = path.file_name().map_or_else(
+                || "attachment.bin".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let len_str = bytes.len().to_string();
+            let get_url_req = HttpRequest::post_form(
+                format!("{}/files.getUploadURLExternal", self.api_base),
+                &[
+                    ("filename", filename.as_str()),
+                    ("length", len_str.as_str()),
+                ],
+            )
+            .with_header(
+                "Authorization",
+                format!("Bearer {}", self.bot_token.as_str()),
+            )
+            .with_timeout(API_REQUEST_TIMEOUT)
+            .with_ssrf_policy(self.ssrf_policy);
+            let url_resp = http_client::send(&get_url_req).map_err(|err| {
+                io::Error::new(err.kind(), "Slack files.getUploadURLExternal failed")
+            })?;
+            let url_json: Value = url_resp.json().unwrap_or(Value::Null);
+            if !(url_resp.is_success() && url_json.get("ok").and_then(Value::as_bool) == Some(true))
+            {
+                return Err(io::Error::other(
+                    url_json.get("error").and_then(Value::as_str).map_or_else(
+                        || format!("HTTP {}", url_resp.status),
+                        sanitize_error_for_status,
+                    ),
+                ));
+            }
+            let upload_url = url_json
+                .get("upload_url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing Slack upload_url")
+                })?;
+            let file_id = url_json
+                .get("file_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Slack file_id"))?
+                .to_owned();
+
+            let up_req = HttpRequest::new(http_client::HttpMethod::Post, upload_url)
+                .with_header("Content-Type", "application/octet-stream")
+                .with_body(bytes)
+                .with_timeout(API_REQUEST_TIMEOUT)
+                .with_ssrf_policy(self.ssrf_policy);
+            let up_resp = http_client::send(&up_req)
+                .map_err(|err| io::Error::new(err.kind(), "Slack external file upload failed"))?;
+            if !up_resp.is_success() {
+                return Err(io::Error::other(format!(
+                    "Slack upload returned HTTP {}",
+                    up_resp.status
+                )));
+            }
+            uploaded.push(json!({ "id": file_id, "title": filename }));
+        }
+        if uploaded.is_empty() {
+            return Ok(None);
+        }
+        let last_id = uploaded
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let mut complete_payload = json!({
+            "files": uploaded,
+            "channel_id": target.channel_id,
+        });
+        if let Some(ref ts) = target.thread_id
+            && !ts.trim().is_empty()
+            && let Some(obj) = complete_payload.as_object_mut()
+        {
+            obj.insert("thread_ts".to_owned(), json!(ts));
+        }
+        if let Some(cap) = caption.filter(|c| !c.trim().is_empty())
+            && let Some(obj) = complete_payload.as_object_mut()
+        {
+            obj.insert("initial_comment".to_owned(), json!(cap));
+        }
+        self.post_api(
+            "files.completeUploadExternal",
+            self.bot_token.as_str(),
+            &complete_payload,
+        )?;
+        Ok(last_id)
+    }
 }
 
 /// Spawns a 128 KiB Slack Socket Mode worker thread for `bot`.
@@ -238,7 +463,9 @@ fn run_slack_loop(
 ) {
     let (mut bot_user_id, mut account_label) = sender.auth_test().unwrap_or((None, None));
     let mut seen_events: VecDeque<String> = VecDeque::with_capacity(DEDUP_RING_CAPACITY);
+    let mut participated_threads: BTreeSet<(String, String)> = BTreeSet::new();
     let mut backoff_ms: u64 = 1_000;
+    let mut consecutive_disconnects: u32 = 0;
 
     while !stop.is_stopped() {
         report_status(
@@ -278,7 +505,12 @@ fn run_slack_loop(
             }
         };
 
-        let mut ws = match WsClient::connect(&ws_url, &[], WS_CONNECT_TIMEOUT) {
+        let mut ws = match WsClient::connect_with_policy(
+            &ws_url,
+            &[],
+            WS_CONNECT_TIMEOUT,
+            sender.ssrf_policy,
+        ) {
             Ok(client) => client,
             Err(err) => {
                 if stop.is_stopped() {
@@ -325,6 +557,7 @@ fn run_slack_loop(
         );
 
         let mut clean_reconnect = false;
+        let mut saw_activity = false;
         while !stop.is_stopped() {
             match ws.poll_event(WS_POLL_TIMEOUT) {
                 Ok(WsEvent::Timeout | WsEvent::Pong(_) | WsEvent::Binary(_)) => {}
@@ -359,9 +592,12 @@ fn run_slack_loop(
                         }
                         "disconnect" => {
                             clean_reconnect = true;
+                            consecutive_disconnects = consecutive_disconnects.saturating_add(1);
                             break;
                         }
                         "events_api" => {
+                            saw_activity = true;
+                            consecutive_disconnects = 0;
                             if let Some(payload) = envelope.get("payload") {
                                 handle_events_api(
                                     &bot.id,
@@ -371,10 +607,13 @@ fn run_slack_loop(
                                     router,
                                     payload,
                                     &mut seen_events,
+                                    &mut participated_threads,
                                 );
                             }
                         }
                         "interactive" => {
+                            saw_activity = true;
+                            consecutive_disconnects = 0;
                             if let Some(payload) = envelope.get("payload") {
                                 handle_interactive(&bot.id, sender, router, payload);
                             }
@@ -406,7 +645,18 @@ fn run_slack_loop(
         if stop.is_stopped() {
             break;
         }
-        if !clean_reconnect {
+        if clean_reconnect {
+            if !saw_activity && consecutive_disconnects >= 2 {
+                let exp = 1_000_u64
+                    .saturating_mul(1_u64 << (consecutive_disconnects.saturating_sub(2)).min(4))
+                    .min(30_000);
+                let jitter = slack_jitter_ms(exp / 2);
+                if stop.wait(Duration::from_millis(exp.saturating_add(jitter))) {
+                    break;
+                }
+            }
+        } else {
+            consecutive_disconnects = 0;
             if stop.wait(Duration::from_millis(backoff_ms)) {
                 break;
             }
@@ -426,6 +676,7 @@ fn run_slack_loop(
     );
 }
 
+#[expect(clippy::too_many_arguments, reason = "Slack event dispatch context")]
 fn handle_events_api(
     bot_id: &BotId,
     bot_user_id: Option<&str>,
@@ -434,6 +685,7 @@ fn handle_events_api(
     router: &Arc<ConversationRouter>,
     payload: &Value,
     seen_events: &mut VecDeque<String>,
+    participated_threads: &mut BTreeSet<(String, String)>,
 ) {
     let Some(event) = payload.get("event") else {
         return;
@@ -470,6 +722,43 @@ fn handle_events_api(
     let Some(channel_id) = event.get("channel").and_then(Value::as_str) else {
         return;
     };
+    let channel_type = event
+        .get("channel_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_dm = channel_type == "im" || channel_id.starts_with('D');
+    let explicit_thread_ts = event.get("thread_ts").and_then(Value::as_str);
+
+    let raw_text = event
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mentions_bot = bot_user_id.is_some_and(|uid| raw_text.contains(&format!("<@{uid}>")));
+
+    // Gate non-DM `message` events: only respond inside threads the bot participates in or @mentions.
+    if event_type == "message" && !is_dm {
+        let in_participated_thread = explicit_thread_ts.is_some_and(|tts| {
+            participated_threads.contains(&(channel_id.to_owned(), tts.to_owned()))
+        });
+        if !in_participated_thread && !mentions_bot {
+            return;
+        }
+    }
+
+    let bot_cfg = bridge.get_bot_config(bot_id);
+    if let Some(ref cfg) = bot_cfg
+        && !is_dm
+        && !cfg.connectors.slack.allowed_channel_ids.is_empty()
+        && !cfg
+            .connectors
+            .slack
+            .allowed_channel_ids
+            .iter()
+            .any(|c| c == channel_id)
+    {
+        return;
+    }
+
     let ts = event.get("ts").and_then(Value::as_str);
 
     // Deduplicate dual delivery of `app_mention` + `message` for the same `(channel, ts)`.
@@ -484,37 +773,33 @@ fn handle_events_api(
         seen_events.push_back(dedup_key);
     }
 
-    let raw_text = event
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     let cleaned = strip_slack_bot_mention(raw_text, bot_user_id);
     if cleaned.is_empty() {
         return;
     }
 
-    let channel_type = event
-        .get("channel_type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let thread_id = event
-        .get("thread_ts")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            if event_type == "app_mention" || channel_type != "im" {
-                ts.map(ToOwned::to_owned)
-            } else {
-                None
-            }
-        });
+    let thread_id = explicit_thread_ts.map(ToOwned::to_owned).or_else(|| {
+        if event_type == "app_mention" || !is_dm {
+            ts.map(ToOwned::to_owned)
+        } else {
+            None
+        }
+    });
+    if let Some(ref tts) = thread_id {
+        if participated_threads.len() >= 1_024
+            && let Some(first) = participated_threads.iter().next().cloned()
+        {
+            participated_threads.remove(&first);
+        }
+        participated_threads.insert((channel_id.to_owned(), tts.clone()));
+    }
+
     let workspace_id = payload
         .get("team_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let acts_for = bridge
-        .get_bot_config(bot_id)
-        .map_or_else(Default::default, |b| b.connectors.slack.acts_for);
+    let acts_for = bot_cfg.map_or_else(Default::default, |b| b.connectors.slack.acts_for);
+    let sender_name = sender.resolve_sender_name(user_id);
 
     let target = DeliveryTarget {
         source: ExternalSource::Slack,
@@ -530,7 +815,7 @@ fn handle_events_api(
         channel_id: channel_id.to_owned(),
         thread_id,
         sender_id: user_id.to_owned(),
-        sender_name: user_id.to_owned(),
+        sender_name,
         text: cleaned,
         attachments: Vec::new(),
         external_message_id: ts.map(ToOwned::to_owned),
@@ -626,14 +911,31 @@ fn handle_interactive(
 }
 
 fn strip_slack_bot_mention(text: &str, bot_user_id: Option<&str>) -> String {
-    let mut s = text.trim();
+    let mut s = text.trim().to_owned();
     if let Some(uid) = bot_user_id {
-        let prefix = format!("<@{uid}>");
-        if let Some(rest) = s.strip_prefix(&prefix) {
-            s = rest.trim_start_matches([' ', ':', ',', '-']);
+        let token = format!("<@{uid}>");
+        if s.contains(&token) {
+            s = s.replace(&token, " ");
         }
     }
-    s.trim().to_owned()
+    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized
+        .trim_start_matches([':', ',', '-'])
+        .trim()
+        .to_owned()
+}
+
+fn slack_jitter_ms(max_jitter: u64) -> u64 {
+    if max_jitter == 0 {
+        return 0;
+    }
+    let nanos = u64::from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    );
+    nanos % max_jitter.saturating_add(1)
 }
 
 #[expect(
@@ -1125,6 +1427,74 @@ mod tests {
         stop.signal();
         ws_thread.join().unwrap();
         http_thread.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slack_inline_mention_users_info_cache_gating_and_file_upload_work() {
+        assert_eq!(
+            strip_slack_bot_mention("hey <@U_BOT> please deploy", Some("U_BOT")),
+            "hey please deploy"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!("krill-slack-w3-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let fpath = dir.join("report.txt");
+        std::fs::write(&fpath, b"slack file content").unwrap();
+
+        let srv = thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let (path, _auth, _body) = read_http(&mut sock);
+                let resp = if path.starts_with("/users.info") {
+                    json!({"ok": true, "user": {"name": "owen", "profile": {"display_name": "Owen"}}})
+                } else if path.ends_with("/files.getUploadURLExternal") {
+                    json!({"ok": true, "upload_url": format!("http://{addr}/upload-bin"), "file_id": "F123"})
+                } else if path.ends_with("/upload-bin")
+                    || path.ends_with("/files.completeUploadExternal")
+                {
+                    json!({"ok": true})
+                } else {
+                    json!({"ok": false, "error": "unexpected"})
+                };
+                let body = serde_json::to_vec(&resp).unwrap();
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+                sock.write_all(&body).unwrap();
+            }
+        });
+
+        let sender = SlackSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("xoxb-t".to_owned()),
+        );
+        // Cached after first users.info hit: second call must not hit mock server.
+        assert_eq!(sender.resolve_sender_name("U_1"), "Owen");
+        assert_eq!(sender.resolve_sender_name("U_1"), "Owen");
+
+        let target = DeliveryTarget {
+            source: ExternalSource::Slack,
+            workspace_id: Some("T1".to_owned()),
+            channel_id: "C_DEV".to_owned(),
+            thread_id: Some("100.1".to_owned()),
+            reply_to_message_id: None,
+        };
+        let fid = sender
+            .send_files(
+                &target,
+                &[fpath.to_string_lossy().into_owned()],
+                Some("cap"),
+            )
+            .unwrap();
+        assert_eq!(fid.as_deref(), Some("F123"));
+
+        srv.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

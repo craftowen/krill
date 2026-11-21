@@ -1,11 +1,16 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
-//! Non-blocking RPC transport, secret-ref naming, runtime catalog, and CSV helpers for Krill Bots UI.
+//! Non-blocking RPC transport, response validation, avatar/session metadata, and CSV helpers for Krill Bots UI.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use krill_proto::bots::{BotAccessRequestStatus, BotItemStatus, BotRpcRequest, BotRpcResponse};
+use krill_proto::SessionId;
+use krill_proto::bots::{
+    BotAccessRequestStatus, BotConfig, BotId, BotItemStatus, BotRpcRequest, BotRpcResponse,
+    MAX_AVATAR_PNG_BYTES,
+};
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole, FEAT_BOTS};
@@ -13,9 +18,62 @@ use krill_proto::screen::Msg as _;
 
 use crate::hosts::HostTarget;
 use crate::i18n::catalog::bots as text;
+use crate::layout::TabColor;
 
 /// Non-blocking injectable RPC closure for `BotRpcRequest` -> `BotRpcResponse`.
 pub type BotRpcCall = Arc<dyn Fn(&BotRpcRequest) -> Result<BotRpcResponse, String> + Send + Sync>;
+
+/// Lightweight UI identity cached for sessions owned by a bot (shown in tabs & sidebar rows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotSessionMeta {
+    pub bot_id: BotId,
+    pub bot_name: String,
+    pub emoji: Option<String>,
+    pub avatar_color: Option<String>,
+}
+
+impl BotSessionMeta {
+    /// Builds display metadata from a [`BotConfig`].
+    #[must_use]
+    pub fn from_bot(bot: &BotConfig) -> Self {
+        Self {
+            bot_id: bot.id.clone(),
+            bot_name: bot.name.clone(),
+            emoji: bot
+                .emoji
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            avatar_color: bot
+                .avatar_color
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// Formats `<emoji> <bot_name>` when emoji is set, or `<bot_name>` otherwise.
+    #[must_use]
+    pub fn display_prefix(&self) -> String {
+        match self
+            .emoji
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(emoji) => format!("{emoji} {}", self.bot_name),
+            None => self.bot_name.clone(),
+        }
+    }
+
+    /// Resolves the mapped semantic [`TabColor`] if a known hex/name is set.
+    #[must_use]
+    pub fn tab_color(&self) -> Option<TabColor> {
+        parse_avatar_color(self.avatar_color.as_deref())
+    }
+}
 
 /// Krill's 8 enabled bot agent runtimes (aligned with Orca's enabled bot agents).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +146,84 @@ pub fn runtime_display_label(agent_id: &str) -> String {
     }
 }
 
+/// Canonical 9 semantic colors matching `ui::tab_tag_color` for bot badges and pickers.
+pub const BOT_AVATAR_COLOR_PALETTE: [(TabColor, &str); 9] = [
+    (TabColor::Blue, "#3b82f6"),
+    (TabColor::Purple, "#a855f7"),
+    (TabColor::Pink, "#ec4899"),
+    (TabColor::Red, "#ef4444"),
+    (TabColor::Orange, "#f97316"),
+    (TabColor::Yellow, "#eab308"),
+    (TabColor::Green, "#22c55e"),
+    (TabColor::Teal, "#14b8a6"),
+    (TabColor::Gray, "#9ca3af"),
+];
+
+/// Maps any persisted avatar color name or `#rrggbb` string to a semantic [`TabColor`].
+#[must_use]
+pub fn parse_avatar_color(raw: Option<&str>) -> Option<TabColor> {
+    let trimmed = raw?.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.as_str() {
+        "purple" | "#a855f7" | "#8b5cf6" => Some(TabColor::Purple),
+        "pink" | "#ec4899" => Some(TabColor::Pink),
+        "red" | "#ef4444" => Some(TabColor::Red),
+        "orange" | "#f97316" => Some(TabColor::Orange),
+        "yellow" | "#eab308" => Some(TabColor::Yellow),
+        "green" | "#22c55e" => Some(TabColor::Green),
+        "teal" | "#14b8a6" | "#06b6d4" => Some(TabColor::Teal),
+        "gray" | "grey" | "#9ca3af" | "#6b7280" => Some(TabColor::Gray),
+        _ => Some(TabColor::Blue),
+    }
+}
+
+/// Canonical `#rrggbb` wire value for a [`TabColor`] avatar accent.
+#[must_use]
+pub const fn avatar_color_hex(color: TabColor) -> &'static str {
+    match color {
+        TabColor::Blue => "#3b82f6",
+        TabColor::Purple => "#a855f7",
+        TabColor::Pink => "#ec4899",
+        TabColor::Red => "#ef4444",
+        TabColor::Orange => "#f97316",
+        TabColor::Yellow => "#eab308",
+        TabColor::Green => "#22c55e",
+        TabColor::Teal => "#14b8a6",
+        TabColor::Gray => "#9ca3af",
+    }
+}
+
+/// Supported reasoning effort choices (empty string = runtime default).
+pub const BOT_EFFORT_OPTIONS: [&str; 4] = ["", "low", "medium", "high"];
+
+/// Localized display label for a reasoning effort string.
+#[must_use]
+pub fn effort_label(effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "low" => text::EFFORT_LOW.get(),
+        "medium" => text::EFFORT_MEDIUM.get(),
+        "high" => text::EFFORT_HIGH.get(),
+        _ => text::EFFORT_DEFAULT.get(),
+    }
+}
+
+/// Validates and wraps raw PNG bytes into a GPUI [`gpui::Image`] handle.
+pub fn decode_png_avatar(bytes: &[u8]) -> Result<Arc<gpui::Image>, String> {
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.len() > MAX_AVATAR_PNG_BYTES {
+        return Err(text::SETTINGS_AVATAR_TOO_LARGE.get().to_owned());
+    }
+    if bytes.len() < PNG_MAGIC.len() || bytes[..PNG_MAGIC.len()] != PNG_MAGIC {
+        return Err(text::SETTINGS_AVATAR_INVALID_PNG.get().to_owned());
+    }
+    Ok(Arc::new(gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        bytes.to_vec(),
+    )))
+}
+
 /// Default read timeout for bot daemon RPC calls (longer for OAuth/sync/tidy/look-around).
 const BOT_RPC_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const BOT_RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,6 +265,30 @@ fn call_daemon_bot(target: Option<&HostTarget>, req: &BotRpcRequest) -> io::Resu
     }
 }
 
+/// Invokes a bot RPC call and promotes [`BotRpcResponse::Error`] into `Err(msg)`.
+pub fn call_checked(call: &BotRpcCall, req: &BotRpcRequest) -> Result<BotRpcResponse, String> {
+    match call(req)? {
+        BotRpcResponse::Error(msg) => Err(msg),
+        other => Ok(other),
+    }
+}
+
+/// Unwraps a [`BotRpcResponse`] where only side-effect success (`Ok` / non-Error reply) matters.
+pub fn expect_ok(call: &BotRpcCall, req: &BotRpcRequest) -> Result<(), String> {
+    call_checked(call, req).map(|_| ())
+}
+
+/// Extracts a strongly-typed variant from a checked RPC call or returns a clear error.
+pub fn expect_variant<T>(
+    call: &BotRpcCall,
+    req: &BotRpcRequest,
+    extract: impl FnOnce(BotRpcResponse) -> Option<T>,
+    expected: &'static str,
+) -> Result<T, String> {
+    let resp = call_checked(call, req)?;
+    extract(resp).ok_or_else(|| format!("Unexpected daemon response (expected {expected})"))
+}
+
 /// Computes total sidebar attention count (`needs_you` open items + `Pending` access requests).
 #[must_use]
 pub fn fetch_attention_count(call: &BotRpcCall) -> usize {
@@ -150,6 +310,33 @@ pub fn fetch_attention_count(call: &BotRpcCall) -> usize {
         _ => 0,
     };
     needs_you.saturating_add(pending_access)
+}
+
+/// Fetches sidebar attention count plus a `SessionId -> BotSessionMeta` index across all bots.
+#[must_use]
+pub fn fetch_badge_and_sessions(call: &BotRpcCall) -> (usize, BTreeMap<SessionId, BotSessionMeta>) {
+    let count = fetch_attention_count(call);
+    let bots_by_id: HashMap<BotId, BotSessionMeta> = match call(&BotRpcRequest::ListBots) {
+        Ok(BotRpcResponse::Bots(bots)) => bots
+            .into_iter()
+            .map(|b| {
+                let meta = BotSessionMeta::from_bot(&b);
+                (b.id, meta)
+            })
+            .collect(),
+        _ => HashMap::new(),
+    };
+    let mut sessions = BTreeMap::new();
+    if let Ok(BotRpcResponse::BotSessions(list)) =
+        call(&BotRpcRequest::ListBotSessions { bot_id: None })
+    {
+        for summary in list {
+            if let Some(meta) = bots_by_id.get(&summary.bot_id) {
+                sessions.insert(summary.session_id, meta.clone());
+            }
+        }
+    }
+    (count, sessions)
 }
 
 /// Canonical scoped keychain secret reference (`<bot_id>:<key>`) aligned with daemon `SecretVault::scoped_ref`.

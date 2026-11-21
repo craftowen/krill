@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use krill_proto::bots::BotId;
+use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::write_atomic_0600;
 use ring::{
     aead, hkdf,
@@ -82,7 +83,11 @@ impl MasterKey {
 
     #[cfg(all(target_os = "macos", not(test)))]
     fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
-        fs::create_dir_all(root)?;
+        ensure_no_symlink_path(root)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)?;
         let _gate = lock(&KEYCHAIN_GATE);
         let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_err)? {
             Some(SecKeychain::disable_user_interaction().map_err(keychain_err)?)
@@ -117,11 +122,13 @@ impl MasterKey {
 
     #[cfg(any(test, target_os = "linux", windows))]
     fn load_or_create(root: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
-        use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        use krill_proto::os::fs::OpenOptionsExt as _;
         use std::io::Write as _;
 
         let _guard = lock(&KEY_FILE_LOCK);
+        ensure_no_symlink_path(root)?;
         let path = root.join(KEY_FILE);
+        ensure_no_symlink_path(&path)?;
         match fs::read(&path) {
             Ok(bytes) => return unseal_key(bytes).map(Arc::new),
             Err(err) if err.kind() == io::ErrorKind::NotFound && allow_create => {}
@@ -162,15 +169,50 @@ impl MasterKey {
             return Err(err);
         }
         drop(file);
-        let placed = fs::hard_link(&tmp, &path);
-        fs::remove_file(&tmp).ok();
-        match placed {
-            Ok(()) => Ok(Arc::new(Self(bytes))),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                unseal_key(fs::read(&path)?).map(Arc::new)
+        place_new_key_file(&path, &tmp, &sealed, |src, dst| fs::hard_link(src, dst))?;
+        ensure_no_symlink_path(&path)?;
+        unseal_key(fs::read(&path)?).map(Arc::new)
+    }
+}
+
+#[cfg(any(test, target_os = "linux", windows))]
+fn place_new_key_file(
+    path: &Path,
+    tmp: &Path,
+    sealed: &[u8],
+    linker: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    use krill_proto::os::fs::OpenOptionsExt as _;
+    use std::io::Write as _;
+
+    let placed = linker(tmp, path);
+    fs::remove_file(tmp).ok();
+    match placed {
+        Ok(()) => ensure_no_symlink_path(path),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => ensure_no_symlink_path(path),
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            ensure_no_symlink_path(path)?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    if let Err(write_err) = file.write_all(sealed).and_then(|()| file.sync_all()) {
+                        drop(file);
+                        fs::remove_file(path).ok();
+                        return Err(write_err);
+                    }
+                    Ok(())
+                }
+                Err(open_err) if open_err.kind() == io::ErrorKind::AlreadyExists => {
+                    ensure_no_symlink_path(path)
+                }
+                Err(open_err) => Err(open_err),
             }
-            Err(err) => Err(err),
         }
+        Err(err) => Err(err),
     }
 }
 
@@ -260,11 +302,11 @@ impl SecretVault {
     }
 
     /// Stores a secret under an arbitrary validated `secret_ref`.
-    pub fn set_ref(&self, secret_ref: &str, mut value: Zeroizing<String>) -> io::Result<()> {
+    pub fn set_ref(&self, secret_ref: &str, value: Zeroizing<String>) -> io::Result<()> {
         validate_secret_ref(secret_ref)?;
         let _guard = lock(&self.io_lock);
         let mut map = self.load_map_locked()?;
-        map.insert(secret_ref.to_owned(), std::mem::take(&mut *value));
+        map.insert(secret_ref.to_owned(), value);
         self.save_map_locked(&map)
     }
 
@@ -272,17 +314,21 @@ impl SecretVault {
     pub fn get_ref(&self, secret_ref: &str) -> io::Result<Option<Zeroizing<String>>> {
         validate_secret_ref(secret_ref)?;
         let _guard = lock(&self.io_lock);
+        ensure_no_symlink_path(&self.root)?;
+        ensure_no_symlink_path(&self.vault_path)?;
         if !self.vault_path.exists() {
             return Ok(None);
         }
-        let map = self.load_map_locked()?;
-        Ok(map.get(secret_ref).cloned().map(Zeroizing::new))
+        let mut map = self.load_map_locked()?;
+        Ok(map.remove(secret_ref))
     }
 
     /// Deletes a secret by exact `secret_ref`. Returns `true` if a value existed.
     pub fn delete_ref(&self, secret_ref: &str) -> io::Result<bool> {
         validate_secret_ref(secret_ref)?;
         let _guard = lock(&self.io_lock);
+        ensure_no_symlink_path(&self.root)?;
+        ensure_no_symlink_path(&self.vault_path)?;
         if !self.vault_path.exists() {
             return Ok(false);
         }
@@ -351,6 +397,8 @@ impl SecretVault {
     /// Deletes all secrets prefixed with `<bot_id>:` plus any explicit refs owned by that bot.
     pub fn delete_bot_secrets(&self, bot_id: &BotId, extra_refs: &[String]) -> io::Result<usize> {
         let _guard = lock(&self.io_lock);
+        ensure_no_symlink_path(&self.root)?;
+        ensure_no_symlink_path(&self.vault_path)?;
         if !self.vault_path.exists() {
             return Ok(0);
         }
@@ -374,7 +422,9 @@ impl SecretVault {
         Ok(loaded)
     }
 
-    fn load_map_locked(&self) -> io::Result<BTreeMap<String, String>> {
+    fn load_map_locked(&self) -> io::Result<BTreeMap<String, Zeroizing<String>>> {
+        ensure_no_symlink_path(&self.root)?;
+        ensure_no_symlink_path(&self.vault_path)?;
         let raw = match fs::read(&self.vault_path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -427,10 +477,15 @@ impl SecretVault {
         let map: BTreeMap<String, String> = serde_json::from_slice(plain).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid bot secrets vault JSON")
         })?;
-        Ok(map)
+        Ok(map
+            .into_iter()
+            .map(|(k, v)| (k, Zeroizing::new(v)))
+            .collect())
     }
 
-    fn save_map_locked(&self, map: &BTreeMap<String, String>) -> io::Result<()> {
+    fn save_map_locked(&self, map: &BTreeMap<String, Zeroizing<String>>) -> io::Result<()> {
+        ensure_no_symlink_path(&self.root)?;
+        ensure_no_symlink_path(&self.vault_path)?;
         let master = self.key(true)?;
         let rng = SystemRandom::new();
         let mut salt = [0u8; SALT_LEN];
@@ -445,10 +500,13 @@ impl SecretVault {
         aad.extend_from_slice(&salt);
         aad.extend_from_slice(&nonce_bytes);
 
+        let view: BTreeMap<&str, &str> =
+            map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let mut plain = Zeroizing::new(
-            serde_json::to_vec(map)
+            serde_json::to_vec(&view)
                 .map_err(|_| io::Error::other("failed to serialize bot secrets vault"))?,
         );
+        drop(view);
         let aead_key = master.derive_aead(&salt)?;
         let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
         aead_key
@@ -459,6 +517,18 @@ impl SecretVault {
         out.extend_from_slice(&aad);
         out.extend_from_slice(&plain);
         write_atomic_0600(&self.vault_path, &out)
+    }
+}
+
+pub(crate) fn ensure_no_symlink_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to follow symlink in bot path",
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -575,6 +645,60 @@ mod tests {
 
         assert!(vault.delete_secret(&bot_b, "k1").unwrap());
         assert!(!vault.delete_secret(&bot_b, "k1").unwrap());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_rejects_symlink_vault_and_key_paths() {
+        let dir = temp_dir("symlink");
+        let target = dir.join("outside.txt");
+        fs::write(&target, b"not-a-vault").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(VAULT_FILE)).unwrap();
+
+        let vault = SecretVault::with_static_key(dir.clone(), [0x11; 32]);
+        assert!(vault.get_ref("tok").is_err());
+        assert!(
+            vault
+                .set_ref("tok", Zeroizing::new("secret".to_owned()))
+                .is_err()
+        );
+        assert!(vault.delete_ref("tok").is_err());
+
+        fs::remove_file(dir.join(VAULT_FILE)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(KEY_FILE)).unwrap();
+        let vault2 = SecretVault::new(dir.clone());
+        assert!(
+            vault2
+                .set_ref("tok", Zeroizing::new("secret".to_owned()))
+                .is_err()
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn key_placement_falls_back_when_hard_link_unsupported() {
+        let dir = temp_dir("hardlink-fallback");
+        let key_path = dir.join(KEY_FILE);
+        let tmp_path = dir.join(".tmp.key");
+        let sealed = seal_key(&[0x77; 32]).unwrap();
+        fs::write(&tmp_path, &sealed).unwrap();
+
+        place_new_key_file(&key_path, &tmp_path, &sealed, |_, _| {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links"))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&key_path).unwrap(), sealed);
+        assert!(!tmp_path.exists());
+
+        // Subsequent AlreadyExists is harmless.
+        fs::write(&tmp_path, &sealed).unwrap();
+        place_new_key_file(&key_path, &tmp_path, &sealed, |_, _| {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"))
+        })
+        .unwrap();
 
         fs::remove_dir_all(&dir).ok();
     }

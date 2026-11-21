@@ -31,7 +31,7 @@ function fixture(screen='orchestration',options={}){
  let timerId=0;const timers=new Map(),calls=[],errors=[],routes=[],headers=[],sheets=[],saved=[],buttons=[],abort=new AbortController();const state={snapshot:{host:{display_name:'Test desktop'},orchestration:{gates:[],questions:[],runs:[],tasks:[]},repositories:[]},connection:{phase:'ready'},groups:new Map(),sessions:new Map(),drafts:new Map(),preferences:{},logs:[],ui:{search:'',filter:'all'},...options.state};
  const el=(...args)=>new Element(...args),ctx={el,state,signal:abort.signal,route:options.route||{},t:(s,...values)=>{copyKeys.add(s);return options.t?.(s,...values)??s;},go:r=>routes.push(r),backTo:r=>routes.push(r),longPress:(node,action)=>{node._longPress=action;return ()=>{};},groupRoute:(g,id)=>`/host/local/group/${g?.key}/s/${id}`,rollup:s=>['Waiting','Blocked','Working','Done','Exited','Unknown'].find(v=>s.some(x=>(x.exited?'Exited':x.state)===v))||'Unknown',icon:()=>el('svg'),dot:v=>el('span',undefined,`status-dot ${String(v).toLowerCase()}`),button(label,action,cls=''){const b=el('button',ctx.t(label),cls);b.setAttribute('aria-label',ctx.t(label));b.action=action;buttons.push(b);return b;},header(title,fallback,onBack){headers.push({title,fallback,onBack});const h=el('header'),copy=el('div',undefined,'header-copy');copy.append(el('h1',ctx.t(title)));h.append(copy);return h;},linkRow(title,description,route){const b=ctx.button('',()=>ctx.go(route),'setting-link'),copy=el('span',undefined,'link-copy');copy.append(el('strong',ctx.t(title)));if(description)copy.append(el('small',ctx.t(description)));b.append(copy);return b;},sheet:(...v)=>sheets.push(v),act:fn=>Promise.resolve().then(fn).catch(e=>errors.push(e)),rpc:async req=>{calls.push(req);return options.rpc?.(req)??{};},createSession:(group,agent,req)=>{calls.push(req);routes.push(`/host/local/group/${group.key}/s/new`);},refresh:async()=>options.refresh?.(),error:e=>errors.push(e),savePreferences:patch=>{saved.push(patch);Object.assign(state.preferences,patch);},rerender(){ctx.rerenders++;},rerenders:0,scanQr(){ctx.scans++;},scans:0,pasteLink(){},install:{show(){ctx.installShown++;}},installShown:0,transport:{reconnect(){},resume(){}}};
  ctx.getConnections=()=>ctx.connections||[];ctx.selectHost=(id,after)=>{ctx.selected=id;after?.();};ctx.openRecent=(id,locator)=>{ctx.opened={id,locator};};ctx.reconnectHost=id=>{ctx.reconnected=id;};ctx.renameHost=id=>{ctx.renamed=id;};ctx.forgetHost=id=>{ctx.forgot=id;};
- const sandbox={document:doc,AbortController,Date,console,setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),setInterval:(fn,ms)=>{timers.set(++timerId,{fn,ms,interval:true});return timerId;},clearInterval:id=>timers.delete(id),KrillMobile:{terminal:{fontScales:[1,1.25],keys:[{id:'esc',label:'Esc'},{id:'tab',label:'Tab'}]},install:options.install||{offer:null}},navigator:{},...options.globals};vm.createContext(sandbox);for(const file of ['details','home','workspaces','session','settings'])vm.runInContext(fs.readFileSync(path.join(options.assetRoot||path.join(__dirname,'../src/mobile/assets/screens'),`${file}.js`),'utf8'),sandbox);
+ const sandbox={document:doc,AbortController,Date,console,setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),setInterval:(fn,ms)=>{timers.set(++timerId,{fn,ms,interval:true});return timerId;},clearInterval:id=>timers.delete(id),KrillMobile:{terminal:{fontScales:[1,1.25],keys:[{id:'esc',label:'Esc'},{id:'tab',label:'Tab'}]},install:options.install||{offer:null}},navigator:{},...options.globals};vm.createContext(sandbox);for(const file of ['details','home','workspaces','session','settings','bots'])vm.runInContext(fs.readFileSync(path.join(options.assetRoot||path.join(__dirname,'../src/mobile/assets/screens'),`${file}.js`),'utf8'),sandbox);
  const view=sandbox.KrillMobile.screens[screen](root,ctx),all=()=>root.descendants(),find=(selector)=>root.querySelector(selector),byText=(label)=>all().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')===label),flush=async()=>{for(let i=0;i<40;i++)await Promise.resolve();};
  return {root,ctx,state,doc,view,calls,errors,routes,headers,sheets,saved,buttons,all,find,byText,flush,timers,abort,M:sandbox.KrillMobile};
 }
@@ -764,5 +764,163 @@ async function tabBarAndLayoutContracts(){
  unpaired.cleanup();
  console.log('PASS tab-bar and layout contracts: #mobile-app bottom:0, zero 100dvh, .home-list clearance, .tab-bar across loading/error/unpaired states');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function botsScreens(){
+ // 1. Security checks on bots.js + parseRoute coverage
+ const botsJs=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/bots.js'),'utf8');
+ for(const forbidden of ['innerHTML','crypto.subtle','crypto.randomUUID'])assert(!botsJs.includes(forbidden),`bots.js must not contain ${forbidden}`);
+ const appJs=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8');
+ const parseLine=appJs.split('\n').find(l=>l.includes('function parseRoute('));
+ const routeBox={location:{hash:'#/bots'},hostRoute:()=>'/host/local',installRestoreHash:null};
+ vm.createContext(routeBox);vm.runInContext(parseLine+'\nglobalThis.parseRoute=parseRoute;',routeBox);
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'bots',botId:undefined,subpage:undefined});
+ routeBox.location.hash='#/bots/bot%201';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'bots',botId:'bot 1',subpage:'bot 1'});
+ routeBox.location.hash='#/up-next';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'up-next',subpage:undefined});
+ routeBox.location.hash='#/bots/%E0%A4%A';
+ assert.throws(()=>routeBox.parseRoute(),/Invalid bot link/);
+
+ // 2. Home entry card gated on capabilities.bots && (count > 0 || needs_you > 0 || pending_access > 0)
+ const hf=fixture('home');
+ hf.ctx.connections=[{id:'one',active:true,name:'Desktop',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},bots:{count:0,needs_you:0,pending_access:0},sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}}}];
+ hf.view.update();
+ assert(!hf.find('#bots-home-card'),'empty bots summary hides Bots card on Home');
+ hf.ctx.connections[0].snapshot.bots={count:2,needs_you:1,pending_access:1};
+ hf.view.update();
+ assert(hf.find('#bots-home-card'),'non-empty bots summary renders Bots card on Home');
+ await hf.find('#bots-home-card').querySelectorAll('button')[0].action();
+ assert.equal(hf.routes.at(-1),'/up-next');
+ await hf.find('#bots-home-card').querySelectorAll('button')[1].action();
+ assert.equal(hf.routes.at(-1),'/bots');
+ hf.abort.abort();
+
+ // 3. #/bots screen: list, paused badge, Open Chat, Create Bot sheet, Access approve + redeem, Group Chat
+ const botsData=[
+  {id:'b1',slug:'triage',name:'Triage Bot',agent_id:'claude',description:'Triages PRs',paused:false,avatar_color:'#2563eb'},
+  {id:'b2',slug:'sleepy',name:'Paused Bot',agent_id:'codex',description:'Paused',paused:true},
+ ];
+ const itemData=[
+  {uid:'item-1',owner_bot_id:'b1',title:'Review release',status:'needs_you',description:'Check hashes',done_means:'Signed',links:[{url:'https://example.com/pr/1'}],events:[{id:1,decisions:[{question:'Ship release?',options:['Approve','Hold'],recommended:0}]}],snoozed_until_ms:null},
+ ];
+ const accessData=[{token:'tok-1',bot_id:'b1',source:'telegram',sender_id:'77',sender_name:'Alice',status:'pending'}];
+ const groupsData=[{id:'grp-1',name:'Eng Team',bot_ids:['b1'],description:'Sync'}];
+ const suggestionsData=[{id:'sug-1',bot_id:'b1',title:'Check CI failures',why:'2 checks failed',ask:'Inspect main'}];
+ const bf=fixture('bots',{
+  state:{snapshot:{capabilities:{bots:true},agents:[{id:'claude',name:'Claude Code'}]}},
+  refresh:()=>{bf.state.sessions.set(99,{id:99,groupKey:'cwd:/bots/b1'});bf.state.groups.set('cwd:/bots/b1',{key:'cwd:/bots/b1',sessions:[{id:99}]});},
+  rpc:req=>{
+   if(req.action==='bots.list')return {bots:botsData,truncated:false,next_cursor:null};
+   if(req.action==='bots.items')return {items:itemData,truncated:false,next_cursor:null};
+   if(req.action==='bots.access.list')return {requests:accessData,truncated:false,next_cursor:null};
+   if(req.action==='bots.connectors.status')return {statuses:[{bot_id:'b1',source:'telegram',enabled:true,state:'connected'}]};
+   if(req.action==='bots.groups.list')return {groups:groupsData,truncated:false,next_cursor:null};
+   if(req.action==='bots.groups.read')return {group:{group:groupsData[0],threads:[{thread_id:'t2',title:'Latest'},{thread_id:'t1',title:'Oldest'}],messages:[{sender_name:'Triage Bot',body:'Ready'}],active_run:false}};
+   if(req.action==='bots.groups.new_thread')return {group:{group:groupsData[0],threads:[{thread_id:'t3',title:'New thread'},{thread_id:'t2',title:'Latest'},{thread_id:'t1',title:'Oldest'}],messages:[],active_run:false}};
+   if(req.action==='bots.chat.open')return {bot_id:'b1',session_id:99,pid:4242};
+   if(req.action==='bots.templates')return {templates:[{id:'pr-reviewer',name:'PR Reviewer',description:'Reviews PRs',mascot:'R'}]};
+   if(req.action==='bots.suggestions.list')return {suggestions:suggestionsData};
+   if(req.action==='bots.look_around')return {bot_id:'b1',suggestions:suggestionsData};
+   return {};
+  }
+ });
+ await bf.flush();
+ assert(bf.root.textContent.includes('Triage Bot'));
+ assert(bf.root.textContent.includes('1 needs you'));
+ const chatButtons=bf.all().filter(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Open Chat');
+ assert.equal(chatButtons.length,2);
+ assert.equal(chatButtons[0].disabled,false);
+ assert.equal(chatButtons[1].disabled,true,'Paused bot disables Open Chat');
+ await chatButtons[0].action();
+ assert.equal(bf.routes.at(-1),'/host/local/group/cwd:/bots/b1/s/99');
+
+ await bf.byText('Approve').action();
+ assert(bf.calls.some(c=>c.action==='bots.access.decide'&&c.token==='tok-1'&&c.approve===true));
+ const codeInput=bf.find('.bots-redeem-form').querySelector('input');
+ codeInput.value='PAIR-99';
+ await bf.byText('Redeem').action();
+ assert(bf.calls.some(c=>c.action==='bots.access.redeem'&&c.code==='PAIR-99'));
+
+ await bf.find('.bots-group-row').action();
+ await bf.flush();
+ assert(bf.root.textContent.includes('Ready'));
+ const grpArea=bf.find('.bot-group-panel').querySelector('textarea');
+ grpArea.value='@triage status?';
+ await bf.find('.bot-group-panel').querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Send').action();
+ assert(bf.calls.some(c=>c.action==='bots.groups.send'&&c.group_id==='grp-1'&&c.thread_id==='t2'&&c.text==='@triage status?'));
+ await bf.find('.bot-group-panel').querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='+ Thread').action();
+ const grpAreaAfter=bf.find('.bot-group-panel').querySelector('textarea');
+ grpAreaAfter.value='@triage in new thread';
+ await bf.find('.bot-group-panel').querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Send').action();
+ assert(bf.calls.some(c=>c.action==='bots.groups.send'&&c.group_id==='grp-1'&&c.thread_id==='t3'&&c.text==='@triage in new thread'));
+
+ await bf.byText('+ New Bot').action();
+ const sheet=bf.sheets.at(-1);
+ assert.equal(sheet[0],'New Bot');
+ bf.ctx.closeSheet=()=>{};
+ const bodyNode=bf.ctx.el('div');
+ sheet[3](bodyNode);
+ await bf.flush();
+ bodyNode.querySelector('input').value='Release Bot';
+ await bodyNode.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Create Bot').action();
+ assert(bf.calls.some(c=>c.action==='bots.create'&&c.name==='Release Bot'));
+ bf.abort.abort();
+
+ // 4. #/up-next and #/bots/:id: decision answer, snooze FieldPatch, look around, soul/memory
+ const uf=fixture('up-next',{
+  state:{snapshot:{capabilities:{bots:true}}},
+  rpc:req=>{
+   if(req.action==='bots.list')return {bots:botsData};
+   if(req.action==='bots.items')return {items:itemData};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:suggestionsData};
+   return {};
+  }
+ });
+ await uf.flush();
+ assert(uf.root.textContent.includes('Ship release?'));
+ await uf.byText('Approve').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.answer'&&c.item_id==='item-1'&&c.option_index===0));
+ await uf.byText('Snooze 4h').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.update'&&c.item_id==='item-1'&&typeof c.snoozed_until_ms?.set==='number'));
+ itemData[0].snoozed_until_ms=Date.now()+100000;
+ uf.view.update();
+ await uf.byText('Unsnooze').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.update'&&c.snoozed_until_ms==='clear'));
+ await uf.byText('Done').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.update'&&c.status==='done'));
+ await uf.byText('Dismiss').action();
+ assert(uf.calls.some(c=>c.action==='bots.suggestions.dismiss'&&c.suggestion_id==='sug-1'));
+ uf.abort.abort();
+
+ const df=fixture('bots',{
+  route:{botId:'b1'},
+  state:{snapshot:{capabilities:{bots:true}}},
+  rpc:req=>{
+   if(req.action==='bots.list')return {bots:botsData};
+   if(req.action==='bots.items')return {items:[]};
+   if(req.action==='bots.connectors.status')return {statuses:[{bot_id:'b1',source:'telegram',state:'connected'}]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.soul.get')return {bot_id:'b1',content:'# Soul'};
+   if(req.action==='bots.memory.get')return {bot_id:'b1',content:'- Fact'};
+   if(req.action==='bots.memory.update')return {content:'- Fact\n- More',restored_facts:[]};
+   if(req.action==='bots.look_around')return {suggestions:[]};
+   return {};
+  }
+ });
+ await df.flush();
+ await df.byText('Look Around').action();
+ assert(df.calls.some(c=>c.action==='bots.look_around'&&c.bot_id==='b1'));
+ const replyBox=df.find('.bot-reply-card').querySelector('textarea');
+ replyBox.value='Ack';
+ await df.byText('Send reply').action();
+ assert(df.calls.some(c=>c.action==='bots.reply'&&c.bot_id==='b1'&&c.text==='Ack'));
+ await df.byText('Load').action();
+ assert(df.root.textContent.includes('SOUL.md'));
+ await df.byText('Save Soul').action();
+ assert(df.calls.some(c=>c.action==='bots.soul.set'&&c.content==='# Soul'));
+ df.abort.abort();
+ console.log('PASS mobile bots screens: routes, Home entry, #/bots, #/bots/:id, #/up-next, decisions, groups, soul/memory, no innerHTML');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

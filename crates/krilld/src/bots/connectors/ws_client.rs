@@ -9,13 +9,13 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 use ring::digest;
 use ring::rand::{SecureRandom as _, SystemRandom};
 
-use crate::bots::http_client::tls_client_config;
+use crate::bots::http_client::{SsrfPolicy, connect_with_deadline, tls_client_config};
 
 const OP_CONT: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
@@ -219,25 +219,35 @@ impl std::fmt::Debug for WsClient {
 }
 
 impl WsClient {
-    /// Connects to a `wss://` (or loopback `ws://`) URL and completes the RFC 6455 upgrade handshake.
+    /// Connects to a `wss://` (or loopback `ws://`) URL with default [`SsrfPolicy::StrictExternal`].
     pub fn connect(
         url: &str,
         extra_headers: &[(String, String)],
         timeout: Duration,
     ) -> io::Result<Self> {
+        Self::connect_with_policy(url, extra_headers, timeout, SsrfPolicy::StrictExternal)
+    }
+
+    /// Connects using an explicit [`SsrfPolicy`] (e.g. `AllowLoopback` for local mock servers)
+    /// and enforces a single total handshake `deadline` across DNS, TCP, TLS, and upgrade.
+    pub fn connect_with_policy(
+        url: &str,
+        extra_headers: &[(String, String)],
+        timeout: Duration,
+        policy: SsrfPolicy,
+    ) -> io::Result<Self> {
         let parsed = parse_ws_url(url)?;
         validate_extra_headers(extra_headers)?;
 
-        let addr = (parsed.host.as_str(), parsed.port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS resolution empty")
-            })?;
-        let tcp = TcpStream::connect_timeout(&addr, timeout)?;
+        let total_timeout = timeout.max(Duration::from_millis(1));
+        let deadline = Instant::now() + total_timeout;
+        let tcp = connect_with_deadline(&parsed.host, parsed.port, deadline, policy)?;
         tcp.set_nodelay(true).ok();
-        tcp.set_read_timeout(Some(timeout))?;
-        tcp.set_write_timeout(Some(timeout))?;
+        let initial_rem = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        tcp.set_read_timeout(Some(initial_rem))?;
+        tcp.set_write_timeout(Some(initial_rem))?;
 
         let mut transport = if parsed.tls {
             let cfg = tls_client_config()?;
@@ -270,6 +280,14 @@ impl WsClient {
         }
         req.push_str("\r\n");
 
+        let write_rem = deadline.saturating_duration_since(Instant::now());
+        if write_rem.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WebSocket handshake timed out before write",
+            ));
+        }
+        transport.tcp().set_write_timeout(Some(write_rem)).ok();
         transport.write_all(req.as_bytes())?;
         transport.flush()?;
 
@@ -286,6 +304,15 @@ impl WsClient {
                     "WebSocket handshake response exceeds limit",
                 ));
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "WebSocket upgrade handshake exceeded deadline",
+                ));
+            }
+            let rem = deadline.saturating_duration_since(now);
+            transport.tcp().set_read_timeout(Some(rem)).ok();
             let n = read_retry(&mut transport, &mut tmp)?;
             if n == 0 {
                 return Err(io::Error::new(
@@ -401,7 +428,8 @@ impl WsClient {
                     });
                 }
                 Ok(n) => {
-                    if self.rx_buf.len().saturating_add(n) > MAX_WS_MESSAGE_BYTES.saturating_add(64)
+                    if self.rx_buf.len().saturating_add(n)
+                        > MAX_WS_MESSAGE_BYTES.saturating_add(16 * 1024)
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -909,10 +937,11 @@ pub(crate) mod tests {
             write_server_frame(&mut sock, true, OP_CLOSE, &[0x03, 0xe8, b'b', b'y', b'e']).unwrap();
         });
 
-        let mut client = WsClient::connect(
+        let mut client = WsClient::connect_with_policy(
             &format!("ws://{addr}/stream?v=10"),
             &[],
             Duration::from_secs(5),
+            SsrfPolicy::AllowLoopback,
         )
         .unwrap();
 
@@ -939,6 +968,44 @@ pub(crate) mod tests {
             }
         );
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ws_client_blocks_loopback_without_policy_and_allows_near_max_rx_headroom() {
+        // StrictExternal must refuse loopback WebSocket targets.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let err =
+            WsClient::connect(&format!("ws://{addr}/s"), &[], Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Near-MAX_WS_MESSAGE_BYTES frame followed by another small frame must not hit cap.
+        let big = "Z".repeat(MAX_WS_MESSAGE_BYTES - 16);
+        let big_srv = big.clone();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = accept_ws_test_handshake(&mut sock).unwrap();
+            write_server_frame(&mut sock, true, OP_TEXT, big_srv.as_bytes()).unwrap();
+            write_server_frame(&mut sock, true, OP_TEXT, b"tail").unwrap();
+            write_server_frame(&mut sock, true, OP_CLOSE, &[0x03, 0xe8]).unwrap();
+        });
+
+        let mut client = WsClient::connect_with_policy(
+            &format!("ws://{addr}/s"),
+            &[],
+            Duration::from_secs(5),
+            SsrfPolicy::AllowLoopback,
+        )
+        .unwrap();
+        assert_eq!(
+            client.poll_event(Duration::from_secs(2)).unwrap(),
+            WsEvent::Text(big)
+        );
+        assert_eq!(
+            client.poll_event(Duration::from_secs(2)).unwrap(),
+            WsEvent::Text("tail".to_owned())
+        );
         server.join().unwrap();
     }
 }

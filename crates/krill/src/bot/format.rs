@@ -7,9 +7,12 @@ use krill_proto::SessionId;
 use krill_proto::bots::catalog::{BotMcpAppCatalogEntry, BotTemplate, ComposioAppCatalogEntry};
 use krill_proto::bots::home::{count_memory_lines, parse_memory_facts};
 use krill_proto::bots::{
-    BotAccessRequest, BotConfig, BotConnectorStatus, BotGroupChat, BotId, BotItem, BotItemLink,
-    BotMcpToolConfig, BotSuggestion, BotToolRelayStatus, ExternalBotCandidate,
-    ExternalBotSourceApp, ExternalSource,
+    BotAccessRequest, BotConfig, BotConnectorStatus, BotConnectorTestResult, BotGroupChat,
+    BotGroupMessage, BotGroupView, BotId, BotItem, BotItemActor, BotItemLink, BotItemsPage,
+    BotMcpOAuthState, BotMcpToolConfig, BotMemoryHistoryEntry, BotMemoryTidyStatus,
+    BotMemoryTopicInfo, BotScheduleConfig, BotSessionSummary, BotSuggestion, BotToolRelayStatus,
+    ComposioConnectionInfo, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
+    ExternalSource,
 };
 use krill_proto::orchestration::SkillEntry;
 use serde::Serialize;
@@ -85,12 +88,22 @@ pub(crate) fn format_bot_detail(bot: &BotConfig, json: bool) -> Result<String, C
     if let Some(ref effort) = bot.effort {
         writeln!(out, "effort      {effort}").ok();
     }
+    if let Some(ref emoji) = bot.emoji {
+        writeln!(out, "emoji       {emoji}").ok();
+    }
+    if let Some(ref avatar) = bot.avatar {
+        writeln!(out, "avatar      {avatar}").ok();
+    }
+    if let Some(ref color) = bot.avatar_color {
+        writeln!(out, "avatar_color {color}").ok();
+    }
     writeln!(
         out,
         "state       {}",
         if bot.paused { "paused" } else { "active" }
     )
     .ok();
+    writeln!(out, "first_run_completed {}", bot.first_run_completed).ok();
     writeln!(out, "folder      {}", bot.folder).ok();
     if let Some(ref ws) = bot.workspace {
         writeln!(out, "workspace   {ws}").ok();
@@ -98,6 +111,38 @@ pub(crate) fn format_bot_detail(bot: &BotConfig, json: bool) -> Result<String, C
     if let Some(ref tpl) = bot.template_id {
         writeln!(out, "template    {tpl}").ok();
     }
+    writeln!(
+        out,
+        "skills      {}",
+        if bot.skills.is_empty() {
+            "none".to_owned()
+        } else {
+            bot.skills.join(", ")
+        }
+    )
+    .ok();
+    writeln!(
+        out,
+        "members     {}",
+        if bot.members.is_empty() {
+            "none".to_owned()
+        } else {
+            bot.members
+                .iter()
+                .map(|m| format!("{} ({}:{})", m.name, m.source.as_str(), m.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )
+    .ok();
+    writeln!(
+        out,
+        "notifications permission={} complete={} error={}",
+        bot.notifications.needs_permission,
+        bot.notifications.task_complete,
+        bot.notifications.could_not_finish
+    )
+    .ok();
     let sources: Vec<&str> = bot
         .connectors
         .enabled_sources()
@@ -125,6 +170,23 @@ pub(crate) fn format_bot_detail(bot: &BotConfig, json: bool) -> Result<String, C
                 .map(|t| t.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
+        }
+    )
+    .ok();
+    writeln!(
+        out,
+        "schedules   {}",
+        if bot.schedules.is_empty() {
+            "none".to_owned()
+        } else {
+            bot.schedules
+                .iter()
+                .map(|s| {
+                    let state = if s.enabled { "enabled" } else { "disabled" };
+                    format!("{}: {} ({}) [{}]", s.id, s.name, s.cron, state)
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
         }
     )
     .ok();
@@ -590,6 +652,18 @@ pub(crate) fn format_items(items: &[BotItem], json: bool) -> Result<String, CliE
     Ok(out.trim_end().to_owned())
 }
 
+pub(crate) fn format_items_page(page: &BotItemsPage, json: bool) -> Result<String, CliError> {
+    if json {
+        return to_json(page);
+    }
+    let table = format_items(&page.items, false)?;
+    let cursor = page.next_cursor.as_deref().unwrap_or("-");
+    Ok(format!(
+        "{table}\n\ntotal={} unseen={} next_cursor={cursor}",
+        page.total_count, page.unseen_count
+    ))
+}
+
 pub(crate) fn format_item_detail(item: &BotItem, json: bool) -> Result<String, CliError> {
     if json {
         return to_json(item);
@@ -618,6 +692,44 @@ pub(crate) fn format_item_detail(item: &BotItem, json: bool) -> Result<String, C
     }
     for link in &item.links {
         writeln!(out, "  link:        {}", format_link(link)).ok();
+    }
+    if !item.events.is_empty() {
+        writeln!(out, "  events ({}):", item.events.len()).ok();
+        for ev in &item.events {
+            let actor = match &ev.actor {
+                BotItemActor::Owner { device: Some(d) } => format!("owner:{d}"),
+                BotItemActor::Owner { device: None } => "owner".to_owned(),
+                BotItemActor::Bot { bot_id, .. } => format!("bot:{bot_id}"),
+                BotItemActor::System { reason } => format!("system:{reason}"),
+            };
+            let kind = format!("{:?}", ev.kind).to_ascii_lowercase();
+            if ev.text.is_empty() {
+                writeln!(
+                    out,
+                    "    - [{}] {kind} by {actor} @{}",
+                    ev.id, ev.created_at_ms
+                )
+                .ok();
+            } else {
+                writeln!(
+                    out,
+                    "    - [{}] {kind} by {actor} @{}: {}",
+                    ev.id, ev.created_at_ms, ev.text
+                )
+                .ok();
+            }
+            for dec in &ev.decisions {
+                writeln!(out, "      question: {}", dec.question).ok();
+                for (i, opt) in dec.options.iter().enumerate() {
+                    let rec = if dec.recommended == Some(i) {
+                        " (recommended)"
+                    } else {
+                        ""
+                    };
+                    writeln!(out, "        [{i}] {opt}{rec}").ok();
+                }
+            }
+        }
     }
     Ok(out.trim_end().to_owned())
 }
@@ -880,7 +992,12 @@ pub(crate) fn format_tools(
         ));
     }
     let mut out = String::new();
-    writeln!(out, "{:<16} {:<18} {:<12} ENDPOINT", "ID", "NAME", "AUTH").ok();
+    writeln!(
+        out,
+        "{:<16} {:<18} {:<8} {:<12} ENDPOINT",
+        "ID", "NAME", "ENABLED", "AUTH"
+    )
+    .ok();
     for t in tools {
         let ep = t
             .endpoint_url
@@ -888,9 +1005,10 @@ pub(crate) fn format_tools(
             .unwrap_or(if t.command.is_empty() { "-" } else { "<cmd>" });
         writeln!(
             out,
-            "{:<16} {:<18} {:<12} {}",
+            "{:<16} {:<18} {:<8} {:<12} {}",
             t.id,
             t.name,
+            if t.enabled { "yes" } else { "no" },
             format!("{:?}", t.auth_kind).to_ascii_lowercase(),
             ep
         )
@@ -987,4 +1105,405 @@ pub(crate) fn format_imported_external(
         writeln!(out, "  - [{app}] {} ({}) — {}", c.name, c.agent, c.path).ok();
     }
     Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_schedules(
+    bot_id: &BotId,
+    schedules: &[BotScheduleConfig],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "schedules": schedules,
+        }));
+    }
+    if schedules.is_empty() {
+        return Ok(format!("No schedules configured for {bot_id}."));
+    }
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{:<18} {:<20} {:<16} {:<8} TZ",
+        "ID", "NAME", "CRON", "ENABLED"
+    )
+    .ok();
+    for s in schedules {
+        writeln!(
+            out,
+            "{:<18} {:<20} {:<16} {:<8} {}",
+            s.id,
+            s.name,
+            s.cron,
+            if s.enabled { "yes" } else { "no" },
+            s.timezone.as_deref().unwrap_or("-")
+        )
+        .ok();
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_memory_history(
+    bot_id: &BotId,
+    entries: &[BotMemoryHistoryEntry],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "history": entries,
+        }));
+    }
+    if entries.is_empty() {
+        return Ok(format!("No memory history for {bot_id}."));
+    }
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{:<16} {:<12} {:<12} {:<7} DIFF",
+        "ENTRY", "ACTION", "ACTOR", "UNDO"
+    )
+    .ok();
+    for e in entries {
+        let undo_state = if e.undone {
+            "undone"
+        } else if e.undoable {
+            "yes"
+        } else {
+            "no"
+        };
+        writeln!(
+            out,
+            "{:<16} {:<12} {:<12} {:<7} +{} -{}",
+            e.entry_id,
+            e.action,
+            e.actor,
+            undo_state,
+            e.added.len(),
+            e.removed.len()
+        )
+        .ok();
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_memory_tidy_status(
+    bot_id: &BotId,
+    status: &BotMemoryTidyStatus,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "status": status,
+        }));
+    }
+    Ok(format!(
+        "memory tidy for {bot_id}: enabled={} interval={}s last_run_ms={} last_tidy_id={} failures={} auto_disabled={} undoable={}",
+        status.enabled,
+        status.interval_secs,
+        status
+            .last_run_ms
+            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
+        status.last_tidy_id.as_deref().unwrap_or("-"),
+        status.consecutive_failures,
+        status.auto_disabled,
+        status.undoable
+    ))
+}
+
+pub(crate) fn format_memory_topics(
+    bot_id: &BotId,
+    topics: &[BotMemoryTopicInfo],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "topics": topics,
+        }));
+    }
+    if topics.is_empty() {
+        return Ok(format!("No memory topics for {bot_id}."));
+    }
+    let mut out = String::new();
+    writeln!(out, "{:<24} {:<10} UPDATED_MS", "TOPIC", "BYTES").ok();
+    for t in topics {
+        writeln!(out, "{:<24} {:<10} {}", t.topic, t.bytes, t.updated_at_ms).ok();
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_memory_topic_content(
+    bot_id: &BotId,
+    topic: &str,
+    content: &str,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "topic": topic,
+            "content": content,
+        }))
+    } else if content.trim().is_empty() {
+        Ok(format!("Topic '{topic}' for {bot_id} is empty."))
+    } else {
+        Ok(content.trim_end().to_owned())
+    }
+}
+
+pub(crate) fn format_suggestions(
+    bot_id: Option<&BotId>,
+    suggestions: &[BotSuggestion],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "suggestions": suggestions,
+        }));
+    }
+    if suggestions.is_empty() {
+        return Ok("No suggestions found.".to_owned());
+    }
+    let mut out = String::new();
+    writeln!(out, "{:<16} {:<14} {:<10} TITLE", "ID", "BOT", "DISMISSED").ok();
+    for s in suggestions {
+        writeln!(
+            out,
+            "{:<16} {:<14} {:<10} {}",
+            s.id,
+            s.bot_id,
+            if s.dismissed { "yes" } else { "no" },
+            s.title
+        )
+        .ok();
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_sessions(
+    sessions: &[BotSessionSummary],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&sessions);
+    }
+    if sessions.is_empty() {
+        return Ok("No bot sessions found.".to_owned());
+    }
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{:<8} {:<16} {:<8} {:<6} {:<8} LABEL",
+        "ID", "BOT", "PID", "LIVE", "WORKING"
+    )
+    .ok();
+    for s in sessions {
+        writeln!(
+            out,
+            "s{:<7} {:<16} {:<8} {:<6} {:<8} {}",
+            s.session_id.0,
+            s.bot_id,
+            s.pid,
+            if s.live { "yes" } else { "no" },
+            if s.working { "yes" } else { "no" },
+            if s.label.is_empty() { "-" } else { &s.label }
+        )
+        .ok();
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_group_view(view: &BotGroupView, json: bool) -> Result<String, CliError> {
+    if json {
+        return to_json(view);
+    }
+    let mut out = String::new();
+    let members: Vec<_> = view.group.bot_ids.iter().map(BotId::as_str).collect();
+    writeln!(
+        out,
+        "group {} ({}) [active_run={}] members=[{}]",
+        view.group.name,
+        view.group.id,
+        view.active_run,
+        members.join(", ")
+    )
+    .ok();
+    if !view.threads.is_empty() {
+        writeln!(out, "threads ({}):", view.threads.len()).ok();
+        for t in &view.threads {
+            let title = if t.title.is_empty() {
+                "(untitled)"
+            } else {
+                &t.title
+            };
+            writeln!(out, "  - {}: {title}", t.thread_id).ok();
+        }
+    }
+    if !view.messages.is_empty() {
+        writeln!(out, "messages ({}):", view.messages.len()).ok();
+        for m in &view.messages {
+            let suffix = if m.in_progress { " [streaming]" } else { "" };
+            writeln!(
+                out,
+                "  [{}] {}: {}{suffix}",
+                m.thread_id, m.sender_name, m.body
+            )
+            .ok();
+        }
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_group_message_posted(
+    message: &BotGroupMessage,
+    dispatched_bots: &[BotId],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "message": message,
+            "dispatched_bots": dispatched_bots,
+        }));
+    }
+    let dispatched: Vec<_> = dispatched_bots.iter().map(BotId::as_str).collect();
+    Ok(format!(
+        "posted group message {} in thread {} (dispatched: [{}])",
+        message.message_id,
+        message.thread_id,
+        dispatched.join(", ")
+    ))
+}
+
+pub(crate) fn format_connector_test(
+    bot_id: &BotId,
+    res: &BotConnectorTestResult,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "result": res,
+        }));
+    }
+    let label = res.account_label.as_deref().unwrap_or("-");
+    let detail = if res.detail.is_empty() {
+        "-"
+    } else {
+        &res.detail
+    };
+    Ok(format!(
+        "connector test {bot_id} {}: ok={} account={label} detail={detail}",
+        res.source.as_str(),
+        res.ok
+    ))
+}
+
+pub(crate) fn format_mcp_oauth(state: &BotMcpOAuthState, json: bool) -> Result<String, CliError> {
+    if json {
+        return to_json(state);
+    }
+    let mut out = format!(
+        "mcp oauth {} for {}: status={}",
+        state.tool_id, state.bot_id, state.status
+    );
+    if let Some(ref url) = state.auth_url {
+        write!(out, "\nauth_url: {url}").ok();
+    }
+    if let Some(ref err) = state.error {
+        write!(out, "\nerror: {err}").ok();
+    }
+    Ok(out)
+}
+
+pub(crate) fn format_composio_connections(
+    bot_id: &BotId,
+    connections: &[ComposioConnectionInfo],
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "connections": connections,
+        }));
+    }
+    if connections.is_empty() {
+        return Ok(format!("No Composio connections for {bot_id}."));
+    }
+    let mut out = String::new();
+    writeln!(out, "{:<20} {:<14} {:<12} ACCOUNT", "ID", "APP", "STATUS").ok();
+    for c in connections {
+        writeln!(
+            out,
+            "{:<20} {:<14} {:<12} {}",
+            c.id,
+            c.app_id,
+            c.status,
+            c.account_label.as_deref().unwrap_or("-")
+        )
+        .ok();
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+pub(crate) fn format_composio_connect_started(
+    bot_id: &BotId,
+    connection_id: &str,
+    redirect_url: &str,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "connection_id": connection_id,
+            "redirect_url": redirect_url,
+        }))
+    } else {
+        Ok(format!(
+            "Composio connect started for {bot_id} ({connection_id}):\n{redirect_url}"
+        ))
+    }
+}
+
+pub(crate) fn format_tracker_defaults(
+    defaults: &DefaultTrackerBots,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        return to_json(defaults);
+    }
+    Ok(format!(
+        "github: {}\nlinear: {}",
+        defaults
+            .github
+            .as_ref()
+            .map_or("-".to_owned(), ToString::to_string),
+        defaults
+            .linear
+            .as_ref()
+            .map_or("-".to_owned(), ToString::to_string),
+    ))
+}
+
+pub(crate) fn format_avatar_saved(
+    bot_id: &BotId,
+    path: &str,
+    mime: &str,
+    bytes: usize,
+    json: bool,
+) -> Result<String, CliError> {
+    if json {
+        to_json(&serde_json::json!({
+            "bot_id": bot_id,
+            "path": path,
+            "mime": mime,
+            "bytes": bytes,
+        }))
+    } else {
+        Ok(format!(
+            "saved avatar for {bot_id} to {path} ({bytes} bytes)"
+        ))
+    }
 }
