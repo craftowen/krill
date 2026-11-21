@@ -4195,9 +4195,9 @@ fn owe900_imported_idle_worktrees_render_as_cards_and_all_projects_visible(
             "{selector} must render for idle imported worktree in virtualized list"
         );
     }
-    // 저장소 헤더와 워크트리 수 배지가 보인다(rows[0] = 첫 프로젝트, 워크트리 8개).
+    // 저장소 헤더는 보이고, 펼친 프로젝트에는 워크트리 수 배지를 숨긴다(접혔을 때만 보인다).
     assert!(cx.debug_bounds("repo-header-0").is_some());
-    assert!(cx.debug_bounds("repo-count-0").is_some());
+    assert!(cx.debug_bounds("repo-count-0").is_none());
 }
 
 /// OWE-900: 세션 없는 워크트리가 10개를 넘는 프로젝트는 접힌 상태로 시작한다.

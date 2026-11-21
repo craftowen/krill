@@ -32,7 +32,7 @@ use crate::ui::status::{self, Size};
 /// 카드 테두리 2 + 안쪽 여백 10 − 세션 행 바깥 여백 4.
 const CARD_SESSION_INSET: f32 = 8.;
 /// 폴더 행의 아이콘 아래에 세션 상태를 정렬한다(이름 아래로 중복 들여쓰지 않는다).
-const FOLDER_SESSION_INSET: f32 = 34.;
+const FOLDER_SESSION_INSET: f32 = 8.;
 
 #[expect(
     clippy::struct_excessive_bools,
@@ -1057,26 +1057,6 @@ impl Sidebar {
                             .text_color(p.sidebar_accent_foreground)
                     })
                     .child(
-                        Button::new(("repo-fold", index))
-                            .ghost()
-                            .xsmall()
-                            .icon(if closed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .accessibility_label(if closed {
-                                text::UNFOLD.get()
-                            } else {
-                                text::FOLD.get()
-                            })
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                cx.stop_propagation();
-                                s.cursor = Some(index);
-                                s.fold(&fold_btn, None, cx);
-                            })),
-                    )
-                    .child(
                         div()
                             .debug_selector(move || format!("repo-icon-{index}"))
                             .child(ui::icons::project_header_icon(
@@ -1093,7 +1073,8 @@ impl Sidebar {
                             .truncate()
                             .child(self.project_header_name(path)),
                     )
-                    .when(wt_count > 0, |d| {
+                    // 펼친 동안에는 워크트리가 보이므로 개수는 접혔을 때만 보인다.
+                    .when(wt_count > 0 && closed, |d| {
                         d.child(
                             div()
                                 .debug_selector(move || format!("repo-count-{index}"))
@@ -1107,6 +1088,34 @@ impl Sidebar {
                                 .child(wt_count.to_string()),
                         )
                     })
+                    // Orca처럼 접기 화살표는 오른쪽에 두고, 펼친 동안에는 호버할 때만 보인다.
+                    .child(
+                        div()
+                            .flex_none()
+                            .when(!closed, |d| {
+                                d.invisible().group_hover(ROW_GROUP, Styled::visible)
+                            })
+                            .child(
+                                Button::new(("repo-fold", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(if closed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .accessibility_label(if closed {
+                                        text::UNFOLD.get()
+                                    } else {
+                                        text::FOLD.get()
+                                    })
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.cursor = Some(index);
+                                        s.fold(&fold_btn, None, cx);
+                                    })),
+                            ),
+                    )
                     .child(
                         div()
                             .flex_none()
@@ -1166,26 +1175,6 @@ impl Sidebar {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
-                    .child(
-                        Button::new(("folder-fold", index))
-                            .ghost()
-                            .xsmall()
-                            .icon(if closed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .accessibility_label(if closed {
-                                text::UNFOLD.get()
-                            } else {
-                                text::FOLD.get()
-                            })
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                cx.stop_propagation();
-                                s.cursor = Some(index);
-                                s.fold(&fold_btn, None, cx);
-                            })),
-                    )
                     .child(ui::icons::project_header_icon(
                         self.project_icon(path),
                         self.project_badge_color(path),
@@ -1199,6 +1188,34 @@ impl Sidebar {
                             .min_w_0()
                             .truncate()
                             .child(self.project_header_name(path)),
+                    )
+                    // Orca처럼 접기 화살표는 오른쪽에 두고, 펼친 동안에는 호버할 때만 보인다.
+                    .child(
+                        div()
+                            .flex_none()
+                            .when(!closed, |d| {
+                                d.invisible().group_hover(ROW_GROUP, Styled::visible)
+                            })
+                            .child(
+                                Button::new(("folder-fold", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(if closed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .accessibility_label(if closed {
+                                        text::UNFOLD.get()
+                                    } else {
+                                        text::FOLD.get()
+                                    })
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.cursor = Some(index);
+                                        s.fold(&fold_btn, None, cx);
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -1241,7 +1258,7 @@ impl Sidebar {
             }
             Row::HiddenWorktrees(repo, count, expanded) => {
                 super::external::render_hidden_row(base, repo, *count, *expanded, cx)
-                    .ml(px(6. + CHILD_INDENT + host_indent))
+                    .ml(px(6. + host_indent))
             }
             Row::PendingWorktree { name, .. } => {
                 self.render_pending_worktree(base, index, name, cx)
@@ -1624,6 +1641,7 @@ impl Sidebar {
         path: &std::path::Path,
         card_title: String,
         title_size: gpui::Rems,
+        idle: bool,
         index: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1686,7 +1704,11 @@ impl Sidebar {
             .min_w_0()
             .truncate()
             .text_size(title_size)
-            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .font_weight(if idle {
+                gpui::FontWeight::NORMAL
+            } else {
+                gpui::FontWeight::SEMIBOLD
+            })
             .child(card_title)
             .into_any_element()
     }
@@ -1752,7 +1774,8 @@ impl Sidebar {
     /// 워크트리 카드 왼쪽 여백(px): 프로젝트 > 워크트리 들여쓰기 + 호스트 들여쓰기 + 계보 깊이(단계당 14px).
     fn worktree_margin(&self, lineage_depth: usize) -> f32 {
         let depth = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
-        6. + CHILD_INDENT + self.host_indent() + depth * 14.
+        // Orca처럼 워크트리 카드를 프로젝트 아이콘 열에 맞춘다(들여쓰기 없음).
+        4. + self.host_indent() + depth * 14.
     }
 
     fn render_pending_worktree(
@@ -2038,17 +2061,21 @@ impl Sidebar {
             // 묶음 선두 상태의 글리프를 그대로 보인다. 유휴(묶음 없음)는 흐릿한 점.
             status::status_glyph_slot(top.state, false, Size::Md, self.spinner_slots(index), cx)
                 .into_any_element()
-        } else {
+        } else if tree_session_count > 0 {
             div()
                 .size(ui::STATE_DOT)
                 .rounded_full()
-                .bg(if tree_session_count > 0 {
-                    p.success
-                } else {
-                    p.muted_foreground.opacity(0.5)
-                })
+                .bg(p.success)
+                .into_any_element()
+        } else {
+            // Orca처럼 세션 없는 워크트리는 쉬는 중(달) 아이콘으로 보인다.
+            Icon::default()
+                .data(ui::icons::MOON_SVG)
+                .with_size(ui::ICON_SM)
+                .text_color(p.muted_foreground)
                 .into_any_element()
         };
+        let idle = tree_session_count == 0 && !unread && !is_active_worktree;
 
         let new_session_btn = {
             let button = Button::new(("new-session", index))
@@ -2295,6 +2322,7 @@ impl Sidebar {
                                         path,
                                         card_title,
                                         ui::TEXT_SM,
+                                        false,
                                         index,
                                         cx,
                                     )))
@@ -2450,17 +2478,36 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
+                            .child(self.card_title_el(
+                                path,
+                                card_title,
+                                ui::TEXT_SM,
+                                idle,
+                                index,
+                                cx,
+                            ))
                             .when(is_default_tree && !is_editing_this, |d| {
                                 d.child(
                                     div()
                                         .debug_selector(move || {
                                             format!("worktree-default-badge-{index}")
                                         })
+                                        .id(("worktree-default-badge", index))
                                         .flex_none()
-                                        .text_size(ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(crate::i18n::catalog::general::DEFAULT.get()),
+                                        .role(gpui::Role::Image)
+                                        .aria_label(crate::i18n::catalog::general::DEFAULT.get())
+                                        .tooltip(|window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(
+                                                crate::i18n::catalog::general::DEFAULT.get(),
+                                            )
+                                            .build(window, cx)
+                                        })
+                                        .child(
+                                            Icon::default()
+                                                .data(ui::icons::HOUSE_SVG)
+                                                .with_size(ui::ICON_XS)
+                                                .text_color(p.muted_foreground),
+                                        ),
                                 )
                             }),
                     )
@@ -2677,7 +2724,8 @@ impl Sidebar {
                                         .items_center()
                                         .justify_between()
                                         .cursor_pointer()
-                                        .child(if card_expanded {
+                                        // 에이전트 상태가 없으면 펼치든 접든 Orca처럼 개수 문구로 보인다.
+                                        .child(if card_expanded || summary.groups.is_empty() {
                                             div()
                                                 .text_size(ui::TEXT_XS)
                                                 .text_color(p.muted_foreground)
@@ -2685,37 +2733,6 @@ impl Sidebar {
                                                     "n",
                                                     &tree_session_count.to_string(),
                                                 )]))
-                                                .into_any_element()
-                                        } else if summary.groups.is_empty() {
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .child(status::status_glyph(
-                                                    AgentState::Unknown,
-                                                    unread,
-                                                    Size::Sm,
-                                                    cx,
-                                                ))
-                                                .child(status::agent_icon(
-                                                    "",
-                                                    ui::ICON_SM,
-                                                    p.muted_foreground,
-                                                ))
-                                                .when(tree_session_count > 1, |d| {
-                                                    d.child(
-                                                        div()
-                                                            .font_family(ui::FONT_MONO)
-                                                            .text_size(ui::TEXT_2XS)
-                                                            .text_color(p.muted_foreground)
-                                                            .child(format!(
-                                                                "+{}",
-                                                                tree_session_count - 1
-                                                            )),
-                                                    )
-                                                })
                                                 .into_any_element()
                                         } else {
                                             status::summary_element(
@@ -2751,7 +2768,8 @@ impl Sidebar {
             .ml(left_margin)
             .my_0p5()
             .px_2p5()
-            .py_1p5()
+            .when(idle, Styled::py_1)
+            .when(!idle, Styled::py_1p5)
             .rounded(ui::RADIUS_MD)
             .border_1()
             .when(is_active_worktree, |d| {
@@ -2768,7 +2786,11 @@ impl Sidebar {
                     d
                 }
             })
-            .text_color(p.worktree_sidebar_foreground)
+            .text_color(if idle {
+                p.muted_foreground
+            } else {
+                p.worktree_sidebar_foreground
+            })
             .cursor_pointer()
             .flex()
             .flex_col()

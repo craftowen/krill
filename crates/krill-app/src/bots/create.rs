@@ -20,11 +20,15 @@ use crate::ui;
 
 use super::rpc::{
     BOT_AVATAR_COLOR_PALETTE, BOT_EFFORT_OPTIONS, BOT_RUNTIMES, avatar_color_hex, call_checked,
-    effort_label,
+    effort_label, runtime_display_label, runtime_models,
 };
 use super::{Close, DetailTab, Screen, View, clear_input_on_window, opt_input_composing};
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent form flags: fold states, focus request, submit in flight"
+)]
 pub(super) struct CreateState {
     pub(super) category: Option<BotTemplateCategory>,
     pub(super) selected_template_id: Option<&'static str>,
@@ -43,7 +47,23 @@ pub(super) struct CreateState {
     pub(super) workspace_input: Option<Entity<InputState>>,
     pub(super) submit_subs: Vec<Subscription>,
     pub(super) focus_name_pending: bool,
+    pub(super) model: ModelChoice,
+    pub(super) show_templates: bool,
+    pub(super) show_advanced: bool,
+    /// Opened from the sidebar "+": Escape closes the modal instead of going back to a bot.
+    pub(super) opened_alone: bool,
     pub(super) submitting: bool,
+}
+
+/// Model picked in the New bot form. Presets come from [`runtime_models`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ModelChoice {
+    /// The runtime's own default (`model: None`).
+    #[default]
+    Default,
+    Preset(&'static str),
+    /// Free text from `model_input`, for models the preset list doesn't know.
+    Custom,
 }
 
 impl CreateState {
@@ -105,6 +125,9 @@ impl CreateState {
         cx: &mut App,
     ) {
         self.selected_template_id = None;
+        self.model = ModelChoice::Default;
+        self.show_templates = false;
+        self.show_advanced = false;
         self.effort.clear();
         self.permission_mode = None;
         self.avatar_color = None;
@@ -299,6 +322,7 @@ impl View {
 
     pub fn clear_selected_template(&mut self, cx: &mut Context<Self>) {
         self.create.selected_template_id = None;
+        self.create.show_templates = false;
         cx.notify();
     }
 
@@ -323,7 +347,21 @@ impl View {
     }
 
     pub fn set_create_runtime(&mut self, runtime_id: &'static str, cx: &mut Context<Self>) {
+        if self.create.effective_runtime() != runtime_id {
+            // A preset id belongs to one runtime's CLI, so a new runtime starts from its default.
+            self.create.model = ModelChoice::Default;
+        }
         runtime_id.clone_into(&mut self.create.runtime_id);
+        cx.notify();
+    }
+
+    pub(super) fn set_create_model(&mut self, model: ModelChoice, cx: &mut Context<Self>) {
+        self.create.model = model;
+        cx.notify();
+    }
+
+    pub fn toggle_create_templates(&mut self, cx: &mut Context<Self>) {
+        self.create.show_templates = !self.create.show_templates;
         cx.notify();
     }
 
@@ -408,18 +446,38 @@ impl View {
             .as_ref()
             .map(|i| i.read(cx).value().trim().to_owned())
             .filter(|s| !s.is_empty());
-        let model = self
-            .create
-            .model_input
-            .as_ref()
-            .map(|i| i.read(cx).value().trim().to_owned())
-            .filter(|s| !s.is_empty());
+        let model = match self.create.model {
+            ModelChoice::Default => None,
+            ModelChoice::Preset(id) => Some(id.to_owned()),
+            ModelChoice::Custom => self
+                .create
+                .model_input
+                .as_ref()
+                .map(|i| i.read(cx).value().trim().to_owned())
+                .filter(|s| !s.is_empty()),
+        };
         let workspace = self
             .create
             .workspace_input
             .as_ref()
             .map(|i| i.read(cx).value().trim().to_owned())
             .filter(|s| !s.is_empty());
+        if self.create.model == ModelChoice::Custom && model.is_none() {
+            self.error = Some(SharedString::from(text::ERR_EMPTY_MODEL.get()));
+            cx.notify();
+            return;
+        }
+        // A folder on this Mac can be checked here; krilld would otherwise fall back to the
+        // bot's own folder without saying so. Remote hosts check their own paths.
+        if self.host.is_local()
+            && workspace
+                .as_deref()
+                .is_some_and(|ws| !std::path::Path::new(ws).is_dir())
+        {
+            self.error = Some(SharedString::from(text::ERR_WORKSPACE_MISSING.get()));
+            cx.notify();
+            return;
+        }
         let effort = (!self.create.effort.trim().is_empty()).then(|| self.create.effort.clone());
 
         let base = CreateBotParams {
@@ -484,6 +542,7 @@ impl View {
                         let default_cwd = this.default_cwd.clone();
                         this.create
                             .clear_form_fields(handle, default_cwd.as_deref(), cx);
+                        this.emit_badge(cx);
                         this.selected_bot_id = Some(new_id.clone());
                         this.screen = Screen::Detail;
                         this.detail_tab = DetailTab::Items;
@@ -505,6 +564,10 @@ impl View {
         cx.notify();
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "One centered New bot form: identity, place, agent, advanced, footer"
+    )]
     pub(super) fn render_create_view(
         &mut self,
         p: &ui::Palette,
@@ -512,39 +575,16 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_create_inputs(window, cx);
-        let filtered = filter_templates(self.create.category, &self.create.search_query);
         let selected_tpl = self.create.selected_template_id.and_then(find_bot_template);
+        let templates_shown = self.create.show_templates || selected_tpl.is_some();
 
         let header = div()
             .flex_none()
             .px_5()
             .py_3()
-            .border_b_1()
-            .border_color(p.border)
             .flex()
             .items_center()
-            .justify_between()
-            .gap_3()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_LG)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.foreground)
-                            .child(text::CREATE_HEADING.get()),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(text::CREATE_DESC.get()),
-                    ),
-            )
+            .justify_end()
             .child(
                 ui::controls()
                     .child(
@@ -576,11 +616,200 @@ impl View {
                     )),
             );
 
-        let category_pills = self.render_template_category_pills(p, cx);
-        let cards = self.render_template_cards(&filtered, p, cx);
-        let form_card = self.render_create_form_card(selected_tpl, p, cx);
-        let templates_heading =
-            text::TEMPLATES_HEADING.format(&[("n", &filtered.len().to_string())]);
+        let identity = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui::field_label(
+                                text::FIELD_EMOJI.get(),
+                                Some(text::OPTIONAL_TAG.get()),
+                                p,
+                            ))
+                            .children(
+                                self.create
+                                    .emoji_input
+                                    .as_ref()
+                                    .map(|i| Input::new(i).small()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui::field_label(text::FIELD_NAME.get(), None, p))
+                            .children(self.create.name_input.as_ref().map(Input::new)),
+                    ),
+            )
+            .child(ui::field_label(
+                text::FIELD_DESCRIPTION.get(),
+                Some(text::OPTIONAL_TAG.get()),
+                p,
+            ))
+            .children(
+                self.create
+                    .description_input
+                    .as_ref()
+                    .map(|i| Input::new(i).small()),
+            );
+
+        let workspace = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(ui::field_label(
+                text::FIELD_WORKSPACE.get(),
+                Some(text::OPTIONAL_TAG.get()),
+                p,
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .children(
+                        self.create
+                            .workspace_input
+                            .as_ref()
+                            .map(|i| div().flex_1().min_w_0().child(Input::new(i).small())),
+                    )
+                    .child(
+                        ui::secondary("bots-create-pick-folder", text::CHOOSE_FOLDER.get())
+                            .icon(IconName::FolderOpen)
+                            .debug_selector(|| "bots-create-pick-folder".into())
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                Self::pick_create_workspace_folder(window, cx);
+                            })),
+                    ),
+            );
+
+        let footer = div()
+            .w_full()
+            .pt_3()
+            .border_t_1()
+            .border_color(p.border)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                ui::ghost(
+                    "bots-create-toggle-templates",
+                    if templates_shown {
+                        text::HIDE_TEMPLATES.get()
+                    } else {
+                        text::SHOW_TEMPLATES.get()
+                    },
+                )
+                .icon(IconName::LayoutDashboard)
+                .debug_selector(|| "bots-create-toggle-templates".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.create.selected_template_id.is_some() {
+                        this.clear_selected_template(cx);
+                    } else {
+                        this.toggle_create_templates(cx);
+                    }
+                })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    // Same chord the key handler below accepts (`secondary` = Cmd on macOS).
+                    .child(ui::keycap(
+                        p,
+                        if cfg!(target_os = "macos") {
+                            "⌘↵"
+                        } else {
+                            "Ctrl+Enter"
+                        },
+                    ))
+                    .child(
+                        ui::button_with_reserved_label(
+                            "bots-create-submit",
+                            text::CREATE_BOT_BTN.get(),
+                            text::CREATING.get(),
+                            self.create.submitting,
+                        )
+                        .debug_selector(|| "bots-create-submit".into())
+                        .disabled(self.create.submitting)
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_create_bot(cx))),
+                    ),
+            );
+
+        let form = div()
+            .w_full()
+            .max_w(px(520.))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(text::CREATE_HEADING.get()),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .text_center()
+                            .child(text::CREATE_DESC.get()),
+                    ),
+            )
+            .children(
+                self.error
+                    .as_ref()
+                    .map(|err| ui::error_banner(p, err.clone())),
+            )
+            .children(self.notice.as_ref().map(|msg| {
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.success.opacity(0.3))
+                    .bg(p.success.opacity(0.1))
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.success)
+                    .child(msg.clone())
+            }))
+            .children(selected_tpl.map(|tpl| Self::render_template_banner(tpl, p, cx)))
+            .child(identity)
+            .child(workspace)
+            .child(self.render_create_agent_row(p, cx))
+            .child(self.render_create_advanced(p, cx))
+            .child(footer)
+            .when(templates_shown, |d| {
+                d.child(self.render_create_templates(p, cx))
+            });
 
         div()
             .id("bots-create-view")
@@ -591,26 +820,17 @@ impl View {
             .min_h_0()
             .flex()
             .flex_col()
-            .child(header)
-            .children(
-                self.error
-                    .as_ref()
-                    .map(|err| div().px_5().pt_3().child(ui::error_banner(p, err.clone()))),
-            )
-            .children(self.notice.as_ref().map(|msg| {
-                div().px_5().pt_3().child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .rounded(ui::RADIUS_SM)
-                        .border_1()
-                        .border_color(p.success.opacity(0.3))
-                        .bg(p.success.opacity(0.1))
-                        .text_size(ui::TEXT_XS)
-                        .text_color(p.success)
-                        .child(msg.clone()),
-                )
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let keys = &event.keystroke;
+                if keys.key == "enter"
+                    && keys.modifiers.secondary()
+                    && !this.input_is_composing(window, cx)
+                {
+                    this.submit_create_bot(cx);
+                    cx.stop_propagation();
+                }
             }))
+            .child(header)
             .child(
                 div()
                     .id("bots-create-scroll")
@@ -618,32 +838,11 @@ impl View {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_5()
-                    .py_4()
+                    .pb_6()
                     .flex()
                     .flex_col()
-                    .gap_4()
-                    .child(form_card)
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_SM)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.foreground)
-                                    .child(templates_heading),
-                            )
-                            .children(self.create.search_input.as_ref().map(|i| {
-                                div().w(px(220.)).max_w_full().child(Input::new(i).small())
-                            })),
-                    )
-                    .child(category_pills)
-                    .child(cards),
+                    .items_center()
+                    .child(form),
             )
     }
 
@@ -820,59 +1019,197 @@ impl View {
         cards
     }
 
-    fn render_create_form_card(
-        &self,
-        selected_tpl: Option<&'static BotTemplate>,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let active_runtime = self.create.effective_runtime().to_owned();
-        let mut runtime_pills = div()
-            .id("bots-runtime-picker")
-            .debug_selector(|| "bots-runtime-picker".into())
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1p5();
-        for rt in BOT_RUNTIMES {
-            let is_active = active_runtime == rt.id;
-            let rt_id = format!("bots-runtime-{}", rt.id);
-            let rt_sel = rt_id.clone();
-            runtime_pills = runtime_pills.child(
+    fn model_choice_label(&self) -> String {
+        match self.create.model {
+            ModelChoice::Default => text::MODEL_DEFAULT.get().to_owned(),
+            ModelChoice::Preset(id) => runtime_models(self.create.effective_runtime())
+                .iter()
+                .find(|(preset, _)| *preset == id)
+                .map_or(id, |(_, label)| *label)
+                .to_owned(),
+            ModelChoice::Custom => text::MODEL_CUSTOM.get().to_owned(),
+        }
+    }
+
+    /// Agent and model pickers, side by side like Orca's New bot dialog.
+    fn render_create_agent_row(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+
+        let runtime = self.create.effective_runtime().to_owned();
+        let this = cx.weak_entity();
+        let runtime_button = Button::new("bots-runtime-picker")
+            .outline()
+            .small()
+            .w_full()
+            .dropdown_caret(true)
+            // Icon and name share one child so the caret layout keeps them left-aligned.
+            .accessibility_label(runtime_display_label(&runtime))
+            .child(
                 div()
-                    .id(SharedString::from(rt_id))
-                    .debug_selector(move || rt_sel.clone())
-                    .px_2p5()
-                    .py_1()
-                    .rounded(ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(if is_active { p.ring } else { p.border })
-                    .bg(if is_active { p.accent } else { p.card })
-                    .cursor_pointer()
-                    .hover(|s| s.bg(p.accent))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_create_runtime(rt.id, cx);
-                    }))
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap_1p5()
                     .child(ui::icons::agent_brand_icon(
-                        rt.brand_id,
-                        ui::ICON_XS,
+                        &runtime,
+                        ui::ICON_SM,
                         p.foreground,
                     ))
+                    .child(div().truncate().child(runtime_display_label(&runtime))),
+            )
+            .debug_selector(|| "bots-runtime-picker".into())
+            .dropdown_menu({
+                let runtime = runtime.clone();
+                move |mut menu, _, _| {
+                    for rt in BOT_RUNTIMES {
+                        let this = this.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(rt.label())
+                                .icon(ui::icons::agent_menu_icon(rt.id))
+                                .checked(runtime == rt.id)
+                                .on_click(move |_, _, cx| {
+                                    this.update(cx, |v, cx| v.set_create_runtime(rt.id, cx))
+                                        .ok();
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
+
+        let current = self.create.model;
+        let presets = runtime_models(&runtime);
+        let this = cx.weak_entity();
+        let model_button = Button::new("bots-model-picker")
+            .outline()
+            .small()
+            .w_full()
+            .dropdown_caret(true)
+            .label(self.model_choice_label())
+            .debug_selector(|| "bots-model-picker".into())
+            .dropdown_menu(move |mut menu, _, _| {
+                let pick = |choice: ModelChoice| {
+                    let this = this.clone();
+                    move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                        this.update(cx, |v, cx| v.set_create_model(choice, cx)).ok();
+                    }
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(text::MODEL_DEFAULT.get())
+                        .checked(current == ModelChoice::Default)
+                        .on_click(pick(ModelChoice::Default)),
+                );
+                for (id, label) in presets {
+                    menu = menu.item(
+                        PopupMenuItem::new(*label)
+                            .checked(current == ModelChoice::Preset(id))
+                            .on_click(pick(ModelChoice::Preset(id))),
+                    );
+                }
+                menu.separator().item(
+                    PopupMenuItem::new(text::MODEL_CUSTOM.get())
+                        .checked(current == ModelChoice::Custom)
+                        .on_click(pick(ModelChoice::Custom)),
+                )
+            });
+
+        let field = |label: &'static str, control: gpui::AnyElement| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(ui::field_label(label, None, p))
+                .child(control)
+        };
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .gap_3()
+                    .child(field(
+                        text::FIELD_RUNTIME.get(),
+                        runtime_button.into_any_element(),
+                    ))
+                    .child(field(
+                        text::FIELD_MODEL.get(),
+                        model_button.into_any_element(),
+                    )),
+            )
+            .when(self.create.model == ModelChoice::Custom, |d| {
+                d.children(
+                    self.create
+                        .model_input
+                        .as_ref()
+                        .map(|i| Input::new(i).small()),
+                )
+            })
+    }
+
+    /// Template gallery, folded under "Start from a template" until asked for.
+    fn render_create_templates(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let filtered = filter_templates(self.create.category, &self.create.search_query);
+        div()
+            .id("bots-create-templates")
+            .debug_selector(|| "bots-create-templates".into())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .child(
                         div()
-                            .text_size(ui::TEXT_XS)
-                            .font_weight(if is_active {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.foreground)
-                            .child(rt.label()),
+                            .child(
+                                text::TEMPLATES_HEADING
+                                    .format(&[("n", &filtered.len().to_string())]),
+                            ),
+                    )
+                    .children(
+                        self.create
+                            .search_input
+                            .as_ref()
+                            .map(|i| div().w(px(200.)).max_w_full().child(Input::new(i).small())),
                     ),
-            );
+            )
+            .child(self.render_template_category_pills(p, cx))
+            .child(self.render_template_cards(&filtered, p, cx))
+    }
+
+    /// Address, effort, permission and avatar color: folded so the form stays short.
+    fn render_create_advanced(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
+        let open = self.create.show_advanced;
+        let toggle = ui::ghost("bots-create-toggle-advanced", text::ADVANCED_OPTIONS.get())
+            .icon(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .debug_selector(|| "bots-create-toggle-advanced".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.create.show_advanced = !this.create.show_advanced;
+                cx.notify();
+            }));
+        if !open {
+            return div().w_full().child(toggle);
         }
 
         let effort_pills = ui::segmented_control(
@@ -952,284 +1289,111 @@ impl View {
             );
         }
 
-        ui::card(p)
+        let labeled = |label: &'static str, control: gpui::AnyElement| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(ui::field_label(label, Some(text::OPTIONAL_TAG.get()), p))
+                .child(control)
+        };
+        div()
+            .w_full()
             .flex()
             .flex_col()
             .gap_3()
-            .when_some(selected_tpl, |d, tpl| {
-                let banner_text = text::SELECTED_TEMPLATE.format(&[("name", tpl.name)]);
-                let ex_text = if !tpl.example[0].is_empty() || !tpl.example[1].is_empty() {
-                    Some(format!("{} — {}", tpl.example[0], tpl.example[1]))
-                } else {
-                    None
-                };
-                d.child(
-                    div()
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .rounded(ui::RADIUS_SM)
-                        .bg(p.accent.opacity(0.6))
-                        .border_1()
-                        .border_color(p.border)
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(ui::TEXT_XS)
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(p.foreground)
-                                        .child(banner_text),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(format!(
-                                            "{}: {}",
-                                            text::TEMPLATE_FIRST_CHAT.get(),
-                                            tpl.first_chat
-                                        )),
-                                )
-                                .when_some(ex_text, |dd, ex| {
-                                    dd.child(
-                                        div()
-                                            .text_size(ui::TEXT_2XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(format!(
-                                                "{}: {ex}",
-                                                text::TEMPLATE_EXAMPLE.get()
-                                            )),
-                                    )
-                                }),
-                        )
-                        .child(
-                            ui::ghost("bots-clear-template", text::CLEAR_TEMPLATE.get())
-                                .debug_selector(|| "bots-clear-template".into())
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.clear_selected_template(cx)),
-                                ),
-                        ),
+            .child(toggle)
+            .child(
+                labeled(
+                    text::FIELD_SLUG.get(),
+                    self.create.slug_input.as_ref().map_or_else(
+                        || div().into_any_element(),
+                        |i| Input::new(i).small().into_any_element(),
+                    ),
                 )
-            })
+                .w_full(),
+            )
             .child(
                 div()
                     .w_full()
                     .flex()
                     .flex_wrap()
                     .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(200.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(text::FIELD_NAME.get(), None, p))
-                            .children(
-                                self.create
-                                    .name_input
-                                    .as_ref()
-                                    .map(|i| Input::new(i).small()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(180.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::FIELD_SLUG.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .children(
-                                self.create
-                                    .slug_input
-                                    .as_ref()
-                                    .map(|i| Input::new(i).small()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(110.))
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::FIELD_EMOJI.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .children(
-                                self.create
-                                    .emoji_input
-                                    .as_ref()
-                                    .map(|i| Input::new(i).small()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(ui::field_label(
-                        text::FIELD_DESCRIPTION.get(),
-                        Some(text::OPTIONAL_TAG.get()),
-                        p,
+                    .child(labeled(
+                        text::FIELD_EFFORT.get(),
+                        effort_pills.into_any_element(),
                     ))
-                    .children(
-                        self.create
-                            .description_input
-                            .as_ref()
-                            .map(|i| Input::new(i).small()),
-                    ),
+                    .child(labeled(
+                        text::FIELD_PERMISSION.get(),
+                        perm_pills.into_any_element(),
+                    )),
             )
+            .child(labeled(
+                text::SETTINGS_AVATAR_COLOR_LABEL.get(),
+                color_swatches.into_any_element(),
+            ))
+    }
+
+    fn render_template_banner(
+        tpl: &'static BotTemplate,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let banner_text = text::SELECTED_TEMPLATE.format(&[("name", tpl.name)]);
+        let ex_text = if !tpl.example[0].is_empty() || !tpl.example[1].is_empty() {
+            Some(format!("{} — {}", tpl.example[0], tpl.example[1]))
+        } else {
+            None
+        };
+        div()
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded(ui::RADIUS_SM)
+            .bg(p.accent.opacity(0.6))
+            .border_1()
+            .border_color(p.border)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
             .child(
                 div()
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(ui::field_label(text::FIELD_RUNTIME.get(), None, p))
-                    .child(runtime_pills),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::FIELD_EFFORT.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .child(effort_pills),
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(banner_text),
                     )
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::FIELD_PERMISSION.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .child(perm_pills),
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(format!(
+                                "{}: {}",
+                                text::TEMPLATE_FIRST_CHAT.get(),
+                                tpl.first_chat
+                            )),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::SETTINGS_AVATAR_COLOR_LABEL.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .child(color_swatches),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(200.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::FIELD_MODEL.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .children(
-                                self.create
-                                    .model_input
-                                    .as_ref()
-                                    .map(|i| Input::new(i).small()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(240.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(ui::field_label(
-                                text::FIELD_WORKSPACE.get(),
-                                Some(text::OPTIONAL_TAG.get()),
-                                p,
-                            ))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .children(self.create.workspace_input.as_ref().map(|i| {
-                                        div().flex_1().min_w_0().child(Input::new(i).small())
-                                    }))
-                                    .child(
-                                        ui::secondary(
-                                            "bots-create-pick-folder",
-                                            text::CHOOSE_FOLDER.get(),
-                                        )
-                                        .debug_selector(|| "bots-create-pick-folder".into())
-                                        .on_click(
-                                            cx.listener(|_, _, window, cx| {
-                                                Self::pick_create_workspace_folder(window, cx);
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        ui::button_with_reserved_label(
-                            "bots-create-submit",
-                            text::CREATE_BOT_BTN.get(),
-                            text::CREATING.get(),
-                            self.create.submitting,
+                    .when_some(ex_text, |dd, ex| {
+                        dd.child(
+                            div()
+                                .text_size(ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(format!("{}: {ex}", text::TEMPLATE_EXAMPLE.get())),
                         )
-                        .debug_selector(|| "bots-create-submit".into())
-                        .disabled(self.create.submitting)
-                        .on_click(cx.listener(|this, _, _, cx| this.submit_create_bot(cx))),
-                    ),
+                    }),
+            )
+            .child(
+                ui::ghost("bots-clear-template", text::CLEAR_TEMPLATE.get())
+                    .debug_selector(|| "bots-clear-template".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_selected_template(cx))),
             )
     }
 }
