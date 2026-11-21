@@ -152,8 +152,20 @@ pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+fn resolve_directory_override(
+    value: Option<&std::ffi::OsStr>,
+    default: PathBuf,
+) -> io::Result<PathBuf> {
+    // Ignore empty override vars (`VAR=""`) so `absolute("")` never resolves into CWD.
+    absolute(
+        value
+            .filter(|v| !v.is_empty())
+            .map_or(default, PathBuf::from),
+    )
+}
+
 fn directory_override(variable: &str, default: PathBuf) -> io::Result<PathBuf> {
-    absolute(std::env::var_os(variable).map_or(default, PathBuf::from))
+    resolve_directory_override(std::env::var_os(variable).as_deref(), default)
 }
 
 fn config_path(agent: TargetAgent, home: &Path) -> io::Result<PathBuf> {
@@ -243,5 +255,30 @@ mod tests {
         assert_eq!(run("uninstall", &["-h"]), ExitCode::SUCCESS);
         // 도움말 플래그는 설치 경로와 겹치지 않는다.
         assert_eq!(run("install", &["--dry-run", "--help"]), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn empty_directory_override_falls_back_to_default() {
+        let root =
+            std::env::temp_dir().join(format!("krill-hook-dir-override-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let default = canonicalize(&root).unwrap().join(".claude");
+        let empty = std::ffi::OsStr::new("");
+
+        assert_eq!(
+            resolve_directory_override(None, default.clone()).unwrap(),
+            default
+        );
+        assert_eq!(
+            resolve_directory_override(Some(empty), default.clone()).unwrap(),
+            default
+        );
+        let custom = root.join("custom");
+        assert_eq!(
+            resolve_directory_override(Some(custom.as_os_str()), default).unwrap(),
+            absolute(custom).unwrap()
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
