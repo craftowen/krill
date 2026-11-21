@@ -126,13 +126,22 @@ fn inspect_a_to_b() -> UsageRequest {
     }
 }
 
-fn switch_session_1() -> UsageRequest {
+fn switch_session_1(interrupt_busy: bool) -> UsageRequest {
     UsageRequest::SwitchSelectedSessions {
         provider: ProviderKind::Claude,
         account_id: "b".into(),
         sessions: vec![SessionId(1)],
-        interrupt_busy: false,
+        interrupt_busy,
     }
+}
+
+/// 카드의 리뷰 버튼이 이동 불가 사유까지 보이는 review 모드 모달을 연다.
+fn open_review_modal(cx: &mut VisualTestContext) {
+    click(cx, "external-switch-review-action");
+    settle(cx);
+    assert!(cx.debug_bounds("session-switch-modal").is_some());
+    assert!(cx.debug_bounds("session-switch-detail-review").is_some());
+    assert!(cx.debug_bounds("external-switch-notice").is_none());
 }
 
 /// 원격 호스트에서 a → b 외부 전환을 일으킨다.
@@ -248,7 +257,7 @@ fn first_in_app_and_automatic_switches_stay_silent(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn local_ask_reviews_unmoved_sessions_and_switches_them(cx: &mut TestAppContext) {
+fn local_ask_opens_review_modal_and_switches_selected_sessions(cx: &mut TestAppContext) {
     let (socket, requests) = fake_daemon("local-ask");
     // Toast entry/exit animations would move click targets between frames.
     cx.update(|cx| cx.set_reduce_motion(true));
@@ -269,10 +278,19 @@ fn local_ask_reviews_unmoved_sessions_and_switches_them(cx: &mut TestAppContext)
     assert!(requests.lock().unwrap().contains(&inspect_a_to_b()));
     assert!(cx.debug_bounds("external-switch-notice").is_some());
     assert!(cx.debug_bounds("external-switch-dismiss").is_some());
-    click(cx, "external-switch-review-action");
+    open_review_modal(cx);
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, UsageRequest::SwitchSelectedSessions { .. })),
+        "the review modal decides, not the card"
+    );
+    click(cx, "session-switch-restart");
     settle(cx);
-    assert!(requests.lock().unwrap().contains(&switch_session_1()));
-    assert!(cx.debug_bounds("external-switch-notice").is_none());
+    assert!(requests.lock().unwrap().contains(&switch_session_1(true)));
+    assert!(cx.debug_bounds("session-switch-modal").is_none());
 }
 
 #[gpui::test]
@@ -284,10 +302,10 @@ fn remote_restart_moves_sessions_and_reports_the_rest(cx: &mut TestAppContext) {
     );
     let seen = requests.lock().unwrap().clone();
     assert!(seen.contains(&inspect_a_to_b()));
-    assert!(seen.contains(&switch_session_1()));
+    assert!(seen.contains(&switch_session_1(false)));
     assert!(cx.debug_bounds("external-switch-notice").is_some());
-    assert!(cx.debug_bounds("external-switch-review-action").is_none());
     assert!(cx.debug_bounds("external-switch-dismiss").is_some());
+    open_review_modal(cx);
 }
 
 #[gpui::test]
@@ -327,6 +345,28 @@ fn kept_switch_stays_dismissed_when_the_same_snapshot_returns(cx: &mut TestAppCo
     assert!(cx.debug_bounds("external-switch-notice").is_none());
     assert_eq!(requests.lock().unwrap().len(), before);
     view.read_with(cx, |s, _| {
+        assert!(s.external_switch.pending_review.is_none());
+    });
+}
+
+#[gpui::test]
+fn settings_window_switch_is_not_an_external_switch(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("ext-switch-settings"));
+    let settings = cx.new(krill_app::settings::SettingsView::new);
+    view.update(cx, |s, cx| {
+        // Local may already hold a startup fallback snapshot; start from a known baseline.
+        s.external_switch = ExternalSwitchTracker::default();
+        s.apply_accounts_snapshot(snapshot("a"), cx);
+        settings.update(cx, |settings, cx| {
+            settings.apply_account_request(
+                UsageRequest::SwitchAccount {
+                    provider: ProviderKind::Claude,
+                    account_id: "b".into(),
+                },
+                cx,
+            );
+        });
+        s.apply_accounts_snapshot(snapshot("b"), cx);
         assert!(s.external_switch.pending_review.is_none());
     });
 }

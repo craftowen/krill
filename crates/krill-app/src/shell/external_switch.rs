@@ -52,6 +52,21 @@ impl ExternalSwitchReview {
         }
     }
 
+    /// 리뷰 모달(또는 일괄 전환)을 여는 버튼 라벨. 열 대상이 없으면 `None`.
+    pub fn review_label(&self) -> Option<&'static str> {
+        use krill_app::i18n::catalog::external_switch as text;
+        let has_candidates = self.plan.as_ref().is_some_and(|p| !p.candidates.is_empty());
+        match self.policy {
+            RunningSessionSwitchPolicy::Ask if has_candidates || !self.movable().is_empty() => {
+                Some(text::SWITCH_SESSIONS.get())
+            }
+            RunningSessionSwitchPolicy::Restart if self.cant_move_count > 0 && has_candidates => {
+                Some(text::REVIEW_UNMOVED.get())
+            }
+            _ => None,
+        }
+    }
+
     pub fn title(&self) -> String {
         use krill_app::i18n::catalog::external_switch as text;
         let args = [
@@ -237,8 +252,15 @@ impl Shell {
         let Some(review) = self.external_switch.pending_review.take() else {
             return;
         };
-        let movable = review.movable();
-        self.switch_external_sessions(&review, movable, cx);
+        match review.plan {
+            Some(plan) if !plan.candidates.is_empty() => {
+                self.open_session_switch_modal(review.host, plan, true, cx);
+            }
+            _ => {
+                let movable = review.movable();
+                self.switch_external_sessions(&review, movable, cx);
+            }
+        }
         cx.notify();
     }
 

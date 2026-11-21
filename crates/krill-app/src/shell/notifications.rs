@@ -437,10 +437,10 @@ impl Shell {
                 .children(review.summary());
             if actionable {
                 let mut actions = div().flex().gap_2();
-                if review.policy == Policy::Ask && !review.movable().is_empty() {
+                if let Some(label) = review.review_label() {
                     let open = shell.clone();
                     actions = actions.child(
-                        ui::primary("external-switch-review-action", text::SWITCH_SESSIONS.get())
+                        ui::primary("external-switch-review-action", label)
                             .debug_selector(|| "external-switch-review-action".into())
                             .on_click(move |_, _, cx| {
                                 open.update(cx, Shell::open_external_switch_review).ok();

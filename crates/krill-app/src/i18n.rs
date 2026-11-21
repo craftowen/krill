@@ -3045,6 +3045,7 @@ catalog! {
         SWITCHED_CANT_MOVE => ("{account}(으)로 전환됨, {n}개 세션을 옮기지 못했습니다", "Switched to {account}; {n} sessions couldn't be moved"),
         SUMMARY => ("전환 가능 {movable}개, 이동 불가 {cant}개", "{movable} can switch, {cant} can't move"),
         SWITCH_SESSIONS => ("세션 전환", "Switch sessions"),
+        REVIEW_UNMOVED => ("미이동 확인", "Review unmoved"),
         KEEP => ("유지", "Keep"),
         OK => ("확인", "OK"),
     }
