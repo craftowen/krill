@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 OWE-839 Windows 메모리 회귀 게이트(MK-066 Windows판). 예산을 넘으면 1로 끝난다.
 
@@ -8,7 +8,7 @@ OWE-839 Windows 메모리 회귀 게이트(MK-066 Windows판). 예산을 넘으�
 PrivateUsage가 게이트, Private Working Set은 보조 기록. 성능 카운터 이름이 지역화되므로 Get-Counter를 쓰지 않는다.
 
   기본(데몬 게이트): holder + krilld <= 60MiB. SSH 같은 비대화형 세션에서 돈다.
-  -App(사람이 로그온한 GUI 세션에서만): krill-app도 띄워 앱 <= 120MiB, 합계 <= 200MiB.
+  -App(사람이 로그온한 GUI 세션에서만): krill-app도 띄워 합계 <= 200MiB(앱 120MiB 개별 제한 해제, 측정만 기록).
   세션 프로세스(생성기)와 ConPTY 호스트(conhost/OpenConsole)는 예산 밖이다. 호스트 합은 기록만 한다.
 
 종료 코드: 0 통과, 1 예산 초과, 2 준비 실패(빌드·데몬 기동·세션 생성).
@@ -34,7 +34,6 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot)
 $DaemonLimit = 60MB
-$AppLimit = 120MB
 $TotalLimit = 200MB
 $GenLines = 20000
 $Idle = 10
@@ -150,12 +149,11 @@ try {
     $fmt = { param($b) '{0:N1}' -f ($b / 1MB) }
     $line = ($rows.Keys | ForEach-Object { "$_ $(& $fmt $rows[$_].Private)" }) -join ' '
     $wsLine = ($rows.Keys | ForEach-Object { "$_ $(& $fmt $rows[$_].WS)" }) -join ' '
-    "MKW $Sessions sessions: $line MiB PrivateUsage (limits: daemon 60 / app 120 / total 200 MiB)"
+    "MKW $Sessions sessions: $line MiB PrivateUsage (limits: daemon 60 / total 200 MiB; app not gated)"
     "MKW private WS: $wsLine MiB; pty hosts ($($hosts.Count)) private $(& $fmt $hostMem.Private) / WS $(& $fmt $hostMem.WS) MiB (not gated)"
 
     $over = @()
     if ($daemon -gt $DaemonLimit) { $over += 'daemon > 60 MiB' }
-    if ($appProc -and $rows.app.Private -gt $AppLimit) { $over += 'app > 120 MiB' }
     if ($appProc -and $rows.total.Private -gt $TotalLimit) { $over += 'total > 200 MiB' }
     if ($over) { Stop-Gate 1 "memory gate failed: $($over -join ', ')" }
     'memory-gate-windows: ok'

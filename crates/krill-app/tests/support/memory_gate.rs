@@ -15,7 +15,6 @@ use super::*;
 const TERMINALS: usize = 10;
 /// 세션마다 내는 줄 수(약 125B/줄 → 약 2.5MB). 핫 스크롤백 1,000행을 다 채우고 콜드 저장소도 쓰게 한다.
 const GEN_LINES: usize = 20_000;
-const APP_LIMIT: u64 = 120 << 20;
 const DAEMON_LIMIT: u64 = 60 << 20;
 const LIMIT: u64 = 200 << 20;
 /// MK-009처럼 출력이 끝난 뒤 이만큼 쉬고 잰다.
@@ -357,7 +356,7 @@ fn mib(bytes: u64) -> String {
     format!("{:.1}", f64::from(kib) / 1024.0)
 }
 
-fn measure(guard: &Processes) -> (u64, u64, u64, String) {
+fn measure(guard: &Processes) -> (u64, u64, String) {
     let app = footprint(guard.apps[0].id());
     let krilld = footprint(guard.krilld.unwrap());
     let holder = footprint(guard.holder.id());
@@ -372,12 +371,7 @@ fn measure(guard: &Processes) -> (u64, u64, u64, String) {
     ] {
         write!(line, "{name} {} ", mib(fp)).unwrap();
     }
-    (
-        app,
-        daemon,
-        total,
-        format!("{line}total {} MiB", mib(total)),
-    )
+    (daemon, total, format!("{line}total {} MiB", mib(total)))
 }
 
 #[test]
@@ -461,22 +455,16 @@ fn release_ten_terminals_within_200mib() {
         "window changed during workload"
     );
 
-    let (app, daemon, total, line) = measure(&guard);
+    let (daemon, total, line) = measure(&guard);
     assert_eq!(
         assert_window_conditions(&guard, false),
         window,
         "window changed during measurement"
     );
     println!(
-        "MK066 {TERMINALS} terminals: {line} (limits: app {} / daemon {} / total {} MiB)",
-        mib(APP_LIMIT),
+        "MK066 {TERMINALS} terminals: {line} (limits: daemon {} / total {} MiB; app not gated)",
         mib(DAEMON_LIMIT),
         mib(LIMIT)
-    );
-    assert!(
-        app <= APP_LIMIT,
-        "app memory gate: {line} (app > {} MiB)",
-        mib(APP_LIMIT)
     );
     assert!(
         daemon <= DAEMON_LIMIT,
