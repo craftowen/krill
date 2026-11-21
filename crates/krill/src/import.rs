@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use crate::orca_import::{ImportDomain, ImportOptions, format_report_human, run_import};
 
-const USAGE: &str = "usage: krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] [--from <orca-dir>]";
+const USAGE: &str = "usage: krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions,bots] [--from <orca-dir>]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // `--from <orca-dir>` 값 자리의 `help`는 경로이므로 첫 두 토큰만 본다.

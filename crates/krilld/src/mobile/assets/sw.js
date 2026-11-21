@@ -1,6 +1,6 @@
 // Direct-origin offline shell. Authentication URLs and all RPC/WS routes stay network-only.
 const CACHE='krill-direct-shell-v6';
-const SHELL=['/','/app.css','/app.js','/i18n.js','/crypto.js','/storage.js','/client.js','/diagnostics.js','/updates.js','/terminal.js','/qr.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg','/apple-touch-icon.png','/icon-192.png','/icon-512.png','/icon-maskable-512.png'];
+const SHELL=['/','/app.css','/app.js','/i18n.js','/crypto.js','/storage.js','/client.js','/diagnostics.js','/updates.js','/terminal.js','/qr.js','/screens/bots.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg','/apple-touch-icon.png','/icon-192.png','/icon-512.png','/icon-maskable-512.png'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(SHELL)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',event=>event.waitUntil(Promise.all([self.clients.claim(),caches.keys().then(keys=>Promise.all(keys.filter(key=>key.startsWith('krill-direct-shell-')&&key!==CACHE).map(key=>caches.delete(key))))])));
 self.addEventListener('fetch',event=>{

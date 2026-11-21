@@ -915,3 +915,40 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 .screen-fallback>.empty{padding:8px 0}
 .workspaces:has(>.workspace-bottom-bar)>.workspace-list{padding-bottom:var(--space-md)}
 @media(orientation:landscape) and (max-height:500px){.page-header.host-header{padding:4px 16px 2px;gap:4px}.page-header.host-header .header-copy{padding-top:2px}.page-header.host-header h1{font-size:calc(20px * var(--ui-scale,1))}.workspaces>#workspace-confirmation-requests{padding-top:8px;padding-bottom:8px;min-height:48px}.workspace-bottom-bar{padding-top:4px;padding-bottom:calc(6px + max(0px, env(safe-area-inset-bottom) - var(--keyboard-inset,0px)))}}
+.bots-list{display:flex;flex-direction:column;gap:14px}
+.bots-section{display:flex;flex-direction:column;gap:8px}
+.bots-offline-hint{margin:4px 4px 0}
+.bots-empty-card{display:flex;flex-direction:column;align-items:center;gap:10px;padding:20px 16px;text-align:center}
+.bot-card-row,.bots-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;min-height:56px}
+.bot-card-row+.bot-card-row,.bots-row+.bots-row,.bot-group-msg+.bot-group-msg{border-top:1px solid var(--border)}
+.bot-card-main{flex:1;min-width:0;display:flex;align-items:center;gap:10px;padding:4px 0;text-align:left;background:transparent;color:inherit;min-height:var(--touch-target)}
+.bots-row-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.bots-row-main strong,.bot-item-title{overflow:hidden;text-overflow:ellipsis}
+.bots-row-actions,.bot-item-controls,.bot-decision-options,.bot-item-links{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.bot-title-line{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.bot-avatar{width:36px;height:36px;flex:none;border-radius:10px;display:inline-flex;align-items:center;justify-content:center;background:var(--surface-raised);color:var(--foreground);font-weight:700;overflow:hidden}
+.bot-avatar-img{width:100%;height:100%;object-fit:cover;display:block}
+.bot-status-pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:calc(12px * var(--ui-scale,1));font-weight:600;background:var(--surface-raised);color:var(--muted-foreground)}
+.bot-status-pill.waiting{color:var(--status-waiting,#f59e0b)}
+.bot-status-pill.working{color:var(--status-working,#3b82f6)}
+.bot-status-pill.connected{color:var(--status-connected,#22c55e)}
+.bot-status-pill.blocked{color:var(--status-blocked,#ef4444)}
+.bot-chat-btn{flex:none}
+.bot-item-card,.bot-reply-card,.bot-docs-card,.bot-group-panel{display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:16px;background:var(--group-surface);border:1px solid var(--border)}
+.bot-item-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.bot-owner-chip{min-height:var(--touch-target);padding:0 6px}
+.bot-item-form,.bots-redeem-form{display:flex;flex-direction:column;gap:8px;width:100%}
+.bots-redeem-form{flex-direction:row;padding:10px 14px;border-top:1px solid var(--border);align-items:center}
+.bots-redeem-form input{flex:1;min-width:0}
+.bot-item-form textarea,.bot-docs-card textarea{width:100%;min-height:56px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--surface-base);color:var(--foreground);font:inherit;resize:vertical}
+.bot-decision-box{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:12px;background:var(--surface-base);border:1px solid var(--border)}
+.bot-decision-q{margin:0;font-weight:600}
+.bot-link-chip{display:inline-flex;align-items:center;padding:4px 8px;border-radius:8px;background:var(--surface-base);border:1px solid var(--border);font-size:calc(12px * var(--ui-scale,1));max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--accent);text-decoration:none}
+.bots-group-row{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:52px;padding:10px 14px;text-align:left;background:transparent;color:inherit;gap:10px}
+.bots-group-row+.bots-group-row{border-top:1px solid var(--border)}
+.bots-group-row.active{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.bot-group-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.bot-group-messages{display:flex;flex-direction:column;max-height:280px;overflow:auto}
+.bot-group-msg{padding:8px 0;display:flex;flex-direction:column;gap:2px}
+.bot-group-msg p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
+.sheet-field-label{font-size:calc(12px * var(--ui-scale,1));font-weight:600;color:var(--text-muted);margin-top:4px}

@@ -8,10 +8,12 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use ring::rand::{SecureRandom as _, SystemRandom};
 use serde::de::DeserializeOwned;
 
 /// Default connect/read/write timeout for outbound bot HTTP requests.
@@ -64,6 +66,30 @@ impl HttpMethod {
     }
 }
 
+/// SSRF protection policy applied to resolved socket addresses before connecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SsrfPolicy {
+    /// Rejects private, loopback, link-local/cloud-metadata, CGNAT, multicast, and unspecified IPs.
+    #[default]
+    StrictExternal,
+    /// Allows loopback (`127.0.0.0/8`, `::1`) for local test mocks while blocking private/metadata IPs.
+    AllowLoopback,
+    /// Allows any resolved IP address (reserved strictly for local diagnostic harnesses).
+    AllowAny,
+}
+
+/// Optional handle allowing an in-flight request's active TCP socket to be closed cleanly.
+pub type RequestCancelSlot = Arc<Mutex<Option<TcpStream>>>;
+
+/// Single multipart/form-data field for file uploads.
+#[derive(Debug, Clone)]
+pub struct MultipartField {
+    pub name: String,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
 /// Outbound HTTP/1.1 request descriptor.
 #[derive(Clone)]
 pub struct HttpRequest {
@@ -73,6 +99,7 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
     pub timeout: Duration,
     pub max_response_bytes: usize,
+    pub ssrf_policy: SsrfPolicy,
 }
 
 impl std::fmt::Debug for HttpRequest {
@@ -82,6 +109,7 @@ impl std::fmt::Debug for HttpRequest {
             .field("header_count", &self.headers.len())
             .field("body_bytes", &self.body.len())
             .field("timeout", &self.timeout)
+            .field("ssrf_policy", &self.ssrf_policy)
             .finish_non_exhaustive()
     }
 }
@@ -96,6 +124,7 @@ impl HttpRequest {
             body: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            ssrf_policy: SsrfPolicy::StrictExternal,
         }
     }
 
@@ -117,6 +146,49 @@ impl HttpRequest {
         Self::new(HttpMethod::Post, url)
             .with_header("Content-Type", "application/x-www-form-urlencoded")
             .with_body(encoded.into_bytes())
+    }
+
+    /// Builds a `multipart/form-data` POST request from text and binary file parts.
+    pub fn post_multipart(url: impl Into<String>, fields: &[MultipartField]) -> io::Result<Self> {
+        let mut nonce = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| io::Error::other("multipart boundary RNG failure"))?;
+        let mut boundary = String::from("----KrillBotBoundary");
+        for byte in nonce {
+            write!(boundary, "{byte:02x}").ok();
+        }
+        let mut body = Vec::new();
+        for field in fields {
+            let clean_name = sanitize_quoted_header_param(&field.name);
+            write!(
+                body,
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{clean_name}\""
+            )
+            .ok();
+            if let Some(ref fname) = field.filename {
+                let clean_fname = sanitize_quoted_header_param(fname);
+                write!(body, "; filename=\"{clean_fname}\"").ok();
+            }
+            body.extend_from_slice(b"\r\n");
+            if let Some(ref ctype) = field.content_type {
+                let clean_ctype: String = ctype
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                    .collect();
+                write!(body, "Content-Type: {clean_ctype}\r\n").ok();
+            }
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(&field.data);
+            body.extend_from_slice(b"\r\n");
+        }
+        write!(body, "--{boundary}--\r\n").ok();
+        Ok(Self::new(HttpMethod::Post, url)
+            .with_header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .with_body(body))
     }
 
     #[must_use]
@@ -142,6 +214,18 @@ impl HttpRequest {
         self.max_response_bytes = cap;
         self
     }
+
+    #[must_use]
+    pub fn with_ssrf_policy(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf_policy = policy;
+        self
+    }
+}
+
+fn sanitize_quoted_header_param(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !matches!(c, '"' | '\r' | '\n' | '\0' | '\\'))
+        .collect()
 }
 
 /// Outbound HTTP/1.1 response.
@@ -311,9 +395,154 @@ pub fn tls_client_config() -> io::Result<Arc<rustls::ClientConfig>> {
         .ok_or_else(|| io::Error::other("failed to initialize rustls client config"))
 }
 
+/// Validates an [`IpAddr`] against the requested [`SsrfPolicy`].
+pub fn validate_ip_against_ssrf(ip: IpAddr, policy: SsrfPolicy) -> io::Result<()> {
+    if policy == SsrfPolicy::AllowAny {
+        return Ok(());
+    }
+    match ip {
+        IpAddr::V4(v4) => validate_ipv4_against_ssrf(v4, policy),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return validate_ipv4_against_ssrf(mapped, policy);
+            }
+            if v6.is_loopback() {
+                if policy == SsrfPolicy::AllowLoopback {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "SSRF blocked loopback IPv6 target",
+                ));
+            }
+            let segs = v6.segments();
+            // NAT64 (`64:ff9b::/96`): check embedded IPv4 address.
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                let hi = segs[6].to_be_bytes();
+                let lo = segs[7].to_be_bytes();
+                let embedded = Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]);
+                return validate_ipv4_against_ssrf(embedded, policy);
+            }
+            let is_nat64_local = segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 1;
+            let is_site_local = (segs[0] & 0xffc0) == 0xfec0;
+            if v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || is_site_local
+                || is_nat64_local
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "SSRF blocked private, link-local, or special IPv6 target",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_ipv4_against_ssrf(v4: Ipv4Addr, policy: SsrfPolicy) -> io::Result<()> {
+    if v4.is_loopback() {
+        if policy == SsrfPolicy::AllowLoopback {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SSRF blocked loopback IPv4 target",
+        ));
+    }
+    let octets = v4.octets();
+    let is_unspecified_net = octets[0] == 0;
+    let is_cgnat = octets[0] == 100 && (octets[1] & 0b1100_0000) == 64;
+    let is_benchmark = octets[0] == 198 && (octets[1] & 0xfe) == 18;
+    let is_reserved = octets[0] >= 240;
+    if v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        || is_unspecified_net
+        || is_cgnat
+        || is_benchmark
+        || is_reserved
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SSRF blocked private, link-local, metadata, or special IPv4 target",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves `host:port`, checks every returned IP against `policy`, and iterates all
+/// addresses until a connection succeeds or `deadline` expires.
+pub(crate) fn connect_with_deadline(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    policy: SsrfPolicy,
+) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "DNS resolution empty",
+        ));
+    }
+    for addr in &addrs {
+        validate_ip_against_ssrf(addr.ip(), policy)?;
+    }
+    let mut last_err: Option<io::Error> = None;
+    let total = addrs.len();
+    for (idx, addr) in addrs.iter().enumerate() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "connection timed out")
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let remaining_addrs = u32::try_from(total.saturating_sub(idx)).unwrap_or(1).max(1);
+        let slice = if remaining_addrs > 1 {
+            (remaining / remaining_addrs)
+                .max(Duration::from_millis(250))
+                .min(remaining)
+        } else {
+            remaining
+        };
+        match TcpStream::connect_timeout(addr, slice) {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "all resolved endpoints failed",
+        )
+    }))
+}
+
 enum HttpStream {
     Plain(TcpStream),
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl HttpStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Plain(s) => s,
+            Self::Tls(s) => &s.sock,
+        }
+    }
 }
 
 impl Read for HttpStream {
@@ -341,7 +570,30 @@ impl Write for HttpStream {
     }
 }
 
-/// Convenience wrapper for sending an HTTP/1.1 request.
+struct ActiveSocketGuard<'a> {
+    slot: Option<&'a RequestCancelSlot>,
+}
+
+impl Drop for ActiveSocketGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot
+            && let Ok(mut guard) = slot.lock()
+        {
+            *guard = None;
+        }
+    }
+}
+
+/// Immediately shuts down an active HTTP request's TCP socket stored in `slot`.
+pub fn cancel_active_request(slot: &RequestCancelSlot) {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(sock) = guard.take()
+    {
+        sock.shutdown(Shutdown::Both).ok();
+    }
+}
+
+/// Convenience wrapper for sending an HTTP/1.1 request with [`SsrfPolicy::StrictExternal`].
 pub fn send_request(
     method: HttpMethod,
     url: &str,
@@ -358,34 +610,394 @@ pub fn send_request(
 
 /// Sends a single HTTP/1.1 request over plain TCP or TLS (`rustls`) and reads the bounded response.
 pub fn send(req: &HttpRequest) -> io::Result<HttpResponse> {
+    send_interruptible(req, None, None)
+}
+
+/// Sends an HTTP/1.1 request that can be aborted mid-poll via `cancel` / `active_socket`.
+pub fn send_interruptible(
+    req: &HttpRequest,
+    cancel: Option<&AtomicBool>,
+    active_socket: Option<&RequestCancelSlot>,
+) -> io::Result<HttpResponse> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "HTTP request cancelled before connect",
+        ));
+    }
+    let timeout = req.timeout.max(Duration::from_millis(1));
+    let deadline = Instant::now() + timeout;
     let parsed = parse_url(&req.url)?;
     validate_headers(&req.headers)?;
 
-    let addr = (parsed.host.as_str(), parsed.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS resolution empty"))?;
-    let tcp = TcpStream::connect_timeout(&addr, req.timeout)?;
+    let tcp = connect_with_deadline(&parsed.host, parsed.port, deadline, req.ssrf_policy)?;
     tcp.set_nodelay(true).ok();
-    tcp.set_read_timeout(Some(req.timeout))?;
-    tcp.set_write_timeout(Some(req.timeout))?;
+    let _guard = if let Some(slot) = active_socket {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = tcp.try_clone().ok();
+        }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            tcp.shutdown(Shutdown::Both).ok();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "HTTP request cancelled",
+            ));
+        }
+        Some(ActiveSocketGuard { slot: Some(slot) })
+    } else {
+        None
+    };
 
-    let mut stream = if parsed.https {
+    let mut stream = open_http_stream(tcp, &parsed, deadline)?;
+    let wire = build_request_bytes(&parsed, req);
+    write_all_with_deadline(&mut stream, &wire, deadline)?;
+
+    read_response(&mut stream, req.max_response_bytes, deadline, cancel)
+}
+
+/// Streaming HTTP/1.1 response handle suitable for SSE (`text/event-stream`) or bounded reads.
+pub struct StreamingHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    stream: HttpStream,
+    raw: Vec<u8>,
+    cursor: usize,
+    is_chunked: bool,
+    content_length: Option<usize>,
+    body_read: usize,
+    chunk_decoder: ChunkStreamState,
+    deadline: Instant,
+}
+
+impl std::fmt::Debug for StreamingHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingHttpResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .field("is_chunked", &self.is_chunked)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChunkStreamState {
+    ReadingSize,
+    ReadingData { remaining: usize },
+    ExpectDataCrlf { remaining: usize },
+    ReadingTrailers,
+    Done,
+}
+
+/// Sends a request and returns once HTTP response status + headers have arrived.
+pub fn send_streaming(req: &HttpRequest) -> io::Result<StreamingHttpResponse> {
+    let timeout = req.timeout.max(Duration::from_millis(1));
+    let deadline = Instant::now() + timeout;
+    let parsed = parse_url(&req.url)?;
+    validate_headers(&req.headers)?;
+
+    let tcp = connect_with_deadline(&parsed.host, parsed.port, deadline, req.ssrf_policy)?;
+    tcp.set_nodelay(true).ok();
+    let mut stream = open_http_stream(tcp, &parsed, deadline)?;
+    let wire = build_request_bytes(&parsed, req);
+    write_all_with_deadline(&mut stream, &wire, deadline)?;
+
+    let (status, headers, initial_body) = read_response_head(&mut stream, deadline, None)?;
+    let is_chunked = has_chunked_encoding(&headers);
+    let content_length = find_content_length(&headers);
+
+    Ok(StreamingHttpResponse {
+        status,
+        headers,
+        stream,
+        raw: initial_body,
+        cursor: 0,
+        is_chunked,
+        content_length,
+        body_read: 0,
+        chunk_decoder: ChunkStreamState::ReadingSize,
+        deadline,
+    })
+}
+
+impl StreamingHttpResponse {
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[must_use]
+    pub fn is_event_stream(&self) -> bool {
+        self.header("content-type")
+            .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
+    }
+
+    /// Consumes the remainder of the response body up to `max_body_bytes`.
+    pub fn into_response(mut self, max_body_bytes: usize) -> io::Result<HttpResponse> {
+        if self.status == 204 || self.status == 304 {
+            return Ok(HttpResponse {
+                status: self.status,
+                headers: self.headers,
+                body: Vec::new(),
+            });
+        }
+        let initial_body = self.raw.get(self.cursor..).unwrap_or_default().to_vec();
+        let body = if self.is_chunked {
+            read_chunked_body(
+                &mut self.stream,
+                initial_body,
+                max_body_bytes,
+                self.deadline,
+                None,
+            )?
+        } else if let Some(expected_len) = self.content_length {
+            if expected_len > max_body_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP response exceeds maximum allowed size",
+                ));
+            }
+            read_exact_body(
+                &mut self.stream,
+                initial_body,
+                expected_len,
+                self.deadline,
+                None,
+            )?
+        } else {
+            read_until_eof_body(
+                &mut self.stream,
+                initial_body,
+                max_body_bytes,
+                self.deadline,
+                None,
+            )?
+        };
+        Ok(HttpResponse {
+            status: self.status,
+            headers: self.headers,
+            body,
+        })
+    }
+
+    /// Reads the next decoded SSE payload slice, de-chunking HTTP/1.1 chunked streams on the fly.
+    pub fn read_next_stream_chunk(
+        &mut self,
+        idle_timeout: Duration,
+        stop: Option<&AtomicBool>,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let idle = idle_timeout.max(Duration::from_millis(50));
+        if self.status == 204 || self.status == 304 {
+            return Ok(None);
+        }
+        if !self.is_chunked {
+            if let Some(expected) = self.content_length
+                && self.body_read >= expected
+            {
+                return Ok(None);
+            }
+            if self.cursor < self.raw.len() {
+                let mut chunk = self.raw.split_off(self.cursor);
+                self.raw.clear();
+                self.cursor = 0;
+                if let Some(expected) = self.content_length {
+                    let remain = expected.saturating_sub(self.body_read);
+                    chunk.truncate(remain);
+                }
+                self.body_read = self.body_read.saturating_add(chunk.len());
+                return if chunk.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(chunk))
+                };
+            }
+            let deadline = Instant::now() + idle;
+            let mut buf = [0u8; 8192];
+            let n = match read_retry_deadline(&mut self.stream, &mut buf, deadline, stop) {
+                Ok(0) => return Ok(None),
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            let mut chunk = buf.get(..n).unwrap_or_default().to_vec();
+            if let Some(expected) = self.content_length {
+                let remain = expected.saturating_sub(self.body_read);
+                chunk.truncate(remain);
+            }
+            self.body_read = self.body_read.saturating_add(chunk.len());
+            return if chunk.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(chunk))
+            };
+        }
+
+        // Incremental HTTP chunked decoder for live SSE streaming.
+        let mut tmp = [0u8; 8192];
+        loop {
+            if self.cursor >= 8192 {
+                self.raw.drain(..self.cursor);
+                self.cursor = 0;
+            }
+            match self.chunk_decoder {
+                ChunkStreamState::Done => return Ok(None),
+                ChunkStreamState::ReadingSize => {
+                    let slice = self.raw.get(self.cursor..).unwrap_or_default();
+                    if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        let line_bytes = slice.get(..pos).unwrap_or_default();
+                        let line = std::str::from_utf8(line_bytes).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid chunk line UTF-8")
+                        })?;
+                        let hex_part = line.split(';').next().unwrap_or(line).trim();
+                        let chunk_len = usize::from_str_radix(hex_part, 16).map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size hex")
+                        })?;
+                        self.cursor = self.cursor.saturating_add(pos).saturating_add(2);
+                        self.chunk_decoder = if chunk_len == 0 {
+                            ChunkStreamState::ReadingTrailers
+                        } else {
+                            ChunkStreamState::ReadingData {
+                                remaining: chunk_len,
+                            }
+                        };
+                        continue;
+                    }
+                    if slice.len() > MAX_CHUNK_LINE_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunk header line too long",
+                        ));
+                    }
+                }
+                ChunkStreamState::ReadingData { remaining } => {
+                    let avail = self.raw.len().saturating_sub(self.cursor);
+                    if avail > 0 {
+                        let take = avail.min(remaining);
+                        let end = self.cursor.saturating_add(take);
+                        let out = self.raw.get(self.cursor..end).unwrap_or_default().to_vec();
+                        self.cursor = end;
+                        let left = remaining.saturating_sub(take);
+                        self.chunk_decoder = if left == 0 {
+                            ChunkStreamState::ExpectDataCrlf { remaining: 2 }
+                        } else {
+                            ChunkStreamState::ReadingData { remaining: left }
+                        };
+                        return Ok(Some(out));
+                    }
+                }
+                ChunkStreamState::ExpectDataCrlf { remaining } => {
+                    let avail = self.raw.len().saturating_sub(self.cursor);
+                    if avail >= remaining {
+                        let end = self.cursor.saturating_add(remaining);
+                        let delim = self.raw.get(self.cursor..end).unwrap_or_default();
+                        if (remaining == 2 && delim != b"\r\n")
+                            || (remaining == 1 && delim != b"\n")
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "missing CRLF after HTTP chunk",
+                            ));
+                        }
+                        self.cursor = end;
+                        self.chunk_decoder = ChunkStreamState::ReadingSize;
+                        continue;
+                    }
+                    if avail == 1 && remaining == 2 {
+                        let first = self.raw.get(self.cursor).copied();
+                        if first != Some(b'\r') {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "missing CRLF after HTTP chunk",
+                            ));
+                        }
+                        self.cursor = self.cursor.saturating_add(1);
+                        self.chunk_decoder = ChunkStreamState::ExpectDataCrlf { remaining: 1 };
+                    }
+                }
+                ChunkStreamState::ReadingTrailers => {
+                    let slice = self.raw.get(self.cursor..).unwrap_or_default();
+                    if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        self.cursor = self.cursor.saturating_add(pos).saturating_add(2);
+                        if pos == 0 {
+                            self.chunk_decoder = ChunkStreamState::Done;
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let deadline = Instant::now() + idle;
+            let n = read_retry_deadline(&mut self.stream, &mut tmp, deadline, stop)?;
+            if n == 0 {
+                self.chunk_decoder = ChunkStreamState::Done;
+                return Ok(None);
+            }
+            self.raw.extend_from_slice(tmp.get(..n).unwrap_or_default());
+        }
+    }
+}
+
+fn open_http_stream(
+    tcp: TcpStream,
+    parsed: &ParsedUrl,
+    deadline: Instant,
+) -> io::Result<HttpStream> {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
+    tcp.set_read_timeout(Some(remaining))?;
+    tcp.set_write_timeout(Some(remaining))?;
+    if parsed.https {
         let cfg = tls_client_config()?;
         let server_name = rustls_pki_types::ServerName::try_from(parsed.host.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name"))?;
         let conn = rustls::ClientConnection::new(cfg, server_name)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        HttpStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
+        Ok(HttpStream::Tls(Box::new(rustls::StreamOwned::new(
+            conn, tcp,
+        ))))
     } else {
-        HttpStream::Plain(tcp)
-    };
+        Ok(HttpStream::Plain(tcp))
+    }
+}
 
-    let wire = build_request_bytes(&parsed, req);
-    stream.write_all(&wire)?;
-    stream.flush()?;
-
-    read_response(&mut stream, req.max_response_bytes)
+fn write_all_with_deadline(
+    stream: &mut HttpStream,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP request write exceeded deadline",
+            ));
+        }
+        stream.tcp().set_write_timeout(Some(remaining)).ok();
+        stream.tcp().set_read_timeout(Some(remaining)).ok();
+        match stream.write(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write HTTP request",
+                ));
+            }
+            Ok(n) => {
+                buf = buf.get(n..).unwrap_or_default();
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
+    stream.tcp().set_write_timeout(Some(remaining)).ok();
+    stream.flush()
 }
 
 fn validate_headers(headers: &[(String, String)]) -> io::Result<()> {
@@ -443,10 +1055,20 @@ fn build_request_bytes(parsed: &ParsedUrl, req: &HttpRequest) -> Vec<u8> {
         head.push_str("Connection: close\r\n");
     }
 
-    for (name, value) in &req.headers {
+    // Case-insensitively deduplicate user headers (last occurrence wins).
+    for (idx, (name, value)) in req.headers.iter().enumerate() {
         if name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("transfer-encoding")
         {
+            continue;
+        }
+        let overridden = req
+            .headers
+            .get(idx.saturating_add(1)..)
+            .unwrap_or_default()
+            .iter()
+            .any(|(later, _)| later.eq_ignore_ascii_case(name));
+        if overridden {
             continue;
         }
         write!(head, "{name}: {value}\r\n").ok();
@@ -468,11 +1090,32 @@ fn build_request_bytes(parsed: &ParsedUrl, req: &HttpRequest) -> Vec<u8> {
     out
 }
 
-fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<HttpResponse> {
+fn has_chunked_encoding(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding")
+            && v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+fn find_content_length(headers: &[(String, String)]) -> Option<usize> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+}
+
+type RawHttpHeadResponse = (u16, Vec<(String, String)>, Vec<u8>);
+
+fn read_response_head(
+    stream: &mut HttpStream,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<RawHttpHeadResponse> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
-    let (status, headers, body_start) = loop {
+    loop {
         let header_end = find_header_end(&buf);
         if let Some(end) = header_end {
             let head_bytes = buf.get(..end).unwrap_or_default();
@@ -480,11 +1123,11 @@ fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<Ht
             let next_start = end.saturating_add(4);
             if status == 100 {
                 // Drain `100 Continue` interim response and keep reading the real response.
-                let tail = buf.get(next_start..).unwrap_or_default().to_vec();
-                buf = tail;
+                buf = buf.get(next_start..).unwrap_or_default().to_vec();
                 continue;
             }
-            break (status, headers, next_start);
+            let initial_body = buf.get(next_start..).unwrap_or_default().to_vec();
+            return Ok((status, headers, initial_body));
         }
         if buf.len() >= MAX_HEADER_BYTES {
             return Err(io::Error::new(
@@ -492,7 +1135,7 @@ fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<Ht
                 "HTTP response headers exceed 64 KiB limit",
             ));
         }
-        let n = read_retry(stream, &mut tmp)?;
+        let n = read_retry_deadline(stream, &mut tmp, deadline, cancel)?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -501,9 +1144,16 @@ fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<Ht
         }
         let chunk = tmp.get(..n).unwrap_or_default();
         buf.extend_from_slice(chunk);
-    };
+    }
+}
 
-    let initial_body = buf.get(body_start..).unwrap_or_default().to_vec();
+fn read_response(
+    stream: &mut HttpStream,
+    max_body_bytes: usize,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<HttpResponse> {
+    let (status, headers, initial_body) = read_response_head(stream, deadline, cancel)?;
 
     if status == 204 || status == 304 {
         return Ok(HttpResponse {
@@ -513,18 +1163,11 @@ fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<Ht
         });
     }
 
-    let is_chunked = headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("transfer-encoding")
-            && v.split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
-    });
-    let content_length = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+    let is_chunked = has_chunked_encoding(&headers);
+    let content_length = find_content_length(&headers);
 
     let body = if is_chunked {
-        read_chunked_body(stream, initial_body, max_body_bytes)?
+        read_chunked_body(stream, initial_body, max_body_bytes, deadline, cancel)?
     } else if let Some(expected_len) = content_length {
         if expected_len > max_body_bytes {
             return Err(io::Error::new(
@@ -532,9 +1175,9 @@ fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<Ht
                 "HTTP response exceeds maximum allowed size",
             ));
         }
-        read_exact_body(stream, initial_body, expected_len)?
+        read_exact_body(stream, initial_body, expected_len, deadline, cancel)?
     } else {
-        read_until_eof_body(stream, initial_body, max_body_bytes)?
+        read_until_eof_body(stream, initial_body, max_body_bytes, deadline, cancel)?
     };
 
     Ok(HttpResponse {
@@ -544,11 +1187,57 @@ fn read_response(stream: &mut impl Read, max_body_bytes: usize) -> io::Result<Ht
     })
 }
 
-fn read_retry(stream: &mut (impl Read + ?Sized), buf: &mut [u8]) -> io::Result<usize> {
+fn read_retry_deadline(
+    stream: &mut HttpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> io::Result<usize> {
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "HTTP request cancelled",
+            ));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP request exceeded total deadline",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let slice = if cancel.is_some() {
+            remaining
+                .min(Duration::from_millis(250))
+                .max(Duration::from_millis(1))
+        } else {
+            remaining.max(Duration::from_millis(1))
+        };
+        stream.tcp().set_read_timeout(Some(slice)).ok();
         match stream.read(buf) {
             Ok(n) => return Ok(n),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "HTTP request cancelled",
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP request exceeded total deadline",
+                    ));
+                }
+            }
             Err(err) => return Err(err),
         }
     }
@@ -595,9 +1284,11 @@ fn parse_response_head(head: &[u8]) -> io::Result<(u16, Vec<(String, String)>)> 
 }
 
 fn read_exact_body(
-    stream: &mut impl Read,
+    stream: &mut HttpStream,
     mut body: Vec<u8>,
     expected_len: usize,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<Vec<u8>> {
     if body.len() > expected_len {
         body.truncate(expected_len);
@@ -609,7 +1300,7 @@ fn read_exact_body(
         let remaining = expected_len.saturating_sub(body.len());
         let to_read = remaining.min(tmp.len());
         let slice = tmp.get_mut(..to_read).unwrap_or(&mut []);
-        let n = read_retry(stream, slice)?;
+        let n = read_retry_deadline(stream, slice, deadline, cancel)?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -622,9 +1313,11 @@ fn read_exact_body(
 }
 
 fn read_until_eof_body(
-    stream: &mut impl Read,
+    stream: &mut HttpStream,
     mut body: Vec<u8>,
     max_body_bytes: usize,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<Vec<u8>> {
     if body.len() > max_body_bytes {
         return Err(io::Error::new(
@@ -634,7 +1327,7 @@ fn read_until_eof_body(
     }
     let mut tmp = [0u8; 8192];
     loop {
-        let n = match read_retry(stream, &mut tmp) {
+        let n = match read_retry_deadline(stream, &mut tmp, deadline, cancel) {
             Ok(0) => break,
             Ok(n) => n,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -652,15 +1345,17 @@ fn read_until_eof_body(
 }
 
 fn read_chunked_body(
-    stream: &mut impl Read,
+    stream: &mut HttpStream,
     mut raw: Vec<u8>,
     max_body_bytes: usize,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     let mut tmp = [0u8; 8192];
 
-    let ensure_bytes = |stream: &mut dyn Read,
+    let ensure_bytes = |stream: &mut HttpStream,
                         raw: &mut Vec<u8>,
                         cursor: &mut usize,
                         needed: usize,
@@ -671,7 +1366,7 @@ fn read_chunked_body(
             *cursor = 0;
         }
         while raw.len().saturating_sub(*cursor) < needed {
-            let n = read_retry(&mut *stream, tmp)?;
+            let n = read_retry_deadline(stream, tmp, deadline, cancel)?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -696,7 +1391,7 @@ fn read_chunked_body(
                     "chunk header line too long",
                 ));
             }
-            let n = read_retry(stream, &mut tmp)?;
+            let n = read_retry_deadline(stream, &mut tmp, deadline, cancel)?;
             if n == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -717,6 +1412,41 @@ fn read_chunked_body(
         cursor = cursor.saturating_add(crlf_rel).saturating_add(2);
 
         if chunk_len == 0 {
+            // Drain optional HTTP trailer lines through the terminating blank CRLF line.
+            let mut trailer_bytes = 0usize;
+            loop {
+                let t_crlf = loop {
+                    let slice = raw.get(cursor..).unwrap_or_default();
+                    if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        break pos;
+                    }
+                    if trailer_bytes.saturating_add(slice.len()) > MAX_HEADER_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunked HTTP trailers exceed limit",
+                        ));
+                    }
+                    let n = read_retry_deadline(stream, &mut tmp, deadline, cancel)?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF reading chunked HTTP trailers",
+                        ));
+                    }
+                    raw.extend_from_slice(tmp.get(..n).unwrap_or_default());
+                };
+                cursor = cursor.saturating_add(t_crlf).saturating_add(2);
+                trailer_bytes = trailer_bytes.saturating_add(t_crlf).saturating_add(2);
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunked HTTP trailers exceed limit",
+                    ));
+                }
+                if t_crlf == 0 {
+                    break;
+                }
+            }
             break;
         }
         if out.len().saturating_add(chunk_len) > max_body_bytes {
@@ -915,7 +1645,7 @@ mod tests {
                     );
                     sock.write_all(resp.as_bytes()).unwrap();
                 } else {
-                    let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n";
+                    let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Trailer: done\r\n\r\n";
                     sock.write_all(resp.as_bytes()).unwrap();
                 }
             }
@@ -923,17 +1653,180 @@ mod tests {
 
         let r1 = send(
             &HttpRequest::post_json(format!("http://{addr}/first"), b"{}".to_vec())
-                .with_header("X-Test", "1"),
+                .with_header("X-Test", "1")
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
         )
         .unwrap();
         assert_eq!(r1.status, 200);
         assert_eq!(r1.text(), r#"{"ok":true}"#);
 
-        let r2 = send(&HttpRequest::get(format!("http://{addr}/second"))).unwrap();
+        let r2 = send(
+            &HttpRequest::get(format!("http://{addr}/second"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
         assert_eq!(r2.status, 200);
         assert_eq!(r2.text(), "hello world");
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ssrf_policy_blocks_private_loopback_metadata_and_mapped_ipv6() {
+        for blocked in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.10",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "64:ff9b::10.0.0.1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(
+                validate_ip_against_ssrf(ip, SsrfPolicy::StrictExternal).is_err(),
+                "{blocked} should be blocked under StrictExternal"
+            );
+        }
+        assert!(
+            validate_ip_against_ssrf("127.0.0.1".parse().unwrap(), SsrfPolicy::AllowLoopback)
+                .is_ok()
+        );
+        assert!(
+            validate_ip_against_ssrf("::1".parse().unwrap(), SsrfPolicy::AllowLoopback).is_ok()
+        );
+        assert!(
+            validate_ip_against_ssrf(
+                "169.254.169.254".parse().unwrap(),
+                SsrfPolicy::AllowLoopback
+            )
+            .is_err()
+        );
+        assert!(
+            validate_ip_against_ssrf("8.8.8.8".parse().unwrap(), SsrfPolicy::StrictExternal)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn deduplicates_request_headers_case_insensitively_and_enforces_deadline() {
+        let parsed = parse_url("http://127.0.0.1:8080/test").unwrap();
+        let req = HttpRequest::post_json("http://127.0.0.1:8080/test", b"{}".to_vec())
+            .with_header("content-type", "text/plain")
+            .with_header("X-Custom", "first")
+            .with_header("x-custom", "second");
+        let wire = String::from_utf8(build_request_bytes(&parsed, &req)).unwrap();
+        assert_eq!(
+            wire.matches("content-type").count() + wire.matches("Content-Type").count(),
+            1
+        );
+        assert!(wire.contains("content-type: text/plain\r\n"));
+        assert!(!wire.contains("first"));
+        assert!(wire.contains("x-custom: second\r\n"));
+
+        // Slow-drip server that stalls past total deadline must time out cleanly.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let n = sock.read(&mut req_buf).unwrap_or(0);
+            assert!(n > 0);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .ok();
+            thread::sleep(Duration::from_millis(350));
+        });
+        let err = send(
+            &HttpRequest::get(format!("http://{addr}/slow"))
+                .with_timeout(Duration::from_millis(120))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_chunked_sse_and_interruptible_cancel_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let n = sock.read(&mut req_buf).unwrap_or(0);
+            assert!(n > 0);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+            sock.write_all(b"d\r\ndata: hello\n\n\r\n").unwrap();
+            sock.flush().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            sock.write_all(b"e\r\ndata: second\n\n\r\n0\r\n\r\n")
+                .unwrap();
+        });
+
+        let mut streaming = send_streaming(
+            &HttpRequest::get(format!("http://{addr}/sse"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert!(streaming.is_event_stream());
+        let mut collected = String::new();
+        while let Some(chunk) = streaming
+            .read_next_stream_chunk(Duration::from_secs(2), None)
+            .unwrap()
+        {
+            collected.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert_eq!(collected, "data: hello\n\ndata: second\n\n");
+        server.join().unwrap();
+
+        // Interruptible abort test.
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = thread::spawn(move || {
+            let (mut sock, _) = listener2.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let n = sock.read(&mut req_buf).unwrap_or(0);
+            assert!(n > 0);
+            thread::sleep(Duration::from_millis(600));
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .ok();
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let slot: RequestCancelSlot = Arc::new(Mutex::new(None));
+        let flag_w = Arc::clone(&flag);
+        let slot_w = Arc::clone(&slot);
+        let killer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            flag_w.store(true, Ordering::Release);
+            cancel_active_request(&slot_w);
+        });
+        let started = Instant::now();
+        let err = send_interruptible(
+            &HttpRequest::get(format!("http://{addr2}/poll"))
+                .with_timeout(Duration::from_secs(10))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+            Some(&flag),
+            Some(&slot),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::Interrupted
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+        ));
+        killer.join().unwrap();
+        server2.join().unwrap();
     }
 
     #[test]

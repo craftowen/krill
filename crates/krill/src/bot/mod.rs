@@ -33,13 +33,14 @@ Lifecycle:
   ls|list [--json]
   new|create <name> [--template <id>] [--agent <id>] [--model <m>] [--effort <lvl>]
              [--permission <manual|yolo>] [--description <text>] [--emoji <str>]
-             [--avatar <str>] [--folder <path>] [--slug <slug>]
-             [--soul <text> | --soul-file <path>] [--json]
+             [--avatar <str>] [--avatar-color <hex>] [--skills <a,b>] [--folder <path>]
+             [--slug <slug>] [--soul <text> | --soul-file <path>] [--json]
   show <bot> [--json]
   update <bot> [--name <n>] [--description <d>] [--agent <id>] [--model <m>|--clear-model]
                [--effort <e>|--clear-effort] [--emoji <e>|--clear-emoji]
-               [--avatar <a>|--clear-avatar] [--folder <p>|--clear-workspace]
-               [--permission <manual|yolo>] [--pause|--resume]
+               [--avatar <a>|--clear-avatar] [--avatar-color <hex>|--clear-avatar-color]
+               [--folder <p>|--clear-workspace] [--permission <manual|yolo>]
+               [--first-run-completed <on|off>] [--pause|--resume]
                [--look-around <on|off>] [--look-around-interval <secs>]
                [--look-around-max <n>] [--look-around-weekdays <on|off>]
                [--look-around-focus <text>] [--memory-tidy <on|off>]
@@ -54,44 +55,66 @@ Catalog (offline):
   apps [--kind mcp|composio|all] [--category coding|chat|monitoring|docs|mail|sales|design] [--json]
   slack-manifest <bot-name> [--json]
 
-Soul & Memory:
+Soul, Memory & Tidy:
   soul [<bot>] [get | set (--text <str> | --file <path> | --stdin)] [--json]
   memory [<bot>] [ls | add <fact> [--date YYYY-MM-DD] [--source <src>]
-                  | forget --fact <fact> | tidy
+                  | forget --fact <fact> | history [--limit <N>]
+                  | edit --old <fact> --new <fact> | undo <entry-id>
+                  | tidy [status | undo [<tidy-id>]]
+                  | topics | topic <name> [--set (--text <str> | --file <path> | --stdin)]
                   | set (--text <str> | --file <path> | --stdin) [--allow-deletions]] [--json]
+  tidy [<bot>] [run | status | undo [<tidy-id>]] [--json]
 
 Items Inbox:
   items [<bot>] [ls [--status planned|working|needs_you|done|canceled] [--all]
+                    [--include-snoozed] [--limit <N>] [--cursor <c> | --page <N>]
+                 | show <item-id>
                  | add <title> [--body <text>] [--done-means <text>] [--status <st>] [--link <kind:target>...]
                  | update <item-id> [--status <st>] [--title <t>] [--body <b>] [--done-means <d>]
                           [--comment <c>] [--close-note <n>] [--snooze <until>|--unsnooze]
+                          [--ask <q> | --question <q> [--option <opt>... [--recommended <idx>]]]
+                 | answer <item-id> [--text <str> | --option <idx>] [--decision-id <id>] [--request-id <id>]
                  | comment <item-id> <text> [--author <name>]
                  | snooze <item-id> <until> | unsnooze <item-id>
-                 | link <item-id> (<dispatch|pr|url|file> <target> | <kind>:<target>) [--label <lbl>]
+                 | link <item-id> (<dispatch|pr|url|file> <target> | <kind>:<target>)
                  | done <item-id> [--note <text>] | cancel <item-id> [--note <text>]] [--json]
 
-Look Around & Messaging:
+Look Around, Schedules, Sessions & Messaging:
   suggest [<bot>] [--run] [--title <t> --why <w> --ask <a> [--link <url>]] [--json]
+  suggestions [<bot>] [ls [--include-dismissed] | dismiss <id> | start <id>] [--json]
+  up-next seen [--bot <bot>] [--json]
+  schedules [<bot>] [ls | add --name <n> --cron <expr> --prompt <text> [--id <id>] [--timezone <tz>] [--disabled]
+                     | enable <id> | disable <id> | rm <id>] [--json]
+  sessions [<bot>] [ls | reset [--session <id>] | stop <id> | retry-kickoff | take-over <id> | run-again <id>] [--json]
   reply [<bot>] (<text> | --text <text>) [--link <external-id>] [--file <path>...] [--react <emoji>] [--json]
   send --to bot:<slug> [--from <sender>] [--type status|question|handoff]
        [--subject <text>] [--thread <id>] <message> [--json]
-  groups [ls | create <name> --members <a,b> [--description <text>]] [--json]
+  groups [ls | create <name> --members <a,b> [--description <text>]
+          | update <id> [--name <n>] [--description <d>] [--members <a,b>]
+          | rm <id> | reorder <id1,id2,...> | new-thread <id> [--title <t>]
+          | read <id> [--thread <tid>] [--limit <N>]
+          | send <id> [--thread <tid>] [--from <sender>] [--reply-mode mentions|all|selected] <msg>
+          | stop <id> [--thread <tid>]] [--json]
 
-Connectors & Access:
-  connectors [<bot>] [status | reload | sync [--source <src>] | slack-manifest <bot-name>
-                      | telegram [--enable|--disable] [--allowed-chats <ids>] [--allowed-users <ids>] [--acts-for owner|anyone|member:<id>]
-                      | slack [--enable|--disable] [--allowed-channels <ids>] [--allowed-users <ids>] [--mirror|--no-mirror] [--acts-for ...]
-                      | discord [--enable|--disable] [--allowed-guilds <ids>] [--allowed-channels <ids>] [--allowed-users <ids>] [--acts-for ...]
-                      | google-setup [--enable|--disable] [--poll-secs <N>] [--services gmail,calendar,drive,docs,sheets,contacts] [--start-oauth]
-                      | github [--enable|--disable] [--repos owner/repo,...] [--use-gh-cli|--no-gh-cli] [--poll-secs <N>]
-                      | linear [--enable|--disable] [--teams KEY,...] [--poll-secs <N>]
-                      | composio [--enable|--disable] [--apps app1,app2]] [--json]
-  access [<bot>] [ls | approve <token> | decline <token>] [--json]
+Connectors, Tracker Routing, Composio & Access:
+  connectors [<bot>] [status | reload | sync [--source <src>] | test <source> | slack-manifest <bot-name>
+                      | telegram [--enable|--disable] [--secret-ref <ref>] [--allowed-chats <ids>] [--allowed-users <ids>] [--acts-for owner|anyone|member:<id>]
+                      | slack [--enable|--disable] [--app-token-ref <ref>] [--bot-token-ref <ref>] [--allowed-channels <ids>] [--allowed-users <ids>] [--mirror|--no-mirror] [--acts-for ...]
+                      | discord [--enable|--disable] [--bot-token-ref <ref>] [--allowed-guilds <ids>] [--allowed-channels <ids>] [--allowed-users <ids>] [--acts-for ...]
+                      | google-setup [--enable|--disable] [--poll-secs <N>] [--services gmail,calendar,drive,docs,sheets,contacts] [--client-secret-ref <ref>] [--token-secret-ref <ref>] [--start-oauth]
+                      | github [--enable|--disable] [--repos owner/repo,...] [--use-gh-cli|--no-gh-cli] [--token-ref <ref>] [--poll-secs <N>]
+                      | linear [--enable|--disable] [--teams KEY,...] [--api-key-ref <ref>] [--poll-secs <N>]
+                      | composio [--enable|--disable] [--apps app1,app2] [--api-key-ref <ref>]] [--json]
+  tracker-default [github|linear] [--bot <bot> | --clear] [--json]
+  composio [<bot>] [connections | connect <app-id> | disconnect <connection-id>] [--json]
+  access [<bot>] [ls | approve <token> | decline <token> | redeem <code>] [--json]
 
-Secrets, MCP Tools & Packaging:
+Secrets, MCP Tools, Avatar & Packaging:
   secret [<bot>] [set <key> (--stdin | --env <VAR>) | rm <key>] [--json]
-  tools [<bot>] [ls | add <app-id> [--url <url>] [--name <name>] [--header <name>...] [--auth oauth|bearer|none]
-                 | rm <app-id> | relay-status] [--json]
+         keys: telegram, slack-app, slack-bot, discord, google-oauth, google-token, github, linear, composio, mcp:<app-id>
+  tools [<bot>] [ls | add <app-id> [--url <url>] [--name <name>] [--header <name>...] [--auth oauth|bearer|none] [--secret-ref <ref>] [--cmd <bin>...]
+                 | enable <app-id> | disable <app-id> | oauth <tool-id> [--status | --cancel] | rm <app-id> | relay-status] [--json]
+  avatar [set <bot> <png-path> | get <bot> <out-path> | color <bot> <hex>] [--json]
   export <bot> <out.zip> [--include-memory] [--no-avatar] [--json]
   import <in.zip> [--slug <slug>] [--name <name>] [--agent <id>] [--json]
   import-external [--source orca|openclaw|hermes|openbot|all] [--path <dir>] [--apply|--dry-run] [--json]";
@@ -155,12 +178,7 @@ impl DaemonBotClient {
                 .target
                 .connect(&hello)
                 .map_err(|e| CliError::fail(e.to_string()))?;
-            let required = FEAT_CONTROL | FEAT_BOTS;
-            if conn.negotiated.features & required != required {
-                return Err(CliError::fail(
-                    "krilld does not support bots (FEAT_BOTS); update or restart the daemon",
-                ));
-            }
+            ensure_bots_feature(conn.negotiated.features)?;
             conn.stream
                 .set_read_timeout(Some(IO_READ_TIMEOUT))
                 .map_err(|e| CliError::fail(e.to_string()))?;
@@ -173,6 +191,16 @@ impl DaemonBotClient {
             .as_mut()
             .ok_or_else(|| CliError::fail("daemon connection unavailable"))
     }
+}
+
+pub(crate) fn ensure_bots_feature(features: u64) -> Result<(), CliError> {
+    let required = FEAT_CONTROL | FEAT_BOTS;
+    if features & required != required {
+        return Err(CliError::fail(
+            "krilld does not support bots (FEAT_BOTS); update or restart the daemon",
+        ));
+    }
+    Ok(())
 }
 
 impl BotClient for DaemonBotClient {
@@ -214,73 +242,105 @@ fn env_bot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn run(raw: &[OsString]) -> ExitCode {
-    let (host, rest) = match crate::remote::extract_host(raw) {
-        Ok(parsed) => parsed,
-        Err(text) => {
-            eprintln!("bot: {text}\n{USAGE}");
-            return ExitCode::from(2);
+fn raw_wants_json(raw: &[OsString]) -> bool {
+    for arg in raw {
+        if arg == "--" {
+            break;
         }
-    };
-    let Ok(args) = rest
+        if arg == "--json" {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn format_cli_error(err: &CliError, json_mode: bool) -> String {
+    if json_mode {
+        let payload = serde_json::json!({
+            "ok": false,
+            "error": err.message,
+            "code": err.code,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(rendered) => rendered,
+            Err(_) => format!(
+                r#"{{"ok":false,"error":{},"code":{}}}"#,
+                serde_json::json!(err.message),
+                err.code
+            ),
+        }
+    } else {
+        format!("bot: {}", err.message)
+    }
+}
+
+pub(crate) fn run_with_client<C, R, B, E>(
+    raw: &[OsString],
+    default_bot: Option<&str>,
+    build_client: B,
+    stdin: &mut R,
+    now_ms: u64,
+    get_env: E,
+) -> Result<String, (CliError, bool)>
+where
+    C: BotClient,
+    R: io::Read,
+    B: FnOnce(Option<String>) -> Result<C, CliError>,
+    E: Fn(&str) -> Option<String>,
+{
+    let normalized = crate::normalize_host_flag(raw.to_vec());
+    let json_mode = raw_wants_json(&normalized);
+    let (host, rest) = crate::remote::extract_host(&normalized)
+        .map_err(|text| (CliError::usage(format!("{text}\n{USAGE}")), json_mode))?;
+    let args = rest
         .into_iter()
         .map(OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
-    else {
-        eprintln!("bot: arguments must be UTF-8");
-        return ExitCode::from(2);
-    };
+        .map_err(|_| (CliError::usage("arguments must be UTF-8"), json_mode))?;
 
-    let default_bot = env_bot_id();
-    let cmd = match parse::parse_command(&args, default_bot.as_deref()) {
-        Ok(cmd) => cmd,
-        Err(err) => {
-            eprintln!("bot: {}", err.message);
-            return ExitCode::from(err.code);
-        }
-    };
+    let cmd = parse::parse_command(&args, default_bot).map_err(|err| (err, json_mode))?;
 
     if let parse::BotCommand::Help(topic) = cmd {
-        println!("{}", parse::help_text(topic.as_deref()));
-        return ExitCode::SUCCESS;
+        return Ok(parse::help_text(topic.as_deref()).to_owned());
     }
 
     if let Some(offline_res) = exec::try_execute_offline(&cmd) {
-        return match offline_res {
-            Ok(out) => {
-                if !out.is_empty() {
-                    println!("{out}");
-                }
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("bot: {}", err.message);
-                ExitCode::from(err.code)
-            }
-        };
+        return offline_res.map_err(|err| (err, json_mode));
     }
 
-    let target = match Target::establish(host) {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("bot: remote: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut client = DaemonBotClient::new(target);
+    let mut client = build_client(host).map_err(|err| (err, json_mode))?;
+    exec::execute_online(cmd, &mut client, stdin, now_ms, get_env).map_err(|err| (err, json_mode))
+}
+
+pub fn run(raw: &[OsString]) -> ExitCode {
+    let default_bot = env_bot_id();
     let mut stdin = io::stdin().lock();
     let now_ms = exec::now_unix_ms();
-    match exec::execute_online(cmd, &mut client, &mut stdin, now_ms, |var| {
-        std::env::var(var).ok()
-    }) {
+    match run_with_client(
+        raw,
+        default_bot.as_deref(),
+        |host| {
+            Target::establish(host)
+                .map(DaemonBotClient::new)
+                .map_err(|err| CliError::fail(format!("remote: {err}")))
+        },
+        &mut stdin,
+        now_ms,
+        |var| std::env::var(var).ok(),
+    ) {
         Ok(out) => {
             if !out.is_empty() {
                 println!("{out}");
             }
             ExitCode::SUCCESS
         }
-        Err(err) => {
-            eprintln!("bot: {}", err.message);
+        Err((err, json_mode)) => {
+            let rendered = format_cli_error(&err, json_mode);
+            if json_mode {
+                println!("{rendered}");
+            } else {
+                eprintln!("{rendered}");
+            }
             ExitCode::from(err.code)
         }
     }

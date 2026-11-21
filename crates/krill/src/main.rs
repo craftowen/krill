@@ -57,7 +57,33 @@ fn main() -> ExitCode {
     run(std::env::args_os().skip(1).collect())
 }
 
+pub(crate) fn normalize_host_flag(raw: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    let mut after_double_dash = false;
+    for arg in raw {
+        if after_double_dash {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            after_double_dash = true;
+            out.push(arg);
+            continue;
+        }
+        if let Some(s) = arg.to_str()
+            && let Some(rest) = s.strip_prefix("--host=")
+        {
+            out.push(std::ffi::OsString::from("--host"));
+            out.push(std::ffi::OsString::from(rest));
+            continue;
+        }
+        out.push(arg);
+    }
+    out
+}
+
 fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
+    let raw = normalize_host_flag(raw);
     if matches!(
         raw.as_slice(),
         [flag] if matches!(flag.to_str(), Some("-h" | "--help" | "help"))
@@ -526,5 +552,40 @@ mod tests {
                 "missing {expected:?} in main USAGE: {USAGE}"
             );
         }
+    }
+
+    #[test]
+    fn host_equals_form_is_normalized_for_help_and_bot() {
+        assert_eq!(
+            run(vec![
+                OsString::from("--host=prod"),
+                OsString::from("--help")
+            ]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(vec![
+                OsString::from("--host=prod"),
+                OsString::from("bot"),
+                OsString::from("--help"),
+            ]),
+            ExitCode::SUCCESS
+        );
+        let normalized = super::normalize_host_flag(vec![
+            OsString::from("--host=alice@box"),
+            OsString::from("send"),
+            OsString::from("--"),
+            OsString::from("--host=literal"),
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                OsString::from("--host"),
+                OsString::from("alice@box"),
+                OsString::from("send"),
+                OsString::from("--"),
+                OsString::from("--host=literal"),
+            ]
+        );
     }
 }

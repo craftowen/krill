@@ -978,6 +978,7 @@ pub struct Sidebar {
     relink: Relink,
     remote_hosts: Vec<RemoteHost>,
     machine_identities: BTreeMap<HostId, krill_proto::ipc::MachineIdentity>,
+    bot_sessions: BTreeMap<HostId, BTreeMap<SessionId, crate::bots::BotSessionMeta>>,
     remote_task: Option<Task<()>>,
     remote_manager: Option<HostManager>,
     remote_info: BTreeMap<String, krill_hosts::HostConnectionInfo>,
@@ -1391,6 +1392,7 @@ impl Sidebar {
             relink: Relink::Steady,
             remote_hosts: Vec::new(),
             machine_identities: BTreeMap::new(),
+            bot_sessions: BTreeMap::new(),
             remote_task: None,
             remote_manager: None,
             remote_info: BTreeMap::new(),
@@ -5389,6 +5391,19 @@ impl Sidebar {
             .or(live_title.as_deref())
             .or(status_title);
         let (mut name, detail) = session_label(session, title);
+        if let Some(meta) = self.bot_session_meta_on(host, session.id) {
+            let prefix = meta.display_prefix();
+            if name.is_empty()
+                || name == meta.bot_name
+                || name.eq_ignore_ascii_case("claude")
+                || name.eq_ignore_ascii_case("codex")
+                || name.eq_ignore_ascii_case("shell")
+            {
+                name = prefix;
+            } else if !name.contains(&meta.bot_name) {
+                name = format!("{prefix}: {name}");
+            }
+        }
         // Derive provenance from dispatch metadata so OSC/custom title changes and
         // already-settled workers keep the marker. Session IDs are host-local.
         if local
@@ -5507,6 +5522,42 @@ impl Sidebar {
             })
             .collect();
         (crate::ui::status::summarize(&pairs), unread)
+    }
+
+    /// Replaces cached bot session identity metadata for a host (used by tabs and sidebar rows).
+    pub fn set_bot_sessions(
+        &mut self,
+        host: HostId,
+        sessions: BTreeMap<SessionId, crate::bots::BotSessionMeta>,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_sessions.insert(host, sessions);
+        cx.notify();
+    }
+
+    /// Registers or refreshes bot identity metadata for a single newly opened bot session.
+    pub fn register_bot_session(
+        &mut self,
+        host: HostId,
+        session_id: SessionId,
+        meta: crate::bots::BotSessionMeta,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_sessions
+            .entry(host)
+            .or_default()
+            .insert(session_id, meta);
+        cx.notify();
+    }
+
+    /// Returns cached bot identity metadata for a session on `host`, if associated with a bot.
+    #[must_use]
+    pub fn bot_session_meta_on(
+        &self,
+        host: &HostId,
+        id: SessionId,
+    ) -> Option<&crate::bots::BotSessionMeta> {
+        self.bot_sessions.get(host)?.get(&id)
     }
 }
 

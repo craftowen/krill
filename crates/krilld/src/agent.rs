@@ -379,6 +379,30 @@ pub(crate) fn refresh_zsh_sync_env(state: &Path) {
     }
 }
 
+/// One loopback HTTP MCP endpoint injected for a bot agent launch.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BotMcpHttpServer {
+    pub id: String,
+    pub url: String,
+    pub bearer_token: String,
+}
+
+/// One local stdio MCP command server injected for a bot agent launch.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BotMcpStdioServer {
+    pub id: String,
+    pub command: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// MCP and workspace directory configuration passed into agent launch for Krill Bots.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BotMcpLaunchConfig {
+    pub bot_home: Option<PathBuf>,
+    pub http_servers: Vec<BotMcpHttpServer>,
+    pub stdio_servers: Vec<BotMcpStdioServer>,
+}
+
 /// OWE-712: 새 세션 하나에만 선택 계정을 적용한다. 전역 활성 계정은 바꾸지 않는다.
 pub(crate) fn launch_selected_in(
     profile: &Profile,
@@ -387,35 +411,129 @@ pub(crate) fn launch_selected_in(
     state: Option<&Path>,
     selected: Option<&str>,
 ) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
+    launch_selected_in_with_bot_mcp(profile, permission, session, state, selected, None, None)
+}
+
+/// Bot-aware extension of [`launch_selected_in`] that injects MCP servers, `--add-dir` for
+/// separated bot homes, and loopback entries in `NO_PROXY`/`no_proxy`.
+pub(crate) fn launch_selected_in_with_bot_mcp(
+    profile: &Profile,
+    permission: Permission,
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    selected: Option<&str>,
+    cwd: Option<&Path>,
+    bot_mcp: Option<&BotMcpLaunchConfig>,
+) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
     let selected = selected
         .map(|id| selected_account(profile, state, id))
         .transpose()?;
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, selected.as_ref());
-    if let Some(profile) = codex_hooks(profile, state, &login.env)? {
+    if bot_mcp.is_some() {
+        merge_loopback_no_proxy(&mut login.env);
+    }
+
+    if is(profile, "codex") {
+        let hooked = codex_hooks(profile, state, &login.env)?;
+        let mut effective = hooked.unwrap_or_else(|| profile.clone());
+        if let Some(mcp) = bot_mcp {
+            let (mcp_args, mcp_env) = codex::mcp_args_and_env(mcp);
+            if !mcp_args.is_empty() && !effective.launch.is_empty() {
+                effective.launch.splice(1..1, mcp_args);
+            }
+            for (k, v) in mcp_env {
+                login.env.retain(|(ek, _)| ek != &k);
+                login.env.push((k, v));
+            }
+        }
         return Ok((
-            wrap_account(&profile, permission, login, account.as_ref()),
+            wrap_account(&effective, permission, login, account.as_ref()),
             None,
             account,
         ));
     }
+
     if is(profile, "claude") {
         let state = state.ok_or(io::ErrorKind::NotFound)?;
         let krill = mk_bin()?;
         let version = claude::probe(profile, &login);
         let settings = claude::Settings::create(state, &krill, session, version.as_deref())?;
         let id = settings.id.clone();
-        return Ok((
-            settings.launch(profile, permission, login)?,
-            Some(id),
-            account,
-        ));
+        let mut launch = settings.launch(profile, permission, login)?;
+        if let Some(mcp) = bot_mcp {
+            if !mcp.http_servers.is_empty() || !mcp.stdio_servers.is_empty() {
+                let mcp_path = claude::create_mcp_config(
+                    state,
+                    session,
+                    &mcp.http_servers,
+                    &mcp.stdio_servers,
+                )?;
+                launch.argv.extend([
+                    b"--mcp-config".to_vec(),
+                    mcp_path.as_os_str().as_bytes().to_vec(),
+                ]);
+            }
+            if let Some(ref home) = mcp.bot_home
+                && cwd.is_none_or(|c| !same_workspace_dir(c, home))
+            {
+                launch
+                    .argv
+                    .extend([b"--add-dir".to_vec(), home.as_os_str().as_bytes().to_vec()]);
+            }
+        }
+        return Ok((launch, Some(id), account));
+    }
+
+    if let Some(mcp) = bot_mcp {
+        for srv in &mcp.stdio_servers {
+            for (k, v) in &srv.env {
+                login.env.retain(|(ek, _)| ek.as_slice() != k.as_bytes());
+                login
+                    .env
+                    .push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+            }
+        }
     }
     Ok((
         wrap_account(profile, permission, login, account.as_ref()),
         None,
         account,
     ))
+}
+
+fn merge_loopback_no_proxy(env: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in env.iter() {
+        if (k.as_slice() == b"NO_PROXY" || k.as_slice() == b"no_proxy")
+            && let Ok(text) = std::str::from_utf8(v)
+        {
+            for item in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !parts.iter().any(|existing| existing == item) {
+                    parts.push(item.to_owned());
+                }
+            }
+        }
+    }
+    for required in ["127.0.0.1", "localhost", "::1"] {
+        if !parts.iter().any(|existing| existing == required) {
+            parts.push(required.to_owned());
+        }
+    }
+    let merged = parts.join(",").into_bytes();
+    env.retain(|(k, _)| k.as_slice() != b"NO_PROXY" && k.as_slice() != b"no_proxy");
+    env.push((b"NO_PROXY".to_vec(), merged.clone()));
+    env.push((b"no_proxy".to_vec(), merged));
+}
+
+fn same_workspace_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 /// 재개에 쓸 계정(OWE-699). 요청이 계정을 지정하면(다른 계정으로 이어가기) 그 계정을 검증해 쓰고,

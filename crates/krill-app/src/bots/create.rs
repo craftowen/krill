@@ -1,36 +1,48 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
-//! Create Bot & 24-Template Gallery screen for Krill Bots modal.
+//! Create Bot & 24-Template Gallery screen (`CreateBotV2`) for Krill Bots modal.
 
 use gpui::{
-    App, Context, Entity, FontWeight, SharedString, Subscription, Window, div, prelude::*, px,
+    App, Context, Entity, Focusable as _, FontWeight, SharedString, Subscription, Window, div,
+    prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Disableable as _, IconName, Sizable as _};
+use krill_proto::agent::Permission;
 use krill_proto::bots::{
-    BUILTIN_BOT_TEMPLATES, BotRpcRequest, BotRpcResponse, BotTemplate, BotTemplateCategory,
-    CreateBotParams, find_bot_template,
+    BUILTIN_BOT_TEMPLATES, BotEventRuleConfig, BotRpcRequest, BotRpcResponse, BotSlug, BotTemplate,
+    BotTemplateCategory, CreateBotParams, CreateBotV2Params, find_bot_template, validate_bot_slug,
 };
 
 use crate::i18n::catalog::bots as text;
+use crate::layout::TabColor;
 use crate::ui;
 
-use super::rpc::BOT_RUNTIMES;
-use super::{Close, DetailTab, Screen, View, opt_input_composing};
+use super::rpc::{
+    BOT_AVATAR_COLOR_PALETTE, BOT_EFFORT_OPTIONS, BOT_RUNTIMES, avatar_color_hex, call_checked,
+    effort_label,
+};
+use super::{Close, DetailTab, Screen, View, clear_input_on_window, opt_input_composing};
 
 #[derive(Default)]
 pub(super) struct CreateState {
     pub(super) category: Option<BotTemplateCategory>,
     pub(super) selected_template_id: Option<&'static str>,
     pub(super) runtime_id: String,
+    pub(super) effort: String,
+    pub(super) permission_mode: Option<Permission>,
+    pub(super) avatar_color: Option<TabColor>,
     pub(super) search_query: String,
     pub(super) search_input: Option<Entity<InputState>>,
     pub(super) search_sub: Option<Subscription>,
     pub(super) name_input: Option<Entity<InputState>>,
+    pub(super) slug_input: Option<Entity<InputState>>,
     pub(super) description_input: Option<Entity<InputState>>,
     pub(super) emoji_input: Option<Entity<InputState>>,
     pub(super) model_input: Option<Entity<InputState>>,
     pub(super) workspace_input: Option<Entity<InputState>>,
+    pub(super) submit_subs: Vec<Subscription>,
+    pub(super) focus_name_pending: bool,
     pub(super) submitting: bool,
 }
 
@@ -46,6 +58,7 @@ impl CreateState {
     pub(super) fn input_is_composing(&self, window: &mut Window, app: &mut App) -> bool {
         opt_input_composing(self.search_input.as_ref(), window, app)
             || opt_input_composing(self.name_input.as_ref(), window, app)
+            || opt_input_composing(self.slug_input.as_ref(), window, app)
             || opt_input_composing(self.description_input.as_ref(), window, app)
             || opt_input_composing(self.emoji_input.as_ref(), window, app)
             || opt_input_composing(self.model_input.as_ref(), window, app)
@@ -56,6 +69,7 @@ impl CreateState {
         let updates = [
             (&self.search_input, text::SEARCH_PLACEHOLDER.get()),
             (&self.name_input, text::FIELD_NAME_PLACEHOLDER.get()),
+            (&self.slug_input, text::FIELD_SLUG_PLACEHOLDER.get()),
             (
                 &self.description_input,
                 text::FIELD_DESCRIPTION_PLACEHOLDER.get(),
@@ -71,6 +85,60 @@ impl CreateState {
             if let Some(input) = slot {
                 input.update(cx, |s, cx| s.set_placeholder(placeholder, window, cx));
             }
+        }
+    }
+
+    pub(super) fn clear_form_fields(
+        &mut self,
+        window_handle: Option<gpui::AnyWindowHandle>,
+        default_cwd: Option<&std::path::Path>,
+        cx: &mut App,
+    ) {
+        self.clear_form_fields_with(None, window_handle, default_cwd, cx);
+    }
+
+    pub(super) fn clear_form_fields_with(
+        &mut self,
+        mut window: Option<&mut Window>,
+        window_handle: Option<gpui::AnyWindowHandle>,
+        default_cwd: Option<&std::path::Path>,
+        cx: &mut App,
+    ) {
+        self.selected_template_id = None;
+        self.effort.clear();
+        self.permission_mode = None;
+        self.avatar_color = None;
+        self.focus_name_pending = true;
+        for slot in [
+            &mut self.name_input,
+            &mut self.slug_input,
+            &mut self.description_input,
+            &mut self.emoji_input,
+            &mut self.model_input,
+        ] {
+            if let Some(win) = window.as_deref_mut() {
+                if let Some(input) = slot {
+                    input.update(cx, |s, cx| s.set_value(String::new(), win, cx));
+                }
+            } else {
+                clear_input_on_window(slot, window_handle, cx);
+            }
+        }
+        let default_ws = default_cwd
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(ws_input) = &self.workspace_input {
+            if let Some(win) = window {
+                ws_input.update(cx, |s, cx| s.set_value(default_ws, win, cx));
+            } else if let Some(handle) = window_handle {
+                let ws_copy = default_ws;
+                let ws_entity = ws_input.clone();
+                drop(handle.update(cx, |_, window, cx| {
+                    ws_entity.update(cx, |s, cx| s.set_value(ws_copy, window, cx));
+                }));
+            }
+        } else {
+            self.workspace_input = None;
         }
     }
 }
@@ -109,6 +177,22 @@ pub fn category_label(cat: BotTemplateCategory) -> &'static str {
 }
 
 impl View {
+    fn subscribe_create_enter(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sub = cx.subscribe_in(input, window, |this, inp, ev: &InputEvent, window, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. })
+                && !crate::jump::entity_input_is_composing(inp, window, cx)
+            {
+                this.submit_create_bot(cx);
+            }
+        });
+        self.create.submit_subs.push(sub);
+    }
+
     fn ensure_create_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !cx.has_global::<gpui_component::Theme>() {
             return;
@@ -126,24 +210,39 @@ impl View {
             self.create.search_input = Some(input);
         }
         if self.create.name_input.is_none() {
-            self.create.name_input = Some(cx.new(|cx| {
+            let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::FIELD_NAME_PLACEHOLDER.get())
-            }));
+            });
+            self.subscribe_create_enter(&input, window, cx);
+            self.create.name_input = Some(input);
+        }
+        if self.create.slug_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(text::FIELD_SLUG_PLACEHOLDER.get())
+            });
+            self.subscribe_create_enter(&input, window, cx);
+            self.create.slug_input = Some(input);
         }
         if self.create.description_input.is_none() {
-            self.create.description_input = Some(cx.new(|cx| {
+            let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::FIELD_DESCRIPTION_PLACEHOLDER.get())
-            }));
+            });
+            self.subscribe_create_enter(&input, window, cx);
+            self.create.description_input = Some(input);
         }
         if self.create.emoji_input.is_none() {
-            self.create.emoji_input = Some(cx.new(|cx| {
+            let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::FIELD_EMOJI_PLACEHOLDER.get())
-            }));
+            });
+            self.subscribe_create_enter(&input, window, cx);
+            self.create.emoji_input = Some(input);
         }
         if self.create.model_input.is_none() {
-            self.create.model_input = Some(cx.new(|cx| {
+            let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::FIELD_MODEL_PLACEHOLDER.get())
-            }));
+            });
+            self.subscribe_create_enter(&input, window, cx);
+            self.create.model_input = Some(input);
         }
         if self.create.workspace_input.is_none() {
             let default_ws = self
@@ -151,14 +250,23 @@ impl View {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            self.create.workspace_input = Some(cx.new(|cx| {
+            let input = cx.new(|cx| {
                 let mut state = InputState::new(window, cx)
                     .placeholder(text::FIELD_WORKSPACE_PLACEHOLDER.get());
                 if !default_ws.is_empty() {
                     state.set_value(default_ws, window, cx);
                 }
                 state
-            }));
+            });
+            self.subscribe_create_enter(&input, window, cx);
+            self.create.workspace_input = Some(input);
+        }
+        if self.create.focus_name_pending
+            && let Some(name_input) = &self.create.name_input
+        {
+            self.create.focus_name_pending = false;
+            let focus = name_input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
         }
     }
 
@@ -175,6 +283,11 @@ impl View {
                     s.set_value(template.name.to_owned(), window, cx);
                 });
             }
+            if let Some(input) = &self.create.slug_input {
+                input.update(cx, |s, cx| {
+                    s.set_value(template.id.to_owned(), window, cx);
+                });
+            }
             if let Some(input) = &self.create.description_input {
                 input.update(cx, |s, cx| {
                     s.set_value(template.description.to_owned(), window, cx);
@@ -186,6 +299,17 @@ impl View {
 
     pub fn clear_selected_template(&mut self, cx: &mut Context<Self>) {
         self.create.selected_template_id = None;
+        cx.notify();
+    }
+
+    pub fn start_blank_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let default_cwd = self.default_cwd.clone();
+        self.create
+            .clear_form_fields_with(Some(window), None, default_cwd.as_deref(), cx);
+        if let Some(name_input) = &self.create.name_input {
+            let focus = name_input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         cx.notify();
     }
 
@@ -252,6 +376,24 @@ impl View {
             cx.notify();
             return;
         };
+
+        let raw_slug = self
+            .create
+            .slug_input
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_owned())
+            .unwrap_or_default();
+        let slug = if raw_slug.is_empty() {
+            None
+        } else {
+            if validate_bot_slug(&raw_slug).is_err() {
+                self.error = Some(SharedString::from(text::ERR_INVALID_SLUG.get()));
+                cx.notify();
+                return;
+            }
+            Some(BotSlug::from_name(&raw_slug))
+        };
+
         let description = self
             .create
             .description_input
@@ -278,29 +420,59 @@ impl View {
             .as_ref()
             .map(|i| i.read(cx).value().trim().to_owned())
             .filter(|s| !s.is_empty());
+        let effort = (!self.create.effort.trim().is_empty()).then(|| self.create.effort.clone());
 
-        let params = CreateBotParams {
+        let base = CreateBotParams {
             name,
             agent_id: self.create.effective_runtime().to_owned(),
             description,
             emoji,
             avatar: None,
             model,
-            effort: None,
-            permission_mode: None,
+            effort,
+            permission_mode: self.create.permission_mode,
             workspace,
             template_id: template.map(|t| t.id.to_owned()),
             initial_soul: template.map(|t| t.default_soul.to_owned()),
+        };
+        let params = CreateBotV2Params {
+            base,
+            slug,
+            avatar_color: self
+                .create
+                .avatar_color
+                .map(avatar_color_hex)
+                .map(str::to_owned),
+            skills: template
+                .map(|t| t.skills.iter().map(|s| (*s).to_owned()).collect())
+                .unwrap_or_default(),
+            events: template
+                .map(|t| {
+                    t.events
+                        .iter()
+                        .map(|ev| BotEventRuleConfig {
+                            id: ev.id.to_owned(),
+                            source: ev.source.to_owned(),
+                            event: ev.event.to_owned(),
+                            prompt: ev.prompt.to_owned(),
+                            enabled: false,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
 
         let rpc = self.rpc.clone();
         self.create.submitting = true;
         self.error = None;
         self.notice = None;
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        self.mutation_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move { rpc(&BotRpcRequest::CreateBot(Box::new(params))) })
+                .spawn(async move {
+                    let req = BotRpcRequest::CreateBotV2(Box::new(params));
+                    call_checked(&rpc, &req)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.create.submitting = false;
@@ -308,18 +480,18 @@ impl View {
                     Ok(BotRpcResponse::Bot(created)) => {
                         let new_id = created.id.clone();
                         this.upsert_bot_config(*created);
-                        this.create.selected_template_id = None;
+                        let handle = this.window_handle;
+                        let default_cwd = this.default_cwd.clone();
+                        this.create
+                            .clear_form_fields(handle, default_cwd.as_deref(), cx);
                         this.selected_bot_id = Some(new_id.clone());
                         this.screen = Screen::Detail;
                         this.detail_tab = DetailTab::Items;
                         this.load_selected_bot_detail(new_id, cx);
                     }
-                    Ok(BotRpcResponse::Error(msg)) => {
-                        this.error = Some(SharedString::from(msg));
-                    }
                     Ok(other) => {
                         this.error = Some(SharedString::from(format!(
-                            "unexpected CreateBot response: {other:?}"
+                            "unexpected CreateBotV2 response: {other:?}"
                         )));
                     }
                     Err(err) => {
@@ -333,10 +505,6 @@ impl View {
         cx.notify();
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Template gallery + custom bot creation form"
-    )]
     pub(super) fn render_create_view(
         &mut self,
         p: &ui::Palette,
@@ -346,7 +514,6 @@ impl View {
         self.ensure_create_inputs(window, cx);
         let filtered = filter_templates(self.create.category, &self.create.search_query);
         let selected_tpl = self.create.selected_template_id.and_then(find_bot_template);
-        let active_runtime = self.create.effective_runtime().to_owned();
 
         let header = div()
             .flex_none()
@@ -380,6 +547,13 @@ impl View {
             )
             .child(
                 ui::controls()
+                    .child(
+                        ui::secondary("bots-create-start-blank", text::START_BLANK.get())
+                            .debug_selector(|| "bots-create-start-blank".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_blank_template(window, cx);
+                            })),
+                    )
                     .when(!self.bots.is_empty(), |d| {
                         d.child(
                             ui::ghost("bots-create-cancel", text::BACK.get())
@@ -402,8 +576,83 @@ impl View {
                     )),
             );
 
-        // Category pills (All + 6 categories).
-        let mut category_pills = div()
+        let category_pills = self.render_template_category_pills(p, cx);
+        let cards = self.render_template_cards(&filtered, p, cx);
+        let form_card = self.render_create_form_card(selected_tpl, p, cx);
+        let templates_heading =
+            text::TEMPLATES_HEADING.format(&[("n", &filtered.len().to_string())]);
+
+        div()
+            .id("bots-create-view")
+            .debug_selector(|| "bots-create-view".into())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .children(
+                self.error
+                    .as_ref()
+                    .map(|err| div().px_5().pt_3().child(ui::error_banner(p, err.clone()))),
+            )
+            .children(self.notice.as_ref().map(|msg| {
+                div().px_5().pt_3().child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(p.success.opacity(0.3))
+                        .bg(p.success.opacity(0.1))
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.success)
+                        .child(msg.clone()),
+                )
+            }))
+            .child(
+                div()
+                    .id("bots-create-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_5()
+                    .py_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(form_card)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_SM)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.foreground)
+                                    .child(templates_heading),
+                            )
+                            .children(self.create.search_input.as_ref().map(|i| {
+                                div().w(px(220.)).max_w_full().child(Input::new(i).small())
+                            })),
+                    )
+                    .child(category_pills)
+                    .child(cards),
+            )
+    }
+
+    fn render_template_category_pills(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut pills = div()
             .id("bots-template-categories")
             .debug_selector(|| "bots-template-categories".into())
             .flex()
@@ -423,7 +672,7 @@ impl View {
         for &cat in BotTemplateCategory::ALL {
             let cat_id = format!("bots-cat-{}", cat.as_str());
             let cat_sel = cat_id.clone();
-            category_pills = category_pills.child(
+            pills = pills.child(
                 ui::segment(
                     p,
                     SharedString::from(cat_id),
@@ -436,8 +685,15 @@ impl View {
                 })),
             );
         }
+        pills
+    }
 
-        // Template cards grid (2 columns wrapping cleanly).
+    fn render_template_cards(
+        &self,
+        filtered: &[&'static BotTemplate],
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let mut cards = div()
             .id("bots-template-grid")
             .debug_selector(|| "bots-template-grid".into())
@@ -445,7 +701,7 @@ impl View {
             .flex()
             .flex_wrap()
             .gap_2p5();
-        for tpl in &filtered {
+        for tpl in filtered {
             let tpl = *tpl;
             let is_picked = self.create.selected_template_id == Some(tpl.id);
             let card_id = format!("bots-template-{}", tpl.id);
@@ -497,13 +753,19 @@ impl View {
                                             .child(tpl.name),
                                     ),
                             )
-                            .when(is_picked, |d| {
-                                d.child(ui::badge(
-                                    p,
-                                    ui::BadgeTone::Success,
-                                    text::USING_TEMPLATE.get(),
-                                ))
-                            }),
+                            .child(ui::badge(
+                                p,
+                                if is_picked {
+                                    ui::BadgeTone::Success
+                                } else {
+                                    ui::BadgeTone::Neutral
+                                },
+                                if is_picked {
+                                    text::USING_TEMPLATE.get()
+                                } else {
+                                    text::USE_TEMPLATE.get()
+                                },
+                            )),
                     )
                     .child(
                         div()
@@ -511,21 +773,60 @@ impl View {
                             .text_color(p.muted_foreground)
                             .child(tpl.description),
                     )
-                    .when(!tpl.connectors.is_empty(), |d| {
-                        let mut chips = div().flex().flex_wrap().items_center().gap_1();
+                    .child({
+                        let mut meta = div().flex().flex_wrap().items_center().gap_1();
                         for src in tpl.connectors {
-                            chips = chips.child(ui::badge(
+                            meta = meta.child(ui::badge(
                                 p,
                                 ui::BadgeTone::Neutral,
                                 Self::source_label(*src),
                             ));
                         }
-                        d.child(chips)
+                        if !tpl.schedules.is_empty() {
+                            meta = meta.child(ui::badge(
+                                p,
+                                ui::BadgeTone::Muted,
+                                text::TEMPLATE_SCHEDULES_COUNT
+                                    .format(&[("n", &tpl.schedules.len().to_string())]),
+                            ));
+                        }
+                        if !tpl.events.is_empty() {
+                            meta = meta.child(ui::badge(
+                                p,
+                                ui::BadgeTone::Muted,
+                                text::TEMPLATE_EVENTS_COUNT
+                                    .format(&[("n", &tpl.events.len().to_string())]),
+                            ));
+                        }
+                        if !tpl.skills.is_empty() {
+                            meta = meta.child(ui::badge(
+                                p,
+                                ui::BadgeTone::Muted,
+                                text::TEMPLATE_SKILLS_COUNT
+                                    .format(&[("n", &tpl.skills.len().to_string())]),
+                            ));
+                        }
+                        if let Some(setup) = tpl.needs_setup {
+                            meta = meta.child(ui::badge(
+                                p,
+                                ui::BadgeTone::Warning,
+                                text::TEMPLATE_NEEDS_SETUP.format(&[("text", setup)]),
+                            ));
+                        }
+                        meta
                     }),
             );
         }
+        cards
+    }
 
-        // Runtime selector pills (Krill's 8 enabled runtimes).
+    fn render_create_form_card(
+        &self,
+        selected_tpl: Option<&'static BotTemplate>,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let active_runtime = self.create.effective_runtime().to_owned();
         let mut runtime_pills = div()
             .id("bots-runtime-picker")
             .debug_selector(|| "bots-runtime-picker".into())
@@ -574,13 +875,94 @@ impl View {
             );
         }
 
-        // Configuration form card.
-        let form_card = ui::card(p)
+        let effort_pills = ui::segmented_control(
+            p,
+            BOT_EFFORT_OPTIONS.into_iter().map(|eff| {
+                let id = format!(
+                    "bots-create-effort-{}",
+                    if eff.is_empty() { "default" } else { eff }
+                );
+                ui::segment(
+                    p,
+                    SharedString::from(id),
+                    effort_label(eff),
+                    self.create.effort == eff,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    eff.clone_into(&mut this.create.effort);
+                    cx.notify();
+                }))
+            }),
+        );
+
+        let perm_pills = ui::segmented_control(
+            p,
+            [
+                (Permission::Manual, "manual", text::PERMISSION_MANUAL.get()),
+                (Permission::Yolo, "yolo", text::PERMISSION_YOLO.get()),
+            ]
+            .into_iter()
+            .map(|(perm, suffix, label)| {
+                let is_on = self.create.permission_mode.is_some_and(|cur| cur == perm);
+                ui::segment(p, format!("bots-create-perm-{suffix}"), label, is_on).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.create.permission_mode = if this.create.permission_mode == Some(perm) {
+                            None
+                        } else {
+                            Some(perm)
+                        };
+                        cx.notify();
+                    }),
+                )
+            }),
+        );
+
+        let mut color_swatches = div().flex().flex_wrap().items_center().gap_1p5().child(
+            ui::segment(
+                p,
+                "bots-create-color-none",
+                text::SETTINGS_COLOR_NONE.get(),
+                self.create.avatar_color.is_none(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.create.avatar_color = None;
+                cx.notify();
+            })),
+        );
+        for (idx, (color, _)) in BOT_AVATAR_COLOR_PALETTE.iter().enumerate() {
+            let color = *color;
+            let active = self.create.avatar_color == Some(color);
+            color_swatches = color_swatches.child(
+                div()
+                    .id(("bots-create-color", idx))
+                    .size(px(20.))
+                    .rounded_full()
+                    .bg(ui::tab_tag_color(color))
+                    .border_2()
+                    .border_color(if active {
+                        p.foreground
+                    } else {
+                        ui::transparent()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.create.avatar_color = Some(color);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        ui::card(p)
             .flex()
             .flex_col()
             .gap_3()
             .when_some(selected_tpl, |d, tpl| {
                 let banner_text = text::SELECTED_TEMPLATE.format(&[("name", tpl.name)]);
+                let ex_text = if !tpl.example[0].is_empty() || !tpl.example[1].is_empty() {
+                    Some(format!("{} — {}", tpl.example[0], tpl.example[1]))
+                } else {
+                    None
+                };
                 d.child(
                     div()
                         .w_full()
@@ -600,7 +982,7 @@ impl View {
                                 .min_w_0()
                                 .flex()
                                 .flex_col()
-                                .gap_0p5()
+                                .gap_1()
                                 .child(
                                     div()
                                         .text_size(ui::TEXT_XS)
@@ -612,8 +994,23 @@ impl View {
                                     div()
                                         .text_size(ui::TEXT_XS)
                                         .text_color(p.muted_foreground)
-                                        .child(tpl.first_chat),
-                                ),
+                                        .child(format!(
+                                            "{}: {}",
+                                            text::TEMPLATE_FIRST_CHAT.get(),
+                                            tpl.first_chat
+                                        )),
+                                )
+                                .when_some(ex_text, |dd, ex| {
+                                    dd.child(
+                                        div()
+                                            .text_size(ui::TEXT_2XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(format!(
+                                                "{}: {ex}",
+                                                text::TEMPLATE_EXAMPLE.get()
+                                            )),
+                                    )
+                                }),
                         )
                         .child(
                             ui::ghost("bots-clear-template", text::CLEAR_TEMPLATE.get())
@@ -633,7 +1030,7 @@ impl View {
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(220.))
+                            .min_w(px(200.))
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -641,6 +1038,25 @@ impl View {
                             .children(
                                 self.create
                                     .name_input
+                                    .as_ref()
+                                    .map(|i| Input::new(i).small()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(180.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui::field_label(
+                                text::FIELD_SLUG.get(),
+                                Some(text::OPTIONAL_TAG.get()),
+                                p,
+                            ))
+                            .children(
+                                self.create
+                                    .slug_input
                                     .as_ref()
                                     .map(|i| Input::new(i).small()),
                             ),
@@ -691,6 +1107,49 @@ impl View {
                     .gap_1()
                     .child(ui::field_label(text::FIELD_RUNTIME.get(), None, p))
                     .child(runtime_pills),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui::field_label(
+                                text::FIELD_EFFORT.get(),
+                                Some(text::OPTIONAL_TAG.get()),
+                                p,
+                            ))
+                            .child(effort_pills),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui::field_label(
+                                text::FIELD_PERMISSION.get(),
+                                Some(text::OPTIONAL_TAG.get()),
+                                p,
+                            ))
+                            .child(perm_pills),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(ui::field_label(
+                                text::SETTINGS_AVATAR_COLOR_LABEL.get(),
+                                Some(text::OPTIONAL_TAG.get()),
+                                p,
+                            ))
+                            .child(color_swatches),
+                    ),
             )
             .child(
                 div()
@@ -761,71 +1220,16 @@ impl View {
                     .justify_end()
                     .gap_2()
                     .child(
-                        ui::primary(
+                        ui::button_with_reserved_label(
                             "bots-create-submit",
-                            if self.create.submitting {
-                                text::CREATING.get()
-                            } else {
-                                text::CREATE_BOT_BTN.get()
-                            },
+                            text::CREATE_BOT_BTN.get(),
+                            text::CREATING.get(),
+                            self.create.submitting,
                         )
                         .debug_selector(|| "bots-create-submit".into())
                         .disabled(self.create.submitting)
                         .on_click(cx.listener(|this, _, _, cx| this.submit_create_bot(cx))),
                     ),
-            );
-
-        let templates_heading =
-            text::TEMPLATES_HEADING.format(&[("n", &filtered.len().to_string())]);
-
-        div()
-            .id("bots-create-view")
-            .debug_selector(|| "bots-create-view".into())
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(header)
-            .children(
-                self.error
-                    .as_ref()
-                    .map(|err| div().px_5().pt_3().child(ui::error_banner(p, err.clone()))),
-            )
-            .child(
-                div()
-                    .id("bots-create-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .py_4()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(form_card)
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_SM)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.foreground)
-                                    .child(templates_heading),
-                            )
-                            .children(self.create.search_input.as_ref().map(|i| {
-                                div().w(px(220.)).max_w_full().child(Input::new(i).small())
-                            })),
-                    )
-                    .child(category_pills)
-                    .child(cards),
             )
     }
 }

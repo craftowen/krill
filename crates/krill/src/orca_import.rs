@@ -114,6 +114,7 @@
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 #[cfg(unix)]
@@ -128,9 +129,11 @@ use krill_proto::agent_history::{
     Action, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, Response, VaultAgent, VaultTarget,
 };
 use krill_proto::bots::{
-    BotConfig, BotId, BotMember, BotSlug, ExternalBotCandidate, ExternalBotSourceApp,
-    ExternalSource, bot_slug_from_name, init_bot_home, soul_description, strip_png_metadata,
-    validate_bot_id, validate_bot_slug,
+    BOT_LOOK_AROUND_FOCUS_MAX_BYTES, BotConfig, BotGroupChat, BotId, BotItemActor, BotItemDecision,
+    BotItemStatus, BotMember, BotScheduleConfig, BotSlug, BotSuggestion, ExternalBotCandidate,
+    ExternalBotSourceApp, ExternalSource, bot_slug_from_name, discover_external_bots_filtered,
+    expand_tilde, init_bot_home, soul_description, strip_png_metadata, validate_bot_id,
+    validate_bot_slug,
 };
 use krill_proto::config_document;
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
@@ -389,6 +392,14 @@ pub struct BotsImportSummary {
     pub bots_added: usize,
     #[serde(default)]
     pub bots_skipped: usize,
+    #[serde(default)]
+    pub items_migrated: usize,
+    #[serde(default)]
+    pub groups_migrated: usize,
+    #[serde(default)]
+    pub suggestions_migrated: usize,
+    #[serde(default)]
+    pub schedules_migrated: usize,
     #[serde(default)]
     pub items: Vec<ImportedBotSummary>,
     /// OpenClaw·Hermes·OpenBot에서 발견된 봇 후보(비밀 설정·키는 열지 않음).
@@ -917,9 +928,13 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
         } else {
             writeln!(
                 out,
-                "  bots: +{} added, {} existing skipped, {} external candidate(s)",
+                "  bots: +{} added, {} existing skipped, {} items, {} groups, {} suggestions, {} schedules, {} external candidate(s)",
                 b.bots_added,
                 b.bots_skipped,
+                b.items_migrated,
+                b.groups_migrated,
+                b.suggestions_migrated,
+                b.schedules_migrated,
                 b.external_candidates.len()
             )
             .ok();
@@ -933,6 +948,20 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
                     out,
                     "    - [{}] {} ({}){state}",
                     item.agent_id, item.name, item.slug
+                )
+                .ok();
+            }
+            for cand in &b.external_candidates {
+                let app = match cand.app {
+                    ExternalBotSourceApp::Orca => "orca",
+                    ExternalBotSourceApp::OpenClaw => "openclaw",
+                    ExternalBotSourceApp::Hermes => "hermes",
+                    ExternalBotSourceApp::OpenBot => "openbot",
+                };
+                writeln!(
+                    out,
+                    "    - external [{app}] {} ({}) — {}",
+                    cand.name, cand.agent, cand.path
                 )
                 .ok();
             }
@@ -1050,21 +1079,63 @@ fn load_orca_domains(
     out
 }
 
-fn query_sqlite_domains(db_path: &Path) -> io::Result<BTreeMap<String, Json>> {
-    let sqlite_bin = if Path::new("/usr/bin/sqlite3").is_file() {
+fn sqlite3_binary() -> &'static str {
+    if Path::new("/usr/bin/sqlite3").is_file() {
         "/usr/bin/sqlite3"
     } else {
         "sqlite3"
+    }
+}
+
+fn sqlite_immutable_uri(db_path: &Path) -> String {
+    let raw = db_path.to_string_lossy();
+    let mut encoded = String::with_capacity(raw.len() + 24);
+    encoded.push_str("file:");
+    for b in raw.bytes() {
+        match b {
+            b'%' => encoded.push_str("%25"),
+            b'?' => encoded.push_str("%3F"),
+            b'#' => encoded.push_str("%23"),
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push(char::from(b)),
+        }
+    }
+    encoded.push_str("?immutable=1");
+    encoded
+}
+
+fn sqlite_wal_companion_exists(db_path: &Path) -> bool {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push("-wal");
+    Path::new(&os).exists()
+}
+
+fn run_sqlite3_json_rows(db_path: &Path, sql: &str) -> io::Result<Vec<Json>> {
+    let bin = sqlite3_binary();
+    let run_once = |target: &str| {
+        Command::new(bin)
+            .arg("-readonly")
+            .arg("-json")
+            .arg(target)
+            .arg(sql)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
     };
-    let output = Command::new(sqlite_bin)
-        .arg("-readonly")
-        .arg("-json")
-        .arg(db_path)
-        .arg("SELECT domain, payload FROM profile_state_documents;")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let db_str = db_path.to_string_lossy();
+    let output = run_once(db_str.as_ref())?;
+    let output = if !output.status.success() && !sqlite_wal_companion_exists(db_path) {
+        let uri = sqlite_immutable_uri(db_path);
+        let retry = run_once(&uri)?;
+        if retry.status.success() {
+            retry
+        } else {
+            output
+        }
+    } else {
+        output
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
@@ -1076,13 +1147,23 @@ fn query_sqlite_domains(db_path: &Path) -> io::Result<BTreeMap<String, Json>> {
     let stdout = String::from_utf8(output.stdout).map_err(invalid_data)?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(Vec::new());
     }
-    let rows: Vec<SqliteRow> = serde_json::from_str(trimmed).map_err(invalid_data)?;
+    serde_json::from_str::<Vec<Json>>(trimmed).map_err(invalid_data)
+}
+
+fn query_sqlite_domains(db_path: &Path) -> io::Result<BTreeMap<String, Json>> {
+    let rows = run_sqlite3_json_rows(
+        db_path,
+        "SELECT domain, payload FROM profile_state_documents;",
+    )?;
     let mut map = BTreeMap::new();
     for row in rows {
-        if let Ok(val) = serde_json::from_str::<Json>(&row.payload) {
-            map.insert(row.domain, val);
+        let Ok(parsed) = serde_json::from_value::<SqliteRow>(row) else {
+            continue;
+        };
+        if let Ok(val) = serde_json::from_str::<Json>(&parsed.payload) {
+            map.insert(parsed.domain, val);
         }
     }
     Ok(map)
@@ -3590,6 +3671,17 @@ struct OrcaAutomation {
     reuse_session: Option<bool>,
     extra_agent_args: Option<String>,
     missed_run_grace_minutes: Option<u32>,
+    bot: Option<OrcaAutomationBot>,
+    once: Option<Json>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaAutomationBot {
+    bot_id: Option<String>,
+    #[serde(alias = "id")]
+    id: Option<String>,
+    folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4071,6 +4163,7 @@ fn map_orca_agent_id(raw: &str) -> Option<&'static str> {
         "dsh" | "deepagents" => Some("dsh"),
         "openclaude" | "open-claude" => Some("openclaude"),
         "opencode2" | "open-code-2" => Some("opencode2"),
+        "openclaw" | "clawdbot" | "moltbot" => Some("openclaw"),
         _ => None,
     }
 }
@@ -4610,6 +4703,34 @@ struct OrcaBotLaunch {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+struct OrcaLookAround {
+    on: Option<bool>,
+    every: Option<String>,
+    weekdays_only: Option<bool>,
+    focus: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaTidyUp {
+    on: Option<bool>,
+    every: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaSlackApp {
+    owner_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaLinearWorkspace {
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct OrcaBotRecord {
     id: String,
     name: String,
@@ -4621,6 +4742,8 @@ struct OrcaBotRecord {
     avatar: Option<String>,
     avatar_color: Option<String>,
     paused: Option<bool>,
+    first_run: Option<bool>,
+    first_run_completed: Option<bool>,
     permission_mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -4628,10 +4751,25 @@ struct OrcaBotRecord {
     template_id: Option<String>,
     notifications: Option<OrcaBotNotifications>,
     members: Vec<OrcaBotMember>,
-    skills: Vec<String>,
+    #[serde(alias = "skills")]
+    skill_projects: Vec<String>,
+    look_around: Option<OrcaLookAround>,
+    tidy_up: Option<OrcaTidyUp>,
+    slack: Option<OrcaSlackApp>,
+    slack_apps: Vec<OrcaSlackApp>,
+    slack_mirror: Option<bool>,
+    linear: Option<OrcaLinearWorkspace>,
+    linear_workspaces: Vec<OrcaLinearWorkspace>,
+    github: Option<Json>,
+    google: Option<bool>,
     created_at: Option<u64>,
     updated_at: Option<u64>,
 }
+
+const IMPORTED_SOURCES_FILE: &str = "imported_sources.json";
+const GROUPS_FILE: &str = "groups.json";
+const SUGGESTIONS_FILE: &str = "suggestions.json";
+const BOT_ITEMS_DB_FILE: &str = "bot-items.db";
 
 fn import_bots_domain(
     opts: &ImportOptions,
@@ -4646,19 +4784,36 @@ fn import_bots_domain(
         None => Vec::new(),
     };
 
+    let ledger_path = bots_root.join(IMPORTED_SOURCES_FILE);
+    let original_ledger = read_original(&ledger_path)?;
+    let mut imported_ledger: BTreeMap<String, String> = match &original_ledger {
+        Some(raw) => serde_json::from_str(raw).unwrap_or_default(),
+        None => BTreeMap::new(),
+    };
+
     let mut summary = BotsImportSummary::default();
     let db_records = load_orca_db_bot_records(domains);
     let source_dirs = collect_orca_bot_dirs(&opts.home, &opts.orca_dir);
 
     let mut seen_source_paths: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut added_any = false;
+    let mut bots_modified = false;
+    let mut ledger_modified = false;
+    let mut bot_id_map: BTreeMap<String, BotId> = BTreeMap::new();
+    for b in &existing_bots {
+        bot_id_map.insert(b.id.as_str().to_owned(), b.id.clone());
+        bot_id_map.insert(b.slug.as_str().to_owned(), b.id.clone());
+    }
     let now_ms = now_secs().saturating_mul(1000);
 
     for bot_dir in source_dirs {
         let norm_dir = normalize_import_path(&bot_dir);
-        if !seen_source_paths.insert(norm_dir) {
+        if !seen_source_paths.insert(norm_dir.clone()) {
             continue;
         }
+        let canonical_src = krill_proto::os::canonicalize(&bot_dir).map_or_else(
+            |_| norm_dir.to_string_lossy().into_owned(),
+            |p| p.to_string_lossy().into_owned(),
+        );
         let Some(folder_name) = bot_dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -4685,7 +4840,7 @@ fn import_bots_domain(
         let memory = read_bounded_utf8(&bot_dir.join("MEMORY.md"));
         let memory_topics = list_memory_topic_files(&bot_dir.join("memory"));
 
-        let config = match build_krill_bot_config(
+        let mut config = match build_krill_bot_config(
             folder_name,
             disk_rec.as_ref(),
             db_match,
@@ -4699,15 +4854,44 @@ fn import_bots_domain(
             }
         };
 
-        let target_home = bots_root.join(config.slug.as_str());
-        let already_exists = existing_bots
-            .iter()
-            .any(|b| b.id == config.id || b.slug == config.slug)
-            || target_home.join("bot.json").is_file();
+        let orca_orig_id = config.id.as_str().to_owned();
+        let matched_existing = imported_ledger
+            .get(&canonical_src)
+            .and_then(|id_str| existing_bots.iter().find(|b| b.id.as_str() == id_str))
+            .or_else(|| existing_bots.iter().find(|b| b.id == config.id))
+            .cloned();
+
+        let already_exists = matched_existing.is_some();
+        if let Some(ref existing) = matched_existing {
+            bot_id_map.insert(orca_orig_id, existing.id.clone());
+            bot_id_map.insert(folder_name.to_owned(), existing.id.clone());
+            if imported_ledger.get(&canonical_src).map(String::as_str) != Some(existing.id.as_str())
+            {
+                imported_ledger.insert(canonical_src.clone(), existing.id.as_str().to_owned());
+                ledger_modified = true;
+            }
+        } else {
+            // Allocate non-colliding slug and ID across existing + intra-run bots.
+            let unique_slug = allocate_unique_bot_slug(&existing_bots, &bots_root, &config.slug);
+            config.slug = unique_slug.clone();
+            unique_slug.as_str().clone_into(&mut config.folder);
+            if existing_bots.iter().any(|b| b.id == config.id) {
+                config.id = allocate_unique_bot_id(&existing_bots, config.slug.as_str())
+                    .map_err(invalid_data)?;
+            }
+            bot_id_map.insert(orca_orig_id, config.id.clone());
+            bot_id_map.insert(folder_name.to_owned(), config.id.clone());
+        }
 
         let item = ImportedBotSummary {
-            id: config.id.as_str().to_owned(),
-            slug: config.slug.as_str().to_owned(),
+            id: matched_existing.as_ref().map_or_else(
+                || config.id.as_str().to_owned(),
+                |b| b.id.as_str().to_owned(),
+            ),
+            slug: matched_existing.as_ref().map_or_else(
+                || config.slug.as_str().to_owned(),
+                |b| b.slug.as_str().to_owned(),
+            ),
             name: config.name.clone(),
             agent_id: config.agent_id.clone(),
             source_path: bot_dir.display().to_string(),
@@ -4734,6 +4918,9 @@ fn import_bots_domain(
                 if let Some(content) = read_bounded_utf8(topic_path) {
                     let dst = created_home.join("memory").join(topic_name);
                     if !dst.exists() {
+                        if let Some(parent) = dst.parent() {
+                            ensure_dir_0700(parent)?;
+                        }
                         krill_proto::os::write_atomic_0600(&dst, content.as_bytes())?;
                     }
                 }
@@ -4761,26 +4948,110 @@ fn import_bots_domain(
                     }
                 }
             }
+            imported_ledger.insert(canonical_src, config.id.as_str().to_owned());
+            ledger_modified = true;
         }
 
         existing_bots.push(config);
-        added_any = true;
+        bots_modified = true;
         summary.bots_added = summary.bots_added.saturating_add(1);
         summary.items.push(item);
     }
 
-    if !opts.dry_run && added_any {
-        let mut rendered = serde_json::to_string_pretty(&existing_bots).map_err(invalid_data)?;
-        rendered.push('\n');
-        write_atomic_0600(&index_path, rendered.as_bytes(), original.as_deref())?;
+    // Migrate bot-scoped recurring automations into matching bots' `BotConfig.schedules`.
+    let schedules_added = migrate_bot_scoped_automations(
+        domains,
+        &mut existing_bots,
+        &bot_id_map,
+        &bots_root,
+        opts.dry_run,
+        warnings,
+    )?;
+    if schedules_added > 0 {
+        summary.schedules_migrated = schedules_added;
+        bots_modified = true;
     }
 
+    if !opts.dry_run {
+        if bots_modified {
+            ensure_dir_0700(&bots_root)?;
+            let mut rendered =
+                serde_json::to_string_pretty(&existing_bots).map_err(invalid_data)?;
+            rendered.push('\n');
+            write_atomic_0600(&index_path, rendered.as_bytes(), original.as_deref())?;
+        }
+        if ledger_modified {
+            ensure_dir_0700(&bots_root)?;
+            let mut rendered =
+                serde_json::to_string_pretty(&imported_ledger).map_err(invalid_data)?;
+            rendered.push('\n');
+            write_atomic_0600(
+                &ledger_path,
+                rendered.as_bytes(),
+                original_ledger.as_deref(),
+            )?;
+        }
+    }
+
+    // Migrate Orca bot items, groups, and look-around suggestions idempotently.
+    summary.items_migrated =
+        import_orca_bot_items(opts, &bots_root, &bot_id_map, &existing_bots, warnings)?;
+    summary.groups_migrated =
+        import_orca_bot_groups(opts, &bots_root, &bot_id_map, &existing_bots, warnings)?;
+    summary.suggestions_migrated = import_orca_look_around_suggestions(
+        opts,
+        &bots_root,
+        &bot_id_map,
+        &existing_bots,
+        warnings,
+    )?;
+
     // Also discover non-Orca external bot candidates (OpenClaw, Hermes, OpenBot) read-only.
-    let mut external = discover_external_bots(&opts.home, None);
+    let mut external = discover_external_bots_filtered(&opts.home, None, None, |key| {
+        std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+    });
     external.retain(|c| c.app != ExternalBotSourceApp::Orca);
     summary.external_candidates = external;
 
     Ok(summary)
+}
+
+fn allocate_unique_bot_slug(existing: &[BotConfig], bots_root: &Path, base: &BotSlug) -> BotSlug {
+    let taken = |cand: &str| {
+        existing.iter().any(|b| b.slug.as_str() == cand)
+            || bots_root.join(cand).join("bot.json").is_file()
+    };
+    if !taken(base.as_str()) {
+        return base.clone();
+    }
+    for n in 2..=9999_u32 {
+        let candidate = format!("{}-{n}", base.as_str());
+        if validate_bot_slug(&candidate).is_ok()
+            && let Ok(slug) = BotSlug::new(&candidate)
+            && !taken(slug.as_str())
+        {
+            return slug;
+        }
+    }
+    base.clone()
+}
+
+fn allocate_unique_bot_id(existing: &[BotConfig], base_slug: &str) -> Result<BotId, String> {
+    let first = format!("bot-{base_slug}");
+    if let Ok(id) = BotId::new(&first)
+        && !existing.iter().any(|b| b.id == id)
+    {
+        return Ok(id);
+    }
+    for n in 2..=9999_u32 {
+        let cand = format!("bot-{base_slug}-{n}");
+        if let Ok(id) = BotId::new(&cand)
+            && !existing.iter().any(|b| b.id == id)
+        {
+            return Ok(id);
+        }
+    }
+    Err("unable to allocate unique bot id".to_owned())
 }
 
 fn load_orca_db_bot_records(domains: &BTreeMap<String, Json>) -> Vec<OrcaBotRecord> {
@@ -4793,9 +5064,40 @@ fn load_orca_db_bot_records(domains: &BTreeMap<String, Json>) -> Vec<OrcaBotReco
 }
 
 fn collect_orca_bot_dirs(home: &Path, orca_dir: &Path) -> Vec<PathBuf> {
-    let roots = [home.join(".orca").join(BOTS_DIR), orca_dir.join(BOTS_DIR)];
+    let mut roots = vec![
+        home.join(".orca").join(BOTS_DIR),
+        orca_dir.join(BOTS_DIR),
+        home.join("Library")
+            .join("Application Support")
+            .join("Orca")
+            .join(BOTS_DIR),
+        home.join("Library")
+            .join("Application Support")
+            .join("orca")
+            .join(BOTS_DIR),
+    ];
+    if let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+        let base = expand_tilde(home, &appdata.to_string_lossy());
+        roots.push(base.join("Orca").join(BOTS_DIR));
+        roots.push(base.join("orca").join(BOTS_DIR));
+    } else {
+        let fallback = home.join("AppData").join("Roaming");
+        roots.push(fallback.join("Orca").join(BOTS_DIR));
+        roots.push(fallback.join("orca").join(BOTS_DIR));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        let base = expand_tilde(home, &xdg.to_string_lossy());
+        roots.push(base.join("Orca").join(BOTS_DIR));
+        roots.push(base.join("orca").join(BOTS_DIR));
+    }
+
     let mut out = Vec::new();
+    let mut seen_roots = BTreeSet::new();
     for root in roots {
+        let root_key = krill_proto::os::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if !seen_roots.insert(root_key) {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&root) else {
             continue;
         };
@@ -4838,27 +5140,48 @@ fn read_bounded_utf8(path: &Path) -> Option<String> {
 }
 
 fn list_memory_topic_files(memory_dir: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = fs::read_dir(memory_dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
+    fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+        if depth > 2 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
             if name.starts_with('.') {
-                return None;
+                continue;
             }
-            let path = e.path();
-            let meta = fs::symlink_metadata(&path).ok()?;
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return None;
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
             }
-            Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                .then_some((name, path))
-        })
-        .collect();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if meta.is_dir() {
+                if depth < 2 {
+                    walk(&path, &rel, depth.saturating_add(1), out);
+                }
+            } else if meta.is_file()
+                && Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                out.push((rel, path));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(memory_dir, "", 0, &mut out);
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
@@ -5024,7 +5347,109 @@ fn build_krill_bot_config(
         .and_then(|r| r.paused)
         .or_else(|| disk.and_then(|r| r.paused))
         .unwrap_or(false);
-    cfg.first_run_completed = soul.and_then(soul_description).is_some();
+    cfg.first_run_completed = match db
+        .and_then(|r| r.first_run_completed)
+        .or_else(|| disk.and_then(|r| r.first_run_completed))
+    {
+        Some(v) => v,
+        None => match db
+            .and_then(|r| r.first_run)
+            .or_else(|| disk.and_then(|r| r.first_run))
+        {
+            Some(first_run) => !first_run,
+            None => soul.and_then(soul_description).is_some(),
+        },
+    };
+
+    if let Some(la) = db
+        .and_then(|r| r.look_around.as_ref())
+        .or_else(|| disk.and_then(|r| r.look_around.as_ref()))
+    {
+        if let Some(on) = la.on {
+            cfg.look_around.enabled = on;
+        }
+        if let Some(ref every) = la.every {
+            cfg.look_around.interval_secs = match every.trim().to_ascii_lowercase().as_str() {
+                "every-2h" => 7_200,
+                "every-4h" => 14_400,
+                "twice-daily" => 43_200,
+                "mornings" => 86_400,
+                _ => cfg.look_around.interval_secs,
+            };
+        }
+        if let Some(weekdays) = la.weekdays_only {
+            cfg.look_around.weekdays_only = weekdays;
+        }
+        if let Some(ref focus) = la.focus {
+            cfg.look_around.focus =
+                truncate_utf8_bytes(focus.trim(), BOT_LOOK_AROUND_FOCUS_MAX_BYTES);
+        }
+    }
+
+    if let Some(tu) = db
+        .and_then(|r| r.tidy_up.as_ref())
+        .or_else(|| disk.and_then(|r| r.tidy_up.as_ref()))
+    {
+        if let Some(on) = tu.on {
+            cfg.memory_tidy.enabled = on;
+        }
+        if let Some(ref every) = tu.every {
+            cfg.memory_tidy.interval_secs = match every.trim().to_ascii_lowercase().as_str() {
+                "week" => 7 * 86_400,
+                _ => 86_400,
+            };
+        }
+    }
+
+    if let Some(mirror) = db
+        .and_then(|r| r.slack_mirror)
+        .or_else(|| disk.and_then(|r| r.slack_mirror))
+    {
+        cfg.connectors.slack.mirror_desktop = mirror;
+    }
+    let slack_entries: Vec<&OrcaSlackApp> = [disk, db]
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r.slack.iter().chain(r.slack_apps.iter()))
+        .collect();
+    if !slack_entries.is_empty() {
+        cfg.connectors.slack.enabled = true;
+        for entry in slack_entries {
+            if let Some(ref uid) = entry.owner_user_id {
+                let uid = uid.trim();
+                if !uid.is_empty()
+                    && !cfg
+                        .connectors
+                        .slack
+                        .allowed_user_ids
+                        .iter()
+                        .any(|u| u == uid)
+                {
+                    cfg.connectors.slack.allowed_user_ids.push(uid.to_owned());
+                }
+            }
+        }
+    }
+    let has_linear = [disk, db]
+        .into_iter()
+        .flatten()
+        .any(|r| r.linear.is_some() || !r.linear_workspaces.is_empty());
+    if has_linear {
+        cfg.connectors.linear.enabled = true;
+    }
+    let has_github = [disk, db].into_iter().flatten().any(|r| r.github.is_some());
+    if has_github {
+        cfg.connectors.github.enabled = true;
+    }
+    if db
+        .and_then(|r| r.google)
+        .or_else(|| disk.and_then(|r| r.google))
+        == Some(true)
+    {
+        cfg.connectors.google.enabled = true;
+        cfg.connectors.google.services.gmail = true;
+        cfg.connectors.google.services.calendar = true;
+    }
 
     if let Some(perm) = db
         .and_then(|r| r.permission_mode.as_deref())
@@ -5091,46 +5516,836 @@ fn build_krill_bot_config(
         });
     }
 
-    let raw_skills = disk
-        .filter(|r| !r.skills.is_empty())
-        .or(db)
-        .map_or(&[][..], |r| r.skills.as_slice());
-    cfg.skills = raw_skills
-        .iter()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut skills = Vec::new();
+    for rec in [disk, db].into_iter().flatten() {
+        for s in &rec.skill_projects {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !skills.iter().any(|e| e == trimmed) {
+                skills.push(trimmed.to_owned());
+            }
+        }
+    }
+    cfg.skills = skills;
 
     cfg.validate().map_err(|e| e.to_string())?;
     Ok(cfg)
 }
 
-/// Discovers bots installed by Orca, `OpenClaw` (`.openclaw`/`.clawdbot`/`.moltbot`),
-/// Hermes (`~/.hermes`), and `OpenBot` on this machine.
-/// Reads folder names, `IDENTITY.md` name lines, and `SOUL.md` previews only;
-/// never opens config files with API keys, tokens, or databases.
-#[must_use]
-pub fn discover_external_bots(
-    home: &Path,
-    filter: Option<ExternalBotSourceApp>,
-) -> Vec<ExternalBotCandidate> {
-    let app_data = default_openbot_data_dir(home);
-    let env_openclaw = std::env::var_os("OPENCLAW_STATE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let env_hermes = std::env::var_os("HERMES_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    discover_external_bots_in(
-        home,
-        Some(&app_data),
-        env_openclaw.as_deref(),
-        env_hermes.as_deref(),
-        filter,
-    )
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.len().saturating_add(ch.len_utf8()) > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
-/// Deterministic, environment-independent external bot discovery helper (also used in tests).
+fn migrate_bot_scoped_automations(
+    domains: &BTreeMap<String, Json>,
+    existing_bots: &mut [BotConfig],
+    bot_id_map: &BTreeMap<String, BotId>,
+    bots_root: &Path,
+    dry_run: bool,
+    warnings: &mut Vec<String>,
+) -> io::Result<usize> {
+    let settings = domains.get("settings").cloned().unwrap_or(Json::Null);
+    let raw_automations = domains
+        .get("automations")
+        .or_else(|| settings.get("automations"));
+    let Some(rows) = raw_automations.and_then(Json::as_array) else {
+        return Ok(0);
+    };
+    let mut added = 0usize;
+    let mut modified_bot_slugs = BTreeSet::new();
+
+    for row in rows {
+        let Ok(auto) = serde_json::from_value::<OrcaAutomation>(row.clone()) else {
+            continue;
+        };
+        if auto.once.as_ref().is_some_and(|v| !v.is_null()) {
+            continue;
+        }
+        let Some(ref bot_ref) = auto.bot else {
+            continue;
+        };
+        let prompt = auto.prompt.trim().to_owned();
+        if prompt.is_empty() {
+            continue;
+        }
+        let target_id = bot_ref
+            .bot_id
+            .as_deref()
+            .or(bot_ref.id.as_deref())
+            .or(bot_ref.folder.as_deref())
+            .and_then(|raw| bot_id_map.get(raw.trim()).cloned());
+        let Some(target_bot_id) = target_id else {
+            continue;
+        };
+        let id_seed = if auto.id.trim().is_empty() {
+            auto.name.trim()
+        } else {
+            auto.id.trim()
+        };
+        let mut sched_id = format!("orca-{}", slugify(id_seed));
+        if sched_id.len() > 64 {
+            sched_id.truncate(64);
+        }
+        let cron = auto
+            .rrule
+            .as_deref()
+            .and_then(|expr| schedule::parse_schedule_to_cron(expr).ok())
+            .unwrap_or_else(|| {
+                rrule_to_utc_cron(
+                    auto.rrule.as_deref(),
+                    auto.dtstart.as_ref().and_then(Json::as_str),
+                )
+            });
+        if let Err(err) = Cron::parse(&cron) {
+            warnings.push(format!(
+                "skipping bot automation '{}': invalid cron '{cron}': {err}",
+                auto.name
+            ));
+            continue;
+        }
+        let Some(bot) = existing_bots.iter_mut().find(|b| b.id == target_bot_id) else {
+            continue;
+        };
+        if bot.schedules.iter().any(|s| s.id == sched_id) {
+            continue;
+        }
+        bot.schedules.push(BotScheduleConfig {
+            id: sched_id,
+            name: if auto.name.trim().is_empty() {
+                "Imported schedule".to_owned()
+            } else {
+                auto.name.trim().to_owned()
+            },
+            cron,
+            prompt,
+            enabled: auto.enabled.unwrap_or(true),
+            timezone: auto
+                .timezone
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        });
+        modified_bot_slugs.insert(bot.slug.as_str().to_owned());
+        added = added.saturating_add(1);
+    }
+
+    if !dry_run && !modified_bot_slugs.is_empty() {
+        for b in existing_bots.iter() {
+            if modified_bot_slugs.contains(b.slug.as_str()) {
+                let bot_home = bots_root.join(b.slug.as_str());
+                if bot_home.is_dir() {
+                    let mut rendered = serde_json::to_string_pretty(b).map_err(invalid_data)?;
+                    rendered.push('\n');
+                    krill_proto::os::write_atomic_0600(
+                        &bot_home.join("bot.json"),
+                        rendered.as_bytes(),
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(added)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
+struct OrcaLookAroundFile {
+    bots: BTreeMap<String, OrcaLookAroundBotState>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
+struct OrcaLookAroundBotState {
+    suggestions: Vec<OrcaLookAroundSuggestion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
+struct OrcaLookAroundSuggestion {
+    id: String,
+    title: String,
+    why: String,
+    ask: String,
+    link: Option<String>,
+    source: Option<String>,
+    created_at: u64,
+    status: String,
+}
+
+fn import_orca_look_around_suggestions(
+    opts: &ImportOptions,
+    bots_root: &Path,
+    bot_id_map: &BTreeMap<String, BotId>,
+    existing_bots: &[BotConfig],
+    warnings: &mut Vec<String>,
+) -> io::Result<usize> {
+    let src_path = opts.orca_dir.join("bot-look-around.json");
+    let Some(raw) = read_bounded_utf8(&src_path) else {
+        return Ok(0);
+    };
+    let parsed: OrcaLookAroundFile = match serde_json::from_str(&raw) {
+        Ok(p) => p,
+        Err(err) => {
+            warnings.push(format!("ignoring malformed {}: {err}", src_path.display()));
+            return Ok(0);
+        }
+    };
+    let dst_path = bots_root.join(SUGGESTIONS_FILE);
+    let original = read_original(&dst_path)?;
+    let mut existing: Vec<BotSuggestion> = match &original {
+        Some(text) => serde_json::from_str(text).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let mut seen: BTreeSet<(String, String)> = existing
+        .iter()
+        .map(|s| (s.bot_id.as_str().to_owned(), s.id.clone()))
+        .collect();
+    let mut added = 0usize;
+
+    for (raw_bot_id, state) in parsed.bots {
+        let Some(bot_id) = bot_id_map.get(raw_bot_id.trim()).cloned().or_else(|| {
+            BotId::new(raw_bot_id.trim())
+                .ok()
+                .filter(|id| existing_bots.iter().any(|b| &b.id == id))
+        }) else {
+            continue;
+        };
+        for s in state.suggestions {
+            let sid = s.id.trim();
+            if sid.is_empty() || s.status == "replaced" {
+                continue;
+            }
+            if !seen.insert((bot_id.as_str().to_owned(), sid.to_owned())) {
+                continue;
+            }
+            let source = match s.source.as_deref() {
+                Some("slack") => Some(ExternalSource::Slack),
+                Some("linear") => Some(ExternalSource::Linear),
+                Some("github") => Some(ExternalSource::GitHub),
+                Some("google") => Some(ExternalSource::Google),
+                Some("telegram") => Some(ExternalSource::Telegram),
+                Some("discord") => Some(ExternalSource::Discord),
+                Some("composio") => Some(ExternalSource::Composio),
+                _ => None,
+            };
+            existing.push(BotSuggestion {
+                id: sid.to_owned(),
+                bot_id: bot_id.clone(),
+                title: s.title,
+                why: s.why,
+                ask: s.ask,
+                link: s.link,
+                source,
+                dismissed: s.status == "dismissed",
+                created_at_ms: s.created_at,
+            });
+            added = added.saturating_add(1);
+        }
+    }
+
+    if !opts.dry_run && added > 0 {
+        ensure_dir_0700(bots_root)?;
+        let mut rendered = serde_json::to_string_pretty(&existing).map_err(invalid_data)?;
+        rendered.push('\n');
+        write_atomic_0600(&dst_path, rendered.as_bytes(), original.as_deref())?;
+    }
+    Ok(added)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OrcaGroupMemberRef {
+    Id(String),
+    Obj {
+        #[serde(rename = "botId", alias = "id")]
+        bot_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OrcaBotGroupRecord {
+    id: String,
+    name: String,
+    description: Option<String>,
+    members: Vec<OrcaGroupMemberRef>,
+    #[serde(alias = "botIds")]
+    bot_ids: Vec<String>,
+    created_at: Option<u64>,
+    updated_at: Option<u64>,
+}
+
+fn import_orca_bot_groups(
+    opts: &ImportOptions,
+    bots_root: &Path,
+    bot_id_map: &BTreeMap<String, BotId>,
+    existing_bots: &[BotConfig],
+    warnings: &mut Vec<String>,
+) -> io::Result<usize> {
+    let mut db_candidates = vec![opts.orca_dir.join("orchestration.db")];
+    if let Some(pid) = active_orca_profile_id(&opts.orca_dir) {
+        db_candidates.push(
+            opts.orca_dir
+                .join("profiles")
+                .join(pid)
+                .join("orchestration.db"),
+        );
+    }
+
+    let dst_path = bots_root.join(GROUPS_FILE);
+    let original = read_original(&dst_path)?;
+    let mut groups: Vec<BotGroupChat> = match &original {
+        Some(raw) => serde_json::from_str(raw).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let mut seen_ids: BTreeSet<String> = groups.iter().map(|g| g.id.clone()).collect();
+    let mut added = 0usize;
+    let mut seen_dbs = BTreeSet::new();
+
+    for db_path in db_candidates {
+        if !db_path.is_file() {
+            continue;
+        }
+        let key = krill_proto::os::canonicalize(&db_path).unwrap_or_else(|_| db_path.clone());
+        if !seen_dbs.insert(key) {
+            continue;
+        }
+        let rows = match run_sqlite3_json_rows(
+            &db_path,
+            "SELECT id, record FROM bot_groups ORDER BY rowid;",
+        ) {
+            Ok(r) => r,
+            Err(err) => {
+                if !err.to_string().contains("no such table") {
+                    warnings.push(format!("failed to read {}: {err}", db_path.display()));
+                }
+                continue;
+            }
+        };
+        for row in rows {
+            let row_id = row.get("id").and_then(Json::as_str).unwrap_or("").trim();
+            let Some(record_str) = row.get("record").and_then(Json::as_str) else {
+                continue;
+            };
+            let Ok(rec) = serde_json::from_str::<OrcaBotGroupRecord>(record_str) else {
+                continue;
+            };
+            let gid = if rec.id.trim().is_empty() {
+                row_id
+            } else {
+                rec.id.trim()
+            };
+            if gid.is_empty() || !seen_ids.insert(gid.to_owned()) {
+                continue;
+            }
+            let mut bot_ids = Vec::new();
+            let raw_member_ids = rec
+                .members
+                .iter()
+                .filter_map(|m| match m {
+                    OrcaGroupMemberRef::Id(s) => Some(s.as_str()),
+                    OrcaGroupMemberRef::Obj { bot_id } => bot_id.as_deref(),
+                })
+                .chain(rec.bot_ids.iter().map(String::as_str));
+            for raw_id in raw_member_ids {
+                let resolved = bot_id_map.get(raw_id.trim()).cloned().or_else(|| {
+                    BotId::new(raw_id.trim())
+                        .ok()
+                        .filter(|id| existing_bots.iter().any(|b| &b.id == id))
+                });
+                if let Some(bid) = resolved
+                    && !bot_ids.contains(&bid)
+                {
+                    bot_ids.push(bid);
+                }
+            }
+            if bot_ids.is_empty() {
+                continue;
+            }
+            let created_at_ms = rec
+                .created_at
+                .unwrap_or_else(|| now_secs().saturating_mul(1000));
+            groups.push(BotGroupChat {
+                id: gid.to_owned(),
+                name: if rec.name.trim().is_empty() {
+                    gid.to_owned()
+                } else {
+                    rec.name.trim().to_owned()
+                },
+                bot_ids,
+                description: rec.description.unwrap_or_default(),
+                created_at_ms,
+                updated_at_ms: rec.updated_at.unwrap_or(created_at_ms),
+            });
+            added = added.saturating_add(1);
+        }
+    }
+
+    if !opts.dry_run && added > 0 {
+        ensure_dir_0700(bots_root)?;
+        let mut rendered = serde_json::to_string_pretty(&groups).map_err(invalid_data)?;
+        rendered.push('\n');
+        write_atomic_0600(&dst_path, rendered.as_bytes(), original.as_deref())?;
+    }
+    Ok(added)
+}
+
+fn active_orca_profile_id(orca_dir: &Path) -> Option<String> {
+    let raw = read_bounded_utf8(&orca_dir.join("orca-profile-index.json"))?;
+    let parsed: ProfileIndex = serde_json::from_str(&raw).ok()?;
+    parsed
+        .active_profile_id
+        .or_else(|| parsed.profiles.into_iter().next().map(|p| p.id))
+}
+
+fn import_orca_bot_items(
+    opts: &ImportOptions,
+    bots_root: &Path,
+    bot_id_map: &BTreeMap<String, BotId>,
+    existing_bots: &[BotConfig],
+    warnings: &mut Vec<String>,
+) -> io::Result<usize> {
+    let mut candidates = vec![opts.orca_dir.join("bot-items.sqlite")];
+    if let Some(pid) = active_orca_profile_id(&opts.orca_dir) {
+        candidates.push(
+            opts.orca_dir
+                .join("profiles")
+                .join(pid)
+                .join("bot-items.sqlite"),
+        );
+    }
+    let Some(src_db) = candidates.into_iter().find(|p| p.is_file()) else {
+        return Ok(0);
+    };
+
+    let item_rows = match run_sqlite3_json_rows(
+        &src_db,
+        "SELECT uid, number, owner_bot_id, title, description, done_means, status, close_note, snoozed_until, version, last_activity_at, created_at, updated_at, closed_at FROM items ORDER BY created_at ASC;",
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            warnings.push(format!("failed to read {}: {err}", src_db.display()));
+            return Ok(0);
+        }
+    };
+    if item_rows.is_empty() {
+        return Ok(0);
+    }
+
+    let link_rows = run_sqlite3_json_rows(
+        &src_db,
+        "SELECT item_uid, kind, ref FROM item_links ORDER BY rowid ASC;",
+    )
+    .unwrap_or_default();
+    let event_rows = run_sqlite3_json_rows(
+        &src_db,
+        "SELECT item_uid, kind, actor, data, created_at FROM item_events ORDER BY id ASC;",
+    )
+    .unwrap_or_default();
+
+    let dst_db = bots_root.join(BOT_ITEMS_DB_FILE);
+    let mut existing_uids = BTreeSet::new();
+    let mut used_numbers: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut max_number_by_bot: BTreeMap<String, u64> = BTreeMap::new();
+    if dst_db.is_file()
+        && let Ok(existing_rows) =
+            run_sqlite3_json_rows(&dst_db, "SELECT uid, owner_bot_id, number FROM items;")
+    {
+        for row in existing_rows {
+            if let Some(uid) = row.get("uid").and_then(Json::as_str) {
+                existing_uids.insert(uid.to_owned());
+            }
+            if let (Some(bot), Some(num)) = (
+                row.get("owner_bot_id").and_then(Json::as_str),
+                row.get("number").and_then(Json::as_u64),
+            ) {
+                used_numbers.entry(bot.to_owned()).or_default().insert(num);
+                let slot = max_number_by_bot.entry(bot.to_owned()).or_insert(0);
+                if num > *slot {
+                    *slot = num;
+                }
+            }
+        }
+    }
+
+    let mut pending_items = Vec::new();
+    let mut pending_uids = BTreeSet::new();
+    let mut resolved_owner_by_uid = BTreeMap::new();
+
+    for row in item_rows {
+        let Some(uid) = row
+            .get("uid")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if !existing_uids.insert(uid.to_owned()) {
+            continue;
+        }
+        let Some(raw_owner) = row.get("owner_bot_id").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(owner_bot_id) = bot_id_map.get(raw_owner.trim()).cloned().or_else(|| {
+            BotId::new(raw_owner.trim())
+                .ok()
+                .filter(|id| existing_bots.iter().any(|b| &b.id == id))
+        }) else {
+            continue;
+        };
+        let owner_str = owner_bot_id.as_str().to_owned();
+        let raw_num = row.get("number").and_then(Json::as_u64).unwrap_or(1);
+        let nums = used_numbers.entry(owner_str.clone()).or_default();
+        let max_slot = max_number_by_bot.entry(owner_str.clone()).or_insert(0);
+        let final_num = if nums.insert(raw_num) {
+            if raw_num > *max_slot {
+                *max_slot = raw_num;
+            }
+            raw_num
+        } else {
+            *max_slot = max_slot.saturating_add(1);
+            nums.insert(*max_slot);
+            *max_slot
+        };
+        let title = row
+            .get("title")
+            .and_then(Json::as_str)
+            .unwrap_or("Untitled")
+            .to_owned();
+        let status = match row
+            .get("status")
+            .and_then(Json::as_str)
+            .unwrap_or("planned")
+        {
+            "working" => BotItemStatus::Working.as_str(),
+            "needs_you" => BotItemStatus::NeedsYou.as_str(),
+            "done" => BotItemStatus::Done.as_str(),
+            "canceled" => BotItemStatus::Canceled.as_str(),
+            _ => BotItemStatus::Planned.as_str(),
+        };
+        pending_uids.insert(uid.to_owned());
+        resolved_owner_by_uid.insert(uid.to_owned(), owner_bot_id);
+        pending_items.push((uid.to_owned(), final_num, owner_str, title, status, row));
+    }
+
+    if pending_items.is_empty() {
+        return Ok(0);
+    }
+
+    if !opts.dry_run {
+        ensure_dir_0700(bots_root)?;
+        let mut sql = String::from(
+            "PRAGMA journal_mode = WAL;\n\
+             PRAGMA busy_timeout = 5000;\n\
+             PRAGMA foreign_keys = ON;\n\
+             CREATE TABLE IF NOT EXISTS items (\n\
+                 uid TEXT PRIMARY KEY,\n\
+                 number INTEGER NOT NULL,\n\
+                 owner_bot_id TEXT NOT NULL,\n\
+                 title TEXT NOT NULL,\n\
+                 description TEXT,\n\
+                 done_means TEXT,\n\
+                 status TEXT NOT NULL,\n\
+                 close_note TEXT,\n\
+                 snoozed_until_ms INTEGER,\n\
+                 version INTEGER NOT NULL,\n\
+                 last_activity_at_ms INTEGER NOT NULL,\n\
+                 created_at_ms INTEGER NOT NULL,\n\
+                 updated_at_ms INTEGER NOT NULL,\n\
+                 closed_at_ms INTEGER,\n\
+                 UNIQUE(owner_bot_id, number)\n\
+             );\n\
+             CREATE INDEX IF NOT EXISTS idx_items_bot_status ON items(owner_bot_id, status);\n\
+             CREATE TABLE IF NOT EXISTS item_links (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 item_uid TEXT NOT NULL REFERENCES items(uid) ON DELETE CASCADE,\n\
+                 kind TEXT NOT NULL,\n\
+                 target TEXT NOT NULL,\n\
+                 UNIQUE(item_uid, kind, target)\n\
+             );\n\
+             CREATE INDEX IF NOT EXISTS idx_item_links_uid ON item_links(item_uid);\n\
+             CREATE TABLE IF NOT EXISTS item_events (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 item_uid TEXT NOT NULL REFERENCES items(uid) ON DELETE CASCADE,\n\
+                 kind TEXT NOT NULL,\n\
+                 actor_json TEXT NOT NULL,\n\
+                 text TEXT NOT NULL,\n\
+                 decisions_json TEXT NOT NULL,\n\
+                 created_at_ms INTEGER NOT NULL\n\
+             );\n\
+             CREATE INDEX IF NOT EXISTS idx_item_events_uid ON item_events(item_uid);\n\
+             BEGIN IMMEDIATE;\n",
+        );
+
+        for (uid, num, owner, title, status, row) in &pending_items {
+            let desc = row.get("description").and_then(Json::as_str);
+            let done_means = row.get("done_means").and_then(Json::as_str);
+            let close_note = row.get("close_note").and_then(Json::as_str);
+            let snoozed = row.get("snoozed_until").and_then(Json::as_u64);
+            let version = row.get("version").and_then(Json::as_u64).unwrap_or(1);
+            let created = row.get("created_at").and_then(Json::as_u64).unwrap_or(0);
+            let updated = row
+                .get("updated_at")
+                .and_then(Json::as_u64)
+                .unwrap_or(created);
+            let last_act = row
+                .get("last_activity_at")
+                .and_then(Json::as_u64)
+                .unwrap_or(updated);
+            let closed = row.get("closed_at").and_then(Json::as_u64);
+            writeln!(
+                sql,
+                "INSERT OR IGNORE INTO items (uid, number, owner_bot_id, title, description, done_means, status, close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, updated_at_ms, closed_at_ms) VALUES ({}, {num}, {}, {}, {}, {}, {}, {}, {}, {version}, {last_act}, {created}, {updated}, {});",
+                sql_hex_text(uid),
+                sql_hex_text(owner),
+                sql_hex_text(title),
+                sql_opt_hex_text(desc),
+                sql_opt_hex_text(done_means),
+                sql_hex_text(status),
+                sql_opt_hex_text(close_note),
+                sql_opt_u64(snoozed),
+                sql_opt_u64(closed),
+            )
+            .ok();
+        }
+
+        for link in &link_rows {
+            let Some(uid) = link.get("item_uid").and_then(Json::as_str) else {
+                continue;
+            };
+            if !pending_uids.contains(uid) {
+                continue;
+            }
+            let Some(kind_raw) = link.get("kind").and_then(Json::as_str) else {
+                continue;
+            };
+            let Some(target) = link.get("ref").and_then(Json::as_str) else {
+                continue;
+            };
+            let kind = match kind_raw {
+                "dispatch" | "pr" | "url" | "file" => kind_raw,
+                _ => continue,
+            };
+            writeln!(
+                sql,
+                "INSERT OR IGNORE INTO item_links (item_uid, kind, target) VALUES ({}, {}, {});",
+                sql_hex_text(uid),
+                sql_hex_text(kind),
+                sql_hex_text(target),
+            )
+            .ok();
+        }
+
+        for ev in &event_rows {
+            let Some(uid) = ev.get("item_uid").and_then(Json::as_str) else {
+                continue;
+            };
+            if !pending_uids.contains(uid) {
+                continue;
+            }
+            let Some(owner_bot) = resolved_owner_by_uid.get(uid) else {
+                continue;
+            };
+            let kind = match ev.get("kind").and_then(Json::as_str).unwrap_or("commented") {
+                "made" => "made",
+                "edited" => "edited",
+                "status" => "status",
+                "linked" => "linked",
+                "snoozed" => "snoozed",
+                "unsnoozed" => "unsnoozed",
+                _ => "commented",
+            };
+            let actor = translate_orca_item_actor(
+                ev.get("actor").and_then(Json::as_str).unwrap_or("{}"),
+                bot_id_map,
+                owner_bot,
+            );
+            let actor_json = serde_json::to_string(&actor).map_err(invalid_data)?;
+            let (text, decisions) = translate_orca_item_event_data(
+                kind,
+                ev.get("data").and_then(Json::as_str).unwrap_or("{}"),
+            );
+            let decisions_json = serde_json::to_string(&decisions).map_err(invalid_data)?;
+            let created = ev.get("created_at").and_then(Json::as_u64).unwrap_or(0);
+            writeln!(
+                sql,
+                "INSERT INTO item_events (item_uid, kind, actor_json, text, decisions_json, created_at_ms) VALUES ({}, {}, {}, {}, {}, {created});",
+                sql_hex_text(uid),
+                sql_hex_text(kind),
+                sql_hex_text(&actor_json),
+                sql_hex_text(&text),
+                sql_hex_text(&decisions_json),
+            )
+            .ok();
+        }
+
+        sql.push_str("COMMIT;\n");
+        let mut child = Command::new(sqlite3_binary())
+            .arg(&dst_db)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(sql.as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::other(format!(
+                "sqlite3 write bot-items.db failed ({}): {}",
+                out.status,
+                stderr.trim()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&dst_db, fs::Permissions::from_mode(0o600)).ok();
+        }
+    }
+
+    Ok(pending_items.len())
+}
+
+fn translate_orca_item_actor(
+    raw_actor_json: &str,
+    bot_id_map: &BTreeMap<String, BotId>,
+    fallback_bot: &BotId,
+) -> BotItemActor {
+    let Ok(val) = serde_json::from_str::<Json>(raw_actor_json) else {
+        return BotItemActor::System {
+            reason: "orca".to_owned(),
+        };
+    };
+    match val.get("kind").and_then(Json::as_str) {
+        Some("owner") => BotItemActor::Owner {
+            device: val.get("device").and_then(Json::as_str).map(str::to_owned),
+        },
+        Some("bot") => {
+            let mapped = val
+                .get("botId")
+                .or_else(|| val.get("bot_id"))
+                .and_then(Json::as_str)
+                .and_then(|s| {
+                    bot_id_map
+                        .get(s.trim())
+                        .cloned()
+                        .or_else(|| BotId::new(s.trim()).ok())
+                })
+                .unwrap_or_else(|| fallback_bot.clone());
+            BotItemActor::Bot {
+                bot_id: mapped,
+                session_id: None,
+            }
+        }
+        other => BotItemActor::System {
+            reason: other.unwrap_or("orca").to_owned(),
+        },
+    }
+}
+
+fn translate_orca_item_event_data(
+    kind: &str,
+    raw_data_json: &str,
+) -> (String, Vec<BotItemDecision>) {
+    let Ok(val) = serde_json::from_str::<Json>(raw_data_json) else {
+        return (String::new(), Vec::new());
+    };
+    let text = if let Some(t) = val.get("text").and_then(Json::as_str) {
+        t.to_owned()
+    } else if kind == "status"
+        && let (Some(from), Some(to)) = (
+            val.get("from").and_then(Json::as_str),
+            val.get("to").and_then(Json::as_str),
+        )
+    {
+        format!("{from} -> {to}")
+    } else if kind == "made"
+        && let Some(title) = val.get("title").and_then(Json::as_str)
+    {
+        title.to_owned()
+    } else {
+        String::new()
+    };
+
+    let raw_decisions = val
+        .get("ask")
+        .and_then(|a| a.get("questions"))
+        .or_else(|| val.get("decisions"))
+        .and_then(Json::as_array);
+    let mut decisions = Vec::new();
+    if let Some(arr) = raw_decisions {
+        for q in arr {
+            let Some(question) = q
+                .get("question")
+                .and_then(Json::as_str)
+                .filter(|s| !s.trim().is_empty())
+            else {
+                continue;
+            };
+            let options = q
+                .get("options")
+                .and_then(Json::as_array)
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| {
+                            o.as_str()
+                                .or_else(|| o.get("label").and_then(Json::as_str))
+                                .or_else(|| o.get("text").and_then(Json::as_str))
+                                .map(str::to_owned)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let recommended = q
+                .get("recommended")
+                .and_then(Json::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&idx| idx < options.len());
+            decisions.push(BotItemDecision {
+                question: question.to_owned(),
+                options,
+                recommended,
+            });
+        }
+    }
+    (text, decisions)
+}
+
+fn sql_hex_text(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len().saturating_mul(2).saturating_add(18));
+    out.push_str("CAST(X'");
+    for b in s.as_bytes() {
+        write!(out, "{b:02X}").ok();
+    }
+    out.push_str("' AS TEXT)");
+    out
+}
+
+fn sql_opt_hex_text(s: Option<&str>) -> String {
+    s.map_or_else(|| "NULL".to_owned(), sql_hex_text)
+}
+
+fn sql_opt_u64(v: Option<u64>) -> String {
+    v.map_or_else(|| "NULL".to_owned(), |n| n.to_string())
+}
+
+/// Deterministic, environment-independent external bot discovery helper (also used in tests),
+/// delegating directly to `krill_proto::bots::external::discover_external_bots_filtered`.
+#[cfg(test)]
 #[must_use]
 pub fn discover_external_bots_in(
     home: &Path,
@@ -5139,317 +6354,15 @@ pub fn discover_external_bots_in(
     hermes_home: Option<&Path>,
     filter: Option<ExternalBotSourceApp>,
 ) -> Vec<ExternalBotCandidate> {
-    let mut out = Vec::new();
-    let want = |app: ExternalBotSourceApp| filter.is_none_or(|f| f == app);
-    if want(ExternalBotSourceApp::Orca) {
-        out.extend(discover_orca_bots_in(home));
-    }
-    if want(ExternalBotSourceApp::OpenClaw) {
-        out.extend(discover_openclaw_bots_in(home, openclaw_state_dir));
-    }
-    if want(ExternalBotSourceApp::Hermes) {
-        out.extend(discover_hermes_bots_in(home, hermes_home));
-    }
-    if want(ExternalBotSourceApp::OpenBot) {
-        out.extend(discover_openbot_bots_in(home, openbot_app_data));
-    }
-    out
-}
-
-fn discover_orca_bots_in(home: &Path) -> Vec<ExternalBotCandidate> {
-    let root = home.join(".orca").join(BOTS_DIR);
-    let mut out = Vec::new();
-    for folder_name in non_hidden_child_dirs(&root)
-        .into_iter()
-        .take(MAX_BOTS_PER_APP)
-    {
-        let dir = root.join(&folder_name);
-        let manifest = read_bounded_utf8(&dir.join("bot.json"))
-            .and_then(|raw| serde_json::from_str::<OrcaBotRecord>(&raw).ok());
-        let soul = read_bounded_utf8(&dir.join("SOUL.md"));
-        if manifest.is_none() && soul.is_none() && !dir.join("MEMORY.md").is_file() {
-            continue;
-        }
-        let name = manifest
-            .as_ref()
-            .map(|m| m.name.trim())
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| bot_name_from_id(&folder_name), str::to_owned);
-        let agent = manifest
-            .as_ref()
-            .and_then(|m| m.agent.as_deref())
-            .and_then(map_orca_agent_id)
-            .unwrap_or("claude")
-            .to_owned();
-        let soul_preview = soul.as_deref().and_then(soul_description);
-        out.push(ExternalBotCandidate {
-            app: ExternalBotSourceApp::Orca,
-            agent,
-            name,
-            path: tilde_display(&dir, home),
-            soul_preview,
-        });
-    }
-    out
-}
-
-fn discover_openclaw_bots_in(
-    home: &Path,
-    openclaw_state_dir: Option<&Path>,
-) -> Vec<ExternalBotCandidate> {
-    let mut roots: Vec<PathBuf> = Vec::with_capacity(4);
-    if let Some(override_dir) = openclaw_state_dir {
-        roots.push(override_dir.to_path_buf());
-    }
-    for name in [".openclaw", ".clawdbot", ".moltbot"] {
-        roots.push(home.join(name));
-    }
-    let Some(root) = roots.into_iter().find(|p| p.is_dir()) else {
-        return Vec::new();
-    };
-    let ids = non_hidden_child_dirs(&root.join("agents"));
-    let agents: Vec<String> = if !ids.is_empty() {
-        ids
-    } else if root.join("workspace").is_dir() {
-        vec!["main".to_owned()]
-    } else {
-        Vec::new()
-    };
-
-    let mut out = Vec::new();
-    for agent in agents.into_iter().take(MAX_BOTS_PER_APP) {
-        let mut places = Vec::with_capacity(3);
-        if agent == "main" {
-            places.push(root.join("workspace"));
-        }
-        places.push(root.join(format!("workspace-{agent}")));
-        places.push(root.join("workspace").join(&agent));
-
-        let workspace = places.into_iter().find(|p| p.is_dir());
-        let folder = workspace
-            .clone()
-            .unwrap_or_else(|| root.join("agents").join(&agent));
-        let name = workspace
-            .as_deref()
-            .and_then(read_openclaw_identity_name)
-            .unwrap_or_else(|| bot_name_from_id(&agent));
-        let soul_preview = read_bounded_utf8(&folder.join("SOUL.md"))
-            .as_deref()
-            .and_then(soul_description);
-        out.push(ExternalBotCandidate {
-            app: ExternalBotSourceApp::OpenClaw,
-            agent,
-            name,
-            path: tilde_display(&folder, home),
-            soul_preview,
-        });
-    }
-    out
-}
-
-/// Parses `OpenClaw`'s `IDENTITY.md` name line (`- **Name:** Molty`).
-fn read_openclaw_identity_name(workspace: &Path) -> Option<String> {
-    let text = read_bounded_utf8(&workspace.join("IDENTITY.md"))?;
-    for line in text.lines() {
-        let stripped = line.trim_start_matches([' ', '\t', '*', '-']);
-        let cleaned_key = stripped.trim_start_matches('*');
-        let Some((key, val)) = cleaned_key.split_once(':') else {
-            continue;
-        };
-        let key_norm = key.trim().trim_end_matches('*').trim();
-        if !key_norm.eq_ignore_ascii_case("name") {
-            continue;
-        }
-        let name = val.trim().trim_matches('*').trim();
-        if !name.is_empty() && name.len() <= 120 && !name.starts_with('(') {
-            return Some(name.to_owned());
-        }
-    }
-    None
-}
-
-fn discover_hermes_bots_in(home: &Path, hermes_home: Option<&Path>) -> Vec<ExternalBotCandidate> {
-    let root = match hermes_home {
-        Some(p) => strip_hermes_profile_suffix(p),
-        None => home.join(".hermes"),
-    };
-    if !root.is_dir() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    if is_hermes_profile_dir(&root) {
-        let soul_preview = read_bounded_utf8(&root.join("SOUL.md"))
-            .as_deref()
-            .and_then(soul_description);
-        out.push(ExternalBotCandidate {
-            app: ExternalBotSourceApp::Hermes,
-            agent: "default".to_owned(),
-            name: "Hermes".to_owned(),
-            path: tilde_display(&root, home),
-            soul_preview,
-        });
-    }
-    for profile in non_hidden_child_dirs(&root.join("profiles")) {
-        if out.len() >= MAX_BOTS_PER_APP {
-            break;
-        }
-        let folder = root.join("profiles").join(&profile);
-        if is_hermes_profile_dir(&folder) {
-            let soul_preview = read_bounded_utf8(&folder.join("SOUL.md"))
-                .as_deref()
-                .and_then(soul_description);
-            out.push(ExternalBotCandidate {
-                app: ExternalBotSourceApp::Hermes,
-                agent: profile.clone(),
-                name: bot_name_from_id(&profile),
-                path: tilde_display(&folder, home),
-                soul_preview,
-            });
-        }
-    }
-    out
-}
-
-fn strip_hermes_profile_suffix(path: &Path) -> PathBuf {
-    if let Some(parent) = path.parent()
-        && parent.file_name().and_then(|n| n.to_str()) == Some("profiles")
-        && let Some(grandparent) = parent.parent()
-    {
-        return grandparent.to_path_buf();
-    }
-    path.to_path_buf()
-}
-
-fn is_hermes_profile_dir(dir: &Path) -> bool {
-    dir.join("SOUL.md").is_file() || dir.join("config.yaml").is_file()
-}
-
-fn default_openbot_data_dir(home: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library")
-            .join("Application Support")
-            .join("OpenBot")
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("APPDATA")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| home.join("AppData").join("Roaming"), PathBuf::from)
-            .join("OpenBot")
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| home.join(".config"), PathBuf::from)
-            .join("OpenBot")
-    }
-}
-
-fn discover_openbot_bots_in(
-    home: &Path,
-    openbot_app_data: Option<&Path>,
-) -> Vec<ExternalBotCandidate> {
-    let agents_root = home.join("OpenBot").join("Agents");
-    let has_data = openbot_app_data.is_some_and(Path::is_dir);
-    if !has_data && !agents_root.is_dir() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for agent in non_hidden_child_dirs(&agents_root)
-        .into_iter()
-        .take(MAX_BOTS_PER_APP)
-    {
-        let stripped = agent
-            .strip_prefix("agent-")
-            .or_else(|| agent.strip_prefix("bot-"))
-            .unwrap_or(&agent);
-        let name = if looks_like_uuid_prefix(stripped) {
-            "OpenBot agent".to_owned()
-        } else {
-            bot_name_from_id(stripped)
-        };
-        let folder = agents_root.join(&agent);
-        let soul_preview = read_bounded_utf8(&folder.join("SOUL.md"))
-            .as_deref()
-            .and_then(soul_description);
-        out.push(ExternalBotCandidate {
-            app: ExternalBotSourceApp::OpenBot,
-            agent,
-            name,
-            path: tilde_display(&folder, home),
-            soul_preview,
-        });
-    }
-    out
-}
-
-fn non_hidden_child_dirs(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            if name.starts_with('.') {
-                return None;
-            }
-            let meta = fs::symlink_metadata(e.path()).ok()?;
-            (!meta.file_type().is_symlink() && meta.is_dir()).then_some(name)
-        })
-        .collect();
-    names.sort();
-    names
-}
-
-fn bot_name_from_id(id: &str) -> String {
-    let words: String = id
-        .chars()
-        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut chars = words.chars();
-    let Some(first) = chars.next() else {
-        return id.to_owned();
-    };
-    let mut out = String::new();
-    for upper in first.to_uppercase() {
-        out.push(upper);
-    }
-    out.push_str(chars.as_str());
-    out
-}
-
-fn looks_like_uuid_prefix(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() >= 14
-        && bytes
-            .get(0..8)
-            .is_some_and(|p| p.iter().all(u8::is_ascii_hexdigit))
-        && bytes.get(8) == Some(&b'-')
-        && bytes
-            .get(9..13)
-            .is_some_and(|p| p.iter().all(u8::is_ascii_hexdigit))
-        && bytes.get(13) == Some(&b'-')
-}
-
-fn tilde_display(path: &Path, home: &Path) -> String {
-    if path == home {
-        return "~".to_owned();
-    }
-    if let Ok(rel) = path.strip_prefix(home) {
-        let joined = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        return format!("~/{joined}");
-    }
-    path.display().to_string()
+    let appdata_dir = openbot_app_data
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().into_owned());
+    discover_external_bots_filtered(home, filter, None, |key| match key {
+        "OPENCLAW_STATE_DIR" => openclaw_state_dir.map(|p| p.to_string_lossy().into_owned()),
+        "HERMES_HOME" => hermes_home.map(|p| p.to_string_lossy().into_owned()),
+        "APPDATA" => appdata_dir.clone(),
+        _ => None,
+    })
 }
 
 // ============================================================================
@@ -5477,15 +6390,24 @@ pub fn slugify(s: &str) -> String {
     }
 }
 
-fn expand_tilde(home: &Path, raw: &str) -> PathBuf {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        home.join(rest)
-    } else if trimmed == "~" {
-        home.to_path_buf()
-    } else {
-        PathBuf::from(trimmed)
+fn bot_name_from_id(id: &str) -> String {
+    let words: String = id
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = words.chars();
+    let Some(first) = chars.next() else {
+        return id.to_owned();
+    };
+    let mut out = String::new();
+    for upper in first.to_uppercase() {
+        out.push(upper);
     }
+    out.push_str(chars.as_str());
+    out
 }
 
 fn basename_str(path: &str) -> String {
@@ -7491,14 +8413,26 @@ mod bots_import_tests {
         assert_eq!(openclaw.len(), 2);
         assert_eq!(openclaw[0].agent, "main");
         assert_eq!(openclaw[0].name, "Molty");
-        assert_eq!(openclaw[0].path, "~/.openclaw/workspace");
+        assert_eq!(
+            openclaw[0].path,
+            home.join(".openclaw")
+                .join("workspace")
+                .display()
+                .to_string()
+        );
         assert_eq!(
             openclaw[0].soul_preview.as_deref(),
             Some("Calm engineering helper.")
         );
         assert_eq!(openclaw[1].agent, "scout");
         assert_eq!(openclaw[1].name, "Scout");
-        assert_eq!(openclaw[1].path, "~/.openclaw/workspace-scout");
+        assert_eq!(
+            openclaw[1].path,
+            home.join(".openclaw")
+                .join("workspace-scout")
+                .display()
+                .to_string()
+        );
 
         let hermes: Vec<_> = found
             .iter()
@@ -7530,7 +8464,14 @@ mod bots_import_tests {
         );
         assert_eq!(legacy.len(), 1);
         assert_eq!(legacy[0].agent, "main");
-        assert_eq!(legacy[0].path, "~/.clawdbot/workspace");
+        assert_eq!(
+            legacy[0].path,
+            legacy_home
+                .join(".clawdbot")
+                .join("workspace")
+                .display()
+                .to_string()
+        );
 
         // Legacy `.moltbot` fallback
         let molt_home = root.join("molt-home");
@@ -7543,7 +8484,526 @@ mod bots_import_tests {
             Some(ExternalBotSourceApp::OpenClaw),
         );
         assert_eq!(molt.len(), 1);
-        assert_eq!(molt[0].path, "~/.moltbot/workspace");
+        assert_eq!(
+            molt[0].path,
+            molt_home
+                .join(".moltbot")
+                .join("workspace")
+                .display()
+                .to_string()
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn orca_bots_handles_v2_fields_slug_collision_nested_topics_and_ledger() {
+        let root = std::env::temp_dir().join(format!("krill-orca-bots-v2-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Two non-ASCII named bots in distinct folders whose derived slug both fall back to `bot`!
+        let b1 = home.join("Library/Application Support/Orca/bots/크릴봇");
+        let b2 = home.join(".orca/bots/도움봇");
+        fs::create_dir_all(b1.join("memory/nested/deep/too-deep")).unwrap();
+        fs::create_dir_all(&b2).unwrap();
+
+        fs::write(
+            b1.join("bot.json"),
+            serde_json::json!({
+                "id": "orca-korean-1",
+                "name": "크릴봇",
+                "agent": "openclaw",
+                "skillProjects": ["code-review", "release-notes"],
+                "lookAround": { "on": true, "every": "twice-daily", "weekdaysOnly": false, "focus": "PR backlog" },
+                "tidyUp": { "on": false, "every": "week" },
+                "slack": { "appId": "A1", "teamId": "T1", "ownerUserId": "U999" },
+                "slackMirror": true,
+                "linearWorkspaces": [{ "workspaceId": "W1", "workspaceName": "Ops" }],
+                "github": { "ownerUserId": "G1" },
+                "google": true,
+                "firstRun": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(b1.join("SOUL.md"), "# 크릴봇\n\nHelpful.\n").unwrap();
+        fs::write(b1.join("memory/top.md"), "top\n").unwrap();
+        fs::write(b1.join("memory/nested/mid.md"), "mid\n").unwrap();
+        fs::write(b1.join("memory/nested/deep/d2.md"), "d2\n").unwrap();
+        fs::write(b1.join("memory/nested/deep/too-deep/d3.md"), "d3\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(b1.join("SOUL.md"), b1.join("memory/evil-link.md")).ok();
+
+        fs::write(
+            b2.join("bot.json"),
+            serde_json::json!({
+                "id": "orca-korean-2",
+                "name": "도움봇",
+                "agent": "claude",
+                "firstRun": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(b2.join("SOUL.md"), "# 도움봇\n\nHelper.\n").unwrap();
+
+        let opts = ImportOptions {
+            home: home.clone(),
+            state_dir: state_dir.clone(),
+            orca_dir: orca_dir.clone(),
+            domains: vec![ImportDomain::Bots],
+            dry_run: false,
+        };
+        let report = run_import(&opts).unwrap();
+        assert_eq!(report.bots.bots_added, 2);
+        assert_eq!(report.bots.bots_skipped, 0);
+
+        let index: Vec<BotConfig> =
+            serde_json::from_str(&fs::read_to_string(state_dir.join("bots/bots.json")).unwrap())
+                .unwrap();
+        assert_eq!(index.len(), 2);
+        let first = index
+            .iter()
+            .find(|b| b.id.as_str() == "orca-korean-1")
+            .unwrap();
+        let second = index
+            .iter()
+            .find(|b| b.id.as_str() == "orca-korean-2")
+            .unwrap();
+        assert_ne!(first.slug, second.slug);
+        assert_eq!(first.agent_id, "openclaw");
+        assert!(!first.first_run_completed);
+        assert!(second.first_run_completed);
+        assert_eq!(first.skills, vec!["code-review", "release-notes"]);
+        assert_eq!(first.look_around.interval_secs, 43_200);
+        assert!(!first.look_around.weekdays_only);
+        assert_eq!(first.look_around.focus, "PR backlog");
+        assert!(!first.memory_tidy.enabled);
+        assert_eq!(first.memory_tidy.interval_secs, 7 * 86_400);
+        assert!(first.connectors.slack.enabled);
+        assert!(first.connectors.slack.mirror_desktop);
+        assert_eq!(first.connectors.slack.allowed_user_ids, vec!["U999"]);
+        assert!(first.connectors.linear.enabled);
+        assert!(first.connectors.github.enabled);
+        assert!(first.connectors.google.enabled);
+        assert!(first.connectors.google.services.gmail);
+        assert!(first.connectors.google.services.calendar);
+
+        let first_mem = state_dir
+            .join("bots")
+            .join(first.slug.as_str())
+            .join("memory");
+        assert!(first_mem.join("top.md").is_file());
+        assert!(first_mem.join("nested/mid.md").is_file());
+        assert!(first_mem.join("nested/deep/d2.md").is_file());
+        assert!(!first_mem.join("nested/deep/too-deep/d3.md").exists());
+        assert!(!first_mem.join("evil-link.md").exists());
+
+        // Ledger imported_sources.json contains canonical paths for both imported Orca bots
+        let ledger: BTreeMap<String, String> = serde_json::from_str(
+            &fs::read_to_string(state_dir.join("bots/imported_sources.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ledger.len(), 2);
+
+        // Windows ~\ tilde expansion via shared expand_tilde
+        assert_eq!(
+            expand_tilde(&home, r"~\bots\demo"),
+            home.join("bots").join("demo")
+        );
+
+        // External candidate details appear in human report
+        let mut fake_report = report;
+        fake_report
+            .bots
+            .external_candidates
+            .push(ExternalBotCandidate {
+                app: ExternalBotSourceApp::OpenClaw,
+                agent: "main".to_owned(),
+                name: "Molty".to_owned(),
+                path: "/tmp/molty".to_owned(),
+                soul_preview: None,
+            });
+        let human = format_report_human(&fake_report);
+        assert!(human.contains("[openclaw] Molty (main)"));
+        assert!(human.contains("/tmp/molty"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "requires sqlite3 CLI on PATH")]
+    fn orca_bots_migrates_wal_items_without_shm_groups_suggestions_and_schedules_idempotently() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-bots-full-mig-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let b1 = home.join(".orca/bots/triage");
+        fs::create_dir_all(&b1).unwrap();
+        fs::write(
+            b1.join("bot.json"),
+            serde_json::json!({
+                "id": "orca-triage-1",
+                "name": "Triage Bot",
+                "agent": "claude"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(b1.join("SOUL.md"), "# Triage\n\nRoutes bugs.\n").unwrap();
+
+        // Seed WAL-mode bot-items.sqlite, then force checkpoint and remove -wal/-shm files!
+        let items_sqlite = orca_dir.join("bot-items.sqlite");
+        let items_sql = r#"
+PRAGMA journal_mode = WAL;
+CREATE TABLE items (
+    uid TEXT PRIMARY KEY,
+    number INTEGER NOT NULL UNIQUE,
+    owner_bot_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    made_by TEXT,
+    title TEXT NOT NULL,
+    description TEXT,
+    done_means TEXT,
+    status TEXT NOT NULL,
+    question_event INTEGER,
+    close_note TEXT,
+    version INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    last_activity_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    closed_at INTEGER,
+    snoozed_until INTEGER
+);
+CREATE TABLE item_links (
+    item_uid TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    added_event INTEGER NOT NULL,
+    PRIMARY KEY (item_uid, kind, ref)
+);
+CREATE TABLE item_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_uid TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    data TEXT NOT NULL,
+    mail TEXT,
+    action INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+INSERT INTO items VALUES ('item-uid-1', 7, 'orca-triage-1', 'chat-1', 'bot', 'bot', '빌드 확인', 'Check CI', 'All green', 'needs_you', 1, NULL, 2, 1, 1700000001000, 1700000000000, 1700000001000, NULL, NULL);
+INSERT INTO item_links VALUES ('item-uid-1', 'pr', 'https://github.com/org/repo/pull/7', 1);
+INSERT INTO item_events (item_uid, kind, actor, data, mail, action, created_at) VALUES (
+    'item-uid-1',
+    'commented',
+    '{"kind":"bot","botId":"orca-triage-1","chatId":"chat-1"}',
+    '{"text":"Deploy now?","ask":{"questions":[{"question":"Deploy now?","options":["Yes","Wait"],"recommended":0}]}}',
+    NULL,
+    1,
+    1700000001000
+);
+PRAGMA wal_checkpoint(TRUNCATE);
+"#;
+        let status = Command::new(sqlite3_binary())
+            .arg(&items_sqlite)
+            .arg(items_sql)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::remove_file(orca_dir.join("bot-items.sqlite-wal")).ok();
+        fs::remove_file(orca_dir.join("bot-items.sqlite-shm")).ok();
+
+        // Seed orchestration.db bot_groups
+        let orch_db = orca_dir.join("orchestration.db");
+        let group_record = serde_json::json!({
+            "id": "bot-group-1",
+            "name": "Release Squad",
+            "description": "Ships builds",
+            "createdAt": 1_700_000_000_000_u64,
+            "members": [{ "botId": "orca-triage-1", "sessionId": "s1" }]
+        })
+        .to_string();
+        let orch_sql = format!(
+            "CREATE TABLE bot_groups (id TEXT PRIMARY KEY, record TEXT NOT NULL); INSERT INTO bot_groups VALUES ('bot-group-1', {});",
+            sql_hex_text(&group_record)
+        );
+        let status_orch = Command::new(sqlite3_binary())
+            .arg(&orch_db)
+            .arg(orch_sql)
+            .status()
+            .unwrap();
+        assert!(status_orch.success());
+
+        // Seed bot-look-around.json
+        fs::write(
+            orca_dir.join("bot-look-around.json"),
+            serde_json::json!({
+                "bots": {
+                    "orca-triage-1": {
+                        "suggestions": [
+                            { "id": "s-open", "title": "Check flake", "why": "2 retries", "ask": "Re-run?", "status": "open", "createdAt": 100 },
+                            { "id": "s-dismiss", "title": "Old", "why": "Resolved", "ask": "Skip", "status": "dismissed", "createdAt": 90 },
+                            { "id": "s-replaced", "title": "Superseded", "why": "N/A", "ask": "No", "status": "replaced", "createdAt": 80 }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Seed bot-scoped recurring automation + one-shot automation in orca-data.json
+        fs::write(
+            orca_dir.join("orca-data.json"),
+            serde_json::json!({
+                "automations": [
+                    {
+                        "id": "bot-sched-1",
+                        "name": "Morning Triage",
+                        "prompt": "Check open PRs",
+                        "rrule": "0 9 * * 1-5",
+                        "timezone": "Asia/Seoul",
+                        "enabled": true,
+                        "bot": { "botId": "orca-triage-1" }
+                    },
+                    {
+                        "id": "bot-once-skip",
+                        "name": "One Shot",
+                        "prompt": "Ignore me",
+                        "rrule": "0 9 * * *",
+                        "once": { "at": 1_700_000_000_000_u64 },
+                        "bot": { "botId": "orca-triage-1" }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let dry_opts = ImportOptions {
+            home,
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Bots],
+            dry_run: true,
+        };
+        let dry = run_import(&dry_opts).unwrap();
+        assert_eq!(dry.bots.bots_added, 1);
+        assert_eq!(dry.bots.items_migrated, 1);
+        assert_eq!(dry.bots.groups_migrated, 1);
+        assert_eq!(dry.bots.suggestions_migrated, 2);
+        assert_eq!(dry.bots.schedules_migrated, 1);
+        assert!(!state_dir.join("bots/bot-items.db").exists());
+
+        let applied = run_import(&ImportOptions {
+            dry_run: false,
+            ..dry_opts.clone()
+        })
+        .unwrap();
+        assert_eq!(applied.bots.items_migrated, 1);
+        assert_eq!(applied.bots.groups_migrated, 1);
+        assert_eq!(applied.bots.suggestions_migrated, 2);
+        assert_eq!(applied.bots.schedules_migrated, 1);
+
+        // Verify Krill schema inside bot-items.db
+        let krill_items_db = state_dir.join("bots/bot-items.db");
+        let item_rows = run_sqlite3_json_rows(
+            &krill_items_db,
+            "SELECT uid, number, owner_bot_id, title, last_activity_at_ms FROM items;",
+        )
+        .unwrap();
+        assert_eq!(item_rows.len(), 1);
+        assert_eq!(item_rows[0]["uid"], "item-uid-1");
+        assert_eq!(item_rows[0]["title"], "빌드 확인");
+
+        let link_rows = run_sqlite3_json_rows(
+            &krill_items_db,
+            "SELECT item_uid, kind, target FROM item_links;",
+        )
+        .unwrap();
+        assert_eq!(link_rows.len(), 1);
+        assert_eq!(link_rows[0]["target"], "https://github.com/org/repo/pull/7");
+
+        let ev_rows = run_sqlite3_json_rows(
+            &krill_items_db,
+            "SELECT actor_json, text, decisions_json FROM item_events;",
+        )
+        .unwrap();
+        assert_eq!(ev_rows.len(), 1);
+        let actor: BotItemActor =
+            serde_json::from_str(ev_rows[0]["actor_json"].as_str().unwrap()).unwrap();
+        assert!(
+            matches!(actor, BotItemActor::Bot { ref bot_id, .. } if bot_id.as_str() == "orca-triage-1")
+        );
+        let decisions: Vec<BotItemDecision> =
+            serde_json::from_str(ev_rows[0]["decisions_json"].as_str().unwrap()).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].question, "Deploy now?");
+        assert_eq!(decisions[0].recommended, Some(0));
+
+        // Verify groups.json, suggestions.json, and bot.schedules
+        let groups: Vec<BotGroupChat> =
+            serde_json::from_str(&fs::read_to_string(state_dir.join("bots/groups.json")).unwrap())
+                .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Release Squad");
+
+        let suggestions: Vec<BotSuggestion> = serde_json::from_str(
+            &fs::read_to_string(state_dir.join("bots/suggestions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(suggestions.len(), 2);
+        assert!(!suggestions[0].dismissed);
+        assert!(suggestions[1].dismissed);
+
+        let bots: Vec<BotConfig> =
+            serde_json::from_str(&fs::read_to_string(state_dir.join("bots/bots.json")).unwrap())
+                .unwrap();
+        assert_eq!(bots[0].schedules.len(), 1);
+        assert_eq!(bots[0].schedules[0].cron, "0 9 * * 1-5");
+
+        // Second apply must be 100% idempotent
+        let rerun = run_import(&ImportOptions {
+            dry_run: false,
+            ..dry_opts
+        })
+        .unwrap();
+        assert_eq!(rerun.bots.bots_added, 0);
+        assert_eq!(rerun.bots.items_migrated, 0);
+        assert_eq!(rerun.bots.groups_migrated, 0);
+        assert_eq!(rerun.bots.suggestions_migrated, 0);
+        assert_eq!(rerun.bots.schedules_migrated, 0);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn orca_bots_migrates_suggestions_and_schedules_without_sqlite_idempotently() {
+        let root =
+            std::env::temp_dir().join(format!("krill-orca-bots-json-mig-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let b1 = home.join(".orca").join("bots").join("triage");
+        fs::create_dir_all(&b1).unwrap();
+        fs::write(
+            b1.join("bot.json"),
+            serde_json::json!({
+                "id": "orca-triage-1",
+                "name": "Triage Bot",
+                "agent": "claude"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(b1.join("SOUL.md"), "# Triage\n\nRoutes bugs.\n").unwrap();
+
+        fs::write(
+            orca_dir.join("bot-look-around.json"),
+            serde_json::json!({
+                "bots": {
+                    "orca-triage-1": {
+                        "suggestions": [
+                            { "id": "s-open", "title": "Check flake", "why": "2 retries", "ask": "Re-run?", "status": "open", "createdAt": 100 },
+                            { "id": "s-dismiss", "title": "Old", "why": "Resolved", "ask": "Skip", "status": "dismissed", "createdAt": 90 },
+                            { "id": "s-replaced", "title": "Superseded", "why": "N/A", "ask": "No", "status": "replaced", "createdAt": 80 }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        fs::write(
+            orca_dir.join("orca-data.json"),
+            serde_json::json!({
+                "automations": [
+                    {
+                        "id": "bot-sched-1",
+                        "name": "Morning Triage",
+                        "prompt": "Check open PRs",
+                        "rrule": "0 9 * * 1-5",
+                        "timezone": "Asia/Seoul",
+                        "enabled": true,
+                        "bot": { "botId": "orca-triage-1" }
+                    },
+                    {
+                        "id": "bot-once-skip",
+                        "name": "One Shot",
+                        "prompt": "Ignore me",
+                        "rrule": "0 9 * * *",
+                        "once": { "at": 1_700_000_000_000_u64 },
+                        "bot": { "botId": "orca-triage-1" }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let dry_opts = ImportOptions {
+            home,
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Bots],
+            dry_run: true,
+        };
+        let dry = run_import(&dry_opts).unwrap();
+        assert_eq!(dry.bots.bots_added, 1);
+        assert_eq!(dry.bots.suggestions_migrated, 2);
+        assert_eq!(dry.bots.schedules_migrated, 1);
+        assert!(!state_dir.join("bots").exists());
+
+        let applied = run_import(&ImportOptions {
+            dry_run: false,
+            ..dry_opts.clone()
+        })
+        .unwrap();
+        assert_eq!(applied.bots.bots_added, 1);
+        assert_eq!(applied.bots.suggestions_migrated, 2);
+        assert_eq!(applied.bots.schedules_migrated, 1);
+
+        let suggestions: Vec<BotSuggestion> = serde_json::from_str(
+            &fs::read_to_string(state_dir.join("bots").join("suggestions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(suggestions.len(), 2);
+        assert!(!suggestions[0].dismissed);
+        assert!(suggestions[1].dismissed);
+
+        let bots: Vec<BotConfig> = serde_json::from_str(
+            &fs::read_to_string(state_dir.join("bots").join("bots.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bots[0].schedules.len(), 1);
+        assert_eq!(bots[0].schedules[0].cron, "0 9 * * 1-5");
+
+        let rerun = run_import(&ImportOptions {
+            dry_run: false,
+            ..dry_opts
+        })
+        .unwrap();
+        assert_eq!(rerun.bots.bots_added, 0);
+        assert_eq!(rerun.bots.suggestions_migrated, 0);
+        assert_eq!(rerun.bots.schedules_migrated, 0);
 
         fs::remove_dir_all(&root).ok();
     }

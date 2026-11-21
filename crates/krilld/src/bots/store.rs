@@ -11,7 +11,7 @@
 //! - `suggestions.json` (`0o600`): cached [`BotSuggestion`] records from Look Around.
 //! - `imported_sources.json` (`0o600`): idempotency ledger for external bot migrations.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -21,33 +21,56 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use krill_proto::SessionId;
 use krill_proto::bots::{
-    ActsFor, BOT_MEMORY_SEED, BotAccessRequest, BotAccessRequestStatus, BotConfig,
-    BotConnectorConfig, BotGroupChat, BotId, BotMcpToolConfig, BotMember, BotPackageExportOptions,
-    BotScheduleConfig, BotSlug, BotSuggestion, CreateBotParams, ExternalBotCandidate,
-    ExternalBotSourceApp, ExternalConversationLink, ExternalSource, MAX_RPC_ZIP_BYTES,
-    MemoryDeletionViolation, UpdateBotParams, append_memory_fact, assert_bot_owns_home,
-    bot_slug_from_name, export_bot_home_zip, find_bot_mcp_app, find_bot_template,
-    forget_memory_fact, import_bot_zip, init_bot_home, soul_description, validate_bot_name,
-    validate_bot_slug, validate_memory_edit,
+    ActsFor, BOT_MEMORY_SEED, BotAccessRequest, BotAccessRequestStatus, BotAvatarData, BotConfig,
+    BotConnectorConfig, BotEventRuleConfig, BotGroupChat, BotId, BotMcpToolConfig, BotMember,
+    BotMemoryHistoryEntry, BotMemoryTopicInfo, BotPackageExportOptions, BotScheduleConfig, BotSlug,
+    BotSuggestion, CreateBotParams, CreateBotV2Params, DefaultTrackerBots, ExternalBotCandidate,
+    ExternalBotSourceApp, ExternalConversationLink, ExternalSource, FieldPatch,
+    MAX_AVATAR_PNG_BYTES, MAX_RPC_ZIP_BYTES, MemoryDeletionViolation, UpdateBotExtrasParams,
+    UpdateBotParams, append_memory_fact, assert_bot_owns_home, bot_slug_from_name,
+    discover_external_bots as proto_discover_external_bots, export_bot_home_zip, find_bot_mcp_app,
+    find_bot_template, forget_memory_fact, import_bot_zip, init_bot_home, materialize_bot_skills,
+    soul_description, strip_png_metadata, validate_bot_name, validate_bot_slug,
+    validate_memory_edit,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
-use krill_proto::os::{canonicalize, home_dir, write_atomic_0600};
+use krill_proto::os::{canonicalize, write_atomic_0600};
 use ring::rand::{SecureRandom as _, SystemRandom};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::bots::connectors::AccessDecision;
+use crate::bots::memory_history;
+use crate::bots::secrets::ensure_no_symlink_path;
 use crate::session::lock;
 
 const BOTS_INDEX_FILE: &str = "bots.json";
 const LINKS_FILE: &str = "links.json";
 const ACCESS_REQUESTS_FILE: &str = "access_requests.json";
+const ACCESS_META_FILE: &str = "access_meta.json";
 const GROUPS_FILE: &str = "groups.json";
 const SUGGESTIONS_FILE: &str = "suggestions.json";
 const IMPORTED_SOURCES_FILE: &str = "imported_sources.json";
+const DEFAULT_TRACKERS_FILE: &str = "default-trackers.json";
+const EVENTS_FILE: &str = "events.json";
+const AVATAR_FILE: &str = "avatar.png";
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PENDING_ACCESS_PER_BOT: usize = 50;
+const ACCESS_NOTIFY_THROTTLE_MS: u64 = 60_000;
+const PAIRING_CODE_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PAIRING_ATTEMPT_WINDOW_MS: u64 = 60_000;
+const PAIRING_MAX_FAILURES_PER_WINDOW: usize = 10;
 
 static ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AccessMetaEntry {
+    pairing_code: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    last_notified_ms: u64,
+}
 
 /// Error returned when a guarded `MEMORY.md` update fails or I/O fails.
 #[derive(Debug)]
@@ -77,6 +100,7 @@ impl From<io::Error> for MemoryUpdateError {
 pub struct BotStore {
     root: PathBuf,
     io_lock: Mutex<()>,
+    pairing_failures: Mutex<Vec<u64>>,
 }
 
 impl fmt::Debug for BotStore {
@@ -92,6 +116,7 @@ impl BotStore {
         Self {
             root: bots_root,
             io_lock: Mutex::new(()),
+            pairing_failures: Mutex::new(Vec::new()),
         }
     }
 
@@ -149,49 +174,71 @@ impl BotStore {
 
     /// Creates a new bot, applies optional built-in template defaults, initializes its home, and saves.
     pub fn create_bot(&self, params: CreateBotParams, now_ms: u64) -> io::Result<BotConfig> {
+        self.create_bot_v2(CreateBotV2Params::from(params), now_ms)
+    }
+
+    /// Creates a new bot using v2 extended parameters (`slug`, `avatar_color`, `skills`, `events`).
+    pub fn create_bot_v2(&self, params: CreateBotV2Params, now_ms: u64) -> io::Result<BotConfig> {
         let _guard = lock(&self.io_lock);
         let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
-        let template = params.template_id.as_deref().and_then(find_bot_template);
+        let base = params.base;
+        let template = base.template_id.as_deref().and_then(find_bot_template);
 
-        let name = validate_bot_name(&params.name)
+        let name = validate_bot_name(&base.name)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-        let base_slug = bot_slug_from_name(&name);
-        let slug = allocate_unique_slug(&bots, &base_slug)?;
+        let slug = match params.slug {
+            Some(requested) => {
+                validate_bot_slug(requested.as_str())
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+                if bots.iter().any(|b| b.slug == requested) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("bot slug already exists: {}", requested.as_str()),
+                    ));
+                }
+                requested
+            }
+            None => allocate_unique_slug(&bots, &bot_slug_from_name(&name))?,
+        };
         let id = allocate_unique_id(&bots, slug.as_str())?;
 
-        let agent_id = if params.agent_id.trim().is_empty() {
+        let agent_id = if base.agent_id.trim().is_empty() {
             "claude".to_owned()
         } else {
-            params.agent_id.trim().to_owned()
+            base.agent_id.trim().to_owned()
         };
 
         let mut cfg = BotConfig::new(id, &name, &agent_id, now_ms)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
         cfg.slug = slug.clone();
         slug.as_str().clone_into(&mut cfg.folder);
-        cfg.emoji = params.emoji;
-        cfg.avatar = params
+        cfg.emoji = base.emoji;
+        cfg.avatar = base
             .avatar
             .or_else(|| template.map(|t| t.mascot.to_owned()));
-        cfg.model = params.model;
-        cfg.effort = params.effort;
-        if let Some(perm) = params.permission_mode {
+        cfg.avatar_color = params
+            .avatar_color
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty());
+        cfg.model = base.model;
+        cfg.effort = base.effort;
+        if let Some(perm) = base.permission_mode {
             cfg.permission_mode = perm;
         }
-        cfg.workspace = params
+        cfg.workspace = base
             .workspace
             .map(|w| w.trim().to_owned())
             .filter(|w| !w.is_empty());
-        cfg.template_id = params.template_id.clone();
+        cfg.template_id.clone_from(&base.template_id);
 
-        let initial_soul = params
+        let initial_soul = base
             .initial_soul
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| template.map(|t| t.default_soul));
 
-        cfg.description = if !params.description.trim().is_empty() {
-            params.description.trim().to_owned()
+        cfg.description = if !base.description.trim().is_empty() {
+            base.description.trim().to_owned()
         } else if let Some(t) = template {
             t.description.to_owned()
         } else {
@@ -230,14 +277,220 @@ impl BotStore {
                 }
             }
         }
+        if !params.skills.is_empty() {
+            cfg.skills = normalize_skill_list(&params.skills)?;
+        }
+
+        let events = if !params.events.is_empty() {
+            validate_events(&params.events)?;
+            params.events
+        } else if let Some(t) = template {
+            t.events
+                .iter()
+                .map(|e| BotEventRuleConfig {
+                    id: e.id.to_owned(),
+                    source: e.source.to_owned(),
+                    event: e.event.to_owned(),
+                    prompt: e.prompt.to_owned(),
+                    enabled: false,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         cfg.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
-        init_bot_home(&self.root, &cfg, initial_soul)?;
-        bots.push(cfg.clone());
-        self.write_json(BOTS_INDEX_FILE, &bots)?;
+        let home_path = self.bot_home(&cfg);
+        let home_existed = home_path.exists();
+        ensure_bot_subdirs_safe(&home_path)?;
+
+        let result = (|| -> io::Result<()> {
+            let home = init_bot_home(&self.root, &cfg, initial_soul)?;
+            ensure_bot_subdirs_safe(&home)?;
+            materialize_bot_skills(&home, &cfg.skills)?;
+            if !events.is_empty() {
+                write_bot_events_sidecar(&home, &events)?;
+            }
+            bots.push(cfg.clone());
+            self.write_json(BOTS_INDEX_FILE, &bots)?;
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            if !home_existed {
+                fs::remove_dir_all(&home_path).ok();
+            }
+            return Err(err);
+        }
         Ok(cfg)
+    }
+
+    /// Updates v2 extras (`avatar_color`, `skills`, `events`) on an existing bot.
+    pub fn update_bot_extras(
+        &self,
+        params: UpdateBotExtrasParams,
+        now_ms: u64,
+    ) -> io::Result<BotConfig> {
+        let _guard = lock(&self.io_lock);
+        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bot = bots
+            .iter_mut()
+            .find(|b| b.id == params.bot_id)
+            .ok_or_else(|| not_found_bot(&params.bot_id))?;
+
+        let prev_home = self.root.join(&bot.folder);
+        ensure_bot_subdirs_safe(&prev_home)?;
+
+        match params.avatar_color {
+            FieldPatch::Unchanged => {}
+            FieldPatch::Clear => bot.avatar_color = None,
+            FieldPatch::Set(c) => {
+                let trimmed = c.trim().to_owned();
+                bot.avatar_color = (!trimmed.is_empty()).then_some(trimmed);
+            }
+        }
+        if let Some(skills) = params.skills {
+            bot.skills = normalize_skill_list(&skills)?;
+        }
+        if let Some(ref events) = params.events {
+            validate_events(events)?;
+        }
+        bot.updated_at_ms = now_ms;
+        bot.validate()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+
+        let updated = bot.clone();
+        let home = init_bot_home(&self.root, &updated, None)?;
+        ensure_bot_subdirs_safe(&home)?;
+        materialize_bot_skills(&home, &updated.skills)?;
+        if let Some(events) = params.events {
+            write_bot_events_sidecar(&home, &events)?;
+        }
+        self.write_json(BOTS_INDEX_FILE, &bots)?;
+        Ok(updated)
+    }
+
+    /// Reads the `events.json` sidecar rules for `bot_id`.
+    pub fn get_events(&self, bot_id: &BotId) -> io::Result<Vec<BotEventRuleConfig>> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        let path = home.join(EVENTS_FILE);
+        ensure_no_symlink_path(&path)?;
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        if bytes.len() > MAX_JSON_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bot events file exceeds size limit",
+            ));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    /// Uploads and sanitizes a PNG avatar (`strip_png_metadata`, `0o600`) for `bot_id`.
+    pub fn upload_avatar(
+        &self,
+        bot_id: &BotId,
+        png_bytes: &[u8],
+        now_ms: u64,
+    ) -> io::Result<BotAvatarData> {
+        if png_bytes.is_empty() || png_bytes.len() > MAX_AVATAR_PNG_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "avatar PNG size is invalid",
+            ));
+        }
+        let cleaned = strip_png_metadata(png_bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+
+        let _guard = lock(&self.io_lock);
+        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bot = bots
+            .iter_mut()
+            .find(|b| &b.id == bot_id)
+            .ok_or_else(|| not_found_bot(bot_id))?;
+
+        let home = init_bot_home(&self.root, bot, None)?;
+        ensure_bot_subdirs_safe(&home)?;
+        let avatar_path = home.join(AVATAR_FILE);
+        ensure_no_symlink_path(&avatar_path)?;
+        write_atomic_0600(&avatar_path, &cleaned)?;
+
+        bot.avatar = Some(AVATAR_FILE.to_owned());
+        bot.updated_at_ms = now_ms;
+        let updated = bot.clone();
+        init_bot_home(&self.root, &updated, None)?;
+        self.write_json(BOTS_INDEX_FILE, &bots)?;
+
+        Ok(BotAvatarData {
+            bot_id: bot_id.clone(),
+            mime: "image/png".to_owned(),
+            png_bytes: cleaned,
+        })
+    }
+
+    /// Reads the sanitized PNG avatar for `bot_id`.
+    pub fn get_avatar(&self, bot_id: &BotId) -> io::Result<BotAvatarData> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        let avatar_path = home.join(AVATAR_FILE);
+        ensure_no_symlink_path(&avatar_path)?;
+        let meta = fs::symlink_metadata(&avatar_path)?;
+        if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_AVATAR_PNG_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "avatar PNG exceeds size limit",
+            ));
+        }
+        let bytes = fs::read(&avatar_path)?;
+        Ok(BotAvatarData {
+            bot_id: bot_id.clone(),
+            mime: "image/png".to_owned(),
+            png_bytes: bytes,
+        })
+    }
+
+    /// Gets the global default bots configured for GitHub / Linear tracker webhooks/polling.
+    pub fn get_default_tracker_bots(&self) -> io::Result<DefaultTrackerBots> {
+        let _guard = lock(&self.io_lock);
+        self.read_json_or_default(DEFAULT_TRACKERS_FILE)
+    }
+
+    /// Sets or clears the default bot for a tracker `source` (`GitHub` or `Linear`).
+    pub fn set_default_tracker_bot(
+        &self,
+        source: ExternalSource,
+        bot_id: Option<BotId>,
+    ) -> io::Result<DefaultTrackerBots> {
+        if !matches!(source, ExternalSource::GitHub | ExternalSource::Linear) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "default tracker bot only supports GitHub or Linear",
+            ));
+        }
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        if let Some(ref bid) = bot_id
+            && !bots.iter().any(|b| &b.id == bid)
+        {
+            return Err(not_found_bot(bid));
+        }
+        let mut defaults: DefaultTrackerBots = self.read_json_or_default(DEFAULT_TRACKERS_FILE)?;
+        match source {
+            ExternalSource::GitHub => defaults.github = bot_id,
+            ExternalSource::Linear => defaults.linear = bot_id,
+            _ => {}
+        }
+        self.write_json(DEFAULT_TRACKERS_FILE, &defaults)?;
+        Ok(defaults)
     }
 
     /// Applies partial updates to an existing bot and refreshes its managed home files.
@@ -383,6 +636,20 @@ impl BotStore {
             self.write_json(SUGGESTIONS_FILE, &suggestions)?;
         }
 
+        let mut defaults: DefaultTrackerBots = self.read_json_or_default(DEFAULT_TRACKERS_FILE)?;
+        let mut defaults_changed = false;
+        if defaults.github.as_ref() == Some(bot_id) {
+            defaults.github = None;
+            defaults_changed = true;
+        }
+        if defaults.linear.as_ref() == Some(bot_id) {
+            defaults.linear = None;
+            defaults_changed = true;
+        }
+        if defaults_changed {
+            self.write_json(DEFAULT_TRACKERS_FILE, &defaults)?;
+        }
+
         if delete_home {
             let home = self.bot_home(&removed);
             if home.exists() {
@@ -455,6 +722,28 @@ impl BotStore {
         content: &str,
         allow_deletions: bool,
     ) -> Result<String, MemoryUpdateError> {
+        let now_ms = current_unix_ms();
+        self.apply_memory_with_history(
+            bot_id,
+            content,
+            allow_deletions,
+            "owner",
+            "update",
+            now_ms,
+        )?;
+        Ok(content.to_owned())
+    }
+
+    /// Updates `<home>/MEMORY.md` recording an attribution entry in `.history.jsonl`.
+    pub(crate) fn apply_memory_with_history(
+        &self,
+        bot_id: &BotId,
+        content: &str,
+        allow_deletions: bool,
+        actor: &str,
+        action: &str,
+        now_ms: u64,
+    ) -> Result<Option<BotMemoryHistoryEntry>, MemoryUpdateError> {
         if content.len() > MAX_TEXT_FILE_BYTES {
             return Err(MemoryUpdateError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -468,7 +757,9 @@ impl BotStore {
             .find(|b| &b.id == bot_id)
             .ok_or_else(|| not_found_bot(bot_id))?;
         let home = init_bot_home(&self.root, bot, None)?;
+        ensure_bot_subdirs_safe(&home)?;
         let mem_path = home.join("MEMORY.md");
+        ensure_no_symlink_path(&mem_path)?;
         let old = if mem_path.exists() {
             read_text_bounded(&mem_path)?
         } else {
@@ -478,7 +769,111 @@ impl BotStore {
             validate_memory_edit(&old, content).map_err(MemoryUpdateError::DeletionBlocked)?;
         }
         write_atomic_0600(&mem_path, content.as_bytes())?;
-        Ok(content.to_owned())
+        let entry = memory_history::record_change(
+            &home,
+            bot_id,
+            actor,
+            action,
+            &old,
+            content,
+            now_ms,
+            old != content,
+        )?;
+        Ok(entry)
+    }
+
+    /// Lists `MEMORY.md` change history entries for `bot_id` (newest first).
+    pub fn get_memory_history(
+        &self,
+        bot_id: &BotId,
+        limit: Option<u32>,
+    ) -> io::Result<Vec<BotMemoryHistoryEntry>> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        memory_history::list_history(&home, limit)
+    }
+
+    /// Rewrites a single fact line in `MEMORY.md` and records history.
+    pub fn edit_memory_fact(
+        &self,
+        bot_id: &BotId,
+        old_fact: &str,
+        new_fact: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> io::Result<String> {
+        let current = self.get_memory(bot_id)?;
+        let rebuilt = memory_history::rewrite_single_fact(&current, old_fact, new_fact)?;
+        self.apply_memory_with_history(bot_id, &rebuilt, true, actor, "edit_fact", now_ms)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(rebuilt)
+    }
+
+    /// Reverts a recorded `.history.jsonl` change on `bot_id`'s `MEMORY.md`.
+    pub fn undo_memory_entry(
+        &self,
+        bot_id: &BotId,
+        entry_id: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> io::Result<String> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        let entry = memory_history::find_entry(&home, entry_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("memory history entry not found: {entry_id}"),
+            )
+        })?;
+        if !entry.undoable || entry.undone {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory change is not undoable or was already undone",
+            ));
+        }
+        let restored = entry.before_content.clone();
+        self.apply_memory_with_history(
+            bot_id,
+            &restored,
+            true,
+            actor,
+            &format!("undo:{entry_id}"),
+            now_ms,
+        )
+        .map_err(|err| io::Error::other(err.to_string()))?;
+        memory_history::mark_undone(&home, entry_id)?;
+        Ok(restored)
+    }
+
+    /// Lists valid topic markdown files under `<home>/memory/<topic>.md`.
+    pub fn list_memory_topics(&self, bot_id: &BotId) -> io::Result<Vec<BotMemoryTopicInfo>> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        memory_history::list_topics(&home)
+    }
+
+    /// Reads `<home>/memory/<topic>.md`.
+    pub fn get_memory_topic(&self, bot_id: &BotId, topic: &str) -> io::Result<String> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        memory_history::get_topic(&home, topic)
+    }
+
+    /// Writes `<home>/memory/<topic>.md`.
+    pub fn set_memory_topic(
+        &self,
+        bot_id: &BotId,
+        topic: &str,
+        content: &str,
+    ) -> io::Result<BotMemoryTopicInfo> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = init_bot_home(&self.root, &bot, None)?;
+        ensure_bot_subdirs_safe(&home)?;
+        memory_history::set_topic(&home, topic, content)
     }
 
     /// Explicitly removes matching fact line(s) from `<home>/MEMORY.md`.
@@ -490,7 +885,9 @@ impl BotStore {
             .find(|b| &b.id == bot_id)
             .ok_or_else(|| not_found_bot(bot_id))?;
         let home = init_bot_home(&self.root, bot, None)?;
+        ensure_bot_subdirs_safe(&home)?;
         let mem_path = home.join("MEMORY.md");
+        ensure_no_symlink_path(&mem_path)?;
         let old = if mem_path.exists() {
             read_text_bounded(&mem_path)?
         } else {
@@ -499,6 +896,16 @@ impl BotStore {
         let (updated, removed) = forget_memory_fact(&old, fact);
         if removed > 0 {
             write_atomic_0600(&mem_path, updated.as_bytes())?;
+            memory_history::record_change(
+                &home,
+                bot_id,
+                "owner",
+                "forget",
+                &old,
+                &updated,
+                current_unix_ms(),
+                true,
+            )?;
         }
         Ok((updated, removed))
     }
@@ -518,7 +925,9 @@ impl BotStore {
             .find(|b| &b.id == bot_id)
             .ok_or_else(|| not_found_bot(bot_id))?;
         let home = init_bot_home(&self.root, bot, None)?;
+        ensure_bot_subdirs_safe(&home)?;
         let mem_path = home.join("MEMORY.md");
+        ensure_no_symlink_path(&mem_path)?;
         let old = if mem_path.exists() {
             read_text_bounded(&mem_path)?
         } else {
@@ -526,6 +935,16 @@ impl BotStore {
         };
         let updated = append_memory_fact(&old, fact, date, source);
         write_atomic_0600(&mem_path, updated.as_bytes())?;
+        memory_history::record_change(
+            &home,
+            bot_id,
+            "bot",
+            "append",
+            &old,
+            &updated,
+            current_unix_ms(),
+            true,
+        )?;
         Ok(updated)
     }
 
@@ -647,6 +1066,29 @@ impl BotStore {
         channel_id: &str,
         now_ms: u64,
     ) -> io::Result<AccessDecision> {
+        self.check_or_request_access_with_workspace(
+            bot_id,
+            source,
+            None,
+            sender_id,
+            sender_name,
+            channel_id,
+            now_ms,
+        )
+    }
+
+    /// Evaluates sender access including an optional `workspace_id` for multi-workspace connectors.
+    #[expect(clippy::too_many_arguments, reason = "access decision context tuple")]
+    pub fn check_or_request_access_with_workspace(
+        &self,
+        bot_id: &BotId,
+        source: ExternalSource,
+        workspace_id: Option<&str>,
+        sender_id: &str,
+        sender_name: &str,
+        channel_id: &str,
+        now_ms: u64,
+    ) -> io::Result<AccessDecision> {
         let _guard = lock(&self.io_lock);
         let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
         let bot = bots
@@ -654,27 +1096,60 @@ impl BotStore {
             .find(|b| &b.id == bot_id)
             .ok_or_else(|| not_found_bot(bot_id))?;
 
-        if is_sender_allowed(bot, source, sender_id, channel_id) {
+        if is_sender_allowed_with_workspace(bot, source, workspace_id, sender_id, channel_id) {
             return Ok(AccessDecision::Allowed);
         }
 
         let mut reqs: Vec<BotAccessRequest> = self.read_json_or_default(ACCESS_REQUESTS_FILE)?;
+        let mut meta_map: BTreeMap<String, AccessMetaEntry> =
+            self.read_json_or_default(ACCESS_META_FILE)?;
         if let Some(existing) = reqs
             .iter()
             .find(|r| &r.bot_id == bot_id && r.source == source && r.sender_id == sender_id)
         {
             return Ok(match existing.status {
-                BotAccessRequestStatus::Approved => AccessDecision::Allowed,
-                BotAccessRequestStatus::Pending => AccessDecision::Pending(existing.clone()),
+                BotAccessRequestStatus::Approved => {
+                    if let Some(ws) = workspace_id {
+                        let stored_ws = meta_map
+                            .get(&existing.token)
+                            .and_then(|m| m.workspace_id.as_deref());
+                        if stored_ws.is_some_and(|w| w != ws) {
+                            return Ok(AccessDecision::Denied(
+                                "sender is approved for a different workspace".to_owned(),
+                            ));
+                        }
+                    }
+                    AccessDecision::Allowed
+                }
+                BotAccessRequestStatus::Pending => {
+                    if let Some(meta) = meta_map.get_mut(&existing.token)
+                        && now_ms.saturating_sub(meta.last_notified_ms) >= ACCESS_NOTIFY_THROTTLE_MS
+                    {
+                        meta.last_notified_ms = now_ms;
+                        self.write_json(ACCESS_META_FILE, &meta_map).ok();
+                    }
+                    AccessDecision::Pending(existing.clone())
+                }
                 BotAccessRequestStatus::Declined => {
                     AccessDecision::Denied("sender access request was declined".to_owned())
                 }
             });
         }
 
+        let pending_for_bot = reqs
+            .iter()
+            .filter(|r| &r.bot_id == bot_id && r.status == BotAccessRequestStatus::Pending)
+            .count();
+        if pending_for_bot >= MAX_PENDING_ACCESS_PER_BOT {
+            return Ok(AccessDecision::Denied(
+                "pending access request queue is full for this bot".to_owned(),
+            ));
+        }
+
         let token = generate_random_hex(16)?;
+        let pairing_code = generate_pairing_code(8)?;
         let req = BotAccessRequest {
-            token,
+            token: token.clone(),
             bot_id: bot_id.clone(),
             source,
             sender_id: sender_id.to_owned(),
@@ -684,9 +1159,26 @@ impl BotStore {
             created_at: now_ms,
             decided_at: None,
         };
+        meta_map.insert(
+            token,
+            AccessMetaEntry {
+                pairing_code,
+                workspace_id: workspace_id.map(ToOwned::to_owned),
+                last_notified_ms: now_ms,
+            },
+        );
         reqs.push(req.clone());
         self.write_json(ACCESS_REQUESTS_FILE, &reqs)?;
+        self.write_json(ACCESS_META_FILE, &meta_map)?;
         Ok(AccessDecision::Pending(req))
+    }
+
+    /// Returns the human pairing code associated with `token`, if recorded.
+    pub fn pairing_code_for_token(&self, token: &str) -> io::Result<Option<String>> {
+        let _guard = lock(&self.io_lock);
+        let meta_map: BTreeMap<String, AccessMetaEntry> =
+            self.read_json_or_default(ACCESS_META_FILE)?;
+        Ok(meta_map.get(token).map(|m| m.pairing_code.clone()))
     }
 
     /// Approves or declines a pending access request by `token`.
@@ -699,6 +1191,9 @@ impl BotStore {
     ) -> io::Result<BotAccessRequest> {
         let _guard = lock(&self.io_lock);
         let mut reqs: Vec<BotAccessRequest> = self.read_json_or_default(ACCESS_REQUESTS_FILE)?;
+        let meta_map: BTreeMap<String, AccessMetaEntry> =
+            self.read_json_or_default(ACCESS_META_FILE)?;
+        let workspace_id = meta_map.get(token).and_then(|m| m.workspace_id.clone());
         let req = reqs.iter_mut().find(|r| r.token == token).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "access request token not found")
         })?;
@@ -723,7 +1218,7 @@ impl BotStore {
                         id: decided.sender_id.clone(),
                         name: decided.sender_name.clone(),
                         source: decided.source,
-                        workspace_id: None,
+                        workspace_id,
                     });
                     bot.updated_at_ms = now_ms;
                     let snapshot = bot.clone();
@@ -734,6 +1229,53 @@ impl BotStore {
         }
 
         Ok(decided)
+    }
+
+    /// Redeems a pending pairing code (or exact request token) with rate-limit throttling.
+    pub fn redeem_pairing_code(&self, code: &str, now_ms: u64) -> io::Result<BotAccessRequest> {
+        let trimmed = code.trim();
+        if trimmed.is_empty() || trimmed.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid pairing code",
+            ));
+        }
+        {
+            let mut failures = lock(&self.pairing_failures);
+            failures.retain(|&t| now_ms.saturating_sub(t) < PAIRING_ATTEMPT_WINDOW_MS);
+            if failures.len() >= PAIRING_MAX_FAILURES_PER_WINDOW {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "too many failed pairing code attempts; try again later",
+                ));
+            }
+        }
+
+        let token = {
+            let _guard = lock(&self.io_lock);
+            let reqs: Vec<BotAccessRequest> = self.read_json_or_default(ACCESS_REQUESTS_FILE)?;
+            let meta_map: BTreeMap<String, AccessMetaEntry> =
+                self.read_json_or_default(ACCESS_META_FILE)?;
+            reqs.iter()
+                .find(|r| {
+                    r.status == BotAccessRequestStatus::Pending
+                        && (r.token == trimmed
+                            || meta_map
+                                .get(&r.token)
+                                .is_some_and(|m| m.pairing_code.eq_ignore_ascii_case(trimmed)))
+                })
+                .map(|r| r.token.clone())
+        };
+
+        let Some(matched_token) = token else {
+            lock(&self.pairing_failures).push(now_ms);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "pairing code not found or already used",
+            ));
+        };
+
+        self.decide_access_request(&matched_token, true, now_ms)
     }
 
     // ---------- Group Chats ----------
@@ -796,7 +1338,108 @@ impl BotStore {
             .find(|g| g.id == trimmed || g.name.eq_ignore_ascii_case(trimmed)))
     }
 
+    /// Gets a group by exact ID.
+    pub fn get_group(&self, group_id: &str) -> io::Result<Option<BotGroupChat>> {
+        let groups = self.list_groups()?;
+        Ok(groups.into_iter().find(|g| g.id == group_id))
+    }
+
+    /// Updates a group chat's name, description, and/or member bot list.
+    pub fn update_group(
+        &self,
+        group_id: &str,
+        name: Option<&str>,
+        description: Option<String>,
+        bot_ids: Option<Vec<BotId>>,
+        now_ms: u64,
+    ) -> io::Result<BotGroupChat> {
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut groups: Vec<BotGroupChat> = self.read_json_or_default(GROUPS_FILE)?;
+        let group = groups
+            .iter_mut()
+            .find(|g| g.id == group_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("group not found: {group_id}"),
+                )
+            })?;
+        if let Some(new_name) = name {
+            group.name = validate_bot_name(new_name)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+        }
+        if let Some(desc) = description {
+            group.description = desc;
+        }
+        if let Some(ids) = bot_ids {
+            let mut unique_ids = Vec::new();
+            for bid in ids {
+                if !bots.iter().any(|b| b.id == bid) {
+                    return Err(not_found_bot(&bid));
+                }
+                if !unique_ids.contains(&bid) {
+                    unique_ids.push(bid);
+                }
+            }
+            if unique_ids.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "group must contain at least one bot",
+                ));
+            }
+            group.bot_ids = unique_ids;
+        }
+        group.updated_at_ms = now_ms;
+        let updated = group.clone();
+        self.write_json(GROUPS_FILE, &groups)?;
+        Ok(updated)
+    }
+
+    /// Deletes a group chat by ID.
+    pub fn delete_group(&self, group_id: &str) -> io::Result<()> {
+        let _guard = lock(&self.io_lock);
+        let mut groups: Vec<BotGroupChat> = self.read_json_or_default(GROUPS_FILE)?;
+        let before = groups.len();
+        groups.retain(|g| g.id != group_id);
+        if groups.len() == before {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("group not found: {group_id}"),
+            ));
+        }
+        self.write_json(GROUPS_FILE, &groups)
+    }
+
+    /// Reorders group chats matching `group_ids` first while keeping any unlisted groups after.
+    pub fn reorder_groups(&self, group_ids: &[String]) -> io::Result<Vec<BotGroupChat>> {
+        let _guard = lock(&self.io_lock);
+        let groups: Vec<BotGroupChat> = self.read_json_or_default(GROUPS_FILE)?;
+        let mut by_id: BTreeMap<String, BotGroupChat> =
+            groups.into_iter().map(|g| (g.id.clone(), g)).collect();
+        let mut reordered = Vec::with_capacity(by_id.len());
+        for gid in group_ids {
+            let Some(group) = by_id.remove(gid) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("group not found in reorder list: {gid}"),
+                ));
+            };
+            reordered.push(group);
+        }
+        reordered.extend(by_id.into_values());
+        self.write_json(GROUPS_FILE, &reordered)?;
+        Ok(reordered)
+    }
+
     // ---------- Look-Around Suggestions ----------
+
+    /// Loads persisted suggestions for `bot_id`.
+    pub fn load_suggestions(&self, bot_id: &BotId) -> io::Result<Vec<BotSuggestion>> {
+        let _guard = lock(&self.io_lock);
+        let all: Vec<BotSuggestion> = self.read_json_or_default(SUGGESTIONS_FILE)?;
+        Ok(all.into_iter().filter(|s| &s.bot_id == bot_id).collect())
+    }
 
     /// Saves the latest suggestions for `bot_id` (replacing previous suggestions for that bot).
     pub fn save_suggestions(&self, bot_id: &BotId, next: &[BotSuggestion]) -> io::Result<()> {
@@ -840,6 +1483,18 @@ impl BotStore {
         agent_override: Option<&str>,
         now_ms: u64,
     ) -> io::Result<BotConfig> {
+        self.import_bot_zip_v2(zip_bytes, None, name_override, agent_override, now_ms)
+    }
+
+    /// Imports a sanitized `.zip` bot package supporting explicit `slug_override` distinct from `name_override`.
+    pub fn import_bot_zip_v2(
+        &self,
+        zip_bytes: &[u8],
+        slug_override: Option<&str>,
+        name_override: Option<&str>,
+        agent_override: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<BotConfig> {
         let pkg = import_bot_zip(zip_bytes)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
@@ -848,12 +1503,26 @@ impl BotStore {
 
         let final_name = validate_bot_name(name_override.unwrap_or(&pkg.manifest.name))
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-        let base_slug = if name_override.is_some() {
-            bot_slug_from_name(&final_name)
+        let slug = if let Some(raw_slug) = slug_override.map(str::trim).filter(|s| !s.is_empty()) {
+            validate_bot_slug(raw_slug)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+            let parsed = BotSlug::new(raw_slug)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+            if bots.iter().any(|b| b.slug == parsed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("bot slug already exists: {}", parsed.as_str()),
+                ));
+            }
+            parsed
         } else {
-            pkg.manifest.slug.clone()
+            let base_slug = if name_override.is_some() {
+                bot_slug_from_name(&final_name)
+            } else {
+                pkg.manifest.slug.clone()
+            };
+            allocate_unique_slug(&bots, &base_slug)?
         };
-        let slug = allocate_unique_slug(&bots, &base_slug)?;
         let id = allocate_unique_id(&bots, slug.as_str())?;
         let agent_id = agent_override
             .map(str::trim)
@@ -896,25 +1565,53 @@ impl BotStore {
         cfg.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
-        let home = init_bot_home(&self.root, &cfg, Some(&pkg.soul))?;
-        write_atomic_0600(&home.join("SOUL.md"), pkg.soul.as_bytes())?;
+        let home_path = self.bot_home(&cfg);
+        let home_existed = home_path.exists();
+        ensure_bot_subdirs_safe(&home_path)?;
 
-        if let Some(mem) = &pkg.memory_md {
-            write_atomic_0600(&home.join("MEMORY.md"), mem.as_bytes())?;
-        }
-        for (topic_file, content) in &pkg.memory_topics {
-            write_atomic_0600(&home.join("memory").join(topic_file), content.as_bytes())?;
-        }
-        for (rel_skill, content) in &pkg.skills {
-            let dest = home.join("skills").join(rel_skill);
-            write_atomic_0600(&dest, content.as_bytes())?;
-        }
-        if let Some(png) = &pkg.avatar_png {
-            write_atomic_0600(&home.join("avatar.png"), png)?;
-        }
+        let result = (|| -> io::Result<()> {
+            let home = init_bot_home(&self.root, &cfg, Some(&pkg.soul))?;
+            ensure_bot_subdirs_safe(&home)?;
+            write_atomic_0600(&home.join("SOUL.md"), pkg.soul.as_bytes())?;
+            materialize_bot_skills(&home, &cfg.skills)?;
 
-        bots.push(cfg.clone());
-        self.write_json(BOTS_INDEX_FILE, &bots)?;
+            if let Some(mem) = &pkg.memory_md {
+                let mem_path = home.join("MEMORY.md");
+                ensure_no_symlink_path(&mem_path)?;
+                write_atomic_0600(&mem_path, mem.as_bytes())?;
+            }
+            for (topic_file, content) in &pkg.memory_topics {
+                let dest = home.join("memory").join(topic_file);
+                ensure_no_symlink_path(&dest)?;
+                write_atomic_0600(&dest, content.as_bytes())?;
+            }
+            for (rel_skill, content) in &pkg.skills {
+                let dest = home.join("skills").join(rel_skill);
+                if let Some(parent) = dest.parent() {
+                    ensure_no_symlink_path(parent)?;
+                }
+                ensure_no_symlink_path(&dest)?;
+                write_atomic_0600(&dest, content.as_bytes())?;
+            }
+            if let Some(png) = &pkg.avatar_png {
+                let clean_png = strip_png_metadata(png)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+                let avatar_path = home.join(AVATAR_FILE);
+                ensure_no_symlink_path(&avatar_path)?;
+                write_atomic_0600(&avatar_path, &clean_png)?;
+            }
+
+            bots.push(cfg.clone());
+            self.write_json(BOTS_INDEX_FILE, &bots)?;
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            if !home_existed {
+                fs::remove_dir_all(&home_path).ok();
+            }
+            return Err(err);
+        }
         Ok(cfg)
     }
 
@@ -941,7 +1638,8 @@ impl BotStore {
         let mut imported = Vec::new();
 
         for cand in &candidates {
-            let canonical_key = canonicalize(Path::new(&cand.path))
+            let src_dir = Path::new(&cand.path);
+            let canonical_key = canonicalize(src_dir)
                 .map_or_else(|_| cand.path.clone(), |p| p.to_string_lossy().into_owned());
             if let Some(existing_id) = imported_ledger.get(&canonical_key)
                 && bots.iter().any(|b| b.id.as_str() == existing_id)
@@ -950,14 +1648,36 @@ impl BotStore {
                 continue;
             }
 
-            let src_dir = Path::new(&cand.path);
+            let manifest = read_external_manifest(src_dir);
+            if let Some(ref ext_id) = manifest.id
+                && bots.iter().any(|b| b.id.as_str() == ext_id)
+            {
+                imported_ledger.insert(canonical_key, ext_id.clone());
+                continue;
+            }
+            if let Some(ref ext_slug) = manifest.slug
+                && let Some(existing) = bots.iter().find(|b| b.slug.as_str() == ext_slug)
+            {
+                imported_ledger.insert(canonical_key, existing.id.as_str().to_owned());
+                continue;
+            }
+
             let soul = read_external_soul(src_dir, &cand.name);
             let memory = read_external_memory(src_dir);
             let clean_name =
                 validate_bot_name(&cand.name).unwrap_or_else(|_| "Imported Bot".to_owned());
-            let base_slug = bot_slug_from_name(&clean_name);
+            let base_slug = manifest
+                .slug
+                .as_deref()
+                .and_then(|s| BotSlug::new(s).ok())
+                .unwrap_or_else(|| bot_slug_from_name(&clean_name));
             let slug = allocate_unique_slug(&bots, &base_slug)?;
-            let id = allocate_unique_id(&bots, slug.as_str())?;
+            let id = manifest
+                .id
+                .as_deref()
+                .and_then(|raw| BotId::new(raw).ok())
+                .filter(|bid| !bots.iter().any(|b| &b.id == bid))
+                .map_or_else(|| allocate_unique_id(&bots, slug.as_str()), Ok)?;
             let agent_id = if cand.agent.trim().is_empty() {
                 "claude".to_owned()
             } else {
@@ -968,32 +1688,53 @@ impl BotStore {
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
             cfg.slug = slug.clone();
             slug.as_str().clone_into(&mut cfg.folder);
-            cfg.description = soul_description(&soul).unwrap_or_default();
+            cfg.description = manifest
+                .description
+                .unwrap_or_else(|| soul_description(&soul).unwrap_or_default());
+            cfg.emoji = manifest.emoji;
+            cfg.model = manifest.model;
+            cfg.avatar_color = manifest.avatar_color;
+            cfg.members = manifest.members;
+            cfg.skills = manifest.skill_projects;
 
-            // Copy optional non-secret metadata from Orca/OpenBot `bot.json`.
-            if let Ok(raw_manifest) = read_text_bounded(&src_dir.join("bot.json"))
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_manifest)
-            {
-                if let Some(desc) = val.get("description").and_then(serde_json::Value::as_str)
-                    && !desc.trim().is_empty()
+            let home_path = self.bot_home(&cfg);
+            let home_existed = home_path.exists();
+            let result = (|| -> io::Result<()> {
+                let home = init_bot_home(&self.root, &cfg, Some(&soul))?;
+                ensure_bot_subdirs_safe(&home)?;
+                write_atomic_0600(&home.join("SOUL.md"), soul.as_bytes())?;
+                if let Some(mem) = memory {
+                    write_atomic_0600(&home.join("MEMORY.md"), mem.as_bytes())?;
+                }
+                copy_external_markdown_dir(&src_dir.join("memory"), &home.join("memory"))?;
+                copy_external_skills_dir(&src_dir.join("skills"), &home.join("skills"))?;
+                copy_external_skill_projects(src_dir, &cfg.skills, &home.join("skills"))?;
+                materialize_bot_skills(&home, &cfg.skills)?;
+
+                let ext_avatar = src_dir.join(AVATAR_FILE);
+                if fs::symlink_metadata(&ext_avatar)
+                    .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+                    && usize::try_from(fs::symlink_metadata(&ext_avatar)?.len())
+                        .unwrap_or(usize::MAX)
+                        <= MAX_AVATAR_PNG_BYTES
+                    && let Ok(raw_png) = fs::read(&ext_avatar)
+                    && let Ok(clean_png) = strip_png_metadata(&raw_png)
                 {
-                    desc.trim().clone_into(&mut cfg.description);
+                    let dst_avatar = home.join(AVATAR_FILE);
+                    ensure_no_symlink_path(&dst_avatar)?;
+                    write_atomic_0600(&dst_avatar, &clean_png)?;
+                    cfg.avatar = Some(AVATAR_FILE.to_owned());
+                    init_bot_home(&self.root, &cfg, None)?;
                 }
-                if let Some(emoji) = val.get("emoji").and_then(serde_json::Value::as_str) {
-                    cfg.emoji = Some(emoji.to_owned());
-                }
-                if let Some(model) = val.get("model").and_then(serde_json::Value::as_str) {
-                    cfg.model = Some(model.to_owned());
-                }
-            }
+                Ok(())
+            })();
 
-            let home = init_bot_home(&self.root, &cfg, Some(&soul))?;
-            write_atomic_0600(&home.join("SOUL.md"), soul.as_bytes())?;
-            if let Some(mem) = memory {
-                write_atomic_0600(&home.join("MEMORY.md"), mem.as_bytes())?;
+            if let Err(err) = result {
+                if !home_existed {
+                    fs::remove_dir_all(&home_path).ok();
+                }
+                return Err(err);
             }
-            copy_external_markdown_dir(&src_dir.join("memory"), &home.join("memory"))?;
-            copy_external_skills_dir(&src_dir.join("skills"), &home.join("skills"))?;
 
             imported_ledger.insert(canonical_key, cfg.id.as_str().to_owned());
             bots.push(cfg.clone());
@@ -1011,7 +1752,9 @@ impl BotStore {
     // ---------- Internal JSON Helpers ----------
 
     fn read_json_or_default<T: DeserializeOwned + Default>(&self, filename: &str) -> io::Result<T> {
+        ensure_no_symlink_path(&self.root)?;
         let path = self.root.join(filename);
+        ensure_no_symlink_path(&path)?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
@@ -1028,14 +1771,17 @@ impl BotStore {
     }
 
     fn write_json<T: Serialize>(&self, filename: &str, value: &T) -> io::Result<()> {
+        ensure_no_symlink_path(&self.root)?;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&self.root)?;
+        let path = self.root.join(filename);
+        ensure_no_symlink_path(&path)?;
         let mut bytes = serde_json::to_vec_pretty(value)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         bytes.push(b'\n');
-        write_atomic_0600(&self.root.join(filename), &bytes)
+        write_atomic_0600(&path, &bytes)
     }
 }
 
@@ -1105,17 +1851,21 @@ fn read_text_bounded(path: &Path) -> io::Result<String> {
     fs::read_to_string(path)
 }
 
-fn is_sender_allowed(
+fn is_sender_allowed_with_workspace(
     bot: &BotConfig,
     source: ExternalSource,
+    workspace_id: Option<&str>,
     sender_id: &str,
     channel_id: &str,
 ) -> bool {
-    if bot
-        .members
-        .iter()
-        .any(|m| m.source == source && m.id == sender_id)
-    {
+    if bot.members.iter().any(|m| {
+        m.source == source
+            && m.id == sender_id
+            && match (&m.workspace_id, workspace_id) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => true,
+            }
+    }) {
         return true;
     }
     match source {
@@ -1170,174 +1920,204 @@ fn is_sender_allowed(
     }
 }
 
-/// Discovers bots from Orca, `OpenClaw` (`.openclaw`/`.clawdbot`/`.moltbot`), Hermes, and `OpenBot`.
+/// Redacts pairing tokens from [`BotAccessRequest`] records for read-only Observer peers.
+#[must_use]
+pub fn redact_access_requests_for_observer(reqs: Vec<BotAccessRequest>) -> Vec<BotAccessRequest> {
+    reqs.into_iter()
+        .map(|mut r| {
+            r.token.clear();
+            r
+        })
+        .collect()
+}
+
+/// Discovers bots from Orca, `OpenClaw`, Hermes, and `OpenBot` using `krill_proto::bots::external`.
 #[must_use]
 pub fn discover_external_bots(
     source_filter: Option<ExternalBotSourceApp>,
     custom_path: Option<&Path>,
 ) -> Vec<ExternalBotCandidate> {
-    let mut out = Vec::new();
-    let mut seen_paths = BTreeSet::new();
+    proto_discover_external_bots(source_filter, custom_path)
+}
 
-    if let Some(path) = custom_path {
-        let app = source_filter.unwrap_or_else(|| infer_source_app(path));
-        scan_external_root(app, path, &mut seen_paths, &mut out);
-        return out;
-    }
+#[derive(Default)]
+struct ExternalManifest {
+    id: Option<String>,
+    slug: Option<String>,
+    description: Option<String>,
+    emoji: Option<String>,
+    model: Option<String>,
+    avatar_color: Option<String>,
+    members: Vec<BotMember>,
+    skill_projects: Vec<String>,
+}
 
-    let Some(home) = home_dir() else {
-        return out;
-    };
-
-    let targets: &[(ExternalBotSourceApp, &[&str])] = &[
-        (ExternalBotSourceApp::Orca, &[".orca/bots"]),
-        (
-            ExternalBotSourceApp::OpenClaw,
-            &[".openclaw", ".clawdbot", ".moltbot"],
-        ),
-        (ExternalBotSourceApp::Hermes, &[".hermes"]),
-        (ExternalBotSourceApp::OpenBot, &[".openbot"]),
-    ];
-
-    for &(app, rel_roots) in targets {
-        if source_filter.is_some_and(|want| want != app) {
+fn read_external_manifest(dir: &Path) -> ExternalManifest {
+    let mut out = ExternalManifest::default();
+    for file in ["bot.json", "agent.json"] {
+        let Ok(raw) = read_text_bounded(&dir.join(file)) else {
             continue;
-        }
-        for rel in rel_roots {
-            let root = home.join(rel);
-            if root.is_dir() {
-                scan_external_root(app, &root, &mut seen_paths, &mut out);
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        out.id = val
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        out.slug = val
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        out.description = val
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        out.emoji = val
+            .get("emoji")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        out.model = val
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        out.avatar_color = val
+            .get("avatarColor")
+            .or_else(|| val.get("avatar_color"))
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        if let Some(arr) = val.get("members").and_then(serde_json::Value::as_array) {
+            for item in arr {
+                if let Ok(member) = serde_json::from_value::<BotMember>(item.clone())
+                    && !member.id.trim().is_empty()
+                {
+                    out.members.push(member);
+                }
             }
         }
+        if let Some(arr) = val
+            .get("skillProjects")
+            .or_else(|| val.get("skills"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in arr {
+                if let Some(skill) = item.as_str()
+                    && validate_bot_slug(skill.trim()).is_ok()
+                {
+                    out.skill_projects.push(skill.trim().to_owned());
+                }
+            }
+        }
+        break;
     }
-
     out
 }
 
-fn infer_source_app(path: &Path) -> ExternalBotSourceApp {
-    let lower = path.to_string_lossy().to_ascii_lowercase();
-    if lower.contains("orca") {
-        ExternalBotSourceApp::Orca
-    } else if lower.contains("hermes") {
-        ExternalBotSourceApp::Hermes
-    } else if lower.contains("openbot") {
-        ExternalBotSourceApp::OpenBot
-    } else {
-        ExternalBotSourceApp::OpenClaw
-    }
+fn ensure_bot_subdirs_safe(home: &Path) -> io::Result<()> {
+    ensure_no_symlink_path(home)?;
+    ensure_no_symlink_path(&home.join("memory"))?;
+    ensure_no_symlink_path(&home.join("skills"))?;
+    ensure_no_symlink_path(&home.join("SOUL.md"))?;
+    ensure_no_symlink_path(&home.join("MEMORY.md"))?;
+    ensure_no_symlink_path(&home.join(AVATAR_FILE))?;
+    ensure_no_symlink_path(&home.join(EVENTS_FILE))?;
+    Ok(())
 }
 
-fn scan_external_root(
-    app: ExternalBotSourceApp,
-    root: &Path,
-    seen: &mut BTreeSet<String>,
-    out: &mut Vec<ExternalBotCandidate>,
-) {
-    if is_bot_dir(root) {
-        push_candidate(app, root, seen, out);
-    }
+fn write_bot_events_sidecar(home: &Path, events: &[BotEventRuleConfig]) -> io::Result<()> {
+    ensure_no_symlink_path(home)?;
+    let path = home.join(EVENTS_FILE);
+    ensure_no_symlink_path(&path)?;
+    let mut bytes = serde_json::to_vec_pretty(events)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    bytes.push(b'\n');
+    write_atomic_0600(&path, &bytes)
+}
 
-    // Check known container subdirectories (`bots/`, `agents/`, `Agents/`, `profiles/`, `workspaces/`).
-    for sub in ["bots", "agents", "Agents", "profiles", "workspaces"] {
-        let container = root.join(sub);
-        if container.is_dir() {
-            scan_children_as_bots(app, &container, seen, out);
+fn normalize_skill_list(raw: &[String]) -> io::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for s in raw {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        validate_bot_slug(trimmed)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+        if !out.iter().any(|existing: &String| existing == trimmed) {
+            out.push(trimmed.to_owned());
         }
     }
-
-    // For flat bot-collection directories (like `~/.orca/bots/*`), scan direct children too.
-    scan_children_as_bots(app, root, seen, out);
+    Ok(out)
 }
 
-fn scan_children_as_bots(
-    app: ExternalBotSourceApp,
-    dir: &Path,
-    seen: &mut BTreeSet<String>,
-    out: &mut Vec<ExternalBotCandidate>,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-            && is_bot_dir(&path)
+fn validate_events(events: &[BotEventRuleConfig]) -> io::Result<()> {
+    for ev in events {
+        if ev.id.trim().is_empty()
+            || ev.source.trim().is_empty()
+            || ev.event.trim().is_empty()
+            || ev.prompt.trim().is_empty()
         {
-            push_candidate(app, &path, seen, out);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bot event rule requires id, source, event, and prompt",
+            ));
         }
     }
+    Ok(())
 }
 
-fn is_bot_dir(dir: &Path) -> bool {
-    dir.join("SOUL.md").is_file()
-        || dir.join("IDENTITY.md").is_file()
-        || dir.join("bot.json").is_file()
-        || dir.join("agent.json").is_file()
-}
-
-fn push_candidate(
-    app: ExternalBotSourceApp,
-    dir: &Path,
-    seen: &mut BTreeSet<String>,
-    out: &mut Vec<ExternalBotCandidate>,
-) {
-    let key = canonicalize(dir).map_or_else(
-        |_| dir.to_string_lossy().into_owned(),
-        |p| p.to_string_lossy().into_owned(),
-    );
-    if !seen.insert(key) {
-        return;
+fn generate_pairing_code(len: usize) -> io::Result<String> {
+    let mut buf = vec![0u8; len];
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| io::Error::other("RNG failure"))?;
+    let mut code = String::with_capacity(len);
+    for b in buf {
+        let idx = usize::from(b) % PAIRING_CODE_CHARS.len();
+        if let Some(&ch) = PAIRING_CODE_CHARS.get(idx) {
+            code.push(char::from(ch));
+        }
     }
+    Ok(code)
+}
 
-    let mut name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.trim_start_matches('.').to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Imported Bot".to_owned());
-    let mut agent = match app {
-        ExternalBotSourceApp::Hermes => "hermes".to_owned(),
-        _ => "claude".to_owned(),
-    };
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
 
-    // Never open `openclaw.json` because external installs may store user tokens inside it.
-    for manifest_name in ["bot.json", "agent.json"] {
-        if let Ok(text) = read_text_bounded(&dir.join(manifest_name))
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+fn copy_external_skill_projects(
+    src_root: &Path,
+    skill_projects: &[String],
+    dst_skills: &Path,
+) -> io::Result<()> {
+    for name in skill_projects {
+        if validate_bot_slug(name).is_err() {
+            continue;
+        }
+        let candidate_dir = src_root.join(name);
+        let candidate_md = candidate_dir.join("SKILL.md");
+        if fs::symlink_metadata(&candidate_dir)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            && let Ok(text) = read_text_bounded(&candidate_md)
         {
-            if let Some(n) = val.get("name").and_then(serde_json::Value::as_str)
-                && !n.trim().is_empty()
-            {
-                n.trim().clone_into(&mut name);
-            }
-            if let Some(a) = val
-                .get("agent_id")
-                .or_else(|| val.get("agent"))
-                .and_then(serde_json::Value::as_str)
-                && !a.trim().is_empty()
-            {
-                a.trim().clone_into(&mut agent);
-            }
-            break;
+            let skill_dst_dir = dst_skills.join(name);
+            ensure_no_symlink_path(&skill_dst_dir)?;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&skill_dst_dir)?;
+            let dst_file = skill_dst_dir.join("SKILL.md");
+            ensure_no_symlink_path(&dst_file)?;
+            write_atomic_0600(&dst_file, text.as_bytes())?;
         }
     }
-
-    let soul_text = read_external_soul(dir, &name);
-    let soul_preview = soul_description(&soul_text).or_else(|| {
-        let first = soul_text
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with('#'));
-        first.map(|s| s.chars().take(160).collect())
-    });
-
-    out.push(ExternalBotCandidate {
-        app,
-        agent,
-        name,
-        path: dir.to_string_lossy().into_owned(),
-        soul_preview,
-    });
+    Ok(())
 }
 
 fn read_external_soul(dir: &Path, fallback_name: &str) -> String {
@@ -1620,5 +2400,152 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&external).ok();
+    }
+
+    #[test]
+    fn v2_create_extras_avatars_pairing_and_default_trackers() {
+        let root = temp_dir("v2-extras");
+        let store = BotStore::new(root.clone());
+
+        let created = store
+            .create_bot_v2(
+                CreateBotV2Params {
+                    base: CreateBotParams {
+                        name: "Triage Bot".to_owned(),
+                        agent_id: "claude".to_owned(),
+                        description: String::new(),
+                        emoji: None,
+                        avatar: None,
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                    slug: Some(BotSlug::new("custom-triage").unwrap()),
+                    avatar_color: Some("#3366ff".to_owned()),
+                    skills: vec!["pr-review-checklist".to_owned()],
+                    events: vec![BotEventRuleConfig {
+                        id: "pr-opened".to_owned(),
+                        source: "github".to_owned(),
+                        event: "pull_request.opened".to_owned(),
+                        prompt: "Review the PR".to_owned(),
+                        enabled: true,
+                    }],
+                },
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(created.slug.as_str(), "custom-triage");
+        assert_eq!(created.avatar_color.as_deref(), Some("#3366ff"));
+        assert!(
+            store
+                .bot_home(&created)
+                .join("skills/pr-review-checklist/SKILL.md")
+                .is_file()
+        );
+        assert_eq!(store.get_events(&created.id).unwrap().len(), 1);
+
+        // Reject duplicate explicit slug.
+        assert!(
+            store
+                .create_bot_v2(
+                    CreateBotV2Params {
+                        base: CreateBotParams {
+                            name: "Another".to_owned(),
+                            agent_id: "claude".to_owned(),
+                            description: String::new(),
+                            emoji: None,
+                            avatar: None,
+                            model: None,
+                            effort: None,
+                            permission_mode: None,
+                            workspace: None,
+                            template_id: None,
+                            initial_soul: None,
+                        },
+                        slug: Some(BotSlug::new("custom-triage").unwrap()),
+                        avatar_color: None,
+                        skills: Vec::new(),
+                        events: Vec::new(),
+                    },
+                    1_100,
+                )
+                .is_err()
+        );
+
+        // Upload & get PNG avatar (minimal valid 1x1 PNG).
+        let png = build_minimal_test_png();
+        let saved_avatar = store.upload_avatar(&created.id, &png, 1_200).unwrap();
+        assert_eq!(saved_avatar.mime, "image/png");
+        let loaded_avatar = store.get_avatar(&created.id).unwrap();
+        assert_eq!(loaded_avatar.png_bytes, saved_avatar.png_bytes);
+
+        // Pairing code redemption approves sender with workspace_id.
+        let decision = store
+            .check_or_request_access_with_workspace(
+                &created.id,
+                ExternalSource::Slack,
+                Some("T_WS_1"),
+                "U99",
+                "Eve",
+                "D1",
+                2_000,
+            )
+            .unwrap();
+        let token = match decision {
+            AccessDecision::Pending(r) => r.token,
+            _ => panic!("expected pending"),
+        };
+        let pairing_code = store.pairing_code_for_token(&token).unwrap().unwrap();
+        let approved = store.redeem_pairing_code(&pairing_code, 2_100).unwrap();
+        assert_eq!(approved.status, BotAccessRequestStatus::Approved);
+        assert_eq!(
+            store
+                .check_or_request_access_with_workspace(
+                    &created.id,
+                    ExternalSource::Slack,
+                    Some("T_WS_1"),
+                    "U99",
+                    "Eve",
+                    "D1",
+                    2_200,
+                )
+                .unwrap(),
+            AccessDecision::Allowed
+        );
+
+        // Default tracker bots.
+        let defaults = store
+            .set_default_tracker_bot(ExternalSource::GitHub, Some(created.id.clone()))
+            .unwrap();
+        assert_eq!(defaults.github, Some(created.id.clone()));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn build_minimal_test_png() -> Vec<u8> {
+        let mut png = Vec::from(&[137u8, 80, 78, 71, 13, 10, 26, 10][..]);
+        let ihdr_data = [0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0];
+        push_png_chunk(&mut png, *b"IHDR", &ihdr_data);
+        push_png_chunk(
+            &mut png,
+            *b"IDAT",
+            &[0x78, 0x9c, 0x63, 0x60, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01],
+        );
+        push_png_chunk(&mut png, *b"IEND", &[]);
+        png
+    }
+
+    fn push_png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(&kind);
+        out.extend_from_slice(data);
+        let mut crc_buf = Vec::with_capacity(4 + data.len());
+        crc_buf.extend_from_slice(&kind);
+        crc_buf.extend_from_slice(data);
+        let crc = krill_proto::bots::crc32(&crc_buf);
+        out.extend_from_slice(&crc.to_be_bytes());
     }
 }

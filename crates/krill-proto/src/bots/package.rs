@@ -4,13 +4,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
     BotConfig, BotLookAroundConfig, BotMcpAuthKind, BotMemoryTidyConfig, BotNotifications,
-    BotScheduleConfig, BotSlug, ExternalSource, validate_bot_name, validate_bot_slug,
+    BotScheduleConfig, BotSlug, ExternalSource, is_windows_reserved_slug, validate_bot_name,
+    validate_bot_slug,
 };
 
 /// Current manifest schema version inside exported bot packages.
@@ -191,6 +195,8 @@ impl SanitizedBotManifest {
             .collect();
         let avatar = if has_avatar_png {
             Some("avatar.png".to_owned())
+        } else if config.avatar.as_deref() == Some("avatar.png") {
+            None
         } else {
             config.avatar.clone()
         };
@@ -750,21 +756,19 @@ pub fn export_bot_home_zip(
     config: &BotConfig,
     options: BotPackageExportOptions,
 ) -> Result<Vec<u8>, PackageError> {
-    let soul = fs::read_to_string(home.join("SOUL.md"))
-        .map_err(|err| PackageError::Io(format!("read SOUL.md: {err}")))?;
+    ensure_no_symlink(home, "bot home")?;
+    let soul = read_bounded_utf8_file(&home.join("SOUL.md"), "SOUL.md", MAX_ZIP_ENTRY_BYTES)?;
 
     let mut skills = BTreeMap::new();
     let skills_dir = home.join("skills");
-    if skills_dir.is_dir() {
+    if let Some(meta) = symlink_metadata_optional(&skills_dir, "skills/")?
+        && meta.is_dir()
+    {
         collect_text_files(&skills_dir, &skills_dir, &mut skills)?;
     }
 
     let memory_md = if options.include_memory {
-        match fs::read_to_string(home.join("MEMORY.md")) {
-            Ok(text) => Some(text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(PackageError::Io(format!("read MEMORY.md: {err}"))),
-        }
+        read_optional_bounded_utf8_file(&home.join("MEMORY.md"), "MEMORY.md", MAX_ZIP_ENTRY_BYTES)?
     } else {
         None
     };
@@ -772,15 +776,17 @@ pub fn export_bot_home_zip(
     let mut memory_topics = BTreeMap::new();
     if options.include_memory {
         let memory_dir = home.join("memory");
-        if memory_dir.is_dir() {
+        if let Some(meta) = symlink_metadata_optional(&memory_dir, "memory/")?
+            && meta.is_dir()
+        {
             let dir_iter = fs::read_dir(&memory_dir)
                 .map_err(|err| PackageError::Io(format!("read memory/: {err}")))?;
             for entry in dir_iter {
                 let entry = entry.map_err(|err| PackageError::Io(err.to_string()))?;
                 let path = entry.path();
-                let meta =
+                let entry_meta =
                     fs::symlink_metadata(&path).map_err(|err| PackageError::Io(err.to_string()))?;
-                if meta.file_type().is_symlink() || !meta.is_file() {
+                if entry_meta.file_type().is_symlink() || !entry_meta.is_file() {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -788,8 +794,7 @@ pub fn export_bot_home_zip(
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
                 {
-                    let content = fs::read_to_string(&path)
-                        .map_err(|err| PackageError::Io(format!("read {name}: {err}")))?;
+                    let content = read_bounded_utf8_file(&path, &name, MAX_ZIP_ENTRY_BYTES)?;
                     memory_topics.insert(name, content);
                 }
             }
@@ -797,11 +802,11 @@ pub fn export_bot_home_zip(
     }
 
     let avatar_png = if options.include_avatar {
-        match fs::read(home.join("avatar.png")) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(PackageError::Io(format!("read avatar.png: {err}"))),
-        }
+        read_optional_bounded_file_bytes(
+            &home.join("avatar.png"),
+            "avatar.png",
+            MAX_AVATAR_PNG_BYTES,
+        )?
     } else {
         None
     };
@@ -935,7 +940,7 @@ pub fn validate_bot_package_path(path: &str) -> Result<(), PackageError> {
     if let Some(rest) = path.strip_prefix("memory/") {
         if !rest.contains('/')
             && let Some(stem) = rest.strip_suffix(".md")
-            && validate_bot_slug(stem).is_ok()
+            && is_valid_memory_topic_stem(stem)
         {
             return Ok(());
         }
@@ -1003,12 +1008,192 @@ fn collect_text_files_inner(
                     "too many files under skills/".to_owned(),
                 ));
             }
-            let text = fs::read_to_string(&path)
-                .map_err(|err| PackageError::Io(format!("read {rel_str}: {err}")))?;
+            let text = read_bounded_utf8_file(&path, &rel_str, MAX_ZIP_ENTRY_BYTES)?;
             out.insert(rel_str, text);
         }
     }
     Ok(())
+}
+
+/// Scans exported bot text (`SOUL.md`, `MEMORY.md`, skills, etc.) for common leaked key prefixes
+/// and Telegram bot token shapes, returning matching secret-type identifiers.
+#[must_use]
+pub fn scan_export_secrets(text: &str) -> Vec<&'static str> {
+    static PATTERNS: LazyLock<[(&'static str, Option<Regex>); 10]> = LazyLock::new(|| {
+        [
+            (
+                "sk-",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])sk-[A-Za-z0-9_-]{6,}").ok(),
+            ),
+            (
+                "xoxb-",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])xoxb-[A-Za-z0-9-]{6,}").ok(),
+            ),
+            (
+                "xoxp-",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])xoxp-[A-Za-z0-9-]{6,}").ok(),
+            ),
+            (
+                "xapp-",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])xapp-[A-Za-z0-9-]{6,}").ok(),
+            ),
+            (
+                "ghp_",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])ghp_[A-Za-z0-9]{6,}").ok(),
+            ),
+            (
+                "gho_",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])gho_[A-Za-z0-9]{6,}").ok(),
+            ),
+            (
+                "lin_api_",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])lin_api_[A-Za-z0-9]{6,}").ok(),
+            ),
+            (
+                "ya29.",
+                Regex::new(r"(?:^|[^A-Za-z0-9_])ya29\.[A-Za-z0-9._-]{6,}").ok(),
+            ),
+            (
+                "1//",
+                Regex::new(r"(?:^|[^A-Za-z0-9_/])1//[A-Za-z0-9_-]{6,}").ok(),
+            ),
+            (
+                "telegram_bot_token",
+                Regex::new(r"(?:^|[^A-Za-z0-9_:])[0-9]{6,}:[A-Za-z0-9_-]{35,}").ok(),
+            ),
+        ]
+    });
+
+    let mut found = Vec::new();
+    for (label, maybe_re) in PATTERNS.iter() {
+        if let Some(re) = maybe_re
+            && re.is_match(text)
+        {
+            found.push(*label);
+        }
+    }
+    found
+}
+
+fn is_valid_memory_topic_stem(stem: &str) -> bool {
+    if stem.is_empty()
+        || stem.len() > 128
+        || stem.starts_with('.')
+        || stem.starts_with(' ')
+        || stem.ends_with(' ')
+        || stem.contains("..")
+    {
+        return false;
+    }
+    let trimmed = stem.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if is_windows_reserved_slug(&trimmed.to_ascii_lowercase()) {
+        return false;
+    }
+    stem.chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' '))
+}
+
+fn ensure_no_symlink(path: &Path, label: &str) -> Result<(), PackageError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|err| PackageError::Io(format!("stat {label}: {err}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(PackageError::UnsafePath(label.to_owned()));
+    }
+    Ok(())
+}
+
+fn symlink_metadata_optional(
+    path: &Path,
+    label: &str,
+) -> Result<Option<fs::Metadata>, PackageError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(PackageError::UnsafePath(label.to_owned()));
+            }
+            Ok(Some(meta))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(PackageError::Io(format!("stat {label}: {err}"))),
+    }
+}
+
+fn read_bounded_file_bytes(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PackageError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|err| PackageError::Io(format!("read {label}: {err}")))?;
+    read_meta_bounded_bytes(path, &meta, label, max_bytes)
+}
+
+fn read_optional_bounded_file_bytes(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, PackageError> {
+    let Some(meta) = symlink_metadata_optional(path, label)? else {
+        return Ok(None);
+    };
+    read_meta_bounded_bytes(path, &meta, label, max_bytes).map(Some)
+}
+
+fn read_meta_bounded_bytes(
+    path: &Path,
+    meta: &fs::Metadata,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PackageError> {
+    if meta.file_type().is_symlink() {
+        return Err(PackageError::UnsafePath(label.to_owned()));
+    }
+    if !meta.is_file() {
+        return Err(PackageError::Io(format!("'{label}' is not a regular file")));
+    }
+    let max_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if meta.len() > max_u64 {
+        return Err(PackageError::LimitExceeded(format!(
+            "'{label}' exceeds {max_bytes} bytes"
+        )));
+    }
+    let file =
+        fs::File::open(path).map_err(|err| PackageError::Io(format!("read {label}: {err}")))?;
+    let mut buf = Vec::new();
+    file.take(max_u64.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|err| PackageError::Io(format!("read {label}: {err}")))?;
+    if buf.len() > max_bytes {
+        return Err(PackageError::LimitExceeded(format!(
+            "'{label}' exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(buf)
+}
+
+fn read_bounded_utf8_file(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<String, PackageError> {
+    let bytes = read_bounded_file_bytes(path, label, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| PackageError::InvalidUtf8(label.to_owned()))
+}
+
+fn read_optional_bounded_utf8_file(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, PackageError> {
+    let Some(bytes) = read_optional_bounded_file_bytes(path, label, max_bytes)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| PackageError::InvalidUtf8(label.to_owned()))
 }
 
 fn strip_url_query_and_auth(url: &str) -> String {

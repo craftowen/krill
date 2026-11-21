@@ -476,7 +476,9 @@ impl Shell {
                         .text_color(p.sidebar_accent_foreground)
                 })
                 .when(self.bots_attention_count > 0, |d| {
-                    d.child(
+                    let attn_label = sb_text::NAV_BOTS_ATTENTION
+                        .format(&[("n", &self.bots_attention_count.to_string())]);
+                    d.aria_label(attn_label).child(
                         krill_app::ui::badge(
                             p,
                             krill_app::ui::BadgeTone::Warning,
