@@ -1021,6 +1021,8 @@ globalThis.MkTerminalCodec = (() => {
         this.port,
         "scroll",
         () => {
+          // 맨 아래에서는 화면 위 틈으로 스크롤백 끝줄이 비친다. 그 줄은 위로 스크롤해야 갱신되어 옛 내용이 남는다.
+          this.root.dataset.liveBottom = String(this.atBottom(1));
           const top = this.port.scrollTop,
             up = top < lastTop && !this.alt,
             refresh =
@@ -2959,6 +2961,7 @@ globalThis.MkTerminalCodec = (() => {
     scrollBottom() {
       this.port.scrollTop = this.port.scrollHeight;
       this.stick = true;
+      this.root.dataset.liveBottom = "true";
       this.latestButton.hidden = true;
       this.syncQuestion();
     }

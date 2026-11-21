@@ -442,6 +442,7 @@ button.account-row:disabled{opacity:1}
 #mobile-app .session .command-dock .live-input-copy{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;min-width:0;flex:1;overflow:hidden}
 #mobile-app .session .command-dock .live-input-copy strong{font-size:calc(12px * var(--ui-scale,1));font-weight:600;line-height:1.15;height:calc(14px * var(--ui-scale,1));color:var(--foreground);white-space:nowrap;flex:none}
 #mobile-app .session .command-dock .live-input-copy small{font:calc(12px * var(--ui-scale,1))/1.15 var(--font-mono);height:calc(14px * var(--ui-scale,1));color:var(--muted-foreground);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;min-width:0}
+.terminal-mount[data-live-bottom=true] .terminal-history{clip-path:inset(0 0 100% 0)}
 /* Live ACK feedback belongs in the reserved input box; never resize the terminal for each ACK. */
 .terminal-mount[data-input-mode=direct][data-phase=input-pending] .terminal-status{display:none}
 #mobile-app .session .command-dock .live-input-copy strong{max-width:100%;overflow:hidden;text-overflow:ellipsis}

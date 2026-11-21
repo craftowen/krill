@@ -1748,6 +1748,98 @@ async function testSplitChatTabSwitchVisibility() {
     "PASS split primary tab switch calls syncViewMode and mounts visible .chat-view + .chat-composer",
   );
 }
+function testTabSwitchKeepsScreen() {
+  const f = fixture([
+    { id: 7, state: "Working", branch: null },
+    { id: 8, state: "Working", branch: "main" },
+  ]);
+  const replaced = [],
+    tabsNow = () => f.buttons.filter((b) => b.className === "session-tab");
+  f.ctx.setRoute = (r) => replaced.push(r);
+  const header = f.root.descendants().find((n) => n.tag === "header"),
+    git = f.buttons.find((b) =>
+      String(b.className || "").includes("session-git-btn"),
+    );
+  assert.equal(git.hidden, true);
+  tabsNow().at(-1).action();
+  assert.deepEqual(f.routes, [], "tab switch does not rebuild the screen");
+  assert.deepEqual(replaced, ["/host/local/group/g/s/8"]);
+  assert.equal(f.mounts.at(-1).options.sessionId, 8);
+  assert(f.mounts.at(-2).unmounted, "previous terminal is released");
+  assert.equal(
+    f.root.descendants().find((n) => n.tag === "header"),
+    header,
+  );
+  assert.equal(git.hidden, false, "header follows the new tab's branch");
+  const b = f.mounts.at(-1);
+  b.options.onStatus({ phase: "ready", message: "80 × 24" });
+  tabsNow()[0].action();
+  const a = f.mounts.at(-1);
+  assert.equal(a.options.sessionId, 7);
+  assert(!b.unmounted, "a ready terminal is parked, not closed");
+  assert.equal(b.root.hidden, true);
+  assert.equal(b.inputActive, false);
+  a.options.onStatus({ phase: "ready", message: "80 × 24" });
+  const count = f.mounts.length;
+  tabsNow()[1].action();
+  assert.equal(
+    f.mounts.length,
+    count,
+    "returning to a parked tab mounts nothing",
+  );
+  assert.equal(b.root.hidden, false);
+  assert.equal(b.inputActive, true);
+  assert.equal(a.root.hidden, true);
+  f.advance(119000);
+  assert(!a.unmounted, "a recently hidden terminal stays attached");
+  tabsNow()[0].action();
+  tabsNow()[1].action();
+  f.advance(119000);
+  assert(!a.unmounted, "returning to a tab restarts its hidden time");
+  f.advance(1000);
+  assert(a.unmounted, "a terminal hidden for two minutes is released");
+  tabsNow()[0].action();
+  const fresh = f.mounts.at(-1);
+  assert.equal(fresh.options.sessionId, 7, "the released tab reattaches");
+  assert.notEqual(fresh, a);
+  fresh.options.onStatus({ phase: "ready", message: "80 × 24" });
+  tabsNow()[1].action();
+  fresh.options.onStatus({ phase: "disconnected", message: "Disconnected" });
+  assert(fresh.unmounted, "a parked terminal that drops is released");
+  f.view.cleanup();
+  assert(b.unmounted, "cleanup releases the visible terminal");
+
+  const chatSwitch = fixture(
+    [
+      { id: 7, state: "Working", branch: null },
+      { id: 8, state: "Working", branch: "main" },
+    ],
+    undefined,
+    false,
+    { sessionViewModes: { "host:8": "chat" } },
+    { chat: true, sessionKey: (id) => `host:${id}` },
+  );
+  const chatReplaced = [];
+  chatSwitch.ctx.setRoute = (r) => chatReplaced.push(r);
+  chatSwitch.buttons
+    .filter((b) => b.className === "session-tab")
+    .at(-1)
+    .action();
+  assert.deepEqual(
+    chatReplaced,
+    [],
+    "switching to a tab whose saved viewMode is chat avoids in-place route update",
+  );
+  assert.deepEqual(
+    chatSwitch.routes,
+    ["/host/local/group/g/s/8"],
+    "switching to a chat-mode tab navigates via go()",
+  );
+  chatSwitch.view.cleanup();
+  console.log(
+    "PASS tab switch reattaches in place, parks ready terminals, and navigates normally for chat tabs",
+  );
+}
 async function main() {
   await testQuickActions();
   await testDefaultSessionView();
@@ -1757,6 +1849,7 @@ async function main() {
   testHostViewBudgets();
   testImeDefersSnapshotUpdates();
   testSessionBackSkipsSessionHistory();
+  testTabSwitchKeepsScreen();
   {
     const f = fixture([
       { id: 7, state: "Working" },
