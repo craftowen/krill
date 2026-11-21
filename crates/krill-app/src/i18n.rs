@@ -1172,6 +1172,9 @@ catalog! {
         RUNNING_CLOSE_CONFIRM => ("닫기", "Close"),
         RUNNING_CLOSE_CANCEL => ("취소", "Cancel"),
         DONT_ASK_AGAIN => ("다시 묻지 않기", "Don't ask again"),
+        STALE_ACCOUNT_BANNER => ("{prev} 계정으로 실행 중입니다. {next} 계정으로 전환할 수 있습니다.", "Running on {prev}, switch to {next}"),
+        STALE_ACCOUNT_SWITCH_BTN => ("전환", "Switch"),
+        STALE_ACCOUNT_KEEP_BTN => ("유지", "Keep"),
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),
