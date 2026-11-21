@@ -5414,6 +5414,132 @@ async function unboundEmptyAndVisibilityTransitions() {
   console.log(
     "PASS MkKeyboard.keepFocus protects composer accessories without capturing Send",
   );
+
+  // 5) Phase 1B: Markdown overhaul, zero-dep highlighting, colored Diff sheet, Tab/Enter submit, <dialog> modal model sheet, skeleton & streaming dots.
+  {
+    let draftSaved = 0;
+    const p1b = fixture({
+      capabilities: {
+        chat_tail: true,
+        chat_composer: true,
+        composer_models: true,
+        command_catalog: true,
+      },
+      handler: async (req) => {
+        if (req.action === "command_catalog")
+          return { items: [{ name: "compact", text: "/compact", kind: "Command" }] };
+        if (req.action === "composer_models")
+          return {
+            supported: true,
+            current: "m1",
+            items: [{ id: "m1", label: "Model 1", efforts: ["low", "high"] }],
+          };
+        if (req.action === "git")
+          return { patch: "@@ -1 +1 @@\n-old\n+new" };
+        if (req.action === "chat_poll")
+          return {
+            generation: "g-p1b",
+            agent: "claude",
+            bound: true,
+            next_offset: 10,
+            items: [
+              { id: "unk", kind: "unknown_future_kind", text: "ignored" },
+              {
+                id: "md2",
+                kind: "assistant",
+                text:
+                  "Paragraph line 1\nParagraph line 2\n\n#### H4\n##### H5\n###### H6\n---\n- [ ] todo item\n- [x] **done** ~~old~~ _ital_ snake_case\n  - nested\n| A | B |\n| --- | --- |\n| 1 | 2 |\n```rust\nfn main() { let x = 42; }\n```",
+              },
+              {
+                id: "t1",
+                kind: "tool_call",
+                tool_name: "Edit",
+                file_path: "/work/a.rs",
+                text: "edited",
+              },
+            ],
+          };
+        return { sent: true };
+      },
+    });
+    p1b.ctx.saveDrafts = () => {
+      draftSaved++;
+    };
+    const skel = p1b.find("chat-skeleton");
+    assert.equal(skel.hidden, false, "skeleton shows before first poll settles");
+    await flush();
+    assert.equal(skel.hidden, true, "skeleton hides once items load");
+
+    const feedNodes = p1b.find("chat-feed").children;
+    assert(
+      !feedNodes.some((n) => n.className?.includes("unknown_future_kind")),
+      "unknown item kinds are skipped cleanly",
+    );
+    const md = p1b.find("chat-md"),
+      mdDesc = md.descendants();
+    assert(mdDesc.some((n) => n.tag === "p" && n.textContent === "Paragraph line 1 Paragraph line 2"));
+    assert(mdDesc.some((n) => n.tag === "h5" && n.textContent === "H4"));
+    assert(mdDesc.some((n) => n.tag === "h6" && n.textContent === "H5"));
+    assert(mdDesc.some((n) => n.tag === "hr" && n.className === "chat-hr"));
+    assert(mdDesc.some((n) => n.tag === "del" && n.textContent === "old"));
+    assert(mdDesc.some((n) => n.tag === "em" && n.textContent === "ital"));
+    assert(mdDesc.some((n) => n.className === "chat-task" && n.dataset.checked === "true"));
+    assert(mdDesc.some((n) => n.className === "chat-task" && n.dataset.checked === "false"));
+    assert(mdDesc.some((n) => n.className === "chat-table-wrap"), "tables use chat-table-wrap not chat-code");
+    const codeNode = mdDesc.find((n) => n.tag === "code" && n.textContent.includes("fn main()"));
+    assert.equal(codeNode.textContent, "fn main() { let x = 42; }");
+    assert(codeNode.descendants().some((n) => n.className === "tok-kw" && n.textContent === "fn"));
+    assert(codeNode.descendants().some((n) => n.className === "tok-num" && n.textContent === "42"));
+
+    // Diff sheet uses colored diff-added/diff-deleted/diff-hunk lines
+    p1b.button("Current diff").action();
+    await flush();
+    const sheetPre = p1b.sheets.at(-1).body.children[0];
+    assert(sheetPre.descendants().some((n) => n.className?.includes("diff-hunk")));
+    assert(sheetPre.descendants().some((n) => n.className?.includes("diff-deleted")));
+    assert(sheetPre.descendants().some((n) => n.className?.includes("diff-added")));
+
+    // Tab accepts slash autocomplete and Enter submits when suggestions closed
+    p1b.input("/");
+    await flush();
+    const tabEv = new Event("keydown", { cancelable: true });
+    tabEv.key = "Tab";
+    p1b.find("chat-input").dispatchEvent(tabEv);
+    assert(tabEv.defaultPrevented);
+    assert.equal(p1b.find("chat-input").value, "/compact ");
+    assert(draftSaved > 0);
+
+    // Streaming dots toggle on Working state
+    const dots = p1b.find("chat-streaming-dots");
+    assert.equal(dots.hidden, true);
+    p1b.state.sessions.get(7).state = "Working";
+    p1b.update();
+    assert.equal(dots.hidden, false);
+    p1b.state.sessions.get(7).state = "Waiting";
+    p1b.update();
+    assert.equal(dots.hidden, true);
+
+    const enterEv = new Event("keydown", { cancelable: true });
+    enterEv.key = "Enter";
+    p1b.find("chat-input").dispatchEvent(enterEv);
+    await flush();
+    assert(enterEv.defaultPrevented);
+    assert(p1b.calls.some((c) => c.action === "prompt" && c.text === "/compact "));
+
+    // Model picker renders inside modal <dialog class="chat-model-sheet">
+    let modalShown = false;
+    const dlg = p1b.find("chat-composer-box").descendants().find((n) => n.tag === "dialog");
+    p1b.buttons.find((b) => b.className === "composer-pill").action();
+    await flush();
+    const mountedDlg = p1b.find("chat-composer-suggestions").descendants().find((n) => n.tag === "dialog");
+    assert(mountedDlg && mountedDlg.className === "chat-model-sheet");
+    mountedDlg.showModal = () => { modalShown = true; mountedDlg.open = true; };
+    assert.equal(dlg, undefined);
+    assert.equal(mountedDlg.attrs["aria-modal"], "true");
+
+    p1b.dispose();
+    console.log("PASS Phase 1B: Markdown, highlighting, diff sheet, Tab/Enter submit, modal <dialog>, skeleton and streaming dots");
+  }
 }
 main().catch((error) => {
   console.error(error);

@@ -90,17 +90,19 @@
       return;
     }
     const tokens =
-      /\\([\\`*_[\]])|(`+)(.*?)\2(?!`)|(\*\*|__|\*)(?=\S)(.+?\S|\S)\4|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
+      /\\([\\`*_~[\]])|(`+)(.*?)\2(?!`)|(\*\*|__|~~|\*)(?=\S)(.+?\S|\S)\4|(?<![A-Za-z0-9_])_(?=\S)(.+?\S|\S)_(?![A-Za-z0-9_])|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
     let end = 0;
     for (const match of text.matchAll(tokens)) {
       if (match.index > end)
         parent.append(el("span", text.slice(end, match.index)));
-      const [, escaped, ticks, code, mark, body, label, href] = match;
+      const [, escaped, ticks, code, mark, body, ubody, label, href] = match;
       if (escaped) parent.append(el("span", escaped));
       else if (ticks) parent.append(el("code", code, "chat-inline-code"));
-      else if (mark) {
-        const node = el(mark.length === 2 ? "strong" : "em");
-        renderInline(el, node, body, depth + 1);
+      else if (mark || ubody !== undefined) {
+        const tag =
+            mark === "~~" ? "del" : mark === "**" || mark === "__" ? "strong" : "em",
+          node = el(tag);
+        renderInline(el, node, ubody ?? body, depth + 1);
         parent.append(node);
       } else if (/^(https?:\/\/|mailto:)/i.test(href)) {
         const node = el("a");
@@ -378,6 +380,78 @@
       if (!ok) throw Error(t("Copy is not available in this browser"));
     }
   }
+  const HIGHLIGHT_KEYWORDS = new Set([
+    "as","async","await","break","case","catch","class","const","continue","crate",
+    "def","default","defer","delete","do","elif","else","enum","except","export",
+    "extends","false","finally","fn","for","from","func","function","go","guard",
+    "if","impl","import","in","interface","is","lambda","let","loop","match","mod",
+    "mut","new","nil","none","not","null","or","package","pass","priv","pub","raise",
+    "ref","return","self","Self","select","static","struct","super","switch","throw",
+    "trait","true","try","type","typeof","undefined","unsafe","use","var","void",
+    "where","while","with","yield","SELECT","FROM","WHERE","INSERT","INTO","UPDATE",
+    "DELETE","CREATE","TABLE","DROP","ALTER","JOIN","ON","AND","OR","NOT","NULL",
+  ]);
+  const HIGHLIGHT_TYPES = new Set([
+    "bool","boolean","byte","char","f32","f64","float","i8","i16","i32","i64",
+    "i128","int","isize","number","object","str","string","u8","u16","u32","u64",
+    "u128","usize","void","Result","Option","Vec","String","Map","Set","Promise",
+  ]);
+  function highlightCode(el, codeEl, code, langLabel) {
+    const raw = String(code ?? "");
+    if (!raw) return;
+    const lang = String(langLabel || "").toLowerCase();
+    if (lang === "diff") {
+      const lines = raw.split("\n");
+      lines.forEach((line, idx) => {
+        const suffix = idx < lines.length - 1 ? "\n" : "";
+        const cls = line.startsWith("+") && !line.startsWith("+++")
+          ? "diff-line diff-added"
+          : line.startsWith("-") && !line.startsWith("---")
+            ? "diff-line diff-deleted"
+            : line.startsWith("@@")
+              ? "diff-line diff-hunk"
+              : "diff-line";
+        codeEl.append(el("span", line + suffix, cls));
+      });
+      return;
+    }
+    const hashComment = /^(python|bash|shell|zsh|yaml|toml|ruby|dockerfile)$/i.test(lang),
+      sqlComment = lang === "sql",
+      pattern = hashComment
+        ? /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*)|("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)|(@[A-Za-z_]\w*)|(\b(?:0[xXbBoO][\da-fA-F_]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[a-zA-Z_]*)\b)|(\b[A-Za-z_$][\w$]*\b)|([+\-*/%=!<>&|^~?:]+)/g
+        : sqlComment
+          ? /(\/\*[\s\S]*?\*\/|--[^\n]*)|("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')|(\b\d+(?:\.\d+)?\b)|(\b[A-Za-z_]\w*\b)|([+\-*/%=<>!|]+)/g
+          : /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|<!--[\s\S]*?-->)|("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)|(@[A-Za-z_]\w*|#\[[^\]]*\])|(\b(?:0[xXbBoO][\da-fA-F_]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[a-zA-Z_]*)\b)|(\b[A-Za-z_$][\w$]*\b)|([+\-*/%=!<>&|^~?:]+)/g;
+    let last = 0;
+    for (const m of raw.matchAll(pattern)) {
+      if (m.index > last) codeEl.append(el("span", raw.slice(last, m.index)));
+      const [full] = m;
+      let cls;
+      if (m[1]) cls = "tok-com";
+      else if (m[2]) cls = "tok-str";
+      else if (sqlComment ? false : m[3]) cls = "tok-meta";
+      else if (sqlComment ? m[3] : m[4]) cls = "tok-num";
+      else if (sqlComment ? m[4] : m[5]) {
+        const nextChar = raw[m.index + full.length];
+        if (HIGHLIGHT_KEYWORDS.has(full)) cls = "tok-kw";
+        else if (HIGHLIGHT_TYPES.has(full) || (/^[A-Z]/.test(full) && /[a-z]/.test(full))) cls = "tok-ty";
+        else if (nextChar === "(") cls = "tok-fn";
+        else if (lang === "json" && raw.slice(m.index + full.length).match(/^\s*:/)) cls = "tok-var";
+      } else cls = "tok-op";
+      codeEl.append(el("span", full, cls));
+      last = m.index + full.length;
+    }
+    if (last < raw.length) codeEl.append(el("span", raw.slice(last)));
+  }
+  const KNOWN_CHAT_KINDS = new Set([
+    "user",
+    "assistant",
+    "reasoning",
+    "tool_call",
+    "tool_result",
+    "question",
+    "permission",
+  ]);
   function renderRichText(el, text, richOpts) {
     const translate = richOpts?.t || ((s) => s),
       wrap = el("div", undefined, "chat-md"),
@@ -395,7 +469,11 @@
         .split("|")
         .map((s) => s.trim());
     const tableLine = (line) => /^\s*\|.*\|\s*$/.test(line),
-      separator = (line) => cells(line).every((s) => /^:?-{3,}:?$/.test(s));
+      separator = (line) => cells(line).every((s) => /^:?-{3,}:?$/.test(s)),
+      hrLine = (line) =>
+        /^(?: {0,3}(?:-[ \t]*){3,}| {0,3}(?:\*[ \t]*){3,}| {0,3}(?:_[ \t]*){3,})$/.test(
+          line,
+        );
     for (const block of blocks) {
       if (block.kind === "code") {
         const codeWrap = el("div", undefined, "chat-code-wrap"),
@@ -406,8 +484,10 @@
             "chat-code-lang",
           ),
           actions = el("div", undefined, "chat-code-actions"),
-          pre = el("pre", undefined, "chat-code");
-        pre.append(el("code", block.code));
+          pre = el("pre", undefined, "chat-code"),
+          codeEl = el("code");
+        highlightCode(el, codeEl, block.code, block.lang);
+        pre.append(codeEl);
         if (richOpts?.renderCodeWrap) {
           const wrapBtn = richOpts.renderCodeWrap(block, pre);
           if (wrapBtn) actions.append(wrapBtn);
@@ -421,20 +501,30 @@
         wrap.append(codeWrap);
         continue;
       }
-      const lines = block.text.split("\n");
-      let list = null,
-        quote = null;
+      const lines = block.text.split("\n"),
+        listStack = [];
+      let quote = null,
+        para = [];
+      const flushPara = () => {
+        if (!para.length) return;
+        wrap.append(rich("p", para.join(" "), "chat-p"));
+        para = [];
+      };
       for (let n = 0; n < lines.length; n++) {
         const line = lines[n].trimEnd(),
           trimmed = line.trim();
         if (!trimmed) {
-          list = quote = null;
+          flushPara();
+          listStack.length = 0;
+          quote = null;
           continue;
         }
         if (tableLine(line)) {
-          list = quote = null;
+          flushPara();
+          listStack.length = 0;
+          quote = null;
           const table = el("table", undefined, "chat-table"),
-            scroll = el("div", undefined, "chat-code"),
+            scroll = el("div", undefined, "chat-table-wrap"),
             header = tableLine(lines[n + 1] || "") && separator(lines[n + 1]);
           let first = true;
           while (n < lines.length && tableLine(lines[n])) {
@@ -452,37 +542,76 @@
           wrap.append(scroll);
           continue;
         }
-        const heading = trimmed.match(/^(#{1,3})\s+(.*)$/),
-          bullet = trimmed.match(/^(?:([-*])|([0-9]+)[.)])\s+(.*)$/),
+        if (hrLine(line)) {
+          flushPara();
+          listStack.length = 0;
+          quote = null;
+          wrap.append(el("hr", undefined, "chat-hr"));
+          continue;
+        }
+        const heading = trimmed.match(/^(#{1,6})\s+(.*)$/),
+          bullet = line.match(/^(\s*)(?:([-*+])|([0-9]+)[.)])\s+(.*)$/),
           quoted = trimmed.match(/^>\s?(.*)$/);
-        if (quoted) {
-          list = null;
+        if (heading) {
+          flushPara();
+          listStack.length = 0;
+          quote = null;
+          const level = Math.min(6, heading[1].length + 1);
+          wrap.append(rich("h" + level, heading[2], "chat-h"));
+        } else if (quoted) {
+          flushPara();
+          listStack.length = 0;
           if (!quote) {
             quote = el("blockquote", undefined, "chat-quote");
             wrap.append(quote);
           }
           quote.append(rich("p", quoted[1], "chat-p"));
         } else if (bullet) {
+          flushPara();
           quote = null;
-          const tag = bullet[2] ? "ol" : "ul";
-          if (!list || list.dataset.listKind !== tag) {
-            list = el(tag, undefined, tag === "ol" ? "chat-ol" : undefined);
-            list.dataset.listKind = tag;
-            if (bullet[2]) list.setAttribute("start", bullet[2]);
-            wrap.append(list);
+          const indent = bullet[1].replace(/\t/g, "  ").length,
+            tag = bullet[3] ? "ol" : "ul";
+          while (listStack.length && listStack[listStack.length - 1].indent > indent)
+            listStack.pop();
+          if (
+            listStack.length &&
+            listStack[listStack.length - 1].indent === indent &&
+            listStack[listStack.length - 1].tag !== tag
+          )
+            listStack.pop();
+          let top = listStack[listStack.length - 1];
+          if (!top || top.indent < indent) {
+            const listNode = el(tag, undefined, tag === "ol" ? "chat-ol" : "chat-ul");
+            listNode.dataset.listKind = tag;
+            if (bullet[3] && bullet[3] !== "1") listNode.setAttribute("start", bullet[3]);
+            (top?.lastLi || wrap).append(listNode);
+            top = { indent, tag, node: listNode, lastLi: null };
+            listStack.push(top);
           }
-          list.append(rich("li", bullet[3], "chat-li"));
+          const taskMatch =
+            tag === "ul" && /^\[([ xX])\]\s+(.*)$/.exec(bullet[4]);
+          let li;
+          if (taskMatch) {
+            const checked = taskMatch[1].toLowerCase() === "x",
+              box = el("span", checked ? "✓" : " ", "chat-task"),
+              copy = el("span");
+            box.dataset.checked = String(checked);
+            box.setAttribute("aria-hidden", "true");
+            li = el("li", undefined, "chat-li chat-task-li");
+            renderInline(el, copy, taskMatch[2]);
+            li.append(box, copy);
+          } else {
+            li = rich("li", bullet[4], "chat-li");
+          }
+          top.node.append(li);
+          top.lastLi = li;
         } else {
-          list = quote = null;
-          wrap.append(
-            rich(
-              heading ? "h" + (heading[1].length + 1) : "p",
-              heading ? heading[2] : line,
-              heading ? "chat-h" : "chat-p",
-            ),
-          );
+          listStack.length = 0;
+          quote = null;
+          para.push(trimmed);
         }
       }
+      flushPara();
     }
     return wrap;
   }
@@ -772,6 +901,10 @@
     input.rows = 1;
     input.placeholder = t("Message agent (Bracketed Paste)…");
     input.setAttribute("aria-label", t("Chat prompt"));
+    function syncComposerHeight() {
+      if (shell.style && composer.offsetHeight)
+        shell.style.setProperty("--chat-composer-h", composer.offsetHeight + "px");
+    }
     let sizedValue = null,
       sizedWidth = -1;
     function sizeInput(force = false) {
@@ -785,6 +918,7 @@
       if (input.scrollHeight)
         input.style.height =
           Math.min(140, Math.max(28, input.scrollHeight)) + "px";
+      syncComposerHeight();
       if (input.style.height !== prev) {
         if (
           globalThis.document?.activeElement === input &&
@@ -794,6 +928,9 @@
         pinLatest();
       }
     }
+    const saveDrafts = () => {
+      if (ownsEntry()) (ctx.saveDrafts || M.persistDrafts)?.();
+    };
     input.value = drafts.get(sessionId) || "";
     function insertText(text) {
       if (!active()) return false;
@@ -812,6 +949,7 @@
       input.selectionStart = input.selectionEnd = start + clean.length;
       entry.draftVersion = (entry.draftVersion || 0) + 1;
       drafts.set(sessionId, input.value);
+      saveDrafts();
       sizeInput();
       closeSuggestions();
       input.focus?.();
@@ -920,9 +1058,13 @@
     }
     // Late fonts, disclosures, a shown pane or keyboard resize re-pin a following reader.
     const resize = globalThis.ResizeObserver
-      ? new ResizeObserver(() => pinLatest())
+      ? new ResizeObserver(() => {
+          syncComposerHeight();
+          pinLatest();
+        })
       : null;
     resize?.observe(feed);
+    resize?.observe(composer);
     const unsubscribeKeyboard = globalThis.MkKeyboard?.subscribe?.(() => {
       if (!disposed && visible) {
         sizeInput(true);
@@ -1066,12 +1208,14 @@
       input.value
         ? drafts.set(sessionId, input.value)
         : drafts.delete(sessionId);
+      saveDrafts();
     }
     input.addEventListener("input", () => {
       entry.draftVersion = (entry.draftVersion || 0) + 1;
       input.value
         ? drafts.set(sessionId, input.value)
         : drafts.delete(sessionId);
+      saveDrafts();
       sizeInput();
       suggest();
     });
@@ -1209,9 +1353,28 @@
       });
     }
     const suggestions = el("div", undefined, "chat-composer-suggestions"),
+      modelDialog = el("dialog", undefined, "chat-model-sheet"),
       choiceList = el("div", undefined, "chat-composer-options");
     choiceList.id = `chat-composer-options-${sessionId}`;
     suggestions.hidden = true;
+    modelDialog.setAttribute("aria-modal", "true");
+    modelDialog.setAttribute("aria-label", t("Model"));
+    modelDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!suggestions.dataset.pending) {
+        closeSuggestions();
+        input.focus?.();
+      }
+    });
+    modelDialog.addEventListener("click", (event) => {
+      if (
+        event.target === modelDialog &&
+        !suggestions.dataset.pending
+      ) {
+        closeSuggestions();
+        input.focus?.();
+      }
+    });
     suggestions.addEventListener("click", (event) => {
       if (
         picker?.kind === "models" &&
@@ -1349,6 +1512,8 @@
       choices = [];
       delete suggestions.dataset.kind;
       delete suggestions.dataset.pending;
+      if (modelDialog.open && typeof modelDialog.close === "function")
+        modelDialog.close();
       suggestions.hidden = true;
       input.setAttribute("aria-expanded", "false");
       input.setAttribute("aria-activedescendant", "");
@@ -1439,17 +1604,20 @@
         item.node = node;
       }
       if (isModels) {
-        const sheet = el("div", undefined, "chat-model-sheet");
-        sheet.append(el("div", undefined, "sheet-handle"), head);
+        modelDialog.replaceChildren(el("div", undefined, "sheet-handle"), head);
         if (items.length) {
-          sheet.append(choiceList);
-          if (message) sheet.append(el("p", message, "muted chat-picker-note"));
+          modelDialog.append(choiceList);
+          if (message) modelDialog.append(el("p", message, "muted chat-picker-note"));
         } else {
-          if (message) sheet.append(el("p", message, "muted chat-picker-note"));
-          sheet.append(choiceList);
+          if (message) modelDialog.append(el("p", message, "muted chat-picker-note"));
+          modelDialog.append(choiceList);
         }
-        suggestions.append(sheet);
+        suggestions.append(modelDialog);
+        if (!modelDialog.open && typeof modelDialog.showModal === "function")
+          modelDialog.showModal();
       } else {
+        if (modelDialog.open && typeof modelDialog.close === "function")
+          modelDialog.close();
         suggestions.append(head);
         if (message) suggestions.append(el("p", message, "muted"));
         suggestions.append(choiceList);
@@ -1644,31 +1812,45 @@
       if (picker?.kind !== "models") suggest();
     });
     input.addEventListener("keydown", (event) => {
-      if (
-        composing ||
-        event.isComposing ||
-        event.keyCode === 229 ||
-        suggestions.hidden
-      )
+      if (composing || event.isComposing || event.keyCode === 229) return;
+      if (!suggestions.hidden) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          closeSuggestions();
+        } else if (
+          (event.key === "ArrowDown" || event.key === "ArrowUp") &&
+          choices.length
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          choiceIndex =
+            (choiceIndex + (event.key === "ArrowDown" ? 1 : choices.length - 1)) %
+            choices.length;
+          markChoice();
+        } else if (
+          event.key === "Enter" ||
+          (event.key === "Tab" && choices.length)
+        ) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (choices.length) selectChoice(choiceIndex);
+        }
         return;
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        closeSuggestions();
-      } else if (
-        (event.key === "ArrowDown" || event.key === "ArrowUp") &&
-        choices.length
-      ) {
-        event.preventDefault();
-        event.stopPropagation();
-        choiceIndex =
-          (choiceIndex + (event.key === "ArrowDown" ? 1 : choices.length - 1)) %
-          choices.length;
-        markChoice();
-      } else if (event.key === "Enter") {
-        event.preventDefault();
-        event.stopPropagation();
-        if (choices.length) selectChoice(choiceIndex);
+      }
+      if (event.key === "Enter") {
+        const modSubmit = Boolean(event.metaKey || event.ctrlKey),
+          plainEnter = !event.shiftKey && !event.altKey && !modSubmit,
+          desktopPointer =
+            typeof globalThis.matchMedia !== "function" ||
+            !globalThis.matchMedia("(pointer: coarse)")?.matches;
+        if (modSubmit || (plainEnter && desktopPointer)) {
+          event.preventDefault();
+          if (typeof composer.requestSubmit === "function")
+            composer.requestSubmit();
+          else
+            composer.dispatchEvent(new Event("submit", { cancelable: true }));
+        }
       }
     });
     function openModelCommand(start, end) {
@@ -1678,6 +1860,7 @@
       input.value
         ? drafts.set(sessionId, input.value)
         : drafts.delete(sessionId);
+      saveDrafts();
       sizeInput();
       chooseModel();
     }
@@ -2363,6 +2546,7 @@
             drafts.get(sessionId) === text
           ) {
             drafts.delete(sessionId);
+            saveDrafts();
             entry.notifyComposer?.({ version, text });
           }
           if (photo && entry.photo === photo) entry.photo = null;
@@ -2398,7 +2582,19 @@
       liveTitle,
     );
     liveCard.append(liveCopy, liveOpen);
-    shell.append(history, pollStatus, feed, jumpBtn, liveCard, composer);
+    const skeleton = el("div", undefined, "chat-skeleton");
+    skeleton.setAttribute("aria-hidden", "true");
+    skeleton.append(
+      el("div", undefined, "chat-skeleton-bar short"),
+      el("div", undefined, "chat-skeleton-bar long"),
+      el("div", undefined, "chat-skeleton-bar medium"),
+    );
+    skeleton.hidden = true;
+    const streamingDots = el("div", undefined, "chat-streaming-dots");
+    streamingDots.setAttribute("aria-hidden", "true");
+    streamingDots.append(el("span"), el("span"), el("span"));
+    streamingDots.hidden = true;
+    shell.append(history, pollStatus, feed, skeleton, streamingDots, jumpBtn, liveCard, composer);
     root.replaceChildren(shell);
     // Only a complete live terminal screen supplies an answer target. Historical cards stay inert.
     let liveQuestion = null,
@@ -2868,8 +3064,9 @@
         idx < entry.items.length;
         idx++
       ) {
-        const item = entry.items[idx],
-          key = itemKey(item, idx),
+        const item = entry.items[idx];
+        if (item.kind && !KNOWN_CHAT_KINDS.has(item.kind)) continue;
+        const key = itemKey(item, idx),
           isFoldedNote = Boolean(foldable[idx]);
         let card = null;
         if (!isFoldedNote) {
@@ -3155,6 +3352,12 @@
       syncQuestionCards();
       syncLiveCardVisibility();
       syncOptimistic();
+      skeleton.hidden = !(
+        !entry.loaded &&
+        !entry.items.length &&
+        !optimisticText() &&
+        state.connection?.phase === "ready"
+      );
       pinLatest();
       restoreReader(anchor);
     }
@@ -3291,9 +3494,20 @@
             ),
           );
         if (item.text && item.text !== item.file_path)
-          lazyDetails(details, () =>
-            details.append(el("pre", item.text, "chat-tool-body")),
-          );
+          lazyDetails(details, () => {
+            const isDiff =
+              toolCategory(item.tool_name) === "fileChange" &&
+              /^(?:@@ |\+\+\+ |--- |diff --git |\*\*\* Update File:)/m.test(
+                item.text,
+              );
+            const pre = el(
+              "pre",
+              isDiff ? undefined : item.text,
+              isDiff ? "chat-tool-body git-patch" : "chat-tool-body",
+            );
+            if (isDiff) renderDiffContent(pre, item.text);
+            details.append(pre);
+          });
         card.append(details);
       } else if (kind === "question") renderQuestionCard(card, item, key);
       else if (kind === "permission") {
@@ -3550,6 +3764,26 @@
       card._syncQuestion = syncCard;
       syncCard();
     }
+    function renderDiffContent(container, value) {
+      if (typeof M.renderDiffLines === "function") {
+        M.renderDiffLines(container, value, {
+          el,
+          signal: ctx.signal,
+          uiTextScale: state.preferences?.uiTextScale,
+        });
+        return;
+      }
+      container.replaceChildren();
+      for (const line of String(value ?? "").split("\n")) {
+        container.append(
+          el(
+            "span",
+            line + "\n",
+            `diff-line ${line.startsWith("+") && !line.startsWith("+++") ? "diff-added" : line.startsWith("-") && !line.startsWith("---") ? "diff-deleted" : line.startsWith("@@") ? "diff-hunk" : ""}`,
+          ),
+        );
+      }
+    }
     function openDiff(filePath) {
       run(async () => {
         const normalizePrefix = (p) =>
@@ -3578,13 +3812,13 @@
                 : t(
                     "No current changes for this file. This is a historical tool record; its earlier diff is not stored here.",
                   );
-            body.append(
-              el(
-                "pre",
-                data?.patch || message,
-                data?.patch ? "chat-code" : "muted",
-              ),
-            );
+            if (data?.patch) {
+              const pre = el("pre", undefined, "chat-code git-patch");
+              renderDiffContent(pre, data.patch);
+              body.append(pre);
+            } else {
+              body.append(el("pre", message, "muted"));
+            }
           },
         );
       });
@@ -3712,6 +3946,17 @@
         .filter(Boolean)
         .join(" · ");
       statusLine.title = statusText.textContent;
+      skeleton.hidden = !(
+        !entry.loaded &&
+        !entry.items.length &&
+        !optimisticText() &&
+        state.connection?.phase === "ready"
+      );
+      streamingDots.hidden = !(
+        state.connection?.phase === "ready" &&
+        state.sessions?.get(sessionId)?.state === "Working" &&
+        !liveQuestion
+      );
       syncTailRunSummary();
       syncAgent();
     }
@@ -4305,6 +4550,8 @@
     sortEfforts,
     fenceLang,
     parseRichBlocks,
+    highlightCode,
+    renderRichText,
     userMessageFolds,
   };
   M.screens.chat = (root, ctx) => {

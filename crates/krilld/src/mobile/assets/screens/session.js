@@ -898,6 +898,7 @@
         () => {},
         "ghost small mode-toggle",
       ),
+      button(t("Source Control"), () => {}, "icon-button session-git-btn", "git"),
       button(t("Terminal actions"), () => {}, "icon-button", "more"),
     ]) {
       node.disabled = true;
