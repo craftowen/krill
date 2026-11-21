@@ -2341,18 +2341,30 @@ async function main() {
   assert.equal(sheet.length, 0);
   sheet.render(body);
   assert.deepEqual(
-    body.children.map((b) => [
-      b.textContent,
+    body.children.map((b) => b.className),
+    [
+      "segmented new-tab-mode",
+      "new-tab-grid",
+      "sheet-group new-tab-terminal-group",
+    ],
+  );
+  const tiles = body.children[1].children;
+  assert.deepEqual(
+    tiles.map((b) => [
+      b.children[1].textContent,
       b.className,
       b.children[0].attrs.class,
     ]),
     [
-      ["Claude Code", "sheet-action provider", "agent-icon claude"],
-      ["Codex", "sheet-action provider", "agent-icon codex"],
-      ["Terminal", "sheet-action provider", "agent-icon"],
+      ["Claude Code", "new-tab-tile", "agent-icon claude"],
+      ["Codex", "new-tab-tile", "agent-icon codex"],
     ],
   );
-  await body.children[0].action();
+  const cliBtn = body.children[0].children.find((b) => b.dataset.mode === "term");
+  cliBtn.action();
+  assert.equal(cliBtn.getAttribute("aria-pressed"), "true");
+  await tiles[0].action();
+  assert.equal(f.state.ui.newTabMode, "term");
   assert.equal(
     JSON.stringify(f.calls.at(-1)),
     '{"action":"create_terminal","cwd_session":7,"agent":"claude"}',
@@ -2361,7 +2373,7 @@ async function main() {
   await add.action();
   body = new Element("div");
   f.sheets.at(-1).render(body);
-  await body.children[2].action();
+  await body.children[2].children[0].action();
   assert.equal(
     JSON.stringify(f.calls.at(-1)),
     '{"action":"create_terminal","cwd_session":7}',
@@ -2376,8 +2388,84 @@ async function main() {
   assert(!f.sheets.at(-1).some((e) => e.label === "Create Tab"));
   f.view.cleanup();
   console.log(
-    "PASS + opens provider sheet (old-daemon Claude/Codex fallback + Terminal) and hands the picked agent to the shared instant create flow",
+    "PASS + opens Orca New Tab sheet (Chat/CLI toggle + agent tiles + Terminal) and hands the picked agent to the shared instant create flow",
   );
+  // Header Git shortcut (routes to /git/<id> before :last-child More) and Safari-style .tab-count-btn + Tabs Sheet
+  const hdrFx = fixture(undefined, {
+    capabilities: { session_create: true, session_close: true },
+  });
+  const s7 = hdrFx.state.sessions.get(7);
+  s7.branch = null;
+  hdrFx.view.update();
+  const gitBtn = hdrFx.buttons.find((b) =>
+    b.className.includes("session-git-btn"),
+  );
+  assert.equal(gitBtn.hidden, true, "Git header shortcut hides without branch");
+  s7.branch = "main";
+  const hdrGroup = hdrFx.state.groups.get("g");
+  const bgWait = {
+    id: 8,
+    agent: "codex",
+    title: "Background",
+    state: "Waiting",
+    exited: false,
+    cwd: "/repo",
+    groupKey: "g",
+    branch: "main",
+  };
+  const bgDone = {
+    id: 9,
+    agent: "claude",
+    title: "Done tab",
+    state: "Done",
+    exited: false,
+    cwd: "/repo",
+    groupKey: "g",
+    branch: "main",
+  };
+  hdrFx.state.sessions.set(8, bgWait);
+  hdrFx.state.sessions.set(9, bgDone);
+  hdrGroup.sessions.push(bgWait, bgDone);
+  hdrFx.view.update();
+  assert.equal(gitBtn.hidden, false, "Git header shortcut shows with branch");
+  const hdrIcons = gitBtn.parentElement.children.filter((n) =>
+    String(n.className || "").includes("icon-button"),
+  );
+  assert.equal(
+    hdrIcons.at(-1).textContent,
+    "Terminal actions",
+    "More button remains :last-child icon-button in session header",
+  );
+  gitBtn.action();
+  assert.equal(hdrFx.routes.at(-1), "/git/7");
+  const tabCountBtn = hdrFx.buttons.find((b) =>
+    b.className.includes("tab-count-btn"),
+  );
+  assert.equal(
+    tabCountBtn.children[0].textContent,
+    "3",
+    "tab count shows live tab count",
+  );
+  assert.equal(
+    tabCountBtn.children[1].hidden,
+    false,
+    "background Waiting tab reveals tab-count alert dot",
+  );
+  tabCountBtn.action();
+  const tabsBody = new Element("div");
+  hdrFx.sheets.at(-1).render(tabsBody);
+  const headings = tabsBody
+    .descendants()
+    .filter((n) => String(n.className || "").includes("sheet-section-label"))
+    .map((n) => n.textContent);
+  assert.deepEqual(headings, ["Needs you", "Working", "Everything else"]);
+  assert(
+    tabsBody
+      .descendants()
+      .some((n) => String(n.className || "").includes("tab-sheet-close")),
+    "Tabs sheet shows close action when session_close is capable",
+  );
+  hdrFx.view.cleanup();
   f = fixture(undefined, {
     capabilities: { session_create: true },
     agents: [
@@ -2394,18 +2482,18 @@ async function main() {
   body = new Element("div");
   f.sheets.at(-1).render(body);
   assert.deepEqual(
-    body.children.map((b) => [
-      b.textContent,
+    body.children[1].children.map((b) => [
+      b.children[1].textContent,
       b.children[0].attrs.class || b.children[0].className,
     ]),
     [
       ["Claude Code", "agent-icon claude"],
       ["OpenCode", "agent-icon opencode"],
       ["My Bot", "agent-icon custom"],
-      ["Terminal", "agent-icon"],
     ],
   );
-  await body.children[2].action();
+  assert.equal(body.children[2].children[0].textContent, "Terminal");
+  await body.children[1].children[2].action();
   assert.equal(
     JSON.stringify(f.calls.at(-1)),
     '{"action":"create_terminal","cwd_session":7,"agent":"my-bot"}',
@@ -2419,9 +2507,10 @@ async function main() {
   body = new Element("div");
   f.sheets.at(-1).render(body);
   assert.deepEqual(
-    body.children.map((b) => b.textContent),
-    ["Terminal"],
+    body.children.map((b) => b.className),
+    ["segmented new-tab-mode", "sheet-group new-tab-terminal-group"],
   );
+  assert.equal(body.children[1].children[0].textContent, "Terminal");
   f.view.cleanup();
   console.log(
     "PASS + sheet lists snapshot agents (custom profiles included) then Terminal; empty list leaves Terminal only",

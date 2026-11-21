@@ -184,3 +184,108 @@ fn excluded_known_alias_is_rejected_before_any_pty_write() {
     session.wait().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn observe_screen_reads_idle_statusline_and_welcome_banner() {
+    let footer = composer_below(&["  Claude Code v2.1.316"]);
+    assert_eq!(
+        observe_screen(&footer),
+        Some(("opus".into(), "Opus 5.5".into(), Some("high".into())))
+    );
+
+    let banner_only = screen(&[
+        " * ▐▛███▜▌ *   Claude Code v2.1.316",
+        "* ▝▜█████▛▘ *  Opus 5.5 (1M context) · Claude Max",
+        " *  ▘▘ ▝▝  *   ~/project",
+    ]);
+    assert_eq!(
+        observe_screen(&banner_only),
+        Some(("opus".into(), "Opus 5.5".into(), None))
+    );
+
+    for (line, expected_id, expected_label, expected_effort) in [
+        (
+            "Opus 5.5 (1M context) · max",
+            "opus",
+            "Opus 5.5",
+            Some("max"),
+        ),
+        (
+            "Sonnet 5.5 · medium · Claude Pro",
+            "sonnet",
+            "Sonnet 5.5",
+            Some("medium"),
+        ),
+        ("Haiku 5.5 · low", "haiku", "Haiku 5.5", Some("low")),
+        ("Fable 5.1", "fable", "Fable 5.1", None),
+    ] {
+        let s = screen(&["Claude Code v2.1.316", RULE, "❯\u{a0}", RULE, line]);
+        assert_eq!(
+            observe_screen(&s),
+            Some((
+                expected_id.into(),
+                expected_label.into(),
+                expected_effort.map(str::to_owned),
+            ))
+        );
+    }
+
+    let narrow_banner = screen(&[
+        "Claude Code v2.1.316",
+        "▝▜█████▛▘  Opus 5.5 (1M",
+        "  ▘▘ ▝▝    context) · Claude Max",
+    ]);
+    assert_eq!(
+        observe_screen(&narrow_banner),
+        Some(("opus".into(), "Opus 5.5".into(), None))
+    );
+
+    let narrow_footer = screen(&[
+        RULE,
+        "❯\u{a0}",
+        RULE,
+        "  Sonnet 5.5 (200k context)",
+        "  · xhigh",
+    ]);
+    assert_eq!(
+        observe_screen(&narrow_footer),
+        Some(("sonnet".into(), "Sonnet 5.5".into(), Some("xhigh".into())))
+    );
+}
+
+#[test]
+fn observe_screen_and_parser_reject_prose() {
+    assert!(parse_model_spec("I prefer Opus 5.5 for coding").is_none());
+    assert!(parse_model_spec("Opus 5.5 is faster than Sonnet 5.5").is_none());
+    assert!(parse_model_spec("Please use Sonnet 5.5 · medium.").is_none());
+
+    let prose = screen(&[
+        "Claude Code v2.1.316",
+        "~/project",
+        "",
+        "Try Opus 5.5 (1M context) · high on difficult tasks.",
+        "",
+        "Opus 5.5 works best with explicit plans.",
+        "────────────────────────",
+        "Opus 5.5 · high",
+    ]);
+    assert!(observe_screen(&prose).is_none());
+}
+
+#[test]
+fn stale_startup_banner_never_overwrites_existing_running_model() {
+    let banner = screen(&[
+        " * ▐▛███▜▌ *   Claude Code v2.1.316",
+        "* ▝▜█████▛▘ *  Opus 5.5 · high",
+    ]);
+    let mut status = json!({
+        "agent": "claude",
+        "model": "claude-sonnet-5-5",
+        "model_label": null,
+        "effort": null
+    });
+    merge_screen_observation(&mut status, &banner);
+    assert_eq!(status["model"], "claude-sonnet-5-5");
+    assert!(status["model_label"].is_null());
+    assert!(status["effort"].is_null());
+}

@@ -886,11 +886,12 @@
     summary.append(liveDot, summaryText);
     header.querySelector("h1").parentElement.append(summary);
 
-    const pendingMode = sessionView(
-      state.preferences,
-      "new",
-      Boolean(M.chat?.mount),
-    );
+    const pendingMode =
+      job.viewMode === "chat" && M.chat?.mount
+        ? "chat"
+        : job.viewMode === "term"
+          ? "term"
+          : sessionView(state.preferences, "new", Boolean(M.chat?.mount));
     for (const node of [
       button(
         t(pendingMode === "chat" ? "Term" : "Chat"),
@@ -961,18 +962,41 @@
     if (pendingMode === "chat") {
       const chatView = el("div", undefined, "chat-view pending-chat"),
         feed = el("div", undefined, "chat-feed"),
+        empty = el("div", undefined, "chat-empty"),
         composer = el("footer", undefined, "chat-composer"),
         box = el("div", undefined, "chat-composer-box"),
         input = el("textarea", undefined, "chat-input"),
-        statusRow = el("div", undefined, "chat-status-row");
+        statusRow = el("div", undefined, "chat-status-row"),
+        leading = el("div", undefined, "composer-leading"),
+        attachBtn = button(
+          t("Photo"),
+          () => {},
+          "icon-button composer-icon",
+          "plus",
+        ),
+        modelBtn = el("button", t("Model"), "composer-pill"),
+        sendBtn = el("button", undefined, "primary composer-send");
+      empty.append(el("p", t("Start a conversation"), "muted"));
+      feed.append(empty);
       input.disabled = true;
       input.rows = 1;
       input.placeholder = job.agent
-        ? t("Message {0}", agentName(job.agent)).replace("{0}", agentName(job.agent))
+        ? t("Message {0}", agentName(job.agent)).replace(
+            "{0}",
+            agentName(job.agent),
+          )
         : t("Connecting…");
+      attachBtn.disabled = true;
+      modelBtn.type = "button";
+      modelBtn.disabled = true;
+      sendBtn.type = "button";
+      sendBtn.disabled = true;
+      sendBtn.append(ctx.icon("arrowUp"));
       composer.setAttribute("aria-hidden", "true");
-      box.append(input);
-      composer.append(box, statusRow);
+      leading.append(attachBtn, modelBtn);
+      statusRow.append(leading, sendBtn);
+      box.append(input, statusRow);
+      composer.append(box);
       chatView.append(feed, composer);
       pane.append(chatView);
     } else {
@@ -1090,6 +1114,13 @@
       "ghost small mode-toggle",
     );
     header.append(modeBtn);
+    const gitBtn = button(
+      t("Source Control"),
+      () => go(`/git/${activeSession().id}`),
+      "icon-button session-git-btn",
+      "git",
+    );
+    header.append(gitBtn);
     const more = button(
       t("Terminal actions"),
       () => actions(activeSession()),
@@ -1130,6 +1161,13 @@
       items[next].scrollIntoView?.({ block: "nearest", inline: "nearest" });
     });
     tabs.append(scroll);
+    const tabCountBtn = button("", () => showTabsSheet(), "tab-count-btn"),
+      tabCountBox = el("span", "1", "tab-count-box"),
+      tabCountAlert = el("span", undefined, "tab-count-alert");
+    tabCountAlert.hidden = true;
+    tabCountAlert.setAttribute("aria-hidden", "true");
+    tabCountBtn.append(tabCountBox, tabCountAlert);
+    tabs.append(tabCountBtn);
     let add;
     if (state.snapshot?.capabilities?.session_create) {
       add = button(t("Create Tab"), newSession, "tab-add", "plus");
@@ -1347,25 +1385,160 @@
       );
     }
 
+    function showTabsSheet() {
+      const active = activeSession(),
+        activeGroup = state.groups.get(active.groupKey) || group,
+        all = (activeGroup?.sessions || []).filter(live),
+        seen = new Map(),
+        labeled = all.map((s) => {
+          const agent = sessionAgent(s),
+            base =
+              cleanTitle(s.title) ||
+              titles.get(s.id) ||
+              agentName(agent) ||
+              "Shell",
+            n = (seen.get(base) || 0) + 1;
+          seen.set(base, n);
+          return { s, agent, label: n > 1 ? `${base} ${n}` : base };
+        }),
+        buckets = [
+          [
+            "Needs you",
+            labeled.filter((x) => ["Waiting", "Blocked"].includes(x.s.state)),
+          ],
+          ["Working", labeled.filter((x) => x.s.state === "Working")],
+          [
+            "Everything else",
+            labeled.filter(
+              (x) => !["Waiting", "Blocked", "Working"].includes(x.s.state),
+            ),
+          ],
+        ].filter(([, items]) => items.length);
+      ctx.sheet(t("Tabs"), [], activeGroup?.label, (body) => {
+        for (const [heading, items] of buckets) {
+          body.append(el("p", t(heading), "eyebrow sheet-section-label"));
+          const box = el("div", undefined, "sheet-group tab-sheet-group");
+          for (const { s, agent, label } of items) {
+            const status = s.exited ? "Exited" : s.state || "Unknown",
+              row = el("div", undefined, "tab-sheet-row"),
+              main = button(
+                "",
+                () => {
+                  ctx.closeSheet();
+                  const latest = state.sessions.get(s.id);
+                  if (latest) selectTab(latest);
+                },
+                "tab-sheet-main",
+              ),
+              copy = el("span", undefined, "tab-sheet-copy"),
+              dot = ctx.dot(status);
+            main.setAttribute("aria-current", String(s.id === active.id));
+            copy.append(
+              el("strong", label),
+              el("small", t(status), "muted"),
+            );
+            main.append(dot, agentIcon(agent), copy);
+            if (s.id === active.id) {
+              const checkWrap = el("span", undefined, "tab-sheet-check");
+              checkWrap.append(ctx.icon("check"));
+              main.append(checkWrap);
+            }
+            row.append(main);
+            if (state.snapshot?.capabilities?.session_close) {
+              row.append(
+                button(
+                  t("Close terminal"),
+                  async () => {
+                    ctx.closeSheet();
+                    await ctx.rpc({ action: "close_terminal", session: s.id });
+                    ctx
+                      .refresh()
+                      .then(() => {
+                        if (ctx.signal.aborted) return;
+                        const next = state.groups.get(group.key);
+                        go(next ? ctx.groupRoute(next) : "/host/local");
+                      })
+                      .catch(ctx.error);
+                  },
+                  "icon-button tab-sheet-close",
+                  "close",
+                ),
+              );
+            }
+            box.append(row);
+          }
+          body.append(box);
+        }
+      });
+    }
+
     function newSession() {
       // 고르는 동안 터미널 소켓 핸드셰이크를 끝내 둔다. 안 쓰면 다음 터미널이 가져간다.
       ctx.transport?.prewarmTerminal?.();
       const agents =
         state.snapshot?.agents ||
         ["claude", "codex"].map((id) => ({ id, name: agentName(id) }));
+      let pickedMode =
+        state.preferences?.defaultSessionView === "term" ? "term" : "chat";
       ctx.sheet(t("New session"), [], undefined, (body) => {
-        for (const a of [...agents, { id: "", name: t("Terminal") }]) {
-          const b = button(
-            a.name || agentName(a.id),
-            async () => {
-              ctx.closeSheet();
-              await create(a.id);
-            },
-            "sheet-action provider",
-          );
-          b.prepend(agentIcon(a.id));
-          body.append(b);
+        const modeBar = el("div", undefined, "segmented new-tab-mode");
+        modeBar.setAttribute("role", "group");
+        modeBar.setAttribute("aria-label", t("Mode"));
+        const modeButtons = [
+            ["chat", "Chat"],
+            ["term", "CLI"],
+          ].map(([mode, label]) => {
+            const b = button(
+              t(label),
+              () => {
+                pickedMode = mode;
+                syncModes();
+              },
+              "segment",
+            );
+            b.dataset.mode = mode;
+            return b;
+          }),
+          syncModes = () => {
+            for (const b of modeButtons)
+              b.setAttribute("aria-pressed", String(b.dataset.mode === pickedMode));
+          };
+        syncModes();
+        modeBar.append(...modeButtons);
+        body.append(modeBar);
+        if (agents.length) {
+          const grid = el("div", undefined, "new-tab-grid");
+          for (const a of agents) {
+            const label = a.name || agentName(a.id),
+              b = button(
+                "",
+                async () => {
+                  (state.ui ||= {}).newTabMode = pickedMode;
+                  ctx.closeSheet();
+                  await create(a.id);
+                },
+                "new-tab-tile",
+              );
+            b.dataset.agent = a.id;
+            b.setAttribute("aria-label", label);
+            b.append(agentIcon(a.id), el("span", label, "new-tab-tile-label"));
+            grid.append(b);
+          }
+          body.append(grid);
         }
+        const termGroup = el("div", undefined, "sheet-group new-tab-terminal-group"),
+          termBtn = button(
+            t("Terminal"),
+            async () => {
+              (state.ui ||= {}).newTabMode = "term";
+              ctx.closeSheet();
+              await create("");
+            },
+            "sheet-action provider new-tab-terminal",
+          );
+        termBtn.prepend(agentIcon(""));
+        termGroup.append(termBtn);
+        body.append(termGroup);
       });
     }
     function create(agent) {
@@ -2101,6 +2274,8 @@
         activeGroup = state.groups.get(active.groupKey) || group;
       ctx.rememberSession?.(active, activeGroup);
       title.textContent = activeGroup.label;
+      gitBtn.hidden = active.branch === null || active.branch === undefined;
+      gitBtn.disabled = state.connection.phase !== "ready";
       tabs.setAttribute(
         "aria-label",
         t(splitSession ? "Terminals in active pane" : "Terminals"),
@@ -2229,6 +2404,17 @@
         if (anchor?.parentElement === scroll)
           scroll.scrollLeft += anchor.getBoundingClientRect().left - anchorLeft;
       }
+      const liveSessions = activeGroup.sessions.filter(live),
+        bgNeedsYou = liveSessions.some(
+          (s) => s.id !== active.id && ["Waiting", "Blocked"].includes(s.state),
+        );
+      tabCountBox.textContent = String(liveSessions.length);
+      tabCountAlert.hidden = !bgNeedsYou;
+      tabCountBtn.setAttribute(
+        "aria-label",
+        t("Tabs ({0})", liveSessions.length),
+      );
+      tabCountBtn.title = t("Tabs ({0})", liveSessions.length);
       if (add) add.disabled = state.connection.phase !== "ready";
       chatHandle?.update?.();
       if (
