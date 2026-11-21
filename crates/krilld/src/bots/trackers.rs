@@ -14,11 +14,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::bots::{
-    BotConfig, BotConnectorStatus, BotErrorCategory, BotErrorDetail, BotId, BotItemActor,
-    BotItemLink, BotItemStatus, ConnectorHealthState, CreateBotItemParams, ExternalSource,
+    BotConfig, BotConnectorStatus, BotConnectorTestResult, BotErrorCategory, BotErrorDetail, BotId,
+    BotItemActor, BotItemLink, BotItemStatus, ConnectorHealthState, CreateBotItemParams,
+    ExternalSource,
 };
 
-use crate::bots::http_client::{self, HttpRequest};
+use crate::bots::http_client::{self, HttpRequest, SsrfPolicy};
 use crate::bots::items::BotItemsStore;
 use crate::bots::secrets::SecretVault;
 use crate::bots::store::BotStore;
@@ -27,6 +28,19 @@ use crate::session::lock;
 const STACK_SIZE: usize = 128 * 1024;
 const DEFAULT_POLL_SECS: u64 = 60;
 const GH_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_GH_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+fn policy_for_url(url: &str) -> SsrfPolicy {
+    if cfg!(test)
+        && (url.starts_with("http://127.0.0.1")
+            || url.starts_with("http://localhost")
+            || url.starts_with("http://[::1]"))
+    {
+        SsrfPolicy::AllowLoopback
+    } else {
+        SsrfPolicy::StrictExternal
+    }
+}
 
 /// Overridable API endpoints for GitHub REST and Linear GraphQL (defaults to production URLs).
 #[derive(Debug, Clone)]
@@ -80,7 +94,8 @@ pub fn poll_github_bot(
                 &HttpRequest::get(&url)
                     .with_header("Authorization", &auth)
                     .with_header("Accept", "application/vnd.github+json")
-                    .with_header("X-GitHub-Api-Version", "2022-11-28"),
+                    .with_header("X-GitHub-Api-Version", "2022-11-28")
+                    .with_ssrf_policy(policy_for_url(&url)),
             )
             .map_err(|err| tracker_transport_err("GitHub", &err))?;
             if resp.status == 401 || resp.status == 403 {
@@ -113,16 +128,17 @@ pub fn poll_github_bot(
                     if raw_url.is_empty() {
                         continue;
                     }
+                    let html_url = github_api_url_to_html_url(raw_url);
                     let link = if subject_type.eq_ignore_ascii_case("PullRequest") {
-                        BotItemLink::Pr(raw_url.to_owned())
+                        BotItemLink::Pr(html_url)
                     } else {
-                        BotItemLink::Url(raw_url.to_owned())
+                        BotItemLink::Url(html_url)
                     };
                     let reason = notif
                         .get("reason")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
-                    let status = if reason == "review_requested" || reason == "mention" {
+                    let status = if matches!(reason, "review_requested" | "mention" | "assign") {
                         BotItemStatus::NeedsYou
                     } else {
                         BotItemStatus::Planned
@@ -145,7 +161,8 @@ pub fn poll_github_bot(
                     &HttpRequest::get(&prs_url)
                         .with_header("Authorization", &auth)
                         .with_header("Accept", "application/vnd.github+json")
-                        .with_header("X-GitHub-Api-Version", "2022-11-28"),
+                        .with_header("X-GitHub-Api-Version", "2022-11-28")
+                        .with_ssrf_policy(policy_for_url(&prs_url)),
                 )
                 .map_err(|err| tracker_transport_err("GitHub", &err))?;
                 if resp.status == 401 || resp.status == 403 {
@@ -162,6 +179,36 @@ pub fn poll_github_bot(
                     for pr in prs {
                         created = created.saturating_add(ingest_github_pr(
                             items, &bot.id, repo, &pr, &actor, current_ms,
+                        ));
+                    }
+                }
+
+                let issues_url = format!("{base}/repos/{repo}/issues?state=open&per_page=10");
+                let issues_resp = http_client::send(
+                    &HttpRequest::get(&issues_url)
+                        .with_header("Authorization", &auth)
+                        .with_header("Accept", "application/vnd.github+json")
+                        .with_header("X-GitHub-Api-Version", "2022-11-28")
+                        .with_ssrf_policy(policy_for_url(&issues_url)),
+                )
+                .map_err(|err| tracker_transport_err("GitHub", &err))?;
+                if issues_resp.status == 401 || issues_resp.status == 403 {
+                    return Err(BotErrorDetail {
+                        category: BotErrorCategory::SignedOut,
+                        agent_name: None,
+                        message: format!(
+                            "GitHub authentication failed (HTTP {})",
+                            issues_resp.status
+                        ),
+                        resets_at_ms: None,
+                    });
+                }
+                if issues_resp.is_success()
+                    && let Ok(issues) = issues_resp.json::<Vec<serde_json::Value>>()
+                {
+                    for issue in issues {
+                        created = created.saturating_add(ingest_github_issue(
+                            items, &bot.id, repo, &issue, &actor, current_ms,
                         ));
                     }
                 }
@@ -189,6 +236,11 @@ pub fn poll_github_bot(
                     .and_then(|s| s.get("title"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("GitHub notification");
+                let subject_type = notif
+                    .get("subject")
+                    .and_then(|s| s.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
                 let raw_url = notif
                     .get("subject")
                     .and_then(|s| s.get("url"))
@@ -197,13 +249,19 @@ pub fn poll_github_bot(
                 if raw_url.is_empty() {
                     continue;
                 }
+                let html_url = github_api_url_to_html_url(raw_url);
+                let link = if subject_type.eq_ignore_ascii_case("PullRequest") {
+                    BotItemLink::Pr(html_url)
+                } else {
+                    BotItemLink::Url(html_url)
+                };
                 if create_dedup_item(
                     items,
                     &bot.id,
                     title,
                     None,
                     BotItemStatus::Planned,
-                    BotItemLink::Url(raw_url.to_owned()),
+                    link,
                     &actor,
                     current_ms,
                 ) {
@@ -226,10 +284,87 @@ pub fn poll_github_bot(
                     ));
                 }
             }
+            let issues_endpoint = format!("repos/{repo}/issues?state=open&per_page=10");
+            if let Ok(issues_json) = run_gh_cli(&["api", &issues_endpoint])
+                && let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&issues_json)
+            {
+                for issue in issues {
+                    created = created.saturating_add(ingest_github_issue(
+                        items, &bot.id, repo, &issue, &actor, current_ms,
+                    ));
+                }
+            }
         }
     }
 
     Ok(created)
+}
+
+fn ingest_github_issue(
+    items: &BotItemsStore,
+    bot_id: &BotId,
+    repo: &str,
+    issue: &serde_json::Value,
+    actor: &BotItemActor,
+    current_ms: u64,
+) -> usize {
+    // GitHub `/issues` endpoint also includes PRs marked with a `pull_request` object.
+    if issue.get("pull_request").is_some_and(|v| !v.is_null()) {
+        return 0;
+    }
+    let Some(html_url) = issue.get("html_url").and_then(serde_json::Value::as_str) else {
+        return 0;
+    };
+    let number = issue.get("number").and_then(serde_json::Value::as_u64);
+    let raw_title = issue
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Issue");
+    let title = match number {
+        Some(n) => format!("{repo} #{n}: {raw_title}"),
+        None => format!("{repo}: {raw_title}"),
+    };
+    let has_assignee = issue
+        .get("assignees")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let status = if has_assignee {
+        BotItemStatus::NeedsYou
+    } else {
+        BotItemStatus::Planned
+    };
+    let body = issue
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.chars().take(1_000).collect());
+    usize::from(create_dedup_item(
+        items,
+        bot_id,
+        &title,
+        body,
+        status,
+        BotItemLink::Url(html_url.to_owned()),
+        actor,
+        current_ms,
+    ))
+}
+
+fn github_api_url_to_html_url(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("https://api.github.com/repos/") {
+        // Handle `/repos/{owner}/{repo}/pulls/{n}` and `/repos/{owner}/{repo}/issues/{n}`
+        let parts: Vec<&str> = rest.split('/').collect();
+        if let (Some(owner), Some(repo), Some(kind), Some(id)) = (
+            parts.first().copied(),
+            parts.get(1).copied(),
+            parts.get(2).copied(),
+            parts.get(3).copied(),
+        ) {
+            let html_kind = if kind == "pulls" { "pull" } else { kind };
+            return format!("https://github.com/{owner}/{repo}/{html_kind}/{id}");
+        }
+        return format!("https://github.com/{rest}");
+    }
+    raw.to_owned()
 }
 
 fn ingest_github_pr(
@@ -277,6 +412,34 @@ fn ingest_github_pr(
     ))
 }
 
+fn drain_bounded_pipe<R: io::Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    thread::Builder::new()
+        .name("bot-gh-pipe".to_owned())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let Some(mut reader) = pipe else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let remain = MAX_GH_OUTPUT_BYTES.saturating_sub(out.len());
+                        if remain > 0 {
+                            out.extend_from_slice(buf.get(..n.min(remain)).unwrap_or_default());
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            out
+        })
+        .unwrap_or_else(|_| thread::spawn(Vec::new))
+}
+
 fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
     let mut child = krill_proto::os::background_command("gh")
         .args(args)
@@ -291,12 +454,18 @@ fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
             resets_at_ms: None,
         })?;
 
+    // Drain stdout & stderr concurrently BEFORE waiting so >64 KiB output never deadlocks pipes.
+    let stdout_handle = drain_bounded_pipe(child.stdout.take());
+    let stderr_handle = drain_bounded_pipe(child.stderr.take());
+
     let deadline = Instant::now() + GH_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(st)) => break st,
             Ok(None) if Instant::now() >= deadline => {
                 krill_proto::os::kill_tree(&mut child);
+                stdout_handle.join().ok();
+                stderr_handle.join().ok();
                 return Err(BotErrorDetail {
                     category: BotErrorCategory::AgentError,
                     agent_name: None,
@@ -306,6 +475,9 @@ fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(err) => {
+                krill_proto::os::kill_tree(&mut child);
+                stdout_handle.join().ok();
+                stderr_handle.join().ok();
                 return Err(BotErrorDetail {
                     category: BotErrorCategory::AgentError,
                     agent_name: None,
@@ -314,15 +486,11 @@ fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
                 });
             }
         }
-    }
+    };
 
-    let output = child.wait_with_output().map_err(|err| BotErrorDetail {
-        category: BotErrorCategory::AgentError,
-        agent_name: None,
-        message: format!("gh CLI output error: {}", err.kind()),
-        resets_at_ms: None,
-    })?;
-    if !output.status.success() {
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let _stderr_bytes = stderr_handle.join().unwrap_or_default();
+    if !status.success() {
         return Err(BotErrorDetail {
             category: BotErrorCategory::SignedOut,
             agent_name: None,
@@ -330,7 +498,7 @@ fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
             resets_at_ms: None,
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
 }
 
 /// Polls Linear assigned/active issues via GraphQL API. Returns the number of newly created items.
@@ -372,7 +540,8 @@ pub fn poll_linear_bot(
 
     let resp = http_client::send(
         &HttpRequest::post_json(&endpoints.linear_graphql_url, payload)
-            .with_header("Authorization", api_key.trim()),
+            .with_header("Authorization", api_key.trim())
+            .with_ssrf_policy(policy_for_url(&endpoints.linear_graphql_url)),
     )
     .map_err(|err| tracker_transport_err("Linear", &err))?;
 
@@ -399,6 +568,10 @@ pub fn poll_linear_bot(
         message: "invalid Linear GraphQL JSON response".to_owned(),
         resets_at_ms: None,
     })?;
+
+    if let Some(err) = check_graphql_errors(&val) {
+        return Err(err);
+    }
 
     let nodes = val
         .get("data")
@@ -523,6 +696,222 @@ fn tracker_transport_err(provider: &str, err: &io::Error) -> BotErrorDetail {
     }
 }
 
+fn check_graphql_errors(val: &serde_json::Value) -> Option<BotErrorDetail> {
+    let errors = val.get("errors").and_then(serde_json::Value::as_array)?;
+    let first = errors.first()?;
+    let msg = first
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Linear GraphQL returned errors");
+    let lower = msg.to_ascii_lowercase();
+    let category = if lower.contains("auth")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("token")
+    {
+        BotErrorCategory::SignedOut
+    } else {
+        BotErrorCategory::AgentError
+    };
+    Some(BotErrorDetail {
+        category,
+        agent_name: None,
+        message: msg.to_owned(),
+        resets_at_ms: None,
+    })
+}
+
+/// Tests GitHub connectivity (`GET /user` or `gh auth status`) for `TestConnector`.
+#[must_use]
+pub fn test_github(
+    bot: &BotConfig,
+    secrets: &SecretVault,
+    endpoints: &TrackerEndpoints,
+) -> BotConnectorTestResult {
+    match secrets.resolve_secret(
+        &bot.id,
+        bot.connectors.github.token_secret_ref.as_deref(),
+        "github_token",
+    ) {
+        Ok(Some(token)) => {
+            let base = endpoints.github_api_base.trim_end_matches('/');
+            let url = format!("{base}/user");
+            let auth = format!("Bearer {}", *token);
+            match http_client::send(
+                &HttpRequest::get(&url)
+                    .with_header("Authorization", auth)
+                    .with_header("Accept", "application/vnd.github+json")
+                    .with_header("X-GitHub-Api-Version", "2022-11-28")
+                    .with_ssrf_policy(policy_for_url(&url)),
+            ) {
+                Ok(resp) if resp.is_success() => {
+                    let login = resp.json::<serde_json::Value>().ok().and_then(|v| {
+                        v.get("login")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|s| format!("@{s}"))
+                    });
+                    BotConnectorTestResult {
+                        source: ExternalSource::GitHub,
+                        ok: true,
+                        account_label: login.clone(),
+                        detail: format!(
+                            "GitHub REST API connected ({})",
+                            login.unwrap_or_else(|| "token valid".to_owned())
+                        ),
+                    }
+                }
+                Ok(resp) => BotConnectorTestResult {
+                    source: ExternalSource::GitHub,
+                    ok: false,
+                    account_label: None,
+                    detail: format!("GitHub authentication failed (HTTP {})", resp.status),
+                },
+                Err(err) => BotConnectorTestResult {
+                    source: ExternalSource::GitHub,
+                    ok: false,
+                    account_label: None,
+                    detail: format!("GitHub network error: {}", err.kind()),
+                },
+            }
+        }
+        Ok(None) if bot.connectors.github.use_gh_cli => {
+            match run_gh_cli(&["api", "user", "--jq", ".login"]) {
+                Ok(login) => {
+                    let clean = login.trim();
+                    let label = (!clean.is_empty()).then(|| format!("@{clean}"));
+                    BotConnectorTestResult {
+                        source: ExternalSource::GitHub,
+                        ok: true,
+                        account_label: label,
+                        detail: "GitHub CLI (`gh`) authenticated".to_owned(),
+                    }
+                }
+                Err(detail) => BotConnectorTestResult {
+                    source: ExternalSource::GitHub,
+                    ok: false,
+                    account_label: None,
+                    detail: detail.message,
+                },
+            }
+        }
+        Ok(None) => BotConnectorTestResult {
+            source: ExternalSource::GitHub,
+            ok: false,
+            account_label: None,
+            detail: "GitHub token missing and gh CLI fallback disabled".to_owned(),
+        },
+        Err(err) => BotConnectorTestResult {
+            source: ExternalSource::GitHub,
+            ok: false,
+            account_label: None,
+            detail: format!("Failed reading GitHub secret: {}", err.kind()),
+        },
+    }
+}
+
+/// Tests Linear GraphQL connectivity (`viewer { id name email }`) for `TestConnector`.
+#[must_use]
+pub fn test_linear(
+    bot: &BotConfig,
+    secrets: &SecretVault,
+    endpoints: &TrackerEndpoints,
+) -> BotConnectorTestResult {
+    let api_key = match secrets.resolve_secret(
+        &bot.id,
+        bot.connectors.linear.api_key_secret_ref.as_deref(),
+        "linear_api_key",
+    ) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return BotConnectorTestResult {
+                source: ExternalSource::Linear,
+                ok: false,
+                account_label: None,
+                detail: "Linear API key not configured in secret vault".to_owned(),
+            };
+        }
+        Err(err) => {
+            return BotConnectorTestResult {
+                source: ExternalSource::Linear,
+                ok: false,
+                account_label: None,
+                detail: format!("Failed reading Linear secret: {}", err.kind()),
+            };
+        }
+    };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "query": "query KrillViewer { viewer { id name email } }"
+    }))
+    .unwrap_or_default();
+    let resp = match http_client::send(
+        &HttpRequest::post_json(&endpoints.linear_graphql_url, payload)
+            .with_header("Authorization", api_key.trim())
+            .with_ssrf_policy(policy_for_url(&endpoints.linear_graphql_url)),
+    ) {
+        Ok(r) => r,
+        Err(err) => {
+            return BotConnectorTestResult {
+                source: ExternalSource::Linear,
+                ok: false,
+                account_label: None,
+                detail: format!("Linear network error: {}", err.kind()),
+            };
+        }
+    };
+    if !resp.is_success() {
+        return BotConnectorTestResult {
+            source: ExternalSource::Linear,
+            ok: false,
+            account_label: None,
+            detail: format!("Linear GraphQL returned HTTP {}", resp.status),
+        };
+    }
+    let val: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => {
+            return BotConnectorTestResult {
+                source: ExternalSource::Linear,
+                ok: false,
+                account_label: None,
+                detail: "invalid Linear GraphQL JSON response".to_owned(),
+            };
+        }
+    };
+    if let Some(err) = check_graphql_errors(&val) {
+        return BotConnectorTestResult {
+            source: ExternalSource::Linear,
+            ok: false,
+            account_label: None,
+            detail: err.message,
+        };
+    }
+    let label = val
+        .get("data")
+        .and_then(|d| d.get("viewer"))
+        .and_then(|v| {
+            v.get("email")
+                .or_else(|| v.get("name"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| Some("Linear GraphQL".to_owned()));
+    BotConnectorTestResult {
+        source: ExternalSource::Linear,
+        ok: true,
+        account_label: label,
+        detail: "Linear GraphQL API connected".to_owned(),
+    }
+}
+
+/// Callback invoked when background tracker polling discovers new items (`has_needs_you` indicates actionable gate).
+pub type TrackerNewItemsCallback = Arc<dyn Fn(&BotConfig, ExternalSource, usize) + Send + Sync>;
+
+#[derive(Default)]
+struct TrackerWakeState {
+    stop: bool,
+    wake_now: bool,
+}
+
 /// Strictly-lazy 60s background poller for GitHub & Linear trackers.
 pub struct TrackerPoller {
     store: Arc<BotStore>,
@@ -530,7 +919,8 @@ pub struct TrackerPoller {
     items: Arc<BotItemsStore>,
     endpoints: TrackerEndpoints,
     statuses: Arc<Mutex<BTreeMap<(BotId, ExternalSource), BotConnectorStatus>>>,
-    stop: Arc<(Mutex<bool>, Condvar)>,
+    on_new_items: Arc<Mutex<Option<TrackerNewItemsCallback>>>,
+    stop: Arc<(Mutex<TrackerWakeState>, Condvar)>,
     running: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -564,13 +954,19 @@ impl TrackerPoller {
             items,
             endpoints,
             statuses: Arc::new(Mutex::new(BTreeMap::new())),
-            stop: Arc::new((Mutex::new(false), Condvar::new())),
+            on_new_items: Arc::new(Mutex::new(None)),
+            stop: Arc::new((Mutex::new(TrackerWakeState::default()), Condvar::new())),
             running: AtomicBool::new(false),
             thread: Mutex::new(None),
         }
     }
 
-    /// Starts the poller thread if ≥1 bot enables GitHub or Linear; stops it otherwise.
+    /// Registers a callback invoked when background tracker polling discovers new items.
+    pub fn set_on_new_items(&self, cb: TrackerNewItemsCallback) {
+        *lock(&self.on_new_items) = Some(cb);
+    }
+
+    /// Starts the poller thread if ≥1 bot enables GitHub or Linear and wakes immediately; stops it otherwise.
     pub fn reconcile(&self) {
         let has_enabled = self
             .store
@@ -580,6 +976,9 @@ impl TrackerPoller {
             .any(|b| !b.paused && (b.connectors.github.enabled || b.connectors.linear.enabled));
         if has_enabled {
             self.ensure_started();
+            let mut st = lock(&self.stop.0);
+            st.wake_now = true;
+            self.stop.1.notify_all();
         } else {
             self.stop();
         }
@@ -672,12 +1071,17 @@ impl TrackerPoller {
         if handle_guard.is_some() {
             return;
         }
-        *lock(&self.stop.0) = false;
+        {
+            let mut st = lock(&self.stop.0);
+            st.stop = false;
+            st.wake_now = true;
+        }
         let store = Arc::clone(&self.store);
         let secrets = Arc::clone(&self.secrets);
         let items = Arc::clone(&self.items);
         let endpoints = self.endpoints.clone();
         let statuses = Arc::clone(&self.statuses);
+        let on_new_items = Arc::clone(&self.on_new_items);
         let stop = Arc::clone(&self.stop);
 
         if let Ok(handle) = thread::Builder::new()
@@ -686,20 +1090,50 @@ impl TrackerPoller {
             .spawn(move || {
                 let mut last_polled: BTreeMap<(BotId, ExternalSource), u64> = BTreeMap::new();
                 loop {
+                    let min_sleep_secs = store
+                        .list_bots()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|b| !b.paused)
+                        .filter_map(|b| {
+                            let gh = b
+                                .connectors
+                                .github
+                                .enabled
+                                .then_some(b.connectors.github.poll_interval_secs.max(15));
+                            let lin = b
+                                .connectors
+                                .linear
+                                .enabled
+                                .then_some(b.connectors.linear.poll_interval_secs.max(15));
+                            match (gh, lin) {
+                                (Some(a), Some(c)) => Some(a.min(c)),
+                                (Some(a), None) | (None, Some(a)) => Some(a),
+                                (None, None) => None,
+                            }
+                        })
+                        .min()
+                        .unwrap_or(DEFAULT_POLL_SECS);
                     let stopped = {
-                        let guard = lock(&stop.0);
-                        if *guard {
+                        let mut guard = lock(&stop.0);
+                        if guard.stop {
                             break;
                         }
-                        let (guard, _) = stop
-                            .1
-                            .wait_timeout_while(
-                                guard,
-                                Duration::from_secs(DEFAULT_POLL_SECS),
-                                |s| !*s,
-                            )
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *guard
+                        if guard.wake_now {
+                            guard.wake_now = false;
+                            false
+                        } else {
+                            let (mut guard, _) = stop
+                                .1
+                                .wait_timeout_while(
+                                    guard,
+                                    Duration::from_secs(min_sleep_secs),
+                                    |s| !s.stop && !s.wake_now,
+                                )
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard.wake_now = false;
+                            guard.stop
+                        }
                     };
                     if stopped {
                         break;
@@ -724,10 +1158,36 @@ impl TrackerPoller {
                                     .is_none_or(|&prev| ts.saturating_sub(prev) >= interval_ms)
                                 {
                                     last_polled.insert(key.clone(), ts);
+                                    let prev_label = lock(&statuses)
+                                        .get(&key)
+                                        .and_then(|s| s.account_label.clone())
+                                        .or_else(|| {
+                                            Some(if bot.connectors.github.repos.is_empty() {
+                                                "GitHub notifications".to_owned()
+                                            } else {
+                                                format!(
+                                                    "{} repo(s)",
+                                                    bot.connectors.github.repos.len()
+                                                )
+                                            })
+                                        });
                                     let st = match poll_github_bot(
                                         &bot, &secrets, &items, &endpoints, ts,
                                     ) {
-                                        Ok(_) => ok_status(&bot.id, ExternalSource::GitHub, ts),
+                                        Ok(new_count) => {
+                                            if new_count > 0
+                                                && let Some(cb) =
+                                                    lock(&on_new_items).as_ref().cloned()
+                                            {
+                                                cb(&bot, ExternalSource::GitHub, new_count);
+                                            }
+                                            ok_status(
+                                                &bot.id,
+                                                ExternalSource::GitHub,
+                                                prev_label,
+                                                ts,
+                                            )
+                                        }
                                         Err(d) => err_status(&bot.id, ExternalSource::GitHub, d),
                                     };
                                     lock(&statuses).insert(key, st);
@@ -746,10 +1206,27 @@ impl TrackerPoller {
                                     .is_none_or(|&prev| ts.saturating_sub(prev) >= interval_ms)
                                 {
                                     last_polled.insert(key.clone(), ts);
+                                    let prev_label = lock(&statuses)
+                                        .get(&key)
+                                        .and_then(|s| s.account_label.clone())
+                                        .or_else(|| Some("Linear GraphQL".to_owned()));
                                     let st = match poll_linear_bot(
                                         &bot, &secrets, &items, &endpoints, ts,
                                     ) {
-                                        Ok(_) => ok_status(&bot.id, ExternalSource::Linear, ts),
+                                        Ok(new_count) => {
+                                            if new_count > 0
+                                                && let Some(cb) =
+                                                    lock(&on_new_items).as_ref().cloned()
+                                            {
+                                                cb(&bot, ExternalSource::Linear, new_count);
+                                            }
+                                            ok_status(
+                                                &bot.id,
+                                                ExternalSource::Linear,
+                                                prev_label,
+                                                ts,
+                                            )
+                                        }
                                         Err(d) => err_status(&bot.id, ExternalSource::Linear, d),
                                     };
                                     lock(&statuses).insert(key, st);
@@ -770,7 +1247,7 @@ impl TrackerPoller {
     pub fn stop(&self) {
         let handle = lock(&self.thread).take();
         if let Some(h) = handle {
-            *lock(&self.stop.0) = true;
+            lock(&self.stop.0).stop = true;
             self.stop.1.notify_all();
             h.join().ok();
             self.running.store(false, Ordering::Release);
@@ -778,14 +1255,19 @@ impl TrackerPoller {
     }
 }
 
-fn ok_status(bot_id: &BotId, source: ExternalSource, ts: u64) -> BotConnectorStatus {
+fn ok_status(
+    bot_id: &BotId,
+    source: ExternalSource,
+    account_label: Option<String>,
+    ts: u64,
+) -> BotConnectorStatus {
     BotConnectorStatus {
         bot_id: bot_id.clone(),
         source,
         enabled: true,
         connected: true,
         state: ConnectorHealthState::Connected,
-        account_label: None,
+        account_label,
         last_sync_ms: Some(ts),
         last_error: None,
         error_category: None,
@@ -846,12 +1328,27 @@ mod tests {
         let items = BotItemsStore::new(dir.join("bot-items.db"));
 
         let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        mock.set_nonblocking(true).unwrap();
         let addr = mock.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
         let server = thread::spawn(move || {
-            for _ in 0..3 {
-                let (mut sock, _) = mock.accept().unwrap();
+            let mut issues_hits = 0usize;
+            while !stop_bg.load(std::sync::atomic::Ordering::Acquire) {
+                let (mut sock, _) = match mock.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                sock.set_nonblocking(false).ok();
                 let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).unwrap();
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
                 let req = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
                 let target = req
                     .lines()
@@ -860,6 +1357,13 @@ mod tests {
                     .unwrap_or("/");
                 let body = if target.contains("/pulls") {
                     r#"[{"number":101,"title":"Fix race condition","html_url":"https://github.com/craftowen/krill/pull/101","requested_reviewers":[{"login":"owen"}]}]"#
+                } else if target.contains("/issues") {
+                    issues_hits = issues_hits.saturating_add(1);
+                    if issues_hits >= 2 {
+                        r#"[{"number":202,"title":"Add issue poller","html_url":"https://github.com/craftowen/krill/issues/202","assignees":[{"login":"owen"}]},{"number":101,"title":"PR dupe","html_url":"https://github.com/craftowen/krill/pull/101","pull_request":{"url":"..."}}]"#
+                    } else {
+                        "[]"
+                    }
                 } else {
                     r#"{"data":{"viewer":{"assignedIssues":{"nodes":[{"id":"l1","identifier":"OWE-900","title":"Ship bots","description":"Track bot work","url":"https://linear.app/owen/issue/OWE-900","team":{"key":"OWE"}}]}}}}"#
                 };
@@ -903,10 +1407,10 @@ mod tests {
             poll_github_bot(&bot, &secrets, &items, &endpoints, 2_000).unwrap(),
             1
         );
-        // Second GitHub poll must deduplicate the same PR link.
+        // Second GitHub poll picks up issue #202 (PR #101 deduplicated and skipped via pull_request check).
         assert_eq!(
             poll_github_bot(&bot, &secrets, &items, &endpoints, 3_000).unwrap(),
-            0
+            1
         );
         assert_eq!(
             poll_linear_bot(&bot, &secrets, &items, &endpoints, 4_000).unwrap(),
@@ -916,14 +1420,87 @@ mod tests {
         let all = items
             .list_items(Some(&bot_id), None, true, true, 5_000)
             .unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert!(all.iter().any(|i| i.status == BotItemStatus::NeedsYou
             && i.links.contains(&BotItemLink::Pr(
                 "https://github.com/craftowen/krill/pull/101".to_owned()
             ))));
+        assert!(all.iter().any(|i| i.title.contains("#202")));
         assert!(all.iter().any(|i| i.title.contains("OWE-900")));
 
+        stop.store(true, std::sync::atomic::Ordering::Release);
         server.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn trackers_graphql_errors_api_to_html_url_and_tests_work() {
+        assert_eq!(
+            github_api_url_to_html_url("https://api.github.com/repos/a/b/pulls/77"),
+            "https://github.com/a/b/pull/77"
+        );
+        assert_eq!(
+            github_api_url_to_html_url("https://api.github.com/repos/a/b/issues/12"),
+            "https://github.com/a/b/issues/12"
+        );
+
+        let dir = temp_dir("gql-err");
+        let secrets = SecretVault::with_static_key(dir.clone(), [0x22; 32]);
+        let items = BotItemsStore::new(dir.join("items.db"));
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+
+        let srv = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut sock, _) = mock.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                assert!(n > 0);
+                let body = if idx == 0 {
+                    r#"{"errors":[{"message":"Authentication failed: invalid token"}]}"#
+                } else if idx == 1 {
+                    r#"{"login":"octocat"}"#
+                } else {
+                    r#"{"data":{"viewer":{"id":"v1","name":"Owen","email":"owen@example.com"}}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let bot_id = BotId::new("bot-trk-err").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "TrkErr", "claude", 1_000).unwrap();
+        secrets
+            .set_secret(&bot_id, "github_token", Zeroizing::new("ghp_1".to_owned()))
+            .unwrap();
+        secrets
+            .set_secret(
+                &bot_id,
+                "linear_api_key",
+                Zeroizing::new("lin_api_1".to_owned()),
+            )
+            .unwrap();
+        let endpoints = TrackerEndpoints {
+            github_api_base: format!("http://{addr}"),
+            linear_graphql_url: format!("http://{addr}/graphql"),
+        };
+
+        let err = poll_linear_bot(&bot, &secrets, &items, &endpoints, 1_000).unwrap_err();
+        assert_eq!(err.category, BotErrorCategory::SignedOut);
+
+        let gh_res = test_github(&bot, &secrets, &endpoints);
+        assert!(gh_res.ok);
+        assert_eq!(gh_res.account_label.as_deref(), Some("@octocat"));
+
+        let lin_res = test_linear(&bot, &secrets, &endpoints);
+        assert!(lin_res.ok);
+        assert_eq!(lin_res.account_label.as_deref(), Some("owen@example.com"));
+
+        srv.join().unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 }

@@ -4030,3 +4030,143 @@ fn spawn_holder_failure_cleans_up_staged_settings_and_launch_record() {
     drop(reg);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[cfg(unix)]
+#[test]
+fn bots_watcher_mask_observer_audit_oversized_and_auto_boot() {
+    use krill_proto::bots::{BotRpcRequest, BotRpcResponse, CreateBotParams};
+    use krill_proto::ipc::{self, FEAT_BOTS, PROTO_MAX, PROTO_MIN, ServerHello};
+    use krill_proto::roles::{self, FEAT_ROLES, Role};
+    use krill_proto::screen::Msg as _;
+
+    // 1. oversized_reply maps Reply::Bot to BotRpcResponse::Error instead of EMSGSIZE.
+    let err_reply = oversized_reply(&Reply::Bot(BotRpcResponse::Ok), 20_000_000);
+    assert!(matches!(err_reply, Reply::Bot(BotRpcResponse::Error(_))));
+
+    let dir = std::env::temp_dir().join(format!("krill-bots-reg-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    // 2. Observer Request::Bot mutation records `deny op=bots` in audit.log, and standalone FEAT_BOTS works without FEAT_CONTROL.
+    let reg = Arc::new(Registry::new(None, Some(&dir)));
+    reg.bind_self_arc();
+
+    let hello = ServerHello {
+        proto_min: PROTO_MIN,
+        proto_max: PROTO_MAX,
+        features: FEAT_CONTROL | FEAT_BOTS | FEAT_ROLES,
+        build: "test".into(),
+        instance_id: 1,
+    };
+
+    // Standalone FEAT_BOTS-only client (must not be treated as watch-only!).
+    let (mut bots_only_client, bots_only_server) = UnixStream::pair().unwrap();
+    bots_only_client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let reg_b = Arc::clone(&reg);
+    let h_b = hello.clone();
+    let srv_b = std::thread::spawn(move || reg_b.serve(bots_only_server, &h_b));
+    let _ = ipc::read_frame(&mut bots_only_client).unwrap().unwrap();
+    let mut hello_bots = krill_proto::daemon::client_hello(ipc::ClientRole::Cli, "bots-only");
+    hello_bots.features = FEAT_BOTS;
+    bots_only_client
+        .write_all(&hello_bots.encode().unwrap())
+        .unwrap();
+    bots_only_client
+        .write_all(&BotRpcRequest::ListBots.encode().unwrap())
+        .unwrap();
+    let (k, body) = ipc::read_frame(&mut bots_only_client).unwrap().unwrap();
+    assert_eq!(k, krill_proto::bots::BOT_REPLY);
+    assert!(matches!(
+        BotRpcResponse::decode(k, &body).unwrap(),
+        BotRpcResponse::Bots(ref list) if list.is_empty()
+    ));
+    drop(bots_only_client);
+    srv_b.join().ok();
+
+    // Observer write denial writes audit `op=bots`.
+    let (mut obs_client, obs_server) = UnixStream::pair().unwrap();
+    obs_client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let reg_o = Arc::clone(&reg);
+    let h_o = hello;
+    let srv_o = std::thread::spawn(move || reg_o.serve(obs_server, &h_o));
+    let _ = ipc::read_frame(&mut obs_client).unwrap().unwrap();
+    let mut hello_ctrl = krill_proto::daemon::client_hello(ipc::ClientRole::App, "obs-bots");
+    hello_ctrl.features = FEAT_CONTROL | FEAT_BOTS | FEAT_ROLES;
+    obs_client.write_all(&hello_ctrl.encode().unwrap()).unwrap();
+    obs_client
+        .write_all(&roles::Request::Set(Role::Observer).encode().unwrap())
+        .unwrap();
+    let _ = ipc::read_frame(&mut obs_client).unwrap().unwrap();
+
+    let create_req = Request::Bot(BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+        name: "Denied Bot".into(),
+        agent_id: "claude".into(),
+        description: String::new(),
+        emoji: None,
+        avatar: None,
+        model: None,
+        effort: None,
+        permission_mode: None,
+        workspace: None,
+        template_id: None,
+        initial_soul: None,
+    })));
+    obs_client.write_all(&create_req.encode().unwrap()).unwrap();
+    let (k, body) = ipc::read_frame(&mut obs_client).unwrap().unwrap();
+    assert!(matches!(
+        Reply::decode(k, &body).unwrap(),
+        Reply::Failed(Failure::Denied)
+    ));
+    drop(obs_client);
+    srv_o.join().ok();
+
+    let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
+    assert!(audit.contains("deny op=bots "), "{audit}");
+
+    // 3. Create a bot on disk so bots.json exists, then verify fresh Registry auto-boots BotsManager on bind_self_arc!
+    let created = reg
+        .bots()
+        .unwrap()
+        .store()
+        .create_bot(
+            CreateBotParams {
+                name: "Auto Boot Bot".into(),
+                agent_id: "claude".into(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            },
+            1_000,
+        )
+        .unwrap();
+    assert!(!created.id.as_str().is_empty());
+    if let Some(b) = reg.bots_if_initialized() {
+        b.shutdown();
+    }
+    drop(reg);
+
+    let reg2 = Arc::new(Registry::new(None, Some(&dir)));
+    reg2.bind_self_arc();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while reg2.bots_if_initialized().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        reg2.bots_if_initialized().is_some(),
+        "BotsManager should auto-boot when bots.json exists"
+    );
+    if let Some(b) = reg2.bots_if_initialized() {
+        b.shutdown();
+    }
+    fs::remove_dir_all(&dir).ok();
+}

@@ -14,12 +14,16 @@ use crate::SessionId;
 use crate::control::bounded;
 use crate::screen::Msg;
 
-use super::package::BotPackageExportOptions;
+use super::package::{BotPackageExportOptions, MAX_AVATAR_PNG_BYTES};
 use super::types::{
-    BotAccessRequest, BotConfig, BotConnectorConfig, BotConnectorStatus, BotGroupChat, BotId,
-    BotItem, BotItemDecision, BotItemLink, BotItemStatus, BotLookAroundConfig, BotMcpToolConfig,
-    BotMemoryTidyConfig, BotNotifications, BotScheduleConfig, BotSuggestion, BotToolRelayStatus,
-    ExternalBotCandidate, ExternalBotSourceApp, ExternalSource,
+    BotAccessRequest, BotAvatarData, BotConfig, BotConnectorConfig, BotConnectorStatus,
+    BotConnectorTestResult, BotEventRuleConfig, BotGroupChat, BotGroupMessage, BotGroupReplyMode,
+    BotGroupView, BotId, BotItem, BotItemDecision, BotItemLink, BotItemStatus, BotItemsPage,
+    BotLookAroundConfig, BotMcpOAuthState, BotMcpToolConfig, BotMemoryHistoryEntry,
+    BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo, BotNotifications,
+    BotScheduleConfig, BotSessionSummary, BotSlug, BotSuggestion, BotToolRelayStatus,
+    ComposioConnectionInfo, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
+    ExternalSource,
 };
 
 /// Dedicated client-to-daemon frame kind for Krill Bots RPC.
@@ -53,6 +57,44 @@ pub struct CreateBotParams {
     pub template_id: Option<String>,
     #[serde(default)]
     pub initial_soul: Option<String>,
+}
+
+/// Extended parameters for creating a bot (`CreateBotV2`) with explicit slug, color, skills, and events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateBotV2Params {
+    pub base: CreateBotParams,
+    #[serde(default)]
+    pub slug: Option<BotSlug>,
+    #[serde(default)]
+    pub avatar_color: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub events: Vec<BotEventRuleConfig>,
+}
+
+impl From<CreateBotParams> for CreateBotV2Params {
+    fn from(base: CreateBotParams) -> Self {
+        Self {
+            base,
+            slug: None,
+            avatar_color: None,
+            skills: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
+/// Partial update parameters (`UpdateBotExtras`) for avatar color, skills, and event rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateBotExtrasParams {
+    pub bot_id: BotId,
+    #[serde(default)]
+    pub avatar_color: FieldPatch<String>,
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
+    #[serde(default)]
+    pub events: Option<Vec<BotEventRuleConfig>>,
 }
 
 /// Three-state patch for nullable fields in update RPC payloads.
@@ -297,6 +339,207 @@ pub enum BotRpcRequest {
         path: Option<String>,
         dry_run: bool,
     },
+    CreateBotV2(Box<CreateBotV2Params>),
+    UpdateBotExtras(Box<UpdateBotExtrasParams>),
+    ImportBotZipV2 {
+        #[serde(deserialize_with = "rpc_zip_bytes")]
+        zip_bytes: Vec<u8>,
+        #[serde(default)]
+        name_override: Option<String>,
+        #[serde(default)]
+        slug_override: Option<BotSlug>,
+        #[serde(default)]
+        agent_override: Option<String>,
+    },
+    UploadBotAvatar {
+        bot_id: BotId,
+        #[serde(deserialize_with = "rpc_avatar_bytes")]
+        png_bytes: Vec<u8>,
+    },
+    GetBotAvatar {
+        bot_id: BotId,
+    },
+    ListItemsPage {
+        #[serde(default)]
+        bot_id: Option<BotId>,
+        include_closed: bool,
+        include_snoozed: bool,
+        #[serde(default)]
+        limit: Option<u32>,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
+    GetBotItem {
+        item_id: String,
+    },
+    AnswerBotItem {
+        item_id: String,
+        #[serde(default)]
+        answer_text: Option<String>,
+        #[serde(default)]
+        option_index: Option<u32>,
+        #[serde(default)]
+        decision_id: Option<String>,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    MarkBotItemsOpened {
+        bot_id: BotId,
+        #[serde(default)]
+        up_to_event_id: Option<String>,
+    },
+    GetMemoryHistory {
+        bot_id: BotId,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    EditMemoryFact {
+        bot_id: BotId,
+        old_fact: String,
+        new_fact: String,
+    },
+    UndoMemoryChange {
+        bot_id: BotId,
+        entry_id: String,
+    },
+    GetMemoryTidyStatus {
+        bot_id: BotId,
+    },
+    UndoMemoryTidy {
+        bot_id: BotId,
+        #[serde(default)]
+        tidy_id: Option<String>,
+    },
+    ListMemoryTopics {
+        bot_id: BotId,
+    },
+    GetMemoryTopic {
+        bot_id: BotId,
+        topic: String,
+    },
+    SetMemoryTopic {
+        bot_id: BotId,
+        topic: String,
+        content: String,
+    },
+    ListSuggestions {
+        #[serde(default)]
+        bot_id: Option<BotId>,
+        include_dismissed: bool,
+    },
+    DismissSuggestion {
+        bot_id: BotId,
+        suggestion_id: String,
+    },
+    StartSuggestion {
+        bot_id: BotId,
+        suggestion_id: String,
+    },
+    MarkUpNextSeen {
+        #[serde(default)]
+        bot_id: Option<BotId>,
+    },
+    ListBotSessions {
+        #[serde(default)]
+        bot_id: Option<BotId>,
+    },
+    ResetBotChat {
+        bot_id: BotId,
+        #[serde(default)]
+        session_id: Option<SessionId>,
+    },
+    StopBotSession {
+        bot_id: BotId,
+        session_id: SessionId,
+    },
+    RetryBotKickoff {
+        bot_id: BotId,
+    },
+    TakeOverWorkspace {
+        bot_id: BotId,
+        session_id: SessionId,
+    },
+    SendBotRunAgain {
+        bot_id: BotId,
+        session_id: SessionId,
+    },
+    UpdateGroup {
+        group_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        bot_ids: Option<Vec<BotId>>,
+    },
+    DeleteGroup {
+        group_id: String,
+    },
+    ReorderGroups {
+        group_ids: Vec<String>,
+    },
+    NewGroupThread {
+        group_id: String,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    ReadGroup {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    SendGroupMessage {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        sender: String,
+        text: String,
+        #[serde(default)]
+        reply_mode: Option<BotGroupReplyMode>,
+    },
+    StopGroup {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+    },
+    TestConnector {
+        bot_id: BotId,
+        source: ExternalSource,
+    },
+    RedeemPairingCode {
+        code: String,
+    },
+    StartMcpOAuth {
+        bot_id: BotId,
+        tool_id: String,
+    },
+    McpOAuthStatus {
+        bot_id: BotId,
+        tool_id: String,
+    },
+    CancelMcpOAuth {
+        bot_id: BotId,
+        tool_id: String,
+    },
+    ListComposioConnections {
+        bot_id: BotId,
+    },
+    StartComposioConnect {
+        bot_id: BotId,
+        app_id: String,
+    },
+    DisconnectComposioAccount {
+        bot_id: BotId,
+        connection_id: String,
+    },
+    SetDefaultTrackerBot {
+        source: ExternalSource,
+        #[serde(default)]
+        bot_id: Option<BotId>,
+    },
+    GetDefaultTrackerBots,
 }
 
 impl BotRpcRequest {
@@ -312,9 +555,21 @@ impl BotRpcRequest {
                 | Self::ListItems { .. }
                 | Self::ListGroups
                 | Self::ConnectorStatus { .. }
-                | Self::ListAccessRequests { .. }
                 | Self::ToolRelayStatus
                 | Self::ImportExternalBots { dry_run: true, .. }
+                | Self::GetBotAvatar { .. }
+                | Self::ListItemsPage { .. }
+                | Self::GetBotItem { .. }
+                | Self::GetMemoryHistory { .. }
+                | Self::GetMemoryTidyStatus { .. }
+                | Self::ListMemoryTopics { .. }
+                | Self::GetMemoryTopic { .. }
+                | Self::ListSuggestions { .. }
+                | Self::ListBotSessions { .. }
+                | Self::ReadGroup { .. }
+                | Self::McpOAuthStatus { .. }
+                | Self::ListComposioConnections { .. }
+                | Self::GetDefaultTrackerBots
         )
     }
 }
@@ -489,6 +744,269 @@ impl fmt::Debug for BotRpcRequest {
                 .field("path", path)
                 .field("dry_run", dry_run)
                 .finish(),
+            Self::CreateBotV2(p) => f.debug_tuple("CreateBotV2").field(p).finish(),
+            Self::UpdateBotExtras(p) => f.debug_tuple("UpdateBotExtras").field(p).finish(),
+            Self::ImportBotZipV2 {
+                zip_bytes,
+                name_override,
+                slug_override,
+                agent_override,
+            } => f
+                .debug_struct("ImportBotZipV2")
+                .field("zip_bytes", &zip_bytes.len())
+                .field("name_override", name_override)
+                .field("slug_override", slug_override)
+                .field("agent_override", agent_override)
+                .finish(),
+            Self::UploadBotAvatar { bot_id, png_bytes } => f
+                .debug_struct("UploadBotAvatar")
+                .field("bot_id", bot_id)
+                .field("bytes", &png_bytes.len())
+                .finish(),
+            Self::GetBotAvatar { bot_id } => f
+                .debug_struct("GetBotAvatar")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::ListItemsPage {
+                bot_id,
+                include_closed,
+                include_snoozed,
+                limit,
+                cursor,
+            } => f
+                .debug_struct("ListItemsPage")
+                .field("bot_id", bot_id)
+                .field("include_closed", include_closed)
+                .field("include_snoozed", include_snoozed)
+                .field("limit", limit)
+                .field("cursor", cursor)
+                .finish(),
+            Self::GetBotItem { item_id } => f
+                .debug_struct("GetBotItem")
+                .field("item_id", item_id)
+                .finish(),
+            Self::AnswerBotItem {
+                item_id,
+                option_index,
+                decision_id,
+                request_id,
+                ..
+            } => f
+                .debug_struct("AnswerBotItem")
+                .field("item_id", item_id)
+                .field("option_index", option_index)
+                .field("decision_id", decision_id)
+                .field("request_id", request_id)
+                .finish_non_exhaustive(),
+            Self::MarkBotItemsOpened {
+                bot_id,
+                up_to_event_id,
+            } => f
+                .debug_struct("MarkBotItemsOpened")
+                .field("bot_id", bot_id)
+                .field("up_to_event_id", up_to_event_id)
+                .finish(),
+            Self::GetMemoryHistory { bot_id, limit } => f
+                .debug_struct("GetMemoryHistory")
+                .field("bot_id", bot_id)
+                .field("limit", limit)
+                .finish(),
+            Self::EditMemoryFact { bot_id, .. } => f
+                .debug_struct("EditMemoryFact")
+                .field("bot_id", bot_id)
+                .finish_non_exhaustive(),
+            Self::UndoMemoryChange { bot_id, entry_id } => f
+                .debug_struct("UndoMemoryChange")
+                .field("bot_id", bot_id)
+                .field("entry_id", entry_id)
+                .finish(),
+            Self::GetMemoryTidyStatus { bot_id } => f
+                .debug_struct("GetMemoryTidyStatus")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::UndoMemoryTidy { bot_id, tidy_id } => f
+                .debug_struct("UndoMemoryTidy")
+                .field("bot_id", bot_id)
+                .field("tidy_id", tidy_id)
+                .finish(),
+            Self::ListMemoryTopics { bot_id } => f
+                .debug_struct("ListMemoryTopics")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::GetMemoryTopic { bot_id, topic } => f
+                .debug_struct("GetMemoryTopic")
+                .field("bot_id", bot_id)
+                .field("topic", topic)
+                .finish(),
+            Self::SetMemoryTopic {
+                bot_id,
+                topic,
+                content,
+            } => f
+                .debug_struct("SetMemoryTopic")
+                .field("bot_id", bot_id)
+                .field("topic", topic)
+                .field("bytes", &content.len())
+                .finish(),
+            Self::ListSuggestions {
+                bot_id,
+                include_dismissed,
+            } => f
+                .debug_struct("ListSuggestions")
+                .field("bot_id", bot_id)
+                .field("include_dismissed", include_dismissed)
+                .finish(),
+            Self::DismissSuggestion {
+                bot_id,
+                suggestion_id,
+            } => f
+                .debug_struct("DismissSuggestion")
+                .field("bot_id", bot_id)
+                .field("suggestion_id", suggestion_id)
+                .finish(),
+            Self::StartSuggestion {
+                bot_id,
+                suggestion_id,
+            } => f
+                .debug_struct("StartSuggestion")
+                .field("bot_id", bot_id)
+                .field("suggestion_id", suggestion_id)
+                .finish(),
+            Self::MarkUpNextSeen { bot_id } => f
+                .debug_struct("MarkUpNextSeen")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::ListBotSessions { bot_id } => f
+                .debug_struct("ListBotSessions")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::ResetBotChat { bot_id, session_id } => f
+                .debug_struct("ResetBotChat")
+                .field("bot_id", bot_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::StopBotSession { bot_id, session_id } => f
+                .debug_struct("StopBotSession")
+                .field("bot_id", bot_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::RetryBotKickoff { bot_id } => f
+                .debug_struct("RetryBotKickoff")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::TakeOverWorkspace { bot_id, session_id } => f
+                .debug_struct("TakeOverWorkspace")
+                .field("bot_id", bot_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::SendBotRunAgain { bot_id, session_id } => f
+                .debug_struct("SendBotRunAgain")
+                .field("bot_id", bot_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::UpdateGroup {
+                group_id,
+                name,
+                bot_ids,
+                ..
+            } => f
+                .debug_struct("UpdateGroup")
+                .field("group_id", group_id)
+                .field("name", name)
+                .field("bot_ids", bot_ids)
+                .finish_non_exhaustive(),
+            Self::DeleteGroup { group_id } => f
+                .debug_struct("DeleteGroup")
+                .field("group_id", group_id)
+                .finish(),
+            Self::ReorderGroups { group_ids } => f
+                .debug_struct("ReorderGroups")
+                .field("group_ids", group_ids)
+                .finish(),
+            Self::NewGroupThread { group_id, title } => f
+                .debug_struct("NewGroupThread")
+                .field("group_id", group_id)
+                .field("title", title)
+                .finish(),
+            Self::ReadGroup {
+                group_id,
+                thread_id,
+                limit,
+            } => f
+                .debug_struct("ReadGroup")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .field("limit", limit)
+                .finish(),
+            Self::SendGroupMessage {
+                group_id,
+                thread_id,
+                sender,
+                reply_mode,
+                ..
+            } => f
+                .debug_struct("SendGroupMessage")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .field("sender", sender)
+                .field("reply_mode", reply_mode)
+                .finish_non_exhaustive(),
+            Self::StopGroup {
+                group_id,
+                thread_id,
+            } => f
+                .debug_struct("StopGroup")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .finish(),
+            Self::TestConnector { bot_id, source } => f
+                .debug_struct("TestConnector")
+                .field("bot_id", bot_id)
+                .field("source", source)
+                .finish(),
+            // Never print secret pairing codes in Debug logs.
+            Self::RedeemPairingCode { .. } => f
+                .debug_struct("RedeemPairingCode")
+                .field("code", &"<redacted>")
+                .finish(),
+            Self::StartMcpOAuth { bot_id, tool_id } => f
+                .debug_struct("StartMcpOAuth")
+                .field("bot_id", bot_id)
+                .field("tool_id", tool_id)
+                .finish(),
+            Self::McpOAuthStatus { bot_id, tool_id } => f
+                .debug_struct("McpOAuthStatus")
+                .field("bot_id", bot_id)
+                .field("tool_id", tool_id)
+                .finish(),
+            Self::CancelMcpOAuth { bot_id, tool_id } => f
+                .debug_struct("CancelMcpOAuth")
+                .field("bot_id", bot_id)
+                .field("tool_id", tool_id)
+                .finish(),
+            Self::ListComposioConnections { bot_id } => f
+                .debug_struct("ListComposioConnections")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::StartComposioConnect { bot_id, app_id } => f
+                .debug_struct("StartComposioConnect")
+                .field("bot_id", bot_id)
+                .field("app_id", app_id)
+                .finish(),
+            Self::DisconnectComposioAccount {
+                bot_id,
+                connection_id,
+            } => f
+                .debug_struct("DisconnectComposioAccount")
+                .field("bot_id", bot_id)
+                .field("connection_id", connection_id)
+                .finish(),
+            Self::SetDefaultTrackerBot { source, bot_id } => f
+                .debug_struct("SetDefaultTrackerBot")
+                .field("source", source)
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::GetDefaultTrackerBots => f.write_str("GetDefaultTrackerBots"),
         }
     }
 }
@@ -557,6 +1075,26 @@ pub enum BotRpcResponse {
         candidates: Vec<ExternalBotCandidate>,
         imported: Vec<BotConfig>,
     },
+    BotAvatar(BotAvatarData),
+    ItemsPage(BotItemsPage),
+    MemoryHistory(Vec<BotMemoryHistoryEntry>),
+    MemoryTidyStatus(BotMemoryTidyStatus),
+    MemoryTopics(Vec<BotMemoryTopicInfo>),
+    Suggestions(Vec<BotSuggestion>),
+    BotSessions(Vec<BotSessionSummary>),
+    GroupView(BotGroupView),
+    GroupMessagePosted {
+        message: BotGroupMessage,
+        dispatched_bots: Vec<BotId>,
+    },
+    ConnectorTest(BotConnectorTestResult),
+    McpOAuth(BotMcpOAuthState),
+    ComposioConnections(Vec<ComposioConnectionInfo>),
+    ComposioConnectStarted {
+        connection_id: String,
+        redirect_url: String,
+    },
+    DefaultTrackerBots(DefaultTrackerBots),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -658,6 +1196,63 @@ impl fmt::Debug for BotRpcResponse {
                 .field("candidates", &candidates.len())
                 .field("imported", &imported.len())
                 .finish(),
+            Self::BotAvatar(data) => f.debug_tuple("BotAvatar").field(data).finish(),
+            Self::ItemsPage(page) => f
+                .debug_struct("ItemsPage")
+                .field("items", &page.items.len())
+                .field("next_cursor", &page.next_cursor)
+                .field("total_count", &page.total_count)
+                .field("unseen_count", &page.unseen_count)
+                .finish(),
+            Self::MemoryHistory(entries) => f
+                .debug_tuple("MemoryHistory")
+                .field(&entries.len())
+                .finish(),
+            Self::MemoryTidyStatus(status) => {
+                f.debug_tuple("MemoryTidyStatus").field(status).finish()
+            }
+            Self::MemoryTopics(topics) => {
+                f.debug_tuple("MemoryTopics").field(&topics.len()).finish()
+            }
+            Self::Suggestions(suggestions) => f
+                .debug_tuple("Suggestions")
+                .field(&suggestions.len())
+                .finish(),
+            Self::BotSessions(sessions) => {
+                f.debug_tuple("BotSessions").field(&sessions.len()).finish()
+            }
+            Self::GroupView(view) => f
+                .debug_struct("GroupView")
+                .field("group_id", &view.group.id)
+                .field("threads", &view.threads.len())
+                .field("messages", &view.messages.len())
+                .field("active_run", &view.active_run)
+                .finish(),
+            Self::GroupMessagePosted {
+                message,
+                dispatched_bots,
+            } => f
+                .debug_struct("GroupMessagePosted")
+                .field("message_id", &message.message_id)
+                .field("group_id", &message.group_id)
+                .field("thread_id", &message.thread_id)
+                .field("dispatched_bots", dispatched_bots)
+                .finish(),
+            Self::ConnectorTest(res) => f.debug_tuple("ConnectorTest").field(res).finish(),
+            Self::McpOAuth(state) => f.debug_tuple("McpOAuth").field(state).finish(),
+            Self::ComposioConnections(conns) => f
+                .debug_tuple("ComposioConnections")
+                .field(&conns.len())
+                .finish(),
+            // Never print OAuth/connect redirect URLs in Debug logs.
+            Self::ComposioConnectStarted { connection_id, .. } => f
+                .debug_struct("ComposioConnectStarted")
+                .field("connection_id", connection_id)
+                .field("redirect_url", &"<redacted>")
+                .finish(),
+            Self::DefaultTrackerBots(defaults) => {
+                f.debug_tuple("DefaultTrackerBots").field(defaults).finish()
+            }
         }
     }
 }
@@ -672,4 +1267,10 @@ impl Msg for BotRpcResponse {
 
 fn rpc_zip_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     bounded::<D, u8, MAX_RPC_ZIP_BYTES>(d)
+}
+
+pub(crate) fn rpc_avatar_bytes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<u8>, D::Error> {
+    bounded::<D, u8, MAX_AVATAR_PNG_BYTES>(d)
 }

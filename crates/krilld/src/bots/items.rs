@@ -5,6 +5,7 @@
 //! Zero SQLite connections are opened until the first bot item operation. When opened, uses WAL,
 //! `busy_timeout = 5000`, `cache_size = -1000` (~1 MiB), and `foreign_keys = ON`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -15,14 +16,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use krill_proto::bots::{
     BOT_ITEM_COMMENT_MAX_BYTES, BOT_ITEM_DESCRIPTION_MAX_BYTES, BOT_ITEM_TITLE_MAX_BYTES, BotId,
     BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind, BotItemLink,
-    BotItemStatus, CreateBotItemParams, UpdateBotItemParams,
+    BotItemStatus, BotItemsPage, CreateBotItemParams, FieldPatch, UpdateBotItemParams,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::session::lock;
 
+const CURRENT_DB_VERSION: i64 = 1;
+const DEFAULT_PAGE_LIMIT: usize = 50;
+const MAX_PAGE_LIMIT: usize = 200;
 static ITEM_UID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Result of [`BotItemsStore::answer_item`] indicating whether a bot session should wake up.
+#[derive(Debug, Clone)]
+pub struct AnswerItemOutcome {
+    pub item: BotItem,
+    pub should_wake_bot: bool,
+    pub answer_summary: String,
+}
 
 /// Lazily opened SQLite persistence for [`BotItem`], [`BotItemLink`], and [`BotItemEvent`].
 pub struct BotItemsStore {
@@ -97,12 +109,122 @@ impl BotItemsStore {
                 .map_err(sql_err)?;
             let mut items = Vec::new();
             for row in rows {
-                let mut item = row.map_err(sql_err)?;
-                item.links = load_links(conn, &item.uid)?;
-                item.events = load_events(conn, &item.uid)?;
-                items.push(item);
+                items.push(row.map_err(sql_err)?);
             }
-            Ok(items)
+            drop(stmt);
+            hydrate_items_batch(conn, items)
+        })
+    }
+
+    /// Paginated item list with batch-hydrated links/events and per-bot `unseen_count`.
+    pub fn list_items_page(
+        &self,
+        bot_id: Option<&BotId>,
+        include_closed: bool,
+        include_snoozed: bool,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<BotItemsPage> {
+        if !self.db_path.exists() && !self.is_open() {
+            return Ok(BotItemsPage::default());
+        }
+        let page_limit = limit
+            .and_then(|n| usize::try_from(n).ok())
+            .map_or(DEFAULT_PAGE_LIMIT, |n| n.clamp(1, MAX_PAGE_LIMIT));
+        let parsed_cursor = cursor
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(parse_items_cursor)
+            .transpose()?;
+
+        self.with_conn(|conn| {
+            let mut where_clause = String::from(" WHERE 1=1");
+            let mut base_bind: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(bid) = bot_id {
+                where_clause.push_str(" AND owner_bot_id = ?");
+                base_bind.push(rusqlite::types::Value::Text(bid.as_str().to_owned()));
+            }
+            if !include_closed {
+                where_clause.push_str(" AND status NOT IN ('done', 'canceled')");
+            }
+            if !include_snoozed {
+                where_clause.push_str(" AND (snoozed_until_ms IS NULL OR snoozed_until_ms <= ?)");
+                base_bind.push(rusqlite::types::Value::Integer(u64_to_i64(now_ms)));
+            }
+
+            let count_sql = format!("SELECT COUNT(*) FROM items{where_clause}");
+            let total_i64: i64 = conn
+                .query_row(
+                    &count_sql,
+                    rusqlite::params_from_iter(base_bind.clone()),
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            let total_count = usize::try_from(total_i64.max(0)).unwrap_or(0);
+
+            let unseen_sql = format!(
+                "SELECT COUNT(*) FROM items i{where_clause} AND EXISTS (\
+                    SELECT 1 FROM item_events e \
+                    WHERE e.item_uid = i.uid \
+                    AND e.id > COALESCE((SELECT last_seen_event_id FROM items_seen s WHERE s.bot_id = i.owner_bot_id), 0)\
+                )"
+            );
+            let unseen_i64: i64 = conn
+                .query_row(
+                    &unseen_sql,
+                    rusqlite::params_from_iter(base_bind.clone()),
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            let unseen_count = usize::try_from(unseen_i64.max(0)).unwrap_or(0);
+
+            let mut page_sql = format!(
+                "SELECT uid, number, owner_bot_id, title, description, done_means, status, \
+                 close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, \
+                 updated_at_ms, closed_at_ms \
+                 FROM items{where_clause}"
+            );
+            let mut page_bind = base_bind;
+            if let Some((cursor_ts, cursor_uid)) = parsed_cursor {
+                page_sql.push_str(
+                    " AND (last_activity_at_ms < ? OR (last_activity_at_ms = ? AND uid < ?))",
+                );
+                page_bind.push(rusqlite::types::Value::Integer(cursor_ts));
+                page_bind.push(rusqlite::types::Value::Integer(cursor_ts));
+                page_bind.push(rusqlite::types::Value::Text(cursor_uid));
+            }
+            page_sql.push_str(" ORDER BY last_activity_at_ms DESC, uid DESC LIMIT ?");
+            page_bind.push(rusqlite::types::Value::Integer(
+                i64::try_from(page_limit.saturating_add(1)).unwrap_or(i64::MAX),
+            ));
+
+            let mut stmt = conn.prepare(&page_sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(page_bind), row_to_item_header)
+                .map_err(sql_err)?;
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(sql_err)?);
+            }
+            drop(stmt);
+
+            let next_cursor = if items.len() > page_limit {
+                items.truncate(page_limit);
+                items
+                    .last()
+                    .map(|last| format!("{}|{}", last.last_activity_at_ms, last.uid))
+            } else {
+                None
+            };
+
+            let items = hydrate_items_batch(conn, items)?;
+            Ok(BotItemsPage {
+                items,
+                next_cursor,
+                total_count,
+                unseen_count,
+            })
         })
     }
 
@@ -172,11 +294,19 @@ impl BotItemsStore {
                     |row| row.get(0),
                 )
                 .map_err(sql_err)?;
+            let initial_mail_state = if status == BotItemStatus::NeedsYou
+                && matches!(actor, BotItemActor::Bot { .. })
+            {
+                Some("owed")
+            } else {
+                None
+            };
             tx.execute(
                 "INSERT INTO items \
                  (uid, number, owner_bot_id, title, description, done_means, status, close_note, \
-                  snoozed_until_ms, version, last_activity_at_ms, created_at_ms, updated_at_ms, closed_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 1, ?8, ?8, ?8, ?9)",
+                  snoozed_until_ms, version, last_activity_at_ms, created_at_ms, updated_at_ms, closed_at_ms, \
+                  mail_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 1, ?8, ?8, ?8, ?9, ?10)",
                 params![
                     uid,
                     next_number,
@@ -187,6 +317,7 @@ impl BotItemsStore {
                     status.as_str(),
                     u64_to_i64(now_ms),
                     closed_at_ms.map(u64_to_i64),
+                    initial_mail_state,
                 ],
             )
             .map_err(sql_err)?;
@@ -279,6 +410,15 @@ impl BotItemsStore {
             }
 
             let status_changed = params_in.status.filter(|&s| s != item.status);
+            let effective_status = status_changed.unwrap_or(item.status);
+            if !effective_status.is_open()
+                && matches!(params_in.snoozed_until_ms, FieldPatch::Set(_))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot snooze a closed (Done or Canceled) item",
+                ));
+            }
             if let Some(new_status) = status_changed {
                 item.status = new_status;
                 if new_status.is_open() {
@@ -289,10 +429,29 @@ impl BotItemsStore {
             }
 
             let prev_snooze = item.snoozed_until_ms;
-            params_in
-                .snoozed_until_ms
-                .clone()
-                .apply(&mut item.snoozed_until_ms);
+            let trimmed_comment = params_in
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let owner_comment =
+                trimmed_comment.is_some() && matches!(actor, BotItemActor::Owner { .. });
+            let auto_unsnooze_on_status = status_changed.is_some_and(|s| {
+                matches!(
+                    s,
+                    BotItemStatus::Done | BotItemStatus::Canceled | BotItemStatus::NeedsYou
+                )
+            });
+
+            match &params_in.snoozed_until_ms {
+                FieldPatch::Unchanged => {
+                    if auto_unsnooze_on_status || owner_comment {
+                        item.snoozed_until_ms = None;
+                    }
+                }
+                FieldPatch::Clear => item.snoozed_until_ms = None,
+                FieldPatch::Set(until) => item.snoozed_until_ms = Some(*until),
+            }
             let snooze_event = match (prev_snooze, item.snoozed_until_ms) {
                 (_, Some(until)) if prev_snooze != Some(until) => {
                     Some((BotItemEventKind::Snoozed, format!("snoozed until {until}")))
@@ -305,11 +464,27 @@ impl BotItemsStore {
             item.updated_at_ms = now_ms;
             item.last_activity_at_ms = now_ms;
 
+            let has_decisions = !params_in.decisions.is_empty();
+            let next_mail_state: Option<&str> = match status_changed {
+                Some(BotItemStatus::NeedsYou)
+                    if matches!(actor, BotItemActor::Bot { .. }) || has_decisions =>
+                {
+                    Some("owed")
+                }
+                Some(s) if !s.is_open() => Some("closed"),
+                None if effective_status == BotItemStatus::NeedsYou && has_decisions => {
+                    Some("owed")
+                }
+                _ => None,
+            };
+
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
             tx.execute(
                 "UPDATE items SET title = ?1, description = ?2, done_means = ?3, status = ?4, \
                  close_note = ?5, snoozed_until_ms = ?6, version = ?7, last_activity_at_ms = ?8, \
-                 updated_at_ms = ?8, closed_at_ms = ?9 WHERE uid = ?10",
+                 updated_at_ms = ?8, closed_at_ms = ?9, \
+                 mail_state = COALESCE(?10, mail_state) \
+                 WHERE uid = ?11",
                 params![
                     item.title,
                     item.description,
@@ -320,34 +495,48 @@ impl BotItemsStore {
                     u64_to_i64(item.version),
                     u64_to_i64(now_ms),
                     item.closed_at_ms.map(u64_to_i64),
+                    next_mail_state,
                     uid,
                 ],
             )
             .map_err(sql_err)?;
 
+            if edited {
+                insert_event(
+                    &tx,
+                    &uid,
+                    BotItemEventKind::Edited,
+                    actor,
+                    "updated item",
+                    &[],
+                    now_ms,
+                )?;
+            }
             if let Some(new_status) = status_changed {
-                let text = params_in
-                    .comment
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map_or_else(
-                        || format!("status -> {}", new_status.as_str()),
-                        ToOwned::to_owned,
-                    );
+                let status_decisions: &[BotItemDecision] = if trimmed_comment.is_some() {
+                    &[]
+                } else {
+                    &params_in.decisions
+                };
                 insert_event(
                     &tx,
                     &uid,
                     BotItemEventKind::Status,
                     actor,
-                    &text,
-                    &params_in.decisions,
+                    &format!("status -> {}", new_status.as_str()),
+                    status_decisions,
                     now_ms,
                 )?;
-            } else if let Some(comment) = params_in
-                .comment
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
+                if new_status == BotItemStatus::NeedsYou {
+                    let row_id = tx.last_insert_rowid();
+                    tx.execute(
+                        "UPDATE items SET question_event = ?1 WHERE uid = ?2",
+                        params![row_id.to_string(), uid],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+            if let Some(comment) = trimmed_comment {
                 insert_event(
                     &tx,
                     &uid,
@@ -357,16 +546,43 @@ impl BotItemsStore {
                     &params_in.decisions,
                     now_ms,
                 )?;
-            } else if edited {
+                if status_changed.is_none()
+                    && has_decisions
+                    && item.status == BotItemStatus::NeedsYou
+                {
+                    let row_id = tx.last_insert_rowid();
+                    tx.execute(
+                        "UPDATE items SET question_event = ?1, \
+                         mail_state = COALESCE(mail_state, 'owed') WHERE uid = ?2",
+                        params![row_id.to_string(), uid],
+                    )
+                    .map_err(sql_err)?;
+                }
+            } else if status_changed.is_none() && has_decisions {
+                let prompt_text = params_in
+                    .decisions
+                    .first()
+                    .map(|d| d.question.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("decision requested");
                 insert_event(
                     &tx,
                     &uid,
-                    BotItemEventKind::Edited,
+                    BotItemEventKind::Commented,
                     actor,
-                    "updated item",
+                    prompt_text,
                     &params_in.decisions,
                     now_ms,
                 )?;
+                if item.status == BotItemStatus::NeedsYou {
+                    let row_id = tx.last_insert_rowid();
+                    tx.execute(
+                        "UPDATE items SET question_event = ?1, \
+                         mail_state = COALESCE(mail_state, 'owed') WHERE uid = ?2",
+                        params![row_id.to_string(), uid],
+                    )
+                    .map_err(sql_err)?;
+                }
             }
 
             if let Some((kind, text)) = snooze_event {
@@ -397,6 +613,13 @@ impl BotItemsStore {
                 )
             })?;
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let was_snoozed: Option<i64> = tx
+                .query_row(
+                    "SELECT snoozed_until_ms FROM items WHERE uid = ?1",
+                    params![uid],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
             insert_event(
                 &tx,
                 &uid,
@@ -406,14 +629,281 @@ impl BotItemsStore {
                 decisions,
                 now_ms,
             )?;
-            tx.execute(
-                "UPDATE items SET version = version + 1, last_activity_at_ms = ?1, updated_at_ms = ?1 WHERE uid = ?2",
-                params![u64_to_i64(now_ms), uid],
-            )
-            .map_err(sql_err)?;
+            let event_row_id = tx.last_insert_rowid();
+            let auto_unsnooze =
+                was_snoozed.is_some() && matches!(actor, BotItemActor::Owner { .. });
+            if auto_unsnooze {
+                insert_event(
+                    &tx,
+                    &uid,
+                    BotItemEventKind::Unsnoozed,
+                    actor,
+                    "unsnoozed",
+                    &[],
+                    now_ms,
+                )?;
+                tx.execute(
+                    "UPDATE items SET snoozed_until_ms = NULL, version = version + 1, \
+                     last_activity_at_ms = ?1, updated_at_ms = ?1 WHERE uid = ?2",
+                    params![u64_to_i64(now_ms), uid],
+                )
+                .map_err(sql_err)?;
+            } else {
+                tx.execute(
+                    "UPDATE items SET version = version + 1, last_activity_at_ms = ?1, \
+                     updated_at_ms = ?1, \
+                     others_last_event_id = CASE WHEN ?3 THEN ?2 ELSE others_last_event_id END \
+                     WHERE uid = ?4",
+                    params![
+                        u64_to_i64(now_ms),
+                        event_row_id,
+                        !matches!(actor, BotItemActor::Bot { .. }),
+                        uid
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
             tx.commit().map_err(sql_err)?;
             load_item_by_uid(conn, &uid)?
                 .ok_or_else(|| io::Error::other("commented bot item vanished"))
+        })
+    }
+
+    /// Records an owner decision/answer for `item_id` and returns whether `mail_state == 'owed'`.
+    #[expect(clippy::too_many_arguments, reason = "owner item answer payload")]
+    pub fn answer_item(
+        &self,
+        item_id: &str,
+        answer_text: Option<&str>,
+        option_index: Option<u32>,
+        _decision_id: Option<&str>,
+        request_id: Option<&str>,
+        actor: &BotItemActor,
+        now_ms: u64,
+    ) -> io::Result<AnswerItemOutcome> {
+        let req_id_trimmed = request_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let text_trimmed = answer_text
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(ref text) = text_trimmed {
+            validate_comment(text)?;
+        }
+        if text_trimmed.is_none() && option_index.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "answer_text or option_index must be provided",
+            ));
+        }
+
+        self.with_conn(|conn| {
+            let uid = resolve_item_uid(conn, item_id)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("bot item not found: {item_id}"),
+                )
+            })?;
+            let item = load_item_by_uid(conn, &uid)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("bot item not found: {item_id}"),
+                )
+            })?;
+
+            let (mail_state, existing_answer_id, snoozed): (
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+            ) = conn
+                .query_row(
+                    "SELECT mail_state, answer_id, snoozed_until_ms FROM items WHERE uid = ?1",
+                    params![uid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(sql_err)?;
+
+            if let (Some(req_id), Some(prev_ans)) = (&req_id_trimmed, &existing_answer_id)
+                && req_id == prev_ans
+            {
+                return Ok(AnswerItemOutcome {
+                    item,
+                    should_wake_bot: false,
+                    answer_summary: "already answered".to_owned(),
+                });
+            }
+
+            let resolved_option = if let Some(idx) = option_index {
+                let idx_usize = usize::try_from(idx).unwrap_or(usize::MAX);
+                let latest_decisions = item
+                    .events
+                    .iter()
+                    .rev()
+                    .find(|e| !e.decisions.is_empty())
+                    .map(|e| e.decisions.as_slice());
+                let opt_label = latest_decisions
+                    .and_then(|decs| decs.first())
+                    .and_then(|d| d.options.get(idx_usize))
+                    .cloned();
+                match opt_label {
+                    Some(label) => Some(label),
+                    None if text_trimmed.is_some() => Some(format!("option #{idx}")),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("decision option index {idx} out of bounds"),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+
+            let answer_summary = match (resolved_option, text_trimmed) {
+                (Some(opt), Some(txt)) => format!("{opt} — {txt}"),
+                (Some(opt), None) => opt,
+                (None, Some(txt)) => txt,
+                (None, None) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty answer"));
+                }
+            };
+
+            let answer_id = req_id_trimmed.unwrap_or_else(|| {
+                let seq = ITEM_UID_SEQ.fetch_add(1, Ordering::Relaxed);
+                format!("ans-{now_ms}-{seq}")
+            });
+            let should_wake_bot = mail_state.as_deref() == Some("owed");
+
+            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            insert_event(
+                &tx,
+                &uid,
+                BotItemEventKind::Commented,
+                actor,
+                &answer_summary,
+                &[],
+                now_ms,
+            )?;
+            let comment_row_id = tx.last_insert_rowid();
+            let next_status = if item.status == BotItemStatus::NeedsYou {
+                insert_event(
+                    &tx,
+                    &uid,
+                    BotItemEventKind::Status,
+                    actor,
+                    "status -> working",
+                    &[],
+                    now_ms,
+                )?;
+                BotItemStatus::Working
+            } else {
+                item.status
+            };
+            if snoozed.is_some() {
+                insert_event(
+                    &tx,
+                    &uid,
+                    BotItemEventKind::Unsnoozed,
+                    actor,
+                    "unsnoozed",
+                    &[],
+                    now_ms,
+                )?;
+            }
+            tx.execute(
+                "UPDATE items SET status = ?1, snoozed_until_ms = NULL, \
+                 mail_state = 'answered', answer_id = ?2, others_last_event_id = ?3, \
+                 version = version + 1, last_activity_at_ms = ?4, updated_at_ms = ?4 \
+                 WHERE uid = ?5",
+                params![
+                    next_status.as_str(),
+                    answer_id,
+                    comment_row_id,
+                    u64_to_i64(now_ms),
+                    uid,
+                ],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+
+            let updated = load_item_by_uid(conn, &uid)?
+                .ok_or_else(|| io::Error::other("answered bot item vanished"))?;
+            Ok(AnswerItemOutcome {
+                item: updated,
+                should_wake_bot,
+                answer_summary,
+            })
+        })
+    }
+
+    /// Attaches chat/mail routing metadata to an item for downstream reply wakeups.
+    pub fn set_mail_metadata(
+        &self,
+        item_id: &str,
+        chat_id: Option<&str>,
+        mail_state: Option<&str>,
+        request_id: Option<&str>,
+    ) -> io::Result<()> {
+        self.with_conn(|conn| {
+            let uid = resolve_item_uid(conn, item_id)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("bot item not found: {item_id}"),
+                )
+            })?;
+            conn.execute(
+                "UPDATE items SET chat_id = COALESCE(?1, chat_id), \
+                 mail_state = COALESCE(?2, mail_state), \
+                 request_id = COALESCE(?3, request_id) \
+                 WHERE uid = ?4",
+                params![chat_id, mail_state, request_id, uid],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+    }
+
+    /// Marks `bot_id`'s items as seen/opened up to `up_to_event_id` (or latest event if `None`).
+    pub fn mark_items_opened(
+        &self,
+        bot_id: &BotId,
+        up_to_event_id: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        self.with_conn(|conn| {
+            let target_event_id: i64 = match up_to_event_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(raw) => raw.parse::<i64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "up_to_event_id must be a numeric event id",
+                    )
+                })?,
+                None => conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(e.id), 0) FROM item_events e \
+                         INNER JOIN items i ON i.uid = e.item_uid \
+                         WHERE i.owner_bot_id = ?1",
+                        params![bot_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_err)?,
+            };
+
+            conn.execute(
+                "INSERT INTO items_seen (bot_id, last_seen_event_id, opened_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(bot_id) DO UPDATE SET \
+                     last_seen_event_id = MAX(items_seen.last_seen_event_id, excluded.last_seen_event_id), \
+                     opened_at_ms = excluded.opened_at_ms",
+                params![bot_id.as_str(), target_event_id, u64_to_i64(now_ms)],
+            )
+            .map_err(sql_err)?;
+            Ok(())
         })
     }
 
@@ -523,6 +1013,12 @@ fn open_and_migrate(path: &PathBuf) -> io::Result<Connection> {
              created_at_ms INTEGER NOT NULL,\n\
              updated_at_ms INTEGER NOT NULL,\n\
              closed_at_ms INTEGER,\n\
+             chat_id TEXT,\n\
+             question_event TEXT,\n\
+             others_last_event_id INTEGER,\n\
+             mail_state TEXT,\n\
+             request_id TEXT,\n\
+             answer_id TEXT,\n\
              UNIQUE(owner_bot_id, number)\n\
          );\n\
          CREATE INDEX IF NOT EXISTS idx_items_bot_status ON items(owner_bot_id, status);\n\
@@ -543,9 +1039,27 @@ fn open_and_migrate(path: &PathBuf) -> io::Result<Connection> {
              decisions_json TEXT NOT NULL,\n\
              created_at_ms INTEGER NOT NULL\n\
          );\n\
-         CREATE INDEX IF NOT EXISTS idx_item_events_uid ON item_events(item_uid);",
+         CREATE INDEX IF NOT EXISTS idx_item_events_uid ON item_events(item_uid);\n\
+         CREATE TABLE IF NOT EXISTS items_seen (\n\
+             bot_id TEXT PRIMARY KEY,\n\
+             last_seen_event_id INTEGER NOT NULL DEFAULT 0,\n\
+             opened_at_ms INTEGER NOT NULL DEFAULT 0\n\
+         );",
     )
     .map_err(sql_err)?;
+
+    let user_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(sql_err)?;
+    if user_version < CURRENT_DB_VERSION {
+        ensure_items_v1_columns(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_items_mail_state ON items(owner_bot_id, mail_state);\n\
+             CREATE INDEX IF NOT EXISTS idx_items_request_id ON items(request_id);\n\
+             PRAGMA user_version = 1;",
+        )
+        .map_err(sql_err)?;
+    }
 
     #[cfg(unix)]
     {
@@ -554,6 +1068,33 @@ fn open_and_migrate(path: &PathBuf) -> io::Result<Connection> {
     }
 
     Ok(conn)
+}
+
+fn ensure_items_v1_columns(conn: &Connection) -> io::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(items)").map_err(sql_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_err)?;
+    for row in rows {
+        existing.insert(row.map_err(sql_err)?);
+    }
+    drop(stmt);
+
+    for (col, ty) in [
+        ("chat_id", "TEXT"),
+        ("question_event", "TEXT"),
+        ("others_last_event_id", "INTEGER"),
+        ("mail_state", "TEXT"),
+        ("request_id", "TEXT"),
+        ("answer_id", "TEXT"),
+    ] {
+        if !existing.contains(col) {
+            conn.execute(&format!("ALTER TABLE items ADD COLUMN {col} {ty}"), [])
+                .map_err(sql_err)?;
+        }
+    }
+    Ok(())
 }
 
 fn resolve_item_uid(conn: &Connection, raw: &str) -> io::Result<Option<String>> {
@@ -595,11 +1136,120 @@ fn resolve_item_uid(conn: &Connection, raw: &str) -> io::Result<Option<String>> 
             .map_err(sql_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_err)?;
-        if matches.len() == 1 {
-            return Ok(matches.into_iter().next());
+        if matches.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "ambiguous item number #{num}: matches multiple bots; qualify with <bot_id>#{num}"
+                ),
+            ));
         }
+        return Ok(matches.into_iter().next());
     }
     Ok(None)
+}
+
+fn hydrate_items_batch(conn: &Connection, mut items: Vec<BotItem>) -> io::Result<Vec<BotItem>> {
+    if items.is_empty() {
+        return Ok(items);
+    }
+    let mut index_by_uid = HashMap::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        index_by_uid.insert(item.uid.clone(), idx);
+    }
+
+    let uids: Vec<String> = items.iter().map(|i| i.uid.clone()).collect();
+    for chunk in uids.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let links_sql = format!(
+            "SELECT item_uid, kind, target FROM item_links \
+             WHERE item_uid IN ({placeholders}) ORDER BY id ASC"
+        );
+        let mut stmt = conn.prepare(&links_sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                let uid: String = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let target: String = row.get(2)?;
+                Ok((uid, decode_link(&kind, target)))
+            })
+            .map_err(sql_err)?;
+        for row in rows {
+            let (uid, link) = row.map_err(sql_err)?;
+            if let Some(&idx) = index_by_uid.get(&uid)
+                && let Some(item) = items.get_mut(idx)
+            {
+                item.links.push(link);
+            }
+        }
+        drop(stmt);
+
+        let events_sql = format!(
+            "SELECT id, item_uid, kind, actor_json, text, decisions_json, created_at_ms \
+             FROM item_events WHERE item_uid IN ({placeholders}) ORDER BY id ASC"
+        );
+        let mut stmt = conn.prepare(&events_sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                let id: i64 = row.get(0)?;
+                let uid: String = row.get(1)?;
+                let kind_raw: String = row.get(2)?;
+                let actor_json: String = row.get(3)?;
+                let text: String = row.get(4)?;
+                let decisions_json: String = row.get(5)?;
+                let created_at: i64 = row.get(6)?;
+                let actor: BotItemActor =
+                    serde_json::from_str(&actor_json).unwrap_or(BotItemActor::System {
+                        reason: "unknown".to_owned(),
+                    });
+                let decisions: Vec<BotItemDecision> =
+                    serde_json::from_str(&decisions_json).unwrap_or_default();
+                Ok((
+                    uid.clone(),
+                    BotItemEvent {
+                        id: i64_to_u64(id),
+                        item_uid: uid,
+                        kind: parse_event_kind(&kind_raw),
+                        actor,
+                        text,
+                        decisions,
+                        created_at_ms: i64_to_u64(created_at),
+                    },
+                ))
+            })
+            .map_err(sql_err)?;
+        for row in rows {
+            let (uid, event) = row.map_err(sql_err)?;
+            if let Some(&idx) = index_by_uid.get(&uid)
+                && let Some(item) = items.get_mut(idx)
+            {
+                item.events.push(event);
+            }
+        }
+    }
+    Ok(items)
+}
+
+fn parse_items_cursor(raw: &str) -> io::Result<(i64, String)> {
+    let (ts_part, uid_part) = raw.split_once('|').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid items pagination cursor",
+        )
+    })?;
+    let ts: i64 = ts_part.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid items cursor timestamp",
+        )
+    })?;
+    if uid_part.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid items cursor uid",
+        ));
+    }
+    Ok((ts, uid_part.to_owned()))
 }
 
 fn load_item_by_uid(conn: &Connection, uid: &str) -> io::Result<Option<BotItem>> {
@@ -1020,6 +1670,185 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_migration_snooze_guards_ambiguity_pagination_and_answer_wake() {
+        let (dir, db) = temp_db("v2");
+        let store = BotItemsStore::new(db);
+        let bot_a = BotId::new("bot-a").unwrap();
+        let bot_b = BotId::new("bot-b").unwrap();
+        let bot_actor = BotItemActor::Bot {
+            bot_id: bot_a.clone(),
+            session_id: Some(krill_proto::SessionId(10)),
+        };
+        let owner = BotItemActor::Owner { device: None };
+
+        let item_a = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_a.clone(),
+                    title: "Deploy prod?".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: vec![],
+                },
+                &bot_actor,
+                1_000,
+            )
+            .unwrap();
+        let _item_b = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_b.clone(),
+                    title: "Other bot #1".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Planned),
+                    links: vec![],
+                },
+                &owner,
+                1_100,
+            )
+            .unwrap();
+
+        // Ambiguous "#1" across multiple bots must fail explicitly.
+        assert!(store.get_item("#1").is_err());
+        assert!(store.get_item("bot-a#1").unwrap().is_some());
+
+        // Updating an already-NeedsYou item with decisions and no comment still persists decisions.
+        let decision_only = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item_a.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: None,
+                    decisions: vec![BotItemDecision {
+                        question: "Approve?".to_owned(),
+                        options: vec!["Yes".to_owned(), "No".to_owned()],
+                        recommended: Some(0),
+                    }],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &owner,
+                1_500,
+            )
+            .unwrap();
+        assert!(
+            decision_only
+                .events
+                .iter()
+                .any(|e| !e.decisions.is_empty() && e.text == "Approve?")
+        );
+
+        // Combining status change + comment emits both Status and Commented events.
+        let with_decision = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item_a.uid.clone(),
+                    title: Some("Deploy prod v2?".to_owned()),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Pick target env".to_owned()),
+                    decisions: vec![BotItemDecision {
+                        question: "Env?".to_owned(),
+                        options: vec!["Staging".to_owned(), "Prod".to_owned()],
+                        recommended: Some(0),
+                    }],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Set(99_000),
+                },
+                &bot_actor,
+                2_000,
+            )
+            .unwrap();
+        assert!(
+            with_decision
+                .events
+                .iter()
+                .any(|e| e.kind == BotItemEventKind::Edited)
+        );
+        assert!(
+            with_decision
+                .events
+                .iter()
+                .any(|e| e.kind == BotItemEventKind::Commented)
+        );
+
+        // Snooze on Done item is rejected.
+        assert!(
+            store
+                .update_item(
+                    &UpdateBotItemParams {
+                        item_id: item_a.uid.clone(),
+                        title: None,
+                        description: None,
+                        done_means: None,
+                        status: Some(BotItemStatus::Done),
+                        comment: None,
+                        decisions: Vec::new(),
+                        close_note: None,
+                        snoozed_until_ms: FieldPatch::Set(120_000),
+                    },
+                    &owner,
+                    2_100,
+                )
+                .is_err()
+        );
+
+        // AnswerBotItem resolves option index, clears owed mail state, unsnoozes, and requests wake.
+        let outcome = store
+            .answer_item(
+                &item_a.uid,
+                Some("Ship it"),
+                Some(1),
+                None,
+                Some("req-1"),
+                &owner,
+                3_000,
+            )
+            .unwrap();
+        assert!(outcome.should_wake_bot);
+        assert_eq!(outcome.answer_summary, "Prod — Ship it");
+        assert!(outcome.item.snoozed_until_ms.is_none());
+        assert_eq!(outcome.item.status, BotItemStatus::Working);
+
+        // Replaying same request_id is idempotent and does not double-wake.
+        let replay = store
+            .answer_item(
+                &item_a.uid,
+                Some("Ship it"),
+                Some(1),
+                None,
+                Some("req-1"),
+                &owner,
+                3_100,
+            )
+            .unwrap();
+        assert!(!replay.should_wake_bot);
+
+        // Pagination + unseen tracking.
+        let page1 = store
+            .list_items_page(None, true, true, Some(1), None, 4_000)
+            .unwrap();
+        assert_eq!(page1.items.len(), 1);
+        assert_eq!(page1.total_count, 2);
+        assert!(page1.unseen_count >= 1);
+        assert!(page1.next_cursor.is_some());
+
+        store.mark_items_opened(&bot_a, None, 4_100).unwrap();
+        let after_seen = store
+            .list_items_page(Some(&bot_a), true, true, Some(10), None, 4_200)
+            .unwrap();
+        assert_eq!(after_seen.unseen_count, 0);
+
         fs::remove_dir_all(&dir).ok();
     }
 }

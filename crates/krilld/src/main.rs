@@ -150,6 +150,9 @@ fn main() -> ExitCode {
     // 새로 게시하면(처음 기동, 인계 뒤) holder에 맡긴다.
     let fresh = !reused || lis.is_err();
     let mut adopt = Vec::new();
+    let standalone_dir = (!linked && (owns_mobile(&path) || daemon::state_dir_isolated()))
+        .then(daemon::state_dir)
+        .flatten();
     let (registry, link) = if let Some((holder, link, mut kept)) = holder {
         if let Err(h) = &mut lis {
             let Ok(a) = h.merge(&mut kept) else {
@@ -163,7 +166,7 @@ fn main() -> ExitCode {
             Some(link),
         )
     } else {
-        (Registry::new(None, None), None)
+        (Registry::new(None, standalone_dir.as_deref()), None)
     };
     let registry = Arc::new(registry);
     // Recover interrupted speculative checkouts even if no creation dialog is opened again.
@@ -323,6 +326,33 @@ fn main() -> ExitCode {
             })
             .ok();
     }
+    let bot_scheduler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(bot_state_dir) = registry.state_dir() {
+        let r = Arc::clone(&registry);
+        let stop = Arc::clone(&bot_scheduler_stop);
+        thread::Builder::new()
+            .name("bot-scheduler".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                krilld::alloc::mobile_thread().ok();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        r.tick_bots_periodic(&bot_state_dir, std::time::SystemTime::now());
+                    }))
+                    .is_err()
+                    {
+                        tracing::warn!("bot scheduler tick panicked; continuing");
+                    }
+                    for _ in 0..15 {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            })
+            .ok();
+    }
     krilld::ipc::initialize_machine_identity(&path);
     tracing::info!(linked, reused, "daemon accepting clients");
     let hello = ServerHello {
@@ -337,6 +367,7 @@ fn main() -> ExitCode {
     } else if let Err(error) = registry.start_mobile(hello.clone()) {
         tracing::warn!(kind=?error.kind(), "mobile gateway unavailable");
     }
+    let accept_registry = Arc::clone(&registry);
     let accept = thread::Builder::new()
         .name("accept".to_owned())
         .stack_size(256 * 1024)
@@ -374,7 +405,7 @@ fn main() -> ExitCode {
                     tracing::info!(closed = full, "handshake admission recovered");
                     full = 0;
                 }
-                let (hello, r) = (hello.clone(), Arc::clone(&registry));
+                let (hello, r) = (hello.clone(), Arc::clone(&accept_registry));
                 match thread::Builder::new()
                     .name("conn".to_owned())
                     .stack_size(256 * 1024)
@@ -393,9 +424,17 @@ fn main() -> ExitCode {
             }
         });
     if accept.is_err() {
+        bot_scheduler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(bots) = registry.bots_if_initialized() {
+            bots.shutdown();
+        }
         return ExitCode::FAILURE;
     }
     handed.recv().ok();
+    bot_scheduler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(bots) = registry.bots_if_initialized() {
+        bots.shutdown();
+    }
     drop(done);
     tracing::info!("daemon handover complete");
     ExitCode::SUCCESS

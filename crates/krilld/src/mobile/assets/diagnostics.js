@@ -63,7 +63,7 @@
     "i18n.js",
     "qr.js",
     "sw.js",
-    ...["home", "session", "chat", "settings", "workspaces", "details"].map(
+    ...["home", "bots", "session", "chat", "settings", "workspaces", "details"].map(
       (n) => `screens/${n}.js`,
     ),
   ]);

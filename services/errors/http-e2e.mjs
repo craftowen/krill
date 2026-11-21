@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import {spawn, spawnSync} from 'node:child_process';
 import {mkdtempSync, rmSync} from 'node:fs';
+import {createServer as createHttpServer} from 'node:http';
 import {createServer} from 'node:net';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -12,7 +13,25 @@ const directory = mkdtempSync(join(tmpdir(), 'krill-errors-http-'));
 const token = 'local-http-test-only-not-production';
 const wrangler = process.env.ERRORS_WRANGLER || 'wrangler';
 let child;
+let hookServer;
 try {
+  const hookPayloads = [];
+  let notifyHook;
+  const hookReceived = new Promise(resolve => { notifyHook = resolve; });
+  hookServer = createHttpServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      if (req.method === 'POST' && req.url === '/feedback') {
+        hookPayloads.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        notifyHook();
+      }
+      res.writeHead(204);
+      res.end();
+    });
+  });
+  await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
+  const hookPort = hookServer.address().port;
   const migration = spawnSync(wrangler, ['d1', 'migrations', 'apply', 'krill-errors',
     '--local', '--persist-to', directory], {cwd, input: 'y\n', encoding: 'utf8', env: {...process.env, WRANGLER_SEND_METRICS: 'false'}});
   assert.equal(migration.status, 0, 'local D1 migration must succeed');
@@ -24,6 +43,7 @@ try {
   const compat = process.env.ERRORS_LOCAL_COMPATIBILITY_DATE;
   child = spawn(wrangler, ['dev', '--local', '--ip', '127.0.0.1', '--port', String(port),
     '--persist-to', directory, '--test-scheduled', '--var', `ADMIN_TOKEN:${token}`,
+    '--var', `FEEDBACK_WEBHOOK_URL:http://127.0.0.1:${hookPort}/feedback`,
     ...(compat ? ['--compatibility-date', compat] : [])],
     {cwd, stdio: 'ignore', env: {...process.env, WRANGLER_SEND_METRICS: 'false'}});
   let ready = false;
@@ -37,6 +57,10 @@ try {
     body: JSON.stringify({message: 'http feedback', release: '0.3.8', os: 'macos', arch: 'aarch64'})});
   assert.equal(feedback.status, 200, 'feedback must be stored in local D1');
   assert.deepEqual(await feedback.json(), {ok: true});
+  await Promise.race([hookReceived, delay(5000).then(() => { throw new Error('feedback webhook timed out'); })]);
+  assert.equal(hookPayloads.length, 1);
+  assert.deepEqual(hookPayloads[0].allowed_mentions, {parse: []});
+  assert.equal(hookPayloads[0].embeds[0].description, 'http feedback');
   const e = {event_id: '00000000000000000000000000000001', process: 'krill-app',
     kind: 'operation_error', error_code: 'session_start_failed', release: '0.2.16', build_id: 'http-test',
     os: 'macos', arch: 'aarch64', source_loc: null, hang_bucket_ms: null, native: null};
@@ -121,5 +145,6 @@ try {
     await exited;
     clearTimeout(timeout);
   }
+  if (hookServer) await new Promise(resolve => hookServer.close(resolve));
   rmSync(directory, {recursive: true, force: true});
 }
