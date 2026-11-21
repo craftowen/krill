@@ -36,6 +36,7 @@ pub(crate) mod popout;
 mod release;
 pub(crate) mod security;
 mod session_accounts;
+mod session_switch_modal;
 mod stale_account_banner;
 mod tabs;
 mod terminal_menu;
@@ -835,6 +836,8 @@ pub struct Shell {
     tab_dialog_previous_focus: Option<FocusHandle>,
     /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
     pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
+    /// 기본 계정 전환 뒤 옮길 실행 중 세션을 고르는 모달.
+    session_switch: Option<session_switch_modal::SessionSwitchModal>,
     /// OWE-870: 탭 이름 인라인 편집.
     tab_rename: Option<tabs::TabRename>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
@@ -1487,6 +1490,7 @@ impl Shell {
             tab_dialog_was_open: false,
             tab_dialog_previous_focus: None,
             pending_running_close: None,
+            session_switch: None,
             tab_rename: None,
             nav_history: NavHistory::default(),
             chat: chat::ChatState::default(),
@@ -1502,6 +1506,7 @@ impl Shell {
         shell.sync_sidebar_tab_state(cx);
         shell.record_workspace_nav(cx);
         Self::register_overlay_hosts(cx);
+        Self::register_account_switch_host(cx);
         shell.refresh_local_state(cx);
         shell.orch_poll = Some(Self::poll_orchestration(cx));
         #[cfg(not(test))]
@@ -8150,8 +8155,9 @@ impl Render for Shell {
         {
             previous.focus(window, cx);
         }
-        let tab_dialog_open =
-            self.confirm_close_tab.is_some() || self.pending_running_close.is_some();
+        let tab_dialog_open = self.confirm_close_tab.is_some()
+            || self.pending_running_close.is_some()
+            || self.session_switch.is_some();
         if tab_dialog_open && !self.tab_dialog_was_open {
             self.tab_dialog_previous_focus = window.focused(cx);
             self.tab_dialog_focus.focus(window, cx);
@@ -9010,6 +9016,7 @@ impl Render for Shell {
             .children(self.render_link_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
             .children(self.render_running_close_dialog(window, cx))
+            .children(self.render_session_switch_modal(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
             .children(self.notification_overlay())
             // Action/safety toasts take priority in this corner. The update

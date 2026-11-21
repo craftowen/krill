@@ -2936,6 +2936,28 @@ catalog! {
         FOLDER_DOWNLOADS => ("다운로드", "Downloads"),
     }
     // krilld가 영어로 보내는 알림. 앱이 `cached_notice`로 언어에 맞춘다. 한글은 예전 버전이 남긴 값도 맞춘다.
+    session_switch {
+        TITLE => ("{next} 계정으로 전환됨", "Switched to {next}"),
+        DETAIL => ("실행 중인 세션을 재시작해 {next} 계정으로 이어갑니다. 작업 중인 세션은 현재 작업을 멈추고 재시작됩니다.", "Restart running sessions to continue on {next}. Working sessions stop their current task and restart."),
+        REVIEW_DETAIL => ("일부 세션이 {next}로 이동되지 않았습니다.", "Some sessions didn't move to {next}."),
+        GROUP_PREVIOUS => ("이전 계정({prev})에서 실행 중 ({count})", "Running on previous account ({prev}) ({count})"),
+        GROUP_ELSEWHERE => ("다른 계정에서 실행 중 ({count})", "Running on other accounts ({count})"),
+        GROUP_CANT_MOVE => ("이동 불가 ({count})", "Can't move ({count})"),
+        NO_SESSION => ("재개 불가", "Can't resume"),
+        UNKNOWN_ACCOUNT => ("계정 미상", "Account unknown"),
+        OWN_FOLDER => ("개인 폴더 사용", "Uses your own folder"),
+        SHARED_SESSION => ("다른 패인에 열림", "Also open in another pane"),
+        PENDING_HANDOFF => ("전환 진행 중", "Switch in progress"),
+        BUSY => ("작업 중", "Working"),
+        IDLE => ("대기 중", "Idle"),
+        DONT_ASK => ("다시 묻지 않기 (자동 재시작)", "Don't ask again (restart automatically)"),
+        KEEP => ("그대로 유지", "Keep as is"),
+        RESTART => ("{count}개 세션 재시작", "Restart {count} sessions"),
+        POLICY_TITLE => ("실행 중 세션 처리", "Running sessions on switch"),
+        POLICY_ASK => ("매번 묻기", "Ask every time"),
+        POLICY_RESTART => ("자동 재시작", "Restart automatically"),
+        POLICY_KEEP => ("기존 세션 유지", "Keep existing sessions"),
+    }
     daemon_notice {
         MOBILE_MODE_CHANGED => ("모바일 연결 모드가 변경되었습니다", "Mobile connection mode changed"),
         PAIRING_CANCELLED => ("페어링 요청이 취소되었거나 만료되었습니다", "The pairing request was cancelled or expired"),

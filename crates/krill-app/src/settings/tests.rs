@@ -182,6 +182,68 @@ fn running_session_switch_policy_defaults_to_ask_and_roundtrips() {
 }
 
 #[gpui::test]
+fn session_switch_policy_selector_saves_running_session_policy(cx: &mut TestAppContext) {
+    let d = dir("session-switch-policy");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1000.), px(3000.)));
+    view.update(vcx, |v, cx| v.set_tab(AdminTab::Accounts, cx));
+    vcx.run_until_parked();
+    for (selector, policy) in [
+        (
+            "settings-switch-policy-restart",
+            RunningSessionSwitchPolicy::Restart,
+        ),
+        (
+            "settings-switch-policy-keep",
+            RunningSessionSwitchPolicy::Keep,
+        ),
+        (
+            "settings-switch-policy-ask",
+            RunningSessionSwitchPolicy::Ask,
+        ),
+    ] {
+        let bounds = vcx.debug_bounds(selector).unwrap();
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert_eq!(running_session_switch_policy(cx), policy, "{selector}"));
+    }
+    fs::remove_dir_all(d).unwrap();
+}
+
+#[gpui::test]
+fn session_switch_settings_account_switch_goes_through_main_window_host(cx: &mut TestAppContext) {
+    use krill_proto::usage::ProviderKind;
+    let d = dir("session-switch-host");
+    init(cx, &d);
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&calls);
+    cx.update(|cx| {
+        register_account_switch_host(cx, move |host, provider, id, _| {
+            seen.borrow_mut().push((host, provider, id));
+            Some(true)
+        });
+        // A released window is skipped and dropped.
+        register_account_switch_host(cx, |_, _, _, _| None);
+    });
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    view.update(vcx, |v, cx| {
+        v.switch_default_account(ProviderKind::Codex, "alt".into(), cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        *calls.borrow(),
+        vec![(
+            crate::hosts::HostId::Local,
+            ProviderKind::Codex,
+            "alt".to_owned()
+        )]
+    );
+    vcx.update(|_, cx| assert_eq!(cx.global::<AccountSwitchHosts>().0.len(), 1));
+    fs::remove_dir_all(d).unwrap();
+}
+
+#[gpui::test]
 fn many_account_hosts_wrap_inside_the_host_bar(cx: &mut TestAppContext) {
     let d = dir("account-host-bar");
     init(cx, &d);

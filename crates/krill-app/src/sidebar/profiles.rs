@@ -234,6 +234,14 @@ impl Sidebar {
         })
     }
 
+    /// Feature bits last negotiated on this host's account IPC connection (0 if never).
+    pub fn session_account_features(&self, host: &HostId) -> u64 {
+        self.profiles
+            .hosts
+            .get(host)
+            .map_or(0, |state| state.features)
+    }
+
     /// Capability comes from this host's account IPC connection, never the active pane.
     pub fn set_session_account_features(
         &mut self,
