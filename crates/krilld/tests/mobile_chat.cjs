@@ -1035,7 +1035,11 @@ async function tailFollow() {
   );
   delete feed.scrollHeight;
   await f.poll(page(30, 32));
-  assert.equal(feed.children.length, 32);
+  assert.equal(
+    feed.children.filter((c) => c.className !== "chat-unread-divider").length,
+    32,
+  );
+  assert.equal(feed.children[30].className, "chat-unread-divider");
   assert.equal(
     feed.scrollTop,
     400,
@@ -1043,6 +1047,10 @@ async function tailFollow() {
   );
   feed.scrollTop = feed.scrollHeight - feed.clientHeight;
   feed.dispatchEvent(new Event("scroll"));
+  assert(
+    !feed.children.some((c) => c.className === "chat-unread-divider"),
+    "returning to bottom clears unread divider",
+  );
   await f.poll(page(32, 33));
   assert.equal(
     feed.scrollTop,
@@ -5539,6 +5547,345 @@ async function unboundEmptyAndVisibilityTransitions() {
 
     p1b.dispose();
     console.log("PASS Phase 1B: Markdown, highlighting, diff sheet, Tab/Enter submit, modal <dialog>, skeleton and streaming dots");
+  }
+
+  // Phase 2B: Queue/Steer on Working, 2s Stop cooldown, inline diffs, unread divider, rate-limit banner, live_prompt_reply cards.
+  {
+    let livePromptPayload = {
+      kind: "numbered_menu",
+      prompt: "Proceed with this plan?",
+      options: [
+        { number: 1, label: "Yes, approve plan", selected: true, checked: false },
+        { number: 2, label: "No, keep planning", selected: false, checked: false },
+      ],
+      cursor: 0,
+      checked: [],
+      is_plan_approval: true,
+      allows_other: false,
+    };
+    let rateLimited = true;
+    const routes = [];
+    let pollStep = 0;
+    let queuedPollData = null;
+    const p2b = fixture({
+      lang: "en",
+      capabilities: {
+        chat_tail: true,
+        chat_interrupt: true,
+        chat_composer: true,
+        composer_models: true,
+        prompt_steer: true,
+        live_prompt_reply: true,
+      },
+      handler: async (req) => {
+        if (req.action === "chat_composer") {
+          return {
+            agent: "claude",
+            supported: true,
+            model: "claude-opus-5-5",
+            rate_limited: rateLimited,
+            live_prompt: livePromptPayload,
+          };
+        }
+        if (req.action === "chat_poll") {
+          if (queuedPollData !== null) {
+            const d = queuedPollData;
+            queuedPollData = null;
+            return d;
+          }
+          pollStep++;
+          if (pollStep === 1) {
+            return {
+              generation: "g-2b",
+              agent: "claude",
+              bound: true,
+              page_start: 0,
+              next_offset: 100,
+              items: [
+                {
+                  id: "m1",
+                  kind: "user",
+                  text: "implement feature",
+                },
+                {
+                  id: "m2",
+                  kind: "tool_call",
+                  tool_name: "Edit",
+                  file_path: "src/lib.rs",
+                  text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                },
+                {
+                  id: "m3",
+                  kind: "permission",
+                  tool_name: "ExitPlanMode",
+                  text: "Proceed with this plan?",
+                },
+              ],
+            };
+          }
+          if (pollStep === 2) {
+            return {
+              generation: "g-2b",
+              agent: "claude",
+              bound: true,
+              page_start: 100,
+              next_offset: 200,
+              items: [
+                {
+                  id: "m4",
+                  kind: "assistant",
+                  text: "New unread reply",
+                },
+              ],
+            };
+          }
+          return {
+            generation: "g-2b",
+            agent: "claude",
+            bound: true,
+            page_start: 200,
+            next_offset: 200,
+            items: [],
+          };
+        }
+        if (req.action === "interrupt") return { interrupted: true };
+        return { sent: true };
+      },
+    });
+    p2b.ctx.go = (path) => routes.push(path);
+    await flush();
+
+    // WorkRun diff summary
+    const diffSummary = p2b.find("chat-run-diff-summary");
+    assert(diffSummary.textContent.includes("+1 -1"), "WorkRun header shows +1 -1 diff stats");
+
+    // Rate-limit banner navigates to /accounts on Switch account click
+    const rlBanner = p2b.find("chat-rate-limit-banner");
+    assert.equal(rlBanner.hidden, false);
+    p2b.button("Switch account").action();
+    await flush();
+    assert.equal(routes.at(-1), "/accounts");
+
+    // ExitPlanMode badge and numbered permission choice dispatch live_prompt_reply
+    const planBadge = p2b.find("chat-plan-badge");
+    assert.equal(planBadge.textContent, "Plan approval");
+    p2b.button("Yes, approve plan").action();
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) =>
+          c.action === "live_prompt_reply" &&
+          c.choice === 0 &&
+          c.expected_prompt === "Proceed with this plan?",
+      ),
+    );
+
+    // Queue + Steer + 2s Stop cooldown while Working
+    p2b.state.sessions.set(7, {
+      id: 7,
+      state: "Working",
+      state_since_unix_ns: "501",
+      cwd: "/work",
+    });
+    p2b.update();
+    await flush();
+    p2b.input("follow-up task");
+    const qBtn = p2b.button("Queue"),
+      sBtn = p2b.button("Steer"),
+      sendBtn = p2b.find("primary composer-send");
+    assert.equal(sendBtn.dataset.mode, "stop");
+    assert.equal(qBtn.hidden, false);
+    assert.equal(sBtn.hidden, false);
+
+    qBtn.action();
+    await flush();
+    assert.equal(p2b.find("chat-input").value, "");
+    assert.equal(p2b.find("chat-queued-strip").hidden, false);
+    assert.equal(p2b.find("chat-queued-strip").children.length, 1);
+
+    // Cmd+Enter while Working steers immediately without touching queue
+    p2b.input("steer now");
+    const cmdEnter = new Event("keydown", { cancelable: true });
+    cmdEnter.key = "Enter";
+    cmdEnter.metaKey = true;
+    p2b.find("chat-input").dispatchEvent(cmdEnter);
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) => c.action === "prompt" && c.text === "steer now" && c.mode === "steer",
+      ),
+    );
+
+    // Clicking Stop starts cooldown and disables Stop
+    sendBtn.dispatchEvent(new Event("click"));
+    await flush();
+    assert.equal(sendBtn.disabled, true);
+
+    // Leaving Working for Done auto-flushes queued item FIFO
+    p2b.state.sessions.set(7, {
+      id: 7,
+      state: "Done",
+      state_since_unix_ns: "502",
+      cwd: "/work",
+    });
+    p2b.update();
+    await flush();
+    assert(
+      p2b.calls.some((c) => c.action === "prompt" && c.text === "follow-up task" && !c.mode),
+    );
+    assert.equal(p2b.find("chat-queued-strip").hidden, true);
+
+    // Inline UnreadDivider appears only when new items arrive while scrolled up (!following)
+    const feed = p2b.find("chat-feed");
+    feed.clientHeight = 100;
+    Object.defineProperty(feed, "scrollHeight", { value: 1000, configurable: true });
+    feed.scrollTop = 200;
+    feed.dispatchEvent(new Event("scroll"));
+    feed.scrollTop = 40;
+    feed.dispatchEvent(new Event("scroll"));
+    delete feed.scrollHeight;
+    queuedPollData = {
+      generation: "g-2b",
+      agent: "claude",
+      bound: true,
+      page_start: 120,
+      next_offset: 180,
+      items: [{ id: "m-unread", kind: "assistant", text: "New unread reply" }],
+    };
+    p2b.update();
+    await flush();
+    assert(
+      feed.descendants().some((n) => n.className === "chat-unread-divider"),
+      "unread divider appears before new items received while scrolled up",
+    );
+    p2b.find("chat-jump-bottom").action();
+    await flush();
+    assert(!feed.descendants().some((n) => n.className === "chat-unread-divider"));
+
+    // Yes/No live permission prompt dispatches yes_no: true on Approve
+    livePromptPayload = {
+      kind: "yes_no",
+      prompt: "Deploy to production? (y/n)",
+    };
+    queuedPollData = {
+      generation: "g-2b",
+      agent: "claude",
+      bound: true,
+      page_start: 150,
+      next_offset: 200,
+      items: [
+        {
+          id: "perm-yn",
+          kind: "permission",
+          tool_name: "Bash",
+          text: "Deploy to production? (y/n)",
+        },
+      ],
+    };
+    p2b.update();
+    await flush();
+    p2b.button("Approve").action();
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) =>
+          c.action === "live_prompt_reply" &&
+          c.yes_no === true &&
+          c.expected_prompt === "Deploy to production? (y/n)",
+      ),
+    );
+
+    // Without live_prompt_reply capability, permission falls back to historical Confirm in Term card
+    const legacy = fixture({
+      capabilities: { chat_tail: true, chat_composer: true },
+      handler: async (req) => {
+        if (req.action === "chat_composer") {
+          return {
+            agent: "claude",
+            supported: true,
+            live_prompt: { kind: "yes_no", prompt: "Allow?" },
+          };
+        }
+        return {
+          generation: "g-legacy",
+          agent: "claude",
+          bound: true,
+          page_start: 0,
+          next_offset: 10,
+          items: [{ id: "p-old", kind: "permission", tool_name: "Bash", text: "Allow?" }],
+        };
+      },
+    });
+    await flush();
+    assert(legacy.button("Confirm in Term"));
+    assert(!legacy.buttons.some((b) => b.textContent === "Approve"));
+    legacy.dispose();
+
+    // Live Question with allows_other & Other option submits write-in via live_prompt_reply
+    livePromptPayload = {
+      kind: "numbered_menu",
+      prompt: "Pick deployment mode",
+      options: [
+        { number: 1, label: "Staging", selected: true, checked: false },
+        { number: 2, label: "Other", selected: false, checked: false },
+      ],
+      cursor: 0,
+      checked: [],
+      is_plan_approval: false,
+      allows_other: true,
+    };
+    queuedPollData = {
+      generation: "g-2b",
+      agent: "claude",
+      bound: true,
+      page_start: 200,
+      next_offset: 300,
+      items: [
+        {
+          id: "q1",
+          kind: "question",
+          title: "Deploy",
+          text: "Pick deployment mode",
+          options: [
+            { label: "Staging", description: "" },
+            { label: "Other", description: "" },
+          ],
+        },
+      ],
+    };
+    p2b.update();
+    await flush();
+    p2b.setQuestion({
+      identity: "q-other",
+      token: "tok-other",
+      title: "Pick deployment mode",
+      multiple: false,
+      enabled: true,
+      choices: [
+        { label: "Staging", selected: true },
+        { label: "Other", selected: false },
+      ],
+    });
+    await flush();
+    const qInput = p2b
+      .find("chat-question-options")
+      .parentElement.children.find((n) => n.tag === "input");
+    assert.equal(qInput.hidden, false);
+    qInput.value = "Canary 10%";
+    qInput.dispatchEvent(new Event("input"));
+    p2b.button("Send other").action();
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) =>
+          c.action === "live_prompt_reply" &&
+          c.other?.option_index === 1 &&
+          c.other?.text === "Canary 10%",
+      ),
+    );
+
+    p2b.dispose();
+    console.log("PASS Phase 2B: Queue/Steer, Stop cooldown, WorkRun diffs, unread divider, rate-limit banner, live_prompt_reply");
   }
 }
 main().catch((error) => {

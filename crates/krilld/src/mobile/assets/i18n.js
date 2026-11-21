@@ -860,6 +860,17 @@
       "세션 작업 디렉터리를 사용할 수 없습니다",
     "No active terminal": "활성 터미널이 없습니다",
     "input rejected": "입력이 거부되었습니다",
+    Queue: "대기열",
+    Steer: "끼어들기",
+    "Queued ({0})": "대기 중 ({0})",
+    New: "새 메시지",
+    "Rate limit reached on current account.":
+      "현재 계정의 사용량 제한에 도달했습니다.",
+    "Plan approval": "계획 승인",
+    Reject: "거절",
+    "Send other": "직접 입력 전송",
+    "Changed {0} files (+{1} -{2})": "파일 {0}개 변경 (+{1} -{2})",
+    "Remove queued": "대기 메시지 삭제",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;

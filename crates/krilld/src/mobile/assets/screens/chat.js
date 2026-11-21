@@ -1002,8 +1002,13 @@
         return;
       }
       if (!canReadEarlier()) return;
-      if (gap <= 1) following = true;
-      else if (upward) following = false;
+      if (gap <= 1) {
+        following = true;
+        if (entry.unreadFromId) {
+          entry.unreadFromId = null;
+          unreadDivider?.remove();
+        }
+      } else if (upward) following = false;
       else if (gap < 60) following = true;
       syncLiveCardVisibility();
       syncJumpButton();
@@ -1034,6 +1039,8 @@
       earlierQueued = false;
       failedEarlier = false;
       autoBlocked = null;
+      entry.unreadFromId = null;
+      unreadDivider?.remove();
       pollStatus.hidden = true;
       if (entry.live && !resetHistory) {
         entry.items = entry.live.items;
@@ -1183,6 +1190,22 @@
       summaryNodes.push(iconWrap);
       if (mainText)
         summaryNodes.push(el("span", mainText, "chat-tool-summary-text"));
+      if (
+        targetRun.diffFiles?.size ||
+        targetRun.diffAdded ||
+        targetRun.diffDeleted
+      ) {
+        const files = String(targetRun.diffFiles?.size || 1),
+          added = String(targetRun.diffAdded || 0),
+          deleted = String(targetRun.diffDeleted || 0),
+          diffText = t("Changed {0} files (+{1} -{2})", files, added, deleted)
+            .replace("{0}", files)
+            .replace("{1}", added)
+            .replace("{2}", deleted);
+        summaryNodes.push(
+          el("span", diffText, "chat-run-diff-summary"),
+        );
+      }
       if (elapsedBadge) {
         if (mainText)
           summaryNodes.push(el("span", " · ", "chat-tool-summary-sep"));
@@ -1218,6 +1241,7 @@
       saveDrafts();
       sizeInput();
       suggest();
+      syncQueueButtons();
     });
     input.addEventListener("change", syncDraft);
     input.addEventListener("blur", syncDraft);
@@ -1387,10 +1411,40 @@
     });
     choiceList.setAttribute("role", "listbox");
     choiceList.setAttribute("aria-label", t("Commands, skills and files"));
-    const box = el("div", undefined, "chat-composer-box");
+    const box = el("div", undefined, "chat-composer-box"),
+      queuedStrip = el("div", undefined, "chat-queued-strip"),
+      queueBtn = button(
+        t("Queue"),
+        () => enqueuePrompt(),
+        "ghost small composer-queue",
+      ),
+      steerBtn = button(
+        t("Steer"),
+        () => dispatchPrompt({ text: input.value, photo: entry.photo, steer: true, fromDraft: true }),
+        "secondary small composer-steer",
+      ),
+      rateLimitBanner = el("div", undefined, "chat-rate-limit-banner");
+    queuedStrip.hidden = true;
+    queueBtn.type = "button";
+    queueBtn.hidden = true;
+    steerBtn.type = "button";
+    steerBtn.hidden = true;
+    rateLimitBanner.hidden = true;
+    rateLimitBanner.append(
+      el("span", t("Rate limit reached on current account.")),
+      button(
+        t("Switch account"),
+        () => {
+          if (ctx.openAccountSwitch) return ctx.openAccountSwitch(sessionId);
+          if (ctx.go) ctx.go("/accounts");
+          else M.app?.navigate?.("/accounts");
+        },
+        "secondary small",
+      ),
+    );
     leading.append(attachBtn, modelBtn, statusLine);
-    statusRow.append(leading, contextMeter, sendBtn);
-    box.append(suggestions, attachment, input, statusRow);
+    statusRow.append(leading, contextMeter, queueBtn, steerBtn, sendBtn);
+    box.append(suggestions, queuedStrip, attachment, input, statusRow);
     composer.append(box, photoPicker);
     // Like Orca, the send tap takes focus so the IME commits the last syllable first.
     for (const row of [attachment, leading, contextMeter])
@@ -1844,6 +1898,18 @@
           desktopPointer =
             typeof globalThis.matchMedia !== "function" ||
             !globalThis.matchMedia("(pointer: coarse)")?.matches;
+        if (modSubmit && isStopMode()) {
+          if (input.value.trim() || entry.photo) {
+            event.preventDefault();
+            dispatchPrompt({
+              text: input.value,
+              photo: entry.photo,
+              steer: true,
+              fromDraft: true,
+            });
+          }
+          return;
+        }
         if (modSubmit || (plainEnter && desktopPointer)) {
           event.preventDefault();
           if (typeof composer.requestSubmit === "function")
@@ -2165,6 +2231,8 @@
         ? t("Message {0}", agentName(agent))
         : t("Message agent (Bracketed Paste)…");
       if (input.placeholder !== text) input.placeholder = text;
+      rateLimitBanner.hidden = !Boolean(status?.rate_limited);
+      for (const card of cards.values()) card._syncPermission?.();
     }
     function copyText(text, node) {
       run(async () => {
@@ -2329,6 +2397,9 @@
           .then(fn)
           .catch((e) => ctx.error?.(Error(cleanRpcError(e, t))));
     }
+    let queueSeq = 0,
+      stopCooldownTimer = null,
+      unreadDivider = null;
     function syncStopLatch() {
       const sess = state.sessions?.get(sessionId);
       if (
@@ -2341,7 +2412,19 @@
         entry.stopping = false;
         entry.stopStamp = null;
       }
+      if (
+        entry.stopCooldownUntil &&
+        (sess?.state !== "Working" ||
+          (entry.stopCooldownStamp &&
+            sess?.state_since_unix_ns &&
+            sess.state_since_unix_ns !== entry.stopCooldownStamp))
+      ) {
+        entry.stopCooldownUntil = 0;
+        entry.stopCooldownStamp = null;
+      }
     }
+    const isStopCooldown = () =>
+      Boolean(entry.stopCooldownUntil && Date.now() < entry.stopCooldownUntil);
     function isStopMode() {
       syncStopLatch();
       return (
@@ -2352,9 +2435,172 @@
     }
     const stopDisabled = () =>
       !!entry.stopping ||
+      isStopCooldown() ||
       !!entry.modelPending ||
       !!liveQuestion ||
       state.connection?.phase !== "ready";
+    function syncQueueButtons() {
+      const show =
+          isStopMode() &&
+          (Boolean(input.value.trim()) || entry.photo?.status === "ready"),
+        disabled =
+          !!liveQuestion ||
+          !!entry.modelPending ||
+          !!entry.sending ||
+          entry.photo?.status === "pending" ||
+          entry.photo?.status === "error" ||
+          state.connection?.phase !== "ready";
+      queueBtn.hidden = !show;
+      steerBtn.hidden = !show;
+      queueBtn.disabled = disabled;
+      steerBtn.disabled = disabled;
+    }
+    function renderQueuedStrip() {
+      const items = entry.queuedPrompts || [];
+      queuedStrip.replaceChildren();
+      queuedStrip.hidden = !items.length;
+      if (!items.length) return;
+      for (const item of items) {
+        const row = el("div", undefined, "chat-queued-item"),
+          preview = String(item.text || "").trim() || t("Photo");
+        row.append(
+          el("span", preview, "chat-queued-label"),
+          button(
+            t("Remove queued"),
+            () => {
+              entry.queuedPrompts = (entry.queuedPrompts || []).filter(
+                (q) => q.id !== item.id,
+              );
+              renderQueuedStrip();
+            },
+            "ghost small",
+          ),
+        );
+        queuedStrip.append(row);
+      }
+    }
+    function enqueuePrompt() {
+      if (
+        !active() ||
+        liveQuestion ||
+        entry.modelPending ||
+        entry.photo?.status === "pending" ||
+        entry.photo?.status === "error"
+      )
+        return;
+      const text = input.value,
+        photo = entry.photo;
+      if (!text.trim() && !photo) return;
+      entry.queuedPrompts ||= [];
+      entry.queuedPrompts.push({ id: ++queueSeq, text, photo: photo || null });
+      entry.draftVersion = (entry.draftVersion || 0) + 1;
+      input.value = "";
+      drafts.delete(sessionId);
+      saveDrafts();
+      if (photo && entry.photo === photo) {
+        entry.photoVersion++;
+        entry.photo = null;
+      }
+      closeSuggestions();
+      sizeInput();
+      updateComposer();
+    }
+    function flushQueued() {
+      const sess = state.sessions?.get(sessionId);
+      if (
+        !active() ||
+        entry.sending ||
+        liveQuestion ||
+        entry.modelPending ||
+        state.connection?.phase !== "ready" ||
+        !(entry.queuedPrompts?.length > 0) ||
+        ["Working", "Waiting", "Blocked", "Exited"].includes(sess?.state)
+      )
+        return;
+      const next = entry.queuedPrompts.shift();
+      renderQueuedStrip();
+      dispatchPrompt({
+        text: next.text,
+        photo: next.photo,
+        steer: false,
+        fromDraft: false,
+      });
+    }
+    function dispatchPrompt({ text, photo, steer, fromDraft }) {
+      if (
+        !active() ||
+        liveQuestion ||
+        entry.modelPending ||
+        entry.sending ||
+        photo?.status === "pending" ||
+        photo?.status === "error" ||
+        (!steer && isStopMode())
+      )
+        return;
+      const version = entry.draftVersion || 0;
+      if (fromDraft && text.trim() === "/model" && !photo && capability("composer_models")) {
+        openModelCommand(0, text.length);
+        return;
+      }
+      if (!String(text || "").trim() && !photo) return;
+      const hadLive = !!entry.live;
+      followLatest();
+      entry.progress = {
+        phase: "sending",
+        text,
+        photo: !!photo,
+        at: Date.now(),
+        canConfirm: entry.loaded && entry.bound,
+        generation: entry.generation,
+        lastState: state.sessions?.get(sessionId)?.state,
+        stamp: state.sessions?.get(sessionId)?.state_since_unix_ns,
+        ids: new Set(entry.items.map((item) => item.id)),
+      };
+      entry.sending = true;
+      closeSuggestions();
+      if (hadLive) renderItems();
+      updateComposer();
+      pinLatestSoon();
+      run(async () => {
+        try {
+          if (!active()) return;
+          await ctx.rpc({
+            action: "prompt",
+            session: sessionId,
+            text,
+            ...(steer && capability("prompt_steer") ? { mode: "steer" } : {}),
+            ...(photo ? { photo: photo.prepared } : {}),
+          });
+          entry.progress.phase = "accepted";
+          entry.notifyComposer?.();
+          if (fromDraft) {
+            if (
+              (entry.draftVersion || 0) === version &&
+              drafts.get(sessionId) === text
+            ) {
+              drafts.delete(sessionId);
+              saveDrafts();
+              entry.notifyComposer?.({ version, text });
+            }
+            if (photo && entry.photo === photo) entry.photo = null;
+          }
+          if (!disposed) {
+            await pollNow();
+            await ctx.refresh?.();
+          }
+        } catch (error) {
+          const message = cleanRpcError(error, t);
+          if (entry.progress.phase === "sending") {
+            entry.progress.phase = "error";
+            entry.progress.error = message;
+          }
+          throw Error(message);
+        } finally {
+          entry.sending = false;
+          entry.notifyComposer?.();
+        }
+      });
+    }
     function updateComposer(sent) {
       updateStatus();
       let cleared = false;
@@ -2400,6 +2646,9 @@
           entry.photo?.status === "pending" ||
           entry.photo?.status === "error";
       attachBtn.disabled = !!liveQuestion || entry.sending || !!entry.photo;
+      syncQueueButtons();
+      renderQueuedStrip();
+      flushQueued();
       attachment.replaceChildren();
       const photo = entry.photo;
       if (!photo) return;
@@ -2477,8 +2726,16 @@
       if (e.detail > 1 || !active() || sendBtn.disabled || stopDisabled())
         return;
       entry.stopping = true;
-      entry.stopStamp =
-        state.sessions?.get(sessionId)?.state_since_unix_ns || null;
+      const stamp = state.sessions?.get(sessionId)?.state_since_unix_ns || null;
+      entry.stopStamp = stamp;
+      entry.stopCooldownStamp = stamp;
+      entry.stopCooldownUntil = Date.now() + 2000;
+      clearTimeout(stopCooldownTimer);
+      stopCooldownTimer = setTimeout(() => {
+        stopCooldownTimer = null;
+        if (!disposed) updateComposer();
+      }, 2000);
+      stopCooldownTimer?.unref?.();
       updateComposer();
       run(async () => {
         const res = await ctx.rpc({ action: "interrupt", session: sessionId });
@@ -2492,79 +2749,12 @@
     });
     composer.addEventListener("submit", (e) => {
       e.preventDefault();
-      if (
-        !active() ||
-        isStopMode() ||
-        liveQuestion ||
-        entry.modelPending ||
-        !suggestions.hidden ||
-        entry.sending ||
-        entry.photo?.status === "pending" ||
-        entry.photo?.status === "error"
-      )
-        return;
-      const text = input.value,
-        photo = entry.photo,
-        version = entry.draftVersion || 0;
-      if (text.trim() === "/model" && !photo && capability("composer_models")) {
-        openModelCommand(0, text.length);
-        return;
-      }
-      if (!text.trim() && !photo) return;
-      const hadLive = !!entry.live;
-      followLatest();
-      entry.progress = {
-        phase: "sending",
-        text,
-        photo: !!photo,
-        at: Date.now(),
-        canConfirm: entry.loaded && entry.bound,
-        generation: entry.generation,
-        lastState: state.sessions?.get(sessionId)?.state,
-        stamp: state.sessions?.get(sessionId)?.state_since_unix_ns,
-        ids: new Set(entry.items.map((item) => item.id)),
-      };
-      entry.sending = true;
-      closeSuggestions();
-      if (hadLive) renderItems();
-      updateComposer();
-      pinLatestSoon();
-      run(async () => {
-        try {
-          if (!active()) return;
-          await ctx.rpc({
-            action: "prompt",
-            session: sessionId,
-            text,
-            ...(photo ? { photo: photo.prepared } : {}),
-          });
-          entry.progress.phase = "accepted";
-          entry.notifyComposer?.();
-          // A later mount or edit owns the current draft; an older RPC must never erase it.
-          if (
-            (entry.draftVersion || 0) === version &&
-            drafts.get(sessionId) === text
-          ) {
-            drafts.delete(sessionId);
-            saveDrafts();
-            entry.notifyComposer?.({ version, text });
-          }
-          if (photo && entry.photo === photo) entry.photo = null;
-          if (!disposed) {
-            await pollNow();
-            await ctx.refresh?.();
-          }
-        } catch (error) {
-          const message = cleanRpcError(error, t);
-          if (entry.progress.phase === "sending") {
-            entry.progress.phase = "error";
-            entry.progress.error = message;
-          }
-          throw Error(message);
-        } finally {
-          entry.sending = false;
-          entry.notifyComposer?.();
-        }
+      if (!suggestions.hidden) return;
+      dispatchPrompt({
+        text: input.value,
+        photo: entry.photo,
+        steer: false,
+        fromDraft: true,
       });
     });
     const liveCard = el("section", undefined, "chat-live-question"),
@@ -2594,7 +2784,7 @@
     streamingDots.setAttribute("aria-hidden", "true");
     streamingDots.append(el("span"), el("span"), el("span"));
     streamingDots.hidden = true;
-    shell.append(history, pollStatus, feed, skeleton, streamingDots, jumpBtn, liveCard, composer);
+    shell.append(history, pollStatus, feed, skeleton, streamingDots, jumpBtn, liveCard, rateLimitBanner, composer);
     root.replaceChildren(shell);
     // Only a complete live terminal screen supplies an answer target. Historical cards stay inert.
     let liveQuestion = null,
@@ -2648,7 +2838,10 @@
     }
     function syncQuestionCards() {
       activeQuestionKey = computeActiveQuestionKey();
-      for (const card of cards.values()) card._syncQuestion?.();
+      for (const card of cards.values()) {
+        card._syncQuestion?.();
+        card._syncPermission?.();
+      }
     }
     const draftFor = (question) => {
       if (entry.questionDraft?.identity !== question.identity)
@@ -3056,6 +3249,13 @@
         wantedNotes = new Set(),
         wantedRuns = new Set(),
         nodes = [];
+      let unreadInserted = false;
+      function pushUnreadDivider() {
+        unreadInserted = true;
+        unreadDivider ||= el("div", undefined, "chat-unread-divider");
+        unreadDivider.replaceChildren(el("span", t("New")));
+        nodes.push(unreadDivider);
+      }
       let run = incremental ? tailRun : null,
         runEnd = 0;
       // Retain the actual question/details nodes so selection, write-in, focus and expansion survive deltas.
@@ -3080,6 +3280,7 @@
             const next = renderCard(item, key);
             card.replaceChildren(...Array.from(next.children));
             card._syncQuestion = next._syncQuestion;
+            card._syncPermission = next._syncPermission;
           }
           card._item = item;
         }
@@ -3164,9 +3365,20 @@
               activeDetail: "",
               minAtMs: null,
               maxAtMs: null,
+              diffFiles: new Set(),
+              diffAdded: 0,
+              diffDeleted: 0,
               endIndex: idx,
             };
             wantedRuns.add(key);
+            if (
+              !unreadInserted &&
+              entry.unreadFromId &&
+              entry.items
+                .slice(idx, runEnd)
+                .some((member) => member.id === entry.unreadFromId)
+            )
+              pushUnreadDivider();
             nodes.push(run.details);
           }
           run.memberKeys.add(key);
@@ -3226,6 +3438,21 @@
               const step = toolStep(item.tool_name);
               run.steps.set(step, (run.steps.get(step) || 0) + 1);
               run.categories.add(toolCategory(item.tool_name));
+              if (
+                toolCategory(item.tool_name) === "fileChange" &&
+                /^(?:@@ |\+\+\+ |--- |diff --git |\*\*\* Update File:)/m.test(
+                  item.text || "",
+                )
+              ) {
+                run.diffFiles ||= new Set();
+                run.diffFiles.add(item.file_path || key);
+                for (const dl of String(item.text || "").split("\n")) {
+                  if (dl.startsWith("+") && !dl.startsWith("+++"))
+                    run.diffAdded = (run.diffAdded || 0) + 1;
+                  else if (dl.startsWith("-") && !dl.startsWith("---"))
+                    run.diffDeleted = (run.diffDeleted || 0) + 1;
+                }
+              }
             } else {
               pair = callId ? run.calls.get(String(callId)) : run.pending[0];
               if (pair) {
@@ -3270,6 +3497,12 @@
           if (run) syncRunSummary(run, false);
           run = null;
           runEnd = 0;
+          if (
+            !unreadInserted &&
+            entry.unreadFromId &&
+            item.id === entry.unreadFromId
+          )
+            pushUnreadDivider();
           nodes.push(card);
         }
       }
@@ -3313,6 +3546,8 @@
           noteCards.delete(key);
         }
       if (!incremental) {
+        if (!unreadInserted && (!entry.unreadFromId || !unreadDivider?.parentElement))
+          unreadDivider?.remove();
         for (const child of Array.from(feed.children || []))
           if (child.className === "chat-empty") child.remove();
         for (const dKey of entry.disclosures?.keys() || []) {
@@ -3511,20 +3746,127 @@
         card.append(details);
       } else if (kind === "question") renderQuestionCard(card, item, key);
       else if (kind === "permission") {
-        card.append(
-          el(
-            "header",
-            `${t("Permission")} • ${item.title || item.tool_name || t("Approval")}`,
-            "chat-role",
-          ),
-          el("p", item.text, "chat-p"),
-          el(
-            "p",
-            t("Historical request. Confirm the current request in Term."),
-            "muted",
-          ),
-          button(t("Confirm in Term"), () => onSwitchTerm?.(), "ghost small"),
-        );
+        let permBusy = false,
+          permMode = null;
+        function syncPermission() {
+          const lastPermIdx = entry.items.findLastIndex(
+              (it) => it.kind === "permission",
+            ),
+            isLatest =
+              lastPermIdx >= 0 &&
+              itemKey(entry.items[lastPermIdx], lastPermIdx) === key,
+            statusLp =
+              entry.composerStatus?.agent === chatAgent()
+                ? entry.composerStatus?.live_prompt
+                : null,
+            lp =
+              isLatest && capability("live_prompt_reply") ? statusLp : null,
+            modeKey = lp ? JSON.stringify([lp, permBusy]) : "hist";
+          if (permMode === modeKey) return;
+          permMode = modeKey;
+          const children = [
+            el(
+              "header",
+              `${t("Permission")} • ${item.title || item.tool_name || t("Approval")}`,
+              "chat-role",
+            ),
+          ];
+          if (
+            lp?.kind === "numbered_menu" &&
+            Array.isArray(lp.options) &&
+            lp.options.length
+          ) {
+            if (lp.is_plan_approval)
+              children.push(el("span", t("Plan approval"), "chat-plan-badge"));
+            children.push(el("p", item.text || lp.prompt || "", "chat-p"));
+            const row = el("div", undefined, "chat-perm-actions");
+            lp.options.forEach((opt, optIdx) => {
+              const b = button(
+                opt.label || String(optIdx + 1),
+                () =>
+                  run(async () => {
+                    permBusy = true;
+                    permMode = null;
+                    syncPermission();
+                    try {
+                      await ctx.rpc({
+                        action: "live_prompt_reply",
+                        session: sessionId,
+                        expected_prompt: lp.prompt || item.text || "",
+                        choice: optIdx,
+                      });
+                      if (!disposed) {
+                        await pollNow();
+                        await refreshStatus(true);
+                      }
+                    } finally {
+                      permBusy = false;
+                      if (!disposed) {
+                        permMode = null;
+                        syncPermission();
+                      }
+                    }
+                  }),
+                optIdx === 0 ? "primary small" : "secondary small",
+              );
+              b.disabled = permBusy || state.connection?.phase !== "ready";
+              row.append(b);
+            });
+            children.push(row);
+          } else if (lp?.kind === "yes_no") {
+            children.push(el("p", item.text || lp.prompt || "", "chat-p"));
+            const row = el("div", undefined, "chat-perm-actions");
+            for (const [label, yesNo, cls] of [
+              [t("Approve"), true, "primary small"],
+              [t("Reject"), false, "secondary small"],
+            ]) {
+              const b = button(
+                label,
+                () =>
+                  run(async () => {
+                    permBusy = true;
+                    permMode = null;
+                    syncPermission();
+                    try {
+                      await ctx.rpc({
+                        action: "live_prompt_reply",
+                        session: sessionId,
+                        expected_prompt: lp.prompt || item.text || "",
+                        yes_no: yesNo,
+                      });
+                      if (!disposed) {
+                        await pollNow();
+                        await refreshStatus(true);
+                      }
+                    } finally {
+                      permBusy = false;
+                      if (!disposed) {
+                        permMode = null;
+                        syncPermission();
+                      }
+                    }
+                  }),
+                cls,
+              );
+              b.disabled = permBusy || state.connection?.phase !== "ready";
+              row.append(b);
+            }
+            children.push(row);
+          } else {
+            children.push(
+              el("p", item.text, "chat-p"),
+              el(
+                "p",
+                t("Historical request. Confirm the current request in Term."),
+                "muted",
+              ),
+              button(t("Confirm in Term"), () => onSwitchTerm?.(), "ghost small"),
+            );
+          }
+          card.replaceChildren(...children);
+        }
+        card._syncPermission = syncPermission;
+        syncPermission();
       }
       return card;
     }
@@ -3595,6 +3937,51 @@
         () => onSwitchTerm?.(),
         "ghost small",
       );
+      const otherSendBtn = button(
+        t("Send other"),
+        () => {
+          const question = currentLive(),
+            lp = capability("live_prompt_reply")
+              ? entry.composerStatus?.live_prompt
+              : null,
+            text = String(custom.value || "").trim(),
+            otherIndex = question?.choices?.findIndex((c) =>
+              isWriteInLabel(c?.label),
+            );
+          if (
+            !question?.enabled ||
+            entry.questionSending ||
+            disposed ||
+            !lp?.allows_other ||
+            otherIndex < 0 ||
+            !text
+          )
+            return;
+          run(async () => {
+            entry.questionSending = true;
+            syncCard();
+            try {
+              await ctx.rpc({
+                action: "live_prompt_reply",
+                session: sessionId,
+                expected_prompt: lp.prompt || item.text || "",
+                other: { option_index: otherIndex, text },
+              });
+              custom.value = "";
+              ctx.toast?.(t("Answer sent"));
+              if (!disposed) {
+                await pollNow();
+                await refreshStatus(true);
+              }
+            } finally {
+              entry.questionSending = false;
+              if (!disposed) syncCard();
+            }
+          });
+        },
+        "primary small chat-other-submit",
+      );
+      otherSendBtn.hidden = true;
       async function sendFromCard(question, picks) {
         if (
           !question?.enabled ||
@@ -3670,7 +4057,17 @@
             b.setAttribute("aria-pressed", String(active));
             b.disabled = !enabled;
           });
-          custom.hidden = true;
+          const lp = capability("live_prompt_reply")
+              ? entry.composerStatus?.live_prompt
+              : null,
+            otherLiveIndex =
+              lp?.kind === "numbered_menu" && lp.allows_other
+                ? question.choices.findIndex((c) => isWriteInLabel(c?.label))
+                : -1;
+          custom.hidden = otherLiveIndex < 0;
+          otherSendBtn.hidden = otherLiveIndex < 0;
+          otherSendBtn.disabled =
+            !enabled || !String(custom.value || "").trim();
           copyBtn.hidden = true;
           copyBtn.disabled = true;
           sendAnswerBtn.hidden = !question.multiple;
@@ -3705,6 +4102,7 @@
             b.disabled = false;
           });
           custom.hidden = false;
+          otherSendBtn.hidden = true;
           const has = Boolean(draftAnswer());
           copyBtn.hidden = !has;
           copyBtn.disabled = !has;
@@ -3759,7 +4157,7 @@
       }
       custom.addEventListener("input", syncCard);
       const actions = el("div", undefined, "chat-actions");
-      actions.append(sendAnswerBtn, termBtn, copyBtn);
+      actions.append(sendAnswerBtn, otherSendBtn, termBtn, copyBtn);
       body.append(list, custom, statusNote, actions);
       card._syncQuestion = syncCard;
       syncCard();
@@ -3974,6 +4372,8 @@
       entry.items = [];
       entry.retainedBytes = 0;
       if (clearSessionState) entry.disclosures?.clear();
+      if (clearSessionState) entry.unreadFromId = null;
+      unreadDivider?.remove();
       entry.pages = [];
       entry.live = null;
       entry.agent = "";
@@ -4209,7 +4609,8 @@
         entry.latestRecovery = false;
         const effectiveStart = res.page_start ?? (res.reset ? 0 : start);
         const incoming = normalizeItems(res, effectiveStart),
-          before = entry.items.length;
+          before = entry.items.length,
+          prevIds = new Set(entry.items.map((item) => item.id));
         let reconciled = false;
         if (incoming.length) {
           if (latest && !reset && !sameTail) {
@@ -4230,6 +4631,16 @@
           rememberPage(effectiveStart, res.next_offset);
         }
         const trimmed = incoming.length && trimItems(true);
+        if (
+          !reset &&
+          wasLoaded &&
+          hadItems > 0 &&
+          !following &&
+          entry.items.length > before
+        ) {
+          const firstUnread = entry.items.find((item) => !prevIds.has(item.id));
+          if (firstUnread) entry.unreadFromId ||= firstUnread.id;
+        }
         if (typeof res.next_offset === "number") entry.offset = res.next_offset;
         lastSuccess = entry.lastSuccess = Date.now();
         failures = 0;
@@ -4246,7 +4657,11 @@
         updateStatus();
         restoreReader(anchor);
         pruneCache(state);
-        refreshStatus();
+        refreshStatus(
+          incoming.some(
+            (item) => item.kind === "permission" || item.kind === "question",
+          ),
+        );
       } catch (error) {
         if (!current()) return;
         if (
@@ -4534,8 +4949,10 @@
         clearCopiedCode();
         clearTimeout(pollTimer);
         clearTimeout(appliedTimer);
+        clearTimeout(stopCooldownTimer);
         clearStatusRetry();
         pollTimer = null;
+        stopCooldownTimer = null;
         if (entry.notifyComposer === updateComposer)
           entry.notifyComposer = null;
       },
