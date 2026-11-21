@@ -195,6 +195,9 @@ pub struct Settings {
     /// 기본 계정 전환 시 실행 중 세션 처리(기본 `ask`).
     #[serde(default)]
     pub running_session_switch_policy: RunningSessionSwitchPolicy,
+    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 끔).
+    #[serde(default)]
+    pub chat_auto_continue_after_rate_limit: bool,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
     /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -314,6 +317,7 @@ impl Default for Settings {
             terminal_use_separate_light_theme: true,
             show_automations_button: true,
             running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
+            chat_auto_continue_after_rate_limit: false,
             terminal_custom_themes: Vec::new(),
         }
     }
@@ -1498,6 +1502,12 @@ fn us_keyboard_layout(id: &str) -> bool {
 pub fn copy_on_select(cx: &App) -> bool {
     cx.try_global::<Config>()
         .is_some_and(|c| c.settings.copy_on_select)
+}
+
+/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 false.
+pub fn chat_auto_continue_after_rate_limit(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_some_and(|c| c.settings.chat_auto_continue_after_rate_limit)
 }
 
 /// 실행 중인 탭·칸을 닫기 전에 확인할지(OWE-872). `init` 전이면 기본값 true.
@@ -9531,6 +9541,27 @@ impl SettingsView {
                 ),
             );
 
+        let chat_auto_continue_row = crate::ui::group_row()
+            .child(self.search_focus.label(
+                p,
+                text::CHAT_AUTO_CONTINUE_TITLE.get(),
+                Some(text::CHAT_AUTO_CONTINUE_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "admin-chat-auto-continue",
+                        s.chat_auto_continue_after_rate_limit,
+                        false,
+                        |next, _, cx| {
+                            edit(cx, move |s| s.chat_auto_continue_after_rate_limit = next);
+                        },
+                    )
+                    .aria_label(text::CHAT_AUTO_CONTINUE_TITLE.get()),
+                ),
+            );
+
         // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
         let yolo_seg = layout::segment(
             p,
@@ -9737,6 +9768,7 @@ impl SettingsView {
                 [
                     open_toml_row,
                     default_view_mode_row,
+                    chat_auto_continue_row,
                     hooks_row,
                     auto_setup_row,
                     quick_commands_row,

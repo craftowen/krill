@@ -97,15 +97,27 @@ pub(crate) fn format_timestamp(epoch: i64) -> Option<String> {
     format_with_offset(epoch, offset_secs)
 }
 
-fn format_with_offset(epoch: i64, offset_secs: i32) -> Option<String> {
+/// Local `HH:MM` for the given instant, with the same offset rule as [`format_timestamp`].
+pub(crate) fn format_clock(epoch: i64) -> Option<String> {
+    if !(MIN_YEAR_EPOCH..=MAX_YEAR_EPOCH).contains(&epoch) {
+        return None;
+    }
+    let utc = civil_from_epoch(epoch)?;
+    let offset_secs = crate::platform::local_utc_offset_secs(epoch, utc)?;
+    let local = local_civil(epoch, offset_secs)?;
+    Some(format!("{:02}:{:02}", local.hour, local.minute))
+}
+
+fn local_civil(epoch: i64, offset_secs: i32) -> Option<CivilTime> {
     if !(-86_400..=86_400).contains(&offset_secs) {
         return None;
     }
-    let shifted = epoch.checked_add(i64::from(offset_secs))?;
-    let local = civil_from_epoch(shifted)?;
-    if !(1..=9999).contains(&local.year) {
-        return None;
-    }
+    let local = civil_from_epoch(epoch.checked_add(i64::from(offset_secs))?)?;
+    (1..=9999).contains(&local.year).then_some(local)
+}
+
+fn format_with_offset(epoch: i64, offset_secs: i32) -> Option<String> {
+    let local = local_civil(epoch, offset_secs)?;
     let date = format!("{:04}-{:02}-{:02}", local.year, local.month, local.day);
     let clock = format!("{:02}:{:02}", local.hour, local.minute);
     let timezone = if offset_secs == 0 {

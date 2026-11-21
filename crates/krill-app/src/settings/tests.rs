@@ -12269,3 +12269,21 @@ fn multi_provider_add_search_edit_remove_and_custom_agent(cx: &mut TestAppContex
 
     fs::remove_dir_all(d).ok();
 }
+
+#[test]
+fn chat_auto_continue_after_rate_limit_defaults_off_and_toml_roundtrips() {
+    let mut settings = Settings::default();
+    assert!(!settings.chat_auto_continue_after_rate_limit);
+    assert!(
+        !Settings::parse_with_language("theme = 'dark'", Language::En)
+            .unwrap()
+            .chat_auto_continue_after_rate_limit
+    );
+    settings.chat_auto_continue_after_rate_limit = true;
+    let encoded = settings.to_toml();
+    assert!(encoded.contains("chat_auto_continue_after_rate_limit = true"));
+    assert_eq!(
+        Settings::parse_with_language(&encoded, settings.language).unwrap(),
+        settings
+    );
+}

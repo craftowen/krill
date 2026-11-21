@@ -36,6 +36,11 @@ pub fn window(win: Option<&Window>, now: i64) -> WindowDisplay {
     }
 }
 
+/// Local `HH:MM` of an epoch-second instant, for short reset labels.
+pub fn local_clock(epoch: i64) -> Option<String> {
+    crate::local_time::format_clock(epoch)
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
