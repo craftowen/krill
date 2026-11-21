@@ -23,6 +23,7 @@ enum Kind {
     Stalled,
     StartupStall,
     AccountInput,
+    ExternalAccountSwitch,
     Fix(String),
     Paste,
 }
@@ -39,6 +40,7 @@ impl Kind {
             Self::Stalled => "stalled".into(),
             Self::StartupStall => "agent-startup-stall".into(),
             Self::AccountInput => "account-input-recovery".into(),
+            Self::ExternalAccountSwitch => "external-switch-notice".into(),
             Self::Fix(id) => format!("fix-{id}").into(),
             Self::Paste => "multiline-paste-warning".into(),
         }
@@ -54,6 +56,7 @@ enum Value {
         hold: Box<account_input::Hold>,
         cancelling: bool,
     },
+    ExternalSwitch(Box<super::external_switch::ExternalSwitchReview>),
 }
 
 #[derive(Default)]
@@ -123,6 +126,12 @@ impl Shell {
                     hold: Box::new(hold),
                     cancelling: self.account_cancel.is_some(),
                 },
+            ));
+        }
+        if let Some(review) = &self.external_switch.pending_review {
+            current.push((
+                Kind::ExternalAccountSwitch,
+                Value::ExternalSwitch(Box::new(review.clone())),
             ));
         }
         if current.is_empty() && self.notifications.list.is_none() {
@@ -311,6 +320,7 @@ impl Shell {
                                 .into_any_element()
                         })
                 }
+                Value::ExternalSwitch(review) => Self::external_switch_note(review, shell.clone()),
             }
             .id1::<Kind>(kind.key())
             .placement(Anchor::TopRight)
@@ -377,6 +387,9 @@ impl Shell {
                                 this.notifications.seen.remove(&Kind::AccountInput);
                                 this.notifications.notes.remove(&Kind::AccountInput);
                             }
+                            (Kind::ExternalAccountSwitch, Value::ExternalSwitch(review)) => {
+                                this.dismiss_external_switch(review, cx);
+                            }
                             _ => {}
                         }
                         cx.notify();
@@ -396,6 +409,64 @@ impl Shell {
                 self.notifications.notes.insert(kind, note);
             }
         }
+    }
+
+    fn external_switch_note(
+        review: &super::external_switch::ExternalSwitchReview,
+        shell: gpui::WeakEntity<Self>,
+    ) -> Notification {
+        use krill_app::i18n::catalog::external_switch as text;
+        use krill_app::settings::RunningSessionSwitchPolicy as Policy;
+        let review = review.clone();
+        let actionable = review.actionable();
+        let note = if actionable {
+            Notification::new().with_type(NotificationType::Warning)
+        } else {
+            Notification::new().with_type(NotificationType::Info)
+        };
+        note.autohide(!actionable).content(move |_, _, _| {
+            let mut card = div()
+                .debug_selector(|| "external-switch-notice".into())
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .child(review.title())
+                .children(review.summary());
+            if actionable {
+                let mut actions = div().flex().gap_2();
+                if let Some(label) = review.review_label() {
+                    let open = shell.clone();
+                    actions = actions.child(
+                        ui::primary("external-switch-review-action", label)
+                            .debug_selector(|| "external-switch-review-action".into())
+                            .on_click(move |_, _, cx| {
+                                open.update(cx, Shell::open_external_switch_review).ok();
+                            }),
+                    );
+                }
+                let close = shell.clone();
+                let dismissed = review.clone();
+                let label = if review.policy == Policy::Ask {
+                    text::KEEP.get()
+                } else {
+                    text::OK.get()
+                };
+                actions = actions.child(
+                    ui::secondary("external-switch-dismiss", label)
+                        .debug_selector(|| "external-switch-dismiss".into())
+                        .on_click(move |_, _, cx| {
+                            close
+                                .update(cx, |this, cx| this.dismiss_external_switch(&dismissed, cx))
+                                .ok();
+                        }),
+                );
+                card = card.child(actions);
+            }
+            card.into_any_element()
+        })
     }
 
     pub(super) fn has_notifications(&self, cx: &App) -> bool {

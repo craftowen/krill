@@ -5576,6 +5576,26 @@ impl SettingsView {
         .detach();
     }
 
+    /// 셸이 이 창의 기본 계정 전환을 외부 전환으로 오인하지 않게 표식을 남긴다.
+    fn mark_in_app_switch(&self, req: &krill_proto::usage::UsageRequest, cx: &mut App) {
+        if let krill_proto::usage::UsageRequest::SwitchAccount {
+            provider,
+            account_id,
+        }
+        | krill_proto::usage::UsageRequest::SwitchAccountOnly {
+            provider,
+            account_id,
+        } = req
+        {
+            crate::accounts::mark_in_app_switch(
+                self.account_host.clone(),
+                *provider,
+                account_id.clone(),
+                cx,
+            );
+        }
+    }
+
     pub fn apply_account_request(
         &mut self,
         req: krill_proto::usage::UsageRequest,
@@ -5598,6 +5618,7 @@ impl SettingsView {
                 cx.notify();
                 return;
             };
+            self.mark_in_app_switch(&req, cx);
             self.spawn_account_rule_request(
                 async move { crate::accounts::request_target(&target, &req) },
                 cx,
@@ -5624,6 +5645,7 @@ impl SettingsView {
             let request_host = self.account_host.clone();
             let req_gen = self.account_rule_generation;
             self.account_error = None;
+            self.mark_in_app_switch(&req, cx);
             self.file_job(
                 "account-local",
                 move || crate::accounts::request_local(&home, dir.as_deref(), &req),
@@ -5662,6 +5684,9 @@ impl SettingsView {
         if listing {
             self.refresh_accounts_async(cx);
             return;
+        }
+        if !self.account_rule_pending {
+            self.mark_in_app_switch(&req, cx);
         }
         self.spawn_account_rule_request(
             async move {

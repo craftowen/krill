@@ -3051,6 +3051,18 @@ catalog! {
         USAGE_RATE_LIMITED => ("사용량 조회 요청이 잠시 제한되었습니다", "Usage check is temporarily rate-limited"),
         USAGE_LAST_VALUE => ("마지막 확인 값", "last known value"),
     }
+    // CLI·모바일·다른 호스트에서 바뀐 기본 계정 안내.
+    external_switch {
+        SWITCHED => ("외부에서 {provider} 계정이 {account}(으)로 전환되었습니다", "{provider} switched to {account} outside this window"),
+        SWITCHED_KEEP => ("외부에서 {provider} 계정이 {account}(으)로 전환되었습니다 (실행 중 세션 유지)", "{provider} switched to {account} outside this window (running sessions kept)"),
+        SWITCHED_MOVED => ("외부에서 {provider} 계정이 {account}(으)로 전환되어 세션 {n}개를 옮겼습니다", "{provider} switched to {account} outside this window; moved {n} sessions"),
+        SWITCHED_CANT_MOVE => ("{account}(으)로 전환됨, {n}개 세션을 옮기지 못했습니다", "Switched to {account}; {n} sessions couldn't be moved"),
+        SUMMARY => ("전환 가능 {movable}개, 이동 불가 {cant}개", "{movable} can switch, {cant} can't move"),
+        SWITCH_SESSIONS => ("세션 전환", "Switch sessions"),
+        REVIEW_UNMOVED => ("미이동 확인", "Review unmoved"),
+        KEEP => ("유지", "Keep"),
+        OK => ("확인", "OK"),
+    }
 }
 
 fn is_last_value_suffix(value: &str) -> bool {
