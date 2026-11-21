@@ -62,10 +62,10 @@ fn render_diff_block(palette: &ui::Palette, text: &str) -> AnyElement {
                 .py_0p5()
                 .text_size(ui::TEXT_2XS)
                 .text_color(palette.muted_foreground)
-                .child(format!(
-                    "… +{} more line(s)",
-                    total_lines - MAX_RENDERED_DIFF_LINES
-                )),
+                .child(
+                    ctext::DIFF_MORE_LINES
+                        .format(&[("n", &(total_lines - MAX_RENDERED_DIFF_LINES).to_string())]),
+                ),
         );
     }
     div()

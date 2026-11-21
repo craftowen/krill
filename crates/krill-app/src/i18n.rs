@@ -2226,6 +2226,7 @@ catalog! {
         REUSE_PROMPT => ("다시 입력", "Reuse"),
         FORK_SESSION => ("포크", "Fork"),
         MINIMAP_TURN => ("턴 {n}", "Turn {n}"),
+        DIFF_MORE_LINES => ("… +{n}줄 더", "… +{n} more line(s)"),
         RUN_FAILED_N => ("{n}개 실패", "{n} failed"),
         RUN_READ_ONE => ("파일 {n}개 읽음", "Read {n} file"),
         RUN_READ_MANY => ("파일 {n}개 읽음", "Read {n} files"),

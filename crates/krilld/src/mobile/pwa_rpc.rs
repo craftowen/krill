@@ -904,22 +904,23 @@ impl Backend {
                         "Maximum 4 photos per message.",
                     ));
                 }
-                if let Some(status) = self
-                    .registry
-                    .upgrade()
-                    .and_then(|reg| reg.mobile_session_status(SessionId(session)))
-                {
-                    if matches!(
+                if let Some(reg) = self.registry.upgrade()
+                    && let Some(status) = reg.mobile_session_status(SessionId(session))
+                    && matches!(
                         status.state,
                         control::AgentState::Waiting | control::AgentState::Blocked
-                    ) {
+                    )
+                {
+                    let has_live_prompt =
+                        reg.session_capture(SessionId(session))
+                            .is_some_and(|screen| {
+                                krill_proto::screen::prompt::detect(&screen.rows).is_some()
+                            });
+                    if mode == PromptMode::Steer || has_live_prompt {
                         return Err(io::Error::other(
                             "Wait for the active prompt before sending a new message",
                         ));
                     }
-                    let _ = mode;
-                } else {
-                    let _ = mode;
                 }
                 // Prepare images before sending anything, then submit image paths and text in order.
                 let mut saved_paths = Vec::with_capacity(all_photos.len());
