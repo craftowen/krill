@@ -266,10 +266,7 @@ impl Shell {
                 cx.subscribe(
                     &created,
                     |this, _, ev: &krill_app::bots::BadgeChanged, cx| {
-                        if this.bots_attention_count != ev.attention_count {
-                            this.bots_attention_count = ev.attention_count;
-                            cx.notify();
-                        }
+                        this.apply_sidebar_bots(ev.attention_count, ev.bots.clone(), cx);
                     },
                 )
                 .detach();
@@ -293,6 +290,55 @@ impl Shell {
         cx.notify();
     }
 
+    fn apply_sidebar_bots(
+        &mut self,
+        attention: usize,
+        bots: Vec<krill_app::bots::SidebarBot>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bots_attention_count != attention || self.sidebar_bots != bots {
+            self.bots_attention_count = attention;
+            self.sidebar_bots = bots;
+            cx.notify();
+        }
+    }
+
+    /// Sidebar Bots section: a bot row opens that bot, `None` (the + button) opens New bot.
+    pub(super) fn open_bot(
+        &mut self,
+        bot_id: Option<krill_proto::bots::BotId>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_bots(window, cx);
+        if let Some(view) = self.bots_cache.clone() {
+            view.update(cx, |v, cx| match bot_id {
+                Some(id) => v.select_bot(id, cx),
+                None => v.open_create_alone(cx),
+            });
+        }
+    }
+
+    /// In-app bot changes arrive as `BadgeChanged`; this slow loop only catches the rest.
+    #[cfg(not(test))]
+    pub(super) fn poll_sidebar_bots(cx: &mut Context<Self>) -> Task<()> {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(INTERVAL).await;
+                let polled = this.update(cx, |s, cx| {
+                    // Floating windows hide the sidebar, so they have nothing to refresh.
+                    if s.role != WindowRole::Floating {
+                        s.refresh_bots_badge(cx);
+                    }
+                });
+                if polled.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
     pub(super) fn refresh_bots_badge(&mut self, cx: &mut Context<Self>) {
         if self.link != Link::Up {
             return;
@@ -308,18 +354,18 @@ impl Shell {
             krill_app::bots::daemon_bot_rpc(target)
         };
         self.bots_badge_task = Some(cx.spawn(async move |this, cx| {
-            let (count, sessions) = cx
+            let Some((snapshot, sessions)) = cx
                 .background_executor()
-                .spawn(async move { krill_app::bots::fetch_badge_and_sessions(&rpc) })
-                .await;
+                .spawn(async move { krill_app::bots::fetch_sidebar_state(&rpc) })
+                .await
+            else {
+                return;
+            };
             this.update(cx, |this, cx| {
-                if this.bots_attention_count != count {
-                    this.bots_attention_count = count;
-                }
                 this.sidebar.update(cx, |sb, cx| {
                     sb.set_bot_sessions(host, sessions, cx);
                 });
-                cx.notify();
+                this.apply_sidebar_bots(snapshot.attention, snapshot.bots, cx);
             })
             .ok();
         }));

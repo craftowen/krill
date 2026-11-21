@@ -39,8 +39,8 @@ use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 pub use rpc::{
-    BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, daemon_bot_rpc,
-    fetch_attention_count, fetch_badge_and_sessions,
+    BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
+    daemon_bot_rpc, fetch_sidebar_state,
 };
 use rpc::{call_checked, decode_png_avatar, parse_avatar_color};
 
@@ -55,10 +55,12 @@ pub struct OpenSession {
     pub session_id: SessionId,
 }
 
-/// Notify the host `Shell` when the total attention count (`needs_you` + pending access) changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Notify the host `Shell` when bots or their attention counts (`needs_you` + pending access) change.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadgeChanged {
     pub attention_count: usize,
+    /// Sidebar Bots section rows, built once per change.
+    pub bots: Vec<SidebarBot>,
 }
 
 /// Notify the host `Shell` when cached `SessionId -> BotSessionMeta` mappings update.
@@ -334,17 +336,7 @@ impl View {
 
     #[must_use]
     pub fn attention_count(&self) -> usize {
-        let needs_you = self
-            .all_open_items
-            .iter()
-            .filter(|i| i.status == BotItemStatus::NeedsYou)
-            .count();
-        let pending = self
-            .all_access_requests
-            .iter()
-            .filter(|r| r.status == BotAccessRequestStatus::Pending)
-            .count();
-        needs_you.saturating_add(pending)
+        self.sidebar_snapshot().attention
     }
 
     pub fn on_hide(&mut self, cx: &mut Context<Self>) {
@@ -368,9 +360,17 @@ impl View {
         self.reload(cx);
     }
 
+    /// Rows and attention total for the main window sidebar's Bots section.
+    #[must_use]
+    pub fn sidebar_snapshot(&self) -> SidebarSnapshot {
+        rpc::sidebar_snapshot(&self.bots, &self.all_open_items, &self.all_access_requests)
+    }
+
     pub(super) fn emit_badge(&self, cx: &mut Context<Self>) {
+        let snapshot = self.sidebar_snapshot();
         cx.emit(BadgeChanged {
-            attention_count: self.attention_count(),
+            attention_count: snapshot.attention,
+            bots: snapshot.bots,
         });
     }
 
@@ -583,7 +583,14 @@ impl View {
         self.create
             .clear_form_fields(handle, default_cwd.as_deref(), cx);
         self.screen = Screen::Create;
+        self.create.opened_alone = false;
         cx.notify();
+    }
+
+    /// New bot as its own dialog (sidebar "+"): Escape closes the modal like Orca's.
+    pub fn open_create_alone(&mut self, cx: &mut Context<Self>) {
+        self.open_create(cx);
+        self.create.opened_alone = true;
     }
 
     pub fn open_import(&mut self, cx: &mut Context<Self>) {
@@ -1181,6 +1188,7 @@ impl View {
                     Ok(BotRpcResponse::Bot(updated)) => {
                         this.upsert_bot_config(*updated);
                         this.notice = Some(SharedString::from(text::SAVED.get()));
+                        this.emit_badge(cx);
                     }
                     Ok(other) => {
                         this.error = Some(SharedString::from(format!(
@@ -1292,10 +1300,12 @@ impl View {
             cx.notify();
             return;
         }
+        let alone = self.screen == Screen::Create && self.create.opened_alone;
         if matches!(
             self.screen,
             Screen::Create | Screen::Import | Screen::Groups
         ) && !self.bots.is_empty()
+            && !alone
         {
             self.screen = Screen::Detail;
             cx.notify();
@@ -2410,7 +2420,8 @@ impl Render for View {
                                 .clone()
                                 .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
-                        .child(Self::render_empty_state(p, cx))
+                        // While the first load runs, an empty pane instead of a "no bots" flash.
+                        .when(!self.loading, |d| d.child(Self::render_empty_state(p, cx)))
                 }
             }
         };
