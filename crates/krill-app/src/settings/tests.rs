@@ -151,6 +151,36 @@ fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
     );
 }
 
+#[test]
+fn running_session_switch_policy_defaults_to_ask_and_roundtrips() {
+    assert_eq!(
+        Settings::default().running_session_switch_policy,
+        RunningSessionSwitchPolicy::Ask
+    );
+    assert_eq!(
+        Settings::parse("").unwrap().running_session_switch_policy,
+        RunningSessionSwitchPolicy::Ask
+    );
+    for (policy, text) in [
+        (RunningSessionSwitchPolicy::Ask, "ask"),
+        (RunningSessionSwitchPolicy::Restart, "restart"),
+        (RunningSessionSwitchPolicy::Keep, "keep"),
+    ] {
+        let s = Settings {
+            running_session_switch_policy: policy,
+            ..Settings::default()
+        };
+        let body = toml::to_string(&s).unwrap();
+        assert!(body.contains(&format!("running_session_switch_policy = \"{text}\"")));
+        assert_eq!(
+            Settings::parse(&body)
+                .unwrap()
+                .running_session_switch_policy,
+            policy
+        );
+    }
+}
+
 #[gpui::test]
 fn many_account_hosts_wrap_inside_the_host_bar(cx: &mut TestAppContext) {
     let d = dir("account-host-bar");

@@ -3012,6 +3012,23 @@ impl Registry {
         req: krill_proto::usage::UsageRequest,
         features: u64,
     ) -> krill_proto::usage::UsageReply {
+        self.on_usage_negotiated_in(
+            peer,
+            role,
+            req,
+            features,
+            &crate::usage::accounts::default_home(),
+        )
+    }
+
+    fn on_usage_negotiated_in(
+        &self,
+        peer: &Peer,
+        role: Role,
+        req: krill_proto::usage::UsageRequest,
+        features: u64,
+        home: &Path,
+    ) -> krill_proto::usage::UsageReply {
         use crate::usage::accounts;
         use krill_proto::usage::{UsageReply, UsageRequest};
 
@@ -3025,10 +3042,63 @@ impl Registry {
         if role == Role::Observer && !req.is_read() {
             return UsageReply::Failed(Failure::Denied);
         }
-        let home = accounts::default_home();
+        let home = home.to_path_buf();
         let state = self.state_dir();
         let state_ref = state.as_deref();
+        let switch_control = krill_proto::usage::FEAT_ACCOUNT_SWITCH_CONTROL
+            | krill_proto::usage::FEAT_PROVIDER_DETAILS;
         let mut reply = match req {
+            UsageRequest::SwitchAccountOnly { .. }
+            | UsageRequest::InspectSessionSwitches { .. }
+            | UsageRequest::SwitchSelectedSessions { .. }
+                if features & switch_control != switch_control =>
+            {
+                UsageReply::Failed(Failure::BadRequest)
+            }
+            // Default only: running sessions keep their account until the user picks them.
+            UsageRequest::SwitchAccountOnly {
+                provider,
+                account_id,
+            } => match accounts::switch_account(&home, state_ref, provider, &account_id) {
+                Ok(snap) => UsageReply::Accounts(snap),
+                Err(e) => UsageReply::Failed(os(&e)),
+            },
+            UsageRequest::InspectSessionSwitches {
+                provider,
+                previous_account_id,
+                target_account_id,
+            } => {
+                let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                match self.inspect_session_switches_in(
+                    &home,
+                    provider,
+                    previous_account_id,
+                    target_account_id,
+                    &snapshot,
+                ) {
+                    Ok(plan) => UsageReply::SessionSwitchPlan(plan),
+                    Err(error) => UsageReply::Failed(error),
+                }
+            }
+            UsageRequest::SwitchSelectedSessions {
+                provider,
+                account_id,
+                sessions,
+                interrupt_busy,
+            } => {
+                let snapshot = accounts::refresh_accounts_with(&home, state_ref, false);
+                match self.queue_selected_account_switches_in(
+                    &sessions,
+                    provider,
+                    &account_id,
+                    interrupt_busy,
+                    &snapshot,
+                    &home,
+                ) {
+                    Ok(()) => UsageReply::Accounts(snapshot),
+                    Err(error) => UsageReply::Failed(error),
+                }
+            }
             UsageRequest::ImportOrcaAntigravity {
                 source_dir,
                 dry_run,

@@ -65,6 +65,18 @@ pub enum KeepAwake {
     Off,
 }
 
+/// 기본 계정을 바꿀 때 실행 중 세션을 어떻게 할지. `Ask`는 매번 고르게 한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunningSessionSwitchPolicy {
+    #[default]
+    Ask,
+    /// 옮길 수 있는 세션을 새 계정으로 다시 시작한다.
+    Restart,
+    /// 실행 중 세션은 그대로 두고 기본 계정만 바꾼다.
+    Keep,
+}
+
 /// `settings.toml`. 빠진 키는 기본값.
 #[expect(
     clippy::struct_excessive_bools,
@@ -180,6 +192,9 @@ pub struct Settings {
     /// 사이드바 자동화 진입점 표시. 명령 팔레트의 '자동화 열기'가 다시 켠다.
     #[serde(default = "default_true")]
     pub show_automations_button: bool,
+    /// 기본 계정 전환 시 실행 중 세션 처리(기본 `ask`).
+    #[serde(default)]
+    pub running_session_switch_policy: RunningSessionSwitchPolicy,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
     /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -298,6 +313,7 @@ impl Default for Settings {
             terminal_theme_light: default_terminal_theme_light(),
             terminal_use_separate_light_theme: true,
             show_automations_button: true,
+            running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
             terminal_custom_themes: Vec::new(),
         }
     }
@@ -1494,6 +1510,21 @@ pub fn confirm_running_close(cx: &App) -> bool {
 pub fn set_confirm_running_close(enabled: bool, cx: &mut App) {
     if cx.has_global::<Config>() && current(cx).confirm_running_close != enabled {
         edit(cx, move |s| s.confirm_running_close = enabled);
+    }
+}
+
+/// 기본 계정 전환 시 실행 중 세션 처리. `init` 전이면 기본값 `Ask`.
+pub fn running_session_switch_policy(cx: &App) -> RunningSessionSwitchPolicy {
+    cx.try_global::<Config>()
+        .map_or_else(RunningSessionSwitchPolicy::default, |c| {
+            c.settings.running_session_switch_policy
+        })
+}
+
+/// 실행 중 세션 처리 방식을 바꾸고 `settings.toml`에 저장한다.
+pub fn set_running_session_switch_policy(policy: RunningSessionSwitchPolicy, cx: &mut App) {
+    if cx.has_global::<Config>() && current(cx).running_session_switch_policy != policy {
+        edit(cx, move |s| s.running_session_switch_policy = policy);
     }
 }
 

@@ -27,7 +27,8 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
     AccountInfo, AccountsSnapshot, AutoSwitchPolicy, AutoSwitchRule, FEAT_USAGE, OrphanProfile,
-    ProviderKind, ResetConsumeOutcome, Snapshot, UsageReply, UsageRequest, Window,
+    ProviderKind, ResetConsumeOutcome, SessionSwitchPlan, Snapshot, UsageReply, UsageRequest,
+    Window,
 };
 
 /// [`UsageRequest::ConsumeResetCredit`] 결과. 스냅샷과 소진 결과를 함께 들고 온다.
@@ -479,12 +480,70 @@ pub fn request_target_with_features(
     let (reply, features) = exchange_target_with_features(target, req)?;
     let snapshot = match reply {
         UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => snap,
-        UsageReply::Current(_) | UsageReply::Orphans(_) | UsageReply::Provisioning(_) => {
-            AccountsSnapshot::default()
-        }
+        UsageReply::Current(_)
+        | UsageReply::Orphans(_)
+        | UsageReply::Provisioning(_)
+        | UsageReply::SessionSwitchPlan(_) => AccountsSnapshot::default(),
         UsageReply::Failed(e) => return Err(failure_text(e)),
     };
     Ok((snapshot, features))
+}
+
+/// 기본 계정 전환 전 실행 중 세션 진단. 살아 있는 세션은 데몬만 알므로 로컬 폴백이 없다.
+pub fn inspect_session_switches(
+    target: &krill_hosts::HostTarget,
+    provider: ProviderKind,
+    previous_account_id: Option<String>,
+    target_account_id: String,
+) -> Result<SessionSwitchPlan, String> {
+    match exchange_target(
+        target,
+        &UsageRequest::InspectSessionSwitches {
+            provider,
+            previous_account_id,
+            target_account_id,
+        },
+    )? {
+        UsageReply::SessionSwitchPlan(plan) => Ok(plan),
+        UsageReply::Failed(e) => Err(failure_text(e)),
+        _ => Err(crate::i18n::catalog::settings::ACCOUNTS_ACTION_FAILED
+            .get()
+            .to_owned()),
+    }
+}
+
+/// 실행 중 세션은 그대로 두고 기본 계정만 바꾼다.
+pub fn switch_account_only(
+    target: &krill_hosts::HostTarget,
+    provider: ProviderKind,
+    account_id: String,
+) -> Result<AccountsSnapshot, String> {
+    request_target(
+        target,
+        &UsageRequest::SwitchAccountOnly {
+            provider,
+            account_id,
+        },
+    )
+}
+
+/// 고른 세션만 새 계정으로 인계한다. 기본 계정은 바꾸지 않는다.
+pub fn switch_selected_sessions(
+    target: &krill_hosts::HostTarget,
+    provider: ProviderKind,
+    account_id: String,
+    sessions: Vec<krill_proto::SessionId>,
+    interrupt_busy: bool,
+) -> Result<AccountsSnapshot, String> {
+    request_target(
+        target,
+        &UsageRequest::SwitchSelectedSessions {
+            provider,
+            account_id,
+            sessions,
+            interrupt_busy,
+        },
+    )
 }
 
 /// Codex banked reset 크레딧 소진. 데몬에만 묻는다(로컬 폴백 없음).
@@ -535,7 +594,8 @@ pub fn orphans_target(
         UsageReply::Accounts(_)
         | UsageReply::Current(_)
         | UsageReply::Provisioning(_)
-        | UsageReply::ResetConsumed { .. } => Ok(Vec::new()),
+        | UsageReply::ResetConsumed { .. }
+        | UsageReply::SessionSwitchPlan(_) => Ok(Vec::new()),
     }
 }
 
@@ -608,7 +668,8 @@ fn exchange_target_with_features(
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
         | krill_proto::usage::FEAT_USAGE_RESET
         | krill_proto::usage::FEAT_USAGE_REFRESH
-        | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH;
+        | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
+        | krill_proto::usage::FEAT_ACCOUNT_SWITCH_CONTROL;
     let mut conn = target
         .connect(&hello)
         .map_err(|e| crate::errors::user_daemon_error(&e))?;
@@ -685,6 +746,9 @@ pub fn request_local(
         UsageRequest::CancelAccountSwitch { .. }
         | UsageRequest::RecoverAccountInput { .. }
         | UsageRequest::SwitchSessionAccount { .. }
+        | UsageRequest::SwitchAccountOnly { .. }
+        | UsageRequest::InspectSessionSwitches { .. }
+        | UsageRequest::SwitchSelectedSessions { .. }
         | UsageRequest::SetAdvancedPolicy(_)
         | UsageRequest::SetDirectUsage(_)
         | UsageRequest::ImportOrcaAntigravity { .. }

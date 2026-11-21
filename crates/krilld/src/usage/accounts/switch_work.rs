@@ -24,6 +24,8 @@ pub(crate) struct SwitchTarget {
     pub account_id: String,
     pub prepared: bool,
     pub not_before: Option<std::time::Instant>,
+    /// The user chose to restart this session even while its agent is working.
+    pub interrupt_busy: bool,
 }
 
 static WORKERS: Mutex<BTreeMap<PathBuf, Weak<SwitchWork>>> = Mutex::new(BTreeMap::new());
@@ -54,6 +56,7 @@ pub(super) fn notify(home: &Path, state: Option<&Path>, events: &[AutoSwitchEven
                     account_id: event.to_id.clone(),
                     prepared: false,
                     not_before: None,
+                    interrupt_busy: false,
                 },
             );
         }

@@ -275,6 +275,7 @@ mod tests {
                             account_id: "selected".into(),
                             prepared: false,
                             not_before: None,
+                            interrupt_busy: false,
                         },
                     );
                 }

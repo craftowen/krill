@@ -1553,3 +1553,96 @@ fn retained_handoff_reasons_round_trip_and_classify_distinct_from_retryable_fail
         HandoffOutcome::Completed { replacement }
     );
 }
+
+#[test]
+fn account_switch_control_requests_roundtrip_and_require_the_bit() {
+    let needed = FEAT_USAGE | FEAT_ACCOUNT_SWITCH_CONTROL | FEAT_PROVIDER_DETAILS;
+    let requests = [
+        UsageRequest::SwitchAccountOnly {
+            provider: ProviderKind::Codex,
+            account_id: "b".into(),
+        },
+        UsageRequest::InspectSessionSwitches {
+            provider: ProviderKind::Claude,
+            previous_account_id: Some("a".into()),
+            target_account_id: "b".into(),
+        },
+        UsageRequest::SwitchSelectedSessions {
+            provider: ProviderKind::Claude,
+            account_id: "b".into(),
+            sessions: vec![crate::SessionId(3), crate::SessionId(9)],
+            interrupt_busy: true,
+        },
+    ];
+    for request in requests {
+        let frame = request.encode().unwrap();
+        let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(UsageRequest::decode(kind, &body).unwrap(), request);
+        assert_eq!(request.required_features(), needed);
+        assert!(!request.is_read());
+        assert!(!request.contains_removed_provider());
+    }
+    // 새 variant는 enum 끝(22·23·24번)에 붙는다.
+    let frame = UsageRequest::SwitchAccountOnly {
+        provider: ProviderKind::Claude,
+        account_id: String::new(),
+    }
+    .encode()
+    .unwrap();
+    let (_, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body, [22, 0, 0]);
+    assert!(
+        UsageRequest::InspectSessionSwitches {
+            provider: ProviderKind::Gemini,
+            previous_account_id: None,
+            target_account_id: "x".into(),
+        }
+        .contains_removed_provider()
+    );
+}
+
+#[test]
+fn session_switch_plan_roundtrips_and_downgrades_for_old_peers() {
+    let plan = SessionSwitchPlan {
+        provider: ProviderKind::Claude,
+        previous_account_id: Some("a".into()),
+        target_account_id: "b".into(),
+        candidates: vec![
+            SessionSwitchCandidate {
+                session: crate::SessionId(1),
+                cwd: "/w".into(),
+                agent: "claude".into(),
+                current_account_id: "a".into(),
+                current_account_label: "a@x".into(),
+                busy: true,
+                group: SessionSwitchGroup::OnPreviousAccount,
+            },
+            SessionSwitchCandidate {
+                session: crate::SessionId(2),
+                cwd: "/w".into(),
+                agent: "claude".into(),
+                current_account_id: String::new(),
+                current_account_label: "unknown".into(),
+                busy: false,
+                group: SessionSwitchGroup::CantMove(CantMoveReason::SharedSession),
+            },
+        ],
+    };
+    let reply = UsageReply::SessionSwitchPlan(plan);
+    let frame = reply.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body[0], 6, "appended after ResetConsumed");
+    assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
+    assert_eq!(
+        reply
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reply
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL),
+        reply
+    );
+}
