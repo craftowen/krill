@@ -648,3 +648,73 @@ fn tui_opening_slash_command_defers_terminal_switch_until_delivery_applied(
         "unbracketed slash command switches to Terminal View after Applied settles"
     );
 }
+
+#[gpui::test]
+fn non_echoed_local_slash_command_confirms_without_prompt_review_and_attachments_clear_review(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::input::Delivery;
+
+    let (view, cx, _, sent) = fixture(cx, "chat-local-slash", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.chat.poll_call = Some(Arc::new(|_| {
+                Ok(krill_proto::control::Reply::AgentHistory(
+                    krill_proto::agent_history::Response::ChatPolled(
+                        krill_proto::agent_history::ChatPollSnapshot {
+                            agent: "claude".into(),
+                            bound: true,
+                            ..Default::default()
+                        },
+                    ),
+                ))
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value("/compact", window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(60));
+    cx.run_until_parked();
+    assert_eq!(sent.lock().unwrap().len(), 2);
+    view.read_with(cx, |shell, app_cx| {
+        assert!(
+            shell.is_pane_chat_view(pane, app_cx),
+            "local non-echoed slash stays in Chat view"
+        );
+        assert!(
+            !shell.chat.prompt_review.contains(&local_key(SESSION)),
+            "local non-echoed slash must confirm without PROMPT_REVIEW"
+        );
+        assert!(
+            !shell.chat.pending_prompts.contains_key(&local_key(SESSION)),
+            "local non-echoed slash pending prompt must clear after Enter ACK"
+        );
+    });
+
+    // Staging an attachment clears a prior prompt_review lock.
+    let dir = std::env::temp_dir().join(format!("krill-chat-att-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sample = dir.join("note.txt");
+    std::fs::write(&sample, b"hello").unwrap();
+    let att = crate::shell::chat::DraftAttachment::from_path(sample).unwrap();
+    view.update(cx, |shell, cx| {
+        shell.chat.prompt_review.insert(local_key(SESSION));
+        shell.stage_chat_attachments(&local_key(SESSION), vec![att], cx);
+        assert!(!shell.chat.prompt_review.contains(&local_key(SESSION)));
+    });
+    std::fs::remove_dir_all(&dir).unwrap();
+}

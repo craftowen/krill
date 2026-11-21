@@ -405,6 +405,17 @@ impl Context {
     }
 
     #[cfg(test)]
+    pub(super) fn test_context(home: PathBuf, cwd: PathBuf, agent: &str) -> Self {
+        Self {
+            home,
+            cwd,
+            agent: agent.to_owned(),
+            config: None,
+            env: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn set_model(&self, id: &str) -> io::Result<Value> {
         validate_model(&self.models(), id)
     }

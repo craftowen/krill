@@ -13,7 +13,7 @@ use gpui_component::input::{
 };
 
 /// 파일 에디터(`EditorState`)에 경량 문법 하이라이터 팩토리를 설치한다.
-/// 지원하는 언어(`html`, `css`, `javascript`, `typescript`, `tsx`, `toml`, `yaml`, `bash`, `sql`, `diff`)는
+/// 지원하는 언어(`html`, `css`, `javascript`, `typescript`, `tsx`, `toml`, `yaml`, `bash`, `sql`, `diff`, `python`, `go`, `c`, `cpp`, `java`, `swift`, `kotlin`)는
 /// 내장 토크나이저를 쓰고, 그 외(`rust`, `json` 등)는 `gpui-component` 기본 하이라이터를 그대로 유지한다.
 pub fn install(state: &mut EditorState, language: &str, cx: &mut Context<EditorState>) {
     if supports(language) {
@@ -88,6 +88,10 @@ enum Lang {
     Bash,
     Sql,
     Diff,
+    Python,
+    Go,
+    CFamily,
+    Swift,
 }
 
 impl Lang {
@@ -95,12 +99,20 @@ impl Lang {
         match name {
             "html" | "htm" | "svg" | "xml" => Some(Self::Html),
             "css" | "scss" => Some(Self::Css),
-            "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx" => Some(Self::Js),
+            "javascript" | "js" | "jsx" | "mjs" | "cjs" | "typescript" | "ts" | "tsx" => {
+                Some(Self::Js)
+            }
             "toml" => Some(Self::Toml),
             "yaml" | "yml" => Some(Self::Yaml),
-            "bash" | "sh" | "zsh" => Some(Self::Bash),
+            "bash" | "sh" | "shell" | "zsh" => Some(Self::Bash),
             "sql" => Some(Self::Sql),
             "diff" | "patch" => Some(Self::Diff),
+            "python" | "py" | "python3" => Some(Self::Python),
+            "go" | "golang" => Some(Self::Go),
+            "c" | "cpp" | "c++" | "cxx" | "cc" | "h" | "hpp" | "java" | "kotlin" | "kt" => {
+                Some(Self::CFamily)
+            }
+            "swift" => Some(Self::Swift),
             _ => None,
         }
     }
@@ -184,6 +196,155 @@ fn tokenize(lang: Lang, src: &str) -> Vec<TokenSpan> {
         Lang::Bash => tokenize_bash(src, 0, &mut out),
         Lang::Sql => tokenize_sql(src, 0, &mut out),
         Lang::Diff => tokenize_diff(src, 0, &mut out),
+        Lang::Python => tokenize_python(src, 0, &mut out),
+        Lang::Go => tokenize_c_like(
+            src,
+            0,
+            &mut out,
+            &[
+                "break",
+                "case",
+                "chan",
+                "const",
+                "continue",
+                "default",
+                "defer",
+                "else",
+                "fallthrough",
+                "for",
+                "func",
+                "go",
+                "goto",
+                "if",
+                "import",
+                "interface",
+                "map",
+                "package",
+                "range",
+                "return",
+                "select",
+                "struct",
+                "switch",
+                "type",
+                "var",
+            ],
+            &["true", "false", "nil", "iota"],
+            false,
+            true,
+        ),
+        Lang::CFamily => tokenize_c_like(
+            src,
+            0,
+            &mut out,
+            &[
+                "auto",
+                "break",
+                "case",
+                "catch",
+                "class",
+                "const",
+                "constexpr",
+                "continue",
+                "default",
+                "do",
+                "else",
+                "enum",
+                "explicit",
+                "extends",
+                "final",
+                "finally",
+                "for",
+                "fun",
+                "if",
+                "implements",
+                "import",
+                "in",
+                "inline",
+                "interface",
+                "namespace",
+                "new",
+                "operator",
+                "override",
+                "package",
+                "private",
+                "protected",
+                "public",
+                "return",
+                "sizeof",
+                "static",
+                "struct",
+                "switch",
+                "template",
+                "throw",
+                "throws",
+                "try",
+                "typedef",
+                "typename",
+                "using",
+                "val",
+                "var",
+                "virtual",
+                "void",
+                "while",
+            ],
+            &["true", "false", "null", "nullptr", "this", "super", "NULL"],
+            true,
+            false,
+        ),
+        Lang::Swift => tokenize_c_like(
+            src,
+            0,
+            &mut out,
+            &[
+                "actor",
+                "as",
+                "async",
+                "await",
+                "break",
+                "case",
+                "catch",
+                "class",
+                "continue",
+                "default",
+                "defer",
+                "do",
+                "else",
+                "enum",
+                "extension",
+                "fallthrough",
+                "for",
+                "func",
+                "guard",
+                "if",
+                "import",
+                "in",
+                "init",
+                "inout",
+                "internal",
+                "is",
+                "let",
+                "mutating",
+                "override",
+                "private",
+                "protocol",
+                "public",
+                "repeat",
+                "return",
+                "static",
+                "struct",
+                "switch",
+                "throw",
+                "throws",
+                "try",
+                "typealias",
+                "var",
+                "where",
+                "while",
+            ],
+            &["true", "false", "nil", "self", "Self", "super"],
+            true,
+            false,
+        ),
     }
     out
 }
@@ -959,6 +1120,210 @@ fn tokenize_diff(src: &str, base: usize, out: &mut Vec<TokenSpan>) {
             push(out, base + offset, 0..line.len(), kind);
         }
         offset += line.len();
+    }
+}
+
+fn tokenize_python(src: &str, base: usize, out: &mut Vec<TokenSpan>) {
+    const KEYWORDS: &[&str] = &[
+        "and", "as", "assert", "async", "await", "break", "case", "class", "continue", "def",
+        "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in",
+        "is", "lambda", "match", "nonlocal", "not", "or", "pass", "raise", "return", "try",
+        "while", "with", "yield",
+    ];
+    const CONSTANTS: &[&str] = &["True", "False", "None", "self", "cls"];
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'#' {
+            let end = bytes[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(len, |p| i + p);
+            push(out, base, i..end, "comment");
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with(b"\"\"\"") || bytes[i..].starts_with(b"'''") {
+            let delim = &bytes[i..i + 3];
+            let mut j = i + 3;
+            while j + 3 <= len {
+                if bytes[j] == b'\\' {
+                    j = (j + 2).min(len);
+                    continue;
+                }
+                if &bytes[j..j + 3] == delim {
+                    j += 3;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 3 > len && (j == len || &bytes[j.saturating_sub(3)..j] != delim) {
+                j = len;
+            }
+            push(out, base, i..j, "string");
+            i = j;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            let end = scan_quoted(bytes, i);
+            push(out, base, i..end, "string");
+            i = end;
+            continue;
+        }
+        if b == b'@' {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.')) {
+                i += 1;
+            }
+            push(out, base, start..i, "attribute");
+            continue;
+        }
+        if b.is_ascii_digit() {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'_')) {
+                i += 1;
+            }
+            push(out, base, start..i, "number");
+            continue;
+        }
+        if is_ident_start(b) {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = src.get(start..i).unwrap_or_default();
+            let kind = if KEYWORDS.contains(&word) {
+                Some("keyword")
+            } else if CONSTANTS.contains(&word) {
+                Some("constant")
+            } else if bytes.get(i) == Some(&b'(') {
+                Some("function")
+            } else if word.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
+                Some("type")
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                push(out, base, start..i, kind);
+            }
+            continue;
+        }
+        if matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']') {
+            push(out, base, i..(i + 1), "punctuation.bracket");
+        } else if matches!(
+            b,
+            b'=' | b'+' | b'-' | b'*' | b'/' | b'!' | b'<' | b'>' | b':' | b'%'
+        ) {
+            push(out, base, i..(i + 1), "operator");
+        }
+        i += 1;
+    }
+}
+
+fn tokenize_c_like(
+    src: &str,
+    base: usize,
+    out: &mut Vec<TokenSpan>,
+    keywords: &[&str],
+    constants: &[&str],
+    has_preproc: bool,
+    has_backtick: bool,
+) {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"//") {
+            let end = bytes[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(len, |p| i + p);
+            push(out, base, i..end, "comment");
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            let end = src
+                .get(i + 2..)
+                .unwrap_or_default()
+                .find("*/")
+                .map_or(len, |pos| i + 2 + pos + 2);
+            push(out, base, i..end, "comment");
+            i = end;
+            continue;
+        }
+        if has_preproc && b == b'#' && (i == 0 || bytes[i - 1] == b'\n') {
+            let end = bytes[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(len, |p| i + p);
+            push(out, base, i..end, "preproc");
+            i = end;
+            continue;
+        }
+        if b == b'"' || b == b'\'' || (has_backtick && b == b'`') {
+            let end = scan_quoted(bytes, i);
+            push(out, base, i..end, "string");
+            i = end;
+            continue;
+        }
+        if b.is_ascii_digit() {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'.' | b'_')) {
+                i += 1;
+            }
+            push(out, base, start..i, "number");
+            continue;
+        }
+        if is_ident_start(b) {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = src.get(start..i).unwrap_or_default();
+            let kind = if keywords.contains(&word) {
+                Some("keyword")
+            } else if constants.contains(&word) {
+                Some("constant")
+            } else if bytes.get(i) == Some(&b'(') {
+                Some("function")
+            } else if word.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
+                Some("type")
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                push(out, base, start..i, kind);
+            }
+            continue;
+        }
+        if matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']') {
+            push(out, base, i..(i + 1), "punctuation.bracket");
+        } else if matches!(
+            b,
+            b'=' | b'+' | b'-' | b'*' | b'/' | b'!' | b'<' | b'>' | b'&' | b'|' | b':' | b'?'
+        ) {
+            push(out, base, i..(i + 1), "operator");
+        }
+        i += 1;
     }
 }
 

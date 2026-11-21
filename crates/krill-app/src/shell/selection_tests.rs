@@ -159,6 +159,42 @@ fn remote_sgr_mouse_keeps_program_input_and_shift_selection(cx: &mut TestAppCont
     );
 }
 
+/// pi 전체 화면처럼 프로그램이 마우스로 선택·복사하면, 화면 밖에 남은 옛 Krill 선택을
+/// ⌘C가 다시 복사해 프로그램이 넣은 클립보드를 덮으면 안 된다.
+#[gpui::test]
+fn program_mouse_click_drops_stale_offscreen_selection(cx: &mut TestAppContext) {
+    let (view, cx, pane, _peer) = remote_terminal(
+        cx,
+        "remote-selection-stale",
+        Modes::MOUSE_DRAG | Modes::SGR_MOUSE,
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            let l = s.live.get_mut(&pane).unwrap();
+            // 받지 않은 스크롤백 줄에 걸린 선택: 읽을 수 없어 기록한 글자로만 복사된다.
+            l.selection = Some(Anchored {
+                anchor: (-40, 0),
+                head: (-40, 5),
+                block: false,
+            });
+            l.selection_text = Some("stale".into());
+        });
+    });
+    cx.write_to_clipboard(ClipboardItem::new_string("from-program".into()));
+    let (bounds, cell) = cx.update(|_, cx| view.read(cx).live[&pane].painted.get());
+    let at = point(
+        bounds.origin.x + cell.width * 0.5,
+        bounds.origin.y + cell.height * 0.5,
+    );
+    cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("from-program")
+    );
+}
+
 #[gpui::test]
 fn remote_sgr_drag_outside_grid_clamps_release_and_applies_osc52_clipboard(
     cx: &mut TestAppContext,

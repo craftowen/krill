@@ -13,6 +13,7 @@ pub(super) struct ChatPrompt {
     pub pending_id: u64,
     pub bytes: Vec<u8>,
     pub opens_terminal: bool,
+    pub local_slash: bool,
 }
 
 pub(super) struct Origin {
@@ -136,6 +137,7 @@ impl Shell {
             pending_id,
             bytes,
             opens_terminal,
+            local_slash,
         } = prompt;
         let key = (self.layout.host(pane).clone(), session);
         let log = self.chat.logs.get(&key);
@@ -270,58 +272,22 @@ impl Shell {
                 .ok();
                 return;
             }
+            if applied && local_slash {
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_chat_prompt(
+                        FinishPrompt {
+                            key: &task_key,
+                            pending_id,
+                            confirmed: true,
+                        },
+                        Some(window),
+                        cx,
+                    );
+                })
+                .ok();
+                return;
+            }
             if applied {
-                let queued_working = this
-                    .update_in(cx, |this, window, cx| {
-                        let working = this.session_agent_state(&origin.host, session, cx)
-                            == krill_proto::control::AgentState::Working;
-                        if !working {
-                            return Ok::<bool, ()>(false);
-                        }
-                        if !this.chat_prompt_current(&origin, cx) {
-                            this.finish_chat_prompt(
-                                FinishPrompt {
-                                    key: &task_key,
-                                    pending_id,
-                                    confirmed: false,
-                                },
-                                Some(window),
-                                cx,
-                            );
-                            return Err(());
-                        }
-                        if this.chat_prompt_confirmed(&origin, pending_id) {
-                            this.finish_chat_prompt(
-                                FinishPrompt {
-                                    key: &task_key,
-                                    pending_id,
-                                    confirmed: true,
-                                },
-                                Some(window),
-                                cx,
-                            );
-                            return Err(());
-                        }
-                        this.chat.prompt_tasks.remove(&task_key);
-                        this.mark_pending_prompt_queued(&task_key, pending_id);
-                        this.spawn_unbracketed_turn_watcher(
-                            super::UnbracketedWatch {
-                                key: task_key.clone(),
-                                pane,
-                                session,
-                                pending_id,
-                            },
-                            window,
-                            cx,
-                        );
-                        cx.notify();
-                        Ok(true)
-                    })
-                    .ok();
-                match queued_working {
-                    Some(Ok(true) | Err(())) | None => return,
-                    Some(Ok(false)) => {}
-                }
                 for step in 0..TURN_POLLS {
                     let Ok((current, confirmed)) = this.update_in(cx, |this, _, cx| {
                         let current = this.chat_prompt_current(&origin, cx);

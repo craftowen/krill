@@ -463,6 +463,27 @@ fn live_footer_overrides_stale_transcript_model_and_effort() {
     assert_eq!(same_family["effort"], "low");
 }
 
+#[test]
+fn waiting_screen_observation_populates_model_without_idle_composer() {
+    let prompt_screen = screen(&[
+        " * ▐▛███▜▌ *   Claude Code v2.1.316",
+        "* ▝▜█████▛▘ *  Opus 5.5 · high",
+        "Allow Read on Cargo.toml? 1. Yes / 2. No",
+    ]);
+    let mut status = json!({
+        "agent": "claude",
+        "supported": true,
+        "model": null,
+        "model_label": null,
+        "effort": null
+    });
+    observe_screen_into(Some(&prompt_screen), &mut status);
+    assert_eq!(status["model"], "opus");
+    assert_eq!(status["model_label"], "Opus 5.5");
+    assert_eq!(status["effort"], "high");
+    assert_eq!(status["effort_supported"], false);
+}
+
 #[cfg(unix)]
 mod pty_tests {
     use super::*;

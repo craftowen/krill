@@ -6,9 +6,12 @@ use crate::session::lock;
 use krill_proto::ipc;
 use krill_proto::mobile::MobileReply;
 use krill_proto::screen::Msg;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use serde_json::Value;
 use std::cell::RefCell;
+use std::ffi::OsString;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,11 +19,29 @@ use std::time::{Duration, Instant};
 /// 클라이언트 간격 요청의 허용 범위. 0은 일시정지(숨은 탭)다.
 const MIN_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_INTERVAL: Duration = Duration::from_secs(60);
+const CHAT_DEBOUNCE: Duration = Duration::from_millis(80);
+const CHAT_FALLBACK_TICK: Duration = Duration::from_secs(1);
 
 type Sink = Box<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
 
+pub(crate) struct ChatFeedPoll {
+    pub(crate) delta: Option<Value>,
+    pub(crate) next_offset: u64,
+    pub(crate) watch_path: Option<PathBuf>,
+}
+
+struct ChatSub {
+    session: u64,
+    offset: u64,
+    watch_path: Option<PathBuf>,
+    last_notify: Option<Instant>,
+    next_tick: Instant,
+    watcher: Option<RecommendedWatcher>,
+}
+
 /// 연결 하나의 피드. 스레드는 첫 구독 때만 만들고 연결이 끝나면 `stop`이 멈추고 회수한다.
 pub(crate) struct Feed {
+    me: Weak<Self>,
     state: Mutex<State>,
     changed: Condvar,
     sink: Sink,
@@ -35,6 +56,7 @@ struct State {
     /// 이 연결에 마지막으로 보낸(응답이든 푸시든) 스냅샷.
     etag: Option<String>,
     rev: u64,
+    chat_sub: Option<ChatSub>,
     stopped: bool,
 }
 
@@ -48,13 +70,48 @@ impl std::fmt::Debug for Feed {
     }
 }
 
+fn watch_chat_target(
+    watch_path: Option<&Path>,
+    weak_feed: Weak<Feed>,
+) -> Option<RecommendedWatcher> {
+    let path = watch_path?;
+    let target_dir = path.parent()?;
+    if !target_dir.exists() {
+        return None;
+    }
+    let file_name: OsString = path.file_name()?.to_os_string();
+    let mut wal_name = file_name.clone();
+    wal_name.push("-wal");
+    let mut shm_name = file_name.clone();
+    shm_name.push("-shm");
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(ev) = event else {
+            return;
+        };
+        let relevant = ev.paths.is_empty()
+            || ev.paths.iter().any(|p| {
+                p.file_name()
+                    .is_some_and(|name| name == file_name || name == wal_name || name == shm_name)
+            });
+        if relevant && let Some(feed) = weak_feed.upgrade() {
+            feed.note_chat_fs_event();
+        }
+    })
+    .ok()?;
+    watcher
+        .watch(target_dir, RecursiveMode::NonRecursive)
+        .ok()?;
+    Some(watcher)
+}
+
 impl Feed {
     /// `sink`은 IPC 프레임 하나를 연결의 응답과 같은 순서 잠금 아래에서 봉인해 보낸다.
     pub(crate) fn new(
         registry: Weak<Registry>,
         sink: impl Fn(&[u8]) -> io::Result<()> + Send + Sync + 'static,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             state: Mutex::default(),
             changed: Condvar::new(),
             sink: Box::new(sink),
@@ -70,12 +127,81 @@ impl Feed {
 
     /// 연결 종료: 대기를 즉시 깨워 끝내고 스레드를 회수한다. 진행 중인 스냅샷 하나는 끝까지 기다린다.
     pub(crate) fn stop(&self) {
-        lock(&self.state).stopped = true;
+        let old_sub = {
+            let mut state = lock(&self.state);
+            state.stopped = true;
+            state.chat_sub.take()
+        };
+        drop(old_sub);
         self.changed.notify_all();
         let thread = lock(&self.thread).take();
         if let Some(thread) = thread {
             thread.join().ok();
         }
+    }
+
+    fn note_chat_fs_event(&self) {
+        let mut state = lock(&self.state);
+        if state.stopped {
+            return;
+        }
+        if let Some(sub) = state.chat_sub.as_mut() {
+            sub.last_notify.get_or_insert_with(Instant::now);
+            self.changed.notify_all();
+        }
+    }
+
+    fn subscribe_chat(
+        self: &Arc<Self>,
+        session: u64,
+        offset: u64,
+        watch_path: Option<PathBuf>,
+    ) -> bool {
+        let watcher = watch_chat_target(watch_path.as_deref(), Weak::clone(&self.me));
+        let now = Instant::now();
+        let mut old_sub = None;
+        let armed = {
+            let mut state = lock(&self.state);
+            if state.stopped {
+                false
+            } else {
+                old_sub = state.chat_sub.replace(ChatSub {
+                    session,
+                    offset,
+                    watch_path,
+                    last_notify: Some(now),
+                    next_tick: now + CHAT_FALLBACK_TICK,
+                    watcher,
+                });
+                self.changed.notify_all();
+                if self.spawn() {
+                    true
+                } else {
+                    old_sub = state.chat_sub.take().or(old_sub);
+                    false
+                }
+            }
+        };
+        drop(old_sub);
+        armed
+    }
+
+    fn unsubscribe_chat(&self, session: u64) {
+        let old_sub = {
+            let mut state = lock(&self.state);
+            if state
+                .chat_sub
+                .as_ref()
+                .is_some_and(|sub| sub.session == session)
+            {
+                let taken = state.chat_sub.take();
+                self.changed.notify_all();
+                taken
+            } else {
+                None
+            }
+        };
+        drop(old_sub);
     }
 
     fn observe(self: &Arc<Self>, request: Option<u64>, etag: &str, rev: u64) -> u64 {
@@ -138,9 +264,24 @@ impl Feed {
         let mut state = lock(&self.state);
         loop {
             if state.stopped {
+                let old_sub = state.chat_sub.take();
+                drop(state);
+                drop(old_sub);
                 return;
             }
-            let (Some(interval), Some(due)) = (state.interval, state.due) else {
+            let snapshot_due = state.interval.zip(state.due);
+            let chat_due = state.chat_sub.as_ref().map(|sub| {
+                sub.last_notify
+                    .map_or(sub.next_tick, |at| at + CHAT_DEBOUNCE)
+            });
+
+            let next_due = match (snapshot_due.map(|(_, d)| d), chat_due) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let Some(due) = next_due else {
                 state = self.wait(state, None);
                 continue;
             };
@@ -149,37 +290,127 @@ impl Feed {
                 state = self.wait(state, Some(due - now));
                 continue;
             }
-            state.due = Some(now + interval);
-            let since = state.etag.clone();
-            drop(state);
-            let snapshot = self
-                .registry
-                .upgrade()
-                .and_then(|registry| registry.mobile_gateway().map(Arc::clone))
-                .map(|gateway| gateway.backend().snapshot_versioned(since.as_deref()));
-            state = lock(&self.state);
-            let Some(Ok((value, rev))) = snapshot else {
-                continue;
-            };
-            if state.stopped || state.interval.is_none() || rev <= state.rev {
+
+            if chat_due.is_some_and(|cd| cd <= now)
+                && let Some(sub) = state.chat_sub.as_mut()
+            {
+                sub.last_notify = None;
+                sub.next_tick = now + CHAT_FALLBACK_TICK;
+                let session = sub.session;
+                let offset = sub.offset;
+                let prev_path = sub.watch_path.clone();
+                drop(state);
+
+                let poll = self
+                    .registry
+                    .upgrade()
+                    .and_then(|registry| registry.mobile_gateway().map(Arc::clone))
+                    .map(|gateway| gateway.backend().poll_chat_for_feed(session, offset));
+                let mut new_watcher = None;
+                let mut path_changed = false;
+                if let Some(Ok(ref res)) = poll
+                    && res.watch_path != prev_path
+                {
+                    path_changed = true;
+                    new_watcher =
+                        watch_chat_target(res.watch_path.as_deref(), Weak::clone(&self.me));
+                }
+
+                state = lock(&self.state);
+                if state.stopped {
+                    let old_sub = state.chat_sub.take();
+                    drop(state);
+                    drop(new_watcher);
+                    drop(old_sub);
+                    return;
+                }
+                let still_matching = state
+                    .chat_sub
+                    .as_ref()
+                    .is_some_and(|s| s.session == session && s.offset == offset);
+                if !still_matching {
+                    drop(state);
+                    drop(new_watcher);
+                    state = lock(&self.state);
+                    continue;
+                }
+                let mut old_watcher = None;
+                if let Some(Ok(res)) = poll {
+                    if path_changed && let Some(s) = state.chat_sub.as_mut() {
+                        s.watch_path = res.watch_path;
+                        old_watcher = s.watcher.take();
+                        s.watcher = new_watcher.take();
+                    }
+                    if let Some(delta) = res.delta
+                        && let Some(frame) = chat_push(session, &delta)
+                    {
+                        match (self.sink)(&frame) {
+                            Ok(()) => {
+                                if let Some(s) = state.chat_sub.as_mut() {
+                                    s.offset = res.next_offset;
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(_) => {
+                                state.stopped = true;
+                                state.interval = None;
+                                let old_sub = state.chat_sub.take();
+                                drop(state);
+                                drop(old_watcher);
+                                drop(new_watcher);
+                                drop(old_sub);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if old_watcher.is_some() || new_watcher.is_some() {
+                    drop(state);
+                    drop(old_watcher);
+                    drop(new_watcher);
+                    state = lock(&self.state);
+                }
                 continue;
             }
-            let Some((frame, etag)) = push(value, rev) else {
-                continue;
-            };
-            // 상태 잠금 안에서 보내 응답 쪽 `observe`와 etag·rev 순서가 섞이지 않게 한다.
-            match (self.sink)(&frame) {
-                Ok(()) => {
-                    state.etag = Some(etag);
-                    state.rev = rev;
+
+            if let Some((interval, s_due)) = snapshot_due
+                && s_due <= now
+            {
+                state.due = Some(now + interval);
+                let since = state.etag.clone();
+                drop(state);
+                let snapshot = self
+                    .registry
+                    .upgrade()
+                    .and_then(|registry| registry.mobile_gateway().map(Arc::clone))
+                    .map(|gateway| gateway.backend().snapshot_versioned(since.as_deref()));
+                state = lock(&self.state);
+                let Some(Ok((value, rev))) = snapshot else {
+                    continue;
+                };
+                if state.stopped || state.interval.is_none() || rev <= state.rev {
+                    continue;
                 }
-                // 릴레이 아웃박스가 가득 참: 이번 푸시는 버리고(nonce 공백은 허용) 다음 간격에 최신 상태로 다시 시도한다.
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                // 연결이 깨졌다. sink가 연결을 이미 닫았다.
-                Err(_) => {
-                    state.stopped = true;
-                    state.interval = None;
-                    return;
+                let Some((frame, etag)) = push(value, rev) else {
+                    continue;
+                };
+                // 상태 잠금 안에서 보내 응답 쪽 `observe`와 etag·rev 순서가 섞이지 않게 한다.
+                match (self.sink)(&frame) {
+                    Ok(()) => {
+                        state.etag = Some(etag);
+                        state.rev = rev;
+                    }
+                    // 릴레이 아웃박스가 가득 참: 이번 푸시는 버리고(nonce 공백은 허용) 다음 간격에 최신 상태로 다시 시도한다.
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    // 연결이 깨졌다. sink가 연결을 이미 닫았다.
+                    Err(_) => {
+                        state.stopped = true;
+                        state.interval = None;
+                        let old_sub = state.chat_sub.take();
+                        drop(state);
+                        drop(old_sub);
+                        return;
+                    }
                 }
             }
         }
@@ -190,6 +421,21 @@ impl Feed {
 pub(super) fn observe(request: Option<u64>, etag: &str, rev: u64) -> Option<u64> {
     let feed = CURRENT.with(|current| current.borrow().clone())?;
     Some(feed.observe(request, etag, rev))
+}
+
+pub(super) fn subscribe_chat(
+    session: u64,
+    offset: u64,
+    watch_path: Option<PathBuf>,
+) -> Option<bool> {
+    let feed = CURRENT.with(|current| current.borrow().clone())?;
+    Some(feed.subscribe_chat(session, offset, watch_path))
+}
+
+pub(super) fn unsubscribe_chat(session: u64) {
+    if let Some(feed) = CURRENT.with(|current| current.borrow().clone()) {
+        feed.unsubscribe_chat(session);
+    }
 }
 
 /// 바뀐 스냅샷 푸시. 기존 응답과 같은 Workflow 프레임이고 JSON이 `{"push":`로 시작해 응답(`{"data"`/`{"ok"`)과 구별된다.
@@ -208,6 +454,17 @@ fn push(mut value: Value, rev: u64) -> Option<(Vec<u8>, String)> {
         text = "{\"push\":\"stale\"}".into();
     }
     Some((MobileReply::Workflow(text).encode().ok()?, etag))
+}
+
+fn chat_push(session: u64, data: &Value) -> Option<Vec<u8>> {
+    let mut text = format!(
+        "{{\"push\":\"chat_delta\",\"session\":{session},\"data\":{}}}",
+        serde_json::to_string(data).ok()?
+    );
+    if text.len() >= ipc::MAX_FRAME.saturating_sub(32) {
+        text = format!("{{\"push\":\"chat_stale\",\"session\":{session}}}");
+    }
+    MobileReply::Workflow(text).encode().ok()
 }
 
 #[cfg(test)]
@@ -311,5 +568,55 @@ mod tests {
             "no respawn after disconnect"
         );
         assert!(lock(&feed.thread).is_none());
+    }
+
+    #[test]
+    fn chat_push_encodes_delta_and_downgrades_oversized_payload_to_chat_stale() {
+        let small = chat_push(9, &serde_json::json!({"items": [], "next_offset": 12})).unwrap();
+        let (kind, body) = ipc::read_frame(&mut &small[..]).unwrap().unwrap();
+        let MobileReply::Workflow(text) = MobileReply::decode(kind, &body).unwrap() else {
+            panic!("expected workflow frame");
+        };
+        assert!(text.starts_with("{\"push\":\"chat_delta\",\"session\":9,"));
+
+        let oversized = serde_json::json!({
+            "items": [{"text": "x".repeat(ipc::MAX_FRAME)}],
+            "next_offset": 99
+        });
+        let stale = chat_push(9, &oversized).unwrap();
+        let (kind, body) = ipc::read_frame(&mut &stale[..]).unwrap().unwrap();
+        let MobileReply::Workflow(text) = MobileReply::decode(kind, &body).unwrap() else {
+            panic!("expected workflow frame");
+        };
+        assert_eq!(text, "{\"push\":\"chat_stale\",\"session\":9}");
+    }
+
+    #[test]
+    fn subscribe_chat_and_unsubscribe_manage_feed_thread_cleanly() {
+        let registry = registry();
+        let dir = std::env::temp_dir().join(format!("mk-feed-sub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let feed = Feed::new(Arc::downgrade(&registry), |_: &[u8]| Ok(()));
+        assert!(feed.subscribe_chat(42, 0, Some(path.clone())));
+        assert!(lock(&feed.state).chat_sub.is_some());
+        assert!(lock(&feed.thread).is_some());
+
+        std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
+        until(|| {
+            lock(&feed.state)
+                .chat_sub
+                .as_ref()
+                .is_some_and(|s| s.next_tick > Instant::now())
+        });
+
+        feed.unsubscribe_chat(42);
+        assert!(lock(&feed.state).chat_sub.is_none());
+
+        feed.stop();
+        assert!(lock(&feed.thread).is_none());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

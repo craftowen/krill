@@ -124,6 +124,7 @@ function fixture(options = {}) {
     },
     clearTimeout: (id) => timers.delete(id),
     KrillMobile: {},
+    MkKeyboard: options.MkKeyboard,
     ResizeObserver: options.ResizeObserver,
   };
   vm.createContext(sandbox);
@@ -181,6 +182,9 @@ function fixture(options = {}) {
       return handler(request);
     },
     photo: (...args) => prepare(...args),
+    error(e) {
+      errors.push(e?.message || String(e));
+    },
     act(fn) {
       const p = Promise.resolve()
         .then(fn)
@@ -1034,7 +1038,11 @@ async function tailFollow() {
   );
   delete feed.scrollHeight;
   await f.poll(page(30, 32));
-  assert.equal(feed.children.length, 32);
+  assert.equal(
+    feed.children.filter((c) => c.className !== "chat-unread-divider").length,
+    32,
+  );
+  assert.equal(feed.children[30].className, "chat-unread-divider");
   assert.equal(
     feed.scrollTop,
     400,
@@ -1042,6 +1050,10 @@ async function tailFollow() {
   );
   feed.scrollTop = feed.scrollHeight - feed.clientHeight;
   feed.dispatchEvent(new Event("scroll"));
+  assert(
+    !feed.children.some((c) => c.className === "chat-unread-divider"),
+    "returning to bottom clears unread divider",
+  );
   await f.poll(page(32, 33));
   assert.equal(
     feed.scrollTop,
@@ -5084,7 +5096,7 @@ async function agyStartupAndModelApplyUx() {
     "PASS agy startup reload, 1.5s boot probe, cold picker Loading…/note, Applying… lock, and confirmed effort retention",
   );
 
-  // Working turns show dedicated Stop alongside Send when drafting, send single interrupt RPC, ignore double-taps, lock duplicate taps, preserve drafts, and allow mid-turn prompt submit.
+  // OWE-1349: Working turns switch Send to Stop, send a single interrupt RPC, ignore double-taps, lock duplicate taps, and preserve drafts.
   {
     const stopChat = fixture({
       capabilities: { chat_interrupt: true },
@@ -5102,15 +5114,13 @@ async function agyStartupAndModelApplyUx() {
       },
     });
     await flush();
-    const sendBtn = stopChat.find("primary composer-send"),
-      stopBtn = stopChat.find("secondary composer-stop");
+    const sendBtn = stopChat.find("primary composer-send");
     assert.equal(sendBtn.dataset.mode, "send");
     assert.equal(sendBtn.type, "submit");
-    assert.equal(sendBtn.hidden, false);
-    assert.equal(stopBtn.hidden, true);
     assert.equal(sendBtn.attrs["aria-label"], "Send");
     assert.equal(sendBtn.textContent, "Send");
 
+    stopChat.input("작성 중인 모바일 초안");
     stopChat.state.sessions.set(7, {
       id: 7,
       state: "Working",
@@ -5120,34 +5130,32 @@ async function agyStartupAndModelApplyUx() {
     stopChat.update();
     await flush();
 
-    // Empty draft while Working shows Stop only.
-    assert.equal(stopBtn.hidden, false);
-    assert.equal(stopBtn.type, "button");
-    assert.equal(stopBtn.attrs["aria-label"], "Stop");
-    assert.equal(stopBtn.textContent, "Stop");
-    assert.equal(stopBtn.disabled, false);
-    assert.equal(sendBtn.hidden, true);
-
-    // Typing a draft while Working reveals Send alongside Stop.
-    stopChat.input("작성 중인 모바일 초안");
-    await flush();
-    assert.equal(stopBtn.hidden, false);
-    assert.equal(sendBtn.hidden, false);
+    assert.equal(sendBtn.dataset.mode, "stop");
+    assert.equal(sendBtn.type, "button");
+    assert.equal(sendBtn.attrs["aria-label"], "Stop");
+    assert.equal(sendBtn.textContent, "Stop");
     assert.equal(sendBtn.disabled, false);
 
-    // Double-tap (event.detail > 1) on Stop must be ignored before latching.
+    // Submitting form while Working must be blocked and preserve the draft.
+    stopChat.submit();
+    await flush();
+    assert(!stopChat.calls.some((c) => c.action === "prompt"));
+    assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
+    assert.equal(stopChat.state.drafts.get(7), "작성 중인 모바일 초안");
+
+    // Double-tap (event.detail > 1) must be ignored before latching.
     const dbl = new Event("click");
     dbl.detail = 2;
-    stopBtn.dispatchEvent(dbl);
+    sendBtn.dispatchEvent(dbl);
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
       0,
     );
-    assert.equal(stopBtn.disabled, false);
+    assert.equal(sendBtn.disabled, false);
 
     // First Stop tap sends interrupt RPC once and locks duplicate taps for this Working turn.
-    stopBtn.dispatchEvent(new Event("click"));
+    sendBtn.dispatchEvent(new Event("click"));
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
@@ -5157,28 +5165,26 @@ async function agyStartupAndModelApplyUx() {
       { ...stopChat.calls.find((c) => c.action === "interrupt") },
       { action: "interrupt", session: 7 },
     );
-    assert.equal(stopBtn.disabled, true);
+    assert.equal(sendBtn.disabled, true);
     assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
     assert.equal(stopChat.state.drafts.get(7), "작성 중인 모바일 초안");
 
     // Duplicate taps while Working (including after remount) must NOT send a second interrupt.
-    stopBtn.dispatchEvent(new Event("click"));
+    sendBtn.dispatchEvent(new Event("click"));
     await flush();
     stopChat.remount();
     await flush();
-    const remountedSend = stopChat.find("primary composer-send"),
-      remountedStop = stopChat.find("secondary composer-stop");
-    assert.equal(remountedStop.hidden, false);
-    assert.equal(remountedStop.disabled, true);
-    assert.equal(remountedSend.hidden, false);
-    remountedStop.dispatchEvent(new Event("click"));
+    const remountedBtn = stopChat.find("primary composer-send");
+    assert.equal(remountedBtn.dataset.mode, "stop");
+    assert.equal(remountedBtn.disabled, true);
+    remountedBtn.dispatchEvent(new Event("click"));
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
       1,
     );
 
-    // Leaving Working clears the stop latch, hides Stop, and keeps Send with the draft intact.
+    // Leaving Working clears the stop latch and restores Send with the draft intact.
     stopChat.state.sessions.set(7, {
       id: 7,
       state: "Waiting",
@@ -5187,14 +5193,13 @@ async function agyStartupAndModelApplyUx() {
     });
     stopChat.update();
     await flush();
-    assert.equal(remountedStop.hidden, true);
-    assert.equal(remountedSend.hidden, false);
-    assert.equal(remountedSend.type, "submit");
-    assert.equal(remountedSend.attrs["aria-label"], "Send");
-    assert.equal(remountedSend.disabled, false);
+    assert.equal(remountedBtn.dataset.mode, "send");
+    assert.equal(remountedBtn.type, "submit");
+    assert.equal(remountedBtn.attrs["aria-label"], "Send");
+    assert.equal(remountedBtn.disabled, false);
     assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
 
-    // Entering a new Working turn re-enables Stop for one fresh interrupt, AND allows submitting the draft mid-turn.
+    // Entering a new Working turn re-enables Stop for one fresh interrupt.
     stopChat.state.sessions.set(7, {
       id: 7,
       state: "Working",
@@ -5203,19 +5208,9 @@ async function agyStartupAndModelApplyUx() {
     });
     stopChat.update();
     await flush();
-    assert.equal(remountedStop.hidden, false);
-    assert.equal(remountedStop.disabled, false);
-    assert.equal(remountedSend.hidden, false);
-    stopChat.submit();
-    await flush();
-    assert.deepEqual(
-      { ...stopChat.calls.findLast((c) => c.action === "prompt") },
-      { action: "prompt", session: 7, text: "작성 중인 모바일 초안" },
-    );
-    assert.equal(stopChat.find("chat-input").value, "");
-    assert.equal(remountedStop.hidden, false);
-    assert.equal(remountedSend.hidden, true);
-    remountedStop.dispatchEvent(new Event("click"));
+    assert.equal(remountedBtn.dataset.mode, "stop");
+    assert.equal(remountedBtn.disabled, false);
+    remountedBtn.dispatchEvent(new Event("click"));
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
@@ -5237,13 +5232,13 @@ async function agyStartupAndModelApplyUx() {
     koChat.update();
     await flush();
     assert.equal(
-      koChat.find("secondary composer-stop").attrs["aria-label"],
+      koChat.find("primary composer-send").attrs["aria-label"],
       "정지",
     );
     koChat.dispose();
   }
   console.log(
-    "PASS working stop + mid-turn send buttons, single interrupt, double-tap guard, duplicate tap latch, draft retention, and next-turn reset",
+    "PASS working stop button single interrupt, double-tap guard, duplicate tap latch, draft retention, and next-turn reset",
   );
 }
 async function unboundEmptyAndVisibilityTransitions() {
@@ -5402,6 +5397,694 @@ async function unboundEmptyAndVisibilityTransitions() {
   console.log(
     "PASS unbound empty composer stays usable without error, hidden->visible poll queue & input resize, and modelBtn disabled on liveQuestion",
   );
+
+  // 4) MkKeyboard.keepFocus covers attachment/leading/contextMeter without blocking Send button focus transfer (IME commit).
+  const kept = [];
+  const imeFx = fixture({
+    MkKeyboard: {
+      keepFocus(container) {
+        kept.push(container);
+      },
+    },
+  });
+  await flush();
+  const hasNode = (rootNode, target) =>
+    rootNode === target || rootNode.descendants().includes(target);
+  const sendNode = imeFx.find("primary composer-send");
+  const modelNode = imeFx.find("composer-pill");
+  const attachNode = imeFx.find("icon-button composer-icon");
+  const ctxNode = imeFx.find("composer-context");
+  assert(
+    !kept.some((c) => hasNode(c, sendNode)),
+    "sendBtn must stay outside keepFocus so tapping Send commits IME composition",
+  );
+  assert(kept.some((c) => hasNode(c, modelNode)));
+  assert(kept.some((c) => hasNode(c, attachNode)));
+  assert(kept.some((c) => hasNode(c, ctxNode)));
+  imeFx.dispose();
+  console.log(
+    "PASS MkKeyboard.keepFocus protects composer accessories without capturing Send",
+  );
+
+  // 5) Phase 1B: Markdown overhaul, zero-dep highlighting, colored Diff sheet, Tab/Enter submit, <dialog> modal model sheet, skeleton & streaming dots.
+  {
+    let draftSaved = 0;
+    const p1b = fixture({
+      capabilities: {
+        chat_tail: true,
+        chat_composer: true,
+        composer_models: true,
+        command_catalog: true,
+      },
+      handler: async (req) => {
+        if (req.action === "command_catalog")
+          return { items: [{ name: "compact", text: "/compact", kind: "Command" }] };
+        if (req.action === "composer_models")
+          return {
+            supported: true,
+            current: "m1",
+            items: [{ id: "m1", label: "Model 1", efforts: ["low", "high"] }],
+          };
+        if (req.action === "git")
+          return { patch: "@@ -1 +1 @@\n-old\n+new" };
+        if (req.action === "chat_poll")
+          return {
+            generation: "g-p1b",
+            agent: "claude",
+            bound: true,
+            next_offset: 10,
+            items: [
+              { id: "unk", kind: "unknown_future_kind", text: "ignored" },
+              {
+                id: "md2",
+                kind: "assistant",
+                text:
+                  "Paragraph line 1\nParagraph line 2\n\n#### H4\n##### H5\n###### H6\n---\n- [ ] todo item\n- [x] **done** ~~old~~ _ital_ snake_case\n  - nested\n| A | B |\n| --- | --- |\n| 1 | 2 |\n```rust\nfn main() { let x = 42; }\n```",
+              },
+              {
+                id: "t1",
+                kind: "tool_call",
+                tool_name: "Edit",
+                file_path: "/work/a.rs",
+                text: "edited",
+              },
+            ],
+          };
+        return { sent: true };
+      },
+    });
+    p1b.ctx.saveDrafts = () => {
+      draftSaved++;
+    };
+    const skel = p1b.find("chat-skeleton");
+    assert.equal(skel.hidden, false, "skeleton shows before first poll settles");
+    await flush();
+    assert.equal(skel.hidden, true, "skeleton hides once items load");
+
+    const feedNodes = p1b.find("chat-feed").children;
+    assert(
+      !feedNodes.some((n) => n.className?.includes("unknown_future_kind")),
+      "unknown item kinds are skipped cleanly",
+    );
+    const md = p1b.find("chat-md"),
+      mdDesc = md.descendants();
+    assert(mdDesc.some((n) => n.tag === "p" && n.textContent === "Paragraph line 1 Paragraph line 2"));
+    assert(mdDesc.some((n) => n.tag === "h5" && n.textContent === "H4"));
+    assert(mdDesc.some((n) => n.tag === "h6" && n.textContent === "H5"));
+    assert(mdDesc.some((n) => n.tag === "hr" && n.className === "chat-hr"));
+    assert(mdDesc.some((n) => n.tag === "del" && n.textContent === "old"));
+    assert(mdDesc.some((n) => n.tag === "em" && n.textContent === "ital"));
+    assert(mdDesc.some((n) => n.className === "chat-task" && n.dataset.checked === "true"));
+    assert(mdDesc.some((n) => n.className === "chat-task" && n.dataset.checked === "false"));
+    assert(mdDesc.some((n) => n.className === "chat-table-wrap"), "tables use chat-table-wrap not chat-code");
+    const codeNode = mdDesc.find((n) => n.tag === "code" && n.textContent.includes("fn main()"));
+    assert.equal(codeNode.textContent, "fn main() { let x = 42; }");
+    assert(codeNode.descendants().some((n) => n.className === "tok-kw" && n.textContent === "fn"));
+    assert(codeNode.descendants().some((n) => n.className === "tok-num" && n.textContent === "42"));
+
+    // Diff sheet uses colored diff-added/diff-deleted/diff-hunk lines
+    p1b.button("Current diff").action();
+    await flush();
+    const sheetPre = p1b.sheets.at(-1).body.children[0];
+    assert(sheetPre.descendants().some((n) => n.className?.includes("diff-hunk")));
+    assert(sheetPre.descendants().some((n) => n.className?.includes("diff-deleted")));
+    assert(sheetPre.descendants().some((n) => n.className?.includes("diff-added")));
+
+    // Tab accepts slash autocomplete and Enter submits when suggestions closed
+    p1b.input("/");
+    await flush();
+    const tabEv = new Event("keydown", { cancelable: true });
+    tabEv.key = "Tab";
+    p1b.find("chat-input").dispatchEvent(tabEv);
+    assert(tabEv.defaultPrevented);
+    assert.equal(p1b.find("chat-input").value, "/compact ");
+    assert(draftSaved > 0);
+
+    // Streaming dots toggle on Working state
+    const dots = p1b.find("chat-streaming-dots");
+    assert.equal(dots.hidden, true);
+    p1b.state.sessions.get(7).state = "Working";
+    p1b.update();
+    assert.equal(dots.hidden, false);
+    p1b.state.sessions.get(7).state = "Waiting";
+    p1b.update();
+    assert.equal(dots.hidden, true);
+
+    const enterEv = new Event("keydown", { cancelable: true });
+    enterEv.key = "Enter";
+    p1b.find("chat-input").dispatchEvent(enterEv);
+    await flush();
+    assert(enterEv.defaultPrevented);
+    assert(p1b.calls.some((c) => c.action === "prompt" && c.text === "/compact "));
+
+    // Model picker renders inside modal <dialog class="chat-model-sheet">
+    let modalShown = false;
+    const dlg = p1b.find("chat-composer-box").descendants().find((n) => n.tag === "dialog");
+    p1b.buttons.find((b) => b.className === "composer-pill").action();
+    await flush();
+    const mountedDlg = p1b.find("chat-composer-suggestions").descendants().find((n) => n.tag === "dialog");
+    assert(mountedDlg && mountedDlg.className === "chat-model-sheet");
+    mountedDlg.showModal = () => { modalShown = true; mountedDlg.open = true; };
+    assert.equal(dlg, undefined);
+    assert.equal(mountedDlg.attrs["aria-modal"], "true");
+
+    p1b.dispose();
+    console.log("PASS Phase 1B: Markdown, highlighting, diff sheet, Tab/Enter submit, modal <dialog>, skeleton and streaming dots");
+  }
+
+  // Phase 2B: Queue/Steer on Working, 2s Stop cooldown, inline diffs, unread divider, rate-limit banner, live_prompt_reply cards.
+  {
+    let livePromptPayload = {
+      kind: "numbered_menu",
+      prompt: "Proceed with this plan?",
+      options: [
+        { number: 1, label: "Yes, approve plan", selected: true, checked: false },
+        { number: 2, label: "No, keep planning", selected: false, checked: false },
+      ],
+      cursor: 0,
+      checked: [],
+      is_plan_approval: true,
+      allows_other: false,
+    };
+    let rateLimited = true;
+    const routes = [];
+    let pollStep = 0;
+    let queuedPollData = null;
+    const p2b = fixture({
+      lang: "en",
+      capabilities: {
+        chat_tail: true,
+        chat_interrupt: true,
+        chat_composer: true,
+        composer_models: true,
+        prompt_steer: true,
+        live_prompt_reply: true,
+      },
+      handler: async (req) => {
+        if (req.action === "chat_composer") {
+          return {
+            agent: "claude",
+            supported: true,
+            model: "claude-opus-5-5",
+            rate_limited: rateLimited,
+            live_prompt: livePromptPayload,
+          };
+        }
+        if (req.action === "chat_poll") {
+          if (queuedPollData !== null) {
+            const d = queuedPollData;
+            queuedPollData = null;
+            return d;
+          }
+          pollStep++;
+          if (pollStep === 1) {
+            return {
+              generation: "g-2b",
+              agent: "claude",
+              bound: true,
+              page_start: 0,
+              next_offset: 100,
+              items: [
+                {
+                  id: "m1",
+                  kind: "user",
+                  text: "implement feature",
+                },
+                {
+                  id: "m2",
+                  kind: "tool_call",
+                  tool_name: "Edit",
+                  file_path: "src/lib.rs",
+                  text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                },
+                {
+                  id: "m3",
+                  kind: "permission",
+                  tool_name: "ExitPlanMode",
+                  text: "Proceed with this plan?",
+                },
+              ],
+            };
+          }
+          if (pollStep === 2) {
+            return {
+              generation: "g-2b",
+              agent: "claude",
+              bound: true,
+              page_start: 100,
+              next_offset: 200,
+              items: [
+                {
+                  id: "m4",
+                  kind: "assistant",
+                  text: "New unread reply",
+                },
+              ],
+            };
+          }
+          return {
+            generation: "g-2b",
+            agent: "claude",
+            bound: true,
+            page_start: 200,
+            next_offset: 200,
+            items: [],
+          };
+        }
+        if (req.action === "interrupt") return { interrupted: true };
+        return { sent: true };
+      },
+    });
+    p2b.ctx.go = (path) => routes.push(path);
+    await flush();
+
+    // WorkRun diff summary
+    const diffSummary = p2b.find("chat-run-diff-summary");
+    assert(diffSummary.textContent.includes("+1 -1"), "WorkRun header shows +1 -1 diff stats");
+
+    // Rate-limit banner navigates to /accounts on Switch account click
+    const rlBanner = p2b.find("chat-rate-limit-banner");
+    assert.equal(rlBanner.hidden, false);
+    p2b.button("Switch account").action();
+    await flush();
+    assert.equal(routes.at(-1), "/accounts");
+
+    // ExitPlanMode badge and numbered permission choice dispatch live_prompt_reply
+    const planBadge = p2b.find("chat-plan-badge");
+    assert.equal(planBadge.textContent, "Plan approval");
+    p2b.button("Yes, approve plan").action();
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) =>
+          c.action === "live_prompt_reply" &&
+          c.choice === 0 &&
+          c.expected_prompt === "Proceed with this plan?",
+      ),
+    );
+
+    // Queue + Steer + 2s Stop cooldown while Working
+    p2b.state.sessions.set(7, {
+      id: 7,
+      state: "Working",
+      state_since_unix_ns: "501",
+      cwd: "/work",
+    });
+    p2b.update();
+    await flush();
+    p2b.input("follow-up task");
+    const qBtn = p2b.button("Queue"),
+      sBtn = p2b.button("Steer"),
+      sendBtn = p2b.find("primary composer-send");
+    assert.equal(sendBtn.dataset.mode, "stop");
+    assert.equal(qBtn.hidden, false);
+    assert.equal(sBtn.hidden, false);
+
+    qBtn.action();
+    await flush();
+    assert.equal(p2b.find("chat-input").value, "");
+    assert.equal(p2b.find("chat-queued-strip").hidden, false);
+    assert.equal(p2b.find("chat-queued-strip").children.length, 1);
+
+    // Cmd+Enter while Working steers immediately without touching queue
+    p2b.input("steer now");
+    const cmdEnter = new Event("keydown", { cancelable: true });
+    cmdEnter.key = "Enter";
+    cmdEnter.metaKey = true;
+    p2b.find("chat-input").dispatchEvent(cmdEnter);
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) => c.action === "prompt" && c.text === "steer now" && c.mode === "steer",
+      ),
+    );
+
+    // Clicking Stop starts cooldown and disables Stop
+    sendBtn.dispatchEvent(new Event("click"));
+    await flush();
+    assert.equal(sendBtn.disabled, true);
+
+    // Leaving Working for Done auto-flushes queued item FIFO
+    p2b.state.sessions.set(7, {
+      id: 7,
+      state: "Done",
+      state_since_unix_ns: "502",
+      cwd: "/work",
+    });
+    p2b.update();
+    await flush();
+    assert(
+      p2b.calls.some((c) => c.action === "prompt" && c.text === "follow-up task" && !c.mode),
+    );
+    assert.equal(p2b.find("chat-queued-strip").hidden, true);
+
+    // Inline UnreadDivider appears only when new items arrive while scrolled up (!following)
+    const feed = p2b.find("chat-feed");
+    feed.clientHeight = 100;
+    Object.defineProperty(feed, "scrollHeight", { value: 1000, configurable: true });
+    feed.scrollTop = 200;
+    feed.dispatchEvent(new Event("scroll"));
+    feed.scrollTop = 40;
+    feed.dispatchEvent(new Event("scroll"));
+    delete feed.scrollHeight;
+    queuedPollData = {
+      generation: "g-2b",
+      agent: "claude",
+      bound: true,
+      page_start: 120,
+      next_offset: 180,
+      items: [{ id: "m-unread", kind: "assistant", text: "New unread reply" }],
+    };
+    p2b.update();
+    await flush();
+    assert(
+      feed.descendants().some((n) => n.className === "chat-unread-divider"),
+      "unread divider appears before new items received while scrolled up",
+    );
+    p2b.find("chat-jump-bottom").action();
+    await flush();
+    assert(!feed.descendants().some((n) => n.className === "chat-unread-divider"));
+
+    // Yes/No live permission prompt dispatches yes_no: true on Approve
+    livePromptPayload = {
+      kind: "yes_no",
+      prompt: "Deploy to production? (y/n)",
+    };
+    queuedPollData = {
+      generation: "g-2b",
+      agent: "claude",
+      bound: true,
+      page_start: 150,
+      next_offset: 200,
+      items: [
+        {
+          id: "perm-yn",
+          kind: "permission",
+          tool_name: "Bash",
+          text: "Deploy to production? (y/n)",
+        },
+      ],
+    };
+    p2b.update();
+    await flush();
+    p2b.button("Approve").action();
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) =>
+          c.action === "live_prompt_reply" &&
+          c.yes === true &&
+          c.expected_prompt === "Deploy to production? (y/n)",
+      ),
+    );
+
+    // Without live_prompt_reply capability, permission falls back to historical Confirm in Term card
+    const legacy = fixture({
+      capabilities: { chat_tail: true, chat_composer: true },
+      handler: async (req) => {
+        if (req.action === "chat_composer") {
+          return {
+            agent: "claude",
+            supported: true,
+            live_prompt: { kind: "yes_no", prompt: "Allow?" },
+          };
+        }
+        return {
+          generation: "g-legacy",
+          agent: "claude",
+          bound: true,
+          page_start: 0,
+          next_offset: 10,
+          items: [{ id: "p-old", kind: "permission", tool_name: "Bash", text: "Allow?" }],
+        };
+      },
+    });
+    await flush();
+    assert(legacy.button("Confirm in Term"));
+    assert(!legacy.buttons.some((b) => b.textContent === "Approve"));
+    legacy.dispose();
+
+    // Live Question with allows_other & Other option submits write-in via live_prompt_reply
+    livePromptPayload = {
+      kind: "numbered_menu",
+      prompt: "Pick deployment mode",
+      options: [
+        { number: 1, label: "Staging", selected: true, checked: false },
+        { number: 2, label: "Other", selected: false, checked: false },
+      ],
+      cursor: 0,
+      checked: [],
+      is_plan_approval: false,
+      allows_other: true,
+    };
+    queuedPollData = {
+      generation: "g-2b",
+      agent: "claude",
+      bound: true,
+      page_start: 200,
+      next_offset: 300,
+      items: [
+        {
+          id: "q1",
+          kind: "question",
+          title: "Deploy",
+          text: "Pick deployment mode",
+          options: [
+            { label: "Staging", description: "" },
+            { label: "Other", description: "" },
+          ],
+        },
+      ],
+    };
+    p2b.update();
+    await flush();
+    p2b.setQuestion({
+      identity: "q-other",
+      token: "tok-other",
+      title: "Pick deployment mode",
+      multiple: false,
+      enabled: true,
+      choices: [
+        { label: "Staging", selected: true },
+        { label: "Other", selected: false },
+      ],
+    });
+    await flush();
+    const qInput = p2b
+      .find("chat-question-options")
+      .parentElement.children.find((n) => n.tag === "input");
+    assert.equal(qInput.hidden, false);
+    qInput.value = "Canary 10%";
+    qInput.dispatchEvent(new Event("input"));
+    p2b.button("Send other").action();
+    await flush();
+    assert(
+      p2b.calls.some(
+        (c) =>
+          c.action === "live_prompt_reply" &&
+          c.choice === 1 &&
+          c.custom_text === "Canary 10%",
+      ),
+    );
+
+    p2b.dispose();
+    console.log("PASS Phase 2B: Queue/Steer, Stop cooldown, WorkRun diffs, unread divider, rate-limit banner, live_prompt_reply");
+  }
+
+  // Phase 3A: chat_push subscribe/unsubscribe and chat_delta/chat_stale dispatch.
+  {
+    let pollReply = {
+      generation: "g-3a",
+      agent: "claude",
+      bound: true,
+      page_start: 0,
+      next_offset: 100,
+      items: [{ id: "0:0", kind: "assistant", text: "initial tail" }],
+    };
+    const p3a = fixture({
+      lang: "en",
+      capabilities: {
+        chat_tail: true,
+        chat_push: true,
+        chat_composer: true,
+        live_prompt_reply: true,
+      },
+      handler: async (req) => {
+        if (req.action === "chat_composer") {
+          return { agent: "claude", supported: true, model: "claude-opus-5-5" };
+        }
+        return pollReply;
+      },
+    });
+    await flush();
+    assert(
+      p3a.calls.some(
+        (c) => c.action === "chat_subscribe" && c.session === 7 && c.offset === 100,
+      ),
+      "expected initial chat_subscribe after poll",
+    );
+    const pollsBefore = p3a.calls.filter((c) => c.action === "chat_poll").length;
+    const subsBefore = p3a.calls.filter((c) => c.action === "chat_subscribe").length;
+
+    p3a.M.chat.onPush({
+      push: "chat_delta",
+      session: 7,
+      data: {
+        generation: "g-3a",
+        agent: "claude",
+        bound: true,
+        page_start: 100,
+        next_offset: 160,
+        items: [{ id: "100:0", kind: "assistant", text: "pushed delta reply" }],
+      },
+    });
+    await flush();
+    assert.equal(p3a.entry.offset, 160);
+    assert(p3a.entry.items.some((i) => i.text === "pushed delta reply"));
+    assert.equal(p3a.calls.filter((c) => c.action === "chat_poll").length, pollsBefore);
+    assert.equal(p3a.calls.filter((c) => c.action === "chat_subscribe").length, subsBefore);
+
+    const statusCallsBefore = p3a.calls.filter((c) => c.action === "chat_composer").length;
+    p3a.M.chat.onPush({
+      push: "chat_delta",
+      session: 7,
+      data: {
+        generation: "g-3a",
+        agent: "claude",
+        bound: true,
+        page_start: 160,
+        next_offset: 200,
+        items: [{ id: "160:0", kind: "permission", tool_name: "Bash", text: "Allow?" }],
+      },
+    });
+    await flush();
+    assert(
+      p3a.calls.filter((c) => c.action === "chat_composer").length > statusCallsBefore,
+      "permission delta should trigger status refresh",
+    );
+
+    pollReply = {
+      generation: "g-3a",
+      agent: "claude",
+      bound: true,
+      page_start: 200,
+      next_offset: 240,
+      items: [{ id: "200:0", kind: "assistant", text: "stale fallback item" }],
+    };
+    p3a.M.chat.onPush({ push: "chat_stale", session: 7 });
+    await flush();
+    assert(p3a.calls.filter((c) => c.action === "chat_poll").length > pollsBefore);
+    assert(p3a.entry.items.some((i) => i.text === "stale fallback item"));
+
+    p3a.dispose();
+    await flush();
+    assert(
+      p3a.calls.some((c) => c.action === "chat_unsubscribe" && c.session === 7),
+      "dispose should unsubscribe chat push",
+    );
+    console.log("PASS Phase 3A: chat_subscribe/unsubscribe and chat_delta/chat_stale push client");
+  }
+
+  // Phase 3B: In-chat search bar, multi-photo attachments (<=4), and message actions <dialog>.
+  {
+    const p3b = fixture({
+      lang: "en",
+      capabilities: { chat_tail: true, chat_composer: true },
+      handler: async () => ({
+        generation: "g-3b",
+        agent: "claude",
+        bound: true,
+        page_start: 0,
+        next_offset: 50,
+        items: [
+          { id: "0:0", kind: "assistant", text: "alpha first finding" },
+          { id: "0:1", kind: "user", text: "alpha second turn" },
+          { id: "0:2", kind: "assistant", text: "gamma summary" },
+        ],
+      }),
+    });
+    await flush();
+
+    // 1. In-chat search bar toggles, counts, highlights, and navigates hits.
+    const searchBar = p3b.find("chat-search-bar");
+    assert.equal(searchBar.hidden, true);
+    p3b.find("icon-button composer-icon chat-search-toggle").action();
+    assert.equal(searchBar.hidden, false);
+    const searchInput = p3b.find("chat-search-input");
+    searchInput.value = "alpha";
+    searchInput.dispatchEvent(new Event("input"));
+    assert.equal(p3b.find("chat-search-count muted").textContent, "1 / 2");
+    assert.equal(
+      p3b.root.descendants().filter((n) => String(n.className || "").includes("chat-search-hit")).length,
+      2,
+    );
+    p3b.button("Next").action();
+    assert.equal(p3b.find("chat-search-count muted").textContent, "2 / 2");
+    p3b.button("Close").action();
+    assert.equal(searchBar.hidden, true);
+    assert.equal(
+      p3b.root.descendants().filter((n) => String(n.className || "").includes("chat-search-hit")).length,
+      0,
+    );
+
+    // 2. Multi-attachment (<= 4 photos) sends `photos`, rejects/caps 5th.
+    const picker = p3b.root
+      .descendants()
+      .find((n) => n.tag === "input" && n.type === "file");
+    assert.equal(picker.multiple, true);
+    let picSeq = 0;
+    p3b.prepare = async (_s, file) => ({
+      mime: "image/png",
+      data: `img-${++picSeq}-${file.name}`,
+    });
+    picker.files = [{ name: "a.png" }, { name: "b.png" }];
+    picker.dispatchEvent(new Event("change"));
+    await flush();
+    assert.equal(p3b.entry.photo.name, "a.png");
+    assert.equal(
+      p3b.root.descendants().filter((n) => n.className === "chat-attachment-chip").length,
+      2,
+    );
+    picker.files = [
+      { name: "c.png" },
+      { name: "d.png" },
+      { name: "e.png" },
+    ];
+    picker.dispatchEvent(new Event("change"));
+    await flush();
+    assert.equal(p3b.entry.attachments.length, 4);
+    assert(p3b.errors.some((e) => e.includes("Maximum 4 photos")));
+    p3b.input("send multi");
+    p3b.submit();
+    await flush();
+    const multiPrompt = p3b.calls.find(
+      (c) => c.action === "prompt" && c.text === "send multi",
+    );
+    assert(multiPrompt, "multi-photo prompt must submit");
+    assert.equal(multiPrompt.photos.length, 4);
+    assert.equal(multiPrompt.photo, undefined);
+    assert.equal(p3b.entry.photo, null);
+
+    // 3. Message actions <dialog> sheet quotes into composer and switches to Term.
+    const moreButtons = p3b.root
+      .descendants()
+      .filter((n) => n.className === "icon-button chat-msg-more");
+    assert(moreButtons.length >= 2);
+    moreButtons[0].action();
+    const sheet = p3b.find("chat-actions-sheet");
+    assert.equal(sheet.open, true);
+    p3b.button("Quote").action();
+    assert.equal(sheet.open, false);
+    assert.equal(p3b.find("chat-input").value, "> alpha first finding\n\n");
+
+    const termBefore = p3b.term;
+    moreButtons[0].action();
+    p3b.button("Jump to Term").action();
+    assert.equal(p3b.term, termBefore + 1);
+
+    p3b.dispose();
+    console.log("PASS Phase 3B: in-chat search, multi-attachment (<=4), and message actions <dialog>");
+  }
 }
 main().catch((error) => {
   console.error(error);

@@ -106,6 +106,11 @@ pub use gpui_base::{
     AxisExt, Edges, FocusTrapElement, InteractiveElementExt, LengthExt, Measure, OngoingScrollExt,
     Placement, Side, measure, measure_if,
 };
+// Krill modification: re-export window text selection primitives for Shell and chat views.
+pub use gpui_base::{
+    SelectableText, TextSelection, TextSelectionHandle, TextSelectionLayer,
+    TextSelectionRegistration, TextSelectionRun,
+};
 pub use gpui_component_macros::icon_named;
 pub use icon::*;
 pub use index_path::IndexPath;

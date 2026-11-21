@@ -596,6 +596,14 @@ impl std::fmt::Debug for Backend {
         f.debug_struct("Backend").finish_non_exhaustive()
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptMode {
+    #[default]
+    Normal,
+    Steer,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
@@ -639,6 +647,22 @@ enum Action {
         text: String,
         #[serde(default)]
         photo: Option<PreparedPhoto>,
+        #[serde(default)]
+        photos: Vec<PreparedPhoto>,
+        #[serde(default)]
+        mode: PromptMode,
+    },
+    LivePromptReply {
+        session: u64,
+        expected_prompt: String,
+        #[serde(default)]
+        yes: Option<bool>,
+        #[serde(default)]
+        choice: Option<usize>,
+        #[serde(default)]
+        multi_selected: Option<Vec<usize>>,
+        #[serde(default)]
+        custom_text: Option<String>,
     },
     Interrupt {
         session: u64,
@@ -883,6 +907,14 @@ enum Action {
     BotsConnectorsStatus {
         #[serde(default)]
         bot_id: Option<String>,
+    },
+    ChatSubscribe {
+        session: u64,
+        #[serde(default)]
+        offset: u64,
+    },
+    ChatUnsubscribe {
+        session: u64,
     },
     #[serde(rename = "bots.groups.list")]
     BotsGroupsList {
@@ -1340,29 +1372,64 @@ impl Backend {
                 session,
                 text,
                 photo,
+                photos,
+                mode,
             } => {
                 if text.len() >= krill_proto::input::MAX_INPUT {
                     return Err(invalid());
                 }
-                // Prepare the image before sending anything, then submit image and text in order.
-                let path = photo
-                    .map(|photo| save_photo(&photo.mime, &photo.data))
-                    .transpose()?;
-                let combined = path.as_ref().map_or_else(
-                    || text.clone(),
-                    |path| {
-                        format!(
-                            "{} {}",
-                            krill_proto::agent::hooks::shell_quote(&path.to_string_lossy()),
-                            text
-                        )
-                    },
-                );
-                let result = self.send_prompt(session, &combined);
-                if result.is_err()
-                    && let Some(path) = path
+                let all_photos: Vec<PreparedPhoto> = photo.into_iter().chain(photos).collect();
+                if all_photos.len() > 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Maximum 4 photos per message.",
+                    ));
+                }
+                if let Some(reg) = self.registry.upgrade()
+                    && let Some(status) = reg.mobile_session_status(SessionId(session))
+                    && matches!(
+                        status.state,
+                        control::AgentState::Waiting | control::AgentState::Blocked
+                    )
                 {
-                    fs::remove_file(path).ok();
+                    let has_live_prompt =
+                        reg.session_capture(SessionId(session))
+                            .is_some_and(|screen| {
+                                krill_proto::screen::prompt::detect(&screen.rows).is_some()
+                            });
+                    if mode == PromptMode::Steer || has_live_prompt {
+                        return Err(io::Error::other(
+                            "Wait for the active prompt before sending a new message",
+                        ));
+                    }
+                }
+                // Prepare images before sending anything, then submit image paths and text in order.
+                let mut saved_paths = Vec::with_capacity(all_photos.len());
+                for item in all_photos {
+                    match save_photo(&item.mime, &item.data) {
+                        Ok(path) => saved_paths.push(path),
+                        Err(err) => {
+                            for saved in saved_paths {
+                                fs::remove_file(saved).ok();
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                let combined = if saved_paths.is_empty() {
+                    text
+                } else {
+                    let quoted: Vec<String> = saved_paths
+                        .iter()
+                        .map(|path| krill_proto::agent::hooks::shell_quote(&path.to_string_lossy()))
+                        .collect();
+                    format!("{} {text}", quoted.join(" "))
+                };
+                let result = self.send_prompt(session, &combined);
+                if result.is_err() {
+                    for path in saved_paths {
+                        fs::remove_file(path).ok();
+                    }
                 }
                 result?;
                 Ok(json!({"sent":true}))
@@ -1538,14 +1605,35 @@ impl Backend {
             Action::MentionFiles { session, query } => {
                 mention_files::load(&self.cwd(session)?, &query)
             }
-            Action::ChatComposer { session } => self.composer_status(session),
+            Action::LivePromptReply {
+                session,
+                expected_prompt,
+                yes,
+                choice,
+                multi_selected,
+                custom_text,
+            } => self.live_prompt_reply(
+                session,
+                &expected_prompt,
+                yes,
+                choice,
+                multi_selected,
+                custom_text,
+            ),
+            Action::ChatComposer { session } => self.chat_composer_status(session),
             Action::ComposerModels { session } => self.composer_models(session),
             Action::SetModel {
                 session,
                 model,
                 effort,
-            } => self.set_composer_model(session, &model, effort.as_deref()),
-            Action::SetEffort { session, effort } => self.set_composer_effort(session, &effort),
+            } => {
+                composer_status::invalidate_all();
+                self.set_composer_model(session, &model, effort.as_deref())
+            }
+            Action::SetEffort { session, effort } => {
+                composer_status::invalidate_all();
+                self.set_composer_effort(session, &effort)
+            }
             Action::DropPut {
                 upload,
                 name,
@@ -2071,6 +2159,23 @@ impl Backend {
                     _ => Err(invalid()),
                 }
             }
+            Action::ChatSubscribe { session, offset } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                let snapshot = registry.chat_poll(SessionId(session), offset);
+                let watch_path = (!snapshot.transcript_path.is_empty())
+                    .then(|| PathBuf::from(&snapshot.transcript_path));
+                let push = feed::subscribe_chat(session, offset, watch_path).unwrap_or(false);
+                Ok(json!({
+                    "subscribed": true,
+                    "session": session,
+                    "offset": offset,
+                    "push": push,
+                }))
+            }
+            Action::ChatUnsubscribe { session } => {
+                feed::unsubscribe_chat(session);
+                Ok(json!({"unsubscribed": true}))
+            }
             Action::BotsGroupsList { limit, cursor } => {
                 let (offset, limit) = parse_bot_page(limit, cursor.as_deref())?;
                 if self.bots_inactive()? {
@@ -2562,6 +2667,107 @@ impl Backend {
             Duration::from_millis(60),
         )
     }
+
+    fn chat_composer_status(&self, session: u64) -> io::Result<Value> {
+        let mut value = self.composer_status(session)?;
+        if let Some(registry) = self.registry.upgrade()
+            && let Some(obj) = value.as_object_mut()
+        {
+            let id = SessionId(session);
+            let rate_limited = registry.agent_control().is_rate_limited(id);
+            obj.insert("rate_limited".into(), Value::Bool(rate_limited));
+            let live_prompt = registry
+                .mobile_session_status(id)
+                .filter(|status| {
+                    matches!(
+                        status.state,
+                        control::AgentState::Waiting | control::AgentState::Blocked
+                    )
+                })
+                .and_then(|_| registry.session_capture(id))
+                .and_then(|screen| krill_proto::screen::prompt::detect(&screen.rows))
+                .and_then(|prompt| serde_json::to_value(prompt).ok());
+            obj.insert("live_prompt".into(), live_prompt.unwrap_or(Value::Null));
+        }
+        Ok(value)
+    }
+
+    fn live_prompt_reply(
+        &self,
+        session: u64,
+        expected_prompt: &str,
+        yes: Option<bool>,
+        choice: Option<usize>,
+        multi_selected: Option<Vec<usize>>,
+        custom_text: Option<String>,
+    ) -> io::Result<Value> {
+        let expected = expected_prompt.trim();
+        if expected.chars().count() < 3 || expected.len() > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Expected prompt text is required.",
+            ));
+        }
+        let registry = self.registry.upgrade().ok_or_else(|| {
+            io::Error::other("Confirm in Term — live session verification is unavailable.")
+        })?;
+        let id = SessionId(session);
+        let status = registry
+            .mobile_session_status(id)
+            .ok_or_else(|| io::Error::other("Session is no longer active."))?;
+        if status.state == control::AgentState::Exited
+            || registry.agent_control().account_binding_retiring(id)
+        {
+            return Err(io::Error::other("Session is no longer active."));
+        }
+        let screen = registry
+            .session_capture(id)
+            .ok_or_else(|| io::Error::other("Live terminal screen is unavailable."))?;
+        let waiting_or_blocked = matches!(
+            status.state,
+            control::AgentState::Waiting | control::AgentState::Blocked
+        );
+        if !waiting_or_blocked
+            && (expected.chars().count() < 8
+                || krill_proto::screen::prompt::detect(&screen.rows).is_none())
+        {
+            return Err(io::Error::other(
+                "Wait for an active prompt before replying.",
+            ));
+        }
+        let reply = if let Some(text) = custom_text {
+            let option_index = match choice {
+                Some(idx) => idx,
+                None => match krill_proto::screen::prompt::detect(&screen.rows) {
+                    Some(krill_proto::screen::prompt::PromptKind::NumberedMenu {
+                        options, ..
+                    }) => options.iter().position(|o| o.is_other).ok_or_else(|| {
+                        io::Error::other("No custom input option is visible on screen.")
+                    })?,
+                    _ => {
+                        return Err(io::Error::other(
+                            "No custom input option is visible on screen.",
+                        ));
+                    }
+                },
+            };
+            krill_proto::screen::prompt::PromptReply::Other { option_index, text }
+        } else if let Some(yes) = yes {
+            krill_proto::screen::prompt::PromptReply::YesNo(yes)
+        } else if let Some(selected) = multi_selected {
+            krill_proto::screen::prompt::PromptReply::MultiSelect(selected)
+        } else if let Some(idx) = choice {
+            krill_proto::screen::prompt::PromptReply::Choice(idx)
+        } else {
+            return Err(invalid());
+        };
+        let bracketed = registry.session_bracketed_paste(id);
+        let steps =
+            krill_proto::screen::prompt::verify_and_plan(&screen.rows, expected, &reply, bracketed)
+                .map_err(|_| io::Error::other("Live screen prompt changed; confirm in Term."))?;
+        self.input_paced(session, &steps, Duration::from_millis(40))?;
+        Ok(json!({"sent":true}))
+    }
     fn wire(&self) -> io::Result<Wire> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         let hello = self.hello.clone();
@@ -2590,17 +2796,44 @@ impl Backend {
         std::mem::swap(&mut wire.socket, &mut socket);
         Ok(wire)
     }
+    pub(super) fn poll_chat_for_feed(
+        &self,
+        session: u64,
+        offset: u64,
+    ) -> io::Result<feed::ChatFeedPoll> {
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let snapshot = registry.chat_poll(SessionId(session), offset);
+        let next_offset = snapshot.next_offset;
+        let watch_path = (!snapshot.transcript_path.is_empty())
+            .then(|| PathBuf::from(&snapshot.transcript_path));
+        if !snapshot.reset && snapshot.items.is_empty() && next_offset == offset {
+            return Ok(feed::ChatFeedPoll {
+                delta: None,
+                next_offset,
+                watch_path,
+            });
+        }
+        let delta = chat_page_value(snapshot, offset)?;
+        Ok(feed::ChatFeedPoll {
+            delta: Some(delta),
+            next_offset,
+            watch_path,
+        })
+    }
     fn control(&self, request: &Request) -> io::Result<Reply> {
-        let mut wire = self.wire()?;
-        wire.socket.write_all(&request.encode()?)?;
-        let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-        Reply::decode(kind, &body).map_err(Into::into)
+        Ok(self
+            .registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .handle_control_mobile(request.clone()))
     }
     fn accounts(&self, request: &UsageRequest) -> io::Result<krill_proto::usage::AccountsSnapshot> {
-        let mut wire = self.wire()?;
-        wire.socket.write_all(&request.encode()?)?;
-        let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-        match UsageReply::decode(kind, &body)? {
+        match self
+            .registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .handle_usage_mobile(request.clone())
+        {
             UsageReply::Accounts(data) => Ok(data),
             UsageReply::Failed(e) => Err(io::Error::other(e.to_string())),
             _ => Err(invalid()),
@@ -2990,7 +3223,7 @@ impl Backend {
         let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "bots":self.snapshot_bots_summary()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value});
         bound_snapshot_payload(&mut data);
@@ -6334,6 +6567,458 @@ mod revision_tests {
         drop(backend);
         drop(registry);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_prompt_reply_and_steer_mode_validation_contracts() {
+        let steer: Action = serde_json::from_str(
+            r#"{"action":"prompt","session":7,"text":"focus","mode":"steer"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            steer,
+            Action::Prompt {
+                session: 7,
+                mode: PromptMode::Steer,
+                ..
+            }
+        ));
+
+        let reply: Action = serde_json::from_str(
+            r#"{"action":"live_prompt_reply","session":7,"expected_prompt":"Deploy target","choice":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reply,
+            Action::LivePromptReply {
+                session: 7,
+                choice: Some(1),
+                ..
+            }
+        ));
+
+        let backend = Backend::new(
+            Weak::new(),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let res: Value = serde_json::from_str(&backend.request(
+            r#"{"action":"live_prompt_reply","session":7,"expected_prompt":"Deploy","choice":0}"#,
+        ))
+        .unwrap();
+        assert_eq!(res["ok"], false);
+        assert!(
+            res["error"].as_str().unwrap().contains("Confirm in Term"),
+            "{res}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_composer_and_live_prompt_reply_verify_real_pty_screen_and_guard_prompt() {
+        use crate::holder::{Holder, link::Link};
+        use crate::os::{AsFd as _, OwnedFd};
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+        use krill_proto::hook::{EventId, HookEvent, Input};
+
+        struct Cleanup {
+            child: Option<std::process::Child>,
+            dir: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(child) = self.child.as_mut() {
+                    child.kill().ok();
+                    child.wait().ok();
+                }
+                fs::remove_dir_all(&self.dir).ok();
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-live-prompt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let mut cleanup = Cleanup {
+            child: None,
+            dir: dir.clone(),
+        };
+        let state_dir = dir.join("state");
+        let repo_dir = dir.join("repo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&repo_dir).unwrap();
+        let canonical_repo = fs::canonicalize(&repo_dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&canonical_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"repo\"\nname = \"Repo\"\npath = {:?}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&canonical_repo)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        cleanup.child = Some(child);
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let registry = Arc::new(Registry::new(Some((holder, vec![])), Some(&state_dir)));
+        let reader_reg = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || reader_reg.run_holder(link));
+        let holder_worker = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected Spawn");
+            };
+            let open_pty = rustix_openpty::openpty(None, None).unwrap();
+            let mut mode = rustix::termios::tcgetattr(&open_pty.user).unwrap();
+            mode.make_raw();
+            rustix::termios::tcsetattr(
+                &open_pty.user,
+                rustix::termios::OptionalActions::Now,
+                &mode,
+            )
+            .unwrap();
+            rustix::fs::fcntl_setfl(
+                &open_pty.user,
+                rustix::fs::fcntl_getfl(&open_pty.user).unwrap() | rustix::fs::OFlags::NONBLOCK,
+            )
+            .unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned {
+                        req,
+                        id,
+                        pid: child_pid,
+                    }
+                    .encode()
+                    .unwrap(),
+                    &[open_pty.controller.as_fd()],
+                )
+                .unwrap();
+            let pty = fs::File::from(open_pty.user);
+            (holder_link, open_pty.controller, pty)
+        });
+
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let repo_key = hex(canonical_repo.as_os_str().as_bytes());
+        let create_reply: Value = serde_json::from_str(
+            &backend
+                .request(&json!({"action": "create_terminal", "workspace": repo_key}).to_string()),
+        )
+        .unwrap();
+        let (holder_link, master, mut pty) = holder_worker.join().unwrap();
+        drop(master);
+
+        let session_id = create_reply["data"]["session"]
+            .as_u64()
+            .expect("session id");
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["data"]["capabilities"]["live_prompt_reply"], true);
+        assert_eq!(snap["data"]["capabilities"]["prompt_steer"], true);
+
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 1_000,
+                    },
+                    agent: "claude".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"PermissionRequest","tool_name":"Bash"}"#
+                        .to_vec(),
+                },
+            )
+            .unwrap();
+
+        pty.write_all(b"Allow Bash: cargo check?\r\n\xe2\x9d\xaf 1. Yes\r\n  2. No\r\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut live_prompt_seen = false;
+        while Instant::now() < deadline {
+            if let Some(screen) = registry.session_capture(SessionId(session_id))
+                && krill_proto::screen::prompt::detect(&screen.rows).is_some()
+            {
+                live_prompt_seen = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(live_prompt_seen, "PTY menu did not reach screen buffer");
+
+        registry
+            .agent_control()
+            .mark_rate_limited(SessionId(session_id));
+        let composer: Value = serde_json::from_str(
+            &backend.request(&json!({"action":"chat_composer","session":session_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(composer["ok"], true, "{composer}");
+        assert_eq!(composer["data"]["rate_limited"], true);
+        assert_eq!(composer["data"]["live_prompt"]["kind"], "numbered_menu");
+        assert_eq!(composer["data"]["live_prompt"]["options"][1]["label"], "No");
+
+        // Sending a chat prompt while Waiting/Blocked must fail closed.
+        let blocked: Value = serde_json::from_str(&backend.request(
+            &json!({"action":"prompt","session":session_id,"text":"new prompt"}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(blocked["ok"], false);
+        assert!(
+            blocked["error"].as_str().unwrap().contains("active prompt"),
+            "{blocked}"
+        );
+
+        // Mismatched expected_prompt fails closed without writing to PTY.
+        let mismatch: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "live_prompt_reply",
+                    "session": session_id,
+                    "expected_prompt": "something else entirely",
+                    "choice": 1
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(mismatch["ok"], false);
+        let mut pty_buf = [0u8; 64];
+        assert_eq!(
+            pty.read(&mut pty_buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        // Matching expected_prompt writes Down Arrow + CR to PTY.
+        let matched: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "live_prompt_reply",
+                    "session": session_id,
+                    "expected_prompt": "Allow Bash: cargo check?",
+                    "choice": 1
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(matched["ok"], true, "{matched}");
+        let mut sent = Vec::new();
+        let read_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < read_deadline {
+            match pty.read(&mut pty_buf) {
+                Ok(n) if n > 0 => sent.extend_from_slice(&pty_buf[..n]),
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !sent.is_empty() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("unexpected PTY read error: {e}"),
+            }
+        }
+        assert_eq!(sent, b"\x1b[B\r");
+
+        // Transition to Working -> steer prompt succeeds.
+        registry
+            .record_test_hook(
+                SessionId(session_id),
+                &HookEvent {
+                    id: EventId {
+                        pid: child_pid,
+                        unix_ns: 2_000,
+                    },
+                    agent: "claude".into(),
+                    ppid: child_pid,
+                    input: Input::Complete,
+                    payload: br#"{"hook_event_name":"UserPromptSubmit"}"#.to_vec(),
+                },
+            )
+            .unwrap();
+        let steer_res: Value = serde_json::from_str(
+            &backend.request(
+                &json!({"action":"prompt","session":session_id,"text":"keep tests minimal","mode":"steer"})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(steer_res["ok"], true, "{steer_res}");
+
+        let inflight_deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::session::lock(&backend.git_inflight).is_empty()
+            && Instant::now() < inflight_deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(holder_link);
+        reader.join().ok();
+        drop(backend);
+        drop(registry);
+    }
+
+    #[test]
+    fn live_prompt_reply_action_deserializes_exact_client_payloads() {
+        let yes_no: Action = serde_json::from_str(
+            &json!({
+                "action": "live_prompt_reply",
+                "session": 1,
+                "expected_prompt": "Allow?",
+                "yes": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            yes_no,
+            Action::LivePromptReply {
+                session: 1,
+                yes: Some(true),
+                choice: None,
+                custom_text: None,
+                ..
+            }
+        ));
+
+        let other: Action = serde_json::from_str(
+            &json!({
+                "action": "live_prompt_reply",
+                "session": 1,
+                "expected_prompt": "Pick deployment mode",
+                "choice": 1,
+                "custom_text": "Canary 10%"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            other,
+            Action::LivePromptReply {
+                session: 1,
+                yes: None,
+                choice: Some(1),
+                custom_text: Some(ref text),
+                ..
+            } if text == "Canary 10%"
+        ));
+
+        let sub: Action = serde_json::from_str(
+            &json!({"action": "chat_subscribe", "session": 42, "offset": 128}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            sub,
+            Action::ChatSubscribe {
+                session: 42,
+                offset: 128
+            }
+        ));
+
+        let unsub: Action =
+            serde_json::from_str(&json!({"action": "chat_unsubscribe", "session": 42}).to_string())
+                .unwrap();
+        assert!(matches!(unsub, Action::ChatUnsubscribe { session: 42 }));
+    }
+
+    #[test]
+    fn prompt_accepts_up_to_four_photos_and_rejects_five() {
+        let one = |i: u8| {
+            json!({
+                "mime": "image/png",
+                "data": hex(&[i]),
+            })
+        };
+        let valid: Action = serde_json::from_str(
+            &json!({
+                "action": "prompt",
+                "session": 1,
+                "text": "check screenshots",
+                "photos": [one(1), one(2), one(3), one(4)]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            valid,
+            Action::Prompt {
+                session: 1,
+                photo: None,
+                ref photos,
+                ..
+            } if photos.len() == 4
+        ));
+
+        let registry = Arc::new(Registry::new(None, None));
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let too_many: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "prompt",
+                    "session": 1,
+                    "text": "too many",
+                    "photos": [one(1), one(2), one(3), one(4), one(5)]
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(too_many["ok"], false);
+        assert!(
+            too_many["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("Maximum 4 photos"))
+        );
     }
 
     #[test]

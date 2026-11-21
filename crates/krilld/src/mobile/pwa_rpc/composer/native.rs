@@ -212,20 +212,36 @@ impl Adapter for Codex {
     ) {
         let supported = status.get("supported").cloned().unwrap_or(false.into());
         set(status, "effort_supported", supported);
-        let Ok(tap) = live.tap() else {
+        let Some(screen) = live.screen() else {
             return;
         };
-        let (screen, _, _) = tap.capture();
-        if idle(&screen) {
-            let banner = banner_model(catalog, &screen);
-            if let Some(model) = observed_model(catalog, &screen)
-                .or_else(|| banner.as_ref().map(|(id, _)| id.clone()))
-            {
-                observe_live_model(status, &model);
-            }
-            if let Some(effort) = effort(&screen).or_else(|| banner.and_then(|(_, e)| e)) {
-                set(status, "effort", effort.into());
-            }
+        observe_screen_into(catalog, &screen, status);
+    }
+}
+
+fn observe_screen_into(catalog: &Value, screen: &Screen, status: &mut Value) {
+    let banner = verified(screen)
+        .then(|| banner_model(catalog, screen))
+        .flatten();
+    if idle(screen) {
+        if let Some(model) =
+            observed_model(catalog, screen).or_else(|| banner.as_ref().map(|(id, _)| id.clone()))
+        {
+            observe_live_model(status, &model);
+        }
+        if let Some(effort) = effort(screen).or_else(|| banner.and_then(|(_, e)| e)) {
+            set(status, "effort", effort.into());
+        }
+    } else if verified(screen) {
+        if status.get("model").and_then(Value::as_str).is_none()
+            && let Some((id, _)) = banner.as_ref()
+        {
+            observe_live_model(status, id);
+        }
+        if status.get("effort").and_then(Value::as_str).is_none()
+            && let Some((_, Some(effort))) = banner
+        {
+            set(status, "effort", effort.into());
         }
     }
 }
@@ -795,5 +811,40 @@ mod tests {
             banner_model(&catalog, &s),
             Some(("gpt-5.4".to_owned(), Some("high".to_owned())))
         );
+    }
+    #[test]
+    fn waiting_screen_observation_populates_missing_banner_without_overwriting() {
+        let catalog = serde_json::json!({
+            "items": [
+                {"id": "gpt-5.4", "label": "GPT-5.4"},
+                {"id": "gpt-5.4-mini", "label": "GPT-5.4-Mini"}
+            ]
+        });
+        let prompt_screen = composer_below(&[
+            "╭──────────────────────────────────╮",
+            "│ >_ OpenAI Codex (v0.166.0)       │",
+            "│ model:     gpt-5.4 high /model   │",
+            "╰──────────────────────────────────╯",
+            "Approve running cargo test?",
+        ]);
+        let mut status = serde_json::json!({
+            "agent": "codex",
+            "supported": true,
+            "model": null,
+            "effort": null
+        });
+        observe_screen_into(&catalog, &prompt_screen, &mut status);
+        assert_eq!(status["model"], "gpt-5.4");
+        assert_eq!(status["effort"], "high");
+
+        let mut existing = serde_json::json!({
+            "agent": "codex",
+            "supported": true,
+            "model": "gpt-5.4-mini",
+            "effort": "low"
+        });
+        observe_screen_into(&catalog, &prompt_screen, &mut existing);
+        assert_eq!(existing["model"], "gpt-5.4-mini");
+        assert_eq!(existing["effort"], "low");
     }
 }
