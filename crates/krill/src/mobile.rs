@@ -33,32 +33,20 @@ enum Command {
 }
 /// `--address` 값 위치를 제외하고 도움말 플래그가 있으면 true.
 /// `pair --address --help`의 `--help`는 주소 값으로 보고 도움말로 오인하지 않는다.
-/// 도움말 판정: 첫 토큰(`pair --help`의 서브커맨드 자리) 또는 서브커맨드 직후만 본다.
-/// `revoke <device_id>` 자리의 베어 `help`는 기기 ID가 아니라 도움말로 보는 것이 친절하므로
-/// 첫 토큰 베어 `help`는 허용하되, ID 자리 베어 `help`는 도움말로 본다. `--address` 값은 건너뛴다.
+/// 베어 `help`는 첫 토큰일 때만 허용한다(`revoke help`처럼 기기 ID 자리의 `help`는 제외).
 fn has_help_flag(args: &[OsString]) -> bool {
-    let mut skip_next = false;
-    let mut pos = 0;
-    for v in args {
-        if skip_next {
-            skip_next = false;
-            pos += 1;
+    let mut it = args.iter().enumerate();
+    while let Some((pos, v)) = it.next() {
+        let Some(s) = v.to_str() else {
             continue;
-        }
-        let s = v.to_str().unwrap_or("");
+        };
         if s == "--address" {
-            skip_next = true;
-            pos += 1;
+            let _ = it.next();
             continue;
         }
-        // pos 0: 서브커맨드 자리. pos 1: 서브커맨드 직후(`-h`/`--help`만).
-        if pos == 0 && matches!(s, "-h" | "--help" | "help") {
+        if matches!(s, "-h" | "--help") || (pos == 0 && s == "help") {
             return true;
         }
-        if pos == 1 && matches!(s, "-h" | "--help") {
-            return true;
-        }
-        pos += 1;
     }
     false
 }
@@ -434,6 +422,18 @@ mod tests {
             parse(&[OsString::from("--help")]),
             Ok(Command::Help)
         ));
+        // Help flags after subcommand options must still display help and exit 0.
+        for sub_args in [
+            vec!["pair", "--tunnel", "--help"],
+            vec!["devices", "--json", "-h"],
+            vec!["revoke", "phone-1", "--help"],
+            vec!["serve", "--tunnel", "-h"],
+            vec!["login", "--json", "--help"],
+            vec!["pair", "--address", "--help", "--help"],
+        ] {
+            assert_eq!(run(&args(&sub_args)), ExitCode::SUCCESS, "{sub_args:?}");
+        }
+        assert!(!has_help_flag(&args(&["revoke", "help"])));
     }
 
     #[test]
