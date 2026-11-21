@@ -1713,6 +1713,13 @@ impl Shell {
                         this.mark_chat_pending_copied(copy_key.clone(), pending_id, cx);
                     })),
                 )
+        } else if matches!(pending.status, super::PendingStatus::Queued) {
+            div().w_full().flex().items_center().justify_end().child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(palette.muted_foreground)
+                    .child(ctext::PENDING_QUEUED.get()),
+            )
         } else {
             div().w_full().flex().items_center().justify_end().child(
                 div()
@@ -1837,7 +1844,7 @@ impl Shell {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             for item in pending_slice {
                 item.id.hash(&mut hasher);
-                matches!(item.status, super::PendingStatus::ReviewRequired).hash(&mut hasher);
+                std::mem::discriminant(&item.status).hash(&mut hasher);
                 let copied = self
                     .chat
                     .copied_pending

@@ -187,3 +187,25 @@ fn unknown_echo_never_submits_and_releases_input_gate() {
     drop(user);
     session.wait().expect("PTY fixture operation");
 }
+
+#[cfg(unix)]
+#[test]
+fn guarded_enter_respects_screen_predicate_and_writes_single_cr() {
+    let (session, mut user) = fixture();
+    let tap = session.tap();
+    assert!(!guarded_enter(&tap, |_| false).expect("guarded_enter predicate rejection"));
+    let mut b = [0; 64];
+    assert_eq!(
+        user.read(&mut b)
+            .expect_err("write must be rejected when predicate is false")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(
+        guarded_enter(&tap, |s| text(s).contains("EMPTY"))
+            .expect("guarded_enter predicate acceptance")
+    );
+    assert_eq!(read_until(&mut user, 1), b"\r");
+    drop(user);
+    session.wait().expect("PTY fixture operation");
+}

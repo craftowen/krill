@@ -813,6 +813,7 @@
       entry.draftVersion = (entry.draftVersion || 0) + 1;
       drafts.set(sessionId, input.value);
       sizeInput();
+      syncActionButtons();
       closeSuggestions();
       input.focus?.();
       return true;
@@ -1073,6 +1074,7 @@
         ? drafts.set(sessionId, input.value)
         : drafts.delete(sessionId);
       sizeInput();
+      syncActionButtons();
       suggest();
     });
     input.addEventListener("change", syncDraft);
@@ -1120,6 +1122,13 @@
       "icon-button composer-icon",
       "plus",
     );
+    const stopBtn = el("button", undefined, "secondary composer-stop");
+    stopBtn.type = "button";
+    stopBtn.hidden = true;
+    stopBtn.setAttribute("aria-label", t("Stop"));
+    const stopGlyph = ctx.icon ? svgIcon("stop") : null;
+    if (stopGlyph) stopBtn.append(stopGlyph);
+    else stopBtn.textContent = t("Stop");
     const sendBtn = el("button", undefined, "primary composer-send");
     sendBtn.dataset.mode = "send";
     sendBtn.type = "submit";
@@ -1226,7 +1235,7 @@
     choiceList.setAttribute("aria-label", t("Commands, skills and files"));
     const box = el("div", undefined, "chat-composer-box");
     leading.append(attachBtn, modelBtn, statusLine);
-    statusRow.append(leading, contextMeter, sendBtn);
+    statusRow.append(leading, contextMeter, stopBtn, sendBtn);
     box.append(suggestions, attachment, input, statusRow);
     composer.append(box, photoPicker);
     // Like Orca, the send tap takes focus so the IME commits the last syllable first.
@@ -1679,6 +1688,7 @@
         ? drafts.set(sessionId, input.value)
         : drafts.delete(sessionId);
       sizeInput();
+      syncActionButtons();
       chooseModel();
     }
     async function chooseModel() {
@@ -1741,18 +1751,22 @@
                   (m) => Array.isArray(m.efforts) && m.efforts.length,
                 )),
           ),
-          activeModelId = data?.current || status?.model;
+          activeModelId = data?.current || status?.model,
+          hasCurrent = Boolean(
+            data?.current && models.some((m) => m.id === data.current),
+          );
         const items = models.map((item) => {
-          const isCurrent =
-              item.id === data.current ||
-              matchesModel(agent, item.id, status?.model),
+          const isCurrent = hasCurrent
+              ? item.id === data.current
+              : matchesModel(agent, item.id, status?.model),
+            matchesStatus = matchesModel(agent, item.id, status?.model),
             label = t(item.label || item.name || item.id);
           return {
             id: item.id,
             group: "models",
             current: isCurrent,
             label:
-              isCurrent && agent === "claude" && status?.model
+              isCurrent && matchesStatus && agent === "claude" && status?.model
                 ? fullModel(status.model)
                 : label,
             efforts: effortSupported
@@ -1841,14 +1855,17 @@
           return;
         discovery.clear();
         if (result?.applied === true) {
+          entry.modelChoices = null;
           const id =
               typeof result.model === "string" ? result.model : choice?.id,
             nextEffort =
-              result.effort ||
-              effort ||
-              entry.model?.effort ||
-              entry.composerStatus?.effort ||
-              null;
+              result.effort === null
+                ? null
+                : result.effort ||
+                  effort ||
+                  entry.model?.effort ||
+                  entry.composerStatus?.effort ||
+                  null;
           if (id)
             entry.model = {
               agent: chatAgent(),
@@ -1859,12 +1876,30 @@
               statusBefore: entry.composerStatus?.model,
               statusEffortBefore: entry.composerStatus?.effort,
             };
-          else if (result.effort && entry.model?.scope === context)
+          else if (result.effort && entry.model?.scope === context) {
+            entry.model.statusEffortBefore = entry.composerStatus?.effort;
             entry.model.effort = result.effort;
+          } else if (
+            result.effort &&
+            entry.composerStatus &&
+            (entry.composerStatus.model || entry.composerStatus.model_label)
+          )
+            entry.model = {
+              agent: chatAgent(),
+              scope: context,
+              id: entry.composerStatus.model || "",
+              label:
+                entry.composerStatus.model_label ||
+                entry.composerStatus.model ||
+                "",
+              effort: result.effort,
+              statusBefore: entry.composerStatus.model,
+              statusEffortBefore: entry.composerStatus.effort,
+            };
           entry.composerStatusAt = 0;
           entry.composerProbes = 0;
-          if (result.effort && entry.composerStatus)
-            entry.composerStatus.effort = result.effort;
+          if (entry.composerStatus && (result.effort !== undefined || effort))
+            entry.composerStatus.effort = nextEffort;
           clearTimeout(appliedTimer);
           modelBtn.dataset.applied = "true";
           appliedTimer = setTimeout(() => {
@@ -1882,8 +1917,18 @@
           entry.modelPending === operation &&
           scope() === context &&
           version === suggestVersion
-        )
-          paintChoices([], t("Model change was not confirmed."));
+        ) {
+          const generic = t(
+              "Request failed. Check the desktop connection and try again.",
+            ),
+            cleaned = error?.message ? cleanRpcError(error, t) : "";
+          paintChoices(
+            [],
+            cleaned && cleaned !== generic
+              ? cleaned
+              : t("Model change was not confirmed."),
+          );
+        }
       } finally {
         delete suggestions.dataset.pending;
         if (entry.modelPending === operation) {
@@ -1913,7 +1958,15 @@
           const data = await ctx.rpc({action:"chat_composer", session:sessionId});
           if (!current() || data?.agent !== chatAgent() || data.generation && data.generation !== generation) return;
           if (entry.model && data.model && data.model !== entry.model.statusBefore && !matchesModel(chatAgent(), entry.model.id, data.model)) entry.model = null;
-          else if (entry.model && data.effort && data.effort !== entry.model.statusEffortBefore) entry.model.effort = data.effort;
+          else if (
+            entry.model &&
+            ((data.effort && data.effort !== entry.model.statusEffortBefore) ||
+              (data.effort === null &&
+                data.model &&
+                matchesModel(chatAgent(), entry.model.id, data.model) &&
+                data.effort_supported === false))
+          )
+            entry.model.effort = data.effort;
           const gotModel = Boolean(data?.model || (data?.supported && data?.model_label));
           entry.composerProbes = gotModel ? 0 : (entry.composerProbes || 0) + 1;
           entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();
@@ -2159,7 +2212,7 @@
         entry.stopStamp = null;
       }
     }
-    function isStopMode() {
+    function canStop() {
       syncStopLatch();
       return (
         capability("chat_interrupt") &&
@@ -2167,11 +2220,27 @@
         !entry.sending
       );
     }
+    function hasDraft() {
+      return Boolean(input.value.trim() || entry.photo);
+    }
     const stopDisabled = () =>
       !!entry.stopping ||
       !!entry.modelPending ||
       !!liveQuestion ||
       state.connection?.phase !== "ready";
+    const sendDisabled = () =>
+      !!entry.modelPending ||
+      !!liveQuestion ||
+      entry.sending ||
+      entry.photo?.status === "pending" ||
+      entry.photo?.status === "error";
+    function syncActionButtons() {
+      const showStop = canStop();
+      stopBtn.hidden = !showStop;
+      stopBtn.disabled = stopDisabled();
+      sendBtn.hidden = showStop && !hasDraft();
+      sendBtn.disabled = sendDisabled();
+    }
     function updateComposer(sent) {
       updateStatus();
       let cleared = false;
@@ -2194,28 +2263,7 @@
         !!entry.modelPending ||
         entry.sending ||
         state.connection?.phase !== "ready";
-      const stopMode = isStopMode(),
-        wantMode = stopMode ? "stop" : "send";
-      if (sendBtn.dataset.mode !== wantMode) {
-        sendBtn.dataset.mode = wantMode;
-        sendBtn.type = stopMode ? "button" : "submit";
-        const label = t(stopMode ? "Stop" : "Send");
-        sendBtn.setAttribute("aria-label", label);
-        const glyph = ctx.icon
-          ? stopMode
-            ? svgIcon("stop")
-            : ctx.icon("arrowUp")
-          : null;
-        if (glyph) sendBtn.replaceChildren(glyph);
-        else sendBtn.textContent = label;
-      }
-      sendBtn.disabled = stopMode
-        ? stopDisabled()
-        : !!entry.modelPending ||
-          !!liveQuestion ||
-          entry.sending ||
-          entry.photo?.status === "pending" ||
-          entry.photo?.status === "error";
+      syncActionButtons();
       attachBtn.disabled = !!liveQuestion || entry.sending || !!entry.photo;
       attachment.replaceChildren();
       const photo = entry.photo;
@@ -2288,10 +2336,10 @@
       }
       entry.notifyComposer?.();
     }
-    sendBtn.addEventListener("click", (e) => {
-      if (!isStopMode()) return;
+    stopBtn.addEventListener("click", (e) => {
+      if (!canStop()) return;
       e.preventDefault();
-      if (e.detail > 1 || !active() || sendBtn.disabled || stopDisabled())
+      if (e.detail > 1 || !active() || stopBtn.disabled || stopDisabled())
         return;
       entry.stopping = true;
       entry.stopStamp =
@@ -2311,7 +2359,6 @@
       e.preventDefault();
       if (
         !active() ||
-        isStopMode() ||
         liveQuestion ||
         entry.modelPending ||
         !suggestions.hidden ||

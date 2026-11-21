@@ -30,7 +30,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 mod command_catalog;
-mod composer;
+pub(super) mod composer;
 mod composer_status;
 mod drops;
 pub(super) mod feed;

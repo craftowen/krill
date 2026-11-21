@@ -126,6 +126,7 @@ impl DraftAttachment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingStatus {
     Sending,
+    Queued,
     ReviewRequired,
 }
 
@@ -473,6 +474,7 @@ pub(crate) struct ChatState {
     copied_code_timer: Option<Task<()>>,
     pub quick_menu: BTreeSet<ChatKey>,
     pub model_picker: BTreeSet<ChatKey>,
+    composer_models_in_flight: BTreeSet<ChatKey>,
     composer_tasks: BTreeMap<ChatKey, Task<()>>,
     earlier_tasks: BTreeMap<ChatKey, Task<()>>,
     last_composer_poll: BTreeMap<ChatKey, std::time::Instant>,
@@ -780,12 +782,14 @@ pub(crate) fn apply_composer_status_json(raw: &str, meta: &mut ComposerMeta) -> 
     {
         meta.model_label = Some(label.to_owned());
     }
-    if let Some(effort) = data
-        .get("effort")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        meta.effort = Some(effort.to_owned());
+    match data.get("effort") {
+        Some(serde_json::Value::String(effort)) if !effort.is_empty() => {
+            meta.effort = Some(effort.to_owned());
+        }
+        Some(serde_json::Value::Null) => {
+            meta.effort = None;
+        }
+        _ => {}
     }
     if let Some(pct) = data
         .pointer("/context/percent")
@@ -890,12 +894,14 @@ pub(crate) fn apply_composer_set_json(raw: &str, meta: &mut ComposerMeta) -> boo
         {
             meta.model_label = Some(label.to_owned());
         }
-        if let Some(effort) = data
-            .get("effort")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            meta.effort = Some(effort.to_owned());
+        match data.get("effort") {
+            Some(serde_json::Value::String(effort)) if !effort.is_empty() => {
+                meta.effort = Some(effort.to_owned());
+            }
+            Some(serde_json::Value::Null) => {
+                meta.effort = None;
+            }
+            _ => {}
         }
         meta.reason = None;
         true
@@ -1441,13 +1447,23 @@ impl Shell {
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
                     {
+                        let composer_interval = if this
+                            .chat
+                            .logs
+                            .get(&key)
+                            .is_none_or(|log| log.meta.model.is_none() || !log.meta.supported)
+                        {
+                            Duration::from_millis(1500)
+                        } else {
+                            Duration::from_secs(5)
+                        };
                         let refresh_composer = snapshot.reset
                             || !snapshot.items.is_empty()
                             || this
                                 .chat
                                 .last_composer_poll
                                 .get(&key)
-                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+                                .is_none_or(|t| t.elapsed() >= composer_interval);
                         this.chat.poll_failed.remove(&key);
                         this.apply_chat_poll_for_host_with_state(
                             session,
@@ -1731,7 +1747,9 @@ impl Shell {
         include_models: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.logs.get(key).is_some_and(|log| log.meta.pending) {
+        if self.chat.logs.get(key).is_some_and(|log| log.meta.pending)
+            || (!include_models && self.chat.composer_models_in_flight.contains(key))
+        {
             return;
         }
         let Some(call) = self.workflow_call_for_key(key) else {
@@ -1739,6 +1757,9 @@ impl Shell {
         };
         let task_key = key.clone();
         let session = key.1.0;
+        if include_models {
+            self.chat.composer_models_in_flight.insert(key.clone());
+        }
         self.chat
             .last_composer_poll
             .insert(key.clone(), std::time::Instant::now());
@@ -1763,6 +1784,9 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 this.chat.composer_tasks.remove(&task_key);
+                if include_models {
+                    this.chat.composer_models_in_flight.remove(&task_key);
+                }
                 let log = this.chat.logs.entry(task_key.clone()).or_default();
                 if let Some(raw) = status_raw
                     && let Some(agent) = apply_composer_status_json(&raw, &mut log.meta)
@@ -1824,6 +1848,7 @@ impl Shell {
                     .cloned()
                     .or_else(|| item.default_effort.clone())
             });
+        self.chat.composer_models_in_flight.remove(key);
         log.meta.pending = true;
         log.meta.reason = None;
         let task_key = key.clone();
@@ -1880,6 +1905,7 @@ impl Shell {
         if log.meta.pending {
             return;
         }
+        self.chat.composer_models_in_flight.remove(key);
         log.meta.pending = true;
         log.meta.reason = None;
         let task_key = key.clone();
@@ -2081,8 +2107,6 @@ impl Shell {
     ) {
         if self.chat.prompt_tasks.contains_key(key)
             || self.chat.prompt_review.contains(key)
-            || self.session_agent_state(&key.0, key.1, cx)
-                == krill_proto::control::AgentState::Working
             || self
                 .chat_pane(key)
                 .is_some_and(|pane| self.paste_queue.has_pending_for(pane))
@@ -2251,15 +2275,22 @@ pub(super) enum ComposerPrimaryAction {
     Send { enabled: bool },
     Sending,
     Stop { latched: bool },
+    StopAndSend { latched: bool, send_enabled: bool },
 }
 
 pub(super) fn composer_primary_action(input: ComposerPrimaryInput) -> ComposerPrimaryAction {
     if input.submission == ComposerSubmissionState::InFlight {
         ComposerPrimaryAction::Sending
     } else if input.agent_state == krill_proto::control::AgentState::Working {
-        // Option A: Krill PTY blocks mid-turn submit, so Working shows Stop even with a draft.
-        ComposerPrimaryAction::Stop {
-            latched: input.interrupt_latched,
+        if input.draft_empty {
+            ComposerPrimaryAction::Stop {
+                latched: input.interrupt_latched,
+            }
+        } else {
+            ComposerPrimaryAction::StopAndSend {
+                latched: input.interrupt_latched,
+                send_enabled: input.submission == ComposerSubmissionState::Ready,
+            }
         }
     } else {
         ComposerPrimaryAction::Send {
@@ -2461,7 +2492,7 @@ struct PendingDispatch {
     opens_terminal: bool,
 }
 
-struct UnbracketedWatch {
+pub(super) struct UnbracketedWatch {
     key: ChatKey,
     pane: super::PaneId,
     session: SessionId,
@@ -2611,6 +2642,11 @@ impl Shell {
                     }
                 }
             } else {
+                if self.session_agent_state(&dispatch.key.0, dispatch.key.1, cx)
+                    == krill_proto::control::AgentState::Working
+                {
+                    self.mark_pending_prompt_queued(&dispatch.key, dispatch.pending_id);
+                }
                 self.spawn_unbracketed_turn_watcher(
                     UnbracketedWatch {
                         key: dispatch.key,
@@ -2702,7 +2738,7 @@ impl Shell {
         self.chat.turn_tasks.insert(map_key, task);
     }
 
-    fn spawn_unbracketed_turn_watcher(
+    pub(super) fn spawn_unbracketed_turn_watcher(
         &mut self,
         watch: UnbracketedWatch,
         window: &mut Window,
@@ -2710,6 +2746,7 @@ impl Shell {
     ) {
         const POLL: Duration = Duration::from_millis(20);
         const TURN_POLLS: usize = 750;
+        const MAX_WORKING_POLLS: usize = 90_000;
         let task_key = watch.key;
         let pane = watch.pane;
         let session = watch.session;
@@ -2722,31 +2759,36 @@ impl Shell {
             .unwrap_or(0);
         let map_key = (task_key.clone(), pending_id);
         let task = cx.spawn_in(window, async move |this, cx| {
-            for step in 0..TURN_POLLS {
+            let mut idle_steps = 0usize;
+            let mut step = 0usize;
+            while idle_steps < TURN_POLLS && step < MAX_WORKING_POLLS {
                 cx.background_executor().timer(POLL).await;
-                let Ok(outcome) = this.update_in(cx, |this, _, cx| {
+                let Ok((outcome, working)) = this.update_in(cx, |this, _, cx| {
+                    let working = this.session_agent_state(&task_key.0, session, cx)
+                        == krill_proto::control::AgentState::Working;
                     if !this.has_pending_prompt(&task_key, pending_id) {
-                        return Some(true);
+                        return (Some(true), working);
                     }
                     let same_epoch =
                         this.chat.logs.get(&task_key).map_or(0, |log| log.epoch) == origin_epoch;
                     if !same_epoch || !this.is_pane_chat_view(pane, cx) {
-                        return Some(false);
+                        return (Some(false), working);
                     }
                     #[cfg(test)]
                     {
                         if let Some(confirmed) = this.chat.prompt_confirmed {
                             if confirmed {
-                                return Some(true);
+                                return (Some(true), working);
                             }
                         } else if this.chat.send_input.is_some() && this.chat.poll_call.is_none() {
-                            return Some(true);
+                            return (Some(true), working);
                         }
                     }
-                    if step % 5 == 0 {
+                    let poll_every = if working { 10 } else { 5 };
+                    if step.is_multiple_of(poll_every) {
                         this.poll_session_chat(pane, session, cx);
                     }
-                    None
+                    (None, working)
                 }) else {
                     return;
                 };
@@ -2760,7 +2802,12 @@ impl Shell {
                         return;
                     }
                     Some(false) => break,
-                    None => {}
+                    None => {
+                        step += 1;
+                        if !working {
+                            idle_steps += 1;
+                        }
+                    }
                 }
             }
             this.update_in(cx, |this, window, cx| {
@@ -2777,6 +2824,20 @@ impl Shell {
             .ok();
         });
         self.chat.turn_tasks.insert(map_key, task);
+    }
+
+    pub(super) fn mark_pending_prompt_queued(&mut self, key: &ChatKey, pending_id: u64) {
+        let mut changed = false;
+        if let Some(entries) = self.chat.pending_prompts.get_mut(key)
+            && let Some(entry) = entries.iter_mut().find(|p| p.id == pending_id)
+            && entry.status == PendingStatus::Sending
+        {
+            entry.status = PendingStatus::Queued;
+            changed = true;
+        }
+        if changed {
+            self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        }
     }
 
     pub(super) fn has_pending_prompt(&self, key: &ChatKey, pending_id: u64) -> bool {

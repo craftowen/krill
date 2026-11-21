@@ -846,10 +846,13 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             draft_empty: false,
             interrupt_latched: false,
         }),
-        ComposerPrimaryAction::Stop { latched: false },
+        ComposerPrimaryAction::StopAndSend {
+            latched: false,
+            send_enabled: false,
+        },
     );
 
-    // Option A: Working + ready shows Stop even when draft text or attachments exist.
+    // Working + empty draft shows Stop only; with a draft/attachment shows both Stop and Send.
     assert_eq!(
         composer_primary_action(ComposerPrimaryInput {
             agent_state: AgentState::Working,
@@ -866,10 +869,13 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             draft_empty: false,
             interrupt_latched: false,
         }),
-        ComposerPrimaryAction::Stop { latched: false },
+        ComposerPrimaryAction::StopAndSend {
+            latched: false,
+            send_enabled: true,
+        },
     );
 
-    // Latched Working keeps Stop disabled even when text is typed afterward.
+    // Latched Working keeps Stop disabled while still allowing a queued follow-up draft to send.
     assert_eq!(
         composer_primary_action(ComposerPrimaryInput {
             agent_state: AgentState::Working,
@@ -877,7 +883,10 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
             draft_empty: false,
             interrupt_latched: true,
         }),
-        ComposerPrimaryAction::Stop { latched: true },
+        ComposerPrimaryAction::StopAndSend {
+            latched: true,
+            send_enabled: true,
+        },
     );
 
     for state in [

@@ -2455,6 +2455,7 @@ catalog! {
         ATTACH_IMAGE_BADGE => ("이미지", "Image"),
         ATTACH_REMOVE => ("첨부 제거", "Remove attachment"),
         PENDING_SENDING => ("전송 중…", "Sending…"),
+        PENDING_QUEUED => ("전송됨 · 대기 중", "Sent · queued"),
         PENDING_REVIEW_REQUIRED => ("전송 확인 필요", "Review required"),
         PENDING_RETRY => ("재시도", "Retry"),
         AUTOCOMPLETE_FILES => ("워크스페이스 파일", "Workspace files"),

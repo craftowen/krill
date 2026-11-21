@@ -5084,7 +5084,7 @@ async function agyStartupAndModelApplyUx() {
     "PASS agy startup reload, 1.5s boot probe, cold picker Loading…/note, Applying… lock, and confirmed effort retention",
   );
 
-  // OWE-1349: Working turns switch Send to Stop, send a single interrupt RPC, ignore double-taps, lock duplicate taps, and preserve drafts.
+  // Working turns show dedicated Stop alongside Send when drafting, send single interrupt RPC, ignore double-taps, lock duplicate taps, preserve drafts, and allow mid-turn prompt submit.
   {
     const stopChat = fixture({
       capabilities: { chat_interrupt: true },
@@ -5102,13 +5102,15 @@ async function agyStartupAndModelApplyUx() {
       },
     });
     await flush();
-    const sendBtn = stopChat.find("primary composer-send");
+    const sendBtn = stopChat.find("primary composer-send"),
+      stopBtn = stopChat.find("secondary composer-stop");
     assert.equal(sendBtn.dataset.mode, "send");
     assert.equal(sendBtn.type, "submit");
+    assert.equal(sendBtn.hidden, false);
+    assert.equal(stopBtn.hidden, true);
     assert.equal(sendBtn.attrs["aria-label"], "Send");
     assert.equal(sendBtn.textContent, "Send");
 
-    stopChat.input("작성 중인 모바일 초안");
     stopChat.state.sessions.set(7, {
       id: 7,
       state: "Working",
@@ -5118,32 +5120,34 @@ async function agyStartupAndModelApplyUx() {
     stopChat.update();
     await flush();
 
-    assert.equal(sendBtn.dataset.mode, "stop");
-    assert.equal(sendBtn.type, "button");
-    assert.equal(sendBtn.attrs["aria-label"], "Stop");
-    assert.equal(sendBtn.textContent, "Stop");
+    // Empty draft while Working shows Stop only.
+    assert.equal(stopBtn.hidden, false);
+    assert.equal(stopBtn.type, "button");
+    assert.equal(stopBtn.attrs["aria-label"], "Stop");
+    assert.equal(stopBtn.textContent, "Stop");
+    assert.equal(stopBtn.disabled, false);
+    assert.equal(sendBtn.hidden, true);
+
+    // Typing a draft while Working reveals Send alongside Stop.
+    stopChat.input("작성 중인 모바일 초안");
+    await flush();
+    assert.equal(stopBtn.hidden, false);
+    assert.equal(sendBtn.hidden, false);
     assert.equal(sendBtn.disabled, false);
 
-    // Submitting form while Working must be blocked and preserve the draft.
-    stopChat.submit();
-    await flush();
-    assert(!stopChat.calls.some((c) => c.action === "prompt"));
-    assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
-    assert.equal(stopChat.state.drafts.get(7), "작성 중인 모바일 초안");
-
-    // Double-tap (event.detail > 1) must be ignored before latching.
+    // Double-tap (event.detail > 1) on Stop must be ignored before latching.
     const dbl = new Event("click");
     dbl.detail = 2;
-    sendBtn.dispatchEvent(dbl);
+    stopBtn.dispatchEvent(dbl);
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
       0,
     );
-    assert.equal(sendBtn.disabled, false);
+    assert.equal(stopBtn.disabled, false);
 
     // First Stop tap sends interrupt RPC once and locks duplicate taps for this Working turn.
-    sendBtn.dispatchEvent(new Event("click"));
+    stopBtn.dispatchEvent(new Event("click"));
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
@@ -5153,26 +5157,28 @@ async function agyStartupAndModelApplyUx() {
       { ...stopChat.calls.find((c) => c.action === "interrupt") },
       { action: "interrupt", session: 7 },
     );
-    assert.equal(sendBtn.disabled, true);
+    assert.equal(stopBtn.disabled, true);
     assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
     assert.equal(stopChat.state.drafts.get(7), "작성 중인 모바일 초안");
 
     // Duplicate taps while Working (including after remount) must NOT send a second interrupt.
-    sendBtn.dispatchEvent(new Event("click"));
+    stopBtn.dispatchEvent(new Event("click"));
     await flush();
     stopChat.remount();
     await flush();
-    const remountedBtn = stopChat.find("primary composer-send");
-    assert.equal(remountedBtn.dataset.mode, "stop");
-    assert.equal(remountedBtn.disabled, true);
-    remountedBtn.dispatchEvent(new Event("click"));
+    const remountedSend = stopChat.find("primary composer-send"),
+      remountedStop = stopChat.find("secondary composer-stop");
+    assert.equal(remountedStop.hidden, false);
+    assert.equal(remountedStop.disabled, true);
+    assert.equal(remountedSend.hidden, false);
+    remountedStop.dispatchEvent(new Event("click"));
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
       1,
     );
 
-    // Leaving Working clears the stop latch and restores Send with the draft intact.
+    // Leaving Working clears the stop latch, hides Stop, and keeps Send with the draft intact.
     stopChat.state.sessions.set(7, {
       id: 7,
       state: "Waiting",
@@ -5181,13 +5187,14 @@ async function agyStartupAndModelApplyUx() {
     });
     stopChat.update();
     await flush();
-    assert.equal(remountedBtn.dataset.mode, "send");
-    assert.equal(remountedBtn.type, "submit");
-    assert.equal(remountedBtn.attrs["aria-label"], "Send");
-    assert.equal(remountedBtn.disabled, false);
+    assert.equal(remountedStop.hidden, true);
+    assert.equal(remountedSend.hidden, false);
+    assert.equal(remountedSend.type, "submit");
+    assert.equal(remountedSend.attrs["aria-label"], "Send");
+    assert.equal(remountedSend.disabled, false);
     assert.equal(stopChat.find("chat-input").value, "작성 중인 모바일 초안");
 
-    // Entering a new Working turn re-enables Stop for one fresh interrupt.
+    // Entering a new Working turn re-enables Stop for one fresh interrupt, AND allows submitting the draft mid-turn.
     stopChat.state.sessions.set(7, {
       id: 7,
       state: "Working",
@@ -5196,9 +5203,19 @@ async function agyStartupAndModelApplyUx() {
     });
     stopChat.update();
     await flush();
-    assert.equal(remountedBtn.dataset.mode, "stop");
-    assert.equal(remountedBtn.disabled, false);
-    remountedBtn.dispatchEvent(new Event("click"));
+    assert.equal(remountedStop.hidden, false);
+    assert.equal(remountedStop.disabled, false);
+    assert.equal(remountedSend.hidden, false);
+    stopChat.submit();
+    await flush();
+    assert.deepEqual(
+      { ...stopChat.calls.findLast((c) => c.action === "prompt") },
+      { action: "prompt", session: 7, text: "작성 중인 모바일 초안" },
+    );
+    assert.equal(stopChat.find("chat-input").value, "");
+    assert.equal(remountedStop.hidden, false);
+    assert.equal(remountedSend.hidden, true);
+    remountedStop.dispatchEvent(new Event("click"));
     await flush();
     assert.equal(
       stopChat.calls.filter((c) => c.action === "interrupt").length,
@@ -5220,13 +5237,13 @@ async function agyStartupAndModelApplyUx() {
     koChat.update();
     await flush();
     assert.equal(
-      koChat.find("primary composer-send").attrs["aria-label"],
+      koChat.find("secondary composer-stop").attrs["aria-label"],
       "정지",
     );
     koChat.dispose();
   }
   console.log(
-    "PASS working stop button single interrupt, double-tap guard, duplicate tap latch, draft retention, and next-turn reset",
+    "PASS working stop + mid-turn send buttons, single interrupt, double-tap guard, duplicate tap latch, draft retention, and next-turn reset",
   );
 }
 async function unboundEmptyAndVisibilityTransitions() {

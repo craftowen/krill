@@ -928,6 +928,10 @@ impl Tap {
         input::streaming_command(self, command, accepts)
     }
 
+    pub(crate) fn guarded_enter(&self, accepts: impl Fn(&Screen) -> bool) -> io::Result<bool> {
+        input::guarded_enter(self, accepts)
+    }
+
     /// 입력 연결이 프레임 사이에서 닫혀도 열린 붙여넣기의 종료 표지를 보충한다.
     pub(crate) fn finish_input(&self) {
         input::finish_input(self);

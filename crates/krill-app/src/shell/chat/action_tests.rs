@@ -978,9 +978,9 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
     assert!(cx.debug_bounds("desktop-chat-send").is_some());
     assert!(cx.debug_bounds("desktop-chat-stop").is_none());
 
-    // Option A: Working + ready switches primary button to Stop even with draft + attachments.
+    // Working + draft shows both Stop (`desktop-chat-stop`) and Send (`desktop-chat-send`).
     set_session_state(&view, cx, krill_proto::control::AgentState::Working, 100);
-    assert!(cx.debug_bounds("desktop-chat-send").is_none());
+    assert!(cx.debug_bounds("desktop-chat-send").is_some());
     let stop_bounds = cx
         .debug_bounds("desktop-chat-stop")
         .expect("Working session must show Stop button even with draft text");
@@ -1093,4 +1093,146 @@ fn chat_stop_is_blocked_while_prompt_is_in_flight(cx: &mut gpui::TestAppContext)
         !sent.lock().unwrap().iter().any(|bytes| bytes == b"\x03"),
         "b\"\\x03\" must never be sent while prompt delivery is in flight"
     );
+}
+
+#[gpui::test]
+fn chat_working_allows_sending_follow_up_prompts_and_queues_without_false_review(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("chat-working-send-follow-up"));
+    let sent = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            shell.layout.set_session(pane, SESSION);
+            shell.layout.set_chat_view(pane, true);
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            shell.chat.prompt_delivery = Some(krill_proto::input::Delivery::Applied);
+            shell.chat.prompt_confirmed = Some(false);
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&krill_proto::term_modes::Modes {
+                    flags: krill_proto::term_modes::Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "claude".into(),
+                    bound: true,
+                    session_id: "agent-working".into(),
+                    transcript_path: "/fake/working.jsonl".into(),
+                    ..Default::default()
+                },
+            );
+            input
+        })
+    });
+    set_session_state(&view, cx, krill_proto::control::AgentState::Working, 100);
+    assert!(cx.debug_bounds("desktop-chat-stop").is_some());
+    assert!(cx.debug_bounds("desktop-chat-send").is_none());
+
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.set_value("queued follow-up", window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("desktop-chat-stop").is_some());
+    let send_bounds = cx
+        .debug_bounds("desktop-chat-send")
+        .expect("Working session with draft must also expose Send button");
+    cx.simulate_click(send_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec!["\x1b[200~queued follow-up\x1b[201~".as_bytes().to_vec()]
+    );
+
+    cx.executor().advance_clock(Duration::from_millis(251));
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![
+            "\x1b[200~queued follow-up\x1b[201~".as_bytes().to_vec(),
+            b"\r".to_vec(),
+        ]
+    );
+    view.read_with(cx, |shell, cx| {
+        assert!(!shell.chat.prompt_tasks.contains_key(&local_key(SESSION)));
+        assert_eq!(shell.chat.pending_prompts[&local_key(SESSION)].len(), 1);
+        assert_eq!(
+            shell.chat.pending_prompts[&local_key(SESSION)][0].status,
+            super::PendingStatus::Queued
+        );
+        assert!(!shell.chat.prompt_review.contains(&local_key(SESSION)));
+        assert!(input.read(cx).value().is_empty());
+    });
+
+    // Waiting >15s while still Working must not mark a queued follow-up ReviewRequired.
+    cx.executor().advance_clock(Duration::from_secs(16));
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.chat.pending_prompts[&local_key(SESSION)][0].status,
+            super::PendingStatus::Queued
+        );
+        assert!(!shell.chat.prompt_review.contains(&local_key(SESSION)));
+    });
+
+    // Can still send a second follow-up while the first is queued and agent is Working.
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.set_value("second follow-up", window, cx);
+        });
+        view.update(cx, |shell, cx| {
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(251));
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert_eq!(shell.chat.pending_prompts[&local_key(SESSION)].len(), 2);
+        assert_eq!(
+            shell.chat.pending_prompts[&local_key(SESSION)][1].status,
+            super::PendingStatus::Queued
+        );
+    });
+
+    // Transcript poll reconciles queued user prompts cleanly.
+    view.update(cx, |shell, _| {
+        shell.apply_chat_poll(
+            SESSION,
+            krill_proto::agent_history::ChatPollSnapshot {
+                bound: true,
+                session_id: "agent-working".into(),
+                transcript_path: "/fake/working.jsonl".into(),
+                items: vec![
+                    krill_proto::agent_history::ChatItem {
+                        kind: krill_proto::agent_history::ChatItemKind::User,
+                        text: "queued follow-up".into(),
+                        ..Default::default()
+                    },
+                    krill_proto::agent_history::ChatItem {
+                        kind: krill_proto::agent_history::ChatItemKind::User,
+                        text: "second follow-up".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(!shell.chat.pending_prompts.contains_key(&local_key(SESSION)));
+    });
 }

@@ -2136,7 +2136,7 @@ fn chat_autocomplete_supports_file_and_slash_selection_ime_guard_working_priorit
     assert!(cx.debug_bounds("chat-autocomplete-popover").is_some());
     assert!(cx.debug_bounds("chat-autocomplete-option-0").is_some());
 
-    // Option A Stop: Working switches Send -> Stop at identical 32px circular dimensions even with draft.
+    // Working exposes 32px Stop alongside Send while a draft is typed.
     shell.update(cx, |shell, cx| {
         shell.sidebar.update(cx, |sidebar, cx| {
             sidebar.connect_source(
@@ -2163,8 +2163,11 @@ fn chat_autocomplete_supports_file_and_slash_selection_ime_guard_working_priorit
 
     let stop_btn = cx
         .debug_bounds("desktop-chat-stop")
-        .expect("Working session with draft text must show Stop under Option A");
-    assert!(cx.debug_bounds("desktop-chat-send").is_none());
+        .expect("Working session with draft text must show Stop");
+    assert!(
+        cx.debug_bounds("desktop-chat-send").is_some(),
+        "Working session with draft text must also expose Send"
+    );
     assert_eq!(stop_btn.size, send_btn.size);
     assert!((stop_btn.size.width - px(32.)).abs() <= px(1.));
     cx.simulate_click(stop_btn.center(), gpui::Modifiers::default());

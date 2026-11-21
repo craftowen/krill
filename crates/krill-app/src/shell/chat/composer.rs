@@ -126,7 +126,7 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
                 },
                 ComposerModelItem {
                     id: "fable".to_owned(),
-                    label: "Fable 5.1".to_owned(),
+                    label: "Fable 5.2".to_owned(),
                     efforts: vec![
                         "low".to_owned(),
                         "medium".to_owned(),
@@ -325,7 +325,6 @@ fn resolved_composer_choices(
         .and_then(|m| {
             active_id
                 .and_then(|id| m.models.iter().find(|item| item.id == id))
-                .filter(|item| !item.efforts.is_empty())
                 .map(|item| item.efforts.clone())
                 .or_else(|| (!m.efforts.is_empty()).then(|| m.efforts.clone()))
         })
@@ -500,94 +499,116 @@ impl Shell {
                 )
         });
 
-        let model_picker =
-            model_picker_open.then(|| {
-                let active_model = current_model.map(str::to_owned);
-                let active_effort = current_effort.map(str::to_owned);
-                let reason = meta.and_then(|m| m.reason.as_deref());
-                let waiting = !supported || reason.is_some_and(|text| text.starts_with("Wait for"));
-                let notice = if waiting {
-                    Some(SharedString::from(ctext::PICKER_WAIT.get()))
-                } else {
-                    reason.map(|text| SharedString::from(text.to_owned()))
-                };
-                let close_key = key.clone();
-                composer_popup(palette)
-                    .id(SharedString::from(format!(
-                        "chat-model-picker-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-model-picker".into())
-                    .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
-                        this.chat.model_picker.remove(&close_key);
-                        cx.notify();
-                    }))
-                    .child(popup_heading(palette, ctext::PICKER_MODEL.get()))
-                    .children(model_choices.into_iter().map(|item| {
-                        let id = item.id;
-                        let is_selected = model_is_selected(active_model.as_deref(), &id);
-                        let key = key.clone();
-                        let option_id = id.clone();
-                        let selector_id = id.clone();
-                        let enabled = supported && !is_pending;
-                        popup_row(
-                            palette,
-                            SharedString::from(format!("chat-model-option-{id}-{}", pane.get())),
-                            enabled,
-                        )
-                        .debug_selector(move || format!("chat-model-option-{selector_id}"))
-                        .child(item.label)
-                        .when(is_selected, |row| {
-                            row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
-                        })
-                        .when(enabled, |row| {
-                            row.on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_chat_model(&key, &option_id, cx);
-                            }))
-                        })
-                    }))
-                    .child(popup_heading(palette, ctext::PICKER_EFFORT.get()))
-                    .child(div().flex().flex_wrap().gap_0p5().children(
-                        effort_choices.into_iter().map(|effort| {
-                            let is_selected = active_effort.as_deref() == Some(effort.as_str());
+        let model_picker = model_picker_open.then(|| {
+            let active_model = current_model.map(str::to_owned);
+            let active_effort = current_effort.map(str::to_owned);
+            let reason = meta.and_then(|m| m.reason.as_deref());
+            let waiting = !supported || reason.is_some_and(|text| text.starts_with("Wait for"));
+            let notice = if waiting {
+                Some(SharedString::from(ctext::PICKER_WAIT.get()))
+            } else {
+                reason.map(|text| SharedString::from(text.to_owned()))
+            };
+            let close_key = key.clone();
+            composer_popup(palette)
+                .id(SharedString::from(format!(
+                    "chat-model-picker-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-model-picker".into())
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    this.chat.model_picker.remove(&close_key);
+                    cx.notify();
+                }))
+                .child(popup_heading(palette, ctext::PICKER_MODEL.get()))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-model-list-{}",
+                            pane.get()
+                        )))
+                        .max_h(px(260.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .children(model_choices.into_iter().map(|item| {
+                            let id = item.id;
+                            let is_selected = model_is_selected(active_model.as_deref(), &id);
                             let key = key.clone();
-                            let option_effort = effort.clone();
-                            let selector_effort = effort.clone();
-                            Button::new(SharedString::from(format!(
-                                "chat-effort-option-{effort}-{}",
-                                pane.get()
-                            )))
-                            .debug_selector(move || format!("chat-effort-option-{selector_effort}"))
-                            .label(effort_text(&effort))
-                            .selected(is_selected)
-                            .disabled(is_pending || !supported)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener({
-                                let focus_input = input_state.clone();
-                                move |this, _, window, cx| {
-                                    this.select_chat_effort(&key, &option_effort, cx);
-                                    if !focus_input.read(cx).focus_handle(cx).is_focused(window) {
-                                        focus_input.update(cx, |state, cx| state.focus(window, cx));
+                            let option_id = id.clone();
+                            let selector_id = id.clone();
+                            let enabled = supported && !is_pending;
+                            popup_row(
+                                palette,
+                                SharedString::from(format!(
+                                    "chat-model-option-{id}-{}",
+                                    pane.get()
+                                )),
+                                enabled,
+                            )
+                            .debug_selector(move || format!("chat-model-option-{selector_id}"))
+                            .child(item.label)
+                            .when(is_selected, |row| {
+                                row.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
+                            })
+                            .when(enabled, |row| {
+                                row.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_chat_model(&key, &option_id, cx);
+                                }))
+                            })
+                        })),
+                )
+                .when(!effort_choices.is_empty(), |popup| {
+                    popup
+                        .child(popup_heading(palette, ctext::PICKER_EFFORT.get()))
+                        .child(div().flex().flex_wrap().gap_0p5().children(
+                            effort_choices.into_iter().map(|effort| {
+                                let is_selected = active_effort.as_deref() == Some(effort.as_str());
+                                let key = key.clone();
+                                let option_effort = effort.clone();
+                                let selector_effort = effort.clone();
+                                Button::new(SharedString::from(format!(
+                                    "chat-effort-option-{effort}-{}",
+                                    pane.get()
+                                )))
+                                .debug_selector(move || {
+                                    format!("chat-effort-option-{selector_effort}")
+                                })
+                                .label(effort_text(&effort))
+                                .selected(is_selected)
+                                .disabled(is_pending || !supported)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener({
+                                    let focus_input = input_state.clone();
+                                    move |this, _, window, cx| {
+                                        this.select_chat_effort(&key, &option_effort, cx);
+                                        if !focus_input.read(cx).focus_handle(cx).is_focused(window)
+                                        {
+                                            focus_input.update(cx, |state, cx| {
+                                                state.focus(window, cx);
+                                            });
+                                        }
                                     }
-                                }
-                            }))
-                        }),
-                    ))
-                    .children(notice.map(|notice| {
-                        div()
-                            .id(SharedString::from(format!(
-                                "chat-model-picker-reason-{}",
-                                pane.get()
-                            )))
-                            .debug_selector(|| "chat-model-picker-reason".into())
-                            .px_2()
-                            .pt_1()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(muted_fg)
-                            .child(notice)
-                    }))
-            });
+                                }))
+                            }),
+                        ))
+                })
+                .children(notice.map(|notice| {
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-model-picker-reason-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-model-picker-reason".into())
+                        .px_2()
+                        .pt_1()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .child(notice)
+                }))
+        });
 
         let attachments = self
             .chat
@@ -1101,14 +1122,12 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .children(context_ring)
-                            .child({
-                                match primary_action {
-                                    super::ComposerPrimaryAction::Stop { latched } => Button::new(
-                                        SharedString::from(format!(
-                                            "desktop-chat-stop-{}",
-                                            pane.get()
-                                        )),
-                                    )
+                            .children({
+                                let build_stop = |latched: bool, stop_key: ChatKey| {
+                                    Button::new(SharedString::from(format!(
+                                        "desktop-chat-stop-{}",
+                                        pane.get()
+                                    )))
                                     .debug_selector(|| "desktop-chat-stop".into())
                                     .icon(
                                         gpui_component::Icon::default()
@@ -1127,11 +1146,14 @@ impl Shell {
                                             if event.click_count() > 1 {
                                                 return;
                                             }
-                                            this.interrupt_chat_turn(&key, cx);
+                                            this.interrupt_chat_turn(&stop_key, cx);
                                         },
-                                    )),
-                                    super::ComposerPrimaryAction::Sending => {
-                                        Button::new(SharedString::from(format!(
+                                    ))
+                                    .into_any_element()
+                                };
+                                let build_send =
+                                    |enabled: bool, clickable: bool, send_key: ChatKey| {
+                                        let btn = Button::new(SharedString::from(format!(
                                             "desktop-chat-send-{}",
                                             pane.get()
                                         )))
@@ -1140,27 +1162,37 @@ impl Shell {
                                         .tooltip(ctext::SEND.get())
                                         .primary()
                                         .rounded(px(999.))
-                                        .disabled(true)
-                                    }
-                                    super::ComposerPrimaryAction::Send { enabled } => {
-                                        Button::new(SharedString::from(format!(
-                                            "desktop-chat-send-{}",
-                                            pane.get()
-                                        )))
-                                        .debug_selector(|| "desktop-chat-send".into())
-                                        .icon(IconName::ArrowUp)
-                                        .tooltip(ctext::SEND.get())
-                                        .primary()
-                                        .rounded(px(999.))
-                                        .disabled(!enabled)
-                                        .on_click(cx.listener(
+                                        .disabled(!enabled);
+                                        if clickable {
+                                            btn.on_click(cx.listener(
                                             move |this, event: &gpui::ClickEvent, window, cx| {
                                                 if event.click_count() > 1 {
                                                     return;
                                                 }
-                                                this.submit_chat_prompt(&key, window, cx);
+                                                this.submit_chat_prompt(&send_key, window, cx);
                                             },
                                         ))
+                                        .into_any_element()
+                                        } else {
+                                            btn.into_any_element()
+                                        }
+                                    };
+                                match primary_action {
+                                    super::ComposerPrimaryAction::Stop { latched } => {
+                                        vec![build_stop(latched, key)]
+                                    }
+                                    super::ComposerPrimaryAction::StopAndSend {
+                                        latched,
+                                        send_enabled,
+                                    } => vec![
+                                        build_stop(latched, key.clone()),
+                                        build_send(send_enabled, true, key),
+                                    ],
+                                    super::ComposerPrimaryAction::Sending => {
+                                        vec![build_send(false, false, key)]
+                                    }
+                                    super::ComposerPrimaryAction::Send { enabled } => {
+                                        vec![build_send(enabled, true, key)]
                                     }
                                 }
                             }),
