@@ -2,6 +2,7 @@
 (() => {
   const M = (globalThis.KrillMobile ||= {});
   M.screens ||= {};
+  const pushHandlers = new Set();
   function cleanRpcError(err, t) {
     const raw = String(err?.message || err || "").trim();
     const tr = typeof t === "function" ? t : (s) => s;
@@ -3832,7 +3833,7 @@
                         action: "live_prompt_reply",
                         session: sessionId,
                         expected_prompt: lp.prompt || item.text || "",
-                        yes_no: yesNo,
+                        yes: yesNo,
                       });
                       if (!disposed) {
                         await pollNow();
@@ -3965,7 +3966,8 @@
                 action: "live_prompt_reply",
                 session: sessionId,
                 expected_prompt: lp.prompt || item.text || "",
-                other: { option_index: otherIndex, text },
+                choice: otherIndex,
+                custom_text: text,
               });
               custom.value = "";
               ctx.toast?.(t("Answer sent"));
@@ -4491,6 +4493,195 @@
       }
       return true;
     }
+    let subscribed = false,
+      subscribedOffset = null,
+      subscribedConn = null;
+    function pollDelay() {
+      return capability("chat_push") && subscribed ? 5000 : 1500;
+    }
+    function syncChatSubscription() {
+      if (!capability("chat_push")) return;
+      const connGen = state.connection?.generation ?? null;
+      const canSub =
+        !disposed &&
+        active() &&
+        isVisible() &&
+        entry.loaded &&
+        !state.cached &&
+        state.connection?.phase === "ready";
+      if (!canSub) {
+        if (subscribed) {
+          subscribed = false;
+          subscribedOffset = null;
+          subscribedConn = null;
+          schedule();
+          if (state.connection?.phase === "ready") {
+            ctx
+              .rpc({ action: "chat_unsubscribe", session: sessionId })
+              .catch(() => {});
+          }
+        }
+        return;
+      }
+      if (
+        subscribed &&
+        subscribedOffset === entry.offset &&
+        subscribedConn === connGen
+      )
+        return;
+      subscribed = true;
+      subscribedOffset = entry.offset;
+      subscribedConn = connGen;
+      schedule();
+      const sentOffset = entry.offset;
+      ctx
+        .rpc({ action: "chat_subscribe", session: sessionId, offset: sentOffset })
+        .catch(() => {
+          if (subscribedOffset === sentOffset && subscribedConn === connGen) {
+            subscribed = false;
+            subscribedOffset = null;
+            subscribedConn = null;
+            schedule();
+          }
+        });
+    }
+    function applyPollPayload(
+      res,
+      { start, latest, resetHistory: wasResetHistory, changed, sameTail, fromPush },
+    ) {
+      const rItems = res.items || [];
+      const reset = Boolean(res.reset || changed || (latest && wasResetHistory)),
+        metaChanged =
+          entry.agent !== (res.agent || "") || entry.bound !== !!res.bound;
+      const hadItems = entry.items.length,
+        wasLoaded = entry.loaded,
+        anchor =
+          (!sameTail && (rItems.length || metaChanged)) || !pollStatus.hidden
+            ? readerAnchor()
+            : null;
+      if (res.reset && entry.progress && entry.progress.phase !== "sending")
+        entry.progress.rendered = true;
+      const generationChanged = Boolean(
+        !res.bound ||
+          (entry.generation &&
+            res.generation &&
+            entry.generation !== res.generation),
+      );
+      if (reset) {
+        clearTranscript(generationChanged);
+        following = true;
+      }
+      entry.generation = res.generation || entry.generation;
+      entry.agent = res.agent || "";
+      entry.bound = !!res.bound;
+      entry.initialized = entry.bound;
+      entry.loaded = true;
+      refreshLatest = false;
+      resetHistory = false;
+      entry.latestRecovery = false;
+      const effectiveStart = res.page_start ?? (res.reset ? 0 : start);
+      const incoming = normalizeItems(res, effectiveStart),
+        before = entry.items.length,
+        prevIds = new Set(entry.items.map((item) => item.id));
+      let reconciled = false;
+      if (incoming.length) {
+        if (latest && !reset && !sameTail) {
+          const incomingIds = new Set(incoming.map((item) => item.id)),
+            overlap = entry.items.findIndex((old) => incomingIds.has(old.id)),
+            next =
+              overlap >= 0
+                ? [...entry.items.slice(0, overlap), ...incoming]
+                : incoming;
+          reconciled =
+            next.length !== entry.items.length ||
+            next.some((item, i) => !sameItem(entry.items[i], item));
+          if (reconciled) entry.items = next;
+        } else if (!sameTail) {
+          const seen = new Set(entry.items.map((item) => item.id));
+          entry.items.push(...incoming.filter((item) => !seen.has(item.id)));
+        }
+        rememberPage(effectiveStart, res.next_offset);
+      }
+      const trimmed = incoming.length && trimItems(true);
+      if (
+        !reset &&
+        wasLoaded &&
+        hadItems > 0 &&
+        !following &&
+        entry.items.length > before
+      ) {
+        const firstUnread = entry.items.find((item) => !prevIds.has(item.id));
+        if (firstUnread) entry.unreadFromId ||= firstUnread.id;
+      }
+      if (typeof res.next_offset === "number") entry.offset = res.next_offset;
+      if (fromPush && subscribed) {
+        subscribedOffset = entry.offset;
+        subscribedConn = state.connection?.generation ?? null;
+      }
+      lastSuccess = entry.lastSuccess = Date.now();
+      failures = 0;
+      pollStatus.hidden = true;
+      if (
+        reconciled ||
+        entry.items.length !== before ||
+        trimmed ||
+        metaChanged ||
+        !wasLoaded ||
+        (reset && (hadItems || !renderedItems))
+      )
+        renderItems(!reset && !trimmed && !reconciled ? before : undefined);
+      updateStatus();
+      restoreReader(anchor);
+      pruneCache(state);
+      refreshStatus(
+        incoming.some(
+          (item) => item.kind === "permission" || item.kind === "question",
+        ),
+      );
+      syncChatSubscription();
+    }
+    function handlePush(p) {
+      if (
+        disposed ||
+        !p ||
+        p.session !== sessionId ||
+        !active() ||
+        !isVisible() ||
+        state.cached ||
+        earlierPending ||
+        entry.live ||
+        state.connection?.phase !== "ready"
+      )
+        return;
+      if (p.push === "chat_stale") {
+        pollNow();
+        return;
+      }
+      if (p.push !== "chat_delta" || !p.data || typeof p.data !== "object")
+        return;
+      const res = p.data;
+      const changed = Boolean(
+        entry.generation && res.generation && entry.generation !== res.generation,
+      );
+      if (
+        res.reset ||
+        changed ||
+        (!res.bound && (entry.items.length || entry.latestRecovery))
+      ) {
+        requestLatest();
+        pollNow();
+        return;
+      }
+      applyPollPayload(res, {
+        start: res.page_start ?? entry.offset,
+        latest: false,
+        resetHistory: false,
+        changed: false,
+        sameTail: false,
+        fromPush: true,
+      });
+    }
+    pushHandlers.add(handlePush);
     async function pollNow(initial = false) {
       // 숨은 Chat도 첫 내용을 받을 때까지는 받아 둔다(실패 2회까지). 연결 전에 마운트돼 첫 프리페치를 놓쳐도 ready 뒤 update()가 다시 받아, Chat을 누른 첫 프레임에 내용이 있다.
       if (
@@ -4578,90 +4769,14 @@
             entry.generation === res.generation &&
             entry.items.length === rItems.length &&
             rItems.every((item, index) => sameItem(entry.items[index], item));
-        const reset = Boolean(res.reset || changed || (latest && resetHistory)),
-          metaChanged =
-            entry.agent !== (res.agent || "") || entry.bound !== !!res.bound;
-        const hadItems = entry.items.length,
-          wasLoaded = entry.loaded,
-          anchor =
-            (!sameTail && (rItems.length || metaChanged)) || !pollStatus.hidden
-              ? readerAnchor()
-              : null;
-        if (res.reset && entry.progress && entry.progress.phase !== "sending")
-          entry.progress.rendered = true;
-        const generationChanged = Boolean(
-          !res.bound ||
-            (entry.generation &&
-              res.generation &&
-              entry.generation !== res.generation),
-        );
-        if (reset) {
-          clearTranscript(generationChanged);
-          following = true;
-        }
-        entry.generation = res.generation || entry.generation;
-        entry.agent = res.agent || "";
-        entry.bound = !!res.bound;
-        entry.initialized = entry.bound;
-        entry.loaded = true;
-        refreshLatest = false;
-        resetHistory = false;
-        entry.latestRecovery = false;
-        const effectiveStart = res.page_start ?? (res.reset ? 0 : start);
-        const incoming = normalizeItems(res, effectiveStart),
-          before = entry.items.length,
-          prevIds = new Set(entry.items.map((item) => item.id));
-        let reconciled = false;
-        if (incoming.length) {
-          if (latest && !reset && !sameTail) {
-            const incomingIds = new Set(incoming.map((item) => item.id)),
-              overlap = entry.items.findIndex((old) => incomingIds.has(old.id)),
-              next =
-                overlap >= 0
-                  ? [...entry.items.slice(0, overlap), ...incoming]
-                  : incoming;
-            reconciled =
-              next.length !== entry.items.length ||
-              next.some((item, i) => !sameItem(entry.items[i], item));
-            if (reconciled) entry.items = next;
-          } else if (!sameTail) {
-            const seen = new Set(entry.items.map((item) => item.id));
-            entry.items.push(...incoming.filter((item) => !seen.has(item.id)));
-          }
-          rememberPage(effectiveStart, res.next_offset);
-        }
-        const trimmed = incoming.length && trimItems(true);
-        if (
-          !reset &&
-          wasLoaded &&
-          hadItems > 0 &&
-          !following &&
-          entry.items.length > before
-        ) {
-          const firstUnread = entry.items.find((item) => !prevIds.has(item.id));
-          if (firstUnread) entry.unreadFromId ||= firstUnread.id;
-        }
-        if (typeof res.next_offset === "number") entry.offset = res.next_offset;
-        lastSuccess = entry.lastSuccess = Date.now();
-        failures = 0;
-        pollStatus.hidden = true;
-        if (
-          reconciled ||
-          entry.items.length !== before ||
-          trimmed ||
-          metaChanged ||
-          !wasLoaded ||
-          (reset && (hadItems || !renderedItems))
-        )
-          renderItems(!reset && !trimmed && !reconciled ? before : undefined);
-        updateStatus();
-        restoreReader(anchor);
-        pruneCache(state);
-        refreshStatus(
-          incoming.some(
-            (item) => item.kind === "permission" || item.kind === "question",
-          ),
-        );
+        applyPollPayload(res, {
+          start,
+          latest,
+          resetHistory,
+          changed,
+          sameTail,
+          fromPush: false,
+        });
       } catch (error) {
         if (!current()) return;
         if (
@@ -4872,7 +4987,7 @@
         pollTimer = setTimeout(async () => {
           await pollNow();
           schedule();
-        }, 1500);
+        }, pollDelay());
     }
     function visibilityChanged() {
       if (!isVisible()) {
@@ -4881,6 +4996,7 @@
         earlierQueued = false;
         clearStatusRetry();
       }
+      syncChatSubscription();
       schedule();
       syncTailRunSummary();
       if (isVisible()) {
@@ -4937,6 +5053,16 @@
         discovery.clear();
         discovering.clear();
         disposed = true;
+        pushHandlers.delete(handlePush);
+        if (subscribed) {
+          subscribed = false;
+          subscribedOffset = null;
+          subscribedConn = null;
+          if (state.connection?.phase === "ready")
+            ctx
+              .rpc({ action: "chat_unsubscribe", session: sessionId })
+              .catch(() => {});
+        }
         if (panelOpen(replyPanel)) ctx.closeSheet?.();
         entry.mounts = Math.max(0, (entry.mounts || 1) - 1);
         globalThis.document?.removeEventListener?.(
@@ -4970,6 +5096,9 @@
     highlightCode,
     renderRichText,
     userMessageFolds,
+    onPush(payload) {
+      for (const fn of [...pushHandlers]) fn(payload);
+    },
   };
   M.screens.chat = (root, ctx) => {
     const session = ctx.state.sessions.get(ctx.route.sessionId);

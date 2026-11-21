@@ -643,6 +643,48 @@ impl Registry {
         self.serve_as(s, hello, true, None)
     }
 
+    pub(crate) fn handle_control_mobile(&self, req: Request) -> Reply {
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let reply = match req {
+            Request::Orchestration(krill_proto::orchestration::OrchAction::SnapshotPage {
+                generation,
+                offset,
+            }) => self.orchestration_page(&peer, generation, offset, ipc::FEATURES),
+            other => self.handle_as(&peer, "mobile-pwa", other, &mut HashMap::new()),
+        };
+        match reply {
+            Reply::Orchestration(response) => {
+                Reply::Orchestration(response.for_features(ipc::FEATURES))
+            }
+            reply => reply,
+        }
+    }
+
+    pub(crate) fn handle_usage_mobile(
+        &self,
+        req: krill_proto::usage::UsageRequest,
+    ) -> krill_proto::usage::UsageReply {
+        let peer = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let required = req.required_features();
+        if ipc::FEATURES & required == required {
+            self.on_usage_negotiated(
+                &peer,
+                Role::InteractiveWithSize { owns_size: false },
+                req,
+                ipc::FEATURES,
+            )
+        } else {
+            krill_proto::usage::UsageReply::Failed(Failure::BadRequest)
+        }
+        .for_features(ipc::FEATURES)
+    }
+
     fn serve_as(
         &self,
         mut s: UnixStream,

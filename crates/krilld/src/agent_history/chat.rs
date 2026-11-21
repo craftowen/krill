@@ -438,8 +438,19 @@ fn poll_transcript_file_until(
                 // 거대 줄조차 아직 `\n`이 디스크에 기록되지 않았으면 다음 폴링에서 다시 읽는다.
                 break;
             }
+            if !items.is_empty() && items.len() >= MAX_CHAT_ITEMS {
+                break;
+            }
             consumed = consumed.saturating_add(skipped);
             batch_bytes = batch_bytes.saturating_add(64 * 1024);
+            items.push(ChatItem {
+                kind: ChatItemKind::ToolResult,
+                text: "Skipped oversized entry".into(),
+                ..Default::default()
+            });
+            if items.len() >= MAX_CHAT_ITEMS {
+                break;
+            }
             continue;
         }
         let n_u64 = u64::try_from(n).unwrap_or(0);
@@ -3287,9 +3298,11 @@ mod tests {
         let snap_huge =
             poll_transcript_file(VaultAgent::Claude, "sid-claude-1", &path, snap2.next_offset);
         assert!(snap_huge.next_offset > snap2.next_offset + 600 * 1024);
-        assert_eq!(snap_huge.items.len(), 1);
-        assert_eq!(snap_huge.items[0].kind, ChatItemKind::Assistant);
-        assert_eq!(snap_huge.items[0].text, "거대 줄 통과 완료");
+        assert_eq!(snap_huge.items.len(), 2);
+        assert_eq!(snap_huge.items[0].kind, ChatItemKind::ToolResult);
+        assert_eq!(snap_huge.items[0].text, "Skipped oversized entry");
+        assert_eq!(snap_huge.items[1].kind, ChatItemKind::Assistant);
+        assert_eq!(snap_huge.items[1].text, "거대 줄 통과 완료");
 
         // 파일이 절단(/clear 등)되면 reset=true와 함께 처음부터 다시 읽는다.
         fs::write(&path, format!("{line1}\n")).unwrap();

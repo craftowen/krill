@@ -495,3 +495,72 @@ fn load_earlier_chat_preserves_cursor_on_transient_error_and_retries(
         assert_eq!(log.items[0].text, "older ok");
     });
 }
+
+#[gpui::test]
+fn active_chat_poll_interval_adapts_to_session_state(cx: &mut gpui::TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus};
+
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (view, cx) = open(cx, state_path("chat-poll-interval"));
+    let pane = view.read_with(cx, |s, _| s.layout.focused().unwrap());
+    let sid = SessionId(995);
+    view.update(cx, |shell, _| {
+        shell.layout.set_session(pane, sid);
+    });
+    view.read_with(cx, |shell, cx| {
+        assert_eq!(
+            shell.active_chat_poll_interval(cx),
+            Duration::from_millis(800)
+        );
+    });
+
+    for (state, expected_ms) in [
+        (AgentState::Unknown, 800),
+        (AgentState::Working, 250),
+        (AgentState::Done, 1500),
+        (AgentState::Waiting, 1500),
+    ] {
+        let snap = krill_app::sidebar::Snapshot {
+            sessions: vec![krill_app::sidebar::Session {
+                id: sid,
+                status: AgentStatus {
+                    state,
+                    agent: "claude".into(),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: None,
+                cwd: None,
+                account: None,
+            }],
+            trees: BTreeMap::new(),
+        };
+        view.update(cx, |shell, cx| {
+            shell.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(Arc::new(StateSource(snap)), cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |shell, cx| {
+            assert_eq!(
+                shell.active_chat_poll_interval(cx),
+                Duration::from_millis(expected_ms),
+                "unexpected interval for {state:?}"
+            );
+        });
+    }
+
+    view.update(cx, |shell, cx| {
+        let key = (shell.layout.host(pane).clone(), sid);
+        shell.chat.poll_failed.insert(key);
+        assert_eq!(
+            shell.active_chat_poll_interval(cx),
+            Duration::from_millis(800)
+        );
+    });
+}

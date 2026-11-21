@@ -534,6 +534,14 @@ enum Action {
         #[serde(default)]
         bot_id: Option<String>,
     },
+    ChatSubscribe {
+        session: u64,
+        #[serde(default)]
+        offset: u64,
+    },
+    ChatUnsubscribe {
+        session: u64,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1296,6 +1304,23 @@ impl Backend {
                     _ => Err(invalid()),
                 }
             }
+            Action::ChatSubscribe { session, offset } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                let snapshot = registry.chat_poll(SessionId(session), offset);
+                let watch_path = (!snapshot.transcript_path.is_empty())
+                    .then(|| PathBuf::from(&snapshot.transcript_path));
+                let push = feed::subscribe_chat(session, offset, watch_path).unwrap_or(false);
+                Ok(json!({
+                    "subscribed": true,
+                    "session": session,
+                    "offset": offset,
+                    "push": push,
+                }))
+            }
+            Action::ChatUnsubscribe { session } => {
+                feed::unsubscribe_chat(session);
+                Ok(json!({"unsubscribed": true}))
+            }
         }
     }
     fn bots_inactive(&self) -> io::Result<bool> {
@@ -1478,17 +1503,44 @@ impl Backend {
         std::mem::swap(&mut wire.socket, &mut socket);
         Ok(wire)
     }
+    pub(super) fn poll_chat_for_feed(
+        &self,
+        session: u64,
+        offset: u64,
+    ) -> io::Result<feed::ChatFeedPoll> {
+        let registry = self.registry.upgrade().ok_or_else(invalid)?;
+        let snapshot = registry.chat_poll(SessionId(session), offset);
+        let next_offset = snapshot.next_offset;
+        let watch_path = (!snapshot.transcript_path.is_empty())
+            .then(|| PathBuf::from(&snapshot.transcript_path));
+        if !snapshot.reset && snapshot.items.is_empty() && next_offset == offset {
+            return Ok(feed::ChatFeedPoll {
+                delta: None,
+                next_offset,
+                watch_path,
+            });
+        }
+        let delta = chat_page_value(snapshot, offset)?;
+        Ok(feed::ChatFeedPoll {
+            delta: Some(delta),
+            next_offset,
+            watch_path,
+        })
+    }
     fn control(&self, request: &Request) -> io::Result<Reply> {
-        let mut wire = self.wire()?;
-        wire.socket.write_all(&request.encode()?)?;
-        let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-        Reply::decode(kind, &body).map_err(Into::into)
+        Ok(self
+            .registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .handle_control_mobile(request.clone()))
     }
     fn accounts(&self, request: &UsageRequest) -> io::Result<krill_proto::usage::AccountsSnapshot> {
-        let mut wire = self.wire()?;
-        wire.socket.write_all(&request.encode()?)?;
-        let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-        match UsageReply::decode(kind, &body)? {
+        match self
+            .registry
+            .upgrade()
+            .ok_or_else(invalid)?
+            .handle_usage_mobile(request.clone())
+        {
             UsageReply::Accounts(data) => Ok(data),
             UsageReply::Failed(e) => Err(io::Error::other(e.to_string())),
             _ => Err(invalid()),
@@ -1872,7 +1924,7 @@ impl Backend {
         }
         let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value});
         bound_snapshot_payload(&mut data);
@@ -5122,5 +5174,68 @@ mod revision_tests {
         reader.join().ok();
         drop(backend);
         drop(registry);
+    }
+
+    #[test]
+    fn live_prompt_reply_action_deserializes_exact_client_payloads() {
+        let yes_no: Action = serde_json::from_str(
+            &json!({
+                "action": "live_prompt_reply",
+                "session": 1,
+                "expected_prompt": "Allow?",
+                "yes": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            yes_no,
+            Action::LivePromptReply {
+                session: 1,
+                yes: Some(true),
+                choice: None,
+                custom_text: None,
+                ..
+            }
+        ));
+
+        let other: Action = serde_json::from_str(
+            &json!({
+                "action": "live_prompt_reply",
+                "session": 1,
+                "expected_prompt": "Pick deployment mode",
+                "choice": 1,
+                "custom_text": "Canary 10%"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            other,
+            Action::LivePromptReply {
+                session: 1,
+                yes: None,
+                choice: Some(1),
+                custom_text: Some(ref text),
+                ..
+            } if text == "Canary 10%"
+        ));
+
+        let sub: Action = serde_json::from_str(
+            &json!({"action": "chat_subscribe", "session": 42, "offset": 128}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            sub,
+            Action::ChatSubscribe {
+                session: 42,
+                offset: 128
+            }
+        ));
+
+        let unsub: Action =
+            serde_json::from_str(&json!({"action": "chat_unsubscribe", "session": 42}).to_string())
+                .unwrap();
+        assert!(matches!(unsub, Action::ChatUnsubscribe { session: 42 }));
     }
 }

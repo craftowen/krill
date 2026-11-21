@@ -1,7 +1,7 @@
 //! MK-082·MK-181: 요청 시 멀티 에이전트 대화 기록을 스캔·전문 검색하고 선택한 대화를 새 탭에서 재개한다.
 //! 열기·새로고침·검색·필터 전환 때만 일회성 백그라운드 IO를 실행하며, 감시·폴링·상주 프로세스는 없다.
 use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
@@ -28,6 +28,17 @@ fn daemon_call() -> Call {
     daemon_call_for(None)
 }
 
+fn should_reconnect_ipc(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
 pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
     #[cfg(test)]
     if target.is_none() {
@@ -38,28 +49,55 @@ pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
             ))
         });
     }
+    let cached: Mutex<Option<daemon::Connection>> = Mutex::new(None);
     Arc::new(move |json| {
-        let mut hello = daemon::client_hello(ClientRole::App, "krill-app-composer");
-        hello.features = krill_proto::mobile::FEAT_MOBILE;
-        let target = match &target {
-            Some(t) => t.clone(),
-            None => HostTarget::local_dev()?,
-        };
-        let conn = target.connect(&hello).map_err(io::Error::other)?;
-        if conn.negotiated.features & krill_proto::mobile::FEAT_MOBILE == 0 {
-            return Err(io::ErrorKind::Unsupported.into());
-        }
-        let mut sock = conn.stream;
-        sock.set_read_timeout(Some(Duration::from_secs(15)))?;
-        sock.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut guard = cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let req = krill_proto::mobile::MobileRequest::Workflow(json.to_owned());
-        sock.write_all(&req.encode()?)?;
-        let (kind, body) = ipc::read_frame(&mut sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-        match krill_proto::mobile::MobileReply::decode(kind, &body)? {
-            krill_proto::mobile::MobileReply::Workflow(out) => Ok(out),
-            krill_proto::mobile::MobileReply::Failed(err) => Err(io::Error::other(err)),
-            _ => Err(io::ErrorKind::InvalidData.into()),
+        for attempt in 0..2 {
+            if guard.is_none() {
+                let mut hello = daemon::client_hello(ClientRole::App, "krill-app-composer");
+                hello.features = krill_proto::mobile::FEAT_MOBILE;
+                let resolved = match &target {
+                    Some(t) => t.clone(),
+                    None => HostTarget::local_dev()?,
+                };
+                let conn = resolved.connect(&hello).map_err(io::Error::other)?;
+                if conn.negotiated.features & krill_proto::mobile::FEAT_MOBILE == 0 {
+                    return Err(io::ErrorKind::Unsupported.into());
+                }
+                conn.stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))?;
+                conn.stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))?;
+                *guard = Some(conn);
+            }
+            let result = (|| -> io::Result<String> {
+                let conn = guard.as_mut().ok_or(io::ErrorKind::NotConnected)?;
+                conn.stream.write_all(&req.encode()?)?;
+                let (kind, body) =
+                    ipc::read_frame(&mut conn.stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+                match krill_proto::mobile::MobileReply::decode(kind, &body)? {
+                    krill_proto::mobile::MobileReply::Workflow(out) => Ok(out),
+                    krill_proto::mobile::MobileReply::Failed(err) => Err(io::Error::other(err)),
+                    _ => Err(io::ErrorKind::InvalidData.into()),
+                }
+            })();
+            match result {
+                Ok(out) => return Ok(out),
+                Err(err) if attempt == 0 && should_reconnect_ipc(&err) => {
+                    *guard = None;
+                }
+                Err(err) => {
+                    if should_reconnect_ipc(&err) {
+                        *guard = None;
+                    }
+                    return Err(err);
+                }
+            }
         }
+        Err(io::ErrorKind::NotConnected.into())
     })
 }
 
@@ -73,17 +111,44 @@ pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
             ))
         });
     }
+    let cached: Mutex<Option<daemon::Connection>> = Mutex::new(None);
     Arc::new(move |req| {
-        let hello = daemon::client_hello(ClientRole::App, "krill-app-history");
-        let target = match &target {
-            Some(t) => t.clone(),
-            None => HostTarget::local_dev()?,
-        };
-        let conn = target.connect(&hello).map_err(io::Error::other)?;
-        let mut sock = conn.stream;
-        sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-        sock.set_write_timeout(Some(Duration::from_secs(2)))?;
-        exchange(conn.negotiated.features, &mut sock, req)
+        let mut guard = cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for attempt in 0..2 {
+            if guard.is_none() {
+                let hello = daemon::client_hello(ClientRole::App, "krill-app-history");
+                let resolved = match &target {
+                    Some(t) => t.clone(),
+                    None => HostTarget::local_dev()?,
+                };
+                let conn = resolved.connect(&hello).map_err(io::Error::other)?;
+                conn.stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))?;
+                conn.stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))?;
+                *guard = Some(conn);
+            }
+            let result = {
+                let conn = guard.as_mut().ok_or(io::ErrorKind::NotConnected)?;
+                let features = conn.negotiated.features;
+                exchange(features, &mut conn.stream, req)
+            };
+            match result {
+                Ok(reply) => return Ok(reply),
+                Err(err) if attempt == 0 && should_reconnect_ipc(&err) => {
+                    *guard = None;
+                }
+                Err(err) => {
+                    if should_reconnect_ipc(&err) {
+                        *guard = None;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(io::ErrorKind::NotConnected.into())
     })
 }
 

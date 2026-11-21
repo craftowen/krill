@@ -5790,7 +5790,7 @@ async function unboundEmptyAndVisibilityTransitions() {
       p2b.calls.some(
         (c) =>
           c.action === "live_prompt_reply" &&
-          c.yes_no === true &&
+          c.yes === true &&
           c.expected_prompt === "Deploy to production? (y/n)",
       ),
     );
@@ -5879,13 +5879,107 @@ async function unboundEmptyAndVisibilityTransitions() {
       p2b.calls.some(
         (c) =>
           c.action === "live_prompt_reply" &&
-          c.other?.option_index === 1 &&
-          c.other?.text === "Canary 10%",
+          c.choice === 1 &&
+          c.custom_text === "Canary 10%",
       ),
     );
 
     p2b.dispose();
     console.log("PASS Phase 2B: Queue/Steer, Stop cooldown, WorkRun diffs, unread divider, rate-limit banner, live_prompt_reply");
+  }
+
+  // Phase 3A: chat_push subscribe/unsubscribe and chat_delta/chat_stale dispatch.
+  {
+    let pollReply = {
+      generation: "g-3a",
+      agent: "claude",
+      bound: true,
+      page_start: 0,
+      next_offset: 100,
+      items: [{ id: "0:0", kind: "assistant", text: "initial tail" }],
+    };
+    const p3a = fixture({
+      lang: "en",
+      capabilities: {
+        chat_tail: true,
+        chat_push: true,
+        chat_composer: true,
+        live_prompt_reply: true,
+      },
+      handler: async (req) => {
+        if (req.action === "chat_composer") {
+          return { agent: "claude", supported: true, model: "claude-opus-5-5" };
+        }
+        return pollReply;
+      },
+    });
+    await flush();
+    assert(
+      p3a.calls.some(
+        (c) => c.action === "chat_subscribe" && c.session === 7 && c.offset === 100,
+      ),
+      "expected initial chat_subscribe after poll",
+    );
+    const pollsBefore = p3a.calls.filter((c) => c.action === "chat_poll").length;
+    const subsBefore = p3a.calls.filter((c) => c.action === "chat_subscribe").length;
+
+    p3a.M.chat.onPush({
+      push: "chat_delta",
+      session: 7,
+      data: {
+        generation: "g-3a",
+        agent: "claude",
+        bound: true,
+        page_start: 100,
+        next_offset: 160,
+        items: [{ id: "100:0", kind: "assistant", text: "pushed delta reply" }],
+      },
+    });
+    await flush();
+    assert.equal(p3a.entry.offset, 160);
+    assert(p3a.entry.items.some((i) => i.text === "pushed delta reply"));
+    assert.equal(p3a.calls.filter((c) => c.action === "chat_poll").length, pollsBefore);
+    assert.equal(p3a.calls.filter((c) => c.action === "chat_subscribe").length, subsBefore);
+
+    const statusCallsBefore = p3a.calls.filter((c) => c.action === "chat_composer").length;
+    p3a.M.chat.onPush({
+      push: "chat_delta",
+      session: 7,
+      data: {
+        generation: "g-3a",
+        agent: "claude",
+        bound: true,
+        page_start: 160,
+        next_offset: 200,
+        items: [{ id: "160:0", kind: "permission", tool_name: "Bash", text: "Allow?" }],
+      },
+    });
+    await flush();
+    assert(
+      p3a.calls.filter((c) => c.action === "chat_composer").length > statusCallsBefore,
+      "permission delta should trigger status refresh",
+    );
+
+    pollReply = {
+      generation: "g-3a",
+      agent: "claude",
+      bound: true,
+      page_start: 200,
+      next_offset: 240,
+      items: [{ id: "200:0", kind: "assistant", text: "stale fallback item" }],
+    };
+    p3a.M.chat.onPush({ push: "chat_stale", session: 7 });
+    await flush();
+    assert(p3a.calls.filter((c) => c.action === "chat_poll").length > pollsBefore);
+    assert(p3a.entry.items.some((i) => i.text === "stale fallback item"));
+
+    p3a.dispose();
+    await flush();
+    assert(
+      p3a.calls.some((c) => c.action === "chat_unsubscribe" && c.session === 7),
+      "dispose should unsubscribe chat push",
+    );
+    console.log("PASS Phase 3A: chat_subscribe/unsubscribe and chat_delta/chat_stale push client");
   }
 }
 main().catch((error) => {

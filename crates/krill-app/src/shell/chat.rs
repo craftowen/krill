@@ -1452,16 +1452,35 @@ impl Shell {
         }
     }
 
+    fn active_chat_poll_interval(&self, cx: &gpui::App) -> Duration {
+        use krill_proto::control::AgentState;
+        let Some(pane) = self.layout.focused() else {
+            return Duration::from_millis(800);
+        };
+        let Some(session) = self.layout.session(pane) else {
+            return Duration::from_millis(800);
+        };
+        let key = (self.layout.host(pane).clone(), session);
+        match self.session_status(&key, cx).map(|(state, _)| state) {
+            Some(AgentState::Working) => Duration::from_millis(250),
+            Some(
+                AgentState::Done | AgentState::Waiting | AgentState::Blocked | AgentState::Exited,
+            ) if !self.chat.poll_failed.contains(&key) => Duration::from_millis(1500),
+            _ => Duration::from_millis(800),
+        }
+    }
+
     pub(super) fn maybe_poll_active_chat(&mut self, cx: &mut Context<Self>) {
         self.prune_chat_lists();
         if !self.is_active_chat_view_in(cx) {
             return;
         }
+        let interval = self.active_chat_poll_interval(cx);
         let now = std::time::Instant::now();
         if self
             .chat
             .last_poll
-            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(800))
+            .is_some_and(|last| now.duration_since(last) < interval)
         {
             return;
         }
@@ -1474,26 +1493,27 @@ impl Shell {
         if self.chat.poll_timer.is_some() {
             return;
         }
+        let mut sleep_for = self.active_chat_poll_interval(cx);
         self.chat.poll_timer = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(800))
-                    .await;
-                let keep_polling = this
+                cx.background_executor().timer(sleep_for).await;
+                let next_interval = this
                     .update(cx, |this, cx| {
                         if this.page_open()
                             || this.dashboard.is_some()
                             || !this.is_active_chat_view_in(cx)
                         {
                             this.chat.poll_timer = None;
-                            return false;
+                            return None;
                         }
                         this.poll_active_chat(cx);
-                        true
+                        Some(this.active_chat_poll_interval(cx))
                     })
-                    .unwrap_or(false);
-                if !keep_polling {
-                    break;
+                    .ok()
+                    .flatten();
+                match next_interval {
+                    Some(interval) => sleep_for = interval,
+                    None => break,
                 }
             }
         }));
