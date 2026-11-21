@@ -753,7 +753,8 @@ fn create_form_submits_with_cmd_enter_and_custom_model(cx: &mut TestAppContext) 
         name.update(cx, |input, cx| input.focus(window, cx));
     });
     vcx.run_until_parked();
-    vcx.simulate_keystrokes("cmd-enter");
+    // `secondary`는 macOS에서 Cmd, 그 밖에서는 Ctrl이다(폼 단축키와 같은 기준).
+    vcx.simulate_keystrokes("secondary-enter");
     vcx.run_until_parked();
 
     vcx.update(|_, cx| {
