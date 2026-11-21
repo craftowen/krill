@@ -6085,6 +6085,100 @@ async function unboundEmptyAndVisibilityTransitions() {
     p3b.dispose();
     console.log("PASS Phase 3B: in-chat search, multi-attachment (<=4), and message actions <dialog>");
   }
+
+  // Queued prompt failure preserves text + photo attachments instead of dropping data
+  {
+    let failNextPrompt = true;
+    const fx = fixture({
+      capabilities: { chat_tail: true, chat_interrupt: true, prompt_steer: true },
+      handler: async (req) => {
+        if (req.action === "prompt" && failNextPrompt) {
+          throw new Error("Connection interrupted");
+        }
+        if (req.action === "prompt") return { sent: true };
+        if (req.action === "chat_poll") {
+          return { generation: "g-q", agent: "claude", bound: true, items: [], page_start: 0, next_offset: 0 };
+        }
+        return { supported: false };
+      },
+    });
+    fx.state.sessions.set(7, { id: 7, state: "Working", state_since_unix_ns: "1", cwd: "/work" });
+    fx.update();
+    await flush();
+
+    const picker = fx.root.descendants().find((n) => n.tag === "input" && n.type === "file");
+    fx.prepare = async (_s, f) => ({ mime: "image/png", data: `q-${f.name}` });
+    picker.files = [{ name: "shot.png" }];
+    picker.dispatchEvent(new Event("change"));
+    await flush();
+    fx.input("queued with photo");
+    fx.button("Queue").action();
+    await flush();
+    assert.equal(fx.find("chat-input").value, "");
+    assert.equal(fx.entry.attachments.length, 0);
+
+    // Second queued prompt stays behind while first fails into empty composer draft
+    fx.input("second queued");
+    fx.button("Queue").action();
+    await flush();
+
+    fx.state.sessions.set(7, { id: 7, state: "Done", state_since_unix_ns: "2", cwd: "/work" });
+    fx.update();
+    await flush();
+    assert.equal(
+      fx.find("chat-input").value,
+      "queued with photo",
+      "failed queued prompt restores text to composer draft when draft is empty",
+    );
+    assert.equal(fx.state.drafts.get(7), "queued with photo");
+    assert.equal(fx.entry.attachments.length, 1);
+    assert.equal(fx.entry.attachments[0].prepared.data, "q-shot.png");
+    assert.equal(
+      fx.calls.filter((c) => c.action === "prompt").length,
+      1,
+      "second queued item must wait when first fails instead of jumping ahead",
+    );
+
+    // Case 2: if user already typed a new draft, failed queued prompt returns to head of queue with Retry
+    fx.button("Remove queued").action();
+    await flush();
+    fx.state.sessions.set(7, { id: 7, state: "Working", state_since_unix_ns: "3", cwd: "/work" });
+    fx.update();
+    await flush();
+    // Composer still holds "queued with photo" + photo; clear photo and queue a text prompt, then type a new draft
+    fx.entry.attachments = [];
+    fx.entry.photo = null;
+    fx.input("queued kept behind draft");
+    fx.button("Queue").action();
+    await flush();
+    fx.input("brand new draft");
+
+    fx.state.sessions.set(7, { id: 7, state: "Done", state_since_unix_ns: "4", cwd: "/work" });
+    fx.update();
+    await flush();
+    assert.equal(fx.find("chat-input").value, "brand new draft", "new user draft is never overwritten");
+    assert.equal(fx.entry.queuedPrompts.length, 1);
+    assert.equal(fx.entry.queuedPrompts[0].text, "queued kept behind draft");
+    assert.equal(fx.find("chat-queued-strip").hidden, false);
+
+    failNextPrompt = false;
+    const retryQueueBtn = fx
+      .find("chat-queued-strip")
+      .descendants()
+      .find((n) => n.textContent === "Retry");
+    assert(retryQueueBtn, "paused queued item renders Retry button");
+    retryQueueBtn.action();
+    await flush();
+    assert(
+      fx.calls.some((c) => c.action === "prompt" && c.text === "queued kept behind draft"),
+      "Retry dispatches the preserved queued item",
+    );
+    assert.equal(fx.find("chat-queued-strip").hidden, true);
+    assert.equal(fx.find("chat-input").value, "brand new draft");
+
+    fx.dispose();
+    console.log("PASS failed queued prompts preserve text/photos without dropping or clobbering active drafts");
+  }
 }
 main().catch((error) => {
   console.error(error);

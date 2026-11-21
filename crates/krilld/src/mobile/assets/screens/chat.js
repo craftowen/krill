@@ -2656,18 +2656,35 @@ const items = entry.queuedPrompts || [];
 queuedStrip.replaceChildren();
 queuedStrip.hidden = !items.length;
 if (!items.length) return;
-for (const item of items) {
+for (const [idx, item] of items.entries()) {
 const row = el("div", undefined, "chat-queued-item"),
 preview = String(item.text || "").trim() || t("Photo");
+row.append(el("span", preview, "chat-queued-label"));
+if (idx === 0 && entry.queuePaused) {
 row.append(
-el("span", preview, "chat-queued-label"),
+button(
+t("Retry"),
+() => {
+entry.queuePaused = false;
+updateComposer();
+},
+"ghost small",
+),
+);
+}
+row.append(
 button(
 t("Remove queued"),
 () => {
-entry.queuedPrompts = (entry.queuedPrompts || []).filter(
+const remaining = (entry.queuedPrompts || []).filter(
 (q) => q.id !== item.id,
 );
+if (!remaining.length || entry.queuedPrompts?.[0]?.id === item.id) {
+entry.queuePaused = false;
+}
+entry.queuedPrompts = remaining;
 renderQueuedStrip();
+if (!entry.queuePaused) flushQueued();
 },
 "ghost small",
 ),
@@ -2686,6 +2703,7 @@ atts.some((a) => a.status === "pending" || a.status === "error")
 return;
 const text = input.value;
 if (!text.trim() && !atts.length) return;
+if (!(entry.queuedPrompts?.length > 0)) entry.queuePaused = false;
 entry.queuedPrompts ||= [];
 entry.queuedPrompts.push({
 id: ++queueSeq,
@@ -2711,6 +2729,7 @@ const sess = state.sessions?.get(sessionId);
 if (
 !active() ||
 entry.sending ||
+entry.queuePaused ||
 liveQuestion ||
 entry.modelPending ||
 state.connection?.phase !== "ready" ||
@@ -2726,9 +2745,10 @@ photo: next.photo,
 photos: next.attachments,
 steer: false,
 fromDraft: false,
+queuedItem: next,
 });
 }
-function dispatchPrompt({ text, photo, photos, steer, fromDraft }) {
+function dispatchPrompt({ text, photo, photos, steer, fromDraft, queuedItem }) {
 const attList =
 Array.isArray(photos) && photos.length ? photos : photo ? [photo] : [];
 if (
@@ -2813,6 +2833,31 @@ const message = cleanRpcError(error, t);
 if (entry.progress.phase === "sending") {
 entry.progress.phase = "error";
 entry.progress.error = message;
+}
+if (queuedItem) {
+const currentDraft =
+ownsEntry() && !disposed ? input.value : drafts.get(sessionId) || "";
+const currentAtts = entry.attachments || [];
+if (!String(currentDraft).trim() && !currentAtts.length) {
+entry.draftVersion = (entry.draftVersion || 0) + 1;
+if (queuedItem.text) drafts.set(sessionId, queuedItem.text);
+else drafts.delete(sessionId);
+saveDrafts();
+if (ownsEntry() && !disposed) {
+input.value = queuedItem.text || "";
+sizeInput();
+}
+if (attList.length) {
+entry.photoVersion++;
+entry.attachments = attList.slice();
+syncEntryPhoto();
+}
+if (entry.queuedPrompts?.length) entry.queuePaused = true;
+} else {
+entry.queuePaused = true;
+entry.queuedPrompts ||= [];
+entry.queuedPrompts.unshift(queuedItem);
+}
 }
 throw Error(message);
 } finally {
