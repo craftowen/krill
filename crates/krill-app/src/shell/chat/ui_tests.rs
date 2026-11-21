@@ -1619,9 +1619,30 @@ fn chat_overlay_split_right_button_splits_and_closes_pane(cx: &mut TestAppContex
     cx.run_until_parked();
     let visible_count = shell.read_with(cx, |shell, _| shell.layout.visible().len());
     assert_eq!(visible_count, 2);
+    assert!(
+        cx.debug_bounds(close_sel).is_none(),
+        "unfocused split chat pane auto-hides close button until hovered"
+    );
+    let top_sel: &'static str =
+        Box::leak(format!("chat-top-controls-{}", pane.get()).into_boxed_str());
+    let top_bounds = cx
+        .debug_bounds(top_sel)
+        .expect("split chat pane mounts top controls");
+    cx.simulate_mouse_move(
+        point(top_bounds.right() - px(8.), top_bounds.center().y),
+        None,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let down_sel: &'static str =
+        Box::leak(format!("chat-split-down-{}", pane.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(down_sel).is_some(),
+        "hovering split chat top controls reveals split-down"
+    );
     let close_btn = cx
         .debug_bounds(close_sel)
-        .expect("split chat pane exposes close button");
+        .expect("hovering split chat top controls reveals close button");
     cx.simulate_click(close_btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let visible_count = shell.read_with(cx, |shell, _| shell.layout.visible().len());

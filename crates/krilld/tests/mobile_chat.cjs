@@ -124,6 +124,7 @@ function fixture(options = {}) {
     },
     clearTimeout: (id) => timers.delete(id),
     KrillMobile: {},
+    MkKeyboard: options.MkKeyboard,
     ResizeObserver: options.ResizeObserver,
   };
   vm.createContext(sandbox);
@@ -5384,6 +5385,34 @@ async function unboundEmptyAndVisibilityTransitions() {
   qChat.dispose();
   console.log(
     "PASS unbound empty composer stays usable without error, hidden->visible poll queue & input resize, and modelBtn disabled on liveQuestion",
+  );
+
+  // 4) MkKeyboard.keepFocus covers attachment/leading/contextMeter without blocking Send button focus transfer (IME commit).
+  const kept = [];
+  const imeFx = fixture({
+    MkKeyboard: {
+      keepFocus(container) {
+        kept.push(container);
+      },
+    },
+  });
+  await flush();
+  const hasNode = (rootNode, target) =>
+    rootNode === target || rootNode.descendants().includes(target);
+  const sendNode = imeFx.find("primary composer-send");
+  const modelNode = imeFx.find("composer-pill");
+  const attachNode = imeFx.find("icon-button composer-icon");
+  const ctxNode = imeFx.find("composer-context");
+  assert(
+    !kept.some((c) => hasNode(c, sendNode)),
+    "sendBtn must stay outside keepFocus so tapping Send commits IME composition",
+  );
+  assert(kept.some((c) => hasNode(c, modelNode)));
+  assert(kept.some((c) => hasNode(c, attachNode)));
+  assert(kept.some((c) => hasNode(c, ctxNode)));
+  imeFx.dispose();
+  console.log(
+    "PASS MkKeyboard.keepFocus protects composer accessories without capturing Send",
   );
 }
 main().catch((error) => {

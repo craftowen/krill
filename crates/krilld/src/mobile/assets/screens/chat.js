@@ -1230,7 +1230,7 @@
     box.append(suggestions, attachment, input, statusRow);
     composer.append(box, photoPicker);
     // Like Orca, the send tap takes focus so the IME commits the last syllable first.
-    for (const row of [attachment, statusRow])
+    for (const row of [attachment, leading, contextMeter])
       globalThis.MkKeyboard?.keepFocus(row, ctx.signal);
     // Read-only discovery is scoped to this mount, host cache and current provider/workspace.
     function chatAgent() {
