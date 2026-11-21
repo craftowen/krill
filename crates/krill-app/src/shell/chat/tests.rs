@@ -1178,3 +1178,40 @@ fn long_clipboard_text_paste_saves_private_txt_attachment_and_quotes_cleanly() {
     );
     assert_eq!(format_chat_quote("   "), None);
 }
+
+/// Every key of a typed sentence reaches the composer: none is taken by a chat shortcut
+/// (a PR screenshot once showed "Who. re. ou?", which turned out to be the synthetic typing tool
+/// under the Korean input method, not the composer).
+#[cfg(unix)]
+#[gpui::test]
+fn composer_keeps_every_typed_key(cx: &mut TestAppContext) {
+    use crate::shell::tests::{open, state_path};
+    let (shell, cx) = open(cx, state_path("chat-typed-keys"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    shell.update(cx, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(pane, SessionId(446));
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll(
+            SessionId(446),
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                ..ChatPollSnapshot::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let key = local_key(SessionId(446));
+    let input = shell.update(cx, |shell, _| {
+        shell.chat.inputs.get(&key).unwrap().0.clone()
+    });
+    cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
+    cx.run_until_parked();
+    let sentence = "Hi! Who are you? Answer in one short sentence.";
+    cx.simulate_input(sentence);
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(input.read(cx).value().as_ref(), sentence));
+}
