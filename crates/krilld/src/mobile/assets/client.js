@@ -1666,6 +1666,14 @@
         };
       function feedPush(current, p) {
         if (current !== generation) return;
+        if (p?.push === "chat_delta" || p?.push === "chat_stale") {
+          try {
+            options.onChatPush?.(p);
+          } catch (e) {
+            options.onError?.(e);
+          }
+          return;
+        }
         try {
           if (p.data && typeof p.data === "object") apply(p.data, true);
           else refresh().catch(() => {});

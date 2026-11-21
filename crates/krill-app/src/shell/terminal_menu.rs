@@ -180,7 +180,9 @@ impl MenuState {
             .separator()
             .menu(text::SPLIT_RIGHT.get(), Box::new(SplitRight))
             .menu(text::SPLIT_DOWN.get(), Box::new(SplitDown))
-            .menu(text::PANE_ZOOM_TOGGLE.get(), Box::new(ToggleZoomPane));
+            .menu(text::PANE_ZOOM_TOGGLE.get(), Box::new(ToggleZoomPane))
+            .separator()
+            .menu(text::TOGGLE_CHAT_VIEW.get(), Box::new(ToggleChatView));
         if let Some(can_fork) = self.fork_enabled {
             menu = menu
                 .separator()

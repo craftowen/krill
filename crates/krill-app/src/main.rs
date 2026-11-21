@@ -630,6 +630,10 @@ fn refresh_menus(cx: &mut App) {
                 krill_app::i18n::catalog::general::PANEL_TOGGLE.get(),
                 shell::TogglePanel,
             ),
+            MenuItem::action(
+                krill_app::i18n::catalog::shell::TOGGLE_CHAT_VIEW.get(),
+                shell::ToggleChatView,
+            ),
             MenuItem::separator(),
             MenuItem::action(
                 krill_app::i18n::catalog::general::ZOOM_IN_ITEM.get(),

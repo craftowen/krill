@@ -122,6 +122,7 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::ToggleChanges", text::SC_CHANGES),
     ("shell::ToggleExplorer", text::SC_EXPLORER),
     ("shell::ToggleSearch", text::SC_WORKSPACE_SEARCH),
+    ("shell::ToggleChatView", text::SC_TOGGLE_CHAT),
     ("shell::Jump", text::SC_JUMP),
     ("shell::CommandPalette", text::SC_COMMAND_PALETTE),
     ("shell::PrevSession", text::SC_PREV_SESSION),
@@ -183,6 +184,7 @@ pub(super) fn action_category(action: &str) -> Category {
         | "shell::Copy"
         | "shell::CopyClean"
         | "shell::Paste"
+        | "shell::ToggleChatView"
         | "popout::FloatTerminal" => Category::Terminal,
         "shell::NewAgentTab" | "shell::NewAgent1" | "shell::NewAgent2" | "shell::NewAgent3"
         | "shell::NewAgent4" => Category::Agents,

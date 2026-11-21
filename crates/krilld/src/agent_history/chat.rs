@@ -438,8 +438,19 @@ fn poll_transcript_file_until(
                 // 거대 줄조차 아직 `\n`이 디스크에 기록되지 않았으면 다음 폴링에서 다시 읽는다.
                 break;
             }
+            if !items.is_empty() && items.len() >= MAX_CHAT_ITEMS {
+                break;
+            }
             consumed = consumed.saturating_add(skipped);
             batch_bytes = batch_bytes.saturating_add(64 * 1024);
+            items.push(ChatItem {
+                kind: ChatItemKind::ToolResult,
+                text: "Skipped oversized entry".into(),
+                ..Default::default()
+            });
+            if items.len() >= MAX_CHAT_ITEMS {
+                break;
+            }
             continue;
         }
         let n_u64 = u64::try_from(n).unwrap_or(0);
@@ -1874,16 +1885,28 @@ fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) 
     }
 }
 
-/// 한 레코드의 시각. Claude·Codex는 `timestamp`(RFC 3339), `OpenCode`는 `time.created`(epoch ms)다.
+/// 한 레코드의 시각. Claude·Codex는 `timestamp`, Agy는 `created_at`, `OpenCode`는 `time.created`다.
 fn record_time(v: &Value) -> String {
-    if let Some(at) = v.get("timestamp").and_then(Value::as_str) {
-        return bounded(at.trim(), 64);
+    for val in [
+        v.get("timestamp"),
+        v.get("created_at"),
+        v.get("time").and_then(|t| t.get("created")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(s) = val.as_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return bounded(trimmed, 64);
+            }
+        } else if let Some(num) = val.as_u64() {
+            return bounded(&num.to_string(), 64);
+        } else if let Some(num) = val.as_i64().filter(|&n| n >= 0) {
+            return bounded(&num.to_string(), 64);
+        }
     }
-    v.get("time")
-        .and_then(|t| t.get("created"))
-        .and_then(Value::as_u64)
-        .map(|ms| ms.to_string())
-        .unwrap_or_default()
+    String::new()
 }
 
 fn parse_claude_line(v: &Value, out: &mut Vec<ChatItem>) {
@@ -2532,7 +2555,7 @@ fn emit_tool_or_special(name: &str, tool_id: &str, input: &Value, out: &mut Vec<
         .unwrap_or("")
         .trim()
         .trim_matches('"');
-    let summary = extract_tool_summary(input, &file_path);
+    let summary = extract_tool_summary(name, input, &file_path);
     push_item(
         out,
         ChatItem {
@@ -2629,6 +2652,8 @@ fn extract_tool_file_path(input: &Value) -> String {
         "file_path",
         "filePath",
         "path",
+        "file",
+        "target_file",
         "TargetFile",
         "AbsolutePath",
     ] {
@@ -2655,7 +2680,159 @@ fn extract_tool_file_path(input: &Value) -> String {
     String::new()
 }
 
-fn extract_tool_summary(input: &Value, file_path: &str) -> String {
+fn push_diff_hunk(out: &mut String, start_line: usize, old: &str, new: &str) {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    out.push_str("@@ -");
+    out.push_str(&start_line.to_string());
+    out.push(',');
+    out.push_str(&old_lines.len().to_string());
+    out.push_str(" +");
+    out.push_str(&start_line.to_string());
+    out.push(',');
+    out.push_str(&new_lines.len().to_string());
+    out.push_str(" @@\n");
+    for line in old_lines {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in new_lines {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+fn extract_tool_diff(tool_name: &str, input: &Value, file_path: &str) -> Option<String> {
+    let lower: String = tool_name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+    let is_file_edit_tool = matches!(
+        lower.as_str(),
+        "edit"
+            | "multiedit"
+            | "write"
+            | "notebookedit"
+            | "editfile"
+            | "writefile"
+            | "writetofile"
+            | "applypatch"
+            | "replacefilecontent"
+            | "multireplacefilecontent"
+    );
+
+    if let Some(raw_patch) = input
+        .as_str()
+        .filter(|s| s.contains("*** Begin Patch") || s.contains("@@") || s.contains("--- "))
+        .or_else(|| {
+            input
+                .get("patch")
+                .or_else(|| input.get("diff"))
+                .or_else(|| input.get("Patch"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(raw_patch.to_owned());
+    }
+
+    if !is_file_edit_tool {
+        return None;
+    }
+
+    let display_path = if file_path.is_empty() {
+        "file"
+    } else {
+        file_path
+    };
+
+    if let Some(chunks) = input
+        .get("edits")
+        .or_else(|| input.get("ReplacementChunks"))
+        .and_then(Value::as_array)
+        .filter(|arr| !arr.is_empty())
+    {
+        let mut out = format!("--- a/{display_path}\n+++ b/{display_path}\n");
+        let mut any_hunk = false;
+        for chunk in chunks {
+            let old = chunk
+                .get("old_string")
+                .or_else(|| chunk.get("oldString"))
+                .or_else(|| chunk.get("TargetContent"))
+                .or_else(|| chunk.get("old"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new = chunk
+                .get("new_string")
+                .or_else(|| chunk.get("newString"))
+                .or_else(|| chunk.get("ReplacementContent"))
+                .or_else(|| chunk.get("new"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if old.is_empty() && new.is_empty() {
+                continue;
+            }
+            let start = chunk
+                .get("StartLine")
+                .or_else(|| chunk.get("start_line"))
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1);
+            push_diff_hunk(&mut out, start, old, new);
+            any_hunk = true;
+        }
+        if any_hunk {
+            return Some(out.trim_end().to_owned());
+        }
+    }
+
+    let old = input
+        .get("old_string")
+        .or_else(|| input.get("oldString"))
+        .or_else(|| input.get("TargetContent"))
+        .and_then(Value::as_str);
+    let new = input
+        .get("new_string")
+        .or_else(|| input.get("newString"))
+        .or_else(|| input.get("ReplacementContent"))
+        .and_then(Value::as_str);
+    if old.is_some() || new.is_some() {
+        let mut out = format!("--- a/{display_path}\n+++ b/{display_path}\n");
+        let start = input
+            .get("StartLine")
+            .or_else(|| input.get("start_line"))
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        push_diff_hunk(&mut out, start, old.unwrap_or(""), new.unwrap_or(""));
+        return Some(out.trim_end().to_owned());
+    }
+
+    if let Some(content) = input
+        .get("content")
+        .or_else(|| input.get("CodeContent"))
+        .or_else(|| input.get("new_source"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let mut out = format!("--- a/{display_path}\n+++ b/{display_path}\n");
+        push_diff_hunk(&mut out, 1, "", content);
+        return Some(out.trim_end().to_owned());
+    }
+
+    None
+}
+
+fn extract_tool_summary(tool_name: &str, input: &Value, file_path: &str) -> String {
+    if let Some(diff) = extract_tool_diff(tool_name, input, file_path) {
+        return diff;
+    }
     for key in [
         "command",
         "cmd",
@@ -3121,9 +3298,11 @@ mod tests {
         let snap_huge =
             poll_transcript_file(VaultAgent::Claude, "sid-claude-1", &path, snap2.next_offset);
         assert!(snap_huge.next_offset > snap2.next_offset + 600 * 1024);
-        assert_eq!(snap_huge.items.len(), 1);
-        assert_eq!(snap_huge.items[0].kind, ChatItemKind::Assistant);
-        assert_eq!(snap_huge.items[0].text, "거대 줄 통과 완료");
+        assert_eq!(snap_huge.items.len(), 2);
+        assert_eq!(snap_huge.items[0].kind, ChatItemKind::ToolResult);
+        assert_eq!(snap_huge.items[0].text, "Skipped oversized entry");
+        assert_eq!(snap_huge.items[1].kind, ChatItemKind::Assistant);
+        assert_eq!(snap_huge.items[1].text, "거대 줄 통과 완료");
 
         // 파일이 절단(/clear 등)되면 reset=true와 함께 처음부터 다시 읽는다.
         fs::write(&path, format!("{line1}\n")).unwrap();
@@ -3923,5 +4102,52 @@ mod performance_tests {
         assert!(resolved_new.is_none());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agy_created_at_and_edit_write_patch_diffs_are_preserved() {
+        let mut out = Vec::new();
+        let agy_str: Value = serde_json::from_str(
+            r#"{"source":"MODEL","created_at":"2026-11-21T12:00:00Z","tool_calls":[{"id":"t1","name":"replace_file_content","args":{"TargetFile":"src/lib.rs","TargetContent":"let x = 1;","ReplacementContent":"let x = 2;\nlet y = 3;","StartLine":10}}]}"#,
+        )
+        .unwrap();
+        parse_line_into_items(VaultAgent::Agy, &agy_str, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].at, "2026-11-21T12:00:00Z");
+        assert_eq!(out[0].file_path, "src/lib.rs");
+        assert!(out[0].text.contains("--- a/src/lib.rs"));
+        assert!(out[0].text.contains("+++ b/src/lib.rs"));
+        assert!(out[0].text.contains("@@ -10,1 +10,2 @@"));
+        assert!(out[0].text.contains("-let x = 1;"));
+        assert!(out[0].text.contains("+let x = 2;"));
+        assert!(out[0].text.contains("+let y = 3;"));
+
+        let mut out_num = Vec::new();
+        let agy_epoch: Value = serde_json::from_str(
+            r#"{"source":"USER_EXPLICIT","created_at":1795230000,"content":"hi"}"#,
+        )
+        .unwrap();
+        parse_line_into_items(VaultAgent::Agy, &agy_epoch, &mut out_num);
+        assert_eq!(out_num[0].at, "1795230000");
+
+        let mut claude_out = Vec::new();
+        let claude_tools: Value = serde_json::from_str(
+            r#"{"type":"assistant","timestamp":"2026-11-21T12:01:00Z","message":{"role":"assistant","content":[
+                {"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"a.rs","old_string":"old1","new_string":"new1"}},
+                {"type":"tool_use","id":"e2","name":"MultiEdit","input":{"file_path":"b.rs","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}},
+                {"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"c.rs","content":"fn main() {}\n"}}
+            ]}}"#,
+        )
+        .unwrap();
+        parse_line_into_items(VaultAgent::Claude, &claude_tools, &mut claude_out);
+        assert_eq!(claude_out.len(), 3);
+        assert!(claude_out[0].text.contains("--- a/a.rs"));
+        assert!(claude_out[0].text.contains("-old1"));
+        assert!(claude_out[0].text.contains("+new1"));
+        assert!(claude_out[1].text.contains("--- a/b.rs"));
+        assert!(claude_out[1].text.contains("-c"));
+        assert!(claude_out[1].text.contains("+d"));
+        assert!(claude_out[2].text.contains("+++ b/c.rs"));
+        assert!(claude_out[2].text.contains("+fn main() {}"));
     }
 }

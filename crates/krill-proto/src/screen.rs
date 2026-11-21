@@ -73,6 +73,7 @@ pub const FEAT_SCREEN: u64 = 1;
 pub const FEAT_HISTORY_VIEW: u64 = 1 << 24;
 mod history_view;
 pub use history_view::{HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+pub mod prompt;
 /// 화면 부가 정보 [`Op`](제목·벨·커서 모양·링크 URI)를 받을 수 있다는 feature 비트(모듈 문서).
 pub const FEAT_SCREEN_META: u64 = 1 << 9;
 /// [`Op::Title`] 최대 바이트. krilld는 넘는 제목을 글자 경계에서 자른다.
