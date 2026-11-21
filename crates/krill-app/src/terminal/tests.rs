@@ -385,3 +385,65 @@ fn effective_cursor_uses_setting_only_when_program_is_silent() {
         CursorStyle::default()
     );
 }
+
+#[test]
+fn url_at_and_sanitize_strip_delimiter_cjk_suffix_and_percent_encode_utf8() {
+    use super::path_link::{UrlLink, sanitize_external_url, url_at};
+    use krill_proto::screen::Cell;
+
+    let row = |s: &str| -> Vec<Cell> {
+        s.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        url_at(&row("(http://127.0.0.1:8787/)하면"), 5),
+        Some(UrlLink {
+            column: 1,
+            cols: 22,
+            uri: "http://127.0.0.1:8787/".into(),
+        })
+    );
+    assert_eq!(
+        url_at(&row("(http://127.0.0.1:8787/?a=1)를"), 5),
+        Some(UrlLink {
+            column: 1,
+            cols: 26,
+            uri: "http://127.0.0.1:8787/?a=1".into(),
+        })
+    );
+    assert_eq!(
+        url_at(&row("(http://127.0.0.1:8787/).하면"), 5),
+        Some(UrlLink {
+            column: 1,
+            cols: 22,
+            uri: "http://127.0.0.1:8787/".into(),
+        })
+    );
+    assert_eq!(
+        url_at(&row("http://localhost:3000/문서"), 5).map(|l| l.uri),
+        Some("http://localhost:3000/문서".into())
+    );
+
+    assert_eq!(
+        sanitize_external_url("http://127.0.0.1:8787/)하면").as_deref(),
+        Some("http://127.0.0.1:8787/")
+    );
+    assert_eq!(
+        sanitize_external_url("http://127.0.0.1:8787)하면").as_deref(),
+        Some("http://127.0.0.1:8787")
+    );
+    assert_eq!(
+        sanitize_external_url("http://localhost:3000/문서").as_deref(),
+        Some("http://localhost:3000/%EB%AC%B8%EC%84%9C")
+    );
+    assert_eq!(
+        sanitize_external_url("http://localhost:3000").as_deref(),
+        Some("http://localhost:3000")
+    );
+    assert_eq!(sanitize_external_url("javascript:alert(1)"), None);
+}

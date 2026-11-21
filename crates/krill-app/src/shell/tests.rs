@@ -1098,7 +1098,11 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     };
     cx.simulate_mouse_down(at, MouseButton::Left, cmd);
     cx.simulate_mouse_up(at, MouseButton::Left, cmd);
-    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/문서"));
+    // macOS NSURL 호환을 위해 비ASCII 경로는 percent-encoding 해서 연다.
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/%EB%AC%B8%EC%84%9C")
+    );
     // 우클릭은 프로그램으로, ⇧+우클릭은 Krill 메뉴 몫이라 보내지 않는다.
     cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
     assert_eq!(input(), b"\x1b[<2;1;1M");
@@ -2853,7 +2857,11 @@ fn security_link_preview_title_filter_multiline_paste_and_secure_input(cx: &mut 
     let open = cx.debug_bounds("terminal-link-open").unwrap().center();
     cx.simulate_click(open, Modifiers::default());
     assert_eq!(link_menu(cx), None);
-    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/보안"));
+    // 클립보드 복사는 사람이 읽는 UTF-8을 유지하고, 브라우저 열기는 macOS NSURL 호환을 위해 percent-encoding 한다.
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/%EB%B3%B4%EC%95%88")
+    );
 
     cx.simulate_mouse_move(empty_pt, None, Modifiers::default());
     cx.run_until_parked();

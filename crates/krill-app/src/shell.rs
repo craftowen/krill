@@ -3167,7 +3167,10 @@ impl Shell {
     /// 원격 호스트 패인의 루프백 URL(`localhost`, `127.0.0.1`, `0.0.0.0`, `[::1]`)이면
     /// 로컬 포워딩 리스너(유휴 10분 뒤 자동 해제)를 먼저 준비하고 포워딩된 로컬 URL로 연다.
     pub(super) fn open_terminal_url(&mut self, pane: PaneId, uri: &str, cx: &mut Context<Self>) {
-        if let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(uri)
+        let Some(uri) = krill_app::terminal::path_link::sanitize_external_url(uri) else {
+            return;
+        };
+        if let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(&uri)
             && self.layout.host(pane).is_remote()
         {
             let Some((host, target)) = self.remote_target_for_pane(pane) else {
@@ -3179,7 +3182,6 @@ impl Shell {
                 cx.notify();
                 return;
             };
-            let uri = uri.to_owned();
             cx.spawn(async move |this, cx| {
                 let forwarded = cx
                     .background_executor()
@@ -3203,7 +3205,7 @@ impl Shell {
             .detach();
             return;
         }
-        cx.open_url(uri);
+        cx.open_url(&uri);
     }
 
     fn sync_history_host(&self, cx: &mut Context<Self>) -> Option<String> {

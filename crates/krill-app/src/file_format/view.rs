@@ -245,6 +245,30 @@ pub fn image_error(error: RasterError) -> String {
     }
 }
 
+fn open_markdown_link(
+    url: &SharedString,
+    event: &gpui::ClickEvent,
+    _window: &mut Window,
+    cx: &mut App,
+) {
+    let should_open = match event {
+        gpui::ClickEvent::Mouse(click) => {
+            matches!(
+                click.up.button,
+                gpui::MouseButton::Left | gpui::MouseButton::Middle
+            )
+        }
+        gpui::ClickEvent::Keyboard(_) => true,
+        gpui::ClickEvent::Touch(click) => !click.long_press,
+    };
+    if !should_open {
+        return;
+    }
+    if let Some(clean) = crate::terminal::path_link::sanitize_external_url(url) {
+        cx.open_url(&clean);
+    }
+}
+
 /// 마크다운 미리보기(gpui-component `TextView`). 원본↔미리보기 토글은 파일 탭 쪽(OWE-663/665)에서.
 pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>, cx: &App) -> AnyElement {
     let pal = crate::ui::palette(cx);
@@ -258,7 +282,7 @@ pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>, cx: &
         .text_size(crate::ui::TEXT_MD)
         .bg(pal.editor_surface)
         .text_color(pal.foreground)
-        .child(TextView::markdown(id, source))
+        .child(TextView::markdown(id, source).on_link_click(open_markdown_link))
         .into_any_element()
 }
 
@@ -536,7 +560,7 @@ fn notebook_row(
                     cell.source.chars().take(2_048).collect()
                 };
                 div()
-                    .child(TextView::markdown(index, source))
+                    .child(TextView::markdown(index, source).on_link_click(open_markdown_link))
                     .when(long && !show_all, |view| {
                         view.child(
                             Button::new(("notebook-markdown-more", index))
