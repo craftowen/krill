@@ -850,3 +850,123 @@ fn journal_rotates_before_exceeding_max_runs_and_reopens_cleanly() {
     let reopened = Journal::open(&dir.0).unwrap();
     assert!(reopened.claimed("job-139", 140));
 }
+
+#[test]
+fn exclusive_lock_contention_returns_would_block_instead_of_other() {
+    let dir = Temp::new("exclusive-would-block");
+    let held = exclusive(&dir.0).unwrap();
+    let contention = exclusive(&dir.0).unwrap_err();
+    assert_eq!(contention.kind(), io::ErrorKind::WouldBlock);
+    drop(held);
+}
+
+#[test]
+fn poll_schedules_releases_registry_state_lock_before_capturing_closed_session() {
+    use crate::registry::Entry;
+    use crate::session::Session;
+    use krill_proto::SessionId;
+    use krill_proto::holder::WinSize;
+    use krill_proto::os::net::UnixStream;
+    use std::io::Write as _;
+    use std::sync::Arc;
+
+    let dir = Temp::new("capture-no-lock");
+    let reg = Arc::new(Registry::new(None, Some(&dir.0)));
+    let (master, mut peer) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        SessionId(55),
+        master.into(),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    peer.write_all(b"finished output\r\n").unwrap();
+    drop(peer);
+    let start = std::time::Instant::now();
+    while !session.is_closed() {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let tap = session.tap();
+    {
+        let mut st = lock(&reg.state);
+        st.sessions.insert(
+            SessionId(55),
+            Entry {
+                session,
+                pid: 0,
+                cwd: PathBuf::from("/tmp"),
+                wrapped: false,
+            },
+        );
+        st.exited.insert(SessionId(55), 0);
+    }
+
+    let mut journal = Journal::open(&dir.0).unwrap();
+    journal
+        .append(&Run {
+            id: "job".into(),
+            minute: 39,
+            phase: "spawned".into(),
+            session: Some(55),
+            ..Default::default()
+        })
+        .unwrap();
+    drop(journal);
+    Schedules {
+        schedule: vec![krill_proto::schedule::Schedule {
+            id: "job".into(),
+            enabled: true,
+            cron: "0 0 1 1 *".into(),
+            cwd: "/tmp".into(),
+            command: vec!["/bin/echo".into()],
+            ..Default::default()
+        }],
+    }
+    .save(&dir.0)
+    .unwrap();
+
+    // Hold `live` so capture_cli inside poll_schedules blocks until we release it.
+    let live_guard = tap.lock_live_for_test();
+    let lock_path = dir.0.join("scheduler.lock");
+    let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+    let reg_poll = Arc::clone(&reg);
+    let poller = std::thread::spawn(move || {
+        let res = reg_poll.poll_schedules(UNIX_EPOCH + Duration::from_mins(40));
+        polled_tx.send(res).ok();
+    });
+    let wait_lock = std::time::Instant::now();
+    while !lock_path.exists() {
+        assert!(wait_lock.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Give poll_schedules a moment to enter capture_cli while `live_guard` is held.
+    std::thread::sleep(Duration::from_millis(40));
+    let (state_tx, state_rx) = std::sync::mpsc::channel();
+    let reg_probe = Arc::clone(&reg);
+    let prober = std::thread::spawn(move || {
+        let _guard = lock(&reg_probe.state);
+        state_tx.send(()).ok();
+    });
+    state_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("Registry::state must remain unblocked while closed session capture waits");
+    prober.join().unwrap();
+    drop(live_guard);
+    polled_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    poller.join().unwrap();
+
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].phase, "finished");
+    assert!(
+        runs[0]
+            .output
+            .as_deref()
+            .is_some_and(|out| out.contains("finished output"))
+    );
+}

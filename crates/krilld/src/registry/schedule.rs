@@ -339,7 +339,7 @@ impl Registry {
                 }
                 continue;
             }
-            let (status, captured) = {
+            let (status, closed_tap) = {
                 let state = lock(&self.state);
                 // An exited root can leave background children holding the PTY.
                 // Wait for reader EOF before releasing that session's fds.
@@ -348,19 +348,18 @@ impl Registry {
                     .get(&id)
                     .is_none_or(|entry| entry.session.is_closed())
                 {
-                    let out = state
-                        .sessions
-                        .get(&id)
-                        .and_then(|entry| {
-                            entry.session.tap().capture_cli(CaptureFormat::Plain).ok()
-                        })
-                        .map(|(_, bytes)| truncate_output(&String::from_utf8_lossy(&bytes)))
-                        .filter(|s| !s.is_empty());
-                    (state.exited.get(&id).copied(), out)
+                    (
+                        state.exited.get(&id).copied(),
+                        state.sessions.get(&id).map(|entry| entry.session.tap()),
+                    )
                 } else {
                     (None, None)
                 }
             };
+            let captured = closed_tap
+                .and_then(|tap| tap.capture_cli(CaptureFormat::Plain).ok())
+                .map(|(_, bytes)| truncate_output(&String::from_utf8_lossy(&bytes)))
+                .filter(|s| !s.is_empty());
             if let Some(status) = status {
                 for mut run in runs {
                     run.phase = "finished".into();
@@ -382,10 +381,32 @@ impl Registry {
         }
         for entry in schedules.schedule {
             let forced = forced_ids.iter().any(|id| id == &entry.id);
-            let cron = Cron::parse(&entry.cron)?;
+            if !forced && !entry.enabled {
+                continue;
+            }
             let target_minute = if forced {
                 Some(minute)
-            } else if entry.enabled && cron_due {
+            } else if cron_due {
+                let cron = match Cron::parse(&entry.cron) {
+                    Ok(cron) => cron,
+                    Err(err) => {
+                        if !journal.claimed(&entry.id, minute) {
+                            journal.append(&Run {
+                                id: entry.id,
+                                minute,
+                                phase: "failed".into(),
+                                session: None,
+                                error: Some(err.to_string()),
+                                status: None,
+                                cwd: None,
+                                output: None,
+                                ..Default::default()
+                            })?;
+                        }
+                        tracing::warn!("skipping schedule entry with invalid cron");
+                        continue;
+                    }
+                };
                 if cron.matches(calendar) && !journal.claimed(&entry.id, minute) {
                     Some(minute)
                 } else if entry.effective_grace_minutes() > 0 {
@@ -500,15 +521,27 @@ impl Registry {
             run.cwd = Some(run_cwd.to_string_lossy().into_owned());
             let launch_as_agent = entry.agent.is_some()
                 || (entry.command.len() == 1 && entry.resolved_agent().is_some());
-            let extra_tokens = entry
+            let extra_tokens = match entry
                 .extra_agent_args
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .map(tokenize_command_line)
-                .transpose()?
-                .unwrap_or_default();
+                .transpose()
+            {
+                Ok(tokens) => tokens.unwrap_or_default(),
+                Err(err) => {
+                    run.phase = "failed".into();
+                    run.error = Some(err.to_string());
+                    journal.append(&run)?;
+                    tracing::warn!("skipping schedule entry with invalid extra_agent_args");
+                    continue;
+                }
+            };
             let mut command = entry.command.into_iter();
             let Some(program) = command.next() else {
+                run.phase = "failed".into();
+                run.error = Some("schedule command is empty".into());
+                journal.append(&run)?;
                 continue;
             };
             let mut extra_args: Vec<String> = command.collect();
@@ -648,7 +681,7 @@ fn exclusive(dir: &Path) -> io::Result<File> {
         .write(true)
         .mode(0o600)
         .open(dir.join("scheduler.lock"))?;
-    file.try_lock().map_err(io::Error::other)?;
+    file.try_lock()?;
     Ok(file)
 }
 
