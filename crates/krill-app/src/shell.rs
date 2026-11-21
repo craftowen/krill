@@ -798,8 +798,13 @@ pub struct Shell {
     artifacts_cache: Option<gpui::Entity<krill_app::artifacts::View>>,
     bots_cache: Option<gpui::Entity<krill_app::bots::View>>,
     pub(super) bots_attention_count: usize,
+    /// Rows of the sidebar Bots section, refreshed with the attention badge.
+    pub(super) sidebar_bots: Vec<krill_app::bots::SidebarBot>,
     #[cfg(not(test))]
     bots_badge_task: Option<Task<()>>,
+    /// Picks up bots made outside the app (`krill bot new` in a pane) for the sidebar.
+    #[cfg(not(test))]
+    bots_poll: Option<Task<()>>,
     modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
@@ -1447,8 +1452,11 @@ impl Shell {
             artifacts_cache: None,
             bots_cache: None,
             bots_attention_count: 0,
+            sidebar_bots: Vec::new(),
             #[cfg(not(test))]
             bots_badge_task: None,
+            #[cfg(not(test))]
+            bots_poll: None,
             modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
@@ -1478,6 +1486,10 @@ impl Shell {
         Self::register_overlay_hosts(cx);
         shell.refresh_local_state(cx);
         shell.orch_poll = Some(Self::poll_orchestration(cx));
+        #[cfg(not(test))]
+        {
+            shell.bots_poll = Some(Self::poll_sidebar_bots(cx));
+        }
         if let Some(path) = restore_path {
             shell.restore_layout(
                 path,

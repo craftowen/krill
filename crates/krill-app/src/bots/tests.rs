@@ -13,11 +13,11 @@ use krill_proto::bots::{
     generate_slack_socket_mode_manifest,
 };
 
-use super::create::filter_templates;
+use super::create::{ModelChoice, filter_templates};
 use super::items::ItemFilter;
 use super::rpc::{
     BOT_RUNTIMES, BotRpcCall, format_csv_i64s, format_csv_strings, parse_csv_i64s,
-    parse_csv_strings,
+    parse_csv_strings, runtime_models, sidebar_snapshot,
 };
 use super::{BadgeChanged, Close, DetailTab, OpenSession, Screen, View};
 
@@ -361,6 +361,16 @@ fn create_view_filters_all_24_templates_and_creates_bot(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     assert!(vcx.debug_bounds("bots-create-view").is_some());
+    assert!(vcx.debug_bounds("bots-runtime-picker").is_some());
+    assert!(vcx.debug_bounds("bots-model-picker").is_some());
+    assert!(vcx.debug_bounds("bots-create-pick-folder").is_some());
+    assert!(
+        vcx.debug_bounds("bots-template-pr-review").is_none(),
+        "templates stay folded until asked for"
+    );
+    let toggle = vcx.debug_bounds("bots-create-toggle-templates").unwrap();
+    vcx.simulate_click(toggle.center(), Modifiers::default());
+    vcx.run_until_parked();
     assert!(vcx.debug_bounds("bots-template-pr-review").is_some());
 
     // Filter to Releases category (4 templates)
@@ -377,7 +387,14 @@ fn create_view_filters_all_24_templates_and_creates_bot(cx: &mut TestAppContext)
         view.update(cx, |v, cx| {
             v.set_template_category(None, cx);
             v.select_template(&BUILTIN_BOT_TEMPLATES[0], Some(window), cx);
+            v.set_create_model(ModelChoice::Preset("opus"), cx);
             v.set_create_runtime("codex", cx);
+            assert_eq!(
+                v.create.model,
+                ModelChoice::Default,
+                "a Claude preset must not follow the bot to Codex"
+            );
+            v.set_create_model(ModelChoice::Preset("gpt-5.4"), cx);
             v.submit_create_bot(cx);
         });
     });
@@ -388,6 +405,7 @@ fn create_view_filters_all_24_templates_and_creates_bot(cx: &mut TestAppContext)
         assert_eq!(v.screen(), Screen::Detail);
         assert_eq!(v.bots().len(), 1);
         assert_eq!(v.bots()[0].agent_id, "codex");
+        assert_eq!(v.bots()[0].model.as_deref(), Some("gpt-5.4"));
         assert_eq!(v.bots()[0].template_id.as_deref(), Some("pr-review"));
     });
 }
@@ -680,5 +698,153 @@ fn connectors_slack_manifest_composio_access_and_tools_relay_and_escape(cx: &mut
 
     vcx.update(|_, cx| view.update(cx, View::handle_escape));
     vcx.run_until_parked();
+    assert!(*closed.lock().unwrap());
+}
+
+#[test]
+fn sidebar_snapshot_counts_attention_per_bot_and_offers_models_per_runtime() {
+    let bots = vec![sample_bot("bot-a", "A"), sample_bot("bot-b", "B")];
+    let items = vec![
+        sample_item("bot-a", "i1", 1, BotItemStatus::NeedsYou),
+        sample_item("bot-a", "i2", 2, BotItemStatus::Working),
+        sample_item("bot-gone", "i3", 3, BotItemStatus::NeedsYou),
+    ];
+    let snap = sidebar_snapshot(&bots, &items, &[]);
+    let names: Vec<_> = snap
+        .bots
+        .iter()
+        .map(|b| (b.name.as_str(), b.attention))
+        .collect();
+    assert_eq!(names, vec![("A", 1), ("B", 0)]);
+    assert_eq!(
+        snap.attention, 2,
+        "the badge total keeps items of bots not listed"
+    );
+
+    for rt in BOT_RUNTIMES {
+        let models = runtime_models(rt.id);
+        assert!(
+            models
+                .iter()
+                .all(|(id, label)| !id.is_empty() && !label.is_empty())
+        );
+    }
+    assert!(runtime_models("claude").iter().any(|(id, _)| *id == "opus"));
+    assert!(runtime_models("pi").is_empty());
+}
+
+#[gpui::test]
+fn create_form_submits_with_cmd_enter_and_custom_model(cx: &mut TestAppContext) {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let (view, vcx) = open_view(cx, state.clone());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.open_create(cx);
+            v.set_create_model(ModelChoice::Custom, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let v = view.read(cx);
+        let name = v.create.name_input.clone().unwrap();
+        let model = v.create.model_input.clone().unwrap();
+        name.update(cx, |s, cx| s.set_value("Release bot", window, cx));
+        model.update(cx, |s, cx| s.set_value("claude-opus-5-5", window, cx));
+        name.update(cx, |input, cx| input.focus(window, cx));
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-enter");
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.screen(), Screen::Detail);
+        assert_eq!(v.bots().len(), 1);
+        assert_eq!(v.bots()[0].name, "Release bot");
+        assert_eq!(v.bots()[0].model.as_deref(), Some("claude-opus-5-5"));
+    });
+
+    // The next New bot starts empty instead of offering "Release bot" again.
+    vcx.update(|_, cx| view.update(cx, View::open_create));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        let name = v
+            .create
+            .name_input
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .value()
+            .to_string();
+        assert_eq!(name, "");
+        assert_eq!(v.create.model, ModelChoice::Default);
+    });
+}
+
+#[gpui::test]
+fn create_form_rejects_empty_custom_model_and_missing_folder(cx: &mut TestAppContext) {
+    // One existing bot, so Escape from the in-modal form would go back to it.
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![sample_bot("bot-a", "A")],
+        ..MockState::default()
+    }));
+    let (view, vcx) = open_view(cx, state.clone());
+    vcx.update(|_, cx| view.update(cx, View::open_create_alone));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let v = view.read(cx);
+        let name = v.create.name_input.clone().unwrap();
+        let ws = v.create.workspace_input.clone().unwrap();
+        name.update(cx, |s, cx| s.set_value("Bot", window, cx));
+        ws.update(cx, |s, cx| {
+            s.set_value("/definitely/not/a/krill/dir", window, cx);
+        });
+        view.update(cx, View::submit_create_bot);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.error.is_some(),
+            "a missing folder is refused, not silently replaced"
+        );
+        assert_eq!(v.bots().len(), 1);
+        let ws = v.create.workspace_input.clone().unwrap();
+        ws.update(cx, |s, cx| s.set_value("", window, cx));
+        view.update(cx, |v, cx| {
+            v.set_create_model(ModelChoice::Custom, cx);
+            v.submit_create_bot(cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.error.is_some(),
+            "Custom with no id is refused, not sent as Default"
+        );
+        assert_eq!(v.bots().len(), 1);
+    });
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| !matches!(r, BotRpcRequest::CreateBot(_))),
+        "neither attempt reached the daemon"
+    );
+
+    // Opened alone (sidebar "+"), Escape closes the modal rather than showing a bot.
+    let closed = Arc::new(Mutex::new(false));
+    let closed_capture = closed.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, _: &Close, _| {
+            *closed_capture.lock().unwrap() = true;
+        })
+        .detach();
+        view.update(cx, View::handle_escape);
+    });
     assert!(*closed.lock().unwrap());
 }

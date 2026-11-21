@@ -5,7 +5,10 @@ use std::io::{self, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use krill_proto::bots::{BotAccessRequestStatus, BotItemStatus, BotRpcRequest, BotRpcResponse};
+use krill_proto::bots::{
+    BotAccessRequest, BotAccessRequestStatus, BotConfig, BotId, BotItem, BotItemStatus,
+    BotRpcRequest, BotRpcResponse,
+};
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole, FEAT_BOTS};
@@ -21,7 +24,6 @@ pub type BotRpcCall = Arc<dyn Fn(&BotRpcRequest) -> Result<BotRpcResponse, Strin
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BotRuntimeOption {
     pub id: &'static str,
-    pub brand_id: &'static str,
 }
 
 impl BotRuntimeOption {
@@ -43,38 +45,14 @@ impl BotRuntimeOption {
 
 /// All 8 enabled Krill bot agent runtimes.
 pub const BOT_RUNTIMES: [BotRuntimeOption; 8] = [
-    BotRuntimeOption {
-        id: "claude",
-        brand_id: "claude",
-    },
-    BotRuntimeOption {
-        id: "codex",
-        brand_id: "codex",
-    },
-    BotRuntimeOption {
-        id: "agy",
-        brand_id: "agy",
-    },
-    BotRuntimeOption {
-        id: "opencode",
-        brand_id: "opencode",
-    },
-    BotRuntimeOption {
-        id: "cursor",
-        brand_id: "cursor",
-    },
-    BotRuntimeOption {
-        id: "pi",
-        brand_id: "pi",
-    },
-    BotRuntimeOption {
-        id: "grok",
-        brand_id: "grok",
-    },
-    BotRuntimeOption {
-        id: "omp",
-        brand_id: "omp",
-    },
+    BotRuntimeOption { id: "claude" },
+    BotRuntimeOption { id: "codex" },
+    BotRuntimeOption { id: "agy" },
+    BotRuntimeOption { id: "opencode" },
+    BotRuntimeOption { id: "cursor" },
+    BotRuntimeOption { id: "pi" },
+    BotRuntimeOption { id: "grok" },
+    BotRuntimeOption { id: "omp" },
 ];
 
 /// Display label for any bot runtime `agent_id`.
@@ -129,27 +107,100 @@ fn call_daemon_bot(target: Option<&HostTarget>, req: &BotRpcRequest) -> io::Resu
     }
 }
 
-/// Computes total sidebar attention count (`needs_you` open items + `Pending` access requests).
+/// Models offered per runtime in the New bot picker. Ids are what each CLI's `--model` accepts.
+// ponytail: mirrors the chat composer fallback list (shell/chat/composer.rs); move both to one
+// catalog when a daemon-side model list exists.
 #[must_use]
-pub fn fetch_attention_count(call: &BotRpcCall) -> usize {
-    let needs_you = match call(&BotRpcRequest::ListItems {
+pub fn runtime_models(runtime_id: &str) -> &'static [(&'static str, &'static str)] {
+    match runtime_id {
+        "claude" => &[
+            ("opus", "Opus 5.5"),
+            ("sonnet", "Sonnet 5.5"),
+            ("haiku", "Haiku 5.5"),
+            ("fable", "Fable 5.1"),
+        ],
+        "codex" => &[
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.3-codex", "GPT-5.3 Codex"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini"),
+        ],
+        "agy" => &[
+            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+        ],
+        _ => &[],
+    }
+}
+
+/// One bot row in the main window sidebar's Bots section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarBot {
+    pub id: BotId,
+    pub name: String,
+    pub emoji: Option<String>,
+    pub paused: bool,
+    /// `needs_you` items plus pending access requests owned by this bot.
+    pub attention: usize,
+}
+
+/// What the sidebar shows for bots: the rows and the total attention badge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidebarSnapshot {
+    pub bots: Vec<SidebarBot>,
+    pub attention: usize,
+}
+
+#[must_use]
+pub fn sidebar_snapshot(
+    bots: &[BotConfig],
+    items: &[BotItem],
+    access: &[BotAccessRequest],
+) -> SidebarSnapshot {
+    let needs: Vec<&BotId> = items
+        .iter()
+        .filter(|item| item.status == BotItemStatus::NeedsYou)
+        .map(|item| &item.owner_bot_id)
+        .chain(
+            access
+                .iter()
+                .filter(|req| req.status == BotAccessRequestStatus::Pending)
+                .map(|req| &req.bot_id),
+        )
+        .collect();
+    SidebarSnapshot {
+        bots: bots
+            .iter()
+            .map(|bot| SidebarBot {
+                id: bot.id.clone(),
+                name: bot.name.clone(),
+                emoji: bot.emoji.clone().filter(|e| !e.trim().is_empty()),
+                paused: bot.paused,
+                attention: needs.iter().filter(|id| **id == &bot.id).count(),
+            })
+            .collect(),
+        attention: needs.len(),
+    }
+}
+
+/// Reads bots, open items and access requests for the sidebar. `None` when the bot list is
+/// unavailable, so the caller keeps what it last showed instead of flashing an empty section.
+#[must_use]
+pub fn fetch_sidebar_snapshot(call: &BotRpcCall) -> Option<SidebarSnapshot> {
+    let Ok(BotRpcResponse::Bots(bots)) = call(&BotRpcRequest::ListBots) else {
+        return None;
+    };
+    let items = match call(&BotRpcRequest::ListItems {
         bot_id: None,
         include_closed: false,
     }) {
-        Ok(BotRpcResponse::Items(items)) => items
-            .iter()
-            .filter(|item| item.status == BotItemStatus::NeedsYou)
-            .count(),
-        _ => 0,
+        Ok(BotRpcResponse::Items(items)) => items,
+        _ => Vec::new(),
     };
-    let pending_access = match call(&BotRpcRequest::ListAccessRequests { bot_id: None }) {
-        Ok(BotRpcResponse::AccessRequests(reqs)) => reqs
-            .iter()
-            .filter(|req| req.status == BotAccessRequestStatus::Pending)
-            .count(),
-        _ => 0,
+    let access = match call(&BotRpcRequest::ListAccessRequests { bot_id: None }) {
+        Ok(BotRpcResponse::AccessRequests(reqs)) => reqs,
+        _ => Vec::new(),
     };
-    needs_you.saturating_add(pending_access)
+    Some(sidebar_snapshot(&bots, &items, &access))
 }
 
 /// Canonical scoped keychain secret reference (`<bot_id>:<key>`) aligned with daemon `SecretVault::scoped_ref`.

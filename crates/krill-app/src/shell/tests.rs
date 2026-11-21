@@ -7126,6 +7126,59 @@ fn automations_open_from_sidebar_and_back_preserves_the_workspace(cx: &mut TestA
 }
 
 #[gpui::test]
+fn sidebar_bots_section_lists_bots_and_opens_them(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bots-sidebar-section"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    assert!(
+        cx.debug_bounds("nav-bots-list").is_none(),
+        "no bots, no list"
+    );
+    assert!(cx.debug_bounds("nav-bots-new").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar_bots = vec![
+                krill_app::bots::SidebarBot {
+                    id: krill_proto::bots::BotId::new("bot-a").unwrap(),
+                    name: "Release bot".to_owned(),
+                    emoji: Some("🚀".to_owned()),
+                    paused: false,
+                    attention: 2,
+                },
+                krill_app::bots::SidebarBot {
+                    id: krill_proto::bots::BotId::new("bot-b").unwrap(),
+                    name: "Paused bot".to_owned(),
+                    emoji: None,
+                    paused: true,
+                    attention: 0,
+                },
+            ];
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("nav-bots-list").is_some());
+    let row = cx.debug_bounds("nav-bot-bot-a").unwrap();
+    assert!(cx.debug_bounds("nav-bot-bot-b").is_some());
+
+    // A bot row opens the Bots modal on that bot.
+    cx.simulate_click(row.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-modal").is_some());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-modal").is_none());
+
+    // + opens New bot directly, with agent and model pickers.
+    let plus = cx.debug_bounds("nav-bots-new").unwrap();
+    cx.simulate_click(plus.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bots-create-view").is_some());
+    assert!(cx.debug_bounds("bots-runtime-picker").is_some());
+    assert!(cx.debug_bounds("bots-model-picker").is_some());
+}
+
+#[gpui::test]
 fn bots_open_from_sidebar_shows_attention_badge_and_preserves_workspace(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("bots-default"));
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));

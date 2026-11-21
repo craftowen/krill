@@ -196,6 +196,111 @@ impl Shell {
             .child(icons::svg_icon(svg, krill_app::ui::ICON_SM, nav_icon_color))
             .child(div().flex_1().min_w_0().truncate().child(label))
     }
+    /// Orca-style Bots section rows under the "봇" nav row: one row per bot, in creation order.
+    fn render_sidebar_bots(
+        &self,
+        p: &krill_app::ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        use krill_app::ui::icons;
+
+        if self.sidebar_bots.is_empty() {
+            return None;
+        }
+        let selected = match &self.modal {
+            Some(super::Modal::Bots(view)) => {
+                let view = view.read(cx);
+                (view.screen() == krill_app::bots::Screen::Detail)
+                    .then(|| view.selected_bot().map(|b| b.id.clone()))
+                    .flatten()
+            }
+            _ => None,
+        };
+        // ponytail: fixed cap of about seven rows, then scroll; Orca's draggable split if lists grow.
+        let mut list = div()
+            .id("nav-bots-list")
+            .debug_selector(|| "nav-bots-list".into())
+            .role(gpui::Role::List)
+            .aria_label(krill_app::i18n::catalog::sidebar::NAV_BOTS.get())
+            .w_full()
+            .max_h(gpui::px(200.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_0p5();
+        for bot in &self.sidebar_bots {
+            let row_id = format!("nav-bot-{}", bot.id.as_str());
+            let row_sel = row_id.clone();
+            let is_selected = selected.as_ref() == Some(&bot.id);
+            let bot_id = bot.id.clone();
+            list = list.child(
+                div()
+                    .id(gpui::SharedString::from(row_id))
+                    .debug_selector(move || row_sel.clone())
+                    .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .focus_visible(|d| d.border_1().border_color(p.ring))
+                    .aria_label(bot.name.clone())
+                    .w_full()
+                    .h(gpui::px(26.))
+                    .pl(gpui::px(26.))
+                    .pr_2()
+                    .rounded(krill_app::ui::RADIUS_SM)
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(krill_app::ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .when(bot.paused, |d| d.opacity(0.55))
+                    .when(is_selected, |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .when(!is_selected, |d| {
+                        d.hover(|d| {
+                            d.bg(p.sidebar_accent.opacity(0.6))
+                                .text_color(p.sidebar_foreground)
+                        })
+                    })
+                    .child(match &bot.emoji {
+                        Some(emoji) => div()
+                            .flex_none()
+                            .w(gpui::px(krill_app::ui::ICON_SM))
+                            .flex()
+                            .justify_center()
+                            .child(emoji.clone())
+                            .into_any_element(),
+                        None => icons::svg_icon(
+                            icons::CUSTOM_AGENT_SVG,
+                            krill_app::ui::ICON_SM,
+                            p.muted_foreground,
+                        )
+                        .into_any_element(),
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(bot.name.clone()))
+                    .when(bot.paused, |d| {
+                        d.child(krill_app::ui::badge(
+                            p,
+                            krill_app::ui::BadgeTone::Muted,
+                            krill_app::i18n::catalog::bots::PAUSED_BADGE.get(),
+                        ))
+                    })
+                    .when(bot.attention > 0, |d| {
+                        d.child(krill_app::ui::badge(
+                            p,
+                            krill_app::ui::BadgeTone::Warning,
+                            bot.attention.to_string(),
+                        ))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_bot(Some(bot_id.clone()), Some(window), cx);
+                    })),
+            );
+        }
+        Some(list)
+    }
+
     pub(super) fn new_agent_with_account(
         &mut self,
         id: String,
@@ -485,8 +590,22 @@ impl Shell {
                         .debug_selector(|| "nav-bots-badge".into()),
                     )
                 })
+                .child(krill_app::ui::button_with_tooltip(
+                    Button::new("nav-bots-new")
+                        .icon(IconName::Plus)
+                        .ghost()
+                        .xsmall()
+                        .debug_selector(|| "nav-bots-new".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_bot(None, Some(window), cx);
+                        })),
+                    "nav-bots-new",
+                    sb_text::NEW_BOT.get(),
+                ))
                 .on_click(cx.listener(|this, _, window, cx| this.open_bots(Some(window), cx))),
             )
+            .children(self.render_sidebar_bots(p, cx))
             .child(
                 Self::nav_row(
                     p,
