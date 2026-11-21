@@ -241,8 +241,9 @@ function fixture(
       error() {},
       photo() {},
       transport: {},
-      sheet: (title, entries, _, render) => {
+      sheet: (title, entries, description, render) => {
         entries.title = title;
+        entries.description = description;
         entries.render = render;
         sheets.push(entries);
       },
@@ -2324,6 +2325,11 @@ async function main() {
       "sheet-group new-tab-terminal-group",
     ],
   );
+  assert.equal(
+    body.children[0].children.find((b) => b.dataset.mode === "term").getAttribute("aria-pressed"),
+    "true",
+    "newSession defaults to CLI/term when defaultSessionView is unset",
+  );
   const tiles = body.children[1].children;
   assert.deepEqual(
     tiles.map((b) => [
@@ -2440,6 +2446,32 @@ async function main() {
       .descendants()
       .some((n) => String(n.className || "").includes("tab-sheet-close")),
     "Tabs sheet shows close action when session_close is capable",
+  );
+  // Closing a background tab via Tabs sheet must ask confirmation and stay on the active tab.
+  const closeBtns = tabsBody
+    .descendants()
+    .filter((n) => String(n.className || "").includes("tab-sheet-close"));
+  closeBtns[0].action();
+  const confirmSheet = hdrFx.sheets.at(-1);
+  assert.equal(confirmSheet.title, "Close terminal?");
+  assert.equal(hdrFx.calls.length, 0, "close_terminal waits for confirmation");
+  const closingId = confirmSheet.description.match(/#(\d+)/)[1];
+  assert.notEqual(closingId, "7", "needs-you bucket puts background tab 8 first");
+  hdrFx.ctx.refresh = async () => {
+    hdrFx.state.sessions.delete(Number(closingId));
+    hdrGroup.sessions = hdrGroup.sessions.filter(
+      (s) => s.id !== Number(closingId),
+    );
+  };
+  await confirmSheet.find((e) => e.label === "Close terminal").action();
+  assert.deepEqual({ ...hdrFx.calls.at(-1) }, {
+    action: "close_terminal",
+    session: Number(closingId),
+  });
+  assert.equal(
+    hdrFx.routes.at(-1),
+    "/git/7",
+    "closing a background tab must not kick user off active session 7",
   );
   hdrFx.view.cleanup();
   f = fixture(undefined, {

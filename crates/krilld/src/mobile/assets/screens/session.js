@@ -898,6 +898,7 @@
         () => {},
         "ghost small mode-toggle",
       ),
+      button(t("Source Control"), () => {}, "icon-button session-git-btn", "git"),
       button(t("Terminal actions"), () => {}, "icon-button", "more"),
     ]) {
       node.disabled = true;
@@ -1278,31 +1279,7 @@
         entries.push({
           label: t("Close terminal"),
           danger: true,
-          action: () =>
-            ctx.sheet(
-              t("Close terminal?"),
-              [
-                {
-                  label: t("Close terminal"),
-                  danger: true,
-                  action: async () => {
-                    await ctx.rpc({
-                      action: "close_terminal",
-                      session: target.id,
-                    });
-                    ctx
-                      .refresh()
-                      .then(() => {
-                        if (ctx.signal.aborted) return;
-                        const next = state.groups.get(group.key);
-                        go(next ? ctx.groupRoute(next) : "/host/local");
-                      })
-                      .catch(ctx.error);
-                  },
-                },
-              ],
-              t("Terminal #{0} will be stopped.", target.id),
-            ),
+          action: () => confirmCloseSession(target),
         }); // 승인 전 맥락: 스냅샷의 마지막 줄(lines)을 시트 제목 아래에 보여 터미널을 열지 않고도 무엇을 승인하는지 확인한다.
       const context =
         ["Waiting", "Blocked"].includes(target.state) && target.lines?.length
@@ -1349,6 +1326,39 @@
             },
           );
         },
+      );
+    }
+
+    function confirmCloseSession(target) {
+      const currentActiveId = activeSession().id;
+      ctx.sheet(
+        t("Close terminal?"),
+        [
+          {
+            label: t("Close terminal"),
+            danger: true,
+            action: async () => {
+              await ctx.rpc({
+                action: "close_terminal",
+                session: target.id,
+              });
+              ctx
+                .refresh()
+                .then(() => {
+                  if (ctx.signal.aborted) return;
+                  if (
+                    target.id !== currentActiveId &&
+                    state.sessions.has(currentActiveId)
+                  )
+                    return;
+                  const next = state.groups.get(group.key);
+                  go(next ? ctx.groupRoute(next) : "/host/local");
+                })
+                .catch(ctx.error);
+            },
+          },
+        ],
+        t("Terminal #{0} will be stopped.", target.id),
       );
     }
 
@@ -1415,18 +1425,7 @@
               row.append(
                 button(
                   t("Close terminal"),
-                  async () => {
-                    ctx.closeSheet();
-                    await ctx.rpc({ action: "close_terminal", session: s.id });
-                    ctx
-                      .refresh()
-                      .then(() => {
-                        if (ctx.signal.aborted) return;
-                        const next = state.groups.get(group.key);
-                        go(next ? ctx.groupRoute(next) : "/host/local");
-                      })
-                      .catch(ctx.error);
-                  },
+                  () => confirmCloseSession(s),
                   "icon-button tab-sheet-close",
                   "close",
                 ),
@@ -1446,7 +1445,7 @@
         state.snapshot?.agents ||
         ["claude", "codex"].map((id) => ({ id, name: agentName(id) }));
       let pickedMode =
-        state.preferences?.defaultSessionView === "term" ? "term" : "chat";
+        state.preferences?.defaultSessionView === "chat" ? "chat" : "term";
       ctx.sheet(t("New session"), [], undefined, (body) => {
         const modeBar = el("div", undefined, "segmented new-tab-mode");
         modeBar.setAttribute("role", "group");

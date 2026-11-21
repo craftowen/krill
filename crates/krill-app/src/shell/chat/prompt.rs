@@ -13,6 +13,7 @@ pub(super) struct ChatPrompt {
     pub pending_id: u64,
     pub bytes: Vec<u8>,
     pub opens_terminal: bool,
+    pub local_slash: bool,
 }
 
 pub(super) struct Origin {
@@ -136,6 +137,7 @@ impl Shell {
             pending_id,
             bytes,
             opens_terminal,
+            local_slash,
         } = prompt;
         let key = (self.layout.host(pane).clone(), session);
         let log = self.chat.logs.get(&key);
@@ -266,6 +268,21 @@ impl Shell {
                     if current {
                         this.switch_pane_to_terminal(pane, window, cx);
                     }
+                })
+                .ok();
+                return;
+            }
+            if applied && local_slash {
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_chat_prompt(
+                        FinishPrompt {
+                            key: &task_key,
+                            pending_id,
+                            confirmed: true,
+                        },
+                        Some(window),
+                        cx,
+                    );
                 })
                 .ok();
                 return;

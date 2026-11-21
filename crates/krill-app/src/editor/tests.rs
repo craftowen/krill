@@ -301,3 +301,72 @@ fn html_syntax_highlights_tags_attributes_style_and_script_and_extracts_title() 
         "embedded <script> JS string: {tokens:?}"
     );
 }
+
+#[test]
+fn lightweight_syntax_highlights_python_go_cpp_and_swift() {
+    let py = "@decorator\ndef greet(name: User) -> None:\n    # comment\n    return \"hi\" + 42\n";
+    let py_tokens = syntax::tokenize_for("python", py);
+    assert!(
+        py_tokens
+            .iter()
+            .any(|(r, k)| *k == "attribute" && py.get(r.clone()) == Some("@decorator")),
+        "{py_tokens:?}"
+    );
+    assert!(
+        py_tokens
+            .iter()
+            .any(|(r, k)| *k == "keyword" && py.get(r.clone()) == Some("def")),
+        "{py_tokens:?}"
+    );
+    assert!(
+        py_tokens
+            .iter()
+            .any(|(r, k)| *k == "function" && py.get(r.clone()) == Some("greet")),
+        "{py_tokens:?}"
+    );
+    assert!(
+        py_tokens
+            .iter()
+            .any(|(r, k)| *k == "comment" && py.get(r.clone()) == Some("# comment")),
+        "{py_tokens:?}"
+    );
+
+    let go = "package main\nfunc main() { return }\n";
+    let go_tokens = syntax::tokenize_for("go", go);
+    assert!(
+        go_tokens
+            .iter()
+            .any(|(r, k)| *k == "keyword" && go.get(r.clone()) == Some("func")),
+        "{go_tokens:?}"
+    );
+
+    let cpp = "#include <stdio.h>\nint add(int a) { return a + 1; }\n";
+    let cpp_tokens = syntax::tokenize_for("cpp", cpp);
+    assert!(
+        cpp_tokens
+            .iter()
+            .any(|(r, k)| *k == "preproc" && cpp.get(r.clone()) == Some("#include <stdio.h>")),
+        "{cpp_tokens:?}"
+    );
+    assert!(
+        cpp_tokens
+            .iter()
+            .any(|(r, k)| *k == "keyword" && cpp.get(r.clone()) == Some("return")),
+        "{cpp_tokens:?}"
+    );
+
+    let swift = "struct AppView { let count = 1 }\n";
+    let swift_tokens = syntax::tokenize_for("swift", swift);
+    assert!(
+        swift_tokens
+            .iter()
+            .any(|(r, k)| *k == "keyword" && swift.get(r.clone()) == Some("struct")),
+        "{swift_tokens:?}"
+    );
+    assert!(
+        swift_tokens
+            .iter()
+            .any(|(r, k)| *k == "type" && swift.get(r.clone()) == Some("AppView")),
+        "{swift_tokens:?}"
+    );
+}

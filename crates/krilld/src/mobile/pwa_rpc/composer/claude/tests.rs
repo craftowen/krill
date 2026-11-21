@@ -289,3 +289,24 @@ fn stale_startup_banner_never_overwrites_existing_running_model() {
     assert!(status["model_label"].is_null());
     assert!(status["effort"].is_null());
 }
+
+#[test]
+fn waiting_screen_observation_populates_model_without_idle_composer() {
+    let prompt_screen = screen(&[
+        " * ▐▛███▜▌ *   Claude Code v2.1.316",
+        "* ▝▜█████▛▘ *  Opus 5.5 · high",
+        "Allow Read on Cargo.toml? 1. Yes / 2. No",
+    ]);
+    let mut status = json!({
+        "agent": "claude",
+        "supported": true,
+        "model": null,
+        "model_label": null,
+        "effort": null
+    });
+    observe_screen_into(Some(&prompt_screen), &mut status);
+    assert_eq!(status["model"], "opus");
+    assert_eq!(status["model_label"], "Opus 5.5");
+    assert_eq!(status["effort"], "high");
+    assert_eq!(status["effort_supported"], false);
+}

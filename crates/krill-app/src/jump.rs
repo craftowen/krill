@@ -592,6 +592,7 @@ pub enum ActionKind {
     ToggleSidebar,
     ToggleExplorer,
     ToggleSearch,
+    ToggleChatView,
     ImportTerminalThemes,
     OpenChecks,
     OpenDisk,

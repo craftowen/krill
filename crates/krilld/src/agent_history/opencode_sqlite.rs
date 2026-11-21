@@ -1,8 +1,12 @@
 //! Read-only `OpenCode` SQLite adapter. Schema reference: Orca ai-vault scanner,
 //! Copyright (c) 2026 Lovecast Inc., MIT. No provider CLI, migrations or exports run.
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, limits::Limit};
 use serde_json::Value;
@@ -13,6 +17,191 @@ const MAX_MESSAGES: usize = 2048;
 const MAX_PARTS: usize = 4096;
 const MAX_PREFIX_ROWS: usize = 100_000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+const CURSOR_CACHE_CAP: usize = 32;
+const MAX_CHECKPOINTS_PER_ENTRY: usize = 512;
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified_ns: Option<u128>,
+    header: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DbStamp {
+    db: FileStamp,
+    wal: Option<FileStamp>,
+}
+
+struct CursorEntry {
+    path: PathBuf,
+    sid: String,
+    stamp: DbStamp,
+    cwd: String,
+    title: String,
+    modified: u64,
+    created: u64,
+    message_count: u64,
+    checkpoints: Vec<(u64, Sha256)>,
+}
+
+fn cursor_cache() -> &'static Mutex<Vec<CursorEntry>> {
+    static CACHE: OnceLock<Mutex<Vec<CursorEntry>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut os: OsString = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn file_stamp(path: &Path, header_offset: u64, header_len: usize) -> Option<FileStamp> {
+    let mut file = File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let modified_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    let mut header = [0u8; 32];
+    let want = header_len.min(header.len());
+    if want > 0 && file.seek(SeekFrom::Start(header_offset)).is_ok() {
+        let mut read = 0;
+        while read < want {
+            let Some(buf) = header.get_mut(read..want) else {
+                break;
+            };
+            match file.read(buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => read += n,
+            }
+        }
+    }
+    Some(FileStamp {
+        len: meta.len(),
+        modified_ns,
+        header,
+    })
+}
+
+fn read_db_stamp(path: &Path) -> Option<DbStamp> {
+    let db = file_stamp(path, 24, 4)?;
+    let wal = file_stamp(&sidecar_path(path, "-wal"), 0, 32);
+    Some(DbStamp { db, wal })
+}
+
+struct CachedResume {
+    fast_idle_batch: Option<Batch>,
+    start_offset: u64,
+    start_digest: Option<Sha256>,
+}
+
+fn lookup_cursor(
+    path: &Path,
+    sid: &str,
+    stamp: &DbStamp,
+    offset: u64,
+    verify_end: Option<u64>,
+) -> Option<CachedResume> {
+    let mut cache = cursor_cache().lock().ok()?;
+    let idx = cache
+        .iter()
+        .position(|e| e.path == path && e.sid == sid && &e.stamp == stamp)?;
+    let entry = cache.get(idx)?;
+    let hasher = entry
+        .checkpoints
+        .iter()
+        .find(|(pos, _)| *pos == offset)
+        .map(|(_, h)| h.clone())?;
+    let idle_batch = if verify_end.is_none() && offset == entry.message_count {
+        let prefix_digest: [u8; 32] = hasher.clone().finalize().into();
+        Some(Batch {
+            sessions: vec![Session {
+                id: sid.to_owned(),
+                cwd: entry.cwd.clone(),
+                title: entry.title.clone(),
+                modified: entry.modified,
+                created: entry.created,
+                messages: Vec::new(),
+                message_count: entry.message_count,
+                prefix_digest,
+                message_digests: Vec::new(),
+                verified_end: None,
+            }],
+            truncated: false,
+            skipped: false,
+            bytes: 0,
+        })
+    } else {
+        None
+    };
+    let moved = cache.remove(idx);
+    cache.push(moved);
+    Some(CachedResume {
+        fast_idle_batch: idle_batch,
+        start_offset: offset,
+        start_digest: Some(hasher),
+    })
+}
+
+fn store_cursor(
+    path: &Path,
+    sid: &str,
+    stamp: DbStamp,
+    session: &Session,
+    new_checkpoints: Vec<(u64, Sha256)>,
+) {
+    let Ok(mut cache) = cursor_cache().lock() else {
+        return;
+    };
+    if let Some(idx) = cache.iter().position(|e| e.path == path && e.sid == sid) {
+        let mut entry = cache.remove(idx);
+        if entry.stamp != stamp {
+            entry.stamp = stamp;
+            entry.checkpoints.clear();
+        }
+        entry.cwd.clone_from(&session.cwd);
+        entry.title.clone_from(&session.title);
+        entry.modified = session.modified;
+        entry.created = session.created;
+        entry.message_count = session.message_count;
+        merge_checkpoints(&mut entry.checkpoints, new_checkpoints);
+        cache.push(entry);
+        return;
+    }
+    if cache.len() >= CURSOR_CACHE_CAP {
+        cache.remove(0);
+    }
+    let mut checkpoints = Vec::new();
+    merge_checkpoints(&mut checkpoints, new_checkpoints);
+    cache.push(CursorEntry {
+        path: path.to_path_buf(),
+        sid: sid.to_owned(),
+        stamp,
+        cwd: session.cwd.clone(),
+        title: session.title.clone(),
+        modified: session.modified,
+        created: session.created,
+        message_count: session.message_count,
+        checkpoints,
+    });
+}
+
+fn merge_checkpoints(dst: &mut Vec<(u64, Sha256)>, added: Vec<(u64, Sha256)>) {
+    for (pos, hasher) in added {
+        if let Some(slot) = dst.iter_mut().find(|(p, _)| *p == pos) {
+            *slot = (pos, hasher);
+        } else {
+            dst.push((pos, hasher));
+        }
+    }
+    dst.sort_by_key(|(pos, _)| *pos);
+    if dst.len() > MAX_CHECKPOINTS_PER_ENTRY {
+        let drop_count = dst.len() - MAX_CHECKPOINTS_PER_ENTRY;
+        dst.drain(..drop_count);
+    }
+}
 
 fn scan_now() -> Instant {
     #[cfg(test)]
@@ -145,6 +334,56 @@ fn read_window(
     page_size: Option<usize>,
     verify_end: Option<u64>,
 ) -> rusqlite::Result<Batch> {
+    let stamp = if messages && page_size.is_some() && id.is_some() {
+        read_db_stamp(path)
+    } else {
+        None
+    };
+    let resumed = if let (Some(sid), Some(stamp)) = (id, stamp.as_ref())
+        && messages
+        && page_size.is_some()
+        && verify_end.is_none_or(|end| end >= offset)
+    {
+        lookup_cursor(path, sid, stamp, offset, verify_end)
+    } else {
+        None
+    };
+    if let Some(CachedResume {
+        fast_idle_batch: Some(batch),
+        ..
+    }) = &resumed
+    {
+        return Ok(Batch {
+            sessions: batch
+                .sessions
+                .iter()
+                .map(|s| Session {
+                    id: s.id.clone(),
+                    cwd: s.cwd.clone(),
+                    title: s.title.clone(),
+                    modified: s.modified,
+                    created: s.created,
+                    messages: Vec::new(),
+                    message_count: s.message_count,
+                    prefix_digest: s.prefix_digest,
+                    message_digests: Vec::new(),
+                    verified_end: s.verified_end,
+                })
+                .collect(),
+            truncated: batch.truncated,
+            skipped: batch.skipped,
+            bytes: batch.bytes,
+        });
+    }
+    let (sql_offset, resume_hasher) = match resumed {
+        Some(CachedResume {
+            start_offset,
+            start_digest: Some(hasher),
+            ..
+        }) => (start_offset, Some(hasher)),
+        _ => (0, None),
+    };
+
     let mut db = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -260,22 +499,36 @@ fn read_window(
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
             }
             let mut stmt = db.prepare(&format!(
-                "SELECT id,data FROM {table} WHERE session_id=?1 ORDER BY {order} LIMIT ?2"
+                "SELECT id,data FROM {table} WHERE session_id=?1 ORDER BY {order} LIMIT ?2 OFFSET ?3"
             ))?;
+            let total_rows = page_size.map_or(MAX_MESSAGES.saturating_add(1), |size| {
+                usize::try_from(
+                    offset
+                        .saturating_add(u64::try_from(size).unwrap_or(128))
+                        .max(verify_end.unwrap_or(0)),
+                )
+                .unwrap_or(usize::MAX)
+            });
+            let remaining_rows =
+                total_rows.saturating_sub(usize::try_from(sql_offset).unwrap_or(0));
             let mut rows = stmt.query(rusqlite::params![
                 session.id,
-                i64::try_from(page_size.map_or(MAX_MESSAGES.saturating_add(1), |size| {
-                    usize::try_from(
-                        offset
-                            .saturating_add(u64::try_from(size).unwrap_or(128))
-                            .max(verify_end.unwrap_or(0)),
-                    )
-                    .unwrap_or(usize::MAX)
-                }))
-                .map_err(|_| rusqlite::Error::InvalidQuery)?
+                i64::try_from(remaining_rows).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                i64::try_from(sql_offset).map_err(|_| rusqlite::Error::InvalidQuery)?
             ])?;
-            let mut digest = Sha256::new();
-            let mut position = 0u64;
+            let mut digest = resume_hasher.clone().unwrap_or_default();
+            let initial_proof: [u8; 32] = digest.clone().finalize().into();
+            if sql_offset > 0 {
+                session.prefix_digest = initial_proof;
+                if verify_end == Some(sql_offset) {
+                    session.verified_end = Some(initial_proof);
+                }
+            }
+            let mut position = sql_offset;
+            let mut recorded_checkpoints = Vec::new();
+            if id.is_some() {
+                recorded_checkpoints.push((position, digest.clone()));
+            }
             while let Some(row) = rows.next()? {
                 if message_count
                     >= if page_size.is_some() {
@@ -350,6 +603,9 @@ fn read_window(
                 }
                 position = position.saturating_add(1);
                 let proof: [u8; 32] = digest.clone().finalize().into();
+                if id.is_some() {
+                    recorded_checkpoints.push((position, digest.clone()));
+                }
                 if position <= offset {
                     session.prefix_digest = proof;
                 } else if page_size.is_none_or(|size| {
@@ -361,6 +617,15 @@ fn read_window(
                 if verify_end == Some(position) {
                     session.verified_end = Some(proof);
                 }
+            }
+            batch.truncated |= batch.bytes > MAX_BYTES || scan_now() >= deadline;
+            if let (Some(sid), Some(stamp)) = (id, stamp.as_ref())
+                && !batch.truncated
+                && !batch.skipped
+                && page_size.is_some()
+                && session.id == sid
+            {
+                store_cursor(path, sid, stamp.clone(), session, recorded_checkpoints);
             }
         }
     }
@@ -838,6 +1103,89 @@ mod tests {
         .unwrap();
         let cell = chat::poll_transcript_file(VaultAgent::OpenCode, "ses_sqlite_001", &path, 0);
         assert!(!cell.bound && cell.next_offset == 0);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cursor_cache_handles_idle_hit_sequential_continuation_and_wal_invalidation() {
+        let (root, path, mut db) = fixture("cursor-cache");
+        let tx = db.transaction().unwrap();
+        tx.execute_batch("DELETE FROM part; DELETE FROM message;")
+            .unwrap();
+        for n in 0..300 {
+            tx.execute(
+                "INSERT INTO message VALUES(?1,'ses_sqlite_001',?2,?3)",
+                rusqlite::params![
+                    format!("m{n:06}"),
+                    format!(r#"{{"role":"user","content":"msg-{n}"}}"#),
+                    n
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let p1 = chat::poll_transcript_file(VaultAgent::OpenCode, "ses_sqlite_001", &path, 0);
+        assert!(p1.bound && !p1.reset && p1.items.len() == 128);
+        let p2 = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            p1.next_offset,
+        );
+        assert!(p2.bound && !p2.reset && p2.items.len() == 128);
+        assert_eq!(p2.items[0].text, "msg-128");
+        let p3 = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            p2.next_offset,
+        );
+        assert!(p3.bound && !p3.reset && p3.items.len() == 44);
+        assert_eq!(p3.items.last().unwrap().text, "msg-299");
+
+        // Idle poll hits O(1) cache cleanly.
+        let idle = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            p3.next_offset,
+        );
+        assert!(idle.bound && !idle.reset && idle.items.is_empty());
+        assert_eq!(idle.next_offset, p3.next_offset);
+
+        // Appending invalidates stamp and returns only the new item.
+        db.execute(
+            "INSERT INTO message VALUES('m000300','ses_sqlite_001','{\"role\":\"user\",\"content\":\"msg-300\"}',300)",
+            [],
+        )
+        .unwrap();
+        let appended = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            p3.next_offset,
+        );
+        assert!(appended.bound && !appended.reset);
+        assert_eq!(appended.items.len(), 1);
+        assert_eq!(appended.items[0].text, "msg-300");
+
+        // Prefix UPDATE invalidates cache and resets.
+        db.execute(
+            "UPDATE message SET data='{\"role\":\"user\",\"content\":\"edited-0\"}' WHERE id='m000000'",
+            [],
+        )
+        .unwrap();
+        let edited = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            appended.next_offset,
+        );
+        assert!(edited.bound && edited.reset);
+        assert_eq!(edited.items[0].text, "edited-0");
+
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
