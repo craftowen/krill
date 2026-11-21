@@ -103,20 +103,24 @@ impl Adapter for Claude {
         status: &mut Value,
     ) {
         observe_statusline(context, live, snapshot, status);
-        let screen = live.tap().ok().map(|tap| tap.capture().0);
-        if let Some(screen) = screen.as_ref() {
-            merge_screen_observation(status, screen);
-        }
-        let effort_supported = status.get("supported").and_then(Value::as_bool) == Some(true)
-            && screen.as_ref().is_some_and(effort_available);
-        set(status, "effort_supported", effort_supported.into());
-        if effort_supported {
-            set(
-                status,
-                "efforts",
-                json!(["low", "medium", "high", "xhigh", "max"]),
-            );
-        }
+        let screen = live.screen();
+        observe_screen_into(screen.as_ref(), status);
+    }
+}
+
+fn observe_screen_into(screen: Option<&Screen>, status: &mut Value) {
+    if let Some(screen) = screen {
+        merge_screen_observation(status, screen);
+    }
+    let effort_supported = status.get("supported").and_then(Value::as_bool) == Some(true)
+        && screen.is_some_and(effort_available);
+    set(status, "effort_supported", effort_supported.into());
+    if effort_supported {
+        set(
+            status,
+            "efforts",
+            json!(["low", "medium", "high", "xhigh", "max"]),
+        );
     }
 }
 

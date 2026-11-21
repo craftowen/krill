@@ -356,6 +356,7 @@ actions!(
         ToggleSidebar,
         FocusSidebar,
         TogglePanel,
+        ToggleChatView,
         ToggleChanges,
         ToggleExplorer,
         ToggleSearch,
@@ -367,6 +368,7 @@ actions!(
         FindPrev,
         Copy,
         CopyClean,
+        QuoteChat,
         Paste,
         ForkSession,
         ContinueInNewSession,
@@ -543,6 +545,7 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-shift-f", ToggleSearch, ctx),
         krill_app::keys::bind("cmd-alt-b", TogglePanel, ctx),
         krill_app::keys::bind("cmd-l", TogglePanel, ctx),
+        krill_app::keys::bind("cmd-shift-j", ToggleChatView, ctx),
         krill_app::keys::bind("cmd-shift-g", ToggleChanges, ctx),
         krill_app::keys::bind("cmd-q", Quit, None),
         krill_app::keys::bind("cmd-j", Jump, ctx),
@@ -553,6 +556,7 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
         krill_app::keys::bind("cmd-c", Copy, ctx),
         krill_app::keys::bind("cmd-shift-c", CopyClean, ctx),
+        krill_app::keys::bind("cmd-shift-l", QuoteChat, ctx),
         krill_app::keys::bind("cmd-v", Paste, ctx),
     ]);
     #[cfg(target_os = "windows")]
@@ -2270,6 +2274,10 @@ impl Shell {
 
     /// Cmd+G/⇧Cmd+G: 열린 터미널 검색 바의 검색어로 다음/이전 일치를 찾는다(OWE-868). 바가 닫혀 있으면 무시한다.
     fn step_search(&mut self, direction: krill_proto::search::Direction, cx: &mut Context<Self>) {
+        if self.is_active_chat_view_in(cx) && self.chat_find_is_open(cx) {
+            self.step_chat_find(direction, cx);
+            return;
+        }
         let query = self
             .search
             .as_ref()
@@ -2300,6 +2308,7 @@ impl Shell {
             (Kind::ToggleSidebar, jtext::ACT_TOGGLE_SIDEBAR.get()),
             (Kind::ToggleExplorer, jtext::ACT_TOGGLE_EXPLORER.get()),
             (Kind::ToggleSearch, jtext::ACT_TOGGLE_SEARCH.get()),
+            (Kind::ToggleChatView, jtext::ACT_TOGGLE_CHAT_VIEW.get()),
             (
                 Kind::ImportTerminalThemes,
                 jtext::ACT_IMPORT_TERMINAL_THEMES.get(),
@@ -2437,6 +2446,7 @@ impl Shell {
             jump::ActionKind::ToggleSidebar => self.toggle_sidebar(cx),
             jump::ActionKind::ToggleExplorer => self.toggle_explorer(window, cx),
             jump::ActionKind::ToggleSearch => self.toggle_workspace_search(window, cx),
+            jump::ActionKind::ToggleChatView => self.toggle_chat_view_with_focus(window, cx),
             jump::ActionKind::OpenChecks => krill_app::onboarding::open_checks_current(cx),
             jump::ActionKind::OpenDisk => {
                 self.open_settings(krill_app::settings::AdminTab::Disk, Some(window), cx);
@@ -2507,6 +2517,10 @@ impl Shell {
         if let Some(pane) = self.layout.focused()
             && self.open_editor_search(pane, window, cx)
         {
+            return;
+        }
+        if self.is_active_chat_view_in(cx) {
+            self.toggle_chat_find(window, cx);
             return;
         }
         // OWE-868: 빈 탭에서는 터미널 검색 바를 열지 않는다(열어도 동작하지 않는다).
@@ -5719,7 +5733,11 @@ impl Shell {
         self.character_input_keys.remove(&e.keystroke.key);
         // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·←·→만 Ctrl+U·A·E로 보낸다.
         let ks = &e.keystroke;
-        let Some(pane) = self.layout.focused().filter(|&p| self.is_terminal_pane(p)) else {
+        let Some(pane) = self
+            .layout
+            .focused()
+            .filter(|&p| self.is_terminal_pane(p) && !self.is_pane_chat_view(p, cx))
+        else {
             return;
         };
         if !e.is_held
@@ -5734,7 +5752,7 @@ impl Shell {
                 .and_then(Live::selected_text)
                 .is_some_and(|t| !t.is_empty())
         {
-            self.copy(cx);
+            self.copy(window, cx);
             if let Some(l) = self.live.get_mut(&pane) {
                 l.clear_selection();
             }
@@ -5786,7 +5804,14 @@ impl Shell {
         }
         // AS-12: `on_key_down`과 같이 포커스를 검사한다. 검색 바·Jump·사이드바 입력 중에
         // 올라온 Release가 버블링돼 터미널 PTY로 새는 것을 막는다(kitty 플래그 2 보고 모드).
-        if self.page_open() || self.dashboard.is_some() || !self.focus.is_focused(window) {
+        if self.page_open()
+            || self.dashboard.is_some()
+            || !self.focus.is_focused(window)
+            || self
+                .layout
+                .focused()
+                .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -6090,8 +6115,15 @@ impl Shell {
         }
     }
 
-    fn copy(&mut self, cx: &mut Context<Self>) {
+    fn copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page_open() || self.dashboard.is_some() {
+            return;
+        }
+        if self.is_active_chat_view_in(cx) {
+            let text = gpui_component::TextSelection::selected_text(window, cx);
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -6103,8 +6135,16 @@ impl Shell {
         }
     }
 
-    fn copy_clean(&mut self, cx: &mut Context<Self>) {
+    fn copy_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page_open() || self.dashboard.is_some() {
+            return;
+        }
+        if self.is_active_chat_view_in(cx) {
+            let raw = gpui_component::TextSelection::selected_text(window, cx);
+            let cleaned = select::clean_text(&raw);
+            if !cleaned.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(cleaned));
+            }
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -7503,7 +7543,7 @@ impl Shell {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseUpEvent, window, cx| {
                     // 끌지 않은 맨 클릭이 링크 위면 대상 URL·복사·열기 팝오버를 띄운다(⌘ 없이도).
                     let clicked = !e.modifiers.modified()
                         && this.live.get(&id).is_some_and(|l| {
@@ -7549,7 +7589,7 @@ impl Shell {
                         }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
                         if krill_app::settings::copy_on_select(cx) {
-                            this.copy(cx);
+                            this.copy(window, cx);
                         }
                         return;
                     }
@@ -7564,11 +7604,11 @@ impl Shell {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseUpEvent, window, cx| {
                     // 패인 밖의 release도 시작한 선택·TUI 마우스 끌기를 확정한다. 다른 패인에는 입력을 보내지 않는다.
                     if this.select_end(id, cx) {
                         if krill_app::settings::copy_on_select(cx) {
-                            this.copy(cx);
+                            this.copy(window, cx);
                         }
                         return;
                     }
@@ -8424,7 +8464,7 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearPane, _, cx| {
-                if this.page_open() || this.dashboard.is_some() {
+                if this.page_open() || this.dashboard.is_some() || this.is_active_chat_view_in(cx) {
                     return;
                 }
                 let unlinked_session = this.layout.focused().and_then(|pane| {
@@ -8449,8 +8489,13 @@ impl Render for Shell {
                         .detach();
                 }
             }))
-            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+            .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
                 if this.page_open() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
+                    gpui_component::TextSelection::select_all(window, cx);
+                    cx.notify();
                     return;
                 }
                 if let Some(l) = this.focused_live() {
@@ -8514,6 +8559,10 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ScrollTop, _, cx| {
                 if !this.page_open() && this.dashboard.is_none() {
+                    if this.is_active_chat_view_in(cx) {
+                        this.scroll_chat_overlay_home(cx);
+                        return;
+                    }
                     if let Some(live) = this.focused_live() {
                         live.clear_selection();
                         live.pane.scroll_top();
@@ -8521,16 +8570,31 @@ impl Render for Shell {
                     cx.notify();
                 }
             }))
-            .on_action(
-                cx.listener(|this, _: &ScrollBottom, _, cx| this.scroll_terminal(isize::MIN, cx)),
-            )
+            .on_action(cx.listener(|this, _: &ScrollBottom, _, cx| {
+                if !this.page_open() && this.dashboard.is_none() && this.is_active_chat_view_in(cx)
+                {
+                    this.scroll_chat_overlay_end(cx);
+                    return;
+                }
+                this.scroll_terminal(isize::MIN, cx);
+            }))
             .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| {
+                if !this.page_open() && this.dashboard.is_none() && this.is_active_chat_view_in(cx)
+                {
+                    this.scroll_chat_overlay_page(-1, cx);
+                    return;
+                }
                 let rows = this
                     .focused_live()
                     .map_or(1, |l| l.pane.screen().rows.len());
                 this.scroll_terminal(isize::try_from(rows).unwrap_or(isize::MAX), cx);
             }))
             .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| {
+                if !this.page_open() && this.dashboard.is_none() && this.is_active_chat_view_in(cx)
+                {
+                    this.scroll_chat_overlay_page(1, cx);
+                    return;
+                }
                 let rows = this
                     .focused_live()
                     .map_or(1, |l| l.pane.screen().rows.len());
@@ -8633,8 +8697,13 @@ impl Render for Shell {
             .map(|d| Self::new_session_actions(d, cx))
             .map(|d| Self::file_actions(d, cx))
             .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleChatView, window, cx| {
+                this.toggle_chat_view_with_focus(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
-                if this.search.is_some() {
+                if this.search.is_some()
+                    || (this.is_active_chat_view_in(cx) && this.chat_find_is_open(cx))
+                {
                     this.step_search(krill_proto::search::Direction::Previous, cx);
                 } else {
                     this.toggle_changes(window, cx);
@@ -8663,8 +8732,11 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &FindPrev, _, cx| {
                 this.step_search(krill_proto::search::Direction::Previous, cx);
             }))
-            .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
-            .on_action(cx.listener(|this, _: &CopyClean, _, cx| this.copy_clean(cx)))
+            .on_action(cx.listener(|this, _: &Copy, window, cx| this.copy(window, cx)))
+            .on_action(cx.listener(|this, _: &CopyClean, window, cx| this.copy_clean(window, cx)))
+            .on_action(cx.listener(|this, _: &QuoteChat, window, cx| {
+                this.quote_chat_selection(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste(window, cx)))
             .on_action(cx.listener(|this, _: &ForkSession, _, cx| {
                 if let Some(pane) = this.layout.focused() {
@@ -8717,6 +8789,7 @@ impl Render for Shell {
             .text_color(fg)
             .font_family(krill_app::ui::FONT_UI)
             .text_size(krill_app::ui::TEXT_MD)
+            .child(gpui_component::TextSelectionLayer)
             .child(
                 div()
                     .flex_1()
@@ -9430,12 +9503,12 @@ impl EntityInputHandler for Shell {
         &mut self,
         _ignore_disabled_input: bool,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let pane = self
             .layout
             .focused()
-            .filter(|&p| self.is_terminal_pane(p))?;
+            .filter(|&p| self.is_terminal_pane(p) && !self.is_pane_chat_view(p, cx))?;
         let range = self
             .live
             .get(&pane)
@@ -9450,9 +9523,12 @@ impl EntityInputHandler for Shell {
     fn marked_text_range(
         &self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        let pane = self.layout.focused()?;
+        let pane = self
+            .layout
+            .focused()
+            .filter(|&p| !self.is_pane_chat_view(p, cx))?;
         let r = self.live.get(&pane)?.ime.marked_range_utf16();
         ime_trace(format_args!("markedRange -> {r:?}"));
         r
@@ -9460,6 +9536,13 @@ impl EntityInputHandler for Shell {
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         ime_trace(format_args!("unmarkText"));
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
         let Some(l) = self.focused_live() else { return };
         let modes = l.pane.modes();
         let mut out = l.ime.unmark();
@@ -9475,6 +9558,13 @@ impl EntityInputHandler for Shell {
         cx: &mut Context<Self>,
     ) {
         ime_trace(format_args!("insertText {text:?} replace={range:?}"));
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
         if text.is_empty() && self.focused_live().is_none() {
             return;
         }
@@ -9498,6 +9588,13 @@ impl EntityInputHandler for Shell {
         ime_trace(format_args!(
             "setMarkedText {new_text:?} sel={new_selected_range:?} replace={range:?}"
         ));
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return;
+        }
         if new_text.is_empty() && self.focused_live().is_none() {
             return;
         }
@@ -9513,8 +9610,15 @@ impl EntityInputHandler for Shell {
         range_utf16: Range<usize>,
         _element_bounds: Bounds<Pixels>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if self
+            .layout
+            .focused()
+            .is_some_and(|p| self.is_pane_chat_view(p, cx))
+        {
+            return None;
+        }
         let l = self.focused_live()?;
         let (bounds, cell) = l.painted.get();
         let at = l

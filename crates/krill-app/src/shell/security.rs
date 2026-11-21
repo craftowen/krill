@@ -2276,5 +2276,42 @@ pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::pa
     Ok(path)
 }
 
+pub(crate) fn save_clipboard_text(text: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PASTE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    let dir = std::env::temp_dir().join("krill-paste");
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+    }
+    let filename = format!(
+        "paste-{}-{}.txt",
+        std::process::id(),
+        PASTE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let path = dir.join(filename);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use krill_proto::os::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(path)
+}
+
 #[cfg(all(test, unix))]
 mod tests;

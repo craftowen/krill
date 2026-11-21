@@ -6,22 +6,23 @@ const enc=new TextEncoder(),dec=new TextDecoder(),flush=async()=>{for(let i=0;i<
 const varint=n=>{const out=[];do{const b=n&127;n>>>=7;out.push(b|(n?128:0));}while(n);return out;};
 const reply=json=>{const bytes=enc.encode(json);return Uint8Array.from([0,0,0,0,0x65,6,...varint(bytes.length),...bytes]);};
 function harness(){
- let now=100000,nextTimer=0;const timers=new Map(),sockets=[],snapshots=[],errors=[],docHandlers=[];
+ let now=100000,nextTimer=0;const timers=new Map(),sockets=[],snapshots=[],chatPushes=[],errors=[],docHandlers=[];
  const document={hidden:false,addEventListener:(name,fn)=>name==='visibilitychange'&&docHandlers.push(fn),removeEventListener:(name,fn)=>{const i=docHandlers.indexOf(fn);if(i>=0)docHandlers.splice(i,1);}};
  class Socket{constructor(url){this.url=url;this.handlers={};this.sent=[];sockets.push(this);}addEventListener(name,fn){(this.handlers[name]||=[]).push(fn);}removeEventListener(name,fn){this.handlers[name]=(this.handlers[name]||[]).filter(v=>v!==fn);}emit(name,event={}){for(const fn of [...this.handlers[name]||[]])fn(event);}send(data){this.sent.push(data);}close(){this.closed=true;}}
  let corrupt=false;
  const C={enc,concat:(...bytes)=>Uint8Array.from(bytes.flatMap(b=>Array.from(b))),unhex:()=>new Uint8Array(32),unbase64:()=>new Uint8Array(32),hex:b=>Buffer.from(b).toString('hex'),sha256:b=>new Uint8Array(require('node:crypto').createHash('sha256').update(b).digest()),Channel:class{seal(b){return b;}open(b){if(corrupt)throw Error('bad frame');return b;}}};
  const context=vm.createContext({TextEncoder,TextDecoder,Uint8Array,Uint32Array,DataView,URL,URLSearchParams,AbortController,MkCrypto:C,WebSocket:Socket,document,Date:class extends Date{static now(){return now;}},crypto:{getRandomValues:b=>b},location:new URL('https://phone.test/'),history:{replaceState(){}},navigator:{},localStorage:{getItem:()=>null,setItem(){},removeItem(){}},setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});return id;},clearTimeout:id=>timers.delete(id)});
  vm.runInContext(source,context);
- const M=context.KrillMobile,transport=M.transport.create({credentials:{device_id:'aa',credential:'bb'},url:'wss://desktop.test/ws',warmTerminal:false,onSnapshot:data=>snapshots.push({at:now,data}),onError:e=>errors.push(e.message)});
+ const M=context.KrillMobile,transport=M.transport.create({credentials:{device_id:'aa',credential:'bb'},url:'wss://desktop.test/ws',warmTerminal:false,onSnapshot:data=>snapshots.push({at:now,data}),onChatPush:p=>chatPushes.push(p),onError:e=>errors.push(e.message)});
  // Run due timers in time order so a 60s window behaves like 60s of wall clock.
  async function tick(ms){const end=now+ms;for(;;){let due=null;for(const [id,t] of timers)if(t.at<=end&&(!due||t.at<due[1].at))due=[id,t];if(!due)break;timers.delete(due[0]);now=Math.max(now,due[1].at);due[1].fn();await flush();}now=end;await flush();}
  const requests=socket=>socket.sent.filter(b=>b instanceof Uint8Array&&b[4]===0x45).map(b=>{let at=5;while(b[at]&128)at++;at++;while(b[at]&128)at++;at++;return JSON.parse(dec.decode(b.slice(at)));});
  const respond=(socket,data,ok=true)=>socket.emit('message',{data:reply(JSON.stringify(ok?{ok:true,data}:{ok:false,error:'invalid mobile authentication or frame'}))});
  const push=(socket,data)=>socket.emit('message',{data:reply(data===undefined?'{"push":"stale"}':`{"push":"snapshot","data":${JSON.stringify(data)}}`)});
+ const pushRaw=(socket,obj)=>socket.emit('message',{data:reply(JSON.stringify(obj))});
  async function connect(){const pending=transport.connect();await flush();const socket=sockets.at(-1);socket.emit('open');await flush();socket.emit('message',{data:JSON.stringify({version:2,challenge:'aa'})});await flush();socket.emit('message',{data:enc.encode('{}')});await flush();socket.emit('message',{data:Uint8Array.from([0,0,0,0,1])});await flush();return {pending,socket};}
  const visibility=hidden=>{document.hidden=hidden;for(const fn of [...docHandlers])fn();};
- return {M,transport,tick,requests,respond,push,connect,visibility,snapshots,errors,sockets,docHandlers,get now(){return now;},set corrupt(v){corrupt=v;}};
+ return {M,transport,tick,requests,respond,push,pushRaw,connect,visibility,snapshots,chatPushes,errors,sockets,docHandlers,get now(){return now;},set corrupt(v){corrupt=v;}};
 }
 const body=(etag,extra={})=>({sessions:[],etag,capabilities:{change_feed:true},...extra});
 // Bring a transport to the armed state against a feed-capable daemon and return the socket.
@@ -147,5 +148,18 @@ test('a definitive read error after the feed is armed keeps the feed instead of 
  await h.tick(1);const next=h.requests(socket).at(-1);assert.equal(h.requests(socket).length,before+2);assert.equal(next.feed,2500,'reconcile keeps negotiating feed');h.respond(socket,{unchanged:true,etag:'e1',rev:1,feed:2500});await flush();
  const mutation=h.transport.rpc({action:'prompt',session:1,text:'once'});await flush();h.respond(socket,null,false);await assert.rejects(mutation,/invalid/);
  await h.tick(1000);assert.equal(h.requests(socket).filter(r=>r.action==='prompt').length,1,'mutations are never retried');
+ h.transport.close();
+});
+
+test('chat_delta and chat_stale pushes forward to onChatPush without triggering snapshot refresh',async()=>{
+ const h=harness(),socket=await armed(h),snapCount=h.snapshots.length,reqCount=h.requests(socket).length;
+ h.pushRaw(socket,{push:'chat_delta',session:7,data:{items:[{id:'10:0',kind:'assistant',text:'hi'}],next_offset:20}});await flush();
+ h.pushRaw(socket,{push:'chat_stale',session:7});await flush();
+ assert.equal(h.snapshots.length,snapCount);
+ assert.equal(h.requests(socket).length,reqCount);
+ assert.equal(h.chatPushes.length,2);
+ assert.equal(h.chatPushes[0].push,'chat_delta');
+ assert.equal(h.chatPushes[0].session,7);
+ assert.equal(h.chatPushes[1].push,'chat_stale');
  h.transport.close();
 });

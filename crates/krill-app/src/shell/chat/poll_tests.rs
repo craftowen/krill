@@ -421,3 +421,146 @@ fn work_run_list_sync_preserves_anchor_across_boundary_prepend_head_drain_and_ta
         "run expanded before tail growth keeps its open state after draining past its initial span"
     );
 }
+
+#[gpui::test]
+fn load_earlier_chat_preserves_cursor_on_transient_error_and_retries(
+    cx: &mut gpui::TestAppContext,
+) {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail_flag = Arc::clone(&fail);
+    let (view, cx) = open(cx, state_path("chat-earlier-retry"));
+    let pane = view.read_with(cx, |s, _| s.layout.focused().unwrap());
+    view.update(cx, |shell, cx| {
+        shell.layout.set_session(pane, SessionId(994));
+        shell.paths = Some(krill_proto::daemon::Paths {
+            socket: "/unused".into(),
+            holder: "/unused".into(),
+            krilld: "/unused".into(),
+        });
+        shell.chat.workflow_call = Some(Arc::new(move |req| {
+            let v: serde_json::Value = serde_json::from_str(req).unwrap();
+            if v.get("action").and_then(|a| a.as_str()) == Some("chat_poll")
+                && v.get("latest").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                let is_before = v
+                    .get("end_offset")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some();
+                if is_before && fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("transient network error"));
+                }
+                let mut data = serde_json::to_value(ChatPollSnapshot {
+                    agent: "claude".into(),
+                    session_id: "tail".into(),
+                    transcript_path: "/tmp/retry.jsonl".into(),
+                    bound: true,
+                    next_offset: 1_000,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: if is_before { "older ok" } else { "newest" }.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .unwrap();
+                data["page_start"] = if is_before { 0 } else { 500 }.into();
+                data["has_earlier"] = (!is_before).into();
+                return Ok(serde_json::json!({"ok":true,"data":data}).to_string());
+            }
+            Ok(serde_json::json!({"ok":true,"data":{}}).to_string())
+        }));
+        shell.toggle_chat_view(cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SessionId(994))];
+        assert_eq!(
+            log.earlier,
+            Some(500),
+            "transient failure must preserve earlier cursor"
+        );
+        assert_eq!(log.items.len(), 1);
+    });
+
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    cx.executor().advance_clock(Duration::from_secs(3));
+    view.update(cx, |shell, cx| {
+        shell.poll_session_chat(pane, SessionId(994), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        let log = &shell.chat.logs[&local_key(SessionId(994))];
+        assert_eq!(log.earlier, None);
+        assert_eq!(log.items.len(), 2);
+        assert_eq!(log.items[0].text, "older ok");
+    });
+}
+
+#[gpui::test]
+fn active_chat_poll_interval_adapts_to_session_state(cx: &mut gpui::TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus};
+
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (view, cx) = open(cx, state_path("chat-poll-interval"));
+    let pane = view.read_with(cx, |s, _| s.layout.focused().unwrap());
+    let sid = SessionId(995);
+    view.update(cx, |shell, _| {
+        shell.layout.set_session(pane, sid);
+    });
+    view.read_with(cx, |shell, cx| {
+        assert_eq!(
+            shell.active_chat_poll_interval(cx),
+            Duration::from_millis(800)
+        );
+    });
+
+    for (state, expected_ms) in [
+        (AgentState::Unknown, 800),
+        (AgentState::Working, 250),
+        (AgentState::Done, 1500),
+        (AgentState::Waiting, 1500),
+    ] {
+        let snap = krill_app::sidebar::Snapshot {
+            sessions: vec![krill_app::sidebar::Session {
+                id: sid,
+                status: AgentStatus {
+                    state,
+                    agent: "claude".into(),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: None,
+                cwd: None,
+                account: None,
+            }],
+            trees: BTreeMap::new(),
+        };
+        view.update(cx, |shell, cx| {
+            shell.sidebar.update(cx, |sidebar, cx| {
+                sidebar.connect_source(Arc::new(StateSource(snap)), cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |shell, cx| {
+            assert_eq!(
+                shell.active_chat_poll_interval(cx),
+                Duration::from_millis(expected_ms),
+                "unexpected interval for {state:?}"
+            );
+        });
+    }
+
+    view.update(cx, |shell, cx| {
+        let key = (shell.layout.host(pane).clone(), sid);
+        shell.chat.poll_failed.insert(key);
+        assert_eq!(
+            shell.active_chat_poll_interval(cx),
+            Duration::from_millis(800)
+        );
+    });
+}

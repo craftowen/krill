@@ -916,3 +916,200 @@ fn composer_primary_action_respects_sending_working_latch_and_draft_state() {
         );
     }
 }
+
+#[test]
+fn work_run_unified_diff_summary_and_unread_divider_projection() {
+    assert!(work_run::is_unified_diff(
+        "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n"
+    ));
+    assert!(!work_run::is_unified_diff("just plain explanation text"));
+
+    let items = vec![
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: "fix lib".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::ToolCall,
+            tool_name: "Edit".into(),
+            file_path: "src/lib.rs".into(),
+            text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Updated src/lib.rs".into(),
+            ..Default::default()
+        }),
+    ];
+
+    let feed = work_run::DisplayFeed::project_with_unread(10, &items, Some(11));
+    assert_eq!(feed.rows().len(), 4);
+    assert!(matches!(
+        feed.rows().get(1),
+        Some(work_run::DisplayRow::UnreadDivider { first_abs_idx: 11 })
+    ));
+    let Some(work_run::DisplayRow::WorkRun(run)) = feed.rows().get(2) else {
+        panic!("expected work run row after unread divider");
+    };
+    assert_eq!(run.changed_files, 1);
+    assert_eq!(run.diff_added, 1);
+    assert_eq!(run.diff_deleted, 1);
+    let summary = run
+        .diff_summary_label()
+        .expect("diff summary should be formatted");
+    assert!(summary.contains('1'));
+    assert!(summary.contains("+1"));
+    assert!(summary.contains("-1"));
+}
+
+#[test]
+fn chat_page_parses_timestamps_and_remote_autocomplete_items_validate_paths() {
+    let page_json = serde_json::json!({
+        "ok": true,
+        "data": {
+            "agent": "claude",
+            "session_id": "sid-ts",
+            "transcript_path": "/tmp/ts.jsonl",
+            "next_offset": 256,
+            "reset": false,
+            "bound": true,
+            "page_start": 0,
+            "has_earlier": false,
+            "items": [{
+                "kind": "assistant",
+                "text": "hello",
+                "at": "2026-11-21T12:34:56+09:00"
+            }]
+        }
+    });
+    let page = parse_chat_page(&page_json.to_string()).expect("chat page should parse");
+    assert_eq!(page.snapshot.items.len(), 1);
+    assert_eq!(page.snapshot.items[0].at, "2026-11-21T12:34:56+09:00");
+    assert_eq!(
+        format_chat_timestamp(&page.snapshot.items[0].at).as_deref(),
+        Some("12:34")
+    );
+    assert!(format_chat_timestamp("1732150800").is_some());
+
+    let slash_json = serde_json::json!({
+        "ok": true,
+        "data": {
+            "items": [
+                {"name": "review", "description": "Code review", "kind": "skill"},
+                {"name": "/compact", "description": "Compact context", "kind": "command", "scope": "Built-in"}
+            ]
+        }
+    });
+    let slash =
+        catalog::parse_remote_slash_items(&slash_json.to_string(), "rev").expect("slash items");
+    assert_eq!(slash.len(), 1);
+    assert_eq!(slash[0].label, "/review");
+    assert_eq!(slash[0].source, catalog::AutocompleteSource::Skill);
+
+    let mention_json = serde_json::json!({
+        "ok": true,
+        "data": {
+            "items": [
+                {"path": "src/main.rs"},
+                {"path": "docs/read me.md"},
+                {"path": "../secret.txt"},
+                {"path": "/etc/passwd"},
+                {"path": "win\\bad.rs"}
+            ]
+        }
+    });
+    let mentions =
+        catalog::parse_remote_mention_items(&mention_json.to_string(), "").expect("mention items");
+    assert_eq!(mentions.len(), 2);
+    assert_eq!(mentions[0].insert_text, "@src/main.rs ");
+    assert_eq!(mentions[1].insert_text, "@\"docs/read me.md\" ");
+}
+
+#[test]
+fn composer_meta_cache_and_composer_status_json_parse_rate_limit_and_live_prompt() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-composer-cache-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let ctx_dir = dir.join("session-context/default");
+    std::fs::create_dir_all(&ctx_dir).unwrap();
+    let transcript = dir.join("chat.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"type":"assistant","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000}}}"#,
+    )
+    .unwrap();
+    let path_str = transcript.to_str().unwrap();
+
+    let first = observe_composer_meta(Some(&dir), "sid-cache", path_str);
+    let second = observe_composer_meta(Some(&dir), "sid-cache", path_str);
+    assert_eq!(first.model.as_deref(), Some("claude-sonnet-4-5"));
+    assert_eq!(second.model, first.model);
+
+    // Statusline session-context file overrides cached transcript values.
+    std::fs::write(
+        ctx_dir.join("sid-cache.json"),
+        r#"{"model":"claude-opus-5-5","effort":"high","percent":42.5}"#,
+    )
+    .unwrap();
+    let overridden = observe_composer_meta(Some(&dir), "sid-cache", path_str);
+    assert_eq!(overridden.model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(overridden.effort.as_deref(), Some("high"));
+    assert_eq!(overridden.context_percent, Some(43));
+
+    std::fs::remove_dir_all(&dir).ok();
+
+    let mut meta = ComposerMeta::default();
+    let status_json = serde_json::json!({
+        "ok": true,
+        "data": {
+            "agent": "claude",
+            "model": "claude-opus-5-5",
+            "rate_limited": true,
+            "live_prompt": {
+                "kind": "yes_no",
+                "prompt": "Continue deploy?"
+            }
+        }
+    });
+    let agent = apply_composer_status_json(&status_json.to_string(), &mut meta);
+    assert_eq!(agent.as_deref(), Some("claude"));
+    assert!(meta.rate_limited);
+    assert!(matches!(
+        meta.live_prompt,
+        Some(krill_proto::screen::prompt::PromptKind::YesNo { ref prompt })
+            if prompt == "Continue deploy?"
+    ));
+}
+
+#[test]
+fn long_clipboard_text_paste_saves_private_txt_attachment_and_quotes_cleanly() {
+    let long = "line\n".repeat(7000);
+    assert!(long.len() >= 32 * 1024);
+    let item = gpui::ClipboardItem::new_string(long);
+    let classified = classify_chat_clipboard_item(&item);
+    let ChatClipboardContent::Attachments(atts) = classified else {
+        panic!("expected long paste >= 32 KiB to become a file attachment");
+    };
+    assert_eq!(atts.len(), 1);
+    let path = &atts[0].path;
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("txt"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    std::fs::remove_file(path).ok();
+
+    assert_eq!(
+        format_chat_quote("hello\n\nworld\x1b[31m!").as_deref(),
+        Some("> hello\n>\n> world!\n\n")
+    );
+    assert_eq!(format_chat_quote("   "), None);
+}

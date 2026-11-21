@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -50,7 +50,16 @@ impl DisplayFeed {
         Arc::clone(EMPTY.get_or_init(|| Arc::new(Self::default())))
     }
 
+    #[cfg(test)]
     pub(super) fn project(base_index: usize, items: &[Arc<ChatItem>]) -> Self {
+        Self::project_with_unread(base_index, items, None)
+    }
+
+    pub(super) fn project_with_unread(
+        base_index: usize,
+        items: &[Arc<ChatItem>],
+        unread_from: Option<usize>,
+    ) -> Self {
         let foldable = compute_foldable_notes(items);
         let mut rows = Vec::new();
         let mut rel_idx = 0;
@@ -93,6 +102,18 @@ impl DisplayFeed {
             }
             rel_idx = rel_end;
         }
+        if let Some(cutoff) = unread_from
+            && cutoff > base_index
+            && let Some(pos) = rows.iter().position(|r| r.span().end() > cutoff)
+            && pos > 0
+        {
+            rows.insert(
+                pos,
+                DisplayRow::UnreadDivider {
+                    first_abs_idx: cutoff,
+                },
+            );
+        }
         Self { rows }
     }
 
@@ -117,6 +138,7 @@ impl DisplayFeed {
 pub(super) enum DisplayRow {
     Item { abs_idx: usize, item: Arc<ChatItem> },
     WorkRun(WorkRun),
+    UnreadDivider { first_abs_idx: usize },
 }
 
 impl DisplayRow {
@@ -124,6 +146,7 @@ impl DisplayRow {
         match self {
             Self::Item { abs_idx, .. } => RawSpan::single(*abs_idx),
             Self::WorkRun(run) => run.span,
+            Self::UnreadDivider { first_abs_idx } => RawSpan::single(*first_abs_idx),
         }
     }
 }
@@ -147,6 +170,64 @@ pub(super) struct WorkRun {
     pub counts: WorkCounts,
     pub category_counts: Vec<(ToolCategory, usize)>,
     pub latest_detail: String,
+    pub changed_files: usize,
+    pub diff_added: usize,
+    pub diff_deleted: usize,
+}
+
+/// Returns true when `text` contains recognizable `unified/apply_patch` diff headers and lines.
+pub(super) fn is_unified_diff(text: &str) -> bool {
+    let mut has_marker = false;
+    let mut has_delta = false;
+    for line in text.lines() {
+        if line.starts_with("@@")
+            || line.starts_with("*** Begin Patch")
+            || line.starts_with("diff --git ")
+            || line.starts_with("+++ ")
+            || line.starts_with("--- ")
+        {
+            has_marker = true;
+        } else if (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
+        {
+            has_delta = true;
+        }
+        if has_marker && has_delta {
+            return true;
+        }
+    }
+    false
+}
+
+/// Counts added/removed lines and modified file headers in unified diffs.
+pub(super) fn parse_diff_stats(text: &str, files: &mut BTreeSet<String>) -> (usize, usize) {
+    if !is_unified_diff(text) {
+        return (0, 0);
+    }
+    let mut added = 0usize;
+    let mut deleted = 0usize;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let clean = rest.trim().strip_prefix("b/").unwrap_or(rest.trim());
+            if !clean.is_empty() && clean != "/dev/null" {
+                files.insert(clean.to_owned());
+            }
+        } else if let Some(rest) = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
+        {
+            let clean = rest.trim();
+            if !clean.is_empty() {
+                files.insert(clean.to_owned());
+            }
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deleted += 1;
+        }
+    }
+    (added, deleted)
 }
 
 impl WorkRun {
@@ -156,6 +237,9 @@ impl WorkRun {
         let mut category_counts: Vec<(ToolCategory, usize)> = Vec::new();
         let mut tool_detail = None;
         let mut thought_detail = None;
+        let mut files = BTreeSet::new();
+        let mut diff_added = 0usize;
+        let mut diff_deleted = 0usize;
 
         for (offset, item) in slice.iter().enumerate() {
             let abs_idx = span.start() + offset;
@@ -165,7 +249,12 @@ impl WorkRun {
                     let category = ToolCategory::from_name_and_title(&item.tool_name, &item.title);
                     match category {
                         ToolCategory::Read => counts.read += 1,
-                        ToolCategory::Edit => counts.edit += 1,
+                        ToolCategory::Edit => {
+                            counts.edit += 1;
+                            if !item.file_path.trim().is_empty() {
+                                files.insert(item.file_path.trim().to_owned());
+                            }
+                        }
                         ToolCategory::Search | ToolCategory::ListFiles => counts.search += 1,
                         ToolCategory::Command => counts.command += 1,
                         ToolCategory::WebFetch
@@ -175,6 +264,9 @@ impl WorkRun {
                         | ToolCategory::Mcp
                         | ToolCategory::Other => counts.other += 1,
                     }
+                    let (a, d) = parse_diff_stats(&item.text, &mut files);
+                    diff_added += a;
+                    diff_deleted += d;
                     if let Some((_, count)) =
                         category_counts.iter_mut().find(|(cat, _)| *cat == category)
                     {
@@ -276,7 +368,21 @@ impl WorkRun {
             counts,
             category_counts,
             latest_detail: tool_detail.or(thought_detail).unwrap_or("").to_owned(),
+            changed_files: files.len(),
+            diff_added,
+            diff_deleted,
         }
+    }
+
+    pub(super) fn diff_summary_label(&self) -> Option<String> {
+        if self.changed_files == 0 && self.diff_added == 0 && self.diff_deleted == 0 {
+            return None;
+        }
+        Some(ctext::RUN_CHANGED_FILES.format(&[
+            ("files", &self.changed_files.max(1).to_string()),
+            ("added", &self.diff_added.to_string()),
+            ("deleted", &self.diff_deleted.to_string()),
+        ]))
     }
 
     #[cfg(test)]
