@@ -173,7 +173,22 @@ impl Pool {
     }
 
     fn run(&self, req: &PrepareWorktree, cancel: &Arc<AtomicBool>) {
-        let result = self.prepare(req, cancel);
+        self.run_with(req, cancel, || self.prepare(req, cancel));
+    }
+
+    fn run_with(
+        &self,
+        req: &PrepareWorktree,
+        cancel: &Arc<AtomicBool>,
+        prepare: impl FnOnce() -> Result<Option<(PathBuf, String)>, String>,
+    ) {
+        let result =
+            if let Ok(res) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
+                res
+            } else {
+                tracing::warn!("worktree preparation worker panicked");
+                Err("worktree preparation panicked".to_owned())
+            };
         if let Ok(Some((repo, commit))) = &result {
             let mut state = lock(&self.state);
             if let Some(slot) = state.slot.as_mut().filter(|s| s.token == req.token)
@@ -199,7 +214,14 @@ impl Pool {
             }
         }
         // The marker is the sole authority for cleanup, including failed/partial checkouts.
-        let cleanup = self.cleanup_marker();
+        let cleanup = if let Ok(res) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cleanup_marker()))
+        {
+            res
+        } else {
+            tracing::warn!("worktree preparation cleanup panicked");
+            Err("worktree preparation cleanup panicked".to_owned())
+        };
         let mut state = lock(&self.state);
         // Failed cleanup occupies the only slot: never accumulate abandoned disk usage.
         if cleanup.is_ok() {
@@ -436,26 +458,7 @@ impl Pool {
             )?,
             "cannot resolve base",
         )?;
-        let token = {
-            let mut state = lock(&self.state);
-            let matches = state.slot.as_ref().is_some_and(|s| {
-                !s.cancel.load(Ordering::Acquire)
-                    && Instant::now() < s.deadline
-                    && s.ready
-                        .as_ref()
-                        .is_some_and(|(r, c)| r == repo && *c == commit)
-            });
-            if !matches {
-                return Ok(false);
-            }
-            let Some(slot) = state.slot.take() else {
-                return Ok(false);
-            };
-            state.promoting = true;
-            self.changed.notify_all();
-            slot.token
-        };
-        let moved = (|| {
+        self.promote_commit(q, repo, &commit, path, branch, || {
             // move requires a missing destination, while free_name reserves an empty directory.
             fs::remove_dir(path).map_err(|e| e.to_string())?;
             text(
@@ -482,10 +485,51 @@ impl Pool {
                     ],
                 )?,
                 "cannot move preparation",
-            )
-        })();
+            )?;
+            Ok(())
+        })
+    }
+
+    fn promote_commit(
+        &self,
+        q: &GitQueue,
+        repo: &Path,
+        commit: &str,
+        path: &Path,
+        branch: &str,
+        move_tree: impl FnOnce() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let token = {
+            let mut state = lock(&self.state);
+            let matches = state.slot.as_ref().is_some_and(|s| {
+                !s.cancel.load(Ordering::Acquire)
+                    && Instant::now() < s.deadline
+                    && s.ready
+                        .as_ref()
+                        .is_some_and(|(r, c)| r == repo && c == commit)
+            });
+            if !matches {
+                return Ok(false);
+            }
+            let Some(slot) = state.slot.take() else {
+                return Ok(false);
+            };
+            state.promoting = true;
+            self.changed.notify_all();
+            slot.token
+        };
+        let moved =
+            if let Ok(res) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move_tree)) {
+                res
+            } else {
+                tracing::warn!("worktree promotion panicked");
+                Err("worktree promotion panicked".to_owned())
+            };
         if let Err(err) = moved {
-            let cleaned = self.cleanup(repo).is_ok();
+            let cleaned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.cleanup(repo).is_ok()
+            }))
+            .unwrap_or(false);
             let mut state = lock(&self.state);
             state.promoting = !cleaned;
             state.settle(token, Status::Failed(err.clone()));

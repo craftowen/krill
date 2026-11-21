@@ -405,3 +405,65 @@ fn deleted_owner_repo_and_corrupt_marker_recover_and_do_not_brick_pool() {
     let initialized = get_or_try_init_pool(&slot, || Ok(Arc::clone(&recovered))).unwrap();
     assert!(Arc::ptr_eq(&initialized, &recovered));
 }
+
+#[test]
+fn panicking_prepare_or_promote_releases_pool_slot_and_cleans_marker() {
+    let f = Fixture::new("prep-panic", "");
+    let pool = pool(&f);
+
+    // 1. Panic inside background prepare worker must unwind into Status::Failed, clear slot,
+    //    remove marker/tree, and leave the pool reusable (never stuck in Status::Busy).
+    let req1 = request(&f, 71);
+    let cancel1 = Arc::new(AtomicBool::new(false));
+    {
+        let mut st = lock(&pool.state);
+        st.slot = Some(Slot {
+            token: req1.token,
+            req_repo: req1.repo.clone(),
+            req_base: req1.base.clone(),
+            cancel: Arc::clone(&cancel1),
+            deadline: Instant::now() + pool.ttl,
+            ready: None,
+        });
+    }
+    fs::write(pool.dir.join(MARKER), br#"{"repo":[]}"#).unwrap();
+    fs::create_dir_all(pool.tree()).unwrap();
+    pool.run_with(&req1, &cancel1, || panic!("simulated prepare panic"));
+    assert_eq!(
+        pool.request(&req1),
+        Status::Failed("worktree preparation panicked".to_owned())
+    );
+    cleaned(&pool);
+
+    // 2. Pool must recover cleanly to prepare a real worktree, and a panic during promotion
+    //    must clear `promoting` and clean up the prepared checkout rather than wedging Busy.
+    let req2 = request(&f, 72);
+    ready(&pool, &req2);
+    let (repo, commit) = lock(&pool.state)
+        .slot
+        .as_ref()
+        .and_then(|s| s.ready.clone())
+        .unwrap();
+    let dest = f.root.join("panic-dest");
+    let err = pool
+        .promote_commit(&f.queue, &repo, &commit, &dest, "panic-branch", || {
+            panic!("simulated promote panic")
+        })
+        .unwrap_err();
+    assert_eq!(err, "worktree promotion panicked");
+    assert_eq!(
+        pool.request(&req2),
+        Status::Failed("worktree promotion panicked".to_owned())
+    );
+    assert!(!lock(&pool.state).promoting);
+    cleaned(&pool);
+
+    // 3. Subsequent preparation must succeed instead of staying wedged in Status::Busy.
+    let req3 = request(&f, 73);
+    ready(&pool, &req3);
+    pool.request(&PrepareWorktree {
+        cancel: true,
+        ..req3
+    });
+    cleaned(&pool);
+}
