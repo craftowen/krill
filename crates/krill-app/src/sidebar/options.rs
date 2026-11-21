@@ -812,6 +812,28 @@ fn ordered_projects<'a>(
     repos
 }
 
+/// A bot's home folder (`<state>/bots/<slug>`). Orca keeps it out of Projects; the sidebar's
+/// Bots section lists that bot's chats instead.
+pub(super) fn is_bot_home(path: &Path) -> bool {
+    let Some(state) = path
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "bots"))
+        .and_then(Path::parent)
+    else {
+        return false;
+    };
+    let named = |p: Option<&Path>, name: &str| {
+        p.and_then(Path::file_name)
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    };
+    // macOS and Linux state dirs end in the bundle id; Windows' is `%LOCALAPPDATA%\Krill`.
+    named(Some(state), krill_proto::daemon::BUNDLE_ID)
+        || (named(Some(state), "Krill")
+            && named(state.parent(), "Local")
+            && named(state.parent().and_then(Path::parent), "AppData"))
+        || krill_proto::daemon::state_dir().is_some_and(|s| s == state)
+}
+
 pub(super) fn rows_with_options<'a>(
     snapshot: &'a Snapshot,
     prefs: &Preferences,
@@ -1161,6 +1183,7 @@ pub(super) fn rows_with_options<'a>(
     {
         if let Some(cwd) = &s.cwd
             && !is_removed(cwd)
+            && !is_bot_home(cwd)
         {
             folders
                 .entry(cwd)

@@ -33,6 +33,10 @@ pub const TEXT_XS: Rems = rems(11. / 16.);
 pub const TEXT_SM: Rems = rems(12. / 16.);
 pub const TEXT_MD: Rems = rems(13. / 16.);
 pub const TEXT_LG: Rems = rems(14. / 16.);
+/// Orca `text-lg`(18px): 새 봇 대화상자 제목.
+pub const TEXT_XL: Rems = rems(18. / 16.);
+/// Orca `text-2xl`(24px): 새 봇 이름 입력처럼 한 화면의 주인공 입력.
+pub const TEXT_2XL: Rems = rems(24. / 16.);
 
 /// 모서리 반경 단계(Orca `--radius: 0.625rem` = 10px 기준).
 pub const RADIUS_XS: Pixels = px(4.);
@@ -211,6 +215,27 @@ pub(super) const fn rgba_bytes(red: u8, green: u8, blue: u8, alpha: u8) -> Hsla 
     };
     hue /= 6.0;
     gpui::hsla(hue, sat, lightness, af)
+}
+
+/// Orca 새 봇 배경 견본(마스코트 뒤 정사각 배경색). 첫 칸 Sky가 기본값이며 저장하지 않는다.
+pub const BOT_AVATAR_BACKGROUNDS: [(u32, &str); 11] = [
+    (0x00b3_dbf4, "Sky"),
+    (0x00ff_ffff, "White"),
+    (0x00c9_b8e8, "Lavender"),
+    (0x00f4_c4cf, "Pink"),
+    (0x00f8_cfa8, "Peach"),
+    (0x00f6_e3a1, "Butter"),
+    (0x00c5_dfb5, "Sage"),
+    (0x00b5_e3d8, "Mint"),
+    (0x008f_a3b8, "Slate"),
+    (0x003a_3f4b, "Graphite"),
+    (0x001f_2126, "Ink"),
+];
+
+/// 봇 아바타 배경 견본 색. 견본 색은 테마와 무관한 사용자 데이터라 팔레트 밖에 둔다.
+#[must_use]
+pub const fn bot_avatar_background(rgb: u32) -> Hsla {
+    hex(rgb)
 }
 
 /// 24비트 RGB 정수(`0x00RR_GGBB`)를 불투명 [`Hsla`]로 바꾼다.

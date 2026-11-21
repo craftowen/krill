@@ -1642,6 +1642,36 @@ fn header_empty_and_dirty_badge_match_orca(cx: &mut TestAppContext) {
     );
 }
 
+/// Orca keeps bot home folders out of Projects: their chats live in the Bots section.
+#[test]
+fn bot_home_folders_stay_out_of_projects() {
+    let cwd = |id: u64, dir: &str| Session {
+        cwd: Some(PathBuf::from(dir)),
+        ..session(id, AgentState::Unknown, None)
+    };
+    let home = "/Users/me/Library/Application Support/dev.krill.app/bots/helper";
+    let snapshot = Snapshot {
+        sessions: vec![cwd(1, home), cwd(2, "/tmp/x"), cwd(3, "/tmp/bots/notes")],
+        trees: BTreeMap::new(),
+    };
+    let all = rows(&snapshot, &Preferences::new(), &BTreeSet::new());
+    assert!(!all.contains(&Row::Folder(home.into())));
+    assert!(
+        !all.iter()
+            .any(|r| matches!(r, Row::Session(s, _) if s.id == SessionId(1)))
+    );
+    assert!(all.contains(&Row::Folder("/tmp/x".into())));
+    // A folder that merely sits in some `bots/` directory is still a project, even under a
+    // folder called Krill.
+    assert!(all.contains(&Row::Folder("/tmp/bots/notes".into())));
+    assert!(!options::is_bot_home(std::path::Path::new(
+        "/Users/me/Krill/bots/helper"
+    )));
+    assert!(options::is_bot_home(std::path::Path::new(
+        "C:/Users/me/AppData/Local/Krill/bots/helper"
+    )));
+}
+
 /// OWE-654: git 밖 세션은 폴더 프로젝트 > 세션으로 묶이고, 데몬이 알려 준 세션은 하나도 빠지지 않는다
 /// (이전 빌드의 '탭이 있는데 세션 없음' 재현 판정 — 행이 비는 경우는 데몬 목록이 빈 때뿐이다).
 #[test]

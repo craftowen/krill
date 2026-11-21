@@ -5,13 +5,15 @@
 //! `ui::page_modal_size`, matching `Automations` and `Artifacts`. Active bot chats open
 //! as regular workspace `[Chat | Term]` tabs via [`OpenSession`].
 
+pub mod avatar;
 mod connectors;
-mod create;
 mod groups;
 mod items;
+pub mod new_bot;
 pub mod rpc;
 mod settings;
 mod soul_memory;
+pub mod templates;
 mod tools_sharing;
 
 #[cfg(test)]
@@ -40,13 +42,17 @@ use crate::ui;
 
 pub use rpc::{
     BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
-    daemon_bot_rpc, fetch_sidebar_state,
+    SidebarState, daemon_bot_rpc, fetch_sidebar_state,
 };
-use rpc::{call_checked, decode_png_avatar, parse_avatar_color};
+use rpc::{call_checked, decode_png_avatar};
 
 /// Request the host `Shell` to close the Bots modal.
 #[derive(Debug)]
 pub struct Close;
+
+/// Request the host `Shell` to open the New bot dialog (Orca's single creation path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestNewBot;
 
 /// Request the host `Shell` to open/focus a bot's live session in a workspace `[Chat | Term]` tab.
 #[derive(Debug, Clone)]
@@ -86,7 +92,6 @@ pub enum DetailTab {
 pub enum Screen {
     #[default]
     Detail,
-    Create,
     Import,
     Groups,
 }
@@ -122,7 +127,6 @@ pub struct View {
     all_connector_statuses: Vec<BotConnectorStatus>,
     all_access_requests: Vec<BotAccessRequest>,
     bot_sessions: Vec<BotSessionSummary>,
-    create: create::CreateState,
     items: items::ItemsState,
     soul_memory: soul_memory::SoulMemoryState,
     connectors: connectors::ConnectorsState,
@@ -152,6 +156,7 @@ pub struct View {
 }
 
 impl EventEmitter<Close> for View {}
+impl EventEmitter<RequestNewBot> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<BadgeChanged> for View {}
 impl EventEmitter<SessionsChanged> for View {}
@@ -236,7 +241,6 @@ impl View {
             all_connector_statuses: Vec::new(),
             all_access_requests: Vec::new(),
             bot_sessions: Vec::new(),
-            create: create::CreateState::default(),
             items: items::ItemsState::default(),
             soul_memory: soul_memory::SoulMemoryState::default(),
             connectors: connectors::ConnectorsState::default(),
@@ -363,7 +367,12 @@ impl View {
     /// Rows and attention total for the main window sidebar's Bots section.
     #[must_use]
     pub fn sidebar_snapshot(&self) -> SidebarSnapshot {
-        rpc::sidebar_snapshot(&self.bots, &self.all_open_items, &self.all_access_requests)
+        rpc::sidebar_snapshot(
+            &self.bots,
+            &self.all_open_items,
+            &self.all_access_requests,
+            &self.bot_sessions,
+        )
     }
 
     pub(super) fn emit_badge(&self, cx: &mut Context<Self>) {
@@ -573,24 +582,13 @@ impl View {
         cx.notify();
     }
 
+    /// New bot always opens Orca's dialog over the workspace.
+    #[expect(
+        clippy::unused_self,
+        reason = "kept as a method for the modal's buttons"
+    )]
     pub fn open_create(&mut self, cx: &mut Context<Self>) {
-        self.armed_delete_bot = None;
-        self.pending_switch_bot = None;
-        self.error = None;
-        self.notice = None;
-        let handle = self.window_handle;
-        let default_cwd = self.default_cwd.clone();
-        self.create
-            .clear_form_fields(handle, default_cwd.as_deref(), cx);
-        self.screen = Screen::Create;
-        self.create.opened_alone = false;
-        cx.notify();
-    }
-
-    /// New bot as its own dialog (sidebar "+"): Escape closes the modal like Orca's.
-    pub fn open_create_alone(&mut self, cx: &mut Context<Self>) {
-        self.open_create(cx);
-        self.create.opened_alone = true;
+        cx.emit(RequestNewBot);
     }
 
     pub fn open_import(&mut self, cx: &mut Context<Self>) {
@@ -1277,8 +1275,7 @@ impl View {
 
     pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let app: &mut gpui::App = cx;
-        self.create.input_is_composing(window, app)
-            || self.items.input_is_composing(window, app)
+        self.items.input_is_composing(window, app)
             || self.soul_memory.input_is_composing(window, app)
             || self.connectors.input_is_composing(window, app)
             || self.tools.input_is_composing(window, app)
@@ -1300,13 +1297,7 @@ impl View {
             cx.notify();
             return;
         }
-        let alone = self.screen == Screen::Create && self.create.opened_alone;
-        if matches!(
-            self.screen,
-            Screen::Create | Screen::Import | Screen::Groups
-        ) && !self.bots.is_empty()
-            && !alone
-        {
+        if matches!(self.screen, Screen::Import | Screen::Groups) && !self.bots.is_empty() {
             self.screen = Screen::Detail;
             cx.notify();
             return;
@@ -1417,10 +1408,7 @@ impl View {
                         .map_or(ConnectorHealthState::Disconnected, |st| st.state)
                 })
                 .collect();
-            let display_emoji = bot.emoji.clone().unwrap_or_default();
-            let has_emoji = !display_emoji.is_empty();
             let avatar_img = self.settings.avatar_cache.get(&bot.id).cloned();
-            let accent_dot = parse_avatar_color(bot.avatar_color.as_deref());
             let runtime_label = rpc::runtime_display_label(&bot.agent_id);
             let row_id = format!("bots-rail-item-{bot_id_sel}");
             let row_sel = row_id.clone();
@@ -1463,35 +1451,15 @@ impl View {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
-                                    .when_some(accent_dot, |d, tc| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .size(ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(ui::tab_tag_color(tc)),
-                                        )
-                                    })
-                                    .when_some(avatar_img, |d, img| {
-                                        d.child(
-                                            gpui::img(img).size(px(16.)).rounded_full().flex_none(),
-                                        )
-                                    })
-                                    .when(bot.avatar.is_none() && has_emoji, |d| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .text_size(ui::TEXT_SM)
-                                                .child(display_emoji),
-                                        )
-                                    })
-                                    .when(bot.avatar.is_none() && !has_emoji, |d| {
-                                        d.child(ui::icons::svg_icon(
-                                            ui::icons::CUSTOM_AGENT_SVG,
-                                            ui::ICON_SM,
-                                            p.muted_foreground,
-                                        ))
-                                    })
+                                    // Same face as the sidebar row (mascot, picture, emoji or initial).
+                                    .child(avatar::render(
+                                        &avatar::Avatar::of(bot),
+                                        avatar_img,
+                                        &bot.name,
+                                        px(20.),
+                                        ui::RADIUS_XS,
+                                        p,
+                                    ))
                                     .child(
                                         div()
                                             .flex_1()
@@ -1993,9 +1961,7 @@ impl View {
         let paused = bot.paused;
         let armed_delete = self.armed_delete_bot.as_ref() == Some(&bot.id);
         let runtime_label = rpc::runtime_display_label(&bot.agent_id);
-        let emoji = bot.emoji.clone().unwrap_or_default();
         let avatar_img = self.settings.avatar_cache.get(&bot.id).cloned();
-        let accent_color = parse_avatar_color(bot.avatar_color.as_deref());
         let bot_session_count = self.sessions_for_bot(&bot.id).len();
 
         let tabs = [
@@ -2055,23 +2021,14 @@ impl View {
                                     .items_center()
                                     .flex_wrap()
                                     .gap_2()
-                                    .when_some(accent_color, |d, tc| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .size(ui::STATE_DOT)
-                                                .rounded_full()
-                                                .bg(ui::tab_tag_color(tc)),
-                                        )
-                                    })
-                                    .when_some(avatar_img, |d, img| {
-                                        d.child(
-                                            gpui::img(img).size(px(24.)).rounded_full().flex_none(),
-                                        )
-                                    })
-                                    .when(bot.avatar.is_none() && !emoji.is_empty(), |d| {
-                                        d.child(div().text_size(ui::TEXT_LG).child(emoji))
-                                    })
+                                    .child(avatar::render(
+                                        &avatar::Avatar::of(bot),
+                                        avatar_img,
+                                        &bot.name,
+                                        px(36.),
+                                        ui::RADIUS_SM,
+                                        p,
+                                    ))
                                     .child(
                                         div()
                                             .min_w_0()
@@ -2268,7 +2225,6 @@ impl Render for View {
         let lang_changed = self.language != crate::i18n::language();
         self.language = crate::i18n::language();
         if lang_changed {
-            self.create.refresh_placeholders(window, cx);
             self.items.refresh_placeholders(window, cx);
             self.soul_memory.refresh_placeholders(window, cx);
             self.connectors.refresh_placeholders(window, cx);
@@ -2334,7 +2290,6 @@ impl Render for View {
 
         let selected_bot = self.selected_bot().cloned();
         let right_pane = match self.screen {
-            Screen::Create => self.render_create_view(p, window, cx),
             Screen::Import => self.render_import_view(p, window, cx),
             Screen::Groups => self.render_groups_view(p, window, cx),
             Screen::Detail => {

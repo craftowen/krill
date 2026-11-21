@@ -36,8 +36,8 @@ pub use terminal_themes::{
     terminal_theme_display_label,
 };
 pub use theme::{
-    ABYSS, AGENT_UNREAD, CHAT_CONTENT_MAX_WIDTH, COMMAND_PALETTE_WIDTH, DARK,
-    DASHBOARD_LANE_MIN_WIDTH, DASHBOARD_SIZE, DIALOG_WIDTH, DIVIDER_HIT_PX, DarkUiTheme,
+    ABYSS, AGENT_UNREAD, BOT_AVATAR_BACKGROUNDS, CHAT_CONTENT_MAX_WIDTH, COMMAND_PALETTE_WIDTH,
+    DARK, DASHBOARD_LANE_MIN_WIDTH, DASHBOARD_SIZE, DIALOG_WIDTH, DIVIDER_HIT_PX, DarkUiTheme,
     FLOATING_SIZE, FONT_MONO, FONT_UI, GLOW, LIGHT, LightUiTheme, MODAL_BACKDROP,
     PANE_CARD_INNER_RADIUS, PANE_GAP, PANE_HEADER_HEIGHT, PANEL_ROW_HEIGHT, PANEL_TAB_HEIGHT,
     PAPER, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, RADIUS_XL, RADIUS_XS, SETTINGS_BAND_HEIGHT,
@@ -48,10 +48,10 @@ pub use theme::{
     STATUS_GROUP_GAP, STATUS_GROUP_ICON, STATUS_PROVIDER_BODY_MAX_HEIGHT,
     STATUS_PROVIDER_CHROME_RESERVE, SWITCH_HEIGHT, SWITCH_THUMB, SWITCH_WIDTH, TAB_BAR_HEIGHT,
     TAB_INACTIVE_OPACITY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TERMINAL_DARK, TERMINAL_GHOSTTY_DARK,
-    TERMINAL_LIGHT, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XS, TIDEPOOL, TITLEBAR_HEIGHT,
-    TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, TRANSPARENT, agent_state_color, apply,
-    git_status_color, hex, hexa, palette, palette_for, tab_tag_color, terminal_surface,
-    terminal_surface_alpha, terminal_theme, terminal_theme_for_mode, titlebar, transparent,
-    workspace_surface_alpha,
+    TERMINAL_LIGHT, TEXT_2XL, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XL, TEXT_XS, TIDEPOOL,
+    TITLEBAR_HEIGHT, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, TRANSPARENT, agent_state_color, apply,
+    bot_avatar_background, git_status_color, hex, hexa, palette, palette_for, tab_tag_color,
+    terminal_surface, terminal_surface_alpha, terminal_theme, terminal_theme_for_mode, titlebar,
+    transparent, workspace_surface_alpha,
 };
 pub use theme_swatch::theme_swatch;

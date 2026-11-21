@@ -9,7 +9,7 @@ use std::time::Duration;
 use krill_proto::SessionId;
 use krill_proto::bots::{
     BotAccessRequest, BotAccessRequestStatus, BotConfig, BotId, BotItem, BotItemStatus,
-    BotRpcRequest, BotRpcResponse, MAX_AVATAR_PNG_BYTES,
+    BotRpcRequest, BotRpcResponse, BotSessionSummary, MAX_AVATAR_PNG_BYTES,
 };
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -121,19 +121,6 @@ pub fn runtime_display_label(agent_id: &str) -> String {
     }
 }
 
-/// Canonical 9 semantic colors matching `ui::tab_tag_color` for bot badges and pickers.
-pub const BOT_AVATAR_COLOR_PALETTE: [(TabColor, &str); 9] = [
-    (TabColor::Blue, "#3b82f6"),
-    (TabColor::Purple, "#a855f7"),
-    (TabColor::Pink, "#ec4899"),
-    (TabColor::Red, "#ef4444"),
-    (TabColor::Orange, "#f97316"),
-    (TabColor::Yellow, "#eab308"),
-    (TabColor::Green, "#22c55e"),
-    (TabColor::Teal, "#14b8a6"),
-    (TabColor::Gray, "#9ca3af"),
-];
-
 /// Maps any persisted avatar color name or `#rrggbb` string to a semantic [`TabColor`].
 #[must_use]
 pub fn parse_avatar_color(raw: Option<&str>) -> Option<TabColor> {
@@ -151,22 +138,6 @@ pub fn parse_avatar_color(raw: Option<&str>) -> Option<TabColor> {
         "teal" | "#14b8a6" | "#06b6d4" => Some(TabColor::Teal),
         "gray" | "grey" | "#9ca3af" | "#6b7280" => Some(TabColor::Gray),
         _ => Some(TabColor::Blue),
-    }
-}
-
-/// Canonical `#rrggbb` wire value for a [`TabColor`] avatar accent.
-#[must_use]
-pub const fn avatar_color_hex(color: TabColor) -> &'static str {
-    match color {
-        TabColor::Blue => "#3b82f6",
-        TabColor::Purple => "#a855f7",
-        TabColor::Pink => "#ec4899",
-        TabColor::Red => "#ef4444",
-        TabColor::Orange => "#f97316",
-        TabColor::Yellow => "#eab308",
-        TabColor::Green => "#22c55e",
-        TabColor::Teal => "#14b8a6",
-        TabColor::Gray => "#9ca3af",
     }
 }
 
@@ -295,9 +266,42 @@ pub struct SidebarBot {
     pub id: BotId,
     pub name: String,
     pub emoji: Option<String>,
+    pub avatar: super::avatar::Avatar,
+    pub avatar_color: Option<String>,
+    /// SOUL-free one-liner shown when nothing else is going on (Orca's fallback activity line).
+    pub description: String,
+    /// Folder name under the bots root (`<state>/bots/<slug>`).
+    pub slug: String,
     pub paused: bool,
     /// `needs_you` items plus pending access requests owned by this bot.
     pub attention: usize,
+    /// Live chats, Home Chat (no external link) first, then newest.
+    pub sessions: Vec<BotSessionSummary>,
+    pub updated_at_ms: u64,
+}
+
+impl SidebarBot {
+    /// The bot's Home Chat: its live session that no Slack/Discord/… thread owns.
+    #[must_use]
+    pub fn home_session(&self) -> Option<&BotSessionSummary> {
+        self.sessions.iter().find(|s| s.link_id.is_none())
+    }
+
+    #[must_use]
+    pub fn working(&self) -> usize {
+        self.sessions.iter().filter(|s| s.working).count()
+    }
+
+    /// Identity the sidebar and tabs use to label this bot's sessions.
+    #[must_use]
+    pub fn session_meta(&self) -> BotSessionMeta {
+        BotSessionMeta {
+            bot_id: self.id.clone(),
+            bot_name: self.name.clone(),
+            emoji: self.emoji.clone(),
+            avatar_color: self.avatar_color.clone(),
+        }
+    }
 }
 
 /// What the sidebar shows for bots: the rows and the total attention badge.
@@ -312,6 +316,7 @@ pub fn sidebar_snapshot(
     bots: &[BotConfig],
     items: &[BotItem],
     access: &[BotAccessRequest],
+    sessions: &[BotSessionSummary],
 ) -> SidebarSnapshot {
     let needs: Vec<&BotId> = items
         .iter()
@@ -327,25 +332,51 @@ pub fn sidebar_snapshot(
     SidebarSnapshot {
         bots: bots
             .iter()
-            .map(|bot| SidebarBot {
-                id: bot.id.clone(),
-                name: bot.name.clone(),
-                emoji: bot.emoji.clone().filter(|e| !e.trim().is_empty()),
-                paused: bot.paused,
-                attention: needs.iter().filter(|id| **id == &bot.id).count(),
+            .map(|bot| {
+                let mut live: Vec<BotSessionSummary> = sessions
+                    .iter()
+                    .filter(|s| s.bot_id == bot.id && s.live)
+                    .cloned()
+                    .collect();
+                live.sort_by_key(|s| (s.link_id.is_some(), std::cmp::Reverse(s.created_at_ms)));
+                SidebarBot {
+                    id: bot.id.clone(),
+                    name: bot.name.clone(),
+                    emoji: bot.emoji.clone().filter(|e| !e.trim().is_empty()),
+                    avatar: super::avatar::Avatar::of(bot),
+                    avatar_color: bot.avatar_color.clone(),
+                    description: bot.description.trim().to_owned(),
+                    slug: bot.slug.as_str().to_owned(),
+                    paused: bot.paused,
+                    attention: needs.iter().filter(|id| **id == &bot.id).count(),
+                    sessions: live,
+                    updated_at_ms: bot.updated_at_ms,
+                }
             })
             .collect(),
         attention: needs.len(),
     }
 }
 
+/// Everything the sidebar Bots section shows, read in one pass.
+#[derive(Debug, Clone, Default)]
+pub struct SidebarState {
+    pub snapshot: SidebarSnapshot,
+    pub sessions: BTreeMap<SessionId, BotSessionMeta>,
+    /// Newly read `avatar.png` bytes: bot, the config time they belong to, PNG (empty when
+    /// it couldn't be read).
+    pub avatars: Vec<(BotId, u64, Vec<u8>)>,
+}
+
 /// Reads bots, open items, access requests and bot sessions for the sidebar, listing bots once.
+/// Uploaded pictures are read only for bots whose config time isn't in `known_avatars`.
 /// `None` when the bot list is unavailable, so the caller keeps what it last showed instead of
 /// flashing an empty section.
 #[must_use]
-pub fn fetch_sidebar_state(
+pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
     call: &BotRpcCall,
-) -> Option<(SidebarSnapshot, BTreeMap<SessionId, BotSessionMeta>)> {
+    known_avatars: &HashMap<BotId, u64, S>,
+) -> Option<SidebarState> {
     let Ok(BotRpcResponse::Bots(bots)) = call(&BotRpcRequest::ListBots) else {
         return None;
     };
@@ -360,21 +391,38 @@ pub fn fetch_sidebar_state(
         Ok(BotRpcResponse::AccessRequests(reqs)) => reqs,
         _ => Vec::new(),
     };
+    let summaries = match call(&BotRpcRequest::ListBotSessions { bot_id: None }) {
+        Ok(BotRpcResponse::BotSessions(list)) => list,
+        _ => Vec::new(),
+    };
     let metas: HashMap<&BotId, BotSessionMeta> = bots
         .iter()
         .map(|b| (&b.id, BotSessionMeta::from_bot(b)))
         .collect();
-    let mut sessions = BTreeMap::new();
-    if let Ok(BotRpcResponse::BotSessions(list)) =
-        call(&BotRpcRequest::ListBotSessions { bot_id: None })
-    {
-        for summary in list {
-            if let Some(meta) = metas.get(&summary.bot_id) {
-                sessions.insert(summary.session_id, meta.clone());
-            }
-        }
-    }
-    Some((sidebar_snapshot(&bots, &items, &access), sessions))
+    let sessions = summaries
+        .iter()
+        .filter_map(|s| Some((s.session_id, metas.get(&s.bot_id)?.clone())))
+        .collect();
+    let avatars = bots
+        .iter()
+        .filter(|b| super::avatar::Avatar::of(b) == super::avatar::Avatar::Upload)
+        .filter(|b| known_avatars.get(&b.id) != Some(&b.updated_at_ms))
+        // An unreadable picture comes back empty, so the caller remembers it and stops asking.
+        .map(|b| {
+            let png = match call(&BotRpcRequest::GetBotAvatar {
+                bot_id: b.id.clone(),
+            }) {
+                Ok(BotRpcResponse::BotAvatar(data)) => data.png_bytes,
+                _ => Vec::new(),
+            };
+            (b.id.clone(), b.updated_at_ms, png)
+        })
+        .collect();
+    Some(SidebarState {
+        snapshot: sidebar_snapshot(&bots, &items, &access, &summaries),
+        sessions,
+        avatars,
+    })
 }
 
 /// Canonical scoped keychain secret reference (`<bot_id>:<key>`) aligned with daemon `SecretVault::scoped_ref`.
