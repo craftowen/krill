@@ -35,13 +35,36 @@ const CHAIN_EXIT_GRACE: Duration = Duration::from_millis(50);
 /// `claude --version` 프로브 제한.
 const PROBE_WAIT: Duration = Duration::from_secs(10);
 
+/// Returns whether `args` requests CLI usage output without treating `--chain <command>` values as help.
+fn wants_help(args: &[OsString]) -> bool {
+    let Some(first) = args.first().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if matches!(first, "-h" | "--help" | "help") {
+        return true;
+    }
+    if matches!(first, "install" | "uninstall") {
+        let rest = args.get(1..).unwrap_or_default();
+        return rest.first().and_then(|s| s.to_str()) == Some("help")
+            || rest
+                .iter()
+                .any(|a| matches!(a.to_str(), Some("-h" | "--help")));
+    }
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--chain") => {
+                let _ = it.next();
+            }
+            Some("-h" | "--help") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 pub fn run(args: &[OsString]) -> ExitCode {
-    // `--chain <command>` 값 자리는 사용자 명령이므로 첫 두 토큰만 본다.
-    let head: Vec<_> = args.iter().take(2).collect();
-    if head
-        .iter()
-        .any(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
-    {
+    if wants_help(args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
