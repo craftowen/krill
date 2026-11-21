@@ -1529,7 +1529,7 @@ async function composerDiscovery() {
   key(f, "Enter");
   await flush();
   assert.equal(f.term, 0);
-  assert.equal(f.find("composer-model-name").textContent, "model b");
+  assert.equal(f.find("composer-model-name").textContent, "Model B");
   assert.equal(
     f.buttons.find((b) => b.className === "composer-pill").attrs["aria-label"],
     "Model B",
@@ -1836,8 +1836,8 @@ async function composerRaces() {
       req.action === "composer_models" ? known : historyHandler(req);
     modelButton(f).action();
     await flush();
-    assert.equal(f.find("composer-model-name").textContent, "model a");
-    f.button("Close").action();
+    assert.equal(f.find("composer-model-name").textContent, "Model A");
+    f.button("Done").action();
     f.handler = async (req) => {
       if (req.action !== "composer_models") return historyHandler(req);
       if (data === null) throw Error("model unavailable");
@@ -1916,7 +1916,7 @@ async function composerRaces() {
     await flush();
     assert.equal(f.entry.modelPending, null);
     assert.equal(f.find("primary composer-send").disabled, false);
-    assert.equal(f.find("composer-model-name").textContent, applied ? "model b" : "model a");
+    assert.equal(f.find("composer-model-name").textContent, applied ? "Model B" : "Model A");
     assert.equal(f.find("chat-input").value, "newer unsent draft");
     assert.equal(f.state.drafts.get(7), "newer unsent draft");
     f.dispose();
@@ -1992,7 +1992,7 @@ async function composerRaces() {
   assert.equal(oldEntry.modelPending, null);
   newSet.resolve({ applied: true, model: "b" });
   await flush();
-  assert.equal(host.find("composer-model-name").textContent, "model b");
+  assert.equal(host.find("composer-model-name").textContent, "Model B");
   host.dispose();
   const pinned = fixture({ capabilities });
   await flush();
@@ -2515,7 +2515,7 @@ async function recoveryPaint() {
   assert.equal(empty.entry.generation, "g2");
   assert.equal(
     empty.find("chat-empty").children[0].textContent,
-    "Enter a new message",
+    "Start a conversation",
   );
   empty.dispose();
   console.log(
@@ -4387,7 +4387,7 @@ async function main() {
   assert.equal(f.entry.agent, "");
   assert.equal(
     f.find("chat-empty").children[0].textContent,
-    "Enter a new message",
+    "Start a conversation",
   );
   f.dispose();
   console.log(
@@ -4936,23 +4936,21 @@ async function agyStartupAndModelApplyUx() {
   );
   assert.equal(
     f.find("chat-empty")?.children[0]?.textContent,
-    "Enter a new message",
+    "Start a conversation",
     "empty state renders as soon as post-upgrade poll finishes",
   );
   const pill = f.find("composer-pill"),
     modelName = f.find("composer-model-name"),
-    effortBars = f.find("composer-model-effort");
+    effortLabel = f.find("composer-model-effort");
   assert.equal(
     pill.hidden,
     false,
     "controllable provider keeps model pill visible while cold catalog settles",
   );
-  assert.equal(modelName.textContent, "gemini 4 carbon");
-  assert.equal(effortBars.hidden, false);
-  assert.equal(
-    effortBars.children.filter((b) => b.dataset.on === "true").length,
-    3,
-  );
+  assert.equal(modelName.textContent, "Gemini 4 Carbon");
+  assert.equal(effortLabel.hidden, false);
+  assert.equal(effortLabel.textContent, "High");
+  assert.equal(effortLabel.dataset.effort, "high");
   const probesBefore = composerProbes;
   clock += 1600;
   f.update();
@@ -4965,6 +4963,7 @@ async function agyStartupAndModelApplyUx() {
   pill.click();
   const suggestions = f.find("chat-composer-suggestions");
   assert.equal(suggestions.hidden, false);
+  assert.equal(suggestions.dataset.kind, "models");
   assert(
     suggestions.descendants().some((n) => n.textContent === "Loading…"),
     "cold model picker displays Loading… immediately",
@@ -5022,7 +5021,7 @@ async function agyStartupAndModelApplyUx() {
   );
   assert.equal(
     modelName.textContent,
-    "gemini 4 carbon",
+    "Gemini 4 Carbon",
     "unconfirmed target model is never optimistically shown on composer pill",
   );
   assert(
@@ -5038,18 +5037,49 @@ async function agyStartupAndModelApplyUx() {
   });
   await flush();
   assert.equal(suggestions.hidden, true);
-  assert.equal(modelName.textContent, "gemini 4 argon");
+  assert.equal(suggestions.dataset.kind, undefined);
+  assert.equal(modelName.textContent, "Gemini 4 Argon");
   assert.equal(
-    effortBars.hidden,
+    effortLabel.hidden,
     false,
-    "confirmed effort bars remain visible after model switch",
+    "confirmed effort label remains visible after model switch",
   );
-  assert.equal(
-    effortBars.children.filter((b) => b.dataset.on === "true").length,
-    3,
-  );
+  assert.equal(effortLabel.textContent, "High");
+  assert.equal(effortLabel.dataset.effort, "high");
   assert.equal(pill.dataset.applied, "true");
   f.dispose();
+  // Jump-to-latest button stays hidden while following live items and reveals when scrolled up
+  {
+    const page = (from, to) => ({
+      ...historyPage(from, to),
+      items: Array.from({ length: to - from }, (_, i) => ({
+        id: "j" + (from + i),
+        kind: "assistant",
+        text: "Message " + (from + i),
+      })),
+    });
+    const jumpFx = fixture({
+      capabilities: { chat_tail: true },
+      handler: async (q) =>
+        q.end_offset !== undefined
+          ? page(Math.max(0, q.end_offset - 30), q.end_offset)
+          : q.latest
+            ? page(60, 90)
+            : page(q.offset, q.offset),
+    });
+    await flush();
+    const feed = jumpFx.find("chat-feed"),
+      jumpBtn = jumpFx.find("chat-jump-bottom");
+    assert.equal(jumpBtn.hidden, true, "jump button hides while following");
+    scroll(feed, 800);
+    scroll(feed, 400);
+    await flush();
+    assert.equal(jumpBtn.hidden, false, "jump button appears after scrolling up");
+    jumpBtn.action();
+    await flush();
+    assert.equal(jumpBtn.hidden, true, "clicking jump button returns to latest");
+    jumpFx.dispose();
+  }
   console.log(
     "PASS agy startup reload, 1.5s boot probe, cold picker Loading…/note, Applying… lock, and confirmed effort retention",
   );

@@ -72,7 +72,10 @@ impl Shell {
             )
             .item(
                 PopupMenuItem::new(shell_text::SPLIT_DOWN.get())
-                    .icon(IconName::PanelBottom)
+                    .icon(
+                        gpui_component::Icon::default()
+                            .data(krill_app::ui::icons::SPLIT_VERTICAL_SVG),
+                    )
                     .on_click(on_shell(this.clone(), |s, _, cx| {
                         s.split_active(Axis::Vertical, cx);
                     })),

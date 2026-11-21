@@ -1294,6 +1294,23 @@ impl Shell {
             .children(self.preview_toggle(id, cx))
             .children(self.open_browser_button(id, &path, &file_host, cx))
             .children(self.share_button(id, &path, &file_host, cx))
+            .child(krill_app::ui::button_with_tooltip(
+                Button::new(("file-pane-split-right", id.get()))
+                    .debug_selector(move || format!("file-pane-split-right-{}", id.get()))
+                    .icon(Icon::default().data(krill_app::ui::icons::SPLIT_HORIZONTAL_SVG))
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.layout.set_zoomed_pane(None);
+                        this.change(true, cx, |l| {
+                            l.focus(id);
+                            l.split(krill_app::layout::Axis::Horizontal);
+                        });
+                    })),
+                format!("file-pane-split-right-{}", id.get()),
+                text::SPLIT_RIGHT.get(),
+            ))
             .when(is_split, |d| {
                 d.child(
                     Button::new(("file-pane-close", id.get()))
