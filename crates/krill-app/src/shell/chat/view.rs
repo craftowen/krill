@@ -2065,31 +2065,72 @@ impl Shell {
                 )
         });
 
-        let switch_pill = div()
+        let is_split = self.layout.visible().len() > 1;
+        let top_controls = div()
             .absolute()
             .top_2()
             .right_3()
-            .rounded_full()
-            .border_1()
-            .border_color(border)
-            .bg(palette.popover.opacity(0.92))
-            .shadow_lg()
+            .flex()
+            .items_center()
+            .gap_1()
             .child(
-                Button::new(SharedString::from(format!(
-                    "desktop-chat-switch-term-{}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-switch-terminal".into())
-                .icon(IconName::SquareTerminal)
-                .label(ctext::TERM.get())
-                .tooltip(krill_app::i18n::catalog::shell::TOGGLE_CHAT_VIEW.get())
-                .rounded_full()
-                .ghost()
-                .xsmall()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.switch_pane_to_terminal(pane, window, cx);
-                })),
-            );
+                div()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(border)
+                    .bg(palette.popover.opacity(0.92))
+                    .shadow_lg()
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "desktop-chat-switch-term-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-switch-terminal".into())
+                        .icon(IconName::SquareTerminal)
+                        .label(ctext::TERM.get())
+                        .tooltip(krill_app::i18n::catalog::shell::TOGGLE_CHAT_VIEW.get())
+                        .rounded_full()
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.switch_pane_to_terminal(pane, window, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(ui::button_with_tooltip(
+                Button::new(("chat-split-right", pane.get()))
+                    .debug_selector(move || format!("chat-split-right-{}", pane.get()))
+                    .icon(gpui_component::Icon::default().data(ui::icons::SPLIT_HORIZONTAL_SVG))
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.layout.set_zoomed_pane(None);
+                        this.change(true, cx, |l| {
+                            l.focus(pane);
+                            l.split(krill_app::layout::Axis::Horizontal);
+                        });
+                    })),
+                format!("chat-split-right-{}", pane.get()),
+                krill_app::i18n::catalog::shell::SPLIT_RIGHT.get(),
+            ))
+            .when(is_split, |d| {
+                d.child(ui::button_with_tooltip(
+                    Button::new(("chat-pane-close", pane.get()))
+                        .debug_selector(move || format!("chat-pane-close-{}", pane.get()))
+                        .icon(IconName::Close)
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.maybe_close_pane(pane, cx);
+                        })),
+                    format!("chat-pane-close-{}", pane.get()),
+                    krill_app::i18n::catalog::shell::CLOSE_PANE.get(),
+                ))
+            });
 
         let in_card = self.workspace_stage() == super::super::pane_frame::WorkspaceStage::CardStage;
         let overlay_weak = cx.weak_entity();
@@ -2128,7 +2169,7 @@ impl Shell {
             .children(self.render_chat_prompt_notices(&key, cx))
             .children(turn_status_line)
             .child(composer)
-            .child(switch_pill);
+            .child(top_controls);
 
         Some(
             div()

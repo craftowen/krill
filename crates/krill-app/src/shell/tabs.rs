@@ -617,17 +617,6 @@ impl Shell {
                         }),
                     )
                     .child(ui::button_with_tooltip(
-                        Button::new("split-right")
-                            .icon(IconName::PanelRight)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.split_active(Axis::Horizontal, cx);
-                            })),
-                        "split-right",
-                        text::SPLIT_RIGHT.get(),
-                    ))
-                    .child(ui::button_with_tooltip(
                         Button::new("titlebar-jump")
                             .icon(IconName::Search)
                             .ghost()
@@ -649,7 +638,18 @@ impl Shell {
                             text::MORE_ACTIONS.get(),
                         )
                         .dropdown_menu(toolbar_menu),
-                    ),
+                    )
+                    .child(ui::button_with_tooltip(
+                        Button::new("toggle-panel")
+                            .icon(IconName::PanelRight)
+                            .ghost()
+                            .xsmall()
+                            .toggled(!self.panel_collapsed)
+                            .debug_selector(|| "toggle-panel".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx))),
+                        "toggle-panel",
+                        text::TOGGLE_PANEL.get(),
+                    )),
             )
     }
 
