@@ -1177,8 +1177,8 @@
     screen.append(tabs);
     const panels = el("div", undefined, "session-panels"),
       primaryPane = el("section", undefined, "terminal-pane primary-pane"),
-      mount = el("div", undefined, "terminal-mount"),
       chatMount = el("div", undefined, "terminal-mount");
+    let mount = el("div", undefined, "terminal-mount");
     chatMount.hidden = true;
     primaryPane.append(mount);
     panels.append(primaryPane);
@@ -1196,8 +1196,43 @@
       retryTimer,
       retryDelay = 1000,
       generation = 0,
+      owner = null,
       disposed = false;
-    const tabEntries = new Map();
+    const tabEntries = new Map(),
+      // 다녀온 탭의 터미널을 숨긴 채 붙여 둬 되돌아가면 소켓·attach 없이 바로 보인다.
+      parked = new Map(),
+      PARK_MAX = 3,
+      // 숨긴 탭도 화면 프레임을 계속 받는다. 릴레이 데이터가 새지 않게 오래 안 보면 놓는다.
+      PARK_MS = 120000;
+    function unpark(id) {
+      const entry = parked.get(id);
+      if (!entry) return;
+      parked.delete(id);
+      clearTimeout(entry.parkTimer);
+      entry.dead = true;
+      entry.handle?.unmount();
+      entry.el.remove();
+    }
+    function park() {
+      const entry = owner;
+      owner = null;
+      if (!entry) return;
+      if (entry.phase !== "ready" || !live(state.sessions.get(entry.id))) {
+        entry.dead = true;
+        entry.handle?.unmount();
+        entry.el.remove();
+        return;
+      }
+      entry.el.hidden = true;
+      entry.handle.setInputActive?.(false);
+      Promise.resolve(entry.handle.setVisible?.(false)).catch(ctx.error);
+      parked.set(entry.id, entry);
+      entry.parkTimer = setTimeout(() => unpark(entry.id), PARK_MS);
+      for (const id of parked.keys()) {
+        if (parked.size <= PARK_MAX) break;
+        unpark(id);
+      }
+    }
     function syncViewMode() {
       const inChat = viewMode === "chat" && Boolean(M.chat?.mount);
       mount.hidden = inChat;
@@ -1575,13 +1610,49 @@
     }
     function attach() {
       cancelRetry();
-      const current = ++generation,
-        target = session,
+      ++generation;
+      const target = session,
         key = stateKey;
-      handle?.unmount();
+      if (owner?.id === target.id && !parked.has(target.id)) {
+        owner.dead = true;
+        owner.handle?.unmount();
+        owner.el.remove();
+        owner = null;
+      }
+      park();
       handle = null;
-      mount.replaceChildren();
-      handle = M.terminal.mount(mount, {
+      const saved = parked.get(target.id);
+      if (saved) {
+        parked.delete(target.id);
+        clearTimeout(saved.parkTimer);
+        owner = saved;
+        mount = saved.el;
+        handle = saved.handle;
+        terminalPhase = saved.phase;
+        terminalMessage = saved.message;
+        mount.hidden = viewMode === "chat";
+        handle.setInputActive?.(activePane === 0);
+        handle.setQuestionActive?.(viewMode === "chat");
+        Promise.resolve(handle.setVisible?.(viewMode !== "chat")).catch(
+          ctx.error,
+        );
+        if (viewMode !== "chat" && activePane === 0) M.activeTerminal = handle;
+        syncSummary();
+        return;
+      }
+      const self = (owner = {
+        id: target.id,
+        el: el("div", undefined, "terminal-mount"),
+        handle: null,
+        phase: undefined,
+        message: "Connecting…",
+        dead: false,
+      });
+      const mine = () => !disposed && !self.dead && owner === self;
+      if (![...parked.values()].some((e) => e.el === mount)) mount.remove();
+      mount = self.el;
+      primaryPane.append(mount);
+      handle = self.handle = M.terminal.mount(mount, {
         sessionId: target.id,
         stateKey: key,
         connect: () => ctx.transport.terminalConnect(),
@@ -1589,8 +1660,7 @@
         visible: viewMode !== "chat",
         questionActive: viewMode === "chat",
         onQuestion: (question, status) => {
-          if (!disposed && current === generation)
-            chatHandle?.setQuestion?.(question, status);
+          if (mine()) chatHandle?.setQuestion?.(question, status);
         },
         onQuestionOpen: M.chat?.mount
           ? () => chatHandle?.openQuestion?.()
@@ -1615,7 +1685,13 @@
           else ctx.savePreferences(patch);
         },
         onStatus: (status) => {
-          if (disposed || current !== generation) return;
+          if (disposed || self.dead) return;
+          self.phase = status.phase;
+          self.message = status.message || "Connecting…";
+          if (owner !== self) {
+            if (status.phase !== "ready") unpark(self.id);
+            return;
+          }
           terminalPhase = status.phase;
           terminalMessage = status.message || "Connecting…";
           if (status.typing && status.phase !== "ready") refocus = true;
@@ -1634,7 +1710,7 @@
         onPhoto: (file) => ctx.photo(target.id, file),
         onEditKeys: () => go("/settings/terminal"),
         onTitle: (title) => {
-          if (disposed || current !== generation) return;
+          if (disposed || self.dead) return;
           const clean = cleanTitle(title);
           if (clean === (titles.get(target.id) || "")) return;
           if (clean) titles.set(target.id, clean);
@@ -1795,21 +1871,37 @@
     }
     function selectTab(target) {
       if (target.id === activeSession().id) return;
-      if (!splitSession) {
-        go(
-          ctx.groupRoute(state.groups.get(target.groupKey) || group, target.id),
-        );
+      const route = ctx.groupRoute(
+        state.groups.get(target.groupKey) || group,
+        target.id,
+      );
+      const targetKey = ctx.sessionKey?.(target.id) ?? target.id;
+      const targetMode = sessionView(
+        state.preferences,
+        targetKey,
+        Boolean(M.chat?.mount),
+      );
+      // 같은 화면에서 터미널만 바꿔 붙인다. 경로 이동은 헤더·탭·도크까지 다시 만들어 전환이 느려진다.
+      const inPlace =
+        !splitSession &&
+        viewMode !== "chat" &&
+        targetMode !== "chat" &&
+        ctx.setRoute;
+      if (!splitSession && !inPlace) {
+        go(route);
         return;
       }
-      if (target.id === (activePane === 1 ? selectedId : splitSession.id))
+      if (
+        splitSession &&
+        target.id === (activePane === 1 ? selectedId : splitSession.id)
+      )
         return;
 
-      if (activePane === 1) {
+      if (inPlace) ctx.setRoute(route);
+      if (splitSession && activePane === 1) {
         if (viewMode === "chat") {
           closeSplit();
-          go(
-            ctx.groupRoute(state.groups.get(target.groupKey) || group, target.id),
-          );
+          go(route);
           return;
         }
         stopSecondary();
@@ -1820,7 +1912,7 @@
         chatMount.replaceChildren?.();
         session = target;
         selectedId = target.id;
-        stateKey = ctx.sessionKey?.(target.id) ?? target.id;
+        stateKey = targetKey;
         group = state.groups.get(target.groupKey) || group;
         primaryPane.dataset.session = selectedId;
         refocus = false;
@@ -1831,6 +1923,7 @@
       }
       syncSplit();
       persistSplit();
+      revealTab = true;
       draw();
       syncSummary();
     }
@@ -1901,6 +1994,7 @@
       if (disposed || secondaryHandle || !splitSession) return;
       const target = state.sessions.get(splitSession.id);
       if (!target) return;
+      unpark(target.id);
       const generation = ++secondaryGeneration,
         key = ctx.sessionKey?.(target.id) ?? target.id;
       secondaryMount.replaceChildren();
@@ -2086,6 +2180,7 @@
         stopSecondary();
         clearTabs();
         handle?.unmount();
+        for (const id of [...parked.keys()]) unpark(id);
         chatHandle?.unmount();
         go(next ? ctx.groupRoute(group, next.id) : "/host/local", true);
         return;
@@ -2274,6 +2369,7 @@
         clearTabs();
         cancelRetry();
         handle?.unmount();
+        for (const id of [...parked.keys()]) unpark(id);
         chatHandle?.unmount();
         if (M.activeTerminal === handle) M.activeTerminal = null;
       },

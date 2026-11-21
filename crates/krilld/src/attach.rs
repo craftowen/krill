@@ -434,10 +434,18 @@ fn history(tap: &Tap, req: &HistoryRequest, features: u64) -> HistoryRows {
 #[derive(Default)]
 struct CaptureClock {
     last: Option<Instant>,
+    /// 직전 프레임이 입력 에코였다. 셸은 줄바꿈과 프롬프트를 0.3ms 안에 나눠 쓰므로
+    /// 바로 다음 한 프레임은 모바일도 [`FRAME_MIN`]으로 보내 프롬프트가 33ms 뒤로 밀리지 않게 한다.
+    after_echo: bool,
 }
 
 impl CaptureClock {
     fn next_delay(&self, now: Instant, minimum: Duration) -> Duration {
+        let minimum = if self.after_echo {
+            minimum.min(FRAME_MIN)
+        } else {
+            minimum
+        };
         self.last.map_or(Duration::ZERO, |at| {
             (at + minimum).saturating_duration_since(now)
         })
@@ -452,6 +460,7 @@ impl CaptureClock {
 
     fn mark(&mut self, now: Instant) {
         self.last = Some(now);
+        self.after_echo = false;
     }
 }
 
@@ -481,8 +490,9 @@ fn sync_client(
         return Ok(false);
     }
     conn.update(rev, position.0, ops, position.1)?;
-    conn.echo.store(false, Ordering::Release);
+    let echo = conn.echo.swap(false, Ordering::AcqRel);
     clock.mark(now);
+    clock.after_echo = echo;
     Ok(true)
 }
 

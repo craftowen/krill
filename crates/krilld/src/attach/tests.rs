@@ -357,6 +357,20 @@ fn mobile_urgent_echo_sends_immediately_after_clock_mark_and_skips_empty_diff_ma
     let mut got = prev;
     got.apply(update.ops).unwrap();
     assert_eq!(got, next);
+
+    // 에코 직후 셸이 이어 쓴 프롬프트는 33ms가 아니라 FRAME_MIN(8ms) 뒤에 나간다.
+    let t2 = t1 + Duration::from_millis(1);
+    assert_eq!(
+        frame_delay(&conn, &clock, t2, MOBILE_FRAME_MIN, false),
+        Duration::from_millis(7)
+    );
+    // 그 다음 일반 출력 프레임부터는 다시 모바일 간격을 지킨다.
+    let ops = diff(&next, &screen(&["$ a", "$ "]));
+    assert!(sync_client(&conn, &mut clock, Revision(4), (Seq(4), false), ops, t2).unwrap());
+    assert_eq!(
+        frame_delay(&conn, &clock, t2, MOBILE_FRAME_MIN, false),
+        MOBILE_FRAME_MIN
+    );
 }
 
 #[test]
