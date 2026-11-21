@@ -2,9 +2,39 @@
 use super::composer::Context;
 use super::{Value, fs, io, json};
 use krill_proto::agent_history::ChatPollSnapshot;
+use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
+const CACHE_TTL: Duration = Duration::from_secs(300);
+const CACHE_CAP: usize = 64;
+
+type FileStamp = Option<(Option<SystemTime>, u64)>;
+type StatusKey = (String, String, String);
+type StatusCache = Mutex<HashMap<StatusKey, CachedStatus>>;
+
+#[derive(Clone)]
+struct CachedStatus {
+    stamp: FileStamp,
+    at: Instant,
+    value: Value,
+}
+
+fn status_cache() -> &'static StatusCache {
+    static CACHE: OnceLock<StatusCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn invalidate_all() {
+    crate::session::lock(status_cache()).clear();
+}
+
+fn file_stamp(file: &fs::File) -> FileStamp {
+    let meta = file.metadata().ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
 
 fn command_value(value: &str) -> bool {
     !value.is_empty()
@@ -70,12 +100,27 @@ fn observe(record: &Value, state: &mut Value) {
 
 pub(super) fn read(snapshot: &ChatPollSnapshot, context: &Context) -> io::Result<Value> {
     let agent = context.agent.as_str();
+    let cache_key = (
+        snapshot.session_id.clone(),
+        agent.to_owned(),
+        snapshot.transcript_path.clone(),
+    );
     let mut state =
         json!({"agent":agent,"model":null,"effort":null,"context":null,"models":[],"efforts":[]});
     if snapshot.bound
         && krill_proto::agent::canonical_id(&snapshot.agent) == agent
         && let Ok(mut file) = fs::File::open(&snapshot.transcript_path)
     {
+        let stamp = file_stamp(&file);
+        {
+            let guard = crate::session::lock(status_cache());
+            if let Some(entry) = guard.get(&cache_key)
+                && entry.at.elapsed() < CACHE_TTL
+                && entry.stamp == stamp
+            {
+                return Ok(entry.value.clone());
+            }
+        }
         let len = file.metadata()?.len();
         let start = len.saturating_sub(MAX_BYTES);
         file.seek(SeekFrom::Start(start))?;
@@ -89,6 +134,26 @@ pub(super) fn read(snapshot: &ChatPollSnapshot, context: &Context) -> io::Result
                 observe(&record, &mut state);
             }
         }
+        let mut guard = crate::session::lock(status_cache());
+        if guard.len() >= CACHE_CAP {
+            guard.retain(|_, v| v.at.elapsed() < CACHE_TTL);
+            if guard.len() >= CACHE_CAP
+                && let Some(oldest_key) = guard
+                    .iter()
+                    .min_by_key(|(_, v)| v.at)
+                    .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest_key);
+            }
+        }
+        guard.insert(
+            cache_key,
+            CachedStatus {
+                stamp,
+                at: Instant::now(),
+                value: state.clone(),
+            },
+        );
     }
     Ok(state)
 }
@@ -121,5 +186,43 @@ mod tests {
             &mut state,
         );
         assert!(state["context"].is_null());
+    }
+
+    #[test]
+    fn transcript_cache_reuses_unchanged_file_and_invalidates_on_change() {
+        let dir = std::env::temp_dir().join(format!("krill-cs-ttl-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("claude.jsonl");
+        fs::write(&transcript, "{\"message\":{\"model\":\"claude-alpha\"}}\n").unwrap();
+
+        let ctx = Context::test_context(dir.clone(), dir.clone(), "claude");
+        let mut snap = ChatPollSnapshot {
+            bound: true,
+            agent: "claude".into(),
+            session_id: "ttl-s1".into(),
+            transcript_path: transcript.to_string_lossy().into_owned(),
+            ..ChatPollSnapshot::default()
+        };
+
+        invalidate_all();
+        let first = read(&snap, &ctx).unwrap();
+        assert_eq!(first["model"], "claude-alpha");
+
+        // Second read with identical metadata hits cache even before changing content.
+        let cached = read(&snap, &ctx).unwrap();
+        assert_eq!(cached["model"], "claude-alpha");
+
+        // Changing file length invalidates cache immediately without waiting 300s.
+        fs::write(
+            &transcript,
+            "{\"message\":{\"model\":\"claude-alpha\"}}\n{\"message\":{\"model\":\"claude-beta-newer\"}}\n",
+        )
+        .unwrap();
+        let refreshed = read(&snap, &ctx).unwrap();
+        assert_eq!(refreshed["model"], "claude-beta-newer");
+        snap.bound = false;
+        assert!(read(&snap, &ctx).unwrap()["model"].is_null());
+        fs::remove_dir_all(&dir).ok();
     }
 }
