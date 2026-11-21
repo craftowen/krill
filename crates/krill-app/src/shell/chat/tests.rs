@@ -964,6 +964,71 @@ fn work_run_unified_diff_summary_and_unread_divider_projection() {
     assert!(summary.contains("-1"));
 }
 
+/// Bot chats: a launch preamble turn is not drawn, and item changes sit between the turns sent
+/// around them (Orca's bot item note rows).
+#[test]
+fn bot_chat_hides_preamble_turn_and_interleaves_item_notes_by_turn_time() {
+    use krill_proto::bots::BotItemStatus;
+    let user = |text: &str| {
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: text.into(),
+            ..Default::default()
+        })
+    };
+    let reply = |text: &str| {
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: text.into(),
+            ..Default::default()
+        })
+    };
+    let preamble = "You are Shop, a bot that runs in Krill. Your home is the current folder.\n\n- Coordinate with other bots using `krill bot send --to <name>` when a task belongs to another bot or needs input from one.";
+    let items = vec![
+        user(preamble),
+        reply("ready"),
+        user("first"),
+        reply("one"),
+        user("second"),
+        reply("two"),
+    ];
+    let note = |at_ms: u64, title: &str| {
+        Arc::new(work_run::ItemNote {
+            at_ms,
+            actor: work_run::NoteActor::Bot,
+            action: work_run::NoteAction::Status(BotItemStatus::Working),
+            title: title.into(),
+            status: BotItemStatus::Working,
+            detail: String::new(),
+        })
+    };
+    // Turns: "first" at 100, "second" at 200 (newest first).
+    let notes = [note(150, "between"), note(250, "after"), note(50, "before")];
+    let feed = work_run::DisplayFeed::project_with_notes(0, &items, None, &notes, &[200, 100]);
+    let shape: Vec<String> = feed
+        .rows()
+        .iter()
+        .map(|row| match row {
+            work_run::DisplayRow::Item { item, .. } => item.text.clone(),
+            work_run::DisplayRow::ItemNote { note, .. } => format!("note:{}", note.title),
+            _ => "other".into(),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "ready",
+            "note:before",
+            "first",
+            "one",
+            "note:between",
+            "second",
+            "two",
+            "note:after"
+        ]
+    );
+}
+
 #[test]
 fn chat_page_parses_timestamps_and_remote_autocomplete_items_validate_paths() {
     let page_json = serde_json::json!({

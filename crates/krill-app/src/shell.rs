@@ -7742,6 +7742,10 @@ impl Shell {
             .layout
             .session(id)
             .or_else(|| self.live.get(&id).and_then(|l| l.pane.session()))?;
+        // Orca's bot chat has no last-prompt bar: the chat itself is the conversation.
+        if self.chat_bot(&(host.clone(), session_id)).is_some() {
+            return None;
+        }
         let sidebar_ref = self.sidebar.read(cx);
         if sidebar_ref
             .session_on(host, session_id)

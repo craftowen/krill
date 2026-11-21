@@ -7353,10 +7353,10 @@ fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mu
         "a mascot face is saved"
     );
     assert_eq!(created.avatar_color.as_deref(), Some("#1f2126"));
+    // The chat opens empty: no kickoff turn, the bot first answers its owner's first message.
     assert!(reqs.iter().any(|r| matches!(
         r,
-        krill_proto::bots::BotRpcRequest::StartBotSession { prompt: Some(p), .. }
-            if p.contains("first-run")
+        krill_proto::bots::BotRpcRequest::StartBotSession { prompt: None, .. }
     )));
     cx.update(|_, cx| {
         let s = view.read(cx);
@@ -7557,9 +7557,16 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
     click(cx, "bot-panel-tab-home");
     click(cx, "bot-panel-settings");
     assert!(cx.debug_bounds("bot-settings-page").is_some());
+    // Orca's settings list: a row opens its page, Back climbs one level at a time.
+    assert!(cx.debug_bounds("bot-settings-root").is_some());
+    click(cx, "bot-settings-agent");
     assert!(cx.debug_bounds("bots-tab-settings-body").is_some());
-    click(cx, "bot-settings-tab-soul");
+    click(cx, "bot-settings-back");
+    assert!(cx.debug_bounds("bot-settings-root").is_some());
+    click(cx, "bot-settings-soul");
     assert!(cx.debug_bounds("bots-tab-soul-memory-body").is_some());
+    click(cx, "bot-settings-back");
+    assert!(cx.debug_bounds("bot-settings-root").is_some());
     click(cx, "bot-settings-back");
     assert!(cx.debug_bounds("bot-panel-header").is_some());
 

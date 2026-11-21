@@ -85,7 +85,7 @@ impl Shell {
         }
     }
 
-    fn bot_host_label(&self) -> SharedString {
+    pub(super) fn bot_host_label(&self) -> SharedString {
         if self.launch_host.is_local() {
             return text::HOST_LOCAL
                 .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)

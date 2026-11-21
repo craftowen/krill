@@ -264,6 +264,23 @@ impl Shell {
         feed_sidebar: bool,
         cx: &mut Context<Self>,
     ) {
+        cx.subscribe(
+            view,
+            |this, _, ev: &krill_app::bots::OpenSettingsPage, cx| {
+                this.open_bot_settings_page(ev.0, cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            view,
+            |this, _, ev: &krill_app::bots::RequestDeleteBot, cx| {
+                if let Some(bot) = this.sidebar_bots.iter().find(|b| b.id == ev.0).cloned() {
+                    this.bot_ui.delete = Some(bot);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
             this.request_new_bot(None, None, cx);
         })
