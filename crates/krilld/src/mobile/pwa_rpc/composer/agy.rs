@@ -5,7 +5,7 @@ use super::{
 };
 use crate::session::lock;
 use crate::usage::{accounts, direct};
-use krill_proto::screen::Screen;
+use krill_proto::screen::{Color, Flags, Screen};
 use krill_proto::usage::ProviderKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ const RETRY: Duration = VERSION_TIMEOUT
     .saturating_add(LIST_TIMEOUT)
     .saturating_add(Duration::from_secs(10));
 const MAX_BYTES: u64 = 64 * 1024;
-const SETTLE: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5 });
+const SETTLE: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 10 });
 const CONFIRM: Duration = Duration::from_secs(3);
 
 const NOT_INSTALLED: &str = "Antigravity CLI was not found on this computer.";
@@ -37,14 +37,14 @@ const CONTROL: &str = "Changes the model in this running Antigravity chat. Antig
 const NOTE: &str = "Antigravity also saves this as the default for new sessions.";
 const NOT_CONFIRMED: &str = "Antigravity received the model command, but its confirmation was not recognized. It will not be resent.";
 
-/// One row of `agy models`. The effort is part of the id, so `/model <id>` sets both at once.
+/// One row of `agy models`. When present, the effort is part of the id, so `/model <id>` sets both at once.
 struct Level {
-    effort: String,
+    effort: Option<String>,
     id: String,
     label: String,
 }
 
-/// What the picker shows: one model, with its efforts as a second choice.
+/// What the picker shows: one model, with its efforts as a second choice when available.
 struct Family {
     id: String,
     label: String,
@@ -52,13 +52,19 @@ struct Family {
 }
 
 impl Family {
-    fn level(&self, effort: &str) -> Option<&Level> {
-        self.levels.iter().find(|level| level.effort == effort)
+    fn level(&self, effort: Option<&str>) -> Option<&Level> {
+        self.levels
+            .iter()
+            .find(|level| level.effort.as_deref() == effort)
     }
 
     fn item(&self) -> Value {
-        let efforts = self.levels.iter().map(|level| level.effort.as_str());
-        json!({"id":self.id,"label":self.label,"efforts":efforts.collect::<Vec<_>>()})
+        let efforts: Vec<&str> = self
+            .levels
+            .iter()
+            .filter_map(|level| level.effort.as_deref())
+            .collect();
+        json!({"id":self.id,"label":self.label,"efforts":efforts})
     }
 }
 
@@ -78,25 +84,32 @@ static VERIFIED_EXE: Mutex<BTreeMap<ExeStamp, Result<(), &'static str>>> =
     Mutex::new(BTreeMap::new());
 
 pub(super) fn prewarm(context: &Context) {
-    let _ = cached(context);
+    prewarm_path(&context.home, context.config.clone());
+}
+
+pub(crate) fn prewarm_path(home: &Path, config: Option<PathBuf>) {
+    let _ = ensure_cached(home, config);
 }
 
 /// Returns what is known now and refreshes on its own thread, so a poll never waits on `agy`.
 fn cached(context: &Context) -> (Option<Families>, Option<&'static str>) {
-    let key = context.config.clone();
+    ensure_cached(&context.home, context.config.clone())
+}
+
+fn ensure_cached(home: &Path, config: Option<PathBuf>) -> (Option<Families>, Option<&'static str>) {
     let mut cache = lock(&CACHE);
-    if cache.len() >= 16 && !cache.contains_key(&key) {
+    if cache.len() >= 16 && !cache.contains_key(&config) {
         cache.pop_first();
     }
-    let slot = cache.entry(key.clone()).or_default();
+    let slot = cache.entry(config.clone()).or_default();
     if slot.loaded.is_none_or(|at| at.elapsed() >= TTL)
         && slot.attempted.is_none_or(|at| at.elapsed() >= RETRY)
     {
         slot.attempted = Some(Instant::now());
-        let home = context.home.clone();
+        let home = home.to_path_buf();
         std::thread::Builder::new()
             .name("agy-models".into())
-            .spawn(move || refresh(key, &home))
+            .spawn(move || refresh(config, &home))
             .ok();
     }
     (slot.families.clone(), slot.failure)
@@ -190,7 +203,26 @@ fn plain_label(label: &str) -> bool {
             .all(|c| c.is_alphanumeric() || " .-_".contains(c))
 }
 
-/// Groups `id\tlabel` rows by model. A row that does not encode its effort is left out.
+fn plain_model_label(label: &str) -> bool {
+    let mut depth = 0usize;
+    !label.is_empty()
+        && label.len() <= 64
+        && label.chars().all(|c| match c {
+            '(' => {
+                depth += 1;
+                depth == 1
+            }
+            ')' => {
+                let ok = depth == 1;
+                depth = depth.saturating_sub(1);
+                ok
+            }
+            _ => c.is_alphanumeric() || " .-_".contains(c),
+        })
+        && depth == 0
+}
+
+/// Groups `id\tlabel` rows by model, plus standalone models without an effort suffix.
 fn parse(output: &str) -> Vec<Family> {
     let mut families: Vec<Family> = Vec::new();
     for (id, label) in output
@@ -198,38 +230,60 @@ fn parse(output: &str) -> Vec<Family> {
         .take(256)
         .filter_map(|line| line.split_once('\t'))
     {
+        let id = id.trim();
         let label = label.trim();
-        let Some((family_label, effort)) =
-            label.strip_suffix(')').and_then(|l| l.rsplit_once(" ("))
-        else {
-            continue;
-        };
-        let effort = effort.to_ascii_lowercase();
-        let Some(family_id) = id.strip_suffix(&format!("-{effort}")) else {
-            continue;
-        };
-        if !valid_id(id) || !valid_effort(&effort) || !plain_label(family_label) {
+        if !valid_id(id) {
             continue;
         }
-        let level = Level {
-            effort,
-            id: id.to_owned(),
-            label: label.to_owned(),
-        };
-        if let Some(family) = families.iter_mut().find(|family| family.id == family_id) {
-            family.levels.push(level);
-        } else if families.len() < 64 {
+        if let Some((family_label, effort_tag)) =
+            label.strip_suffix(')').and_then(|l| l.rsplit_once(" ("))
+        {
+            let effort = effort_tag.to_ascii_lowercase();
+            if valid_effort(&effort) {
+                let Some(family_id) = id.strip_suffix(&format!("-{effort}")) else {
+                    continue;
+                };
+                if !plain_label(family_label) {
+                    continue;
+                }
+                let level = Level {
+                    effort: Some(effort),
+                    id: id.to_owned(),
+                    label: label.to_owned(),
+                };
+                if let Some(family) = families.iter_mut().find(|family| family.id == family_id) {
+                    family.levels.push(level);
+                } else if families.len() < 64 {
+                    families.push(Family {
+                        id: family_id.to_owned(),
+                        label: family_label.to_owned(),
+                        levels: vec![level],
+                    });
+                }
+                continue;
+            }
+        }
+        if !plain_model_label(label) || families.iter().any(|family| family.id == id) {
+            continue;
+        }
+        if families.len() < 64 {
             families.push(Family {
-                id: family_id.to_owned(),
-                label: family_label.to_owned(),
-                levels: vec![level],
+                id: id.to_owned(),
+                label: label.to_owned(),
+                levels: vec![Level {
+                    effort: None,
+                    id: id.to_owned(),
+                    label: label.to_owned(),
+                }],
             });
         }
     }
     for family in &mut families {
-        family
-            .levels
-            .sort_by_key(|level| EFFORT_ORDER.iter().position(|e| *e == level.effort));
+        family.levels.sort_by_key(|level| {
+            EFFORT_ORDER
+                .iter()
+                .position(|e| Some(*e) == level.effort.as_deref())
+        });
     }
     families
 }
@@ -242,47 +296,131 @@ fn verified(screen: &Screen) -> bool {
 
 fn composer(screen: &Screen, draft: Option<&str>) -> bool {
     let y = usize::from(screen.cursor.line);
-    let expected = format!("> {}", draft.unwrap_or_default());
-    screen.cursor.visible
-        && y > 0
-        && native::border(screen, y - 1)
-        && native::border(screen, y + 1)
-        && screen
-            .rows
-            .get(y)
-            .is_some_and(|cells| cells.iter().all(|c| c.zerowidth.is_empty()))
-        && native::row(screen, y) == expected.trim_end()
-        && usize::from(screen.cursor.column) == 2 + draft.map_or(0, str::len)
+    let Some(cells) = screen.rows.get(y) else {
+        return false;
+    };
+    if !screen.cursor.visible
+        || y == 0
+        || !native::border(screen, y - 1)
+        || !native::border(screen, y + 1)
+        || !cells.iter().all(|c| c.zerowidth.is_empty())
+        || usize::from(screen.cursor.column) != 2 + draft.map_or(0, str::len)
+    {
+        return false;
+    }
+    if let Some(draft) = draft {
+        let expected = format!("> {draft}");
+        return native::row(screen, y) == expected.trim_end();
+    }
+    if cells.first().is_none_or(|c| c.ch != '>') || cells.get(1).is_some_and(|c| c.ch != ' ') {
+        return false;
+    }
+    let tail = cells.get(2..).unwrap_or_default();
+    if tail.iter().all(|c| c.ch.is_whitespace()) {
+        return true;
+    }
+    let prompt_fg = cells.first().map_or(Color::Default, |c| c.fg);
+    let first_non_ws = tail.iter().find(|c| !c.ch.is_whitespace()).map(|c| c.ch);
+    !matches!(first_non_ws, Some('/' | '!' | '@'))
+        && tail.iter().all(|c| {
+            c.ch.is_whitespace()
+                || c.flags.contains(Flags::DIM)
+                || (c.fg != Color::Default && c.fg != prompt_fg)
+        })
 }
 
-/// The echoed command and the completion row Enter would select. A narrow terminal cuts the id.
+/// The echoed command and the completion row Enter would select. Narrow or multi-row menus
+/// may place the highlighted row below `y + 2` or omit the id column.
 fn echoed(screen: &Screen, command: &str, level: &Level) -> bool {
-    let completion = native::row(screen, usize::from(screen.cursor.line) + 2);
-    composer(screen, Some(command))
-        && completion
-            .strip_prefix(&format!("> {}  ", level.label))
-            .is_some_and(|id| {
-                id == level.id
-                    || id
-                        .strip_suffix("...")
-                        .is_some_and(|cut| level.id.starts_with(cut))
-            })
+    if !composer(screen, Some(command)) {
+        return false;
+    }
+    let start = usize::from(screen.cursor.line) + 2;
+    let end = start.saturating_add(12).min(screen.rows.len());
+    for y in start..end {
+        let line = native::row(screen, y);
+        if line.trim().is_empty() || line.contains("Navigate") || line.contains('│') {
+            break;
+        }
+        if line.starts_with("> ") {
+            let Some(after_label) = line.strip_prefix(&format!("> {}", level.label)) else {
+                return false;
+            };
+            if after_label.is_empty() {
+                return true;
+            }
+            let Some(padded) = after_label.strip_prefix("  ") else {
+                return false;
+            };
+            let id = padded.trim_start();
+            return id == level.id
+                || id
+                    .strip_suffix("...")
+                    .is_some_and(|cut| !cut.is_empty() && level.id.starts_with(cut));
+        }
+    }
+    false
+}
+
+fn strip_context_window(status: &str) -> &str {
+    let Some(without_paren) = status.strip_suffix(')') else {
+        return status;
+    };
+    let Some((prefix, size)) = without_paren.rsplit_once(" (") else {
+        return status;
+    };
+    let Some(num) = size.strip_suffix(['k', 'K', 'm', 'M']) else {
+        return status;
+    };
+    let mut parts = num.split('.');
+    let valid_num = match (parts.next(), parts.next(), parts.next()) {
+        (Some(whole), None, None) => !whole.is_empty() && whole.bytes().all(|b| b.is_ascii_digit()),
+        (Some(whole), Some(frac), None) => {
+            !whole.is_empty()
+                && !frac.is_empty()
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    };
+    if valid_num { prefix } else { status }
 }
 
 /// `(label, effort)` from the footer, the screen's last row in every observed layout. The status
 /// line is configurable, so only its first segment is read.
-fn footer(screen: &Screen) -> Option<(String, String)> {
+#[cfg(all(test, unix))]
+fn footer(screen: &Screen) -> Option<(String, Option<String>)> {
+    footer_with(screen, None)
+}
+
+fn footer_with(screen: &Screen, families: Option<&[Family]>) -> Option<(String, Option<String>)> {
     let row = (0..screen.rows.len())
         .rev()
         .map(|y| native::row(screen, y))
         .find(|row| !row.trim().is_empty())?;
     let status = row.split('│').next()?.trim();
-    let (label, effort) = status.rsplit_once(" · ").or_else(|| {
+    if status.starts_with('>') {
+        return None;
+    }
+    if let Some((label, effort)) = status.rsplit_once(" · ").or_else(|| {
         let (label, rest) = status.split_once(" (")?;
         Some((label, rest.split_once(')')?.0))
-    })?;
-    let effort = effort.to_ascii_lowercase();
-    (plain_label(label) && valid_effort(&effort)).then(|| (label.to_owned(), effort))
+    }) {
+        let effort = effort.to_ascii_lowercase();
+        if plain_label(label) && valid_effort(&effort) {
+            return Some((label.to_owned(), Some(effort)));
+        }
+    }
+    let candidate = strip_context_window(status).trim();
+    let known_standalone = families.is_some_and(|fams| {
+        fams.iter()
+            .any(|f| f.label == candidate && f.levels.iter().all(|l| l.effort.is_none()))
+    });
+    if known_standalone || (row.contains('│') && plain_model_label(candidate)) {
+        Some((candidate.to_owned(), None))
+    } else {
+        None
+    }
 }
 
 /// Reads from the newest `⎿` down, ignoring blank rows and sticky `┃` callout banners pinned
@@ -349,7 +487,7 @@ impl Adapter for Agy {
         set(catalog, "supported", true.into());
         set(catalog, "reason", CONTROL.into());
         set(catalog, "note", NOTE.into());
-        if let Some(family) = footer(&screen)
+        if let Some(family) = footer_with(&screen, Some(&families))
             .and_then(|(label, _)| families.iter().find(|family| family.label == label))
         {
             set(catalog, "current", family.id.as_str().into());
@@ -375,12 +513,13 @@ impl Adapter for Agy {
         if !verified(&before) || !composer(&before, None) {
             return Err(io::Error::other(WAIT));
         }
-        let current = footer(&before);
+        let current = footer_with(&before, Some(&families));
         let level = match effort {
-            Some(effort) => family.level(effort),
+            Some(effort) => family.level(Some(effort)),
             None => current
                 .as_ref()
-                .and_then(|(_, effort)| family.level(effort))
+                .and_then(|(_, effort)| effort.as_deref())
+                .and_then(|effort| family.level(Some(effort)))
                 .or_else(|| family.levels.first()),
         }
         .ok_or_else(|| invalid("Effort is not in this session model's discovered catalog"))?;
@@ -391,7 +530,7 @@ impl Adapter for Agy {
             }
             reply
         };
-        if current.is_some_and(|(label, effort)| label == family.label && effort == level.effort) {
+        if current.is_some_and(|(label, eff)| label == family.label && eff == level.effort) {
             return Ok(done(true));
         }
         let command = format!("/model {}", level.id);
@@ -418,9 +557,8 @@ impl Adapter for Agy {
                 && composer(&screen, None)
                 // Mid-turn output pushes the note away, and the footer is Antigravity's own report.
                 && (working
-                    && footer(&screen).is_some_and(|(label, effort)| {
-                        label == family.label && effort == level.effort
-                    })
+                    && footer_with(&screen, Some(&families))
+                        .is_some_and(|(label, eff)| label == family.label && eff == level.effort)
                     || confirmed(&screen, &level.label)
                         && native::contains_phrase(
                             &native::fresh_text(&tap, seq.0),
@@ -435,7 +573,11 @@ impl Adapter for Agy {
 
     fn set_effort(&self, context: &Context, live: &Live<'_>, effort: &str) -> io::Result<Value> {
         let (families, _) = cached(context);
-        let (label, _) = footer(&live.tap()?.capture().0).ok_or_else(no_current_model)?;
+        let (label, _) = footer_with(
+            &live.tap()?.capture().0,
+            families.as_deref().map(Vec::as_slice),
+        )
+        .ok_or_else(no_current_model)?;
         let family = families
             .iter()
             .flat_map(|families| families.iter())
@@ -452,21 +594,32 @@ impl Adapter for Agy {
         _snapshot: &ChatPollSnapshot,
         status: &mut Value,
     ) {
-        let supported = status.get("supported").cloned().unwrap_or(false.into());
-        set(status, "effort_supported", supported);
-        let Some((label, effort)) = live.screen().as_ref().and_then(footer) else {
+        let supported = status
+            .get("supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (families, _) = cached(context);
+        let Some((label, effort)) = live
+            .screen()
+            .as_ref()
+            .and_then(|screen| footer_with(screen, families.as_deref().map(Vec::as_slice)))
+        else {
+            set(status, "effort_supported", supported.into());
             return;
         };
-        let (families, _) = cached(context);
-        if let Some(family) = families
+        let family = families
             .iter()
             .flat_map(|families| families.iter())
-            .find(|family| family.label == label)
-        {
+            .find(|family| family.label == label);
+        let effort_supported = supported
+            && family.is_none_or(|f| f.levels.iter().any(|l| l.effort.is_some()))
+            || effort.is_some();
+        if let Some(family) = family {
             observe_live_model(status, &family.id);
         }
+        set(status, "effort_supported", effort_supported.into());
         set(status, "model_label", label.into());
-        set(status, "effort", effort.into());
+        set(status, "effort", effort.map_or(Value::Null, Into::into));
     }
 
     fn settle(&self, context: &Context) {

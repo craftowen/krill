@@ -2067,18 +2067,18 @@ models.some(
 (m) => Array.isArray(m.efforts) && m.efforts.length,
 )),
 ),
-activeModelId = data?.current || status?.model;
+activeModelId = data?.current || status?.model,
+hasCurrent = Boolean(data?.current && models.some((m) => m.id === data.current));
 const items = models.map((item) => {
-const isCurrent =
-item.id === data.current ||
-matchesModel(agent, item.id, status?.model),
+const isCurrent = hasCurrent ? item.id === data.current : matchesModel(agent, item.id, status?.model),
+matchesStatus = matchesModel(agent, item.id, status?.model),
 label = t(item.label || item.name || item.id);
 return {
 id: item.id,
 group: "models",
 current: isCurrent,
 label:
-isCurrent && agent === "claude" && status?.model
+isCurrent && matchesStatus && agent === "claude" && status?.model
 ? fullModel(status.model)
 : label,
 efforts: effortSupported
@@ -2167,10 +2167,13 @@ scope() !== context
 return;
 discovery.clear();
 if (result?.applied === true) {
+entry.modelChoices = null;
 const id =
 typeof result.model === "string" ? result.model : choice?.id,
 nextEffort =
-result.effort ||
+result.effort === null
+? null
+: result.effort ||
 effort ||
 entry.model?.effort ||
 entry.composerStatus?.effort ||
@@ -2185,12 +2188,30 @@ effort: nextEffort,
 statusBefore: entry.composerStatus?.model,
 statusEffortBefore: entry.composerStatus?.effort,
 };
-else if (result.effort && entry.model?.scope === context)
+else if (result.effort && entry.model?.scope === context) {
+entry.model.statusEffortBefore = entry.composerStatus?.effort;
 entry.model.effort = result.effort;
+} else if (
+result.effort &&
+entry.composerStatus &&
+(entry.composerStatus.model || entry.composerStatus.model_label)
+)
+entry.model = {
+agent: chatAgent(),
+scope: context,
+id: entry.composerStatus.model || "",
+label:
+entry.composerStatus.model_label ||
+entry.composerStatus.model ||
+"",
+effort: result.effort,
+statusBefore: entry.composerStatus.model,
+statusEffortBefore: entry.composerStatus.effort,
+};
 entry.composerStatusAt = 0;
 entry.composerProbes = 0;
-if (result.effort && entry.composerStatus)
-entry.composerStatus.effort = result.effort;
+if (entry.composerStatus && (result.effort !== undefined || effort))
+entry.composerStatus.effort = nextEffort;
 clearTimeout(appliedTimer);
 modelBtn.dataset.applied = "true";
 appliedTimer = setTimeout(() => {
@@ -2208,8 +2229,18 @@ active() &&
 entry.modelPending === operation &&
 scope() === context &&
 version === suggestVersion
-)
-paintChoices([], t("Model change was not confirmed."));
+) {
+const generic = t(
+"Request failed. Check the desktop connection and try again.",
+),
+cleaned = error?.message ? cleanRpcError(error, t) : "";
+paintChoices(
+[],
+cleaned && cleaned !== generic
+? cleaned
+: t("Model change was not confirmed."),
+);
+}
 } finally {
 delete suggestions.dataset.pending;
 if (entry.modelPending === operation) {
@@ -2239,7 +2270,7 @@ try {
 const data = await ctx.rpc({action:"chat_composer", session:sessionId});
 if (!current() || data?.agent !== chatAgent() || data.generation && data.generation !== generation) return;
 if (entry.model && data.model && data.model !== entry.model.statusBefore && !matchesModel(chatAgent(), entry.model.id, data.model)) entry.model = null;
-else if (entry.model && data.effort && data.effort !== entry.model.statusEffortBefore) entry.model.effort = data.effort;
+else if (entry.model && ((data.effort && data.effort !== entry.model.statusEffortBefore) || (data.effort === null && data.model && matchesModel(chatAgent(), entry.model.id, data.model) && data.effort_supported === false))) entry.model.effort = data.effort;
 const gotModel = Boolean(data?.model || (data?.supported && data?.model_label));
 entry.composerProbes = gotModel ? 0 : (entry.composerProbes || 0) + 1;
 entry.composerStatus = data; entry.composerStatusAt = Date.now(); syncAgent();

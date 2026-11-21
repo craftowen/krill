@@ -126,7 +126,7 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
                 },
                 ComposerModelItem {
                     id: "fable".to_owned(),
-                    label: "Fable 5.1".to_owned(),
+                    label: "Fable 5.2".to_owned(),
                     efforts: vec![
                         "low".to_owned(),
                         "medium".to_owned(),
@@ -325,7 +325,7 @@ pub(super) fn resolved_composer_choices(
         .and_then(|m| {
             active_id
                 .and_then(|id| m.models.iter().find(|item| item.id == id))
-                .filter(|item| !item.efforts.is_empty())
+                .filter(|item| !item.efforts.is_empty() || m.efforts.is_empty())
                 .map(|item| item.efforts.clone())
                 .or_else(|| (!m.efforts.is_empty()).then(|| m.efforts.clone()))
         })

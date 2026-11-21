@@ -217,6 +217,10 @@ fn no_current_model() -> io::Error {
     io::Error::other("Wait for an idle chat with an observed current model")
 }
 
+pub(crate) fn prewarm_agy_launch(home: &Path, config: Option<PathBuf>) {
+    agy::prewarm_path(home, config);
+}
+
 pub(super) fn command_context(
     stored: Option<&StoredLaunch>,
     agents: &Agents,
