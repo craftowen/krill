@@ -2914,25 +2914,24 @@ impl Sidebar {
         else {
             return;
         };
-        if let Some(path) = self.folder_on(&HostId::Local, id).map(Path::to_path_buf) {
-            self.collapsed.remove(&path);
-            self.expand_lineage_ancestors(&path);
-            for (repo, trees) in &self.snapshot.trees {
-                if trees.contains(&path) {
-                    self.collapsed.remove(repo);
-                    if external::is_claude_worktree(&path) {
-                        self.shown_external.insert(repo.clone());
-                    }
-                }
-            }
+        let target_wt = self.folder_on(&HostId::Local, id).map(Path::to_path_buf);
+        if self.reveal_worktree_on(&HostId::Local, target_wt.as_deref()) {
             self.persist(cx);
         }
-        let index = self.rows.iter().enumerate().position(|(i, r)| {
-            self.row_host(i).is_local() && matches!(r, Row::Session(s, _) if s.id == id)
-        });
-        if let Some(index) = index {
+        if let Some(index) = self.focused_row_index(&HostId::Local, id, target_wt.as_deref()) {
             self.select_session_on(index, HostId::Local, id, cx);
             self.scroll_row_into_view(index, ScrollStrategy::Nearest);
+        } else {
+            self.mark_session_read(&HostId::Local, id, cx);
+            if let Some(wt) = target_wt
+                && self.selected_worktree.as_ref() != Some(&wt)
+            {
+                self.selected_worktree = Some(wt);
+                self.write_state(cx);
+            }
+            self.action_host = Some(HostId::Local);
+            cx.emit(Selected(id));
+            cx.notify();
         }
     }
 
@@ -2964,6 +2963,128 @@ impl Sidebar {
             })
     }
 
+    fn reveal_worktree_on(&mut self, host: &HostId, target_wt: Option<&Path>) -> bool {
+        let mut uncollapsed = self.collapsed_hosts.remove(host);
+        let Some(wt) = target_wt else {
+            return uncollapsed;
+        };
+        if self.collapsed.remove(wt) {
+            uncollapsed = true;
+        }
+        if host.is_local() {
+            if self.expand_lineage_ancestors(wt) {
+                uncollapsed = true;
+            }
+            if self.prefs.get(wt).is_some_and(|p| p.pinned)
+                && self.collapsed_groups.remove(&GroupKey::Pinned)
+            {
+                uncollapsed = true;
+            }
+        }
+        let session_count = self
+            .snapshot_for(host)
+            .sessions
+            .iter()
+            .filter(|s| s.worktree.as_deref() == Some(wt))
+            .count();
+        if session_count > 0 {
+            let removed_fold = self.manually_folded_cards.remove(wt);
+            if self.expanded_cards.insert(wt.to_path_buf()) || removed_fold {
+                uncollapsed = true;
+            }
+        }
+        let is_claude_wt = external::is_claude_worktree(wt);
+        let parent_repos: Vec<PathBuf> = self
+            .snapshot_for(host)
+            .trees
+            .iter()
+            .filter(|&(repo, trees)| {
+                repo.as_path() == wt || trees.iter().any(|t| t.as_path() == wt)
+            })
+            .map(|(repo, _)| repo.clone())
+            .collect();
+        for repo in &parent_repos {
+            if self.collapsed.remove(repo) {
+                uncollapsed = true;
+            }
+            if is_claude_wt && self.shown_external.insert(repo.clone()) {
+                uncollapsed = true;
+            }
+        }
+        if !host.is_local() && self.options.group_by == GroupBy::Repo {
+            let candidate_projects: Vec<&Path> = if parent_repos.is_empty() {
+                vec![wt]
+            } else {
+                parent_repos.iter().map(PathBuf::as_path).collect()
+            };
+            for project_path in candidate_projects {
+                let key = basename(project_path).to_ascii_lowercase();
+                let matching_collapsed: Vec<PathBuf> = self
+                    .collapsed
+                    .iter()
+                    .filter(|p| basename(p).to_ascii_lowercase() == key)
+                    .cloned()
+                    .collect();
+                for path in matching_collapsed {
+                    if self.collapsed.remove(&path) {
+                        uncollapsed = true;
+                    }
+                }
+            }
+        }
+        if !self.collapsed_groups.is_empty() {
+            let key = self.group_for_path(host, wt);
+            if key.is_some_and(|key| self.collapsed_groups.remove(&key)) {
+                uncollapsed = true;
+            }
+            match self.options.group_by {
+                GroupBy::WorkspaceStatus => {
+                    let status = if host.is_local() {
+                        self.worktree_statuses
+                            .get(wt)
+                            .copied()
+                            .or_else(|| {
+                                self.disk
+                                    .store
+                                    .statuses
+                                    .get(wt.to_string_lossy().as_ref())
+                                    .and_then(|v| {
+                                        krill_proto::orchestration::WorkspaceStatus::parse(v).ok()
+                                    })
+                            })
+                            .unwrap_or(krill_proto::orchestration::WorkspaceStatus::Todo)
+                    } else {
+                        krill_proto::orchestration::WorkspaceStatus::Todo
+                    };
+                    if self
+                        .collapsed_groups
+                        .remove(&GroupKey::WorkspaceStatus(status))
+                    {
+                        uncollapsed = true;
+                    }
+                }
+                GroupBy::PrStatus => {
+                    let pr_group = if host.is_local() {
+                        let has_cp = self
+                            .disk
+                            .store
+                            .prs
+                            .get(wt.to_string_lossy().as_ref())
+                            .is_some_and(|&pr| pr > 0);
+                        options::PrGroup::from_status(self.prs.get(wt), has_cp)
+                    } else {
+                        options::PrGroup::from_status(None, false)
+                    };
+                    if self.collapsed_groups.remove(&GroupKey::PrStatus(pr_group)) {
+                        uncollapsed = true;
+                    }
+                }
+                GroupBy::Repo | GroupBy::None => {}
+            }
+        }
+        uncollapsed
+    }
+
     /// 현재 포커스된 세션(또는 그 워크트리) 행으로 스크롤·선택한다.
     pub fn reveal_focused(&mut self, cx: &mut Context<Self>) {
         let Some(focused_id) = self.focused else {
@@ -2973,145 +3094,7 @@ impl Sidebar {
         let target_wt = self
             .folder_on(&focused_host, focused_id)
             .map(Path::to_path_buf);
-        let mut uncollapsed = self.collapsed_hosts.remove(&focused_host);
-        if let Some(wt) = &target_wt {
-            if self.collapsed.remove(wt) {
-                uncollapsed = true;
-            }
-            if focused_host.is_local() {
-                if self.expand_lineage_ancestors(wt) {
-                    uncollapsed = true;
-                }
-                if self.prefs.get(wt).is_some_and(|p| p.pinned)
-                    && self.collapsed_groups.remove(&GroupKey::Pinned)
-                {
-                    uncollapsed = true;
-                }
-            }
-            let session_count = self
-                .snapshot_for(&focused_host)
-                .sessions
-                .iter()
-                .filter(|s| s.worktree.as_deref() == Some(wt.as_path()))
-                .count();
-            if session_count > 0 {
-                self.manually_folded_cards.remove(wt);
-                if self.expanded_cards.insert(wt.clone()) {
-                    uncollapsed = true;
-                }
-            }
-            let is_claude_wt = external::is_claude_worktree(wt);
-            let parent_repos: Vec<PathBuf> = self
-                .snapshot_for(&focused_host)
-                .trees
-                .iter()
-                .filter(|&(repo, trees)| repo == wt || trees.iter().any(|t| t == wt))
-                .map(|(repo, _)| repo.clone())
-                .collect();
-            for repo in &parent_repos {
-                if self.collapsed.remove(repo) {
-                    uncollapsed = true;
-                }
-                if is_claude_wt && self.shown_external.insert(repo.clone()) {
-                    uncollapsed = true;
-                }
-            }
-            if !focused_host.is_local() && self.options.group_by == GroupBy::Repo {
-                let candidate_projects: Vec<&Path> = if parent_repos.is_empty() {
-                    vec![wt.as_path()]
-                } else {
-                    parent_repos.iter().map(PathBuf::as_path).collect()
-                };
-                for project_path in candidate_projects {
-                    let key = basename(project_path).to_ascii_lowercase();
-                    let matching_collapsed: Vec<PathBuf> = self
-                        .collapsed
-                        .iter()
-                        .filter(|p| basename(p).to_ascii_lowercase() == key)
-                        .cloned()
-                        .collect();
-                    for path in matching_collapsed {
-                        if self.collapsed.remove(&path) {
-                            uncollapsed = true;
-                        }
-                    }
-                }
-            }
-            if !self.collapsed_groups.is_empty() {
-                let key = self.group_for_path(&focused_host, wt);
-                if key.is_some_and(|key| self.collapsed_groups.remove(&key)) {
-                    uncollapsed = true;
-                }
-            }
-            if !focused_host.is_local() && self.options.group_by == GroupBy::Repo {
-                let candidate_projects: Vec<&Path> = if parent_repos.is_empty() {
-                    vec![wt.as_path()]
-                } else {
-                    parent_repos.iter().map(PathBuf::as_path).collect()
-                };
-                for project_path in candidate_projects {
-                    let key = basename(project_path).to_ascii_lowercase();
-                    let matching_collapsed: Vec<PathBuf> = self
-                        .collapsed
-                        .iter()
-                        .filter(|p| basename(p).to_ascii_lowercase() == key)
-                        .cloned()
-                        .collect();
-                    for path in matching_collapsed {
-                        if self.collapsed.remove(&path) {
-                            uncollapsed = true;
-                        }
-                    }
-                }
-            }
-            if !self.collapsed_groups.is_empty() {
-                match self.options.group_by {
-                    GroupBy::WorkspaceStatus => {
-                        let status = if focused_host.is_local() {
-                            self.worktree_statuses
-                                .get(wt)
-                                .copied()
-                                .or_else(|| {
-                                    self.disk
-                                        .store
-                                        .statuses
-                                        .get(wt.to_string_lossy().as_ref())
-                                        .and_then(|v| {
-                                            krill_proto::orchestration::WorkspaceStatus::parse(v)
-                                                .ok()
-                                        })
-                                })
-                                .unwrap_or(krill_proto::orchestration::WorkspaceStatus::Todo)
-                        } else {
-                            krill_proto::orchestration::WorkspaceStatus::Todo
-                        };
-                        if self
-                            .collapsed_groups
-                            .remove(&GroupKey::WorkspaceStatus(status))
-                        {
-                            uncollapsed = true;
-                        }
-                    }
-                    GroupBy::PrStatus => {
-                        let pr_group = if focused_host.is_local() {
-                            let has_cp = self
-                                .disk
-                                .store
-                                .prs
-                                .get(wt.to_string_lossy().as_ref())
-                                .is_some_and(|&pr| pr > 0);
-                            options::PrGroup::from_status(self.prs.get(wt), has_cp)
-                        } else {
-                            options::PrGroup::from_status(None, false)
-                        };
-                        if self.collapsed_groups.remove(&GroupKey::PrStatus(pr_group)) {
-                            uncollapsed = true;
-                        }
-                    }
-                    GroupBy::Repo | GroupBy::None => {}
-                }
-            }
-        }
+        let uncollapsed = self.reveal_worktree_on(&focused_host, target_wt.as_deref());
         let selected_changed = if target_wt.is_some() && self.selected_worktree != target_wt {
             self.selected_worktree.clone_from(&target_wt);
             true
