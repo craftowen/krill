@@ -50,12 +50,16 @@ pub use rpc::{
     BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
     SidebarState, daemon_bot_rpc, fetch_sidebar_state,
 };
-use rpc::{call_checked, decode_png_avatar};
+use rpc::{call_checked, decode_png_avatar, join_errors, unsupported_version};
 pub use settings_root::{OpenSettingsPage, RequestDeleteBot};
 
 /// Request the host `Shell` to close the Bots modal.
 #[derive(Debug)]
 pub struct Close;
+
+/// Request the host `Shell` to open Settings > Remote, where an outdated computer's Krill updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenRemoteSettings;
 
 /// Request the host `Shell` to open the New bot dialog (Orca's single creation path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +135,8 @@ pub struct View {
     busy: bool,
     chats: ChatsState,
     error: Option<SharedString>,
+    /// This host's krilld predates bots: its version (`""` when it didn't say).
+    unsupported: Option<SharedString>,
     notice: Option<SharedString>,
     armed_delete_bot: Option<BotId>,
     all_open_items: Vec<BotItem>,
@@ -175,6 +181,7 @@ enum Mode {
 
 impl EventEmitter<Close> for View {}
 impl EventEmitter<RequestNewBot> for View {}
+impl EventEmitter<OpenRemoteSettings> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<BadgeChanged> for View {}
 impl EventEmitter<SessionsChanged> for View {}
@@ -256,6 +263,7 @@ impl View {
             busy: false,
             chats: ChatsState::default(),
             error: None,
+            unsupported: None,
             notice: None,
             armed_delete_bot: None,
             all_open_items: Vec::new(),
@@ -350,6 +358,7 @@ impl View {
         self.target.clone_from(&target);
         if target_changed {
             self.rpc = daemon_bot_rpc(target);
+            self.unsupported = None;
             self.selected_bot_id = None;
             self.bots.clear();
             self.bots_loaded_at_ms = None;
@@ -358,6 +367,26 @@ impl View {
             self.reload(cx);
         } else {
             cx.notify();
+        }
+    }
+
+    /// The current host's name as the host list shows it.
+    fn host_label(&self) -> String {
+        self.available_hosts
+            .iter()
+            .find(|(id, _, _)| id == &self.host)
+            .map(|(_, label, _)| label.clone())
+            .or_else(|| self.host.remote_id().map(str::to_owned))
+            .unwrap_or_else(|| text::HOST_LOCAL.get().to_owned())
+    }
+
+    /// Banner text for failed loads: each message once, naming the host when there are several.
+    fn load_error(&self, errors: &[String]) -> SharedString {
+        let joined = join_errors(errors);
+        if self.available_hosts.len() > 1 {
+            format!("{}: {joined}", self.host_label()).into()
+        } else {
+            joined.into()
         }
     }
 
@@ -529,6 +558,7 @@ impl View {
                 this.loading = false;
                 match outcome {
                     Ok((bots, open_items, statuses, access, relay, sessions, warnings)) => {
+                        this.unsupported = None;
                         this.bots = bots;
                         this.bots_loaded_at_ms = Some(now_unix_ms());
                         this.all_open_items = open_items;
@@ -541,7 +571,7 @@ impl View {
                             this.bot_sessions = list;
                         }
                         if !warnings.is_empty() {
-                            this.error = Some(SharedString::from(warnings.join(" | ")));
+                            this.error = Some(this.load_error(&warnings));
                         }
                         let still_valid = this
                             .selected_bot_id
@@ -557,9 +587,14 @@ impl View {
                             this.load_selected_bot_detail(bot_id, cx);
                         }
                     }
-                    Err(err) => {
-                        this.error = Some(SharedString::from(err));
-                    }
+                    // An older krilld without bots is a state to explain, not an error.
+                    Err(err) => match unsupported_version(&err) {
+                        Some(version) => {
+                            this.unsupported = Some(version.to_owned().into());
+                            this.bots.clear();
+                        }
+                        None => this.error = Some(this.load_error(&[err])),
+                    },
                 }
                 cx.notify();
             })
@@ -639,6 +674,9 @@ impl View {
     }
 
     pub(super) fn load_selected_bot_detail(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        if self.unsupported.is_some() {
+            return;
+        }
         self.detail_gen = self.detail_gen.wrapping_add(1);
         let generation = self.detail_gen;
         let rpc = self.rpc.clone();
@@ -903,8 +941,10 @@ impl View {
                 }
 
                 this.connectors.needs_sync_from_bot = true;
-                if !errors.is_empty() {
-                    this.error = Some(SharedString::from(errors.join(" | ")));
+                if let Some(version) = errors.iter().find_map(|e| unsupported_version(e)) {
+                    this.unsupported = Some(version.to_owned().into());
+                } else if !errors.is_empty() {
+                    this.error = Some(this.load_error(&errors));
                 }
                 this.sync_open_items_for_bot(&bot_id);
                 this.emit_badge(cx);
@@ -1748,6 +1788,62 @@ impl View {
         )
     }
 
+    /// This host's krilld predates bots: say so and point at the update instead of an error.
+    fn render_unsupported(
+        &self,
+        version: &str,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let host = self.host_label();
+        let desc = if version.is_empty() {
+            text::UNSUPPORTED_DESC_NO_VERSION.format(&[("host", &host)])
+        } else {
+            text::UNSUPPORTED_DESC.format(&[("host", &host), ("version", version)])
+        };
+        div()
+            .id("bots-unsupported")
+            .debug_selector(|| "bots-unsupported".into())
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_6()
+            .text_center()
+            .child(ui::icons::svg_box(
+                ui::icons::CUSTOM_AGENT_SVG,
+                32.0,
+                p.muted_foreground,
+            ))
+            .child(
+                div()
+                    .text_size(ui::TEXT_LG)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.foreground)
+                    .child(text::UNSUPPORTED_TITLE.get()),
+            )
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(desc),
+            )
+            .when(self.host.is_remote(), |d| {
+                d.child(
+                    ui::primary(
+                        "bots-unsupported-update",
+                        text::UNSUPPORTED_OPEN_UPDATE.get(),
+                    )
+                    .debug_selector(|| "bots-unsupported-update".into())
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenRemoteSettings))),
+                )
+            })
+    }
+
     fn render_empty_state(p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id("bots-empty")
@@ -2429,8 +2525,13 @@ impl Render for View {
                                 .clone()
                                 .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
-                        // While the first load runs, an empty pane instead of a "no bots" flash.
-                        .when(!self.loading, |d| d.child(Self::render_empty_state(p, cx)))
+                        .map(|d| match self.unsupported.clone() {
+                            Some(version) => d.child(self.render_unsupported(&version, p, cx)),
+                            // While the first load runs, an empty pane instead of a "no bots" flash.
+                            None => {
+                                d.when(!self.loading, |d| d.child(Self::render_empty_state(p, cx)))
+                            }
+                        })
                 }
             }
         };

@@ -1062,7 +1062,7 @@ impl Shell {
                                 .data(ui::icons::SERVER_SVG)
                                 .size(px(ui::ICON_XS)),
                         )
-                        .child(div().truncate().child(self.bot_host_label())),
+                        .child(div().truncate().child(self.bot_host_label(cx))),
                 )
                 .child(ui::button_with_tooltip(
                     Button::new(SharedString::from(format!(

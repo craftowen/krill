@@ -7473,6 +7473,60 @@ fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mu
 }
 
 #[gpui::test]
+fn a_bot_made_on_another_computer_runs_there(cx: &mut TestAppContext) {
+    use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
+    let (view, cx) = open(cx, state_path("bots-new-remote"));
+    let recorder = |log: Arc<std::sync::Mutex<Vec<BotRpcRequest>>>| -> krill_app::bots::BotRpcCall {
+        Arc::new(move |req| {
+            log.lock().unwrap().push(req.clone());
+            // Refuse the start: which daemon was asked is the point, not attaching a remote pane.
+            Ok(match req {
+                BotRpcRequest::StartBotSession { .. } => BotRpcResponse::Error("test".into()),
+                _ => BotRpcResponse::Ok,
+            })
+        })
+    };
+    let here: Arc<std::sync::Mutex<Vec<BotRpcRequest>>> = Arc::default();
+    let studio_log: Arc<std::sync::Mutex<Vec<BotRpcRequest>>> = Arc::default();
+    let studio = krill_app::hosts::HostId::Remote("iroh:studio".into());
+    let bot = BotConfig::new(BotId::new("bot-far").unwrap(), "Far", "claude", 1).unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(recorder(here.clone()));
+            s.bot_rpc_overrides
+                .insert(studio.clone(), recorder(studio_log.clone()));
+            s.on_new_bot_event(
+                &krill_app::bots::new_bot::Event::Created {
+                    bot: Box::new(bot),
+                    warning: None,
+                    host: studio.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let started_on_studio = studio_log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| matches!(r, BotRpcRequest::StartBotSession { .. }));
+    assert!(
+        started_on_studio,
+        "its chat starts on the computer it was made on"
+    );
+    assert!(
+        !here
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::StartBotSession { .. }))
+    );
+    cx.update(|_, cx| assert_eq!(view.read(cx).launch_host, studio));
+}
+
+#[gpui::test]
 fn bot_rows_start_one_home_chat_and_explain_a_paused_bot(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("bots-row-guards"));
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));
