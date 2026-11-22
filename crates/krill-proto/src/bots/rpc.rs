@@ -592,6 +592,15 @@ pub enum BotRpcRequest {
         #[serde(default)]
         created: Option<BotId>,
     },
+    /// Lists external bot source paths already imported into active Krill bots.
+    ListImportedSources,
+    /// Imports a single discovered external candidate even if an earlier bot came from the same
+    /// folder, applying the owner's chosen name, mascot/color, and agent settings.
+    ImportExternalBotCopy {
+        source: Option<ExternalBotSourceApp>,
+        path: String,
+        params: Box<CreateBotV2Params>,
+    },
 }
 
 impl BotRpcRequest {
@@ -626,6 +635,7 @@ impl BotRpcRequest {
                 | Self::GetBotUpcoming { .. }
                 | Self::GetBotSettingsExtras { .. }
                 | Self::ListBotOffers { .. }
+                | Self::ListImportedSources
         )
     }
 }
@@ -1119,6 +1129,17 @@ impl fmt::Debug for BotRpcRequest {
                 .field("offer_id", offer_id)
                 .field("created", created)
                 .finish(),
+            Self::ListImportedSources => f.write_str("ListImportedSources"),
+            Self::ImportExternalBotCopy {
+                source,
+                path,
+                params,
+            } => f
+                .debug_struct("ImportExternalBotCopy")
+                .field("source", source)
+                .field("path", path)
+                .field("name", &params.base.name)
+                .finish(),
         }
     }
 }
@@ -1262,6 +1283,7 @@ pub enum BotRpcResponse {
     Upcoming(BotUpcoming),
     BotSettingsExtras(BotSettingsExtras),
     BotOffers(Vec<BotOffer>),
+    ImportedSources(Vec<(String, BotId)>),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1426,6 +1448,10 @@ impl fmt::Debug for BotRpcResponse {
                 f.debug_tuple("BotSettingsExtras").field(extras).finish()
             }
             Self::BotOffers(offers) => f.debug_tuple("BotOffers").field(offers).finish(),
+            Self::ImportedSources(sources) => f
+                .debug_tuple("ImportedSources")
+                .field(&sources.len())
+                .finish(),
         }
     }
 }

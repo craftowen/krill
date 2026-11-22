@@ -1700,8 +1700,29 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
             },
             false,
         ),
+        (BotRpcRequest::ListImportedSources, true),
+        (
+            BotRpcRequest::ImportExternalBotCopy {
+                source: Some(ExternalBotSourceApp::OpenClaw),
+                path: "/tmp/openclaw/bot".to_owned(),
+                params: Box::new(CreateBotV2Params::from(CreateBotParams {
+                    name: "Copy".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: Some("mascot:B1".to_owned()),
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                })),
+            },
+            false,
+        ),
     ];
-    assert_eq!(v2_requests.len(), 47);
+    assert_eq!(v2_requests.len(), 49);
 
     for (req, expected_ro) in v2_requests {
         assert_eq!(
@@ -1853,8 +1874,9 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
             github: Some(bot_id.clone()),
             linear: None,
         }),
+        BotRpcResponse::ImportedSources(vec![("/tmp/openclaw/bot".to_owned(), bot_id.clone())]),
     ];
-    assert_eq!(v2_responses.len(), 14);
+    assert_eq!(v2_responses.len(), 15);
 
     for reply in v2_responses {
         let raw_reply = reply.encode().unwrap();

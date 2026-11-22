@@ -6,6 +6,7 @@
 //! as regular workspace `[Chat | Term]` tabs via [`OpenSession`].
 
 pub mod avatar;
+pub mod avatar_gen;
 mod connector_logos;
 mod connectors;
 mod connectors_panel;
@@ -18,9 +19,12 @@ mod home_select;
 mod home_snooze;
 mod home_time;
 mod home_upcoming;
+mod import_dialog;
 mod items;
 pub mod new_bot;
 mod panel;
+pub mod pickers;
+pub mod picture_picker;
 pub mod rpc;
 mod settings;
 mod settings_pages;
@@ -89,6 +93,15 @@ pub struct OpenSession {
 pub struct DraftInHomeChat {
     pub bot_id: BotId,
     pub text: String,
+}
+
+/// A bot was just made (Import): close the Bots dialog and open its Home Chat, with `kickoff`
+/// as its first turn when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenBotHome {
+    pub bot_id: BotId,
+    pub kickoff: Option<String>,
+    pub host: HostId,
 }
 
 /// Notify the host `Shell` when bots or their attention counts (`needs_you` + pending access) change.
@@ -167,6 +180,7 @@ pub struct View {
     connectors: connectors::ConnectorsState,
     tools: tools_sharing::ToolsState,
     import_state: tools_sharing::ImportState,
+    import_dialog: import_dialog::ImportDialog,
     settings: settings::SettingsState,
     groups: groups::GroupsState,
     load_gen: u64,
@@ -203,6 +217,7 @@ impl EventEmitter<RequestNewBot> for View {}
 impl EventEmitter<OpenRemoteSettings> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<DraftInHomeChat> for View {}
+impl EventEmitter<OpenBotHome> for View {}
 impl EventEmitter<BadgeChanged> for View {}
 impl EventEmitter<SessionsChanged> for View {}
 impl EventEmitter<OpenSettingsPage> for View {}
@@ -295,6 +310,7 @@ impl View {
             connectors: connectors::ConnectorsState::default(),
             tools: tools_sharing::ToolsState::default(),
             import_state: tools_sharing::ImportState::default(),
+            import_dialog: import_dialog::ImportDialog::new(cx),
             settings: settings::SettingsState::default(),
             groups: groups::GroupsState::default(),
             load_gen: 0,
@@ -690,6 +706,7 @@ impl View {
         self.error = None;
         self.notice = None;
         self.screen = Screen::Import;
+        self.reset_import_dialog(cx);
         cx.notify();
     }
 
@@ -1406,7 +1423,19 @@ impl View {
             cx.notify();
             return;
         }
-        if matches!(self.screen, Screen::Import | Screen::Groups) && !self.bots.is_empty() {
+        // Import is its own dialog (Orca): Esc goes back from its second step, else closes it.
+        if self.screen == Screen::Import {
+            if self.import_dialog.view == import_dialog::ImportView::Export
+                && !self.import_state.candidates.is_empty()
+            {
+                self.import_dialog.view = import_dialog::ImportView::Pick;
+                cx.notify();
+                return;
+            }
+            cx.emit(Close);
+            return;
+        }
+        if matches!(self.screen, Screen::Groups) && !self.bots.is_empty() {
             self.screen = Screen::Detail;
             cx.notify();
             return;
@@ -2482,11 +2511,36 @@ impl Render for View {
         if self.mode == Mode::Panel {
             return self.render_panel(window, cx).into_any_element();
         }
+        if self.screen == Screen::Import {
+            let dialog = self.render_import_dialog(p, window, cx);
+            return ui::modal_focus_scope(
+                div()
+                    .id("bots-page")
+                    .debug_selector(|| "bots-page".into())
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape"
+                            && !event.keystroke.modifiers.modified()
+                            && !this.input_is_composing(window, cx)
+                        {
+                            this.handle_escape(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .w_full()
+                    .bg(p.background)
+                    .font_family(ui::FONT_UI)
+                    .text_size(ui::TEXT_MD)
+                    .text_color(p.foreground)
+                    .child(dialog),
+                &self.focus,
+            )
+            .into_any_element();
+        }
         let pending_switch_banner = self.render_pending_switch(p, cx);
 
         let selected_bot = self.selected_bot().cloned();
         let right_pane = match self.screen {
-            Screen::Import => self.render_import_view(p, window, cx),
+            Screen::Import => div().id("bots-import-unreachable"),
             Screen::Groups => self.render_groups_view(p, window, cx),
             Screen::Detail => {
                 if let Some(bot) = selected_bot {

@@ -132,6 +132,129 @@ pub fn prepare_picture(bytes: &[u8]) -> Result<Vec<u8>, PictureError> {
     Ok(png)
 }
 
+/// Computes a toned-down background tint (`0x00RR_GGBB`) from the outer 10% ring of a 512px PNG,
+/// returning `None` when the border ring is mostly transparent (matching Orca `pictureTint`).
+#[must_use]
+pub fn picture_tint(png_bytes: &[u8]) -> Option<u32> {
+    let img = image::load_from_memory(png_bytes).ok()?.to_rgba8();
+    let side = img.width().min(img.height());
+    if side == 0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "ring width is bounded by image dimensions clamped at 8192"
+    )]
+    let ring = ((side as f32) * 0.1).round().max(1.0) as u32;
+    let mut bins: HashMap<u32, (u32, u64, u64, u64)> = HashMap::new();
+    let mut sampled: u32 = 0;
+    let mut opaque: u32 = 0;
+    for y in 0..side {
+        for x in 0..side {
+            let edge_dist = x.min(y).min(side - 1 - x).min(side - 1 - y);
+            if edge_dist >= ring {
+                continue;
+            }
+            sampled += 1;
+            let px = img.get_pixel(x, y).0;
+            if px[3] < 128 {
+                continue;
+            }
+            opaque += 1;
+            let key = ((u32::from(px[0]) >> 4) << 8)
+                | ((u32::from(px[1]) >> 4) << 4)
+                | (u32::from(px[2]) >> 4);
+            let entry = bins.entry(key).or_insert((0, 0, 0, 0));
+            entry.0 += 1;
+            entry.1 += u64::from(px[0]);
+            entry.2 += u64::from(px[1]);
+            entry.3 += u64::from(px[2]);
+        }
+    }
+    if opaque * 2 < sampled {
+        return None;
+    }
+    let (_, (count, sum_r, sum_g, sum_b)) =
+        bins.into_iter().max_by_key(|(_, (cnt, _, _, _))| *cnt)?;
+    if count == 0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bin average precision into 0..1 sRGB is exact enough"
+    )]
+    let rf = (sum_r as f32 / count as f32) / 255.0;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bin average precision into 0..1 sRGB is exact enough"
+    )]
+    let gf = (sum_g as f32 / count as f32) / 255.0;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "bin average precision into 0..1 sRGB is exact enough"
+    )]
+    let bf = (sum_b as f32 / count as f32) / 255.0;
+
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let light_raw = f32::midpoint(max, min);
+    let (hue, sat_raw) = if (max - min).abs() < f32::EPSILON {
+        (0.0, 0.0)
+    } else {
+        let delta = max - min;
+        let sat_calc = if light_raw > 0.5 {
+            delta / (2.0 - max - min)
+        } else {
+            delta / (max + min)
+        };
+        let hue_calc = if (max - rf).abs() < f32::EPSILON {
+            ((gf - bf) / delta + if gf < bf { 6.0 } else { 0.0 }) / 6.0
+        } else if (max - gf).abs() < f32::EPSILON {
+            ((bf - rf) / delta + 2.0) / 6.0
+        } else {
+            ((rf - gf) / delta + 4.0) / 6.0
+        };
+        (hue_calc, sat_calc)
+    };
+    let sat = sat_raw.min(0.60);
+    let light = light_raw.clamp(0.35, 0.80);
+    let q_hi = if light < 0.5 {
+        light * (1.0 + sat)
+    } else {
+        light + sat - light * sat
+    };
+    let p_lo = 2.0 * light - q_hi;
+    let chan = |unit: f32| -> u32 {
+        let wrapped = if unit < 0.0 {
+            unit + 1.0
+        } else if unit > 1.0 {
+            unit - 1.0
+        } else {
+            unit
+        };
+        let scaled = if wrapped < 1.0 / 6.0 {
+            p_lo + (q_hi - p_lo) * 6.0 * wrapped
+        } else if wrapped < 0.5 {
+            q_hi
+        } else if wrapped < 2.0 / 3.0 {
+            p_lo + (q_hi - p_lo) * (2.0 / 3.0 - wrapped) * 6.0
+        } else {
+            p_lo
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to 0.0..=255.0 before rounding and u32 cast"
+        )]
+        {
+            (scaled * 255.0).round().clamp(0.0, 255.0) as u32
+        }
+    };
+    Some((chan(hue + 1.0 / 3.0) << 16) | (chan(hue) << 8) | chan(hue - 1.0 / 3.0))
+}
+
 /// Canonical mascot ID for a stored avatar value (`B1` or Orca's `mascot:B1`).
 #[must_use]
 pub fn mascot_id(raw: &str) -> Option<&'static str> {

@@ -277,6 +277,16 @@ impl Shell {
             },
         )
         .detach();
+        cx.subscribe(view, |this, _, ev: &krill_app::bots::OpenBotHome, cx| {
+            this.close_settings(None, cx);
+            if ev.host != this.launch_host {
+                this.set_launch_host(ev.host.clone(), cx);
+                this.sidebar_bots.clear();
+            }
+            this.refresh_bots_badge(cx);
+            this.open_bot_home(ev.bot_id.clone(), ev.kickoff.clone(), cx);
+        })
+        .detach();
         cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
             this.request_new_bot(None, None, cx);
         })

@@ -162,6 +162,12 @@
       "sha256": "59bfe9bc385ad69f50793ce4a53397316d7a875a7148a63c16df9b674c6cda64"
     },
     {
+      "file": "openclaw.png",
+      "source": "src/shared/agent-icons/openclaw.png",
+      "modifications": "none",
+      "sha256": "cedce9c78ad63f8a0b69bd3441cf7ae9d6934c0faa7a1052ab921374727bddce"
+    },
+    {
       "file": "qwen-code.png",
       "source": "src/shared/agent-icons/qwen-code.png",
       "modifications": "none",

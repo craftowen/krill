@@ -206,6 +206,12 @@ pub struct Settings {
     pub bot_sidebar_hide_sleeping_workers: bool,
     /// 봇 워커가 만든 워크스페이스를 프로젝트에서 숨기고 봇 아래에만 둔다(Orca `hideBotCreatedWorkspaces`, 기본 켬).
     pub hide_bot_workspaces: bool,
+    /// 새 봇 만들기 상단의 외부 봇 가져오기 안내 배너를 다시 보지 않음(기본 거짓).
+    #[serde(default)]
+    pub bot_import_nudge_dismissed: bool,
+    /// 아바타 생성에 마지막으로 고른 로컬 에이전트(`codex`, `grok`, `agy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_generation_agent: Option<String>,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
     /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -330,6 +336,8 @@ impl Default for Settings {
             bot_sidebar_hide_paused: false,
             bot_sidebar_hide_sleeping_workers: false,
             hide_bot_workspaces: true,
+            bot_import_nudge_dismissed: false,
+            avatar_generation_agent: None,
             terminal_custom_themes: Vec::new(),
         }
     }
