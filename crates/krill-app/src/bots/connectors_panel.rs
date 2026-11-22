@@ -15,6 +15,31 @@ use super::connector_logos as logo;
 use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
+/// The apps rail's categories (Orca `bot-app-catalog`), with Krill's connectors in them.
+const CATEGORIES: [(&crate::i18n::Message, IconName, &[ExternalSource]); 5] = [
+    (
+        &hm::CAT_CODING,
+        IconName::CodeXml,
+        &[ExternalSource::GitHub],
+    ),
+    (
+        &hm::CAT_CHAT,
+        IconName::MessageSquare,
+        &[
+            ExternalSource::Slack,
+            ExternalSource::Discord,
+            ExternalSource::Telegram,
+        ],
+    ),
+    (&hm::CAT_DOCS, IconName::Files, &[ExternalSource::Linear]),
+    (
+        &hm::CAT_MAIL,
+        IconName::Briefcase,
+        &[ExternalSource::Google],
+    ),
+    (&hm::CAT_MORE, IconName::Plug, &[ExternalSource::Composio]),
+];
+
 const SOURCES: [ExternalSource; 7] = [
     ExternalSource::Slack,
     ExternalSource::GitHub,
@@ -25,9 +50,9 @@ const SOURCES: [ExternalSource; 7] = [
     ExternalSource::Composio,
 ];
 
-/// A connector's logo in Orca's 32 px tile.
-fn tile(source: ExternalSource, size: f32, p: &ui::Palette) -> gpui::Div {
-    let icon = match source {
+/// A connector's one-color logo.
+fn logo(source: ExternalSource) -> Icon {
+    match source {
         ExternalSource::Slack => Icon::default().data(logo::SLACK_SVG),
         ExternalSource::GitHub => Icon::default().data(logo::GITHUB_SVG),
         ExternalSource::Linear => Icon::default().data(logo::LINEAR_SVG),
@@ -35,7 +60,12 @@ fn tile(source: ExternalSource, size: f32, p: &ui::Palette) -> gpui::Div {
         ExternalSource::Discord => Icon::default().data(logo::DISCORD_SVG),
         ExternalSource::Telegram => Icon::new(IconName::MessageSquare),
         ExternalSource::Composio => Icon::new(IconName::Plug),
-    };
+    }
+}
+
+/// A connector's logo in Orca's 32 px tile.
+fn tile(source: ExternalSource, size: f32, p: &ui::Palette) -> gpui::Div {
+    let icon = logo(source);
     div()
         .size(px(size))
         .flex_none()
@@ -90,13 +120,13 @@ impl View {
         if let Some(source) = self.connectors.page {
             return body
                 .child(
-                    div().pb_2().child(
+                    div().pb_2().flex().child(
                         Button::new("bot-connector-page-back")
                             .debug_selector(|| "bot-connector-page-back".into())
                             .ghost()
                             .xsmall()
                             .icon(Icon::new(IconName::ArrowLeft).size(px(14.)))
-                            .label(text::CONNECTORS_HEADING.get())
+                            .label(text::BP_CONNECTORS.get())
                             .text_color(p.muted_foreground)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.connectors.page = None;
@@ -176,7 +206,7 @@ impl View {
                     div()
                         .text_size(ui::TEXT_SM)
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(text::CONNECTORS_HEADING.get()),
+                        .child(text::BP_CONNECTORS.get()),
                 )
                 .child(
                     Button::new("bot-connectors-add")
@@ -238,7 +268,16 @@ impl View {
             .py_2()
             .cursor_pointer()
             .hover(|d| d.bg(p.accent.opacity(0.4)))
-            .child(tile(source, 32., p))
+            // A list row shows the bare logo, as Orca's does.
+            .child(
+                div()
+                    .size(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(logo(source).size(px(20.)).text_color(p.foreground)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -304,67 +343,221 @@ impl View {
         }
     }
 
-    /// Orca's "Add to {bot}": every connector, a click opens its page to set it up.
+    /// Orca's "Add to {bot}" (`AddConnectorDialog`): the apps rail (`BotAppsRail`: all apps, the
+    /// bot's own, each category), search, then each category's apps; Add opens its page to set
+    /// it up, Manage the page of one already added.
     fn render_add_connector(
-        &self,
+        &mut self,
         bot: &BotConfig,
         p: &ui::Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         self.connectors.adding?;
+        let search = self
+            .connectors
+            .add_search
+            .get_or_insert_with(|| {
+                let input = cx.new(|cx| {
+                    gpui_component::input::InputState::new(window, cx)
+                        .placeholder(hm::SEARCH_APPS.get())
+                });
+                cx.observe(&input, |_, _, cx| cx.notify()).detach();
+                input
+            })
+            .clone();
+        let query = search.read(cx).value().trim().to_lowercase();
         let added = Self::added_connectors(bot);
+        let rail = self.connectors.add_rail;
         let title = hm::ADD_TO.format(&[("bot", &bot.name)]);
-        let mut rows = div().flex().flex_col().gap_0p5().p_2();
-        for source in SOURCES {
-            let on = added.contains(&source);
-            let sel = format!("bot-connector-add-{}", source.as_str());
-            let debug = sel.clone();
-            rows = rows.child(
+        // Rail: 0 all apps, 1 the bot's own, then a category.
+        let mut rail_col = div()
+            .w(px(208.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .border_r_1()
+            .border_color(p.border)
+            .px_2()
+            .py(px(10.));
+        let rail_button = |idx: u8, icon: AnyElement, label: String, count: Option<usize>| {
+            let pressed = rail == idx;
+            div()
+                .id(("bot-apps-rail", usize::from(idx)))
+                .debug_selector(move || format!("bot-apps-rail-{idx}"))
+                .role(gpui::Role::Button)
+                .aria_selected(pressed)
+                .h(px(28.))
+                .w_full()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(ui::RADIUS_SM)
+                .px_2()
+                .cursor_pointer()
+                .text_size(ui::TEXT_SM)
+                .when(pressed, |d| {
+                    d.bg(p.accent)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.accent_foreground)
+                })
+                .when(!pressed, |d| {
+                    d.text_color(p.foreground.opacity(0.6))
+                        .hover(|d| d.bg(p.accent.opacity(0.2)))
+                })
+                .child(icon)
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .children(count.map(|n| {
+                    div()
+                        .flex_none()
+                        .text_size(ui::TEXT_XS)
+                        .opacity(0.7)
+                        .child(n.to_string())
+                }))
+        };
+        let small = |name: IconName| Icon::new(name).size(px(14.)).into_any_element();
+        let pick = |idx: u8| {
+            move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.connectors.add_rail = idx;
+                cx.notify();
+            }
+        };
+        rail_col = rail_col
+            .child(
+                rail_button(
+                    0,
+                    small(IconName::LayoutGrid),
+                    hm::ALL_APPS.get().to_owned(),
+                    None,
+                )
+                .on_click(cx.listener(pick(0))),
+            )
+            .child(
+                rail_button(
+                    1,
+                    small(IconName::Bot),
+                    hm::ADDED_TO.format(&[("bot", &bot.name)]),
+                    Some(added.len()),
+                )
+                .on_click(cx.listener(pick(1))),
+            )
+            .child(div().mx_1().my_1p5().h(px(1.)).bg(p.border));
+        for (c, (name, icon, members)) in CATEGORIES.iter().enumerate() {
+            let idx = u8::try_from(c + 2).unwrap_or(u8::MAX);
+            rail_col = rail_col.child(
+                rail_button(
+                    idx,
+                    small(*icon),
+                    name.get().to_owned(),
+                    Some(members.len()),
+                )
+                .on_click(cx.listener(pick(idx))),
+            );
+        }
+        // The list: each category's apps that the rail and search keep.
+        let mut list = div().flex().flex_col().px_2().pb_2();
+        let mut shown = 0;
+        for (c, (name, icon, members)) in CATEGORIES.iter().enumerate() {
+            let idx = u8::try_from(c + 2).unwrap_or(u8::MAX);
+            if rail >= 2 && rail != idx {
+                continue;
+            }
+            let apps: Vec<ExternalSource> = members
+                .iter()
+                .copied()
+                .filter(|s| rail != 1 || added.contains(s))
+                .filter(|s| {
+                    query.is_empty()
+                        || Self::source_label(*s).to_lowercase().contains(&query)
+                        || about(*s).to_lowercase().contains(&query)
+                })
+                .collect();
+            if apps.is_empty() {
+                continue;
+            }
+            list = list.child(
                 div()
-                    .id(SharedString::from(sel))
-                    .debug_selector(move || debug.clone())
-                    .role(gpui::Role::Button)
-                    .tab_index(0)
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .rounded(ui::RADIUS_LG)
-                    .px_3()
-                    .py_2()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.accent))
-                    .child(tile(source, 32., p))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(ui::TEXT_SM)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(Self::source_label(source)),
-                            )
-                            .child(
-                                div()
-                                    .line_clamp(2)
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(about(source)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(if on { hm::ADDED.get() } else { hm::ADD.get() }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.connectors.adding = None;
-                        this.connectors.page = Some(source);
-                        cx.notify();
-                    })),
+                    .gap_1p5()
+                    .px_2()
+                    .pt(px(14.))
+                    .pb_1()
+                    .text_size(ui::TEXT_2XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.muted_foreground)
+                    .child(Icon::new(*icon).size(px(12.)))
+                    .child(name.get()),
+            );
+            for source in apps {
+                shown += 1;
+                let on = added.contains(&source);
+                let sel = format!("bot-connector-add-{}", source.as_str());
+                let debug = sel.clone();
+                let open = cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                    this.connectors.adding = None;
+                    this.connectors.page = Some(source);
+                    cx.notify();
+                });
+                list = list.child(
+                    div()
+                        .id(SharedString::from(sel.clone()))
+                        .debug_selector(move || debug.clone())
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .rounded(ui::RADIUS_LG)
+                        .p_2()
+                        .hover(|d| d.bg(p.accent.opacity(0.4)))
+                        .child(tile(source, 32., p))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_SM)
+                                        .line_height(px(18.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(Self::source_label(source)),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .line_height(px(16.))
+                                        .text_color(p.muted_foreground)
+                                        .child(about(source)),
+                                ),
+                        )
+                        .child(if on {
+                            Button::new(SharedString::from(format!("{sel}-manage")))
+                                .ghost()
+                                .xsmall()
+                                .label(hm::MANAGE.get())
+                                .on_click(open)
+                        } else {
+                            Button::new(SharedString::from(format!("{sel}-add")))
+                                .outline()
+                                .xsmall()
+                                .label(hm::ADD.get())
+                                .on_click(open)
+                        }),
+                );
+            }
+        }
+        if shown == 0 {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_6()
+                    .text_center()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .child(hm::NO_APPS.get()),
             );
         }
         let close = cx.listener(|this, _, _, cx| {
@@ -376,8 +569,8 @@ impl View {
             .debug_selector(|| "bot-connector-add-dialog".into())
             .role(gpui::Role::Dialog)
             .aria_label(SharedString::from(title.clone()))
-            .w(px(460.))
-            .max_h(px(600.))
+            .w(px(760.))
+            .h(px(600.))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -391,6 +584,7 @@ impl View {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -418,10 +612,27 @@ impl View {
                     ),
             )
             .child(
-                div()
-                    .id("bot-connector-add-list")
-                    .overflow_y_scroll()
-                    .child(rows),
+                div().flex_1().min_h_0().flex().child(rail_col).child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div().flex_none().px_4().pt_3().child(
+                                gpui_component::input::Input::new(&search)
+                                    .prefix(Icon::new(IconName::Search).size(px(14.))),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .id("bot-connector-add-list")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .child(list),
+                        ),
+                ),
             );
         let backdrop = div()
             .id("bot-connector-add-backdrop")

@@ -846,7 +846,9 @@ impl View {
         if !event.decisions.is_empty() {
             body = body.child(
                 div()
-                    .when(body_has_words(event), gpui::Styled::mt_4)
+                    .when(body_has_words(event), |d| {
+                        d.mt_3().pt_3().border_t_1().border_color(p.border)
+                    })
                     .child(questions),
             );
         }

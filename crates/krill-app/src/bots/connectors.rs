@@ -31,6 +31,9 @@ pub(super) struct ConnectorsState {
     pub(super) page: Option<ExternalSource>,
     /// The bot page's Connectors tab: "Add to {bot}" is open.
     pub(super) adding: Option<()>,
+    /// "Add to {bot}": the rail's pick (0 all apps, 1 the bot's own, then a category) and search.
+    pub(super) add_rail: u8,
+    pub(super) add_search: Option<Entity<InputState>>,
     pub(super) bot_statuses: Vec<BotConnectorStatus>,
     pub(super) bot_access_requests: Vec<BotAccessRequest>,
     pub(super) show_all_access_requests: bool,

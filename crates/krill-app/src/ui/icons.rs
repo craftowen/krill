@@ -821,6 +821,8 @@ mod tests {
             IconName::CircleQuestionMark,
             IconName::UserPlus,
             IconName::House,
+            IconName::LayoutGrid,
+            IconName::Files,
         ] {
             let path = icon.path();
             assert!(
@@ -870,6 +872,7 @@ gpui_kit_assets::icon_assets!(
         ExternalLink,
         File,
         FileText,
+        Files,
         Folder,
         FolderOpen,
         Gauge,
@@ -880,6 +883,7 @@ gpui_kit_assets::icon_assets!(
         Info,
         Keyboard,
         Layers,
+        LayoutGrid,
         Link,
         ListChecks,
         ListFilter,

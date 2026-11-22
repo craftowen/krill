@@ -3277,6 +3277,16 @@ catalog! {
         ADDED => ("추가됨", "Added"),
         ADD_CONNECTOR => ("커넥터 추가", "Add a connector"),
         ADD_TO => ("{bot}에 추가", "Add to {bot}"),
+        SEARCH_APPS => ("앱 검색", "Search apps"),
+        ALL_APPS => ("모든 앱", "All apps"),
+        ADDED_TO => ("{bot}에 추가된 앱", "Added to {bot}"),
+        MANAGE => ("관리", "Manage"),
+        NO_APPS => ("일치하는 앱이 없습니다.", "No apps match."),
+        CAT_CODING => ("코딩", "Coding"),
+        CAT_CHAT => ("채팅", "Chat"),
+        CAT_DOCS => ("문서와 프로젝트", "Docs and projects"),
+        CAT_MAIL => ("메일과 회의", "Mail and meetings"),
+        CAT_MORE => ("더 많은 앱", "More apps"),
         CONNECTORS_EMPTY => ("사람들이 Slack, GitHub, Linear에서 {name}에게 말을 걸게 하고, Google과 다른 앱에서 일하게 하세요.", "Let people reach {name} in Slack, GitHub and Linear, and let it work in your Google and other apps."),
     }
 }

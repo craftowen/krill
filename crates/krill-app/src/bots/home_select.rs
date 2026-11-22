@@ -157,8 +157,14 @@ impl View {
             .debug_selector(|| "bot-home-pill-move".into())
             .ghost()
             .xsmall()
-            .label(hm::MOVE_TO.get())
-            .icon(Icon::new(IconName::ChevronUp).size(px(12.)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(hm::MOVE_TO.get())
+                    .child(Icon::new(IconName::ChevronUp).size(px(12.))),
+            )
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu.label(if count == 1 {
                     hm::MOVE_ONE.get().to_owned()
