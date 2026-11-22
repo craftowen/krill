@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use krill_proto::screen::url::{is_cjk_or_hangul, is_fullwidth_punct, scan_url_len};
 use krill_proto::screen::{Cell, Flags, is_bidi_control};
 
 mod input;
@@ -32,55 +33,6 @@ pub struct UrlLink {
     pub uri: String,
 }
 
-/// 전각 문장부호·괄호(한·중·일 문장 안 경로·URL 경계, #30213, #30093).
-fn is_fullwidth_punct(c: char) -> bool {
-    matches!(
-        c,
-        '（' | '）'
-            | '「'
-            | '」'
-            | '『'
-            | '』'
-            | '【'
-            | '】'
-            | '〈'
-            | '〉'
-            | '《'
-            | '》'
-            | '〔'
-            | '〕'
-            | '［'
-            | '］'
-            | '｛'
-            | '｝'
-            | '、'
-            | '。'
-            | '・'
-            | '：'
-            | '；'
-            | '！'
-            | '？'
-            | '“'
-            | '”'
-            | '‘'
-            | '’'
-    )
-}
-
-/// 한글·가나·한자 등 공백 없이 조사·서술어가 이어지는 동아시아 문자(#30213, #30093, #30037).
-fn is_cjk_or_hangul(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x1100..=0x11FF
-            | 0x3040..=0x30FF
-            | 0x3130..=0x318F
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xAC00..=0xD7AF
-            | 0xF900..=0xFAFF
-    )
-}
-
 /// 경로를 끊는 글자. `:`는 `path:line`에 쓰여 끊지 않는다.
 fn breaks(c: char) -> bool {
     c.is_whitespace()
@@ -91,49 +43,6 @@ fn breaks(c: char) -> bool {
             c,
             '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' | ';'
         )
-}
-
-/// 평문 URL 본문을 끊는 글자. 쿼리·경로 안 `,`·`;`·`:`·`()`·`[]`는 본문에 두고 문장 끝에서만 잘라낸다.
-fn url_breaks(c: char) -> bool {
-    c.is_whitespace()
-        || c.is_control()
-        || is_bidi_control(c)
-        || is_fullwidth_punct(c)
-        || matches!(
-            c,
-            '"' | '\'' | '`' | '<' | '>' | '{' | '}' | '|' | '\\' | '^'
-        )
-}
-
-fn trim_url_end(slice: &[(u16, char, u16)]) -> usize {
-    let mut end = slice.len();
-    while end > 0 {
-        let Some(&(_, c, _)) = slice.get(end - 1) else {
-            break;
-        };
-        let strip = match c {
-            '.' | ',' | ':' | ';' | '!' | '?' | '~' => true,
-            ')' => {
-                let head = slice.get(..end).unwrap_or_default();
-                let open = head.iter().filter(|&&(_, ch, _)| ch == '(').count();
-                let close = head.iter().filter(|&&(_, ch, _)| ch == ')').count();
-                close > open
-            }
-            ']' => {
-                let head = slice.get(..end).unwrap_or_default();
-                let open = head.iter().filter(|&&(_, ch, _)| ch == '[').count();
-                let close = head.iter().filter(|&&(_, ch, _)| ch == ']').count();
-                close > open
-            }
-            _ => false,
-        };
-        if strip {
-            end -= 1;
-        } else {
-            break;
-        }
-    }
-    end
 }
 
 /// (시작 칸, 글자, 폭). 2칸 글자의 둘째 칸(SPACER)은 앞 글자에 붙인다.
@@ -209,56 +118,22 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
             i = start + scheme_len;
             continue;
         }
-        let mut in_path = false;
-        let mut seg_ascii = false;
-        let mut seg_delim = false;
-        let raw_end = rest
-            .iter()
-            .enumerate()
-            .position(|(idx, &(_, c, _))| {
-                if url_breaks(c) {
-                    return true;
-                }
-                if idx >= scheme_len {
-                    if matches!(c, '/' | '?' | '#' | '=' | '&') {
-                        in_path = true;
-                        seg_ascii = false;
-                        seg_delim = false;
-                        return false;
-                    }
-                    if !in_path && !c.is_ascii() {
-                        return true;
-                    }
-                    if in_path && (seg_ascii || seg_delim) && is_cjk_or_hangul(c) {
-                        return true;
-                    }
-                    if c.is_ascii_alphanumeric() {
-                        seg_ascii = true;
-                    } else if matches!(c, ')' | ']' | '}' | '>' | '"' | '\'' | ',' | ';' | ':') {
-                        seg_delim = true;
-                    }
-                }
-                false
-            })
-            .map_or(len, |off| start + off);
         // 같은 공백 단위 토큰 안에 제어·양방향 위장 문자가 섞여 있으면 전체 후보를 버린다.
         let token_poisoned = rest
             .iter()
             .take_while(|&&(_, c, _)| !c.is_whitespace())
             .any(|&(_, c, _)| c.is_control() || is_bidi_control(c));
         if token_poisoned {
-            i = raw_end.max(start + scheme_len);
+            i = start + scheme_len;
             continue;
         }
-        i = start + scheme_len;
-        let Some(raw_slice) = chars.get(start..raw_end) else {
-            continue;
-        };
-        let trimmed_len = trim_url_end(raw_slice);
+        let trimmed_len = scan_url_len(rest, |&(_, c, _)| c);
         if trimmed_len <= scheme_len {
+            i = start + scheme_len;
             continue;
         }
-        let Some(token) = raw_slice.get(..trimmed_len) else {
+        i = start + trimmed_len;
+        let Some(token) = rest.get(..trimmed_len) else {
             continue;
         };
         let Some(&(start_col, _, _)) = token.first() else {

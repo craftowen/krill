@@ -93,6 +93,76 @@ fn soft_wrapped_url_trims_punctuation_and_rejects_bidi_across_rows() {
 }
 
 #[test]
+fn soft_wrapped_korean_parenthesized_url_stops_before_closing_paren() {
+    // '새'(0-1)'로'(2-3)'고'(4-5)'침'(6-7)'('(8)"http://127.0.0.1:"(9..26)
+    let mut s = Screen::blank(26, 2);
+    let mut r0 = Vec::new();
+    for ch in "새로고침(http://127.0.0.1:".chars() {
+        let wide = krill_proto::screen::url::is_cjk_or_hangul(ch);
+        r0.push(Cell {
+            ch,
+            flags: if wide { Flags::WIDE } else { Flags::default() },
+            ..Cell::default()
+        });
+        if wide {
+            r0.push(Cell {
+                flags: Flags::SPACER,
+                ..Cell::default()
+            });
+        }
+    }
+    assert_eq!(r0.len(), 26);
+    r0.last_mut().unwrap().flags |= Flags::WRAPLINE;
+    s.rows[0] = r0;
+    s.rows[1] = "8787/)하면"
+        .chars()
+        .flat_map(|ch| {
+            let wide = krill_proto::screen::url::is_cjk_or_hangul(ch);
+            if wide {
+                vec![
+                    Cell {
+                        ch,
+                        flags: Flags::WIDE,
+                        ..Cell::default()
+                    },
+                    Cell {
+                        flags: Flags::SPACER,
+                        ..Cell::default()
+                    },
+                ]
+            } else {
+                vec![Cell {
+                    ch,
+                    ..Cell::default()
+                }]
+            }
+        })
+        .collect();
+
+    let (h0, uri0) = at(&s, 0, 12).unwrap();
+    assert_eq!(uri0, "http://127.0.0.1:8787/");
+    assert_eq!(
+        h0,
+        Highlight {
+            line: 0,
+            column: 9,
+            cols: 17,
+        }
+    );
+    let (h1, uri1) = at(&s, 1, 2).unwrap();
+    assert_eq!(uri1, "http://127.0.0.1:8787/");
+    assert_eq!(
+        h1,
+        Highlight {
+            line: 1,
+            column: 0,
+            cols: 5,
+        }
+    );
+    assert!(at(&s, 1, 5).is_none());
+}
+
+#[test]
 fn excessive_soft_wraps_are_rejected_instead_of_opening_a_prefix() {
     let mut s = Screen::blank(256, 128);
     for row in &mut s.rows {

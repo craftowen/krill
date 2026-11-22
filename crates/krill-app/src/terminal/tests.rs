@@ -104,6 +104,27 @@ fn link_hit_testing_excludes_padding_and_unsafe_schemes(_cx: &mut TestAppContext
         osc_link_highlight(&s, &painted, point(px(25.), px(25.))),
         None
     );
+    // Unparseable OSC 8 http(s) URL (such as over-captured trailing delimiter + Hangul) is rejected.
+    s.links[0][0].uri = "http://127.0.0.1:8787)하면".into();
+    assert_eq!(link_target(&s, &painted, point(px(25.), px(25.))), None);
+    assert_eq!(
+        osc_link_highlight(&s, &painted, point(px(25.), px(25.))),
+        None
+    );
+    // Valid mailto: and http(s):// links remain accepted.
+    s.links[0][0].uri = "mailto:user@example.com".into();
+    assert_eq!(
+        link_target(&s, &painted, point(px(25.), px(25.))),
+        Some("mailto:user@example.com")
+    );
+    assert_eq!(
+        osc_link_highlight(&s, &painted, point(px(25.), px(25.))),
+        Some(Highlight {
+            line: 0,
+            column: 1,
+            cols: 2,
+        })
+    );
 }
 
 #[test]

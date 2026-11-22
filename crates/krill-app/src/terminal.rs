@@ -238,13 +238,21 @@ pub fn link_target<'a>(
 ) -> Option<&'a str> {
     let (column, line) = cell_at(painted, screen, position)?;
     let uri = screen.link_at(line, column)?;
-    (["https://", "http://", "mailto:"]
-        .iter()
-        .any(|s| uri.starts_with(s))
-        && !uri
-            .chars()
-            .any(|c| c.is_control() || krill_proto::screen::is_bidi_control(c)))
-    .then_some(uri)
+    if uri
+        .chars()
+        .any(|c| c.is_control() || krill_proto::screen::is_bidi_control(c))
+    {
+        return None;
+    }
+    if uri.starts_with("https://") || uri.starts_with("http://") {
+        let valid = gpui::http_client::Url::parse(uri).is_ok_and(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str()
+                    .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.'))
+        });
+        return valid.then_some(uri);
+    }
+    uri.starts_with("mailto:").then_some(uri)
 }
 
 /// 로컬 파일 링크는 실행하지 않고 Finder에서 위치만 표시한다.
