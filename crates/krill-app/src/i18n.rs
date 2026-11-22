@@ -1227,6 +1227,14 @@ catalog! {
         LAUNCHER_GROUP_NEW => ("새로 만들기", "New"),
         LAUNCHER_GROUP_FILES => ("파일", "Files"),
         LAUNCHER_NO_MATCHES => ("일치하는 항목 없음", "No matches"),
+        LAUNCHER_ALIAS_CLAUDE => ("클로드 챗 채팅", "claude anthropic chat"),
+        LAUNCHER_ALIAS_CODEX => ("코덱스 챗 채팅", "codex openai gpt chat"),
+        LAUNCHER_ALIAS_AGY => ("안티그래비티 제미나이", "agy antigravity gemini"),
+        LAUNCHER_ALIAS_OPENCODE => ("오픈코드", "opencode"),
+        LAUNCHER_ALIAS_CURSOR => ("커서", "cursor"),
+        LAUNCHER_ALIAS_PI => ("파이", "pi π"),
+        LAUNCHER_ALIAS_AGENT => ("에이전트 챗 채팅", "agent chat"),
+        LAUNCHER_ALIAS_TERMINAL => ("터미널 셸 쉘", "terminal shell"),
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),

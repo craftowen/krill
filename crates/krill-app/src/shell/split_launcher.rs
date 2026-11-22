@@ -14,7 +14,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Enter, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Icon, IconName, Sizable as _};
-use krill_app::i18n::catalog::shell as text;
+use krill_app::i18n::{Language, Message, catalog::shell as text};
 use krill_app::layout::{Axis, PaneId};
 use krill_app::pane;
 use krill_app::ui;
@@ -82,16 +82,25 @@ pub(super) fn landing_query_matches(candidate: &str, query: &str) -> bool {
     needle.is_empty() || candidate.to_lowercase().contains(&needle)
 }
 
-fn agent_search_aliases(agent_id: &str) -> &'static [&'static str] {
+fn agent_search_alias_message(agent_id: &str) -> Message {
     match agent_id.to_lowercase().as_str() {
-        "claude" | "claude-code" => &["claude", "anthropic", "클로드", "챗", "채팅", "chat"],
-        "codex" => &["codex", "openai", "gpt", "코덱스", "챗", "채팅", "chat"],
-        "agy" | "antigravity" => &["agy", "antigravity", "gemini", "안티그래비티", "제미나이"],
-        "opencode" => &["opencode", "오픈코드"],
-        "cursor" | "cursor-agent" => &["cursor", "커서"],
-        "pi" => &["pi", "π"],
-        _ => &["agent", "에이전트", "chat", "챗", "채팅"],
+        "claude" | "claude-code" => text::LAUNCHER_ALIAS_CLAUDE,
+        "codex" => text::LAUNCHER_ALIAS_CODEX,
+        "agy" | "antigravity" => text::LAUNCHER_ALIAS_AGY,
+        "opencode" => text::LAUNCHER_ALIAS_OPENCODE,
+        "cursor" | "cursor-agent" => text::LAUNCHER_ALIAS_CURSOR,
+        "pi" => text::LAUNCHER_ALIAS_PI,
+        _ => text::LAUNCHER_ALIAS_AGENT,
     }
+}
+
+fn alias_message_matches(message: Message, query: &str) -> bool {
+    [Language::Ko, Language::En].into_iter().any(|lang| {
+        message
+            .in_language(lang)
+            .split_whitespace()
+            .any(|alias| landing_query_matches(alias, query))
+    })
 }
 
 fn split_trailing_segment(path: &Path) -> (String, String) {
@@ -480,9 +489,7 @@ impl Shell {
             let matches = landing_query_matches(&name, query)
                 || landing_query_matches(&agent_id, query)
                 || landing_query_matches(&label, query)
-                || agent_search_aliases(&agent_id)
-                    .iter()
-                    .any(|alias| landing_query_matches(alias, query));
+                || alias_message_matches(agent_search_alias_message(&agent_id), query);
             if matches {
                 rows.push(LauncherRow::Agent {
                     agent_id,
@@ -491,9 +498,7 @@ impl Shell {
             }
         }
         if landing_query_matches(text::LAUNCHER_TERMINAL.get(), query)
-            || landing_query_matches("Terminal", query)
-            || landing_query_matches("터미널", query)
-            || landing_query_matches("shell", query)
+            || alias_message_matches(text::LAUNCHER_ALIAS_TERMINAL, query)
         {
             rows.push(LauncherRow::Terminal);
         }
