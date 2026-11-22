@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use krill_proto::SessionId;
 use krill_proto::bots::{
-    BotAccessRequest, BotAccessRequestStatus, BotConfig, BotId, BotItem, BotItemStatus,
-    BotRpcRequest, BotRpcResponse, BotSessionSummary, MAX_AVATAR_PNG_BYTES,
+    BotAccessRequest, BotAccessRequestStatus, BotAgentModel, BotConfig, BotId, BotItem,
+    BotItemStatus, BotRpcRequest, BotRpcResponse, BotSessionSummary, MAX_AVATAR_PNG_BYTES,
 };
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -235,29 +235,22 @@ pub fn expect_variant<T>(
     extract(resp).ok_or_else(|| format!("Unexpected daemon response (expected {expected})"))
 }
 
-/// Models offered per runtime in the New bot picker. Ids are what each CLI's `--model` accepts.
-// ponytail: mirrors the chat composer fallback list (shell/chat/composer.rs); move both to one
-// catalog when a daemon-side model list exists.
+/// Built-in models the New bot picker offers until krilld reports the agent's own list
+/// ([`BotRpcRequest::ListAgentModels`]). Same list as the chat composer's; "Default" is `None` here.
 #[must_use]
-pub fn runtime_models(runtime_id: &str) -> &'static [(&'static str, &'static str)] {
-    match runtime_id {
-        "claude" => &[
-            ("opus", "Opus 5.5"),
-            ("sonnet", "Sonnet 5.5"),
-            ("haiku", "Haiku 5.5"),
-            ("fable", "Fable 5.1"),
-        ],
-        "codex" => &[
-            ("gpt-5.4", "GPT-5.4"),
-            ("gpt-5.3-codex", "GPT-5.3 Codex"),
-            ("gpt-5.4-mini", "GPT-5.4 Mini"),
-        ],
-        "agy" => &[
-            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-            ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-        ],
-        _ => &[],
+pub fn runtime_models(runtime_id: &str) -> Vec<BotAgentModel> {
+    if !matches!(runtime_id, "claude" | "codex" | "agy") {
+        return Vec::new();
     }
+    crate::agent_models::builtin(runtime_id)
+        .0
+        .iter()
+        .filter(|m| m.id != "default")
+        .map(|m| BotAgentModel {
+            id: m.id.to_owned(),
+            label: m.label.to_owned(),
+        })
+        .collect()
 }
 
 /// One bot row in the main window sidebar's Bots section.

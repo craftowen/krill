@@ -36,9 +36,9 @@ pub use package::{
     validate_bot_package_path, validate_zip_entry_path, write_store_zip,
 };
 pub use rpc::{
-    BOT_REPLY, BOT_REQ, BotRpcRequest, BotRpcResponse, CreateBotItemParams, CreateBotParams,
-    CreateBotV2Params, FieldPatch, MAX_RPC_ZIP_BYTES, UpdateBotExtrasParams, UpdateBotItemParams,
-    UpdateBotParams,
+    BOT_REPLY, BOT_REQ, BotAgentModel, BotAgentModels, BotRpcRequest, BotRpcResponse,
+    CreateBotItemParams, CreateBotParams, CreateBotV2Params, FieldPatch, MAX_RPC_ZIP_BYTES,
+    UpdateBotExtrasParams, UpdateBotItemParams, UpdateBotParams,
 };
 pub use types::{
     ActsFor, BOT_DERIVED_SLUG_MAX_BYTES, BOT_DESCRIPTION_MAX_BYTES, BOT_ID_MAX_BYTES,

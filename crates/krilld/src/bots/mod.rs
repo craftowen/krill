@@ -1457,6 +1457,17 @@ impl BotsManager {
                 Ok(defaults) => BotRpcResponse::DefaultTrackerBots(defaults),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
+            BotRpcRequest::ListAgentModels { agent_id } => {
+                let Some(home) = krill_proto::os::home_dir() else {
+                    return BotRpcResponse::Error("home directory unavailable".to_owned());
+                };
+                match registry.agent_control().agents() {
+                    Ok(agents) => BotRpcResponse::AgentModels(crate::mobile::bot_launch_models(
+                        &home, &agents, &agent_id,
+                    )),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::TestConnector { bot_id, source } => {
                 let bot = match self.store.get_bot(&bot_id) {
                     Ok(Some(b)) => b,
@@ -1833,6 +1844,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ListBotSessions { .. }
         | BotRpcRequest::GetBotAvatar { .. }
         | BotRpcRequest::GetDefaultTrackerBots
+        | BotRpcRequest::ListAgentModels { .. }
         | BotRpcRequest::SendBotMail { .. } => Ok(()),
         BotRpcRequest::SendGroupMessage { sender, .. } => {
             let trimmed = sender.trim();

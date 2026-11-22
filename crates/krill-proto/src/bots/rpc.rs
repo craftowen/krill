@@ -540,6 +540,11 @@ pub enum BotRpcRequest {
         bot_id: Option<BotId>,
     },
     GetDefaultTrackerBots,
+    /// Models a new bot on this computer can launch `agent_id` with, from the same source the
+    /// chat composer's model picker uses.
+    ListAgentModels {
+        agent_id: String,
+    },
 }
 
 impl BotRpcRequest {
@@ -570,6 +575,7 @@ impl BotRpcRequest {
                 | Self::McpOAuthStatus { .. }
                 | Self::ListComposioConnections { .. }
                 | Self::GetDefaultTrackerBots
+                | Self::ListAgentModels { .. }
         )
     }
 }
@@ -1007,8 +1013,28 @@ impl fmt::Debug for BotRpcRequest {
                 .field("bot_id", bot_id)
                 .finish(),
             Self::GetDefaultTrackerBots => f.write_str("GetDefaultTrackerBots"),
+            Self::ListAgentModels { agent_id } => f
+                .debug_struct("ListAgentModels")
+                .field("agent_id", agent_id)
+                .finish(),
         }
     }
+}
+
+/// One model a bot can launch with: `id` is what the agent CLI's `--model` accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotAgentModel {
+    pub id: String,
+    pub label: String,
+}
+
+/// Reply to [`BotRpcRequest::ListAgentModels`]. An empty `models` means "nothing discovered":
+/// the client keeps its built-in list, and `reason` says why when the agent reported one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotAgentModels {
+    pub models: Vec<BotAgentModel>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Versioned extensible RPC response enum paired with [`BotRpcRequest`].
@@ -1095,6 +1121,7 @@ pub enum BotRpcResponse {
         redirect_url: String,
     },
     DefaultTrackerBots(DefaultTrackerBots),
+    AgentModels(BotAgentModels),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1253,6 +1280,7 @@ impl fmt::Debug for BotRpcResponse {
             Self::DefaultTrackerBots(defaults) => {
                 f.debug_tuple("DefaultTrackerBots").field(defaults).finish()
             }
+            Self::AgentModels(models) => f.debug_tuple("AgentModels").field(models).finish(),
         }
     }
 }

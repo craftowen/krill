@@ -32,138 +32,17 @@ pub(super) fn agent_display_name(agent: &str) -> String {
 }
 
 pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>, Vec<String>) {
-    match agent.to_ascii_lowercase().as_str() {
-        "codex" => (
-            vec![
-                ComposerModelItem {
-                    id: "gpt-5.4".to_owned(),
-                    label: "GPT-5.4".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "xhigh".to_owned(),
-                    ],
-                    default_effort: Some("high".to_owned()),
-                },
-                ComposerModelItem {
-                    id: "gpt-5.3-codex".to_owned(),
-                    label: "GPT-5.3 Codex".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "xhigh".to_owned(),
-                    ],
-                    default_effort: Some("high".to_owned()),
-                },
-                ComposerModelItem {
-                    id: "gpt-5.4-mini".to_owned(),
-                    label: "GPT-5.4 Mini".to_owned(),
-                    efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
-                    default_effort: Some("medium".to_owned()),
-                },
-            ],
-            vec![
-                "low".to_owned(),
-                "medium".to_owned(),
-                "high".to_owned(),
-                "xhigh".to_owned(),
-            ],
-        ),
-        "gemini" | "agy" | "antigravity" => (
-            vec![
-                ComposerModelItem {
-                    id: "gemini-2.5-pro".to_owned(),
-                    label: "Gemini 2.5 Pro".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "max".to_owned(),
-                    ],
-                    default_effort: Some("high".to_owned()),
-                },
-                ComposerModelItem {
-                    id: "gemini-2.5-flash".to_owned(),
-                    label: "Gemini 2.5 Flash".to_owned(),
-                    efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
-                    default_effort: Some("medium".to_owned()),
-                },
-            ],
-            vec![
-                "low".to_owned(),
-                "medium".to_owned(),
-                "high".to_owned(),
-                "max".to_owned(),
-            ],
-        ),
-        _ => (
-            vec![
-                ComposerModelItem {
-                    id: "default".to_owned(),
-                    label: "Default".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "xhigh".to_owned(),
-                        "max".to_owned(),
-                    ],
-                    default_effort: None,
-                },
-                ComposerModelItem {
-                    id: "opus".to_owned(),
-                    label: "Opus 5.5".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "xhigh".to_owned(),
-                        "max".to_owned(),
-                    ],
-                    default_effort: None,
-                },
-                ComposerModelItem {
-                    id: "fable".to_owned(),
-                    label: "Fable 5.2".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "xhigh".to_owned(),
-                        "max".to_owned(),
-                    ],
-                    default_effort: None,
-                },
-                ComposerModelItem {
-                    id: "sonnet".to_owned(),
-                    label: "Sonnet 5.5".to_owned(),
-                    efforts: vec![
-                        "low".to_owned(),
-                        "medium".to_owned(),
-                        "high".to_owned(),
-                        "xhigh".to_owned(),
-                        "max".to_owned(),
-                    ],
-                    default_effort: None,
-                },
-                ComposerModelItem {
-                    id: "haiku".to_owned(),
-                    label: "Haiku 5.5".to_owned(),
-                    efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
-                    default_effort: None,
-                },
-            ],
-            vec![
-                "low".to_owned(),
-                "medium".to_owned(),
-                "high".to_owned(),
-                "xhigh".to_owned(),
-                "max".to_owned(),
-            ],
-        ),
-    }
+    let (models, efforts) = krill_app::agent_models::builtin(agent);
+    let models = models
+        .iter()
+        .map(|m| ComposerModelItem {
+            id: m.id.to_owned(),
+            label: m.label.to_owned(),
+            efforts: m.efforts.iter().map(|e| (*e).to_owned()).collect(),
+            default_effort: m.default_effort.map(str::to_owned),
+        })
+        .collect();
+    (models, efforts.iter().map(|e| (*e).to_owned()).collect())
 }
 
 /// `claude-opus-5-5` reads as `opus 5.5`, the way the phone shows it. Other labels stay as reported.
