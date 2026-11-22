@@ -562,6 +562,12 @@ impl Shell {
             return None;
         }
         let host = self.layout.host(pane).clone();
+        if let Some(target) = self.layout.group_pane(pane) {
+            return Some(Workspace {
+                host,
+                folder: PathBuf::from(format!("/.krill-group/{}", target.group_id)),
+            });
+        }
         if let Some(bot) = self.bot_for_pane(pane)
             && let Some(folder) = self.bot_folder(bot)
         {

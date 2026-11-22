@@ -277,6 +277,16 @@ impl Shell {
             },
         )
         .detach();
+        cx.subscribe(view, |this, _, ev: &krill_app::bots::OpenBotHome, cx| {
+            this.close_settings(None, cx);
+            if ev.host != this.launch_host {
+                this.set_launch_host(ev.host.clone(), cx);
+                this.sidebar_bots.clear();
+            }
+            this.refresh_bots_badge(cx);
+            this.open_bot_home(ev.bot_id.clone(), ev.kickoff.clone(), cx);
+        })
+        .detach();
         cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
             this.request_new_bot(None, None, cx);
         })
@@ -334,12 +344,25 @@ impl Shell {
         bots: Vec<krill_app::bots::SidebarBot>,
         cx: &mut Context<Self>,
     ) {
+        let groups = self.sidebar_groups.clone();
+        self.apply_sidebar_state(attention, bots, groups, cx);
+    }
+
+    pub(super) fn apply_sidebar_state(
+        &mut self,
+        attention: usize,
+        bots: Vec<krill_app::bots::SidebarBot>,
+        groups: Vec<krill_proto::bots::BotGroupSummary>,
+        cx: &mut Context<Self>,
+    ) {
         if self.bots_attention_count != attention
             || self.sidebar_bots != bots
+            || self.sidebar_groups != groups
             || !self.bot_ui.loaded
         {
             self.bots_attention_count = attention;
             self.sidebar_bots = bots;
+            self.sidebar_groups = groups;
             self.bot_ui.loaded = true;
             self.bot_ui.panel.stale = true;
             // A restored chat may only now turn out to be a bot's: root its Files there.
@@ -410,7 +433,12 @@ impl Shell {
                 this.sidebar.update(cx, |sb, cx| {
                     sb.set_bot_sessions(host, state.sessions, cx);
                 });
-                this.apply_sidebar_bots(state.snapshot.attention, state.snapshot.bots, cx);
+                this.apply_sidebar_state(
+                    state.snapshot.attention,
+                    state.snapshot.bots,
+                    state.groups,
+                    cx,
+                );
                 if !state.avatars.is_empty() {
                     this.store_bot_avatars(state.avatars);
                     cx.notify();

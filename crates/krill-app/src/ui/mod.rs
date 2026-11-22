@@ -50,8 +50,8 @@ pub use theme::{
     TAB_INACTIVE_OPACITY, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TERMINAL_DARK, TERMINAL_GHOSTTY_DARK,
     TERMINAL_LIGHT, TEXT_2XL, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XL, TEXT_XS, TIDEPOOL,
     TITLEBAR_HEIGHT, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, TRANSPARENT, agent_state_color, apply,
-    bot_avatar_background, git_status_color, hex, hexa, palette, palette_for, tab_tag_color,
-    terminal_surface, terminal_surface_alpha, terminal_theme, terminal_theme_for_mode, titlebar,
-    transparent, workspace_surface_alpha,
+    bot_avatar_background, git_status_color, hex, hexa, new_bot_band_fill, palette, palette_for,
+    tab_tag_color, terminal_surface, terminal_surface_alpha, terminal_theme,
+    terminal_theme_for_mode, titlebar, transparent, workspace_surface_alpha,
 };
 pub use theme_swatch::theme_swatch;

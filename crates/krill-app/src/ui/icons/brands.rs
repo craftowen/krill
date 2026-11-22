@@ -34,6 +34,7 @@ pub const KIRO_PNG: &[u8] = include_bytes!("orca/kiro.png");
 pub const MISTRAL_VIBE_PNG: &[u8] = include_bytes!("orca/mistral-vibe.png");
 pub const MUSE_PNG: &[u8] = include_bytes!("orca/muse.png");
 pub const OPENCLAUDE_PNG: &[u8] = include_bytes!("orca/openclaude.png");
+pub const OPENCLAW_PNG: &[u8] = include_bytes!("orca/openclaw.png");
 pub const QWEN_PNG: &[u8] = include_bytes!("orca/qwen-code.png");
 pub const TRAE_PNG: &[u8] = include_bytes!("orca/trae.png");
 pub const ZCODE_PNG: &[u8] = include_bytes!("orca/zcode.png");
@@ -61,6 +62,7 @@ static KIRO: OnceLock<Arc<Image>> = OnceLock::new();
 static MISTRAL_VIBE: OnceLock<Arc<Image>> = OnceLock::new();
 static MUSE: OnceLock<Arc<Image>> = OnceLock::new();
 static OPENCLAUDE: OnceLock<Arc<Image>> = OnceLock::new();
+static OPENCLAW: OnceLock<Arc<Image>> = OnceLock::new();
 static QWEN: OnceLock<Arc<Image>> = OnceLock::new();
 static TRAE: OnceLock<Arc<Image>> = OnceLock::new();
 static ZCODE: OnceLock<Arc<Image>> = OnceLock::new();
@@ -95,6 +97,7 @@ pub(super) fn agent_icon(agent_id: &str) -> Option<Icon> {
         "mistral-vibe" => png_icon(MISTRAL_VIBE_PNG, &MISTRAL_VIBE),
         "muse" => png_icon(MUSE_PNG, &MUSE),
         "openclaude" => png_icon(OPENCLAUDE_PNG, &OPENCLAUDE),
+        "openclaw" => png_icon(OPENCLAW_PNG, &OPENCLAW),
         "qwen" => png_icon(QWEN_PNG, &QWEN),
         "trae" => png_icon(TRAE_PNG, &TRAE),
         "zcode" => png_icon(ZCODE_PNG, &ZCODE),
@@ -147,6 +150,7 @@ mod tests {
             ("mistral-vibe.png", MISTRAL_VIBE_PNG),
             ("muse.png", MUSE_PNG),
             ("openclaude.png", OPENCLAUDE_PNG),
+            ("openclaw.png", OPENCLAW_PNG),
             ("qwen-code.png", QWEN_PNG),
             ("trae.png", TRAE_PNG),
             ("zcode.png", ZCODE_PNG),

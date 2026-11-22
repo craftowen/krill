@@ -1,112 +1,80 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
-//! Orca's "New bot" dialog: a mascot carousel with background swatches and a picture upload,
-//! a large name field, an optional job line, "Runs on … with … · Change", and Create (⌘↵).
-//!
-//! The host `Shell` draws it over the workspace and opens the new bot's Home Chat on
-//! [`Event::Created`].
-
-use std::collections::HashMap;
-use std::sync::Arc;
+//! Orca's "New bot" dialog: top color band, first-bot import nudge, 64px picture popover trigger +
+//! large bare heading Name field, 5-line Identity box, 2-column Computer + Agent picker,
+//! template part chips or editable proposal fields (`Watches`, `Does`, `Reports`, `Takes over`),
+//! and Create (⌘↵).
 
 use gpui::{
-    App, ClickEvent, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, FontWeight, Image,
-    KeyDownEvent, SharedString, Subscription, Task, TextAlign, Window, div, prelude::*, px,
-    relative,
+    AnyElement, App, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, FontWeight,
+    KeyDownEvent, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
+use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Disableable as _, IconName, Sizable as _};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::popover::Popover;
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+#[cfg(test)]
+use krill_proto::agent::Permission;
+#[cfg(test)]
+use krill_proto::bots::BotAgentModel;
+#[cfg(test)]
+use krill_proto::bots::ExternalBotCandidate;
 use krill_proto::bots::{
-    BotAgentModel, BotAgentModels, BotConfig, BotRpcRequest, BotRpcResponse, BotTemplate,
-    CreateBotParams, CreateBotV2Params,
+    BOT_PROPOSAL_PURPOSE_MAX, BotConfig, BotImportNudgeInfo, BotProposal, BotRpcRequest,
+    BotRpcResponse, BotTemplate, CreateBotParams, CreateBotV2Params, ExternalBotSourceApp,
+    bot_import_nudge, find_bot_skill, proposal_identity, proposal_soul, template_proposal,
 };
 
-use super::avatar::{self, PICKER_MASCOTS, PICTURE_MAX_BYTES, PictureError, prepare_picture};
-use super::rpc::{BOT_RUNTIMES, BotRpcCall, call_checked, runtime_display_label, runtime_models};
+use super::avatar::{self, PictureError};
+use super::pickers::{
+    BotAgentSetup, PopoverTrigger, RunsOnVariant, available_runtimes, render_runs_on_picker,
+};
+use super::picture_picker::PictureState;
+use super::rpc::call_checked;
 use crate::hosts::HostId;
 use crate::i18n::catalog::bots as text;
+use crate::i18n::catalog::import_bot as itext;
 use crate::ui;
 
-/// Orca's job-line limit; the name follows krilld's byte cap.
-const NAME_MAX_BYTES: usize = krill_proto::bots::BOT_NAME_MAX_BYTES;
-const PURPOSE_MAX: usize = 200;
+pub use super::pickers::HostChoice;
 
-/// Carousel geometry (Orca `size-28`, neighbours scaled to 72 px, ±110 px from the centre).
-const FACE: f32 = 112.;
-const NEIGHBOUR: f32 = 72.;
-const CAROUSEL_HEIGHT: f32 = 120.;
-const DIALOG_WIDTH: f32 = 448.;
-const TEMPLATE_DIALOG_WIDTH: f32 = 576.;
+const NAME_MAX_BYTES: usize = krill_proto::bots::BOT_NAME_MAX_BYTES;
+const PURPOSE_MAX: usize = BOT_PROPOSAL_PURPOSE_MAX;
+const PURPOSE_COUNTER_FROM: usize = 160;
+const DIALOG_WIDTH: f32 = 512.;
+const PROPOSAL_DIALOG_WIDTH: f32 = 576.;
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// The bot exists. `picture_error` says why a picked picture couldn't be saved (the bot
-    /// then keeps its default face).
     Created {
         bot: Box<BotConfig>,
         warning: Option<String>,
-        /// The computer it was made on (and runs on).
         host: HostId,
     },
     Close,
-    /// A picked computer's Krill predates bots: the host opens where it updates.
     UpdateHost,
-    /// "Start from a template": the host swaps this dialog for the templates gallery.
     BrowseTemplates,
+    OpenImport,
 }
 
-/// A computer the bot can be made on (Orca's "Computer" choices).
-#[derive(Clone)]
-pub struct HostChoice {
-    pub id: HostId,
-    pub label: SharedString,
-    pub rpc: BotRpcCall,
-}
-
-impl std::fmt::Debug for HostChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostChoice")
-            .field("id", &self.id)
-            .field("label", &self.label)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Why a computer can't take a new bot; Orca greys these out in its Computer list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Blocked {
-    /// Its Krill predates bots (its version, `""` when it didn't say).
-    NoBots(String),
-    Unreachable,
-}
-
-/// Whether `rpc`'s computer can run bots: `None` when it can.
-fn probe(rpc: &BotRpcCall) -> Option<Blocked> {
-    let err = rpc(&BotRpcRequest::ListBots).err()?;
-    Some(
-        super::rpc::unsupported_version(&err).map_or(Blocked::Unreachable, |version| {
-            Blocked::NoBots(version.to_owned())
-        }),
-    )
-}
-
-/// One face in the carousel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Face {
-    Mascot(&'static str),
-    /// The uploaded picture.
-    Custom,
+enum TemplateChip {
+    Apps,
+    Skills,
+    Schedules,
+    Events,
 }
 
-/// First free "New bot", "New bot 2", … (Orca fills an empty name the same way).
+type ChipContentFn =
+    Box<dyn Fn(&NewBot, &ui::Palette, &mut Context<NewBot>) -> AnyElement + 'static>;
+
+/// First free `"New bot"`, `"New bot 2"`, … (Orca fills an empty name the same way).
 #[must_use]
 pub fn unique_name(base: &str, taken: &[String]) -> String {
     let is_taken = |n: &str| taken.iter().any(|t| t.trim().eq_ignore_ascii_case(n));
     if !is_taken(base) {
         return base.to_owned();
     }
-    // One of the next `taken.len() + 1` numbers is always free.
     (2..=taken.len() + 2)
         .map(|i| format!("{base} {i}"))
         .find(|n| !is_taken(n))
@@ -115,56 +83,30 @@ pub fn unique_name(base: &str, taken: &[String]) -> String {
 
 pub struct NewBot {
     focus: FocusHandle,
-    carousel_focus: FocusHandle,
-    rpc: BotRpcCall,
-    host_label: SharedString,
-    host_is_local: bool,
-    host_id: HostId,
-    /// Every computer offered, the default first.
-    hosts: Vec<HostChoice>,
-    blocked: HashMap<HostId, Blocked>,
-    probe_tasks: Vec<Task<()>>,
+    setup: BotAgentSetup,
     taken_names: Vec<String>,
-    faces: Vec<Face>,
-    current: usize,
-    background: u32,
-    /// Prepared 512 px PNG and its decoded image.
-    picture: Option<(Vec<u8>, Arc<Image>)>,
-    picture_error: Option<PictureError>,
+    pub picture: PictureState,
     name: Entity<InputState>,
-    /// Single line: only single-line inputs centre their text like Orca's field.
-    purpose: Entity<InputState>,
-    runtime: &'static str,
-    model: Option<String>,
-    /// krilld's list for `runtime` (the chat composer's source); `None` while it is asked.
-    discovered: Option<BotAgentModels>,
-    models_task: Option<Task<()>>,
-    changing: bool,
+    purpose: Entity<TextareaState>,
+    watches: Option<Entity<TextareaState>>,
+    does: Option<Entity<TextareaState>>,
+    reports: Option<Entity<TextareaState>>,
     template: Option<&'static BotTemplate>,
-    /// Template skills the user kept checked.
+    proposal: Option<BotProposal>,
+    prefilled_identity: Option<String>,
+    origin: Option<String>,
     skills: Vec<&'static str>,
+    open_chip: Option<TemplateChip>,
+    nudge: Option<BotImportNudgeInfo>,
+    nudge_dismissed: bool,
+    nudge_task: Option<Task<()>>,
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
-    picture_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
-impl EventEmitter<Event> for NewBot {}
-
-impl std::fmt::Debug for NewBot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NewBot")
-            .field("face", &self.faces.get(self.current))
-            .field("runtime", &self.runtime)
-            .field("submitting", &self.submitting)
-            .finish_non_exhaustive()
-    }
-}
-
 impl NewBot {
-    /// `template` pre-fills the dialog the way Orca's "Use template…" does. The bot is made
-    /// on the first of `hosts` unless another is picked.
     pub fn new(
         hosts: Vec<HostChoice>,
         taken_names: Vec<String>,
@@ -172,153 +114,185 @@ impl NewBot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let proposal = template.map(template_proposal);
+        let origin = template.map(|t| text::NB_FROM_TEMPLATE.format(&[("template", t.name)]));
+        Self::new_with_proposal(hosts, taken_names, template, proposal, origin, window, cx)
+    }
+
+    pub fn new_with_proposal(
+        hosts: Vec<HostChoice>,
+        taken_names: Vec<String>,
+        template: Option<&'static BotTemplate>,
+        proposal: Option<BotProposal>,
+        origin: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let setup = BotAgentSetup::from_hosts(hosts, Self::setup_mut, cx);
+        let tpl_mascot = template
+            .map(|t| t.mascot)
+            .or_else(|| proposal.as_ref().and_then(|p| p.mascot.as_deref()))
+            .and_then(avatar::mascot_id);
+        let picture = PictureState::new("new-bot", tpl_mascot, cx);
+
+        let prefilled_identity = proposal.as_ref().and_then(|p| {
+            let _ = template?;
+            let id_text = proposal_identity(
+                p.watches.as_deref(),
+                p.does.as_deref(),
+                p.reports.as_deref(),
+            );
+            (!id_text.is_empty()).then_some(id_text)
+        });
+        let initial_name = proposal
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let initial_purpose = prefilled_identity
+            .clone()
+            .or_else(|| proposal.as_ref().map(|p| p.purpose.clone()))
+            .unwrap_or_default();
+
         let name = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).placeholder(text::NB_NAME_PLACEHOLDER.get());
-            if let Some(t) = template {
-                s.set_value(unique_name(t.name, &taken_names), window, cx);
-            }
-            s
+            InputState::new(window, cx)
+                .placeholder(text::NB_NAME_LABEL.get())
+                .default_value(initial_name)
         });
         let purpose = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).placeholder(text::NB_PURPOSE_PLACEHOLDER.get());
-            if let Some(t) = template {
-                s.set_value(t.description.to_owned(), window, cx);
-            }
-            s
+            TextareaState::new(window, cx)
+                .auto_grow(5, 7)
+                .placeholder(text::NB_IDENTITY_PLACEHOLDER.get())
+                .default_value(initial_purpose)
         });
-        let mut faces: Vec<Face> = PICKER_MASCOTS.iter().map(|m| Face::Mascot(m)).collect();
-        let current = match template.and_then(|t| avatar::mascot_id(t.mascot)) {
-            Some(id) => faces
-                .iter()
-                .position(|f| *f == Face::Mascot(id))
-                .unwrap_or_else(|| {
-                    // `S2` stays out of the picker unless a template asks for it.
-                    faces.insert(0, Face::Mascot(id));
-                    0
-                }),
-            None => random_index(faces.len()),
+
+        let (watches, does, reports) = if template.is_none()
+            && let Some(ref prop) = proposal
+        {
+            let mut mk = |val: Option<&str>, cx: &mut Context<Self>| {
+                let s = val.unwrap_or("").to_owned();
+                cx.new(|cx| {
+                    TextareaState::new(window, cx)
+                        .auto_grow(1, 3)
+                        .default_value(s)
+                })
+            };
+            (
+                Some(mk(prop.watches.as_deref(), cx)),
+                Some(mk(prop.does.as_deref(), cx)),
+                Some(mk(prop.reports.as_deref(), cx)),
+            )
+        } else {
+            (None, None, None)
         };
-        let subs = vec![
-            cx.subscribe_in(&name, window, Self::on_input),
-            cx.subscribe_in(&purpose, window, Self::on_input),
+
+        let mut subs = vec![
+            cx.subscribe_in(&name, window, |this, inp, ev: &InputEvent, window, cx| {
+                this.on_name_input(inp, ev, window, cx);
+            }),
+            cx.subscribe_in(
+                &purpose,
+                window,
+                |this, inp, ev: &InputEvent, window, cx| {
+                    this.on_purpose_input(inp, ev, window, cx);
+                },
+            ),
         ];
-        let first = hosts.first().cloned().unwrap_or_else(|| HostChoice {
-            id: HostId::Local,
-            label: text::HOST_LOCAL.get().into(),
-            rpc: Arc::new(|_| Err(text::DAEMON_UNAVAILABLE.get().to_owned())),
-        });
-        let host_is_local = first.id.is_local();
-        let mut view = Self {
+        for extra in [&watches, &does, &reports].into_iter().flatten() {
+            let sub = cx.observe(extra, |_, _, cx| cx.notify());
+            subs.push(sub);
+        }
+
+        let skills = template.map(|t| t.skills.to_vec()).unwrap_or_default();
+
+        let first_bot = taken_names.is_empty();
+        let nudge_dismissed = crate::settings::current(cx).bot_import_nudge_dismissed;
+
+        let mut me = Self {
             focus: cx.focus_handle(),
-            carousel_focus: cx.focus_handle().tab_stop(true),
-            rpc: first.rpc,
-            host_label: first.label,
-            host_is_local,
-            host_id: first.id,
-            hosts,
-            blocked: HashMap::new(),
-            probe_tasks: Vec::new(),
+            setup,
             taken_names,
-            faces,
-            current,
-            background: avatar::DEFAULT_BACKGROUND,
-            picture: None,
-            picture_error: None,
+            picture,
             name,
             purpose,
-            runtime: available_runtimes(host_is_local, cx)
-                .first()
-                .copied()
-                .unwrap_or("claude"),
-            model: None,
-            discovered: None,
-            models_task: None,
-            changing: false,
+            watches,
+            does,
+            reports,
             template,
-            skills: template.map(|t| t.skills.to_vec()).unwrap_or_default(),
+            proposal,
+            prefilled_identity,
+            origin,
+            skills,
+            open_chip: None,
+            nudge: None,
+            nudge_dismissed,
+            nudge_task: None,
             submitting: false,
             error: None,
             task: None,
-            picture_task: None,
             _subs: subs,
         };
-        view.load_models(cx);
-        view.probe_hosts(cx);
-        view
-    }
 
-    /// The computer the bot will be made on.
-    #[must_use]
-    pub fn host(&self) -> &HostId {
-        &self.host_id
-    }
-
-    /// Asks each remote computer whether it can run bots, greying out the ones that can't.
-    fn probe_hosts(&mut self, cx: &mut Context<Self>) {
-        self.probe_tasks = self
-            .hosts
-            .iter()
-            .filter(|h| h.id.is_remote())
-            .map(|h| {
-                let id = h.id.clone();
-                let rpc = h.rpc.clone();
-                cx.spawn(async move |this, cx| {
-                    let blocked = cx
-                        .background_executor()
-                        .spawn(async move { probe(&rpc) })
-                        .await;
-                    this.update(cx, |this, cx| this.set_blocked(&id, blocked, cx))
-                        .ok();
-                })
-            })
-            .collect();
-    }
-
-    fn set_blocked(&mut self, id: &HostId, blocked: Option<Blocked>, cx: &mut Context<Self>) {
-        let Some(blocked) = blocked else {
-            self.blocked.remove(id);
-            cx.notify();
-            return;
-        };
-        self.blocked.insert(id.clone(), blocked);
-        // The computer it was going on can't take it: fall back to one that can.
-        if &self.host_id == id
-            && let Some(next) = self
+        if first_bot
+            && !nudge_dismissed
+            && let Some(local_rpc) = me
+                .setup
                 .hosts
                 .iter()
-                .find(|h| !self.blocked.contains_key(&h.id))
-                .map(|h| h.id.clone())
+                .find(|h| h.id.is_local())
+                .map(|h| h.rpc.clone())
         {
-            self.select_host(&next, cx);
+            me.nudge_task = Some(cx.spawn(async move |this, cx| {
+                let cands = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match call_checked(
+                            &local_rpc,
+                            &BotRpcRequest::ImportExternalBots {
+                                source: None,
+                                path: None,
+                                dry_run: true,
+                            },
+                        ) {
+                            Ok(BotRpcResponse::ImportedExternalBots { candidates, .. }) => {
+                                candidates
+                            }
+                            _ => Vec::new(),
+                        }
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.nudge = bot_import_nudge(&cands);
+                    cx.notify();
+                })
+                .ok();
+            }));
         }
-        cx.notify();
+
+        me
     }
 
-    /// Makes the bot on `id` instead. A computer that can't run bots isn't picked.
+    fn setup_mut(&mut self) -> &mut BotAgentSetup {
+        &mut self.setup
+    }
+
+    pub(super) fn picture_mut(&mut self) -> &mut PictureState {
+        &mut self.picture
+    }
+
+    fn on_update_host(_: &mut Self, cx: &mut Context<Self>) {
+        cx.emit(Event::UpdateHost);
+    }
+
+    /// Computer the new bot is currently being made on.
+    #[must_use]
+    pub fn host(&self) -> &HostId {
+        &self.setup.host_id
+    }
+
+    /// Picks `id` as target computer.
     pub fn select_host(&mut self, id: &HostId, cx: &mut Context<Self>) {
-        if self.blocked.contains_key(id) {
-            return;
-        }
-        let Some(choice) = self.hosts.iter().find(|h| &h.id == id).cloned() else {
-            return;
-        };
-        self.rpc = choice.rpc;
-        self.host_label = choice.label;
-        self.host_is_local = choice.id.is_local();
-        self.host_id = choice.id;
         self.error = None;
-        // This computer may not have the agent picked for the last one.
-        let runtimes = available_runtimes(self.host_is_local, cx);
-        if !runtimes.contains(&self.runtime)
-            && let Some(first) = runtimes.first()
-        {
-            self.set_runtime(first, cx);
-        } else {
-            // Each computer lists its own models.
-            self.model = None;
-            self.load_models(cx);
-        }
-        cx.notify();
+        self.setup.select_host(id, Self::setup_mut, cx);
     }
 
     #[must_use]
@@ -326,18 +300,43 @@ impl NewBot {
         self.focus.clone()
     }
 
-    /// Puts the cursor in the name field (Orca focuses it when the dialog opens).
     pub fn focus_name(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.name.update(cx, |s, cx| s.focus(window, cx));
     }
 
-    /// Pre-fills the job line ("Blank bot for “…”" from the templates search).
     pub fn set_purpose(&mut self, purpose: String, window: &mut Window, cx: &mut Context<Self>) {
         self.purpose
             .update(cx, |s, cx| s.set_value(purpose, window, cx));
     }
 
-    fn on_input(
+    #[cfg(test)]
+    pub fn set_nudge_candidates_for_test(
+        &mut self,
+        candidates: &[ExternalBotCandidate],
+        cx: &mut Context<Self>,
+    ) {
+        self.nudge = bot_import_nudge(candidates);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn set_name_for_test(&mut self, val: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let owned = val.to_owned();
+        self.name.update(cx, |s, cx| s.set_value(owned, window, cx));
+    }
+
+    #[cfg(test)]
+    pub fn set_gen_description_for_test(
+        &mut self,
+        desc: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picture
+            .set_gen_description_for_test(desc, Self::picture_mut, window, cx);
+    }
+
+    fn on_name_input(
         &mut self,
         input: &Entity<InputState>,
         ev: &InputEvent,
@@ -345,20 +344,16 @@ impl NewBot {
         cx: &mut Context<Self>,
     ) {
         match ev {
-            // Enter in either field submits, like Orca's form; ⌘↵ works from anywhere.
             InputEvent::PressEnter { .. }
                 if !crate::jump::entity_input_is_composing(input, window, cx) =>
             {
-                self.submit(cx);
+                if self.can_submit(cx) {
+                    self.submit(cx);
+                }
             }
-            // Orca's `maxLength`: the name keeps to krilld's byte cap, the job to 200 characters.
             InputEvent::Change if !crate::jump::entity_input_is_composing(input, window, cx) => {
                 let value = input.read(cx).value().to_string();
-                let capped = if *input == self.name {
-                    clip_bytes(&value, NAME_MAX_BYTES)
-                } else {
-                    clip_chars(&value, PURPOSE_MAX)
-                };
+                let capped = clip_bytes(&value, NAME_MAX_BYTES);
                 if capped.len() < value.len() {
                     let capped = capped.to_owned();
                     input.update(cx, |s, cx| s.set_value(capped, window, cx));
@@ -370,199 +365,96 @@ impl NewBot {
         }
     }
 
+    fn on_purpose_input(
+        &mut self,
+        input: &Entity<TextareaState>,
+        ev: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let InputEvent::Change = ev {
+            if !super::opt_textarea_composing(Some(input), window, cx)
+                && self.prefilled_identity.is_none()
+            {
+                let value = input.read(cx).value().to_string();
+                let capped = clip_chars(&value, PURPOSE_MAX);
+                if capped.len() < value.len() {
+                    let capped = capped.to_owned();
+                    input.update(cx, |s, cx| s.set_value(capped, window, cx));
+                }
+            }
+            cx.notify();
+        }
+    }
+
     fn input_is_composing(&self, window: &mut Window, cx: &mut App) -> bool {
         crate::jump::entity_input_is_composing(&self.name, window, cx)
-            || crate::jump::entity_input_is_composing(&self.purpose, window, cx)
+            || super::opt_textarea_composing(Some(&self.purpose), window, cx)
+            || super::opt_textarea_composing(self.watches.as_ref(), window, cx)
+            || super::opt_textarea_composing(self.does.as_ref(), window, cx)
+            || super::opt_textarea_composing(self.reports.as_ref(), window, cx)
     }
 
-    fn face(&self) -> Face {
-        self.faces[self.current]
+    fn identity_too_long(&self, cx: &App) -> bool {
+        let Some(ref pre) = self.prefilled_identity else {
+            return false;
+        };
+        let cur = self.purpose.read(cx).value().trim().to_owned();
+        cur != *pre && cur.chars().count() > PURPOSE_MAX
     }
 
-    /// Steps the carousel, wrapping at both ends like Orca.
+    fn can_submit(&self, cx: &App) -> bool {
+        !self.submitting
+            && !self.setup.is_blocked()
+            && !available_runtimes(self.setup.host_is_local, cx).is_empty()
+            && !self.identity_too_long(cx)
+            && !self.name.read(cx).value().trim().is_empty()
+    }
+
     pub fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let len = self.faces.len().cast_signed();
-        self.current = (self.current.cast_signed() + delta)
-            .rem_euclid(len)
-            .cast_unsigned();
-        self.picture_error = None;
-        cx.notify();
-    }
-
-    fn select_face(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.current = index;
-        self.picture_error = None;
-        cx.notify();
+        self.picture.step(delta, cx);
     }
 
     pub fn set_background(&mut self, rgb: u32, cx: &mut Context<Self>) {
-        self.background = rgb;
-        self.picture_error = None;
-        cx.notify();
+        self.picture.set_background(rgb, cx);
     }
 
-    fn form_is_empty(&self, cx: &App) -> bool {
-        self.template.is_none()
-            && self.name.read(cx).value().trim().is_empty()
-            && self.purpose.read(cx).value().trim().is_empty()
-    }
-
-    fn pick_picture(&mut self, cx: &mut Context<Self>) {
-        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(text::NB_UPLOAD.get().into()),
-        });
-        self.picture_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = chosen.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            this.update(cx, |this, cx| this.load_picture_from_path(path, cx))
-                .ok();
-        }));
-    }
-
-    fn load_picture_from_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
-        self.load_picture(
-            move || {
-                // Refuse a huge file before reading it into memory.
-                let len = std::fs::metadata(&path)
-                    .map_err(|_| PictureError::Unreadable)?
-                    .len();
-                if usize::try_from(len).map_or(true, |n| n > PICTURE_MAX_BYTES) {
-                    return Err(PictureError::TooBig);
-                }
-                std::fs::read(path).map_err(|_| PictureError::Unreadable)
-            },
-            cx,
-        );
-    }
-
-    /// Decodes off the UI thread, then shows the picture as the selected face.
     pub fn load_picture(
         &mut self,
         read: impl FnOnce() -> Result<Vec<u8>, PictureError> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.picture_task = Some(cx.spawn(async move |this, cx| {
-            let prepared = cx
-                .background_executor()
-                .spawn(async move { prepare_picture(&read()?) })
-                .await;
-            this.update(cx, |this, cx| {
-                match prepared {
-                    Ok(png) => {
-                        let image =
-                            Arc::new(Image::from_bytes(gpui::ImageFormat::Png, png.clone()));
-                        this.picture = Some((png, image));
-                        this.picture_error = None;
-                        // Orca slots the picture right after the mascot being looked at.
-                        if let Some(at) = this.faces.iter().position(|f| *f == Face::Custom) {
-                            this.current = at;
-                        } else {
-                            let at = this.current + 1;
-                            this.faces.insert(at, Face::Custom);
-                            this.current = at;
-                        }
-                    }
-                    Err(err) => this.picture_error = Some(err),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.picture.load_picture(read, Self::picture_mut, cx);
     }
 
-    /// Pasting an image anywhere in the dialog uses it; text paste falls through to the field.
-    fn paste_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(item) = cx.read_from_clipboard() else {
-            return false;
-        };
-        let Some(bytes) = item.entries().iter().find_map(|e| match e {
-            gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty() => Some(img.bytes.clone()),
-            _ => None,
-        }) else {
-            return false;
-        };
-        let _ = window;
-        self.load_picture(move || Ok(bytes), cx);
-        true
-    }
-
+    #[cfg(test)]
     pub(super) fn set_runtime(&mut self, runtime: &'static str, cx: &mut Context<Self>) {
-        if self.runtime != runtime {
-            self.runtime = runtime;
-            self.model = None;
-            self.load_models(cx);
-        }
-        cx.notify();
+        self.setup.set_runtime(runtime, Self::setup_mut, cx);
     }
 
+    #[cfg(test)]
     pub(super) fn set_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
-        self.model = model;
-        cx.notify();
+        self.setup.set_model(model, cx);
     }
 
-    /// Asks krilld for the agent's own model list, the one the chat composer shows. The built-in
-    /// list stays up meanwhile, and when the daemon is too old to answer.
-    fn load_models(&mut self, cx: &mut Context<Self>) {
-        let rpc = self.rpc.clone();
-        let agent_id = self.runtime.to_owned();
-        self.discovered = None;
-        // Replacing the task drops a reply for the runtime picked before.
-        self.models_task = Some(cx.spawn(async move |this, cx| {
-            let reply = cx
-                .background_executor()
-                .spawn(
-                    async move { call_checked(&rpc, &BotRpcRequest::ListAgentModels { agent_id }) },
-                )
-                .await;
-            this.update(cx, |this, cx| {
-                // An older daemon (or a failed call) lists nothing, so the built-in list stays.
-                this.discovered = Some(match reply {
-                    Ok(BotRpcResponse::AgentModels(models)) => models,
-                    _ => BotAgentModels::default(),
-                });
-                cx.notify();
-            })
-            .ok();
-        }));
+    #[cfg(test)]
+    pub(super) fn set_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
+        self.setup.set_effort(effort, cx);
     }
 
-    /// What the model picker lists: krilld's models, or the built-in ones until it reports any.
+    #[cfg(test)]
+    pub(super) fn set_permission(&mut self, perm: Option<Permission>, cx: &mut Context<Self>) {
+        self.setup.set_permission(perm, cx);
+    }
+
+    #[cfg(test)]
     pub(super) fn model_choices(&self) -> Vec<BotAgentModel> {
-        match &self.discovered {
-            Some(found)
-                if !found.models.is_empty()
-                    && crate::agent_models::prefers_discovered(self.runtime) =>
-            {
-                found.models.clone()
-            }
-            _ => runtime_models(self.runtime),
-        }
+        self.setup.model_choices()
     }
 
-    /// Like the composer's picker notice: still loading, or why the agent listed nothing.
+    #[cfg(test)]
     pub(super) fn model_notice(&self) -> Option<SharedString> {
-        let Some(found) = &self.discovered else {
-            return Some(text::MODELS_LOADING.get().into());
-        };
-        found
-            .reason
-            .clone()
-            .filter(|_| found.models.is_empty())
-            .map(Into::into)
-    }
-
-    fn model_label(&self, id: &str) -> String {
-        self.model_choices()
-            .into_iter()
-            .find(|m| m.id == id)
-            .map_or_else(|| id.to_owned(), |m| m.label)
+        self.setup.model_notice()
     }
 
     pub(super) fn toggle_skill(&mut self, skill: &'static str, cx: &mut Context<Self>) {
@@ -574,7 +466,66 @@ impl NewBot {
         cx.notify();
     }
 
-    /// Builds the create request from what the dialog shows.
+    fn form_is_empty(&self, cx: &App) -> bool {
+        self.template.is_none()
+            && self.proposal.is_none()
+            && self.name.read(cx).value().trim().is_empty()
+            && self.purpose.read(cx).value().trim().is_empty()
+    }
+
+    fn effective_proposal(&self, name: &str, cx: &App) -> Option<BotProposal> {
+        let prop = self.proposal.as_ref()?;
+        let purpose = self.purpose.read(cx).value().trim().to_owned();
+        if let Some(ref pre) = self.prefilled_identity {
+            if purpose == *pre {
+                return Some(BotProposal {
+                    name: name.to_owned(),
+                    ..prop.clone()
+                });
+            }
+            return Some(BotProposal {
+                name: name.to_owned(),
+                purpose: if purpose.is_empty() {
+                    prop.purpose.clone()
+                } else {
+                    purpose
+                },
+                watches: None,
+                does: None,
+                reports: None,
+                automations: prop.automations.clone(),
+                template_id: prop.template_id.clone(),
+                mascot: prop.mascot.clone(),
+                worktrees: prop.worktrees.clone(),
+            });
+        }
+        let read_opt = |opt: &Option<Entity<TextareaState>>, fallback: &Option<String>| {
+            opt.as_ref().map_or_else(
+                || fallback.clone(),
+                |e| {
+                    let t = e.read(cx).value().trim().to_owned();
+                    (!t.is_empty()).then_some(t)
+                },
+            )
+        };
+        Some(BotProposal {
+            name: name.to_owned(),
+            purpose: if purpose.is_empty() {
+                prop.purpose.clone()
+            } else {
+                purpose
+            },
+            watches: read_opt(&self.watches, &prop.watches),
+            does: read_opt(&self.does, &prop.does),
+            reports: read_opt(&self.reports, &prop.reports),
+            automations: prop.automations.clone(),
+            template_id: prop.template_id.clone(),
+            mascot: prop.mascot.clone(),
+            worktrees: prop.worktrees.clone(),
+        })
+    }
+
+    /// Builds the create request from the current dialog state.
     fn params(&self, cx: &App) -> CreateBotV2Params {
         let typed = clip_bytes(self.name.read(cx).value().trim(), NAME_MAX_BYTES).to_owned();
         let name = if typed.is_empty() {
@@ -582,56 +533,61 @@ impl NewBot {
         } else {
             typed
         };
-        let description = clip_chars(self.purpose.read(cx).value().trim(), PURPOSE_MAX).to_owned();
-        let (avatar, avatar_color) = match self.face() {
-            Face::Mascot(id) => (
-                Some(id.to_owned()),
-                (self.background != avatar::DEFAULT_BACKGROUND)
-                    .then(|| avatar::format_color(self.background)),
-            ),
-            // The picture is uploaded right after the bot exists.
-            Face::Custom => (None, None),
-        };
+        let (avatar_field, avatar_color, _) = self.picture.avatar_and_upload();
         let template = self.template;
+        let made = self.effective_proposal(&name, cx);
+        let (description, initial_soul) = if let Some(ref prop) = made {
+            let soul = if let Some(tpl) = template
+                && self
+                    .prefilled_identity
+                    .as_ref()
+                    .is_some_and(|pre| self.purpose.read(cx).value().trim() == pre.as_str())
+            {
+                tpl.default_soul.to_owned()
+            } else {
+                proposal_soul(&name, prop)
+            };
+            (prop.purpose.clone(), Some(soul))
+        } else {
+            let raw_purpose = self.purpose.read(cx).value().trim().to_owned();
+            (clip_chars(&raw_purpose, PURPOSE_MAX).to_owned(), None)
+        };
+
         CreateBotV2Params {
             base: CreateBotParams {
                 name,
-                agent_id: self.runtime.to_owned(),
+                agent_id: self.setup.runtime.to_owned(),
                 description,
                 emoji: None,
-                avatar,
-                model: self.model.clone(),
-                effort: None,
-                permission_mode: None,
+                avatar: avatar_field,
+                model: self.setup.model.clone(),
+                effort: self.setup.effort.clone(),
+                permission_mode: self.setup.permission_mode,
                 workspace: None,
                 template_id: template.map(|t| t.id.to_owned()),
-                initial_soul: template.map(|t| t.default_soul.to_owned()),
+                initial_soul,
             },
             slug: None,
             avatar_color,
             skills: self.skills.iter().map(|s| (*s).to_owned()).collect(),
-            // krilld adds the template's event rules (turned off) itself.
             events: Vec::new(),
         }
     }
 
     pub fn submit(&mut self, cx: &mut Context<Self>) {
-        if self.submitting {
+        if self.submitting || self.setup.is_blocked() || self.identity_too_long(cx) {
             return;
         }
         let params = self.params(cx);
-        let picture = (self.face() == Face::Custom)
-            .then(|| self.picture.as_ref().map(|(png, _)| png.clone()))
-            .flatten();
-        // krilld fills in a template's skills when none are sent, so "all unchecked" is
-        // applied right after the bot exists.
+        let (_, _, picture) = self.picture.avatar_and_upload();
         let clear_skills =
             self.template.is_some_and(|t| !t.skills.is_empty()) && self.skills.is_empty();
-        let rpc = self.rpc.clone();
-        let host = self.host_id.clone();
+        let rpc = self.setup.rpc.clone();
+        let host = self.setup.host_id.clone();
         self.submitting = true;
         self.error = None;
         cx.notify();
+
         self.task = Some(cx.spawn(async move |this, cx| {
             let created = cx
                 .background_executor()
@@ -641,7 +597,6 @@ impl NewBot {
                         BotRpcResponse::Bot(bot) => bot,
                         other => return Err(format!("unexpected CreateBot response: {other:?}")),
                     };
-                    // What didn't stick after the bot was made (shown as a notice).
                     let mut warning = None;
                     if clear_skills {
                         let req = BotRpcRequest::UpdateBotExtras(Box::new(
@@ -659,7 +614,6 @@ impl NewBot {
                         }
                     }
                     if let Some(png_bytes) = picture {
-                        // The bot exists either way; say why its picture didn't stick.
                         let upload = BotRpcRequest::UploadBotAvatar {
                             bot_id: bot.id.clone(),
                             png_bytes,
@@ -691,8 +645,8 @@ impl NewBot {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
-        // Orca ignores closing while the bot is being made.
         if !self.submitting {
+            self.picture.cancel_running_generation();
             cx.emit(Event::Close);
         }
     }
@@ -711,620 +665,505 @@ impl NewBot {
                 if keys.modifiers.secondary() && !keys.modifiers.shift && !keys.modifiers.alt =>
             {
                 cx.stop_propagation();
-                self.submit(cx);
-            }
-            "left" | "right" if self.carousel_focus.is_focused(window) => {
-                cx.stop_propagation();
-                self.step(if keys.key == "left" { -1 } else { 1 }, cx);
+                if self.can_submit(cx) {
+                    self.submit(cx);
+                }
             }
             _ => {}
         }
     }
-}
 
-/// A computer that can't take the bot, greyed out with why (and Orca's "Update" when that helps).
-fn blocked_host_row(label: &SharedString, blocked: &Blocked, cx: &App) -> gpui::Div {
-    let p = ui::palette(cx);
-    let (hint, action) = match blocked {
-        Blocked::NoBots(version) if version.is_empty() => (
-            text::NB_HOST_NO_BOTS.format(&[("host", label)]),
-            Some(text::NB_HOST_UPDATE_ACTION.get()),
-        ),
-        Blocked::NoBots(version) => (
-            text::NB_HOST_NO_BOTS_VERSION.format(&[("host", label), ("version", version)]),
-            Some(text::NB_HOST_UPDATE_ACTION.get()),
-        ),
-        Blocked::Unreachable => (text::NB_HOST_UNREACHABLE.format(&[("host", label)]), None),
-    };
-    div()
-        .w_full()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .child(
+    fn render_import_nudge(&self, p: &ui::Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.setup.host_is_local || self.nudge_dismissed {
+            return None;
+        }
+        let info = self.nudge?;
+        let app_icon_id = match info.app {
+            ExternalBotSourceApp::OpenClaw => "openclaw",
+            _ => "hermes",
+        };
+        let line = if info.count == 1 {
+            itext::NUDGE_ONE.format(&[("app", info.label)])
+        } else {
+            itext::NUDGE_MANY.format(&[("count", &info.count.to_string()), ("app", info.label)])
+        };
+        let action_label = if info.count == 1 {
+            itext::NUDGE_ACTION_ONE.get()
+        } else {
+            itext::NUDGE_ACTION_MANY.get()
+        };
+
+        Some(
             div()
-                .min_w_0()
+                .id("new-bot-import-nudge")
+                .debug_selector(|| "new-bot-import-nudge".into())
+                .px_2p5()
+                .py_2()
+                .rounded(ui::RADIUS_MD)
+                .border_1()
+                .border_color(p.border)
                 .flex()
-                .flex_col()
+                .items_center()
+                .justify_between()
+                .gap_3()
                 .child(
                     div()
-                        .truncate()
-                        .text_color(p.muted_foreground)
-                        .child(label.clone()),
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::icons::agent_brand_icon(
+                            app_icon_id,
+                            ui::ICON_LG,
+                            p.foreground,
+                        ))
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_SM)
+                                .text_color(p.foreground)
+                                .child(line),
+                        ),
                 )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            ui::secondary("new-bot-import-nudge-action", action_label)
+                                .xsmall()
+                                .debug_selector(|| "new-bot-import-nudge-action".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.picture.cancel_running_generation();
+                                    cx.emit(Event::OpenImport);
+                                })),
+                        )
+                        .child(ui::button_with_tooltip(
+                            Button::new("new-bot-import-nudge-dismiss")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::Close).size(px(ui::ICON_XS)))
+                                .accessibility_label(itext::NUDGE_DISMISS.get())
+                                .debug_selector(|| "new-bot-import-nudge-dismiss".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.nudge_dismissed = true;
+                                    crate::settings::edit(cx, |s| {
+                                        s.bot_import_nudge_dismissed = true;
+                                    });
+                                    cx.notify();
+                                })),
+                            "new-bot-import-nudge-dismiss",
+                            itext::NUDGE_DISMISS.get(),
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_takes_over(&self, p: &ui::Palette) -> Option<AnyElement> {
+        let prop = self.proposal.as_ref()?;
+        if prop.worktrees.is_empty() {
+            return None;
+        }
+        let pills = prop.worktrees.iter().map(|entry| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_full()
+                .border_1()
+                .border_color(p.border)
+                .text_size(ui::TEXT_XS)
+                .text_color(p.foreground)
+                .child(ui::icons::svg_icon(
+                    ui::icons::GIT_BRANCH_SVG,
+                    ui::ICON_XS,
+                    p.muted_foreground,
+                ))
+                .child(div().truncate().child(entry.name.clone()))
+        });
+        Some(
+            div()
+                .id("new-bot-takes-over")
+                .debug_selector(|| "new-bot-takes-over".into())
+                .flex()
+                .flex_col()
+                .gap_1p5()
                 .child(
                     div()
                         .text_size(ui::TEXT_XS)
                         .text_color(p.muted_foreground)
-                        .child(hint),
-                ),
-        )
-        .children(action.map(|action| {
-            div()
-                .flex_none()
-                .text_size(ui::TEXT_XS)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.foreground)
-                .child(action)
-        }))
-}
-
-/// The longest prefix of `s` within `max` bytes that ends on a character boundary.
-fn clip_bytes(s: &str, max: usize) -> &str {
-    let mut end = s.len().min(max);
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.get(..end).unwrap_or(s)
-}
-
-/// The first `max` characters of `s`.
-fn clip_chars(s: &str, max: usize) -> &str {
-    s.char_indices()
-        .nth(max)
-        .and_then(|(i, _)| s.get(..i))
-        .unwrap_or(s)
-}
-
-/// Runtimes a new bot can start with: on this computer, the installed ones (all of them
-/// before detection finishes, or for a remote host).
-fn available_runtimes(local: bool, cx: &App) -> Vec<&'static str> {
-    BOT_RUNTIMES
-        .iter()
-        .map(|rt| rt.id)
-        .filter(|id| !local || crate::accounts::installed::agent_maybe_installed(cx, id))
-        .collect()
-}
-
-fn random_index(len: usize) -> usize {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    usize::try_from(nanos).unwrap_or(0) % len.max(1)
-}
-
-impl NewBot {
-    fn face_image(&self, face: Face) -> Option<Arc<Image>> {
-        match face {
-            Face::Mascot(id) => avatar::mascot_image(id, self.background),
-            Face::Custom => self.picture.as_ref().map(|(_, img)| img.clone()),
-        }
-    }
-
-    fn render_face(&self, index: usize, size: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let current = index == self.current;
-        let image = self.face_image(self.faces[index]);
-        let id = SharedString::from(format!("new-bot-face-{index}"));
-        div()
-            .id(id.clone())
-            .debug_selector(move || id.to_string())
-            .flex_none()
-            .size(px(size))
-            .when(!current, |d| {
-                d.opacity(0.4)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_face(index, cx)))
-            })
-            .children(image.map(|img| {
-                gpui::img(img)
-                    .size(px(size))
-                    .rounded(if current {
-                        ui::RADIUS_XL
-                    } else {
-                        ui::RADIUS_LG
-                    })
-                    .object_fit(gpui::ObjectFit::Cover)
-            }))
-            .into_any_element()
-    }
-
-    fn chevron(
-        id: &'static str,
-        icon: IconName,
-        tip: &'static str,
-        delta: isize,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        ui::button_with_tooltip(
-            Button::new(id)
-                .ghost()
-                .small()
-                .icon(icon)
-                .debug_selector(move || id.into())
-                .on_click(cx.listener(move |this, _, _, cx| this.step(delta, cx))),
-            id,
-            tip,
+                        .child(text::NB_TAKES_OVER.get()),
+                )
+                .child(div().flex().flex_wrap().gap_1p5().children(pills))
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::NB_AGENTS_KEEP_RUNNING.get()),
+                )
+                .into_any_element(),
         )
     }
 
-    fn render_carousel(
-        &self,
-        p: &ui::Palette,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let len = self.faces.len();
-        let prev = (self.current + len - 1) % len;
-        let next = (self.current + 1) % len;
-        let focused = self.carousel_focus.is_focused(window);
-        let live = match self.face() {
-            Face::Custom => text::NB_YOUR_IMAGE.get().to_owned(),
-            Face::Mascot(id) => text::NB_MASCOT_N.format(&[
-                (
-                    "n",
-                    &(PICKER_MASCOTS.iter().position(|m| *m == id).unwrap_or(0) + 1).to_string(),
-                ),
-                ("total", &PICKER_MASCOTS.len().to_string()),
-            ]),
-        };
-        let prev_button = Self::chevron(
-            "new-bot-prev",
-            IconName::ChevronLeft,
-            text::NB_PREV_PICTURE.get(),
-            -1,
-            cx,
-        );
-        let next_button = Self::chevron(
-            "new-bot-next",
-            IconName::ChevronRight,
-            text::NB_NEXT_PICTURE.get(),
-            1,
-            cx,
-        );
-        div()
-            .id("new-bot-carousel")
-            .debug_selector(|| "new-bot-carousel".into())
-            .track_focus(&self.carousel_focus)
-            .role(gpui::Role::Group)
-            .aria_label(text::NB_PICTURE.get())
-            .relative()
-            .w_full()
-            .h(px(CAROUSEL_HEIGHT))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px((2.0f32.mul_add(110., -FACE) - NEIGHBOUR) / 2.))
-            .child(self.render_face(prev, NEIGHBOUR, cx))
-            .child(
-                div()
-                    .rounded(ui::RADIUS_XL)
-                    .border_2()
-                    .border_color(if focused { p.ring } else { ui::TRANSPARENT })
-                    .child(self.render_face(self.current, FACE, cx)),
-            )
-            .child(self.render_face(next, NEIGHBOUR, cx))
-            .child(
-                div()
-                    .absolute()
-                    .left_2()
-                    .top_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .child(prev_button),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right_2()
-                    .top_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .child(next_button),
-            )
-            .child(
-                div()
-                    .id("new-bot-carousel-live")
-                    .absolute()
-                    .size_0()
-                    .overflow_hidden()
-                    .aria_label(live),
-            )
-    }
-
-    fn render_swatches(
-        &self,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let mut row = div()
-            .id("new-bot-swatches")
-            .role(gpui::Role::Group)
-            .aria_label(text::NB_BACKGROUND.get())
-            .mt_2()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_center()
-            .gap_1();
-        for (rgb, name) in ui::BOT_AVATAR_BACKGROUNDS {
-            let selected = self.background == rgb;
-            let id = SharedString::from(format!("new-bot-swatch-{rgb:06x}"));
-            row = row.child(
-                div()
-                    .id(id.clone())
-                    .debug_selector(move || id.to_string())
-                    .role(gpui::Role::Button)
-                    .aria_label(name)
-                    .tab_index(0)
-                    .focus_visible(|d| d.border_color(p.ring))
-                    .flex_none()
-                    .size(px(20.))
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(selected, |d| d.border_2().border_color(p.foreground))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_background(rgb, cx)))
-                    .child(
-                        div()
-                            .size(px(16.))
-                            .rounded_full()
-                            .bg(ui::bot_avatar_background(rgb))
-                            .border_1()
-                            .border_color(p.border),
-                    ),
-            );
-        }
-        row
-    }
-
-    fn render_upload_line(p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        div()
-            .mt_0p5()
-            .h(px(28.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(ui::TEXT_SM)
-            .text_color(p.muted_foreground)
-            .child(
-                div()
-                    .id("new-bot-upload")
-                    .debug_selector(|| "new-bot-upload".into())
-                    .role(gpui::Role::Button)
-                    .tab_index(0)
-                    .focus_visible(|d| d.border_1().border_color(p.ring))
-                    .cursor_pointer()
-                    .underline()
-                    .hover(|d| d.text_color(p.foreground))
-                    .on_click(cx.listener(|this, _, _, cx| this.pick_picture(cx)))
-                    .child(text::NB_UPLOAD.get()),
-            )
-            .child(text::NB_UPLOAD_REST.get())
-    }
-
-    fn render_runs_on(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let strong = |s: SharedString| {
-            div()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.foreground)
-                .child(s)
-        };
-        let mut agent = runtime_display_label(self.runtime);
-        if let Some(model) = &self.model {
-            agent = format!("{agent} ({})", self.model_label(model));
-        }
-        // "Runs on {host} with {agent}": icons sit next to the names, word order per language.
-        let line = text::NB_RUNS_LINE.get();
-        let (before_host, rest) = line.split_once("{host}").unwrap_or((line, ""));
-        let (between, after_agent) = rest.split_once("{agent}").unwrap_or((rest, ""));
-        div()
-            .id("new-bot-runs-on")
-            .debug_selector(|| "new-bot-runs-on".into())
-            .role(gpui::Role::Button)
-            .tab_index(0)
-            .focus_visible(|d| d.border_1().border_color(p.ring))
-            .mx_auto()
-            .px_2()
-            .py_1()
-            .rounded(ui::RADIUS_SM)
-            .cursor_pointer()
-            .hover(|d| d.bg(p.accent.opacity(0.5)))
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_center()
-            .gap_x_1()
-            .text_size(ui::TEXT_SM)
-            .text_color(p.muted_foreground)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.changing = !this.changing;
-                cx.notify();
-            }))
-            .when(!before_host.trim().is_empty(), |d| {
-                d.child(before_host.trim().to_owned())
-            })
-            .child(ui::icons::svg_icon(
-                if self.host_is_local {
-                    ui::icons::MONITOR_SVG
-                } else {
-                    ui::icons::CLOUD_SVG
-                },
-                ui::ICON_XS,
-                p.muted_foreground,
-            ))
-            .child(strong(self.host_label.clone()))
-            .when(!between.trim().is_empty(), |d| {
-                d.child(between.trim().to_owned())
-            })
-            .child(ui::icons::agent_brand_icon(
-                self.runtime,
-                ui::ICON_XS,
-                p.foreground,
-            ))
-            .child(strong(agent.into()))
-            .when(!after_agent.trim().is_empty(), |d| {
-                d.child(after_agent.trim().to_owned())
-            })
-            .child("·")
-            .child(div().underline().child(text::NB_CHANGE.get()))
-    }
-
-    fn render_change(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let this = cx.weak_entity();
-        let runtime = self.runtime;
-        let runtime_button = Button::new("new-bot-runtime")
-            .outline()
-            .small()
-            .w_full()
-            .dropdown_caret(true)
-            .accessibility_label(runtime_display_label(runtime))
-            .debug_selector(|| "new-bot-runtime".into())
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(ui::icons::agent_brand_icon(
-                        runtime,
-                        ui::ICON_SM,
-                        p.foreground,
-                    ))
-                    .child(div().truncate().child(runtime_display_label(runtime))),
-            )
-            .dropdown_menu(move |mut menu, _, cx| {
-                // Orca lists only agents this computer can run (all of them for a remote host).
-                let local = this.upgrade().is_some_and(|v| v.read(cx).host_is_local);
-                for rt in BOT_RUNTIMES.iter().filter(|rt| {
-                    !local || crate::accounts::installed::agent_maybe_installed(cx, rt.id)
-                }) {
-                    let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(rt.label())
-                            .icon(ui::icons::agent_menu_icon(rt.id))
-                            .checked(runtime == rt.id)
-                            .on_click(move |_, _, cx| {
-                                this.update(cx, |v, cx| v.set_runtime(rt.id, cx)).ok();
-                            }),
-                    );
-                }
-                menu
-            });
-        let this = cx.weak_entity();
-        let current = self.model.clone();
-        let choices = self.model_choices();
-        let model_label = current.as_deref().map_or_else(
-            || text::MODEL_DEFAULT.get().to_owned(),
-            |m| self.model_label(m),
-        );
-        let notice = self.model_notice();
-        let model_button = Button::new("new-bot-model")
-            .outline()
-            .small()
-            .w_full()
-            .dropdown_caret(true)
-            .label(model_label)
-            .debug_selector(|| "new-bot-model".into())
-            .dropdown_menu(move |mut menu, _, _| {
-                let pick = |choice: Option<String>| {
-                    let this = this.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        this.update(cx, |v, cx| v.set_model(choice.clone(), cx))
-                            .ok();
-                    }
-                };
-                // agy lists every model × effort pair, so long lists scroll.
-                menu = menu.max_h(px(360.)).scrollable(true).item(
-                    PopupMenuItem::new(text::MODEL_DEFAULT.get())
-                        .checked(current.is_none())
-                        .on_click(pick(None)),
-                );
-                for choice in &choices {
-                    menu = menu.item(
-                        PopupMenuItem::new(choice.label.clone())
-                            .checked(current.as_deref() == Some(choice.id.as_str()))
-                            .on_click(pick(Some(choice.id.clone()))),
-                    );
-                }
-                if let Some(notice) = &notice {
-                    menu = menu.label(notice.clone());
-                }
-                menu
-            });
-        let field = |label: &'static str| {
-            div()
-                .text_size(ui::TEXT_SM)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.foreground)
-                .child(label)
-        };
-        div()
-            .id("new-bot-change")
-            .debug_selector(|| "new-bot-change".into())
-            .mt_3()
-            .pt_3()
-            .border_t_1()
-            .border_color(p.border)
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(field(text::NB_COMPUTER.get()))
-                    .child(self.render_host_picker(p, cx))
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(text::NB_COMPUTER_HINT.get()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(field(text::NB_AGENT.get()))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(div().flex_1().min_w_0().child(runtime_button))
-                            .child(div().flex_1().min_w_0().child(model_button)),
-                    ),
-            )
-    }
-
-    /// Orca's Computer field: this computer and each connected one. Computers whose Krill
-    /// predates bots are greyed out and open the update; unreachable ones can't be picked.
-    fn render_host_picker(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let current = div()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .child(ui::icons::svg_icon(
-                if self.host_is_local {
-                    ui::icons::MONITOR_SVG
-                } else {
-                    ui::icons::CLOUD_SVG
-                },
-                ui::ICON_SM,
-                p.muted_foreground,
-            ))
-            .child(div().truncate().child(self.host_label.clone()));
-        if self.hosts.len() < 2 {
-            return current.text_size(ui::TEXT_LG).into_any_element();
-        }
-        let this = cx.weak_entity();
-        Button::new("new-bot-host")
-            .outline()
-            .small()
-            .w_full()
-            .dropdown_caret(true)
-            .accessibility_label(self.host_label.clone())
-            .debug_selector(|| "new-bot-host".into())
-            .child(current)
-            .dropdown_menu(move |mut menu, _, cx| {
-                let Some(view) = this.upgrade() else {
-                    return menu;
-                };
-                let view = view.read(cx);
-                // Orca lists the computers that can take the bot first.
-                let mut rows: Vec<(HostChoice, Option<Blocked>)> = view
-                    .hosts
-                    .iter()
-                    .map(|h| (h.clone(), view.blocked.get(&h.id).cloned()))
-                    .collect();
-                rows.sort_by_key(|(_, blocked)| blocked.is_some());
-                let current = view.host_id.clone();
-                for (host, blocked) in rows {
-                    let this = this.clone();
-                    let id = host.id.clone();
-                    let item = match blocked {
-                        None => PopupMenuItem::new(host.label)
-                            .checked(id == current)
-                            .on_click(move |_, _, cx| {
-                                this.update(cx, |v, cx| v.select_host(&id, cx)).ok();
-                            }),
-                        Some(blocked) => {
-                            let update = matches!(blocked, Blocked::NoBots(_));
-                            let label = host.label;
-                            PopupMenuItem::element(move |_, cx| {
-                                blocked_host_row(&label, &blocked, cx)
-                            })
-                            .disabled(!update)
-                            .on_click(move |_, _, cx| {
-                                this.update(cx, |_, cx| cx.emit(Event::UpdateHost)).ok();
-                            })
-                        }
-                    };
-                    menu = menu.item(item);
-                }
-                menu
-            })
-            .into_any_element()
-    }
-
-    fn render_comes_with(
+    fn render_template_parts(
         &self,
         tpl: &'static BotTemplate,
         p: &ui::Palette,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let list = super::templates::comes_with_rows(tpl, p, |skill| {
-            let id = SharedString::from(format!("new-bot-skill-{skill}"));
-            Some(
-                gpui_component::checkbox::Checkbox::new(id)
-                    .checked(self.skills.contains(&skill))
-                    .accessibility_label(text::NB_ADD_SKILL.format(&[("skill", skill)]))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_skill(skill, cx)))
-                    .into_any_element(),
-            )
-        });
-        div()
-            .pt_4()
-            .border_t_1()
-            .border_color(p.border)
+    ) -> gpui::Stateful<gpui::Div> {
+        let apps_n = tpl.connectors.len();
+        let skills_n = tpl.skills.len();
+        let kept_n = self.skills.len();
+        let sched_n = tpl.schedules.len();
+        let events_n = tpl.events.len();
+
+        let mut row = div()
+            .id("new-bot-template-parts")
+            .debug_selector(|| "new-bot-template-parts".into())
             .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(ui::TEXT_SM)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(p.foreground)
-                    .child(text::NB_COMES_WITH.get()),
-            )
-            .child(
-                div()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::NB_COMES_WITH_TIP.get()),
-            )
-            .children(list)
+            .flex_wrap()
+            .items_center()
+            .gap_1p5();
+
+        let chip_btn = |id: &'static str,
+                        chip: TemplateChip,
+                        icon: AnyElement,
+                        label: SharedString,
+                        warning: bool,
+                        muted_label: bool,
+                        content: ChipContentFn| {
+            let open = self.open_chip == Some(chip);
+            let entity = cx.entity();
+            Popover::new(SharedString::from(format!("{id}-popover")))
+                .open(open)
+                .appearance(false)
+                .on_open_change(cx.listener(move |this, is_open: &bool, _, cx| {
+                    this.open_chip = (*is_open).then_some(chip);
+                    cx.notify();
+                }))
+                .trigger(PopoverTrigger(
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.to_owned())
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .h(px(26.))
+                        .px_2p5()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if warning {
+                            p.warning.opacity(0.45)
+                        } else {
+                            p.border
+                        })
+                        .cursor_pointer()
+                        .hover(|d| d.bg(p.accent.opacity(0.5)))
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if warning {
+                            p.warning
+                        } else if muted_label {
+                            p.muted_foreground
+                        } else {
+                            p.foreground
+                        })
+                        .child(icon)
+                        .child(label),
+                    open,
+                ))
+                .content(move |_, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        let palette = ui::palette(cx);
+                        div()
+                            .w(px(288.))
+                            .p_2()
+                            .bg(palette.popover)
+                            .text_color(palette.popover_foreground)
+                            .border_1()
+                            .border_color(palette.border)
+                            .rounded(ui::RADIUS_MD)
+                            .shadow_lg()
+                            .occlude()
+                            .child(content(this, palette, cx))
+                            .into_any_element()
+                    })
+                })
+        };
+
+        if apps_n > 0 || tpl.needs_setup.is_some() {
+            let label: SharedString = if apps_n == 1 {
+                text::NB_TPL_PART_APPS_ONE.get().into()
+            } else {
+                text::NB_TPL_PART_APPS_MANY
+                    .format(&[("n", &apps_n.to_string())])
+                    .into()
+            };
+            let warn = tpl.needs_setup.is_some();
+            row = row.child(chip_btn(
+                "new-bot-chip-apps",
+                TemplateChip::Apps,
+                ui::icons::svg_icon(
+                    ui::icons::PLUG_SVG,
+                    ui::ICON_MD,
+                    if warn { p.warning } else { p.foreground },
+                )
+                .into_any_element(),
+                label,
+                warn,
+                false,
+                Box::new(move |this, p, _| {
+                    let mut list = div().flex().flex_col().gap_1();
+                    for c in tpl.connectors {
+                        let state = div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::NB_TPL_PICKS_IN_CHAT.get())
+                            .into_any_element();
+                        list = list.child(template_part_row(
+                            ui::icons::svg_icon(
+                                ui::icons::PLUG_SVG,
+                                ui::ICON_MD,
+                                p.muted_foreground,
+                            )
+                            .into_any_element(),
+                            super::View::source_label(*c).to_owned(),
+                            None,
+                            Some(state),
+                            p,
+                        ));
+                    }
+                    if let Some(note) = tpl.needs_setup {
+                        list = list.child(template_part_row(
+                            Icon::new(IconName::CircleAlert)
+                                .size(px(ui::ICON_MD))
+                                .text_color(p.warning)
+                                .into_any_element(),
+                            text::NB_TPL_MANUAL_SETUP.get().to_owned(),
+                            Some(note.to_owned()),
+                            None,
+                            p,
+                        ));
+                    }
+                    let _ = this;
+                    list.into_any_element()
+                }),
+            ));
+        }
+
+        if skills_n > 0 {
+            let label: SharedString = if kept_n == skills_n {
+                if skills_n == 1 {
+                    text::NB_TPL_PART_SKILLS_ONE.get().into()
+                } else {
+                    text::NB_TPL_PART_SKILLS_MANY
+                        .format(&[("n", &skills_n.to_string())])
+                        .into()
+                }
+            } else {
+                text::NB_TPL_PART_SKILLS_PARTIAL
+                    .format(&[
+                        ("on", &kept_n.to_string()),
+                        ("total", &skills_n.to_string()),
+                    ])
+                    .into()
+            };
+            row = row.child(chip_btn(
+                "new-bot-chip-skills",
+                TemplateChip::Skills,
+                ui::icons::svg_icon(ui::icons::BOOK_OPEN_SVG, ui::ICON_MD, p.foreground)
+                    .into_any_element(),
+                label,
+                false,
+                kept_n < skills_n,
+                Box::new(move |this, p, cx| {
+                    let mut list = div().flex().flex_col().gap_1();
+                    for skill_id in tpl.skills {
+                        let checked = this.skills.contains(skill_id);
+                        let desc = find_bot_skill(skill_id).map(|s| s.description.to_owned());
+                        let sid = *skill_id;
+                        let view = cx.weak_entity();
+                        let toggle = ui::switch(
+                            p,
+                            SharedString::from(format!("new-bot-skill-switch-{sid}")),
+                            checked,
+                            false,
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| this.toggle_skill(sid, cx)).ok();
+                            },
+                        )
+                        .into_any_element();
+                        list = list.child(template_part_row(
+                            ui::icons::svg_icon(
+                                ui::icons::BOOK_OPEN_SVG,
+                                ui::ICON_MD,
+                                p.muted_foreground,
+                            )
+                            .into_any_element(),
+                            (*skill_id).to_owned(),
+                            desc,
+                            Some(toggle),
+                            p,
+                        ));
+                    }
+                    list.into_any_element()
+                }),
+            ));
+        }
+
+        if sched_n > 0 {
+            let label: SharedString = if sched_n == 1 {
+                text::NB_TPL_PART_ROUTINES_ONE.get().into()
+            } else {
+                text::NB_TPL_PART_ROUTINES_MANY
+                    .format(&[("n", &sched_n.to_string())])
+                    .into()
+            };
+            row = row.child(chip_btn(
+                "new-bot-chip-schedules",
+                TemplateChip::Schedules,
+                ui::icons::svg_icon(ui::icons::CLOCK_SVG, ui::ICON_MD, p.foreground)
+                    .into_any_element(),
+                label,
+                false,
+                false,
+                Box::new(move |_, p, _| {
+                    let mut list = div().flex().flex_col().gap_1();
+                    for s in tpl.schedules {
+                        let st = div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::NB_TPL_STARTS_OFF.get())
+                            .into_any_element();
+                        list = list.child(template_part_row(
+                            ui::icons::svg_icon(
+                                ui::icons::CLOCK_SVG,
+                                ui::ICON_MD,
+                                p.muted_foreground,
+                            )
+                            .into_any_element(),
+                            s.what.to_owned(),
+                            Some(s.when.to_owned()),
+                            Some(st),
+                            p,
+                        ));
+                    }
+                    list.into_any_element()
+                }),
+            ));
+        }
+
+        if events_n > 0 {
+            let label: SharedString = if events_n == 1 {
+                text::NB_TPL_PART_EVENTS_ONE.get().into()
+            } else {
+                text::NB_TPL_PART_EVENTS_MANY
+                    .format(&[("n", &events_n.to_string())])
+                    .into()
+            };
+            row = row.child(chip_btn(
+                "new-bot-chip-events",
+                TemplateChip::Events,
+                ui::icons::svg_icon(ui::icons::ZAP_SVG, ui::ICON_MD, p.foreground)
+                    .into_any_element(),
+                label,
+                false,
+                false,
+                Box::new(move |_, p, _| {
+                    let mut list = div().flex().flex_col().gap_1();
+                    for ev in tpl.events {
+                        let st = div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::NB_TPL_PICKS_IN_CHAT.get())
+                            .into_any_element();
+                        list = list.child(template_part_row(
+                            ui::icons::svg_icon(
+                                ui::icons::ZAP_SVG,
+                                ui::ICON_MD,
+                                p.muted_foreground,
+                            )
+                            .into_any_element(),
+                            ev.name.to_owned(),
+                            None,
+                            Some(st),
+                            p,
+                        ));
+                    }
+                    list.into_any_element()
+                }),
+            ));
+        }
+
+        row
+    }
+
+    fn render_proposal_fields(&self, p: &ui::Palette) -> Option<AnyElement> {
+        if self.template.is_some() {
+            return None;
+        }
+        let prop = self.proposal.as_ref()?;
+        let row =
+            |id: &'static str, label: &'static str, entity: Option<&Entity<TextareaState>>| {
+                entity.map(|inp| {
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.to_owned())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(label),
+                        )
+                        .child(Textarea::new(inp).appearance(false))
+                })
+            };
+        let has_any = self.watches.is_some()
+            || self.does.is_some()
+            || self.reports.is_some()
+            || !prop.worktrees.is_empty();
+        if !has_any {
+            return None;
+        }
+
+        Some(
+            div()
+                .id("new-bot-proposal-fields")
+                .debug_selector(|| "new-bot-proposal-fields".into())
+                .pt_4()
+                .border_t_1()
+                .border_color(p.border)
+                .flex()
+                .flex_col()
+                .gap_4()
+                .children(row(
+                    "new-bot-watches",
+                    text::NB_WATCHES.get(),
+                    self.watches.as_ref(),
+                ))
+                .children(row("new-bot-does", text::NB_DOES.get(), self.does.as_ref()))
+                .children(row(
+                    "new-bot-reports",
+                    text::NB_REPORTS.get(),
+                    self.reports.as_ref(),
+                ))
+                .children(self.render_takes_over(p))
+                .into_any_element(),
+        )
     }
 
     fn render_footer(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
         let show_templates = self.form_is_empty(cx);
+        let can_submit = self.can_submit(cx);
         let chord = if cfg!(target_os = "macos") {
             "⌘ ↵"
         } else {
@@ -1351,23 +1190,23 @@ impl NewBot {
                         .text_size(ui::TEXT_SM)
                         .text_color(p.muted_foreground)
                         .hover(|d| d.text_color(p.foreground))
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::BrowseTemplates)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.picture.cancel_running_generation();
+                            cx.emit(Event::BrowseTemplates);
+                        }))
                         .child(ui::icons::svg_icon(
                             ui::icons::LAYOUT_TEMPLATE_SVG,
                             ui::ICON_MD,
                             p.muted_foreground,
                         ))
-                        .child(text::NB_START_FROM_TEMPLATE.get()),
+                        .child(text::NB_TEMPLATE_SHORT.get()),
                 )
             })
             .child(
                 div().ml_auto().child(
-                    ui::primary("new-bot-create", text::NB_CREATE.get())
+                    ui::primary("new-bot-create", text::NB_CREATE_SHORT.get())
                         .debug_selector(|| "new-bot-create".into())
-                        .disabled(
-                            self.submitting
-                                || available_runtimes(self.host_is_local, cx).is_empty(),
-                        )
+                        .disabled(!can_submit)
                         .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
                         .child(
                             div()
@@ -1386,87 +1225,121 @@ impl NewBot {
     }
 }
 
+/// Longest prefix of `s` within `max` bytes ending on a char boundary.
+fn clip_bytes(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or(s)
+}
+
+/// First `max` characters of `s`.
+fn clip_chars(s: &str, max: usize) -> &str {
+    s.char_indices()
+        .nth(max)
+        .and_then(|(i, _)| s.get(..i))
+        .unwrap_or(s)
+}
+
 impl Render for NewBot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
+        let dark = cx.theme().mode.is_dark();
         let viewport = window.viewport_size();
-        let width = if self.template.is_some() {
-            TEMPLATE_DIALOG_WIDTH
+        let width = if self.proposal.is_some() && self.template.is_none() {
+            PROPOSAL_DIALOG_WIDTH
         } else {
             DIALOG_WIDTH
         };
-        let subtitle: SharedString = match self.template {
-            Some(t) => text::NB_FROM_TEMPLATE
-                .format(&[("template", t.name)])
-                .into(),
-            None => text::NB_SUBTITLE.get().into(),
-        };
-        let custom = self.face() == Face::Custom;
-        let purpose_len = self.purpose.read(cx).value().chars().count();
 
-        let picker = div()
-            .id("new-bot-picker")
-            .relative()
-            .rounded(ui::RADIUS_XL)
-            .border_1()
-            .border_color(ui::TRANSPARENT)
-            .drag_over::<ExternalPaths>(move |d, _, _, _| {
-                d.border_dashed().border_color(p.foreground.opacity(0.35))
-            })
-            .child(self.render_carousel(p, window, cx))
-            // Orca hides the swatches for a picture; keep their space so nothing below moves.
-            .child(self.render_swatches(p, cx).when(custom, Styled::invisible))
-            .child(match self.picture_error {
-                Some(err) => div()
-                    .id("new-bot-picture-error")
-                    .role(gpui::Role::Alert)
-                    .mt_0p5()
-                    .h(px(28.))
+        let purpose_text = self.purpose.read(cx).value().to_string();
+        let purpose_len = purpose_text.chars().count();
+        let show_counter = purpose_len >= PURPOSE_COUNTER_FROM
+            && self
+                .prefilled_identity
+                .as_deref()
+                .is_none_or(|pre| purpose_text.trim() != pre);
+        let too_long = self.identity_too_long(cx);
+
+        let name_row = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                self.picture
+                    .render_new_bot_trigger(Self::picture_mut, p, cx),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.destructive)
-                    .child(ui::icons::svg_icon(
-                        ui::icons::TRIANGLE_ALERT_SVG,
-                        ui::ICON_MD,
-                        p.destructive,
-                    ))
-                    .child(err.message())
-                    .into_any_element(),
-                None => Self::render_upload_line(p, cx).into_any_element(),
-            });
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_2XL)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(Input::new(&self.name).appearance(false)),
+                    )
+                    .children(self.picture.intake_error().map(|err| {
+                        div()
+                            .mt_1()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.destructive)
+                            .child(
+                                Icon::new(IconName::CircleAlert)
+                                    .size(px(ui::ICON_MD))
+                                    .text_color(p.destructive),
+                            )
+                            .child(err.message())
+                    })),
+            );
 
-        let fields = div()
+        let identity_box = div()
             .flex()
             .flex_col()
             .gap_1()
             .child(
-                Input::new(&self.name)
-                    .appearance(false)
-                    .text_align(TextAlign::Center)
-                    .text_size(ui::TEXT_2XL)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .px_9(),
-            )
-            .child(
-                Input::new(&self.purpose)
-                    .appearance(false)
-                    .text_align(TextAlign::Center)
-                    .text_size(ui::TEXT_LG)
-                    .text_color(p.muted_foreground)
-                    .px_9(),
-            )
-            // The counter's line is always there; it only becomes visible near the limit.
-            .child(
                 div()
-                    .text_center()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.background)
+                    .px_3()
+                    .py_2()
                     .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .when(purpose_len < 160, Styled::invisible)
-                    .child(format!("{purpose_len}/{PURPOSE_MAX}")),
-            );
+                    .child(Textarea::new(&self.purpose).appearance(false)),
+            )
+            .when(show_counter, |d| {
+                d.child(
+                    div()
+                        .text_right()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(if too_long {
+                            p.destructive
+                        } else {
+                            p.muted_foreground
+                        })
+                        .child(format!("{purpose_len}/{PURPOSE_MAX}")),
+                )
+            });
+
+        let taken = self.taken_names.clone();
+        let runs_on = render_runs_on_picker(
+            "new-bot",
+            RunsOnVariant::Fields,
+            &self.setup,
+            None,
+            &taken,
+            Self::setup_mut,
+            Self::on_update_host,
+            p,
+            cx,
+        );
 
         let body = div()
             .id("new-bot-body")
@@ -1476,31 +1349,25 @@ impl Render for NewBot {
             .flex()
             .flex_col()
             .gap_4()
-            .child(picker)
-            .child(fields)
+            .children(self.render_import_nudge(p, cx))
             .child(
                 div()
+                    .pt_1()
                     .flex()
                     .flex_col()
-                    .child(self.render_runs_on(p, cx))
-                    .when(
-                        !self.changing && available_runtimes(self.host_is_local, cx).is_empty(),
-                        |d| {
-                            d.child(
-                                div()
-                                    .mt_1()
-                                    .text_center()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(text::NB_NO_AGENTS.get()),
-                            )
-                        },
-                    )
-                    .when(self.changing, |d| d.child(self.render_change(p, cx))),
+                    .gap_3()
+                    .child(name_row)
+                    .child(identity_box),
             )
-            .children(self.template.map(|t| self.render_comes_with(t, p, cx)))
+            .child(runs_on)
+            .when_some(self.template, |d, tpl| {
+                d.children(self.render_takes_over(p))
+                    .child(self.render_template_parts(tpl, p, cx))
+            })
+            .children(self.render_proposal_fields(p))
             .children(self.error.clone().map(|e| ui::error_banner(p, e)));
 
+        let band = self.picture.band_color();
         let card = div()
             .id("new-bot-dialog")
             .debug_selector(|| "new-bot-dialog".into())
@@ -1508,10 +1375,11 @@ impl Render for NewBot {
             .aria_label(text::NB_TITLE.get())
             .occlude()
             .relative()
+            .overflow_hidden()
             .w(px(width))
             .max_w((viewport.width - ui::SPACE_4 * 2.).max(px(0.)))
             .max_h((viewport.height - ui::SPACE_4 * 2.).max(px(0.)))
-            .p_6()
+            .p_5()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)
@@ -1524,8 +1392,8 @@ impl Render for NewBot {
             .flex_col()
             .gap_4()
             .capture_action(
-                cx.listener(|this, _: &gpui_component::input::Paste, window, cx| {
-                    if this.paste_picture(window, cx) {
+                cx.listener(|this, _: &gpui_component::input::Paste, _, cx| {
+                    if this.picture.paste_image(Self::picture_mut, cx) {
                         cx.stop_propagation();
                     }
                 }),
@@ -1541,12 +1409,20 @@ impl Render for NewBot {
                 cx.listener(|this, e: &KeyDownEvent, window, cx| this.on_key(e, window, cx)),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                if let Some(path) = paths.paths().first().cloned() {
-                    this.load_picture_from_path(path, cx);
-                }
+                this.picture.drop_paths(paths, Self::picture_mut, cx);
             }))
-            // A click on the card (or a menu it opened) stays here; the backdrop closes.
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(band.map(|rgb| {
+                div()
+                    .id("new-bot-band")
+                    .debug_selector(|| "new-bot-band".into())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(84.))
+                    .bg(ui::new_bot_band_fill(rgb, dark))
+            }))
             .child(
                 div().absolute().top_4().right_4().child(
                     Button::new("new-bot-close")
@@ -1562,25 +1438,23 @@ impl Render for NewBot {
                 div()
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .text_center()
+                    .gap_1()
                     .child(
                         div()
                             .text_size(ui::TEXT_XL)
                             .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(relative(1.375))
                             .child(text::NB_TITLE.get()),
                     )
-                    .child(
+                    .children(self.origin.clone().map(|orig| {
                         div()
-                            .text_size(ui::TEXT_LG)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
-                            .child(subtitle),
-                    ),
+                            .child(orig)
+                    })),
             )
             .child(body)
             .child(self.render_footer(p, cx));
+
         ui::modal_backdrop(
             viewport,
             div()
@@ -1597,6 +1471,53 @@ impl Render for NewBot {
                 .child(ui::modal_focus_scope(card, &self.focus)),
         )
     }
+}
+
+impl EventEmitter<Event> for NewBot {}
+
+impl std::fmt::Debug for NewBot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewBot")
+            .field("submitting", &self.submitting)
+            .field("has_template", &self.template.is_some())
+            .field("has_proposal", &self.proposal.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+fn template_part_row(
+    icon: AnyElement,
+    title: String,
+    subtitle: Option<String>,
+    right: Option<AnyElement>,
+    p: &ui::Palette,
+) -> gpui::Div {
+    div()
+        .px_2()
+        .py_1p5()
+        .rounded(ui::RADIUS_XS)
+        .flex()
+        .items_start()
+        .gap_2p5()
+        .child(div().mt(px(2.)).flex_none().child(icon))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(p.foreground)
+                        .child(title),
+                )
+                .children(subtitle.map(|s| {
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(s)
+                })),
+        )
+        .children(right)
 }
 
 impl gpui::Focusable for NewBot {

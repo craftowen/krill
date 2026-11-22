@@ -14,8 +14,11 @@ pub use brands::{
     AIDER_SVG, AMP_PNG, ANTIGRAVITY_PNG, CLAUDE_SVG, CLINE_PNG, CONTINUE_PNG, COPILOT_SVG,
     CRUSH_PNG, CURSOR_PNG, DEVIN_PNG, DROID_PNG, DSH_PNG, GOOSE_PNG, GROK_PNG, HERMES_PNG,
     KILO_PNG, KIMI_PNG, KIRO_PNG, MISTRAL_VIBE_PNG, MUSE_PNG, OMP_SVG, OPENAI_SVG, OPENCLAUDE_PNG,
-    OPENCODE_SVG, PI_SVG, QWEN_PNG, TRAE_PNG, ZCODE_PNG,
+    OPENCLAW_PNG, OPENCODE_SVG, PI_SVG, QWEN_PNG, TRAE_PNG, ZCODE_PNG,
 };
+
+/// Lucide `image-up` 아이콘 SVG(ISC License). 봇 아바타 업로드 링크·버튼.
+pub const IMAGE_UP_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M10.3 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10l-3.1-3.1a2 2 0 0 0-2.814.014L6 21"/><path d="m14 19.5 3-3 3 3"/><path d="M17 22v-5.5"/><circle cx="9" cy="9" r="2"/></svg>"#;
 
 /// 커스텀 에이전트 메뉴용 중립 봇 마크. 특정 프로바이더 로고로 오인하지 않게 한다.
 pub const CUSTOM_AGENT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5M23 12v5M9 17h6"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>"#;
@@ -149,6 +152,8 @@ pub const GAUGE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="cu
 pub const CIRCLE_HELP_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>"#;
 /// Lucide `inbox`.
 pub const INBOX_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>"#;
+/// Lucide `list-checks`.
+pub const LIST_CHECKS_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg>"#;
 /// Lucide `user-plus`.
 pub const USER_PLUS_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/></svg>"#;
 /// Lucide `arrow-up-right`.
@@ -220,6 +225,9 @@ pub const SPLIT_HORIZONTAL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none"
 /// Lucide `square-split-vertical` 아이콘 SVG(ISC License). 패인 상하 분할(아래에 분할).
 pub const SPLIT_VERTICAL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M5 8V5c0-1 1-2 2-2h10c1 0 2 1 2 2v3"/><path d="M19 16v3c0 1-1 2-2 2H7c-1 0-2-1-2-2v-3"/><line x1="4" x2="20" y1="12" y2="12"/></svg>"#;
 
+/// Lucide `reply` 아이콘 SVG(ISC License). 그룹 채팅 멤버 턴 답장 버튼.
+pub const REPLY_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M20 18v-2a4 4 0 0 0-4-4H4"/><path d="m9 17-5-5 5-5"/></svg>"#;
+
 /// Krill 공식 소버린 코랄 크릴(A1) 모노크롬 마크 SVG (`viewBox="0 0 24 24"`).
 /// Source: `packaging/macos/krill-mono.svg` (뾰족한 두흉부·눈·더듬이·3단 아치 등갑·부채꼴 미절).
 pub const KRILL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M20.36 7.07C18.5 5.8 15.02 4.99 12.24 5.91C11.31 6.26 10.73 6.73 10.36 7.43L11.55 10.7C13.86 10.9 16.76 9.97 18.5 8.7C19.2 8.18 19.78 7.65 20.36 7.07ZM15.14 7.42A0.81 0.81 0 1 0 16.76 7.42A0.81 0.81 0 1 0 15.14 7.42ZM18.27 6.49C15.6 3.01 9.22 2.08 3.77 5.91C9.11 2.9 15.26 3.94 17.81 6.73ZM17.69 6.84C15.02 4.52 10.38 4.06 6.32 6.61C10.27 4.75 14.68 5.33 17.23 7.07ZM9.49 7.82A6.84 6.84 0 0 0 6.2 11.75L9.5 12.82A3.36 3.36 0 0 1 11.12 10.89ZM6.4 12.29A6.5 6.5 0 0 0 6.97 16.9L9.48 15.57A3.65 3.65 0 0 1 9.16 12.98ZM7.59 17.06A6.03 6.03 0 0 0 10.84 19.6L11.48 17.61A3.94 3.94 0 0 1 9.35 15.95ZM11.66 18.21Q15.02 16.93 18.97 17.63Q17.11 19.14 12.82 19.48ZM12.82 19.72Q16.76 19.83 18.62 21.92Q14.79 21.92 11.66 19.83Z"/></svg>"#;
@@ -282,6 +290,7 @@ pub fn agent_icon_bytes(agent_id: &str) -> &'static [u8] {
         "mistral-vibe" => MISTRAL_VIBE_PNG,
         "muse" => MUSE_PNG,
         "openclaude" => OPENCLAUDE_PNG,
+        "openclaw" => OPENCLAW_PNG,
         "qwen" => QWEN_PNG,
         "trae" => TRAE_PNG,
         "zcode" => ZCODE_PNG,
@@ -322,7 +331,7 @@ pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
         "codex" | "opencode" | "opencode2" | "cursor" | "cursor-agent" | "pi" | "copilot"
         | "aider" | "omp" | "grok" | "muse" | "hermes" | "kimi" | "qwen" | "droid" | "kiro"
         | "goose" | "amp" | "mistral-vibe" | "crush" | "cline" | "kilo" | "continue" | "devin"
-        | "trae" | "zcode" | "dsh" | "openclaude" => fg,
+        | "trae" | "zcode" | "dsh" | "openclaude" | "openclaw" => fg,
         _ => rgb(CUSTOM_AGENT_COLOR).into(),
     }
 }

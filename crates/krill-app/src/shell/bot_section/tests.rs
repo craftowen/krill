@@ -250,3 +250,396 @@ fn bot_options_sort_and_hide_and_search_lists_matches(cx: &mut TestAppContext) {
     click(cx, "bot-search-result-zed");
     assert!(cx.debug_bounds("bots-search-results").is_none());
 }
+
+fn group_rpc(
+    recorded: Arc<std::sync::Mutex<Vec<String>>>,
+    room_view: krill_proto::bots::BotGroupRoomView,
+    items: Vec<krill_proto::bots::BotItem>,
+) -> krill_app::bots::BotRpcCall {
+    use krill_proto::bots::{BotGroupThread, BotGroupView, BotRpcRequest, BotRpcResponse};
+    let base_view = room_view.clone();
+    Arc::new(move |req| match req {
+        BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![])),
+        BotRpcRequest::ListGroupSummaries => Ok(BotRpcResponse::GroupSummaries(vec![])),
+        BotRpcRequest::ReadGroupRoom { .. } => Ok(BotRpcResponse::GroupRoom(room_view.clone())),
+        BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(items.clone())),
+        BotRpcRequest::CreateGroup { name, bot_ids, .. } => {
+            recorded
+                .lock()
+                .expect("record lock")
+                .push(format!("create:{name}:{}", bot_ids.len()));
+            let created = krill_proto::bots::BotGroupChat {
+                id: "grp-new".to_owned(),
+                name: name.clone(),
+                bot_ids: bot_ids.clone(),
+                description: String::new(),
+                created_at_ms: 1_700_000_000_100,
+                updated_at_ms: 1_700_000_000_100,
+            };
+            Ok(BotRpcResponse::Group(created))
+        }
+        BotRpcRequest::NewGroupThread { group_id, title } => {
+            recorded
+                .lock()
+                .expect("record lock")
+                .push(format!("thread:{group_id}:{title:?}"));
+            let mut g = base_view.group.clone();
+            g.id.clone_from(group_id);
+            Ok(BotRpcResponse::GroupView(BotGroupView {
+                group: g,
+                threads: vec![BotGroupThread {
+                    thread_id: "thr-new".to_owned(),
+                    group_id: group_id.clone(),
+                    title: title.clone().unwrap_or_else(|| "Follow-up".to_owned()),
+                    created_at_ms: 1_700_000_000_200,
+                    updated_at_ms: 1_700_000_000_200,
+                }],
+                messages: Vec::new(),
+                active_run: false,
+            }))
+        }
+        BotRpcRequest::SetGroupReplyAudience { group_id, audience } => {
+            recorded
+                .lock()
+                .expect("record lock")
+                .push(format!("audience:{group_id}:{audience:?}"));
+            Ok(BotRpcResponse::GroupReplyAudienceUpdated {
+                group_id: group_id.clone(),
+                audience: audience.clone(),
+            })
+        }
+        BotRpcRequest::SendGroupMessageWithAudience {
+            group_id,
+            text,
+            audience,
+            ..
+        } => {
+            recorded
+                .lock()
+                .expect("record lock")
+                .push(format!("send:{group_id}:{text}:{audience:?}"));
+            Ok(BotRpcResponse::GroupMessagePosted {
+                message: krill_proto::bots::BotGroupMessage {
+                    message_id: "m-sent".to_owned(),
+                    group_id: group_id.clone(),
+                    thread_id: "thr-main".to_owned(),
+                    sender_id: "owner".to_owned(),
+                    sender_name: "You".to_owned(),
+                    body: text.clone(),
+                    mentions: Vec::new(),
+                    created_at_ms: 1_700_000_000_300,
+                    in_progress: false,
+                },
+                dispatched_bots: Vec::new(),
+            })
+        }
+        BotRpcRequest::StopGroupMember {
+            group_id, bot_id, ..
+        } => {
+            recorded
+                .lock()
+                .expect("record lock")
+                .push(format!("stop:{group_id}:{bot_id:?}"));
+            Ok(BotRpcResponse::Ok)
+        }
+        BotRpcRequest::DeleteGroup { group_id } => {
+            recorded
+                .lock()
+                .expect("record lock")
+                .push(format!("delete:{group_id}"));
+            Ok(BotRpcResponse::Ok)
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    })
+}
+
+#[gpui::test]
+fn group_sidebar_row_create_dialog_search_and_open_page(cx: &mut TestAppContext) {
+    use krill_proto::bots::{
+        BotGroupChat, BotGroupMessage, BotGroupReplyAudience, BotGroupRoomView, BotGroupSummary,
+        BotGroupThread,
+    };
+
+    let (view, cx) = setup(cx, "bot-group-create-and-search");
+    let group = BotGroupChat {
+        id: "grp-1".to_owned(),
+        name: "Release Crew".to_owned(),
+        bot_ids: vec![BotId::new("krill").unwrap(), BotId::new("zed").unwrap()],
+        description: String::new(),
+        created_at_ms: 1_700_000_000_010,
+        updated_at_ms: 1_700_000_000_010,
+    };
+    let summary = BotGroupSummary {
+        group: group.clone(),
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: vec![BotGroupThread {
+            thread_id: "thr-main".to_owned(),
+            group_id: "grp-1".to_owned(),
+            title: "Main thread".to_owned(),
+            created_at_ms: 1_700_000_000_010,
+            updated_at_ms: 1_700_000_000_010,
+        }],
+        latest_message: Some(BotGroupMessage {
+            message_id: "m0".to_owned(),
+            group_id: "grp-1".to_owned(),
+            thread_id: "thr-main".to_owned(),
+            sender_id: "krill".to_owned(),
+            sender_name: "Krill bot".to_owned(),
+            body: "Standing by".to_owned(),
+            mentions: Vec::new(),
+            created_at_ms: 1_700_000_000_020,
+            in_progress: false,
+        }),
+        active_turns: Vec::new(),
+    };
+    let room_view = BotGroupRoomView {
+        group,
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: summary.threads.clone(),
+        active_thread_id: Some("thr-main".to_owned()),
+        messages: summary.latest_message.iter().cloned().collect(),
+        has_earlier: false,
+        active_turns: Vec::new(),
+    };
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rpc = group_rpc(recorded.clone(), room_view, Vec::new());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let bots = s.sidebar_bots.clone();
+            s.bot_rpc_override = Some(rpc);
+            s.apply_sidebar_state(0, bots, vec![summary], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("bot-group-row-grp-1").is_some());
+
+    // Group search hit opens the Bot Group Page & BotGroupItemsPanel.
+    click(cx, "bots-section-search");
+    cx.simulate_input("Release");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bot-group-search-result-grp-1").is_some());
+    click(cx, "bot-group-search-result-grp-1");
+    assert!(cx.debug_bounds("bot-group-page").is_some());
+    assert!(cx.debug_bounds("group-composer-card").is_some());
+    assert!(cx.debug_bounds("group-reply-picker").is_some());
+    assert!(cx.debug_bounds("bot-group-panel").is_some());
+    assert!(cx.debug_bounds("bot-group-panel-header").is_some());
+    assert!(cx.debug_bounds("bot-group-panel-members-btn").is_some());
+    assert!(cx.debug_bounds("bot-group-panel-filter").is_some());
+
+    // Open BotGroupMembersDialog (`New group`), pick 2 bots, accept suggested name, and submit.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.open_new_group_dialog(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bot-group-members-dialog").is_some());
+    click(cx, "group-member-pick-krill");
+    click(cx, "group-member-pick-zed");
+    assert!(cx.debug_bounds("group-name-suggestion").is_some());
+    click(cx, "group-name-suggestion");
+    click(cx, "group-dialog-submit");
+    assert!(cx.debug_bounds("bot-group-members-dialog").is_none());
+
+    let log = recorded.lock().expect("log lock");
+    assert!(
+        log.iter().any(|e| e == "create:Krill bot & Alpha shop:2"),
+        "expected CreateGroup RPC in log, got {log:?}"
+    );
+}
+
+#[gpui::test]
+fn group_page_turns_peer_handoff_reply_picker_and_panel_filters(cx: &mut TestAppContext) {
+    use krill_proto::bots::{
+        BotGroupChat, BotGroupMessage, BotGroupReplyAudience, BotGroupRoomView, BotGroupSummary,
+        BotGroupThread, BotGroupTurnInfo, BotItem, BotItemEvent, BotItemEventKind, BotItemLink,
+        BotItemStatus,
+    };
+
+    let (view, cx) = setup(cx, "bot-group-page-features");
+    let krill_id = BotId::new("krill").unwrap();
+    let zed_id = BotId::new("zed").unwrap();
+    let group = BotGroupChat {
+        id: "grp-release".to_owned(),
+        name: "Ops Team".to_owned(),
+        bot_ids: vec![krill_id.clone(), zed_id.clone()],
+        description: String::new(),
+        created_at_ms: 1_700_000_000_010,
+        updated_at_ms: 1_700_000_000_050,
+    };
+    let summary = BotGroupSummary {
+        group: group.clone(),
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: vec![BotGroupThread {
+            thread_id: "thr-main".to_owned(),
+            group_id: "grp-release".to_owned(),
+            title: "Main thread".to_owned(),
+            created_at_ms: 1_700_000_000_010,
+            updated_at_ms: 1_700_000_000_050,
+        }],
+        latest_message: None,
+        active_turns: vec![BotGroupTurnInfo {
+            group_id: "grp-release".to_owned(),
+            thread_id: "thr-main".to_owned(),
+            bot_id: zed_id.clone(),
+            session_id: SessionId(41),
+            message_id: "m3".to_owned(),
+            started_at_ms: 1_700_000_000_045,
+        }],
+    };
+    let room_view = BotGroupRoomView {
+        group: group.clone(),
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: summary.threads.clone(),
+        active_thread_id: Some("thr-main".to_owned()),
+        messages: vec![
+            BotGroupMessage {
+                message_id: "m1".to_owned(),
+                group_id: "grp-release".to_owned(),
+                thread_id: "thr-main".to_owned(),
+                sender_id: "owner".to_owned(),
+                sender_name: "You".to_owned(),
+                body: "Verify deploy @krill".to_owned(),
+                mentions: vec![krill_id.clone()],
+                created_at_ms: 1_700_000_000_020,
+                in_progress: false,
+            },
+            BotGroupMessage {
+                message_id: "m2".to_owned(),
+                group_id: "grp-release".to_owned(),
+                thread_id: "thr-main".to_owned(),
+                sender_id: "krill".to_owned(),
+                sender_name: "Krill bot".to_owned(),
+                body: "Passed unit checks; @zed please deploy.".to_owned(),
+                mentions: vec![zed_id.clone()],
+                created_at_ms: 1_700_000_000_030,
+                in_progress: false,
+            },
+            BotGroupMessage {
+                message_id: "m3".to_owned(),
+                group_id: "grp-release".to_owned(),
+                thread_id: "thr-main".to_owned(),
+                sender_id: "zed".to_owned(),
+                sender_name: "Alpha shop".to_owned(),
+                body: "Deploying package…".to_owned(),
+                mentions: Vec::new(),
+                created_at_ms: 1_700_000_000_045,
+                in_progress: true,
+            },
+        ],
+        has_earlier: true,
+        active_turns: summary.active_turns.clone(),
+    };
+    let group_item = BotItem {
+        uid: "item-group-1".to_owned(),
+        number: 1,
+        owner_bot_id: krill_id,
+        title: "Release notes check".to_owned(),
+        description: Some("Tracked from grp-release".to_owned()),
+        done_means: None,
+        status: BotItemStatus::NeedsYou,
+        close_note: None,
+        links: vec![BotItemLink::Url("krill://group/grp-release".to_owned())],
+        events: vec![BotItemEvent {
+            id: 1,
+            item_uid: "item-group-1".to_owned(),
+            actor: krill_proto::bots::BotItemActor::Owner { device: None },
+            kind: BotItemEventKind::Made,
+            text: "Created in grp-release".to_owned(),
+            decisions: Vec::new(),
+            created_at_ms: 1_700_000_000_025,
+        }],
+        snoozed_until_ms: None,
+        version: 1,
+        last_activity_at_ms: 1_700_000_000_025,
+        created_at_ms: 1_700_000_000_025,
+        updated_at_ms: 1_700_000_000_025,
+        closed_at_ms: None,
+    };
+    let external_item = BotItem {
+        uid: "item-other-2".to_owned(),
+        number: 2,
+        owner_bot_id: zed_id,
+        title: "Price watch scan".to_owned(),
+        description: Some("Separate schedule".to_owned()),
+        done_means: None,
+        status: BotItemStatus::Working,
+        close_note: None,
+        links: Vec::new(),
+        events: Vec::new(),
+        snoozed_until_ms: None,
+        version: 1,
+        last_activity_at_ms: 1_700_000_000_020,
+        created_at_ms: 1_700_000_000_020,
+        updated_at_ms: 1_700_000_000_020,
+        closed_at_ms: None,
+    };
+
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rpc = group_rpc(recorded.clone(), room_view, vec![group_item, external_item]);
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let bots = s.sidebar_bots.clone();
+            s.bot_rpc_override = Some(rpc);
+            s.apply_sidebar_state(0, bots, vec![summary], cx);
+            s.open_bot_group("grp-release", None, Some(window), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("bot-group-page").is_some());
+    assert!(cx.debug_bounds("group-load-earlier").is_some());
+    assert!(cx.debug_bounds("group-peer-request").is_some());
+    assert!(cx.debug_bounds("grp-turn-krill").is_some());
+    assert!(cx.debug_bounds("grp-turn-zed").is_some());
+    assert!(cx.debug_bounds("grp-turn-stop").is_some());
+    assert!(cx.debug_bounds("group-composer-stop").is_some());
+
+    // Clicking Reply on krill inserts `@krill `, and typing `@kr` keeps mention popup reachable.
+    click(cx, "grp-turn-reply");
+    assert!(cx.debug_bounds("group-composer-send").is_some());
+    click(cx, "group-composer-send");
+
+    // Scope starts at `ThisGroup` (`item-group-1` only) and expands on `AllTheirWork`.
+    assert!(cx.debug_bounds("bot-group-items-list").is_some());
+    cx.update(|_, cx| {
+        let panel_view = view.update(cx, Shell::bot_panel_view).unwrap();
+        assert_eq!(panel_view.read(cx).group_filter_counts().0[0].1, 1);
+        panel_view.update(cx, |v, cx| {
+            v.set_group_chat_scope(
+                krill_app::bots::group_panel::GroupChatScope::AllTheirWork,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let panel_view = view.update(cx, Shell::bot_panel_view).unwrap();
+        let total: usize = panel_view
+            .read(cx)
+            .group_filter_counts()
+            .0
+            .iter()
+            .map(|(_, c)| *c)
+            .sum();
+        assert_eq!(total, 2, "AllTheirWork shows both member bots' items");
+    });
+
+    // Delete confirmation modal sends `DeleteGroup`.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_ui.delete_group = Some(group);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bot-group-delete-dialog").is_some());
+    click(cx, "bot-group-delete-confirm");
+    assert!(cx.debug_bounds("bot-group-delete-dialog").is_none());
+
+    let log = recorded.lock().expect("log lock");
+    assert!(log.iter().any(|e| e.starts_with("send:grp-release:")));
+    assert!(log.iter().any(|e| e == "delete:grp-release"));
+}

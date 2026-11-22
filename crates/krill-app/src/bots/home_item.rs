@@ -122,7 +122,11 @@ impl View {
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(IconName::ArrowLeft).size(px(14.)))
-                    .label(text::BP_HOME.get())
+                    .label(if self.group_panel.active {
+                        text::GRP_BACK_ITEMS.get()
+                    } else {
+                        text::BP_HOME.get()
+                    })
                     .text_color(p.muted_foreground)
                     .on_click(cx.listener(|this, _, _, cx| this.close_home_item(cx))),
             );

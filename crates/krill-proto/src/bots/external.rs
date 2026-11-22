@@ -784,3 +784,143 @@ fn looks_like_uuid_prefix(s: &str) -> bool {
             .is_some_and(|p| p.iter().all(u8::is_ascii_hexdigit))
         && bytes.get(13) == Some(&b'-')
 }
+
+/// Prompt the owner copies into an external bot whose files cannot be read directly.
+pub const BOT_IMPORT_EXPORT_PROMPT: &str = "I'm moving to another assistant and need a complete copy of your setup. Don't change, pause or delete anything. If you keep your setup in files (persona or soul, memory, user notes, skills, routines), save copies of those files, unchanged, into a folder in my Downloads called <your name>-export, then list what you saved. Write out in full in your reply anything that isn't in a file. Never include passwords, API keys, tokens or cookies.";
+
+/// Maximum length of the old bot's reply pasted into Export import.
+pub const BOT_IMPORT_REPLY_MAX: usize = 200_000;
+
+/// Home-relative file where an exported bot's reply is saved.
+pub const BOT_IMPORT_REPLY_FILE: &str = "import/old-bot-reply.md";
+
+/// Summary for the first-bot import nudge inside New bot: `OpenClaw` count, else `Hermes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BotImportNudgeInfo {
+    pub app: ExternalBotSourceApp,
+    pub label: &'static str,
+    pub count: usize,
+}
+
+/// Human-facing app label used in import rows and nudges.
+#[must_use]
+pub const fn bot_import_app_label(app: ExternalBotSourceApp) -> &'static str {
+    match app {
+        ExternalBotSourceApp::OpenClaw => "OpenClaw",
+        ExternalBotSourceApp::Hermes => "Hermes",
+        ExternalBotSourceApp::OpenBot => "OpenBot",
+        ExternalBotSourceApp::Orca => "Orca",
+    }
+}
+
+/// Returns the first-bot import nudge line (`OpenClaw` bots first, else `Hermes` bots).
+#[must_use]
+pub fn bot_import_nudge(candidates: &[ExternalBotCandidate]) -> Option<BotImportNudgeInfo> {
+    for app in [ExternalBotSourceApp::OpenClaw, ExternalBotSourceApp::Hermes] {
+        let count = candidates.iter().filter(|c| c.app == app).count();
+        if count > 0 {
+            return Some(BotImportNudgeInfo {
+                app,
+                label: bot_import_app_label(app),
+                count,
+            });
+        }
+    }
+    None
+}
+
+/// Suggests a bot name from an export folder like `~/Downloads/sage-export` -> `Sage`.
+#[must_use]
+pub fn bot_name_from_export_folder(raw_path: &str) -> Option<String> {
+    let trimmed = raw_path.trim().trim_end_matches(['/', '\\']);
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let tail_idx = base.len().saturating_sub(7);
+    let stripped = base
+        .strip_suffix("-export")
+        .or_else(|| base.strip_suffix("_export"))
+        .or_else(|| base.strip_suffix(" export"))
+        .or_else(|| base.strip_suffix("-EXPORT"))
+        .or_else(|| base.strip_suffix("_EXPORT"))
+        .or_else(|| {
+            base.get(..tail_idx).filter(|_| {
+                base.len() > 7
+                    && base.get(tail_idx..).is_some_and(|s| {
+                        s.eq_ignore_ascii_case("-export")
+                            || s.eq_ignore_ascii_case("_export")
+                            || s.eq_ignore_ascii_case(" export")
+                    })
+            })
+        })
+        .unwrap_or(base);
+    if stripped
+        .chars()
+        .all(|ch| ch == '-' || ch == '_' || ch.is_whitespace())
+    {
+        return None;
+    }
+    Some(bot_name_from_id(stripped))
+}
+
+#[cfg(test)]
+mod nudge_tests {
+    use super::*;
+
+    #[test]
+    fn nudge_prefers_openclaw_then_hermes_and_ignores_others() {
+        let openbot = ExternalBotCandidate {
+            app: ExternalBotSourceApp::OpenBot,
+            agent: "ob".to_owned(),
+            name: "Ob".to_owned(),
+            path: "/tmp/ob".to_owned(),
+            soul_preview: None,
+        };
+        let hermes = ExternalBotCandidate {
+            app: ExternalBotSourceApp::Hermes,
+            agent: "default".to_owned(),
+            name: "Hermes".to_owned(),
+            path: "/tmp/hermes".to_owned(),
+            soul_preview: None,
+        };
+        let openclaw = ExternalBotCandidate {
+            app: ExternalBotSourceApp::OpenClaw,
+            agent: "research".to_owned(),
+            name: "Research".to_owned(),
+            path: "/tmp/openclaw".to_owned(),
+            soul_preview: None,
+        };
+        assert_eq!(bot_import_nudge(std::slice::from_ref(&openbot)), None);
+        assert_eq!(
+            bot_import_nudge(&[openbot.clone(), hermes.clone()]),
+            Some(BotImportNudgeInfo {
+                app: ExternalBotSourceApp::Hermes,
+                label: "Hermes",
+                count: 1,
+            })
+        );
+        assert_eq!(
+            bot_import_nudge(&[hermes, openclaw]),
+            Some(BotImportNudgeInfo {
+                app: ExternalBotSourceApp::OpenClaw,
+                label: "OpenClaw",
+                count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn export_folder_suggests_clean_bot_name() {
+        assert_eq!(
+            bot_name_from_export_folder("/Users/a/Downloads/sage-export").as_deref(),
+            Some("Sage")
+        );
+        assert_eq!(
+            bot_name_from_export_folder("/Users/a/Downloads/research_desk_export").as_deref(),
+            Some("Research desk")
+        );
+        assert_eq!(
+            bot_name_from_export_folder("/Users/a/Downloads/Custom-Export/").as_deref(),
+            Some("Custom")
+        );
+        assert_eq!(bot_name_from_export_folder("-export"), None);
+    }
+}

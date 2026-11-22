@@ -1108,7 +1108,10 @@ impl BotsManager {
                 bot_ids,
                 ts,
             ) {
-                Ok(group) => BotRpcResponse::Group(group),
+                Ok(group) => {
+                    self.groups.prune_audience_for_updated_group(&group);
+                    BotRpcResponse::Group(group)
+                }
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::DeleteGroup { group_id } => {
@@ -1166,36 +1169,7 @@ impl BotsManager {
                 reply_mode,
                 ts,
             ) {
-                Ok(plan) => {
-                    let mut dispatched_bots = Vec::new();
-                    for target in &plan.target_bots {
-                        if let Ok((sid, _)) = self.runtime.deliver_or_wake_bot(
-                            registry,
-                            &self.store,
-                            &self.secrets,
-                            &self.tool_relay,
-                            &self.composio_base_url,
-                            &target.id,
-                            &plan.prompt_for_bot,
-                            ts,
-                        ) {
-                            self.groups
-                                .record_turn_started(
-                                    &plan.group.id,
-                                    &plan.thread.thread_id,
-                                    target,
-                                    sid,
-                                    ts,
-                                )
-                                .ok();
-                            dispatched_bots.push(target.id.clone());
-                        }
-                    }
-                    BotRpcResponse::GroupMessagePosted {
-                        message: plan.posted_message,
-                        dispatched_bots,
-                    }
-                }
+                Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::StopGroup {
@@ -1205,6 +1179,77 @@ impl BotsManager {
                 .groups
                 .stop_group(&self.store, &group_id, thread_id.as_deref())
             {
+                Ok(stopped) => {
+                    for (bid, sid) in stopped {
+                        self.runtime
+                            .stop_session(registry, &self.tool_relay, &bid, sid)
+                            .ok();
+                    }
+                    BotRpcResponse::Ok
+                }
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ListGroupSummaries => {
+                match self.groups.list_group_summaries(&self.store) {
+                    Ok(summaries) => BotRpcResponse::GroupSummaries(summaries),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
+            BotRpcRequest::ReadGroupRoom {
+                group_id,
+                thread_id,
+                before_message_id,
+                limit,
+            } => match self.groups.read_group_room(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                before_message_id.as_deref(),
+                limit,
+            ) {
+                Ok(room) => BotRpcResponse::GroupRoom(room),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::SetGroupReplyAudience { group_id, audience } => {
+                match self
+                    .groups
+                    .set_reply_audience(&self.store, &group_id, audience)
+                {
+                    Ok(saved) => BotRpcResponse::GroupReplyAudienceUpdated {
+                        group_id,
+                        audience: saved,
+                    },
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
+            BotRpcRequest::SendGroupMessageWithAudience {
+                group_id,
+                thread_id,
+                sender,
+                text,
+                audience,
+            } => match self.groups.prepare_message_dispatch_with_audience(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                &sender,
+                &text,
+                audience,
+                ts,
+            ) {
+                Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::StopGroupMember {
+                group_id,
+                thread_id,
+                bot_id,
+            } => match self.groups.stop_group_member(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                bot_id.as_ref(),
+            ) {
                 Ok(stopped) => {
                     for (bid, sid) in stopped {
                         self.runtime
@@ -1588,6 +1633,26 @@ impl BotsManager {
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
+            BotRpcRequest::ListImportedSources => match self.store.list_imported_sources() {
+                Ok(sources) => BotRpcResponse::ImportedSources(sources),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ImportExternalBotCopy {
+                source,
+                path,
+                params,
+            } => {
+                match self
+                    .store
+                    .import_external_bot_copy(source, &path, *params, ts)
+                {
+                    Ok(bot) => {
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::TestConnector { bot_id, source } => {
                 let bot = match self.store.get_bot(&bot_id) {
                     Ok(Some(b)) => b,
@@ -1731,6 +1796,36 @@ impl BotsManager {
                     Err(detail) => BotRpcResponse::Error(detail.message),
                 }
             }
+        }
+    }
+
+    fn execute_group_dispatch(
+        &self,
+        registry: &Registry,
+        plan: groups::GroupDispatchPlan,
+        ts: u64,
+    ) -> BotRpcResponse {
+        let mut dispatched_bots = Vec::new();
+        for target in &plan.target_bots {
+            if let Ok((sid, _)) = self.runtime.deliver_or_wake_bot(
+                registry,
+                &self.store,
+                &self.secrets,
+                &self.tool_relay,
+                &self.composio_base_url,
+                &target.id,
+                &plan.prompt_for_bot,
+                ts,
+            ) {
+                self.groups
+                    .record_turn_started(&plan.group.id, &plan.thread.thread_id, target, sid, ts)
+                    .ok();
+                dispatched_bots.push(target.id.clone());
+            }
+        }
+        BotRpcResponse::GroupMessagePosted {
+            message: plan.posted_message,
+            dispatched_bots,
         }
     }
 
@@ -1959,6 +2054,8 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::GetBotItem { .. }
         | BotRpcRequest::ListGroups
         | BotRpcRequest::ReadGroup { .. }
+        | BotRpcRequest::ListGroupSummaries
+        | BotRpcRequest::ReadGroupRoom { .. }
         | BotRpcRequest::ConnectorStatus { .. }
         | BotRpcRequest::ToolRelayStatus
         | BotRpcRequest::ListBotSessions { .. }
@@ -1968,11 +2065,13 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::GetBotUpcoming { .. }
         | BotRpcRequest::GetBotSettingsExtras { .. }
         | BotRpcRequest::ListBotOffers { .. }
+        | BotRpcRequest::ListImportedSources
         | BotRpcRequest::SendBotMail { .. } => Ok(()),
         // A bot proposes bots only from its own chat; the owner answers them.
         BotRpcRequest::OfferBot { bot_id, .. } if bot_id == caller_bot => Ok(()),
         BotRpcRequest::OfferBot { .. } => deny("cannot propose a bot for another bot"),
-        BotRpcRequest::SendGroupMessage { sender, .. } => {
+        BotRpcRequest::SendGroupMessage { sender, .. }
+        | BotRpcRequest::SendGroupMessageWithAudience { sender, .. } => {
             let trimmed = sender.trim();
             if trimmed.is_empty()
                 || trimmed == caller_bot.as_str()
@@ -2066,6 +2165,8 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ReorderGroups { .. }
         | BotRpcRequest::NewGroupThread { .. }
         | BotRpcRequest::StopGroup { .. }
+        | BotRpcRequest::SetGroupReplyAudience { .. }
+        | BotRpcRequest::StopGroupMember { .. }
         | BotRpcRequest::SetConnectorConfig { .. }
         | BotRpcRequest::SetSecret { .. }
         | BotRpcRequest::DeleteSecret { .. }
@@ -2080,6 +2181,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ImportBotZipV2 { .. }
         | BotRpcRequest::UploadBotAvatar { .. }
         | BotRpcRequest::ImportExternalBots { .. }
+        | BotRpcRequest::ImportExternalBotCopy { .. }
         | BotRpcRequest::SetDefaultTrackerBot { .. }
         | BotRpcRequest::TestConnector { .. }
         | BotRpcRequest::StartMcpOAuth { .. }
@@ -3159,6 +3261,76 @@ mod tests {
             ),
             BotRpcResponse::ImportedExternalBots { .. }
         ));
+        assert!(matches!(
+            mgr.handle_rpc(&reg, BotRpcRequest::ListImportedSources),
+            BotRpcResponse::ImportedSources(_)
+        ));
+        // Creating a copy from an external candidate dir records the source and allows a 2nd copy.
+        let ext_dir = state.join("ext-copy-src");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::write(ext_dir.join("SOUL.md"), "# Ext\n\nHelps out.\n").unwrap();
+        let copy1 = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::ImportExternalBotCopy {
+                source: Some(krill_proto::bots::ExternalBotSourceApp::OpenClaw),
+                path: ext_dir.to_string_lossy().into_owned(),
+                params: Box::new(krill_proto::bots::CreateBotV2Params::from(
+                    CreateBotParams {
+                        name: "Ext Copy 1".to_owned(),
+                        agent_id: "claude".to_owned(),
+                        description: String::new(),
+                        emoji: None,
+                        avatar: Some("mascot:B1".to_owned()),
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                )),
+            },
+        ) {
+            BotRpcResponse::Bot(b) => Some(b),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(copy1.name, "Ext Copy 1");
+        assert_eq!(copy1.avatar.as_deref(), Some("mascot:B1"));
+        let imported_sources = match mgr.handle_rpc(&reg, BotRpcRequest::ListImportedSources) {
+            BotRpcResponse::ImportedSources(s) => s,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(imported_sources.len(), 1);
+        assert_eq!(imported_sources[0].1, copy1.id);
+        let copy2 = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::ImportExternalBotCopy {
+                source: Some(krill_proto::bots::ExternalBotSourceApp::OpenClaw),
+                path: ext_dir.to_string_lossy().into_owned(),
+                params: Box::new(krill_proto::bots::CreateBotV2Params::from(
+                    CreateBotParams {
+                        name: "Ext Copy 2".to_owned(),
+                        agent_id: "codex".to_owned(),
+                        description: String::new(),
+                        emoji: None,
+                        avatar: Some("mascot:B2".to_owned()),
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                )),
+            },
+        ) {
+            BotRpcResponse::Bot(b) => Some(b),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(copy2.name, "Ext Copy 2");
+        assert_ne!(copy1.id, copy2.id);
         assert!(matches!(
             mgr.handle_rpc(
                 &reg,

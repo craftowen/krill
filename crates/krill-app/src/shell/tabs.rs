@@ -148,6 +148,9 @@ impl Shell {
                 .get()
                 .to_owned();
         }
+        if let Some(title) = self.group_tab_title(pane) {
+            return title;
+        }
         if let Some(path) = self.layout.file(pane) {
             return krill_app::editor::file_name(path);
         }
@@ -276,19 +279,40 @@ impl Shell {
                 };
                 let pane = tab.focused;
                 let is_launcher = self.is_split_launcher(pane);
-                // 파일·빈 런처 탭에는 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
-                let description = if self.layout.file(pane).is_some() || is_launcher {
+                let is_group = self.is_group_pane(pane);
+                // 파일·빈 런처·그룹 탭에는 단일 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
+                let description = if self.layout.file(pane).is_some() || is_launcher || is_group {
                     label.clone()
                 } else {
                     description
                 };
                 let file_prefix = self.file_tab_prefix(pane);
+                let group_prefix = if is_group {
+                    self.group_for_pane(pane).map(|summary| {
+                        let face_members = krill_app::bots::group_faces::resolve_members(
+                            &summary.group.bot_ids,
+                            &self.sidebar_bots,
+                            &|id| self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone()),
+                        );
+                        let ring_bg = if selected { p.background } else { p.sidebar };
+                        krill_app::bots::group_faces::render_group_tab_icon(
+                            &face_members,
+                            ring_bg,
+                            p,
+                        )
+                    })
+                } else {
+                    None
+                };
                 let rename_input = self
                     .tab_rename
                     .as_ref()
                     .filter(|r| tab.root.contains(r.pane))
                     .map(|r| r.input.clone());
-                let tab_hover_spec = if self.layout.file(pane).is_none() && !is_launcher {
+                let tab_hover_spec = if self.layout.file(pane).is_none()
+                    && !is_launcher
+                    && !is_group
+                {
                     let sidebar_ref = self.sidebar.read(cx);
                     let now_ns = sidebar_ref.now_unix_ns();
                     let prompt_history = self
@@ -392,6 +416,8 @@ impl Shell {
                             .child(if let Some(fp) = file_prefix {
                                 // MK-119: 파일 탭은 [파일 아이콘][미저장 점]으로 바꾼다.
                                 fp.into_any_element()
+                            } else if let Some(gp) = group_prefix {
+                                gp
                             } else if is_launcher {
                                 gpui_component::Icon::new(IconName::Plus)
                                     .with_size(ui::ICON_SM)
@@ -1390,6 +1416,53 @@ impl Shell {
                     cx.notify();
                 }))
                 .into_any_element(),
+            );
+            file_items.push(
+                div()
+                    .my_1()
+                    .h(px(1.))
+                    .w_full()
+                    .bg(p.border)
+                    .into_any_element(),
+            );
+        }
+        if let Some(summary) = self.group_for_pane(pane).cloned() {
+            item_count.set(item_count.get() + 1);
+            let gid = summary.group.id.clone();
+            let new_thread_label = krill_app::i18n::catalog::bots::GRP_NEW_THREAD
+                .format(&[("name", &summary.group.name)]);
+            file_items.push(
+                div()
+                    .id("tab-menu-group-new-thread")
+                    .debug_selector(|| "tab-menu-group-new-thread".into())
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(new_thread_label.clone())
+                    .tab_index(0)
+                    .focus_visible(|d| d.bg(p.accent).border_1().border_color(p.ring))
+                    .px_2()
+                    .py_1()
+                    .rounded(ui::RADIUS_SM)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_SM)
+                    .cursor_pointer()
+                    .text_color(p.popover_foreground)
+                    .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+                    .child(div().flex_1().min_w_0().truncate().child(new_thread_label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(krill_app::i18n::catalog::bots::GRP_STARTS_FRESH.get()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.tab_context_menu = None;
+                        this.create_and_open_group_thread(gid.clone(), window, cx);
+                    }))
+                    .into_any_element(),
             );
             file_items.push(
                 div()

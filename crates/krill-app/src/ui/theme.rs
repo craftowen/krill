@@ -238,6 +238,18 @@ pub const fn bot_avatar_background(rgb: u32) -> Hsla {
     hex(rgb)
 }
 
+/// 새 봇 대화상자 상단의 부드러운 색 띠 그라데이션(Orca `--new-bot-band`).
+#[must_use]
+pub fn new_bot_band_fill(rgb: u32, dark: bool) -> gpui::Background {
+    let base = hex(rgb);
+    let alpha = if dark { 0.26 } else { 0.46 };
+    gpui::linear_gradient(
+        180.,
+        gpui::linear_color_stop(base.opacity(alpha), 0.),
+        gpui::linear_color_stop(base.opacity(0.0), 1.),
+    )
+}
+
 /// 24비트 RGB 정수(`0x00RR_GGBB`)를 불투명 [`Hsla`]로 바꾼다.
 pub const fn hex(rgb: u32) -> Hsla {
     rgba_bytes(

@@ -25,6 +25,7 @@ impl View {
         tab: DetailTab,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.group_panel.active = false;
         if self.selected_bot_id.as_ref() != Some(bot_id) {
             self.connectors.page = None;
             self.connectors.adding = None;
@@ -81,6 +82,10 @@ impl View {
                     .map(|err| self.render_error_with_retry(err, p, cx)),
             )
             .children(self.render_notice(p));
+        // Group items panel replaces the single-bot panel when a group room is active.
+        if self.group_panel.active {
+            return root.child(self.render_group_panel(p, window, cx));
+        }
         // The bot list is still loading (or the bot just went away): nothing to show yet.
         let Some(bot) = self.selected_bot().cloned() else {
             return root;

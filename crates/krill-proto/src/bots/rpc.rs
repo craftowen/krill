@@ -17,13 +17,14 @@ use crate::screen::Msg;
 use super::package::{BotPackageExportOptions, MAX_AVATAR_PNG_BYTES};
 use super::types::{
     BotAccessRequest, BotAvatarData, BotConfig, BotConnectorConfig, BotConnectorStatus,
-    BotConnectorTestResult, BotEventRuleConfig, BotGroupChat, BotGroupMessage, BotGroupReplyMode,
-    BotGroupView, BotId, BotItem, BotItemDecision, BotItemLink, BotItemStatus, BotItemsPage,
-    BotItemsStale, BotLookAroundConfig, BotMcpOAuthState, BotMcpToolConfig, BotMember,
-    BotMemoryHistoryEntry, BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo,
-    BotNotifications, BotOffer, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
-    BotSuggestion, BotToolRelayStatus, ComposioConnectionInfo, DefaultTrackerBots,
-    ExternalBotCandidate, ExternalBotSourceApp, ExternalSource, LookAroundEvery, TidyEvery,
+    BotConnectorTestResult, BotEventRuleConfig, BotGroupChat, BotGroupMessage,
+    BotGroupReplyAudience, BotGroupReplyMode, BotGroupRoomView, BotGroupSummary, BotGroupView,
+    BotId, BotItem, BotItemDecision, BotItemLink, BotItemStatus, BotItemsPage, BotItemsStale,
+    BotLookAroundConfig, BotMcpOAuthState, BotMcpToolConfig, BotMember, BotMemoryHistoryEntry,
+    BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo, BotNotifications, BotOffer,
+    BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug, BotSuggestion,
+    BotToolRelayStatus, ComposioConnectionInfo, DefaultTrackerBots, ExternalBotCandidate,
+    ExternalBotSourceApp, ExternalSource, LookAroundEvery, TidyEvery,
 };
 
 /// Dedicated client-to-daemon frame kind for Krill Bots RPC.
@@ -592,6 +593,49 @@ pub enum BotRpcRequest {
         #[serde(default)]
         created: Option<BotId>,
     },
+    /// Lists external bot source paths already imported into active Krill bots.
+    ListImportedSources,
+    /// Imports a single discovered external candidate even if an earlier bot came from the same
+    /// folder, applying the owner's chosen name, mascot/color, and agent settings.
+    ImportExternalBotCopy {
+        source: Option<ExternalBotSourceApp>,
+        path: String,
+        params: Box<CreateBotV2Params>,
+    },
+    /// Lists multi-bot groups with reply audience, threads, latest message, and active turns.
+    ListGroupSummaries,
+    /// Reads a paginated multi-bot group room page with active turns and persisted reply audience.
+    ReadGroupRoom {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        #[serde(default)]
+        before_message_id: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// Updates the default reply audience for a group chat room.
+    SetGroupReplyAudience {
+        group_id: String,
+        audience: BotGroupReplyAudience,
+    },
+    /// Posts a message to a group room using an explicit [`BotGroupReplyAudience`].
+    SendGroupMessageWithAudience {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        sender: String,
+        text: String,
+        audience: BotGroupReplyAudience,
+    },
+    /// Stops either one member bot or all active bots in a group thread.
+    StopGroupMember {
+        group_id: String,
+        #[serde(default)]
+        thread_id: Option<String>,
+        #[serde(default)]
+        bot_id: Option<BotId>,
+    },
 }
 
 impl BotRpcRequest {
@@ -626,6 +670,9 @@ impl BotRpcRequest {
                 | Self::GetBotUpcoming { .. }
                 | Self::GetBotSettingsExtras { .. }
                 | Self::ListBotOffers { .. }
+                | Self::ListImportedSources
+                | Self::ListGroupSummaries
+                | Self::ReadGroupRoom { .. }
         )
     }
 }
@@ -1119,6 +1166,58 @@ impl fmt::Debug for BotRpcRequest {
                 .field("offer_id", offer_id)
                 .field("created", created)
                 .finish(),
+            Self::ListImportedSources => f.write_str("ListImportedSources"),
+            Self::ImportExternalBotCopy {
+                source,
+                path,
+                params,
+            } => f
+                .debug_struct("ImportExternalBotCopy")
+                .field("source", source)
+                .field("path", path)
+                .field("name", &params.base.name)
+                .finish(),
+            Self::ListGroupSummaries => f.write_str("ListGroupSummaries"),
+            Self::ReadGroupRoom {
+                group_id,
+                thread_id,
+                before_message_id,
+                limit,
+            } => f
+                .debug_struct("ReadGroupRoom")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .field("before_message_id", before_message_id)
+                .field("limit", limit)
+                .finish(),
+            Self::SetGroupReplyAudience { group_id, audience } => f
+                .debug_struct("SetGroupReplyAudience")
+                .field("group_id", group_id)
+                .field("audience", audience)
+                .finish(),
+            Self::SendGroupMessageWithAudience {
+                group_id,
+                thread_id,
+                sender,
+                audience,
+                ..
+            } => f
+                .debug_struct("SendGroupMessageWithAudience")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .field("sender", sender)
+                .field("audience", audience)
+                .finish_non_exhaustive(),
+            Self::StopGroupMember {
+                group_id,
+                thread_id,
+                bot_id,
+            } => f
+                .debug_struct("StopGroupMember")
+                .field("group_id", group_id)
+                .field("thread_id", thread_id)
+                .field("bot_id", bot_id)
+                .finish(),
         }
     }
 }
@@ -1262,6 +1361,13 @@ pub enum BotRpcResponse {
     Upcoming(BotUpcoming),
     BotSettingsExtras(BotSettingsExtras),
     BotOffers(Vec<BotOffer>),
+    ImportedSources(Vec<(String, BotId)>),
+    GroupSummaries(Vec<BotGroupSummary>),
+    GroupRoom(BotGroupRoomView),
+    GroupReplyAudienceUpdated {
+        group_id: String,
+        audience: BotGroupReplyAudience,
+    },
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1426,6 +1532,26 @@ impl fmt::Debug for BotRpcResponse {
                 f.debug_tuple("BotSettingsExtras").field(extras).finish()
             }
             Self::BotOffers(offers) => f.debug_tuple("BotOffers").field(offers).finish(),
+            Self::ImportedSources(sources) => f
+                .debug_tuple("ImportedSources")
+                .field(&sources.len())
+                .finish(),
+            Self::GroupSummaries(groups) => f
+                .debug_tuple("GroupSummaries")
+                .field(&groups.len())
+                .finish(),
+            Self::GroupRoom(room) => f
+                .debug_struct("GroupRoom")
+                .field("group_id", &room.group.id)
+                .field("active_thread_id", &room.active_thread_id)
+                .field("messages", &room.messages.len())
+                .field("has_earlier", &room.has_earlier)
+                .finish(),
+            Self::GroupReplyAudienceUpdated { group_id, audience } => f
+                .debug_struct("GroupReplyAudienceUpdated")
+                .field("group_id", group_id)
+                .field("audience", audience)
+                .finish(),
         }
     }
 }

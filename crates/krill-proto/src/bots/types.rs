@@ -1,6 +1,7 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
 //! Core domain types and validation for Krill Bots.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -1413,6 +1414,61 @@ pub struct BotGroupView {
     pub active_run: bool,
 }
 
+/// Persisted default reply audience for a multi-bot group chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BotGroupReplyAudience {
+    Bot {
+        bot_id: BotId,
+    },
+    All,
+    #[default]
+    Mentions,
+}
+
+/// Active dispatch turn for one member bot inside a group thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotGroupTurnInfo {
+    pub group_id: String,
+    pub thread_id: String,
+    pub bot_id: BotId,
+    pub session_id: crate::SessionId,
+    pub message_id: String,
+    pub started_at_ms: u64,
+}
+
+/// Sidebar/panel summary of a multi-bot group chat room without full history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotGroupSummary {
+    pub group: BotGroupChat,
+    #[serde(default)]
+    pub reply_audience: BotGroupReplyAudience,
+    #[serde(default)]
+    pub threads: Vec<BotGroupThread>,
+    #[serde(default)]
+    pub latest_message: Option<BotGroupMessage>,
+    #[serde(default)]
+    pub active_turns: Vec<BotGroupTurnInfo>,
+}
+
+/// Paginated room view for a full group chat workspace page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotGroupRoomView {
+    pub group: BotGroupChat,
+    #[serde(default)]
+    pub reply_audience: BotGroupReplyAudience,
+    #[serde(default)]
+    pub threads: Vec<BotGroupThread>,
+    #[serde(default)]
+    pub active_thread_id: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<BotGroupMessage>,
+    #[serde(default)]
+    pub has_earlier: bool,
+    #[serde(default)]
+    pub active_turns: Vec<BotGroupTurnInfo>,
+}
+
 /// OAuth sign-in state for a `BrowserOAuth` MCP tool attached to a bot.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotMcpOAuthState {
@@ -1490,4 +1546,62 @@ const fn default_memory_tidy_interval() -> u64 {
 
 const fn default_poll_interval() -> u64 {
     DEFAULT_CONNECTOR_POLL_INTERVAL_SECS
+}
+
+/// Extracts mentioned group member IDs from message or draft text (`@everyone`, `@id`, `@slug`,
+/// `@name`, and `@Hyphenated-Name`), preserving first-seen order without duplicates.
+#[must_use]
+pub fn extract_group_mention_ids(text: &str, members: &[(&BotId, &str, &str)]) -> Vec<BotId> {
+    let mut mentioned = Vec::new();
+    let mut seen = BTreeSet::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars.get(i).copied() == Some('@') {
+            let prev_ok = i == 0
+                || chars
+                    .get(i.saturating_sub(1))
+                    .is_some_and(|c| !c.is_alphanumeric() && *c != '_');
+            if prev_ok {
+                let start = i.saturating_add(1);
+                let mut end = start;
+                while end < chars.len()
+                    && chars
+                        .get(end)
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                {
+                    end = end.saturating_add(1);
+                }
+                let token: String = chars.get(start..end).unwrap_or_default().iter().collect();
+                if token.eq_ignore_ascii_case("everyone") {
+                    for (id, _, _) in members {
+                        if seen.insert((*id).clone()) {
+                            mentioned.push((*id).clone());
+                        }
+                    }
+                } else if !token.is_empty() {
+                    for (id, slug, name) in members {
+                        let hyphen = name.replace(' ', "-");
+                        let matched = id.as_str().eq_ignore_ascii_case(&token)
+                            || slug.eq_ignore_ascii_case(&token)
+                            || name.eq_ignore_ascii_case(&token)
+                            || hyphen.eq_ignore_ascii_case(&token);
+                        if matched && seen.insert((*id).clone()) {
+                            mentioned.push((*id).clone());
+                        }
+                    }
+                }
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    // Also match exact `@<Full Name With Spaces>` mentions when member names contain spaces.
+    let lower = text.to_ascii_lowercase();
+    for (id, _, name) in members {
+        let needle = format!("@{}", name.to_ascii_lowercase());
+        if lower.contains(&needle) && seen.insert((*id).clone()) {
+            mentioned.push((*id).clone());
+        }
+    }
+    mentioned
 }

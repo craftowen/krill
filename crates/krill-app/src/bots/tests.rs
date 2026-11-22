@@ -45,6 +45,7 @@ struct MockState {
     secrets: Vec<(String, String)>,
     requests: Vec<BotRpcRequest>,
     candidates: Vec<ExternalBotCandidate>,
+    imported_sources: Vec<(String, BotId)>,
     suggestions: Vec<BotSuggestion>,
     oauth_states: BTreeMap<(BotId, String), BotMcpOAuthState>,
     composio_connections: Vec<ComposioConnectionInfo>,
@@ -100,6 +101,41 @@ fn sample_item(bot_id: &str, uid: &str, number: u64, status: BotItemStatus) -> B
     }
 }
 
+fn mock_create_bot_v2(st: &mut MockState, v2: &krill_proto::bots::CreateBotV2Params) -> BotConfig {
+    let base = &v2.base;
+    let id_str = v2.slug.as_ref().map_or_else(
+        || format!("bot-{}", st.bots.len() + 1),
+        |s| s.as_str().to_owned(),
+    );
+    let mut cfg = BotConfig::new(
+        BotId::new(&id_str).unwrap(),
+        &base.name,
+        &base.agent_id,
+        1_700_000_000_000,
+    )
+    .unwrap();
+    if let Some(slug) = &v2.slug {
+        cfg.slug = slug.clone();
+    }
+    cfg.description.clone_from(&base.description);
+    cfg.emoji.clone_from(&base.emoji);
+    cfg.avatar.clone_from(&base.avatar);
+    cfg.avatar_color.clone_from(&v2.avatar_color);
+    cfg.model.clone_from(&base.model);
+    cfg.effort.clone_from(&base.effort);
+    if let Some(perm) = base.permission_mode {
+        cfg.permission_mode = perm;
+    }
+    cfg.workspace.clone_from(&base.workspace);
+    cfg.template_id.clone_from(&base.template_id);
+    cfg.skills.clone_from(&v2.skills);
+    if let Some(s) = &base.initial_soul {
+        st.soul.clone_from(s);
+    }
+    st.bots.push(cfg.clone());
+    cfg
+}
+
 fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
     Arc::new(move |req: &BotRpcRequest| {
         let mut st = state.lock().unwrap();
@@ -127,37 +163,7 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 Ok(BotRpcResponse::Bot(Box::new(cfg)))
             }
             BotRpcRequest::CreateBotV2(v2) => {
-                let base = &v2.base;
-                let id_str = v2.slug.as_ref().map_or_else(
-                    || format!("bot-{}", st.bots.len() + 1),
-                    |s| s.as_str().to_owned(),
-                );
-                let mut cfg = BotConfig::new(
-                    BotId::new(&id_str).unwrap(),
-                    &base.name,
-                    &base.agent_id,
-                    1_700_000_000_000,
-                )
-                .unwrap();
-                if let Some(slug) = &v2.slug {
-                    cfg.slug = slug.clone();
-                }
-                cfg.description.clone_from(&base.description);
-                cfg.emoji.clone_from(&base.emoji);
-                cfg.avatar.clone_from(&base.avatar);
-                cfg.avatar_color.clone_from(&v2.avatar_color);
-                cfg.model.clone_from(&base.model);
-                cfg.effort.clone_from(&base.effort);
-                if let Some(perm) = base.permission_mode {
-                    cfg.permission_mode = perm;
-                }
-                cfg.workspace.clone_from(&base.workspace);
-                cfg.template_id.clone_from(&base.template_id);
-                cfg.skills.clone_from(&v2.skills);
-                if let Some(s) = &base.initial_soul {
-                    st.soul.clone_from(s);
-                }
-                st.bots.push(cfg.clone());
+                let cfg = mock_create_bot_v2(&mut st, v2);
                 Ok(BotRpcResponse::Bot(Box::new(cfg)))
             }
             BotRpcRequest::UpdateBot(params) => {
@@ -856,6 +862,16 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     imported,
                 })
             }
+            BotRpcRequest::ListImportedSources => {
+                Ok(BotRpcResponse::ImportedSources(st.imported_sources.clone()))
+            }
+            BotRpcRequest::ImportExternalBotCopy { path, params, .. } => {
+                let cfg = mock_create_bot_v2(&mut st, params);
+                if !st.imported_sources.iter().any(|(p, _)| p == path) {
+                    st.imported_sources.push((path.clone(), cfg.id.clone()));
+                }
+                Ok(BotRpcResponse::Bot(Box::new(cfg)))
+            }
             BotRpcRequest::ListAgentModels { agent_id } => Ok(st
                 .agent_models
                 .get(agent_id)
@@ -1184,20 +1200,15 @@ fn connectors_slack_manifest_composio_access_and_tools_relay_and_escape(cx: &mut
     }
     assert_eq!(BOT_MCP_APPS[9].auth_kind, BotMcpAuthKind::None);
 
-    // Import screen + External scan + Escape back to Detail + Escape emits Close
+    // Import modal + Escape closes the dialog directly when no Pick step is waiting behind Export.
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.open_import(cx);
-            v.run_external_import(true, cx);
         });
     });
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("bots-import-view").is_some());
-
-    vcx.update(|_, cx| view.update(cx, View::handle_escape));
-    vcx.run_until_parked();
-    assert_eq!(view.read_with(vcx, |v, _| v.screen()), Screen::Detail);
-    assert!(!*closed.lock().unwrap());
+    assert!(vcx.debug_bounds("bot-import-hero").is_some());
 
     vcx.update(|_, cx| view.update(cx, View::handle_escape));
     vcx.run_until_parked();
@@ -1498,49 +1509,18 @@ fn v2_groups_settings_memory_undo_decisions_and_connectors(cx: &mut TestAppConte
     assert!(state.lock().unwrap().topics.contains_key("ops"));
     assert!(state.lock().unwrap().suggestions[0].dismissed);
 
-    // Groups screen: create group -> thread -> @mention message -> stop
+    // Group items panel: merges member bot items and switches chat/bot filters
     vcx.update(|_, cx| {
-        view.update(cx, View::open_groups);
-    });
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("bots-groups-view").is_some());
-    vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            if let Some(inp) = &v.groups.name_input {
-                inp.update(cx, |s, cx| s.set_value("Triage Room", window, cx));
-            }
-            v.groups.member_bot_ids = vec![bot1.clone(), bot2.clone()];
-            v.submit_create_or_update_group(cx);
+            v.show_group_in_panel("grp-triage", &[bot1.clone(), bot2.clone()], &[], cx);
+            v.set_group_chat_scope(super::GroupChatScope::AllTheirWork, cx);
         });
     });
     vcx.run_until_parked();
-    let gid = view.read_with(vcx, |v, _| v.groups.groups[0].id.clone());
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            if let Some(t) = &v.groups.thread_title_input {
-                t.update(cx, |s, cx| s.set_value("Incident", window, cx));
-            }
-            v.create_group_thread(gid.clone(), cx);
-        });
-    });
-    vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            if let Some(c) = &v.groups.composer_input {
-                c.update(cx, |s, cx| s.set_value("@bot-1 check", window, cx));
-            }
-            v.send_group_message(gid.clone(), cx);
-        });
-    });
-    vcx.run_until_parked();
-    assert!(
-        state
-            .lock()
-            .unwrap()
-            .group_messages
-            .iter()
-            .any(|m| m.body == "@bot-1 check")
-    );
+    assert!(view.read_with(vcx, |v, _| {
+        v.group_panel_active()
+            && v.group_items_filter().chat_scope == super::GroupChatScope::AllTheirWork
+    }));
 
     // Connectors rollback + reload error propagation + pairing + tracker + MCP OAuth
     vcx.update(|_, cx| {
@@ -1803,6 +1783,8 @@ fn new_bot_dialog_lists_the_agents_own_models_and_launches_the_pick(cx: &mut Tes
     vcx.update(|_, cx| {
         dialog.update(cx, |d, cx| {
             d.set_model(Some("gemini-4-neon-high".to_owned()), cx);
+            d.set_effort(Some("high".to_owned()), cx);
+            d.set_permission(Some(Permission::Yolo), cx);
             d.submit(cx);
         });
     });
@@ -1811,7 +1793,10 @@ fn new_bot_dialog_lists_the_agents_own_models_and_launches_the_pick(cx: &mut Tes
     assert!(reqs.iter().any(|r| matches!(
         r,
         BotRpcRequest::CreateBotV2(p)
-            if p.base.agent_id == "agy" && p.base.model.as_deref() == Some("gemini-4-neon-high")
+            if p.base.agent_id == "agy"
+                && p.base.model.as_deref() == Some("gemini-4-neon-high")
+                && p.base.effort.as_deref() == Some("high")
+                && p.base.permission_mode == Some(Permission::Yolo)
     )));
 }
 
@@ -2590,4 +2575,338 @@ fn settings_rows_open_their_own_pages(cx: &mut TestAppContext) {
     )));
     show(vcx, DetailTab::Items);
     assert!(vcx.debug_bounds("bot-home-group-stale").is_none());
+}
+
+#[gpui::test]
+fn import_dialog_supports_picture_picker_runs_on_copy_update_and_filter_threshold(
+    cx: &mut TestAppContext,
+) {
+    let mut mock = MockState::default();
+    let existing = sample_bot("imported-scout", "Scout Old");
+    mock.bots.push(existing.clone());
+    for i in 1..=11 {
+        mock.candidates.push(ExternalBotCandidate {
+            app: if i % 2 == 1 {
+                ExternalBotSourceApp::OpenClaw
+            } else {
+                ExternalBotSourceApp::Hermes
+            },
+            agent: "claude".to_owned(),
+            name: format!("Agent {i}"),
+            path: format!("/tmp/external-bot-{i}"),
+            soul_preview: Some(format!("External bot #{i}")),
+        });
+    }
+    mock.imported_sources
+        .push(("/tmp/external-bot-1".to_owned(), existing.id.clone()));
+
+    let state = Arc::new(Mutex::new(mock));
+    let (view, vcx) = open_view(cx, state.clone());
+    let closed = Arc::new(Mutex::new(false));
+    let closed_flag = closed.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, ev: &Close, _| {
+            let _ = ev;
+            *closed_flag.lock().unwrap() = true;
+        })
+        .detach();
+    });
+
+    vcx.update(|_, cx| view.update(cx, View::open_import));
+    vcx.run_until_parked();
+
+    // Candidate 1 was already imported (Update mode hides BotRunsOnPicker) and filter input appears past FILTER_FROM (10).
+    assert!(vcx.debug_bounds("bots-import-view").is_some());
+    assert!(vcx.debug_bounds("bot-import-filter").is_some());
+    assert!(vcx.debug_bounds("bot-import-update").is_some());
+    assert!(vcx.debug_bounds("import-bot-runs-on").is_none());
+
+    // Typing a new name switches to Copy mode, revealing BotRunsOnPicker + "Create".
+    vcx.simulate_input("Agent Copy");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bot-import-create").is_some());
+    assert!(vcx.debug_bounds("import-bot-runs-on").is_some());
+    let pic_btn = vcx.debug_bounds("import-bot-picture-btn").unwrap();
+    vcx.simulate_click(pic_btn.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("import-bot-carousel").is_some());
+    let ink = vcx.debug_bounds("import-bot-swatch-1f2126").unwrap();
+    vcx.simulate_click(ink.center(), Modifiers::default());
+    vcx.run_until_parked();
+    vcx.simulate_click(pic_btn.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("import-bot-carousel").is_none());
+
+    // Filter narrows the list below the scroll fold and reveals "Another app..." right away.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            if let Some(filter) = &v.import_dialog.filter_input {
+                filter.update(cx, |s, cx| s.set_value("Agent 11", window, cx));
+            }
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bot-import-pick-Agent 11").is_some());
+    assert!(vcx.debug_bounds("bot-import-pick-Agent 2").is_none());
+
+    // Switching to "Another app..." goes to Export; first Escape returns to Pick; second closes.
+    let other_app = vcx.debug_bounds("bot-import-other-app").unwrap();
+    vcx.simulate_click(other_app.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bot-import-choose-folder").is_some());
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.import_dialog.folder = Some(std::path::PathBuf::from("/tmp/exported-helper"));
+            v.import_dialog.typed = None;
+            if let Some(inp) = &v.import_dialog.name_input {
+                inp.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let suggestion = vcx
+        .debug_bounds("bot-import-suggestion")
+        .expect("export folder suggestion visible");
+    vcx.simulate_click(suggestion.center(), Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).import_dialog.typed.as_deref(),
+            Some("Exported helper")
+        );
+    });
+
+    vcx.update(|_, cx| view.update(cx, View::handle_escape));
+    vcx.run_until_parked();
+    assert!(!*closed.lock().unwrap());
+    assert_eq!(
+        view.read_with(vcx, |v, _| v.import_dialog.view),
+        super::import_dialog::ImportView::Pick
+    );
+
+    // Back in Pick, submit creates an imported copy via ImportExternalBotCopy.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.import_dialog.typed = Some("Scout Two".to_owned());
+            v.create_imported_bot(cx);
+        });
+    });
+    vcx.run_until_parked();
+    let reqs = state.lock().unwrap().requests.clone();
+    assert!(reqs.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::ImportExternalBotCopy { path, params, .. }
+            if path == "/tmp/external-bot-1"
+                && params.base.name == "Scout Two"
+                && params.avatar_color.as_deref() == Some("#1f2126")
+    )));
+}
+
+#[gpui::test]
+fn new_bot_import_nudge_opens_import_and_dismisses_cleanly(cx: &mut TestAppContext) {
+    use super::new_bot::{Event, HostChoice, NewBot};
+    use crate::hosts::HostId;
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::settings::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        crate::settings::edit(cx, |s| s.bot_import_nudge_dismissed = false);
+    });
+    let rpc = make_mock_rpc(Arc::default());
+    let (dialog, vcx) = cx.add_window_view(|window, cx| {
+        NewBot::new(
+            vec![HostChoice {
+                id: HostId::Local,
+                label: "My Mac".into(),
+                rpc,
+            }],
+            Vec::new(),
+            None,
+            window,
+            cx,
+        )
+    });
+    let events: Arc<Mutex<Vec<String>>> = Arc::default();
+    let ev_ref = events.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, ev: &Event, _| {
+            if matches!(ev, Event::OpenImport) {
+                ev_ref.lock().unwrap().push("open_import".to_owned());
+            }
+        })
+        .detach();
+        dialog.update(cx, |d, cx| {
+            d.set_nudge_candidates_for_test(
+                &[ExternalBotCandidate {
+                    app: ExternalBotSourceApp::OpenClaw,
+                    agent: "claude".to_owned(),
+                    name: "Claw".to_owned(),
+                    path: "/tmp/openclaw-agent".to_owned(),
+                    soul_preview: None,
+                }],
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+
+    let action = vcx
+        .debug_bounds("new-bot-import-nudge-action")
+        .expect("nudge action rendered");
+    vcx.simulate_click(action.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(events.lock().unwrap().as_slice(), ["open_import"]);
+
+    let dismiss = vcx
+        .debug_bounds("new-bot-import-nudge-dismiss")
+        .expect("nudge dismiss rendered");
+    vcx.simulate_click(dismiss.center(), Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("new-bot-import-nudge").is_none());
+    vcx.update(|_, cx| {
+        assert!(crate::settings::current(cx).bot_import_nudge_dismissed);
+        crate::settings::edit(cx, |s| s.bot_import_nudge_dismissed = false);
+    });
+}
+
+#[gpui::test]
+fn new_bot_proposal_fields_template_chips_and_avatar_gen_work(cx: &mut TestAppContext) {
+    use super::avatar_gen::{
+        AvatarAgentStatusKind, AvatarGenerationCapability, AvatarGenerationFailure,
+        AvatarImageAgent, AvatarImageAgentStatus,
+    };
+    use super::new_bot::{HostChoice, NewBot};
+    use super::picture_picker::{GenRunState, PictureFace};
+    use crate::hosts::HostId;
+    use krill_proto::bots::{BotProposal, HandedWorkspace};
+
+    let state = Arc::new(Mutex::new(MockState::default()));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let proposal = BotProposal {
+        name: "Release Marshal".to_owned(),
+        purpose: "Coordinates releases and watches CI failures.".to_owned(),
+        watches: Some("PRs labeled release".to_owned()),
+        does: Some("Summarizes blockers".to_owned()),
+        reports: Some("Daily in #release".to_owned()),
+        automations: Vec::new(),
+        template_id: None,
+        mascot: Some("krill".to_owned()),
+        worktrees: vec![HandedWorkspace {
+            id: "wt-1".to_owned(),
+            name: "bot-create-group".to_owned(),
+        }],
+    };
+    let (dialog, vcx) = cx.add_window_view(|window, cx| {
+        NewBot::new_with_proposal(
+            vec![HostChoice {
+                id: HostId::Local,
+                label: "My Mac".into(),
+                rpc: rpc.clone(),
+            }],
+            Vec::new(),
+            None,
+            Some(proposal),
+            None,
+            window,
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    for sel in [
+        "new-bot-watches",
+        "new-bot-does",
+        "new-bot-reports",
+        "new-bot-takes-over",
+    ] {
+        assert!(
+            vcx.debug_bounds(sel).is_some(),
+            "missing proposal field {sel}"
+        );
+    }
+
+    // Verify AvatarGenerateFace capability + real-person safety guard.
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.picture.set_capability_for_test(
+                AvatarGenerationCapability {
+                    agents: vec![AvatarImageAgentStatus {
+                        agent: AvatarImageAgent::Codex,
+                        status: AvatarAgentStatusKind::Ready,
+                    }],
+                },
+                cx,
+            );
+            assert!(d.picture.faces().contains(&PictureFace::Generate));
+            d.set_gen_description_for_test("portrait of a real person", window, cx);
+            d.picture.start_generation(NewBot::picture_mut, cx);
+            assert!(matches!(
+                d.picture.gen_run,
+                GenRunState::Error {
+                    failure: AvatarGenerationFailure::RealPerson,
+                    ..
+                }
+            ));
+            d.submit(cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let reqs = state.lock().unwrap().requests.clone();
+    assert!(reqs.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::CreateBotV2(p)
+            if p.base.name == "Release Marshal"
+                && p.base.description.contains("Coordinates releases")
+                && p.base.initial_soul.as_deref().is_some_and(|soul| {
+                    soul.contains("Watches") && soul.contains("Does") && soul.contains("Reports")
+                })
+    )));
+
+    // Also verify interactive template chips popover (`pr-review`).
+    let tpl = krill_proto::bots::find_bot_template("pr-review").unwrap();
+    let (tpl_dialog, vcx2) = cx.add_window_view(|window, cx| {
+        NewBot::new(
+            vec![HostChoice {
+                id: HostId::Local,
+                label: "My Mac".into(),
+                rpc,
+            }],
+            Vec::new(),
+            Some(tpl),
+            window,
+            cx,
+        )
+    });
+    let _ = &tpl_dialog;
+    vcx2.run_until_parked();
+    assert!(vcx2.debug_bounds("new-bot-template-parts").is_some());
+    let skills_chip = vcx2.debug_bounds("new-bot-chip-skills").unwrap();
+    vcx2.simulate_click(skills_chip.center(), Modifiers::default());
+    vcx2.run_until_parked();
+    assert_eq!(tpl.skills, ["pr-review-checklist"]);
+    assert!(
+        vcx2.debug_bounds("new-bot-skill-switch-pr-review-checklist")
+            .is_some()
+    );
+}
+
+#[test]
+fn settings_roundtrip_preserves_new_bot_nudge_and_avatar_agent() {
+    let mut s = crate::settings::Settings::default();
+    assert!(!s.bot_import_nudge_dismissed);
+    assert_eq!(s.avatar_generation_agent, None);
+    s.bot_import_nudge_dismissed = true;
+    s.avatar_generation_agent = Some("codex".to_owned());
+    let json = serde_json::to_string(&s).unwrap();
+    let back: crate::settings::Settings = serde_json::from_str(&json).unwrap();
+    assert!(back.bot_import_nudge_dismissed);
+    assert_eq!(back.avatar_generation_agent.as_deref(), Some("codex"));
 }

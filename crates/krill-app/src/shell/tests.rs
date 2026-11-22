@@ -7418,24 +7418,27 @@ fn new_bot_dialog_creates_with_mascot_and_opens_home_chat_with_first_run(cx: &mu
     cx.simulate_click(create.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("new-bot-dialog").is_some());
-    assert!(cx.debug_bounds("new-bot-carousel").is_some());
-    assert!(cx.debug_bounds("new-bot-swatch-1f2126").is_some());
-    assert!(cx.debug_bounds("new-bot-runs-on").is_some());
+    assert!(cx.debug_bounds("new-bot-picture-btn").is_some());
+    assert!(cx.debug_bounds("new-bot-runs-on-fields").is_some());
     assert!(
         cx.debug_bounds("new-bot-start-from-template").is_some(),
         "an empty form offers templates"
     );
 
-    // Type a name (the field has focus), pick a background, create with the keyboard.
+    // Type a name (the field has focus), open the picture popover to pick a background, create with the keyboard.
     cx.simulate_input("Krill helper");
-    cx.run_until_parked();
-    let ink = cx.debug_bounds("new-bot-swatch-1f2126").unwrap();
-    cx.simulate_click(ink.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("new-bot-start-from-template").is_none(),
         "typing hides the template link like Orca"
     );
+    let pic_btn = cx.debug_bounds("new-bot-picture-btn").unwrap();
+    cx.simulate_click(pic_btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("new-bot-carousel").is_some());
+    let ink = cx.debug_bounds("new-bot-swatch-1f2126").unwrap();
+    cx.simulate_click(ink.center(), Modifiers::default());
+    cx.run_until_parked();
     cx.simulate_keystrokes("cmd-enter");
     cx.run_until_parked();
 
@@ -7817,12 +7820,15 @@ fn new_bot_dialog_closes_from_the_backdrop_not_from_its_own_clicks(cx: &mut Test
     });
     cx.run_until_parked();
     let dialog = cx.debug_bounds("new-bot-dialog").unwrap();
-    // Inside the card (the Change line opens the agent pickers) keeps it open.
-    let runs_on = cx.debug_bounds("new-bot-runs-on").unwrap();
-    cx.simulate_click(runs_on.center(), Modifiers::default());
+    // Inside the card (clicking the agent picker opens its popover and keeps the dialog open).
+    let runtime = cx.debug_bounds("new-bot-runtime").unwrap();
+    cx.simulate_click(runtime.center(), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("new-bot-dialog").is_some());
-    assert!(cx.debug_bounds("new-bot-change").is_some());
+    assert!(cx.debug_bounds("new-bot-agent-popover-body").is_some());
+    // Dismiss the popover via its trigger, then backdrop-click closes the dialog.
+    cx.simulate_click(runtime.center(), Modifiers::default());
+    cx.run_until_parked();
     cx.simulate_click(
         point(dialog.left() / 2., dialog.center().y),
         Modifiers::default(),

@@ -2,7 +2,7 @@
 //! Durable multi-bot group chat threads, messages, `@mention` + [`BotGroupReplyMode`] routing,
 //! and active turn completion relay.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::path::PathBuf;
@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use krill_proto::SessionId;
 use krill_proto::bots::{
-    BotConfig, BotGroupChat, BotGroupMessage, BotGroupReplyMode, BotGroupThread, BotGroupView,
-    BotId,
+    BotConfig, BotGroupChat, BotGroupMessage, BotGroupReplyAudience, BotGroupReplyMode,
+    BotGroupRoomView, BotGroupSummary, BotGroupThread, BotGroupTurnInfo, BotGroupView, BotId,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::write_atomic_0600;
@@ -25,6 +25,7 @@ use crate::session::lock;
 const THREADS_FILE: &str = "group-threads.json";
 const MESSAGES_FILE: &str = "group-messages.json";
 const TURNS_FILE: &str = "group-turns.json";
+const META_FILE: &str = "group-meta.json";
 const MAX_GROUP_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGES_PER_THREAD: usize = 200;
 const MAX_MESSAGE_BYTES: usize = 32 * 1024;
@@ -50,6 +51,8 @@ struct GroupRuntimeData {
     messages: Vec<BotGroupMessage>,
     #[serde(default)]
     turns: Vec<ActiveGroupTurn>,
+    #[serde(default)]
+    audiences: BTreeMap<String, BotGroupReplyAudience>,
 }
 
 /// Dispatch plan produced when posting a message to a group thread.
@@ -101,9 +104,26 @@ impl GroupCoordinator {
             data.threads.retain(|t| t.group_id != group_id);
             data.messages.retain(|m| m.group_id != group_id);
             data.turns.retain(|t| t.group_id != group_id);
+            data.audiences.remove(group_id);
             self.persist_locked(data)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn prune_audience_for_updated_group(&self, group: &BotGroupChat) {
+        let _io = lock(&self.io_lock);
+        if self.ensure_loaded_locked().is_err() {
+            return;
+        }
+        let mut guard = lock(&self.state);
+        if let Some(data) = guard.as_mut()
+            && let Some(BotGroupReplyAudience::Bot { bot_id }) = data.audiences.get(&group.id)
+            && !group.bot_ids.contains(bot_id)
+        {
+            data.audiences
+                .insert(group.id.clone(), BotGroupReplyAudience::Mentions);
+            self.persist_locked(data).ok();
+        }
     }
 
     pub fn reorder_groups(store: &BotStore, group_ids: &[String]) -> io::Result<Vec<BotGroupChat>> {
@@ -148,13 +168,101 @@ impl GroupCoordinator {
         Ok(thread)
     }
 
-    pub fn read_group(
+    pub fn list_group_summaries(&self, store: &BotStore) -> io::Result<Vec<BotGroupSummary>> {
+        let groups = store.list_groups()?;
+        let _io = lock(&self.io_lock);
+        self.ensure_loaded_locked()?;
+        let guard = lock(&self.state);
+        let data = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing state"))?;
+
+        Ok(groups
+            .into_iter()
+            .map(|group| {
+                let mut threads: Vec<BotGroupThread> = data
+                    .threads
+                    .iter()
+                    .filter(|t| t.group_id == group.id)
+                    .cloned()
+                    .collect();
+                threads.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
+                let latest_message = data
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| {
+                        m.group_id == group.id && (!m.body.trim().is_empty() || m.in_progress)
+                    })
+                    .cloned();
+                let active_turns = data
+                    .turns
+                    .iter()
+                    .filter(|t| t.group_id == group.id)
+                    .map(|t| BotGroupTurnInfo {
+                        group_id: t.group_id.clone(),
+                        thread_id: t.thread_id.clone(),
+                        bot_id: t.bot_id.clone(),
+                        session_id: t.session_id,
+                        message_id: t.placeholder_message_id.clone(),
+                        started_at_ms: t.started_at_ms,
+                    })
+                    .collect();
+                let reply_audience =
+                    effective_audience(data.audiences.get(&group.id), &group.bot_ids);
+                BotGroupSummary {
+                    group,
+                    reply_audience,
+                    threads,
+                    latest_message,
+                    active_turns,
+                }
+            })
+            .collect())
+    }
+
+    pub fn set_reply_audience(
+        &self,
+        store: &BotStore,
+        group_id: &str,
+        audience: BotGroupReplyAudience,
+    ) -> io::Result<BotGroupReplyAudience> {
+        let group = store.get_group(group_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("group not found: {group_id}"),
+            )
+        })?;
+        if let BotGroupReplyAudience::Bot { ref bot_id } = audience
+            && !group.bot_ids.contains(bot_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "bot {} is not a member of group {group_id}",
+                    bot_id.as_str()
+                ),
+            ));
+        }
+        let _io = lock(&self.io_lock);
+        self.ensure_loaded_locked()?;
+        let mut guard = lock(&self.state);
+        let data = guard
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing state"))?;
+        data.audiences.insert(group.id, audience.clone());
+        self.persist_locked(data)?;
+        Ok(audience)
+    }
+
+    pub fn read_group_room(
         &self,
         store: &BotStore,
         group_id: &str,
         thread_id: Option<&str>,
+        before_message_id: Option<&str>,
         limit: Option<u32>,
-    ) -> io::Result<BotGroupView> {
+    ) -> io::Result<BotGroupRoomView> {
         let group = store.get_group(group_id)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -194,7 +302,7 @@ impl GroupCoordinator {
             .and_then(|n| usize::try_from(n).ok())
             .map_or(DEFAULT_READ_LIMIT, |n| n.clamp(1, MAX_MESSAGES_PER_THREAD));
 
-        let mut messages: Vec<BotGroupMessage> = if let Some(ref tid) = selected_thread_id {
+        let mut thread_msgs: Vec<BotGroupMessage> = if let Some(ref tid) = selected_thread_id {
             data.messages
                 .iter()
                 .filter(|m| m.group_id == group.id && &m.thread_id == tid)
@@ -203,22 +311,59 @@ impl GroupCoordinator {
         } else {
             Vec::new()
         };
-        if messages.len() > cap {
-            let start = messages.len().saturating_sub(cap);
-            messages.drain(..start);
-        }
 
-        let active_run = data.turns.iter().any(|t| {
-            t.group_id == group.id
-                && selected_thread_id
-                    .as_ref()
-                    .is_none_or(|tid| &t.thread_id == tid)
-        }) || messages.iter().any(|m| m.in_progress);
+        let end = before_message_id
+            .and_then(|anchor| thread_msgs.iter().position(|m| m.message_id == anchor))
+            .unwrap_or(thread_msgs.len());
+        let start = end.saturating_sub(cap);
+        let has_earlier = start > 0;
+        let messages = thread_msgs.drain(start..end).collect();
 
-        Ok(BotGroupView {
+        let active_turns = data
+            .turns
+            .iter()
+            .filter(|t| {
+                t.group_id == group.id
+                    && selected_thread_id
+                        .as_ref()
+                        .is_none_or(|tid| &t.thread_id == tid)
+            })
+            .map(|t| BotGroupTurnInfo {
+                group_id: t.group_id.clone(),
+                thread_id: t.thread_id.clone(),
+                bot_id: t.bot_id.clone(),
+                session_id: t.session_id,
+                message_id: t.placeholder_message_id.clone(),
+                started_at_ms: t.started_at_ms,
+            })
+            .collect();
+        let reply_audience = effective_audience(data.audiences.get(&group.id), &group.bot_ids);
+
+        Ok(BotGroupRoomView {
             group,
+            reply_audience,
             threads,
+            active_thread_id: selected_thread_id,
             messages,
+            has_earlier,
+            active_turns,
+        })
+    }
+
+    pub fn read_group(
+        &self,
+        store: &BotStore,
+        group_id: &str,
+        thread_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> io::Result<BotGroupView> {
+        let room = self.read_group_room(store, group_id, thread_id, None, limit)?;
+        let active_run =
+            !room.active_turns.is_empty() || room.messages.iter().any(|m| m.in_progress);
+        Ok(BotGroupView {
+            group: room.group,
+            threads: room.threads,
+            messages: room.messages,
             active_run,
         })
     }
@@ -232,6 +377,58 @@ impl GroupCoordinator {
         sender: &str,
         text: &str,
         reply_mode: Option<BotGroupReplyMode>,
+        now_ms: u64,
+    ) -> io::Result<GroupDispatchPlan> {
+        let audience = reply_mode.map(|mode| match mode {
+            BotGroupReplyMode::All | BotGroupReplyMode::Selected => BotGroupReplyAudience::All,
+            BotGroupReplyMode::Mentions => BotGroupReplyAudience::Mentions,
+        });
+        let legacy_selected = reply_mode == Some(BotGroupReplyMode::Selected);
+        self.prepare_message_dispatch_inner(
+            store,
+            group_id,
+            thread_id,
+            sender,
+            text,
+            audience,
+            legacy_selected,
+            now_ms,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "group message dispatch inputs")]
+    pub(crate) fn prepare_message_dispatch_with_audience(
+        &self,
+        store: &BotStore,
+        group_id: &str,
+        thread_id: Option<&str>,
+        sender: &str,
+        text: &str,
+        audience: BotGroupReplyAudience,
+        now_ms: u64,
+    ) -> io::Result<GroupDispatchPlan> {
+        self.prepare_message_dispatch_inner(
+            store,
+            group_id,
+            thread_id,
+            sender,
+            text,
+            Some(audience),
+            false,
+            now_ms,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "group message dispatch inputs")]
+    fn prepare_message_dispatch_inner(
+        &self,
+        store: &BotStore,
+        group_id: &str,
+        thread_id: Option<&str>,
+        sender: &str,
+        text: &str,
+        audience: Option<BotGroupReplyAudience>,
+        legacy_selected: bool,
         now_ms: u64,
     ) -> io::Result<GroupDispatchPlan> {
         let trimmed_text = text.trim();
@@ -263,17 +460,38 @@ impl GroupCoordinator {
             }
         }
 
+        let _io = lock(&self.io_lock);
+        self.ensure_loaded_locked()?;
+        let mut guard = lock(&self.state);
+        let data = guard
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing state"))?;
+
         let mentioned_ids = extract_mentions(trimmed_text, &member_bots);
-        let mode = reply_mode.unwrap_or_default();
-        let target_ids: Vec<BotId> = match mode {
-            BotGroupReplyMode::All => member_bots.iter().map(|b| b.id.clone()).collect(),
-            BotGroupReplyMode::Mentions => mentioned_ids.clone(),
-            BotGroupReplyMode::Selected => {
+        let resolved_audience = if legacy_selected {
+            if mentioned_ids.is_empty() {
+                member_bots
+                    .first()
+                    .map_or(BotGroupReplyAudience::Mentions, |b| {
+                        BotGroupReplyAudience::Bot {
+                            bot_id: b.id.clone(),
+                        }
+                    })
+            } else {
+                BotGroupReplyAudience::Mentions
+            }
+        } else {
+            match audience {
+                Some(explicit) => explicit,
+                None => effective_audience(data.audiences.get(&group.id), &group.bot_ids),
+            }
+        };
+        let target_ids: Vec<BotId> = match resolved_audience {
+            BotGroupReplyAudience::All => member_bots.iter().map(|b| b.id.clone()).collect(),
+            BotGroupReplyAudience::Mentions => mentioned_ids.clone(),
+            BotGroupReplyAudience::Bot { bot_id } => {
                 if mentioned_ids.is_empty() {
-                    member_bots
-                        .first()
-                        .map(|b| vec![b.id.clone()])
-                        .unwrap_or_default()
+                    vec![bot_id]
                 } else {
                     mentioned_ids.clone()
                 }
@@ -284,13 +502,6 @@ impl GroupCoordinator {
             .into_iter()
             .filter(|b| target_ids.contains(&b.id) && !b.paused)
             .collect();
-
-        let _io = lock(&self.io_lock);
-        self.ensure_loaded_locked()?;
-        let mut guard = lock(&self.state);
-        let data = guard
-            .as_mut()
-            .ok_or_else(|| io::Error::other("missing state"))?;
 
         let thread = if let Some(explicit) = thread_id.map(str::trim).filter(|s| !s.is_empty()) {
             let pos = data
@@ -505,6 +716,16 @@ impl GroupCoordinator {
         group_id: &str,
         thread_id: Option<&str>,
     ) -> io::Result<Vec<(BotId, SessionId)>> {
+        self.stop_group_member(store, group_id, thread_id, None)
+    }
+
+    pub(crate) fn stop_group_member(
+        &self,
+        store: &BotStore,
+        group_id: &str,
+        thread_id: Option<&str>,
+        bot_id: Option<&BotId>,
+    ) -> io::Result<Vec<(BotId, SessionId)>> {
         if store.get_group(group_id)?.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -527,7 +748,8 @@ impl GroupCoordinator {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .is_none_or(|tid| turn.thread_id == tid);
-            if matches_group && matches_thread {
+            let matches_bot = bot_id.is_none_or(|bid| &turn.bot_id == bid);
+            if matches_group && matches_thread && matches_bot {
                 stopped.push((turn.bot_id, turn.session_id));
             } else {
                 keep_turns.push(turn);
@@ -540,7 +762,8 @@ impl GroupCoordinator {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .is_none_or(|tid| msg.thread_id == tid);
-            if msg.group_id == group_id && matches_thread && msg.in_progress {
+            let matches_bot = bot_id.is_none_or(|bid| msg.sender_id == bid.as_str());
+            if msg.group_id == group_id && matches_thread && matches_bot && msg.in_progress {
                 msg.in_progress = false;
                 if msg.body.trim().is_empty() {
                     "[stopped]".clone_into(&mut msg.body);
@@ -585,13 +808,16 @@ impl GroupCoordinator {
             return Ok(());
         }
         ensure_no_symlink_path(&self.bots_root)?;
-        let threads: Vec<BotGroupThread> = self.read_vec_or_default(THREADS_FILE)?;
-        let messages: Vec<BotGroupMessage> = self.read_vec_or_default(MESSAGES_FILE)?;
-        let turns: Vec<ActiveGroupTurn> = self.read_vec_or_default(TURNS_FILE)?;
+        let threads: Vec<BotGroupThread> = self.read_json_or_default(THREADS_FILE)?;
+        let messages: Vec<BotGroupMessage> = self.read_json_or_default(MESSAGES_FILE)?;
+        let turns: Vec<ActiveGroupTurn> = self.read_json_or_default(TURNS_FILE)?;
+        let audiences: BTreeMap<String, BotGroupReplyAudience> =
+            self.read_json_or_default(META_FILE)?;
         *lock(&self.state) = Some(GroupRuntimeData {
             threads,
             messages,
             turns,
+            audiences,
         });
         Ok(())
     }
@@ -602,21 +828,22 @@ impl GroupCoordinator {
             .recursive(true)
             .mode(0o700)
             .create(&self.bots_root)?;
-        self.write_vec(THREADS_FILE, &data.threads)?;
-        self.write_vec(MESSAGES_FILE, &data.messages)?;
-        self.write_vec(TURNS_FILE, &data.turns)?;
+        self.write_json(THREADS_FILE, &data.threads)?;
+        self.write_json(MESSAGES_FILE, &data.messages)?;
+        self.write_json(TURNS_FILE, &data.turns)?;
+        self.write_json(META_FILE, &data.audiences)?;
         Ok(())
     }
 
-    fn read_vec_or_default<T: for<'de> Deserialize<'de>>(
+    fn read_json_or_default<T: Default + for<'de> Deserialize<'de>>(
         &self,
         filename: &str,
-    ) -> io::Result<Vec<T>> {
+    ) -> io::Result<T> {
         let path = self.bots_root.join(filename);
         ensure_no_symlink_path(&path)?;
         let bytes = match fs::read(&path) {
             Ok(b) => b,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
             Err(err) => return Err(err),
         };
         if bytes.len() > MAX_GROUP_JSON_BYTES {
@@ -628,63 +855,37 @@ impl GroupCoordinator {
         Ok(serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
-    fn write_vec<T: Serialize>(&self, filename: &str, items: &[T]) -> io::Result<()> {
+    fn write_json<T: Serialize + ?Sized>(&self, filename: &str, value: &T) -> io::Result<()> {
         let path = self.bots_root.join(filename);
         ensure_no_symlink_path(&path)?;
-        let mut bytes = serde_json::to_vec_pretty(items)
+        let mut bytes = serde_json::to_vec_pretty(value)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         bytes.push(b'\n');
         write_atomic_0600(&path, &bytes)
     }
 }
 
-fn extract_mentions(text: &str, members: &[BotConfig]) -> Vec<BotId> {
-    let mut mentioned = Vec::new();
-    let mut seen = BTreeSet::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars.get(i).copied() == Some('@') {
-            let prev_ok = i == 0
-                || chars
-                    .get(i.saturating_sub(1))
-                    .is_some_and(|c| !c.is_alphanumeric() && *c != '_');
-            if prev_ok {
-                let start = i + 1;
-                let mut end = start;
-                while end < chars.len()
-                    && chars
-                        .get(end)
-                        .is_some_and(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                {
-                    end += 1;
-                }
-                let token: String = chars.get(start..end).unwrap_or_default().iter().collect();
-                if !token.is_empty() {
-                    for bot in members {
-                        let clean_name = bot.name.replace(' ', "-");
-                        let matched = bot.id.as_str().eq_ignore_ascii_case(&token)
-                            || bot.slug.as_str().eq_ignore_ascii_case(&token)
-                            || bot.name.eq_ignore_ascii_case(&token)
-                            || clean_name.eq_ignore_ascii_case(&token);
-                        if matched && seen.insert(bot.id.clone()) {
-                            mentioned.push(bot.id.clone());
-                        }
-                    }
-                }
+fn effective_audience(
+    saved: Option<&BotGroupReplyAudience>,
+    member_ids: &[BotId],
+) -> BotGroupReplyAudience {
+    match saved {
+        Some(BotGroupReplyAudience::Bot { bot_id }) if member_ids.contains(bot_id) => {
+            BotGroupReplyAudience::Bot {
+                bot_id: bot_id.clone(),
             }
         }
-        i += 1;
+        Some(BotGroupReplyAudience::All) => BotGroupReplyAudience::All,
+        _ => BotGroupReplyAudience::Mentions,
     }
-    // Also support exact `@<Full Name With Spaces>` mentions if present.
-    let lower = text.to_ascii_lowercase();
-    for bot in members {
-        let needle = format!("@{}", bot.name.to_ascii_lowercase());
-        if lower.contains(&needle) && seen.insert(bot.id.clone()) {
-            mentioned.push(bot.id.clone());
-        }
-    }
-    mentioned
+}
+
+fn extract_mentions(text: &str, members: &[BotConfig]) -> Vec<BotId> {
+    let refs: Vec<(&BotId, &str, &str)> = members
+        .iter()
+        .map(|b| (&b.id, b.slug.as_str(), b.name.as_str()))
+        .collect();
+    krill_proto::bots::extract_group_mention_ids(text, &refs)
 }
 
 fn prune_thread_messages(messages: &mut Vec<BotGroupMessage>, group_id: &str, thread_id: &str) {
@@ -854,6 +1055,107 @@ mod tests {
 
         groups.delete_group(&store, &grp.id).unwrap();
         assert!(store.get_group(&grp.id).unwrap().is_none());
+
+        // V2 room pagination, reply audience persistence & pruning, @everyone, and per-member stop.
+        let grp3 = store
+            .create_group(
+                "Incident Room",
+                vec![alice.id.clone(), bob.id.clone()],
+                String::new(),
+                2_000,
+            )
+            .unwrap();
+        let saved = groups
+            .set_reply_audience(
+                &store,
+                &grp3.id,
+                BotGroupReplyAudience::Bot {
+                    bot_id: bob.id.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            BotGroupReplyAudience::Bot {
+                bot_id: bob.id.clone()
+            }
+        );
+
+        let plan_default = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp3.id,
+                None,
+                "owner",
+                "first message",
+                saved.clone(),
+                2_100,
+            )
+            .unwrap();
+        assert_eq!(plan_default.target_bots.len(), 1);
+        assert_eq!(plan_default.target_bots[0].id, bob.id);
+
+        let plan_everyone = groups
+            .prepare_message_dispatch_with_audience(
+                &store,
+                &grp3.id,
+                Some(&plan_default.thread.thread_id),
+                "owner",
+                "@everyone status?",
+                BotGroupReplyAudience::Mentions,
+                2_200,
+            )
+            .unwrap();
+        assert_eq!(plan_everyone.target_bots.len(), 2);
+
+        groups
+            .record_turn_started(
+                &grp3.id,
+                &plan_default.thread.thread_id,
+                &alice,
+                SessionId(91),
+                2_210,
+            )
+            .unwrap();
+        groups
+            .record_turn_started(
+                &grp3.id,
+                &plan_default.thread.thread_id,
+                &bob,
+                SessionId(92),
+                2_220,
+            )
+            .unwrap();
+        let stopped_one = groups
+            .stop_group_member(
+                &store,
+                &grp3.id,
+                Some(&plan_default.thread.thread_id),
+                Some(&alice.id),
+            )
+            .unwrap();
+        assert_eq!(stopped_one, vec![(alice.id.clone(), SessionId(91))]);
+        let room_mid = groups
+            .read_group_room(&store, &grp3.id, None, None, Some(1))
+            .unwrap();
+        assert!(room_mid.has_earlier);
+        assert_eq!(room_mid.messages.len(), 1);
+        assert_eq!(room_mid.active_turns.len(), 1);
+        assert_eq!(room_mid.active_turns[0].bot_id, bob.id);
+
+        let updated = GroupCoordinator::update_group(
+            &store,
+            &grp3.id,
+            None,
+            None,
+            Some(vec![alice.id.clone()]),
+            2_300,
+        )
+        .unwrap();
+        groups.prune_audience_for_updated_group(&updated);
+        let summaries = groups.list_group_summaries(&store).unwrap();
+        let summary3 = summaries.iter().find(|s| s.group.id == grp3.id).unwrap();
+        assert_eq!(summary3.reply_audience, BotGroupReplyAudience::Mentions);
 
         fs::remove_dir_all(&root).ok();
     }

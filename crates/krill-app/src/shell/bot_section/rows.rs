@@ -18,8 +18,6 @@ use krill_proto::control::AgentState;
 
 use super::{Shell, ShellAction, now_secs};
 
-/// The row picture: 36 px as Orca's sidebar draws it (measured on the reference screenshot; its
-/// source says `size-8`, which its root scale renders at 36).
 pub(super) const AVATAR: f32 = 36.;
 
 /// Orca `BotRowStatus`: the avatar shows exceptions; working shows at the row's end.
@@ -340,7 +338,7 @@ impl Shell {
         if self.bot_ui.collapsed {
             return section.into_any_element();
         }
-        if self.sidebar_bots.is_empty() {
+        if self.sidebar_bots.is_empty() && self.sidebar_groups.is_empty() {
             // Until the list arrives, show nothing rather than an invitation to make a first bot.
             if self.bot_ui.loaded {
                 section = section.child(Self::render_bots_empty(p, cx));
@@ -356,7 +354,12 @@ impl Shell {
             .iter()
             .map(|b| self.bot_facts(b, focused, cx))
             .collect();
-        let arrange: Vec<view::ArrangeFacts<'_>> = self
+        let group_facts: Vec<super::group_rows::GroupFacts> = self
+            .sidebar_groups
+            .iter()
+            .map(|g| self.bot_group_facts(g, cx))
+            .collect();
+        let arrange_bots: Vec<view::ArrangeFacts<'_>> = self
             .sidebar_bots
             .iter()
             .zip(&facts)
@@ -367,7 +370,20 @@ impl Shell {
                 activity_at: f.activity_ms,
             })
             .collect();
-        let order = view::arrange(&arrange, self.bot_view(cx));
+        let arrange_groups: Vec<view::ArrangeFacts<'_>> = self
+            .sidebar_groups
+            .iter()
+            .zip(&group_facts)
+            .map(|(g, f)| view::ArrangeFacts {
+                name: &g.group.name,
+                paused: f.all_paused,
+                needs_you: f.status == RowStatus::Permission,
+                activity_at: f.activity_ms,
+            })
+            .collect();
+        let view_opts = self.bot_view(cx);
+        let order = view::arrange(&arrange_bots, view_opts);
+        let entries = view::arrange_entries(&arrange_bots, &arrange_groups, view_opts);
         if let Some(search) = self.render_bot_search(&order, p, cx) {
             let searching = !self.bot_ui.query.trim().is_empty();
             section = section.child(search);
@@ -388,7 +404,7 @@ impl Shell {
             .pr_1()
             .flex()
             .flex_col();
-        if order.is_empty() {
+        if entries.is_empty() {
             list = list.child(
                 div()
                     .id("bots-all-hidden")
@@ -399,8 +415,21 @@ impl Shell {
                     .child(text::SBO_ALL_HIDDEN.get()),
             );
         }
-        for i in order {
-            list = list.child(self.render_bot_entry(&self.sidebar_bots[i], &facts[i], p, cx));
+        for entry in entries {
+            match entry {
+                view::SidebarEntry::Bot(i) => {
+                    list =
+                        list.child(self.render_bot_entry(&self.sidebar_bots[i], &facts[i], p, cx));
+                }
+                view::SidebarEntry::Group(i) => {
+                    list = list.child(self.render_group_row(
+                        &self.sidebar_groups[i],
+                        &group_facts[i],
+                        p,
+                        cx,
+                    ));
+                }
+            }
         }
         section.child(list).into_any_element()
     }
@@ -1274,7 +1303,7 @@ fn avatar_tile(bot: &SidebarBot, cx: &gpui::App) -> AnyElement {
 /// corner, centred 3 px in from it, on a disc of the row's own colour.
 // ponytail: a painted disc stands in for Orca's mask cutout (gpui has no masks), so a hovered
 // row shows the sidebar colour around the badge; draw a mask if that ever reads wrong.
-fn avatar_badge(
+pub(super) fn avatar_badge(
     status: RowStatus,
     stopped: bool,
     p: &'static ui::Palette,

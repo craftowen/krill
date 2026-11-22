@@ -429,6 +429,7 @@ pub fn sidebar_snapshot(
 #[derive(Debug, Clone, Default)]
 pub struct SidebarState {
     pub snapshot: SidebarSnapshot,
+    pub groups: Vec<krill_proto::bots::BotGroupSummary>,
     pub sessions: BTreeMap<SessionId, BotSessionMeta>,
     /// Newly read `avatar.png` bytes: bot, the config time they belong to, PNG (empty when
     /// it couldn't be read).
@@ -462,6 +463,22 @@ pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
         Ok(BotRpcResponse::BotSessions(list)) => list,
         _ => Vec::new(),
     };
+    let groups = match call(&BotRpcRequest::ListGroupSummaries) {
+        Ok(BotRpcResponse::GroupSummaries(groups)) => groups,
+        _ => match call(&BotRpcRequest::ListGroups) {
+            Ok(BotRpcResponse::Groups(raw)) => raw
+                .into_iter()
+                .map(|group| krill_proto::bots::BotGroupSummary {
+                    group,
+                    reply_audience: krill_proto::bots::BotGroupReplyAudience::default(),
+                    threads: Vec::new(),
+                    latest_message: None,
+                    active_turns: Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+    };
     let metas: HashMap<&BotId, BotSessionMeta> = bots
         .iter()
         .map(|b| (&b.id, BotSessionMeta::from_bot(b)))
@@ -487,6 +504,7 @@ pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
         .collect();
     Some(SidebarState {
         snapshot: sidebar_snapshot(&bots, &items, &access, &summaries),
+        groups,
         sessions,
         avatars,
     })

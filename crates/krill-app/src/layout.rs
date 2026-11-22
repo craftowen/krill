@@ -27,6 +27,16 @@ const FILE_NAME: &str = "layout.bin";
 const FORMAT_VERSION: u8 = 7;
 /// Optional preferences after `FocusTail`; old readers ignore this suffix.
 const CHAT_VIEWS_TAG: &[u8] = b"KCV1";
+/// Optional group-pane bindings after `chat_views`; old readers ignore this suffix.
+const GROUP_PANES_TAG: &[u8] = b"KGP1";
+
+/// Group chat room/thread binding attached to a layout pane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPaneTarget {
+    pub group_id: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
 /// 손상·악성 파일의 깊은 중첩이 역직렬화 재귀로 스택을 넘지 않게 하는 상한.
 /// 탭 10개 × 분할 4개는 수백 바이트다.
 const MAX_FILE_BYTES: u64 = 16 * 1024;
@@ -137,7 +147,8 @@ impl PaneTree {
         }
     }
 
-    fn leaves(&self, out: &mut Vec<PaneId>) {
+    /// Collects every leaf pane ID inside this split tree.
+    pub fn leaves(&self, out: &mut Vec<PaneId>) {
         match self {
             Self::Leaf(id) => out.push(*id),
             Self::Split { first, second, .. } => {
@@ -436,6 +447,9 @@ pub struct Layout {
     /// Explicit Chat/Terminal choices survive app updates, scoped to the saved pane/host.
     #[serde(skip)]
     chat_views: BTreeMap<PaneId, bool>,
+    /// Multi-bot group room/thread panes (Orca Group Page tabs).
+    #[serde(skip)]
+    group_panes: BTreeMap<PaneId, GroupPaneTarget>,
 }
 
 /// v5까지의 디스크 `Tab`(OWE-734 `pinned`·`color` 이전).
@@ -535,6 +549,7 @@ impl From<LegacyLayoutV6> for Layout {
             mru: MruState::default(),
             zoomed: Vec::new(),
             chat_views: BTreeMap::new(),
+            group_panes: BTreeMap::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -580,6 +595,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             mru: MruState::default(),
             zoomed: Vec::new(),
             chat_views: BTreeMap::new(),
+            group_panes: BTreeMap::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -613,6 +629,7 @@ impl Default for Layout {
             },
             zoomed: Vec::new(),
             chat_views: BTreeMap::new(),
+            group_panes: BTreeMap::new(),
         }
     }
 }
@@ -630,6 +647,30 @@ impl Layout {
     pub fn set_chat_view(&mut self, pane: PaneId, chat: bool) {
         if self.pane_exists(pane) && !self.files.contains_key(&pane) {
             self.chat_views.insert(pane, chat);
+        }
+    }
+
+    /// Multi-bot group room/thread attached to `pane`, if any.
+    #[must_use]
+    pub fn group_pane(&self, pane: PaneId) -> Option<&GroupPaneTarget> {
+        self.group_panes.get(&pane)
+    }
+
+    /// Marks `pane` as a multi-bot group chat page (removing any conflicting session/file).
+    pub fn set_group_pane(&mut self, pane: PaneId, target: Option<GroupPaneTarget>) {
+        if !self.pane_exists(pane) {
+            return;
+        }
+        match target {
+            Some(target) => {
+                self.sessions.remove(&pane);
+                self.files.remove(&pane);
+                self.chat_views.remove(&pane);
+                self.group_panes.insert(pane, target);
+            }
+            None => {
+                self.group_panes.remove(&pane);
+            }
         }
     }
 
@@ -787,6 +828,7 @@ impl Layout {
     pub fn set_session(&mut self, pane: PaneId, session: SessionId) {
         if self.panes().contains(&pane)
             && !self.files.contains_key(&pane)
+            && !self.group_panes.contains_key(&pane)
             && self
                 .sessions
                 .insert(pane, session)
@@ -960,6 +1002,7 @@ impl Layout {
         self.record_mru(tab);
         self.sessions.remove(&pane);
         self.chat_views.remove(&pane);
+        self.group_panes.remove(&pane);
         self.set_host(pane, host);
         self.files.insert(pane, path);
         Some(pane)
@@ -1090,6 +1133,9 @@ impl Layout {
         });
         self.chat_views
             .retain(|p, _| live.contains(p) && !self.files.contains_key(p));
+        self.group_panes.retain(|p, _| {
+            live.contains(p) && !self.files.contains_key(p) && !self.sessions.contains_key(p)
+        });
     }
 
     fn alloc_pane(&mut self) -> PaneId {
@@ -1871,6 +1917,9 @@ impl Layout {
                 .chat_views
                 .keys()
                 .all(|p| seen.contains(p) && !self.files.contains_key(p))
+            && self.group_panes.keys().all(|p| {
+                seen.contains(p) && !self.files.contains_key(p) && !self.sessions.contains_key(p)
+            })
     }
 
     /// 손상 백업(`.corrupt`)을 만들지 않고 저장 파일에서 창 위치·크기만 미리 읽는다.
@@ -1940,14 +1989,30 @@ impl Layout {
                                 postcard::take_from_bytes::<FocusTail>(focus_bytes)
                         {
                             // A bad optional preference must not discard live tabs or sessions.
-                            if let Some(bytes) = preferences.strip_prefix(CHAT_VIEWS_TAG)
-                                && let Ok(views) =
-                                    postcard::from_bytes::<BTreeMap<PaneId, bool>>(bytes)
+                            let mut rest_prefs = preferences;
+                            if let Some(bytes) = rest_prefs.strip_prefix(CHAT_VIEWS_TAG)
+                                && let Ok((views, next)) =
+                                    postcard::take_from_bytes::<BTreeMap<PaneId, bool>>(bytes)
                             {
                                 l.chat_views = views
                                     .into_iter()
                                     .filter(|(pane, _)| {
                                         l.pane_exists(*pane) && !l.files.contains_key(pane)
+                                    })
+                                    .collect();
+                                rest_prefs = next;
+                            }
+                            if let Some(bytes) = rest_prefs.strip_prefix(GROUP_PANES_TAG)
+                                && let Ok((groups, _)) = postcard::take_from_bytes::<
+                                    BTreeMap<PaneId, GroupPaneTarget>,
+                                >(bytes)
+                            {
+                                l.group_panes = groups
+                                    .into_iter()
+                                    .filter(|(pane, _)| {
+                                        l.pane_exists(*pane)
+                                            && !l.files.contains_key(pane)
+                                            && !l.sessions.contains_key(pane)
                                     })
                                     .collect();
                             }
@@ -1994,11 +2059,14 @@ impl Layout {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut body = postcard::to_stdvec(self).map_err(io::Error::other)?;
         let tail = self.tail();
-        let focus = (self.tabs.len() > 1 || !self.zoomed.is_empty() || !self.chat_views.is_empty())
-            .then(|| FocusTail {
-                order: self.mru_order(),
-                zoomed: self.zoomed.clone(),
-            });
+        let focus = (self.tabs.len() > 1
+            || !self.zoomed.is_empty()
+            || !self.chat_views.is_empty()
+            || !self.group_panes.is_empty())
+        .then(|| FocusTail {
+            order: self.mru_order(),
+            zoomed: self.zoomed.clone(),
+        });
         if !self.hosts.is_empty() || tail != LayoutTail::default() || focus.is_some() {
             body.extend(postcard::to_stdvec(&self.hosts).map_err(io::Error::other)?);
             if tail != LayoutTail::default() || focus.is_some() {
@@ -2009,6 +2077,12 @@ impl Layout {
                         body.extend(CHAT_VIEWS_TAG);
                         body.extend(
                             postcard::to_stdvec(&self.chat_views).map_err(io::Error::other)?,
+                        );
+                    }
+                    if !self.group_panes.is_empty() {
+                        body.extend(GROUP_PANES_TAG);
+                        body.extend(
+                            postcard::to_stdvec(&self.group_panes).map_err(io::Error::other)?,
                         );
                     }
                 }
@@ -2183,6 +2257,37 @@ mod leaf_mru_tests {
         assert_ne!(restored_file, file_pane);
         assert_eq!(merged.session(restored), Some(SessionId(11)));
         assert_eq!(merged.file(restored_file), Some(Path::new("saved.md")));
+    }
+
+    #[test]
+    fn group_pane_binding_roundtrips_and_cleans_conflicts() {
+        let dir = std::env::temp_dir().join(format!("krill-layout-grp-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let path = dir.join(FILE_NAME);
+        let mut layout = Layout::default();
+        layout.new_tab();
+        let grp_pane = layout.focused().unwrap();
+        layout.set_session(grp_pane, SessionId(5));
+        layout.set_group_pane(
+            grp_pane,
+            Some(GroupPaneTarget {
+                group_id: "grp-triage".to_owned(),
+                thread_id: Some("thr-1".to_owned()),
+            }),
+        );
+        assert!(layout.session(grp_pane).is_none());
+        assert!(layout.is_valid());
+        layout.save(&path).unwrap();
+
+        let reloaded = Layout::load(&path).unwrap();
+        assert_eq!(
+            reloaded.group_pane(grp_pane),
+            Some(&GroupPaneTarget {
+                group_id: "grp-triage".to_owned(),
+                thread_id: Some("thr-1".to_owned()),
+            })
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }
 
