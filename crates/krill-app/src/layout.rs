@@ -947,6 +947,24 @@ impl Layout {
         pane
     }
 
+    /// 지정한 칸을 파일 칸으로 바꾼다(빈 분할 런처에서 파일을 골랐을 때 같은 칸에 연다).
+    pub fn open_file_in_pane(
+        &mut self,
+        pane: PaneId,
+        host: HostId,
+        path: PathBuf,
+    ) -> Option<PaneId> {
+        let tab = self.tab_of_pane(pane)?;
+        self.active = tab;
+        self.tabs[tab].focused = pane;
+        self.record_mru(tab);
+        self.sessions.remove(&pane);
+        self.chat_views.remove(&pane);
+        self.set_host(pane, host);
+        self.files.insert(pane, path);
+        Some(pane)
+    }
+
     /// 파일을 미리보기로 연다(OWE-849): 이미 열려 있으면 그 탭·칸으로 포커스만 옮기고,
     /// 살아 있는 미리보기 칸이 있으면 그 칸을 재사용하며, 아니면 새 탭을 열어 슬롯에 기록한다.
     pub fn open_file_preview(&mut self, path: PathBuf) -> PaneId {

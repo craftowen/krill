@@ -254,12 +254,29 @@ impl Shell {
         kickoff: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.start_bot_session_in(bot_id, kickoff, None, cx);
+    }
+
+    /// Starts a new chat for a bot, filling `target_pane` in place when present (split/tab launcher).
+    pub(super) fn start_bot_session_in(
+        &mut self,
+        bot_id: BotId,
+        kickoff: Option<String>,
+        target_pane: Option<krill_app::layout::PaneId>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(rpc) = self.bot_rpc() else {
+            if let Some(pane) = target_pane {
+                self.clear_split_launcher_launching(pane);
+            }
             return;
         };
         let bot = self.sidebar_bots.iter().find(|b| b.id == bot_id);
         // krilld won't start a paused bot; say so in the app's words.
         if bot.is_some_and(|b| b.paused) && kickoff.is_none() {
+            if let Some(pane) = target_pane {
+                self.clear_split_launcher_launching(pane);
+            }
             self.notice = Some(text::OPEN_CHAT_PAUSED_TOOLTIP.get().to_owned());
             cx.notify();
             return;
@@ -285,6 +302,9 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 this.bot_ui.opening.remove(&opening);
+                if let Some(pane) = target_pane {
+                    this.clear_split_launcher_launching(pane);
+                }
                 match started {
                     Ok(BotRpcResponse::SessionStarted {
                         bot_id,
@@ -309,7 +329,11 @@ impl Shell {
                                 },
                             );
                         }
-                        this.open_bot_session(&bot_id, session_id, cx);
+                        if let Some(pane) = target_pane.filter(|p| this.layout.pane_exists(*p)) {
+                            this.open_bot_session_in_pane(&bot_id, session_id, pane, cx);
+                        } else {
+                            this.open_bot_session(&bot_id, session_id, cx);
+                        }
                         this.refresh_bots_badge(cx);
                     }
                     Ok(_) => {
@@ -322,6 +346,54 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    /// Replaces a launcher pane in place with a live bot chat session.
+    pub(super) fn open_bot_session_in_pane(
+        &mut self,
+        bot_id: &BotId,
+        session: krill_proto::SessionId,
+        pane: krill_app::layout::PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let host = self.launch_host.clone();
+        let bot = self.sidebar_bots.iter().find(|b| &b.id == bot_id).cloned();
+        if let Some(meta) = bot.as_ref().map(SidebarBot::session_meta) {
+            self.sidebar.update(cx, |sb, cx| {
+                sb.register_bot_session(host.clone(), session, meta, cx);
+            });
+        }
+        let folder = bot.as_ref().and_then(|b| self.bot_folder(b)).or_else(|| {
+            self.sidebar
+                .read(cx)
+                .folder_on(&host, session)
+                .map(std::path::Path::to_path_buf)
+        });
+        self.split_launchers.remove(&pane);
+        self.workspace_closing.remove(&(host.clone(), session));
+        self.change(true, cx, |l| {
+            if let Some(tab) = l.tab_of_pane(pane) {
+                l.activate(tab);
+            }
+            l.focus(pane);
+            l.set_host(pane, host.clone());
+            l.set_session(pane, session);
+            if let Some(folder) = folder {
+                l.set_launch(
+                    pane,
+                    krill_proto::control::Create {
+                        account: None,
+                        program: krill_proto::control::Program::Login,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: krill_app::pane::SIZE.0,
+                        rows: krill_app::pane::SIZE.1,
+                    },
+                );
+            }
+        });
+        self.set_pane_chat_view(pane, true, cx);
+        self.files.refocus = true;
     }
 
     /// Shows one of a bot's sessions as a chat tab, labelled with the bot's identity.

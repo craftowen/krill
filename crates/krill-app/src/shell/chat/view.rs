@@ -2826,11 +2826,7 @@ impl Shell {
                     .xsmall()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.layout.set_zoomed_pane(None);
-                        this.change(true, cx, |l| {
-                            l.focus(pane);
-                            l.split(krill_app::layout::Axis::Horizontal);
-                        });
+                        this.split_pane(pane, krill_app::layout::Axis::Horizontal, cx);
                     })),
                 format!("chat-split-right-{}", pane.get()),
                 krill_app::i18n::catalog::shell::SPLIT_RIGHT.get(),
@@ -2845,11 +2841,7 @@ impl Shell {
                 .xsmall()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.layout.set_zoomed_pane(None);
-                    this.change(true, cx, |l| {
-                        l.focus(pane);
-                        l.split(krill_app::layout::Axis::Vertical);
-                    });
+                    this.split_pane(pane, krill_app::layout::Axis::Vertical, cx);
                 })),
             format!("chat-split-down-{}", pane.get()),
             krill_app::i18n::catalog::shell::SPLIT_DOWN.get(),

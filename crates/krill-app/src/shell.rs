@@ -38,6 +38,7 @@ mod release;
 pub(crate) mod security;
 mod session_accounts;
 mod session_switch_modal;
+mod split_launcher;
 mod stale_account_banner;
 mod tabs;
 mod terminal_menu;
@@ -821,6 +822,8 @@ pub struct Shell {
     pub(super) sidebar_bots: Vec<krill_app::bots::SidebarBot>,
     /// Orca's sidebar Bots section, New bot and templates dialogs.
     bot_ui: bot_section::BotUi,
+    /// Orca's empty split/new-tab pane launcher state, keyed by pane id.
+    split_launchers: HashMap<PaneId, split_launcher::SplitLauncher>,
     bots_badge_task: Option<Task<()>>,
     /// Picks up bots made outside the app (`krill bot new` in a pane) for the sidebar.
     #[cfg(not(test))]
@@ -1481,6 +1484,7 @@ impl Shell {
             bots_attention_count: 0,
             sidebar_bots: Vec::new(),
             bot_ui: bot_section::BotUi::default(),
+            split_launchers: HashMap::new(),
             bots_badge_task: None,
             #[cfg(not(test))]
             bots_poll: None,
@@ -4603,6 +4607,7 @@ impl Shell {
         let paste_queue = &self.paste_queue;
         self.creations.retain(|p, _| layout.pane_exists(*p));
         self.outcome_unknown.retain(|p, _| layout.pane_exists(*p));
+        self.split_launchers.retain(|p, _| layout.pane_exists(*p));
         self.live.retain(|p, live| {
             visible.contains(p)
                 || layout.pane_exists(*p)
@@ -4664,6 +4669,9 @@ impl Shell {
             }
             if self.layout.file(p).is_some() {
                 continue; // 파일 칸은 세션에 붙지 않는다(MK-119)
+            }
+            if self.split_launchers.contains_key(&p) {
+                continue; // 빈 분할·새 탭 런처 칸은 사용자가 고를 때까지 PTY를 만들지 않는다
             }
             // 업데이트 health는 로컬 칸 연결로 판정한다. 원격 칸만 보이면 호스트가 꺼졌거나 SSH가 느릴 때
             // 30초 안에 붙지 못해 업데이트가 매번 롤백됐다(설 실기, v0.1.10→0.1.11).
@@ -6314,6 +6322,26 @@ impl Shell {
         self.change_with_policy(save, close::Policy::Preserve, cx, f);
     }
 
+    pub(super) fn change_with_launcher(
+        &mut self,
+        bot_id: Option<krill_proto::bots::BotId>,
+        root_folder: Option<PathBuf>,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Layout) -> Option<PaneId>,
+    ) {
+        self.change_with_policy_and_hook(
+            true,
+            close::Policy::Preserve,
+            cx,
+            f,
+            |this, created_pane| {
+                if let Some(pane) = created_pane {
+                    this.register_split_launcher(pane, bot_id, root_folder);
+                }
+            },
+        );
+    }
+
     fn change_with_policy(
         &mut self,
         save: bool,
@@ -6321,9 +6349,21 @@ impl Shell {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Layout),
     ) {
+        self.change_with_policy_and_hook(save, policy, cx, f, |_, ()| {});
+    }
+
+    fn change_with_policy_and_hook<R>(
+        &mut self,
+        save: bool,
+        policy: close::Policy,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Layout) -> R,
+        after_layout: impl FnOnce(&mut Self, R),
+    ) {
         let focused = self.layout.focused();
         let before = self.layout.clone();
-        f(&mut self.layout);
+        let out = f(&mut self.layout);
+        after_layout(self, out);
         if !self.layout.tabs().is_empty() {
             krill_app::onboarding::dismiss_welcome(cx);
         }
@@ -7154,6 +7194,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         const PANE_HEADER_GROUP: &str = "pane-header";
+        if self.is_split_launcher(id) {
+            return self.render_split_launcher_pane(id, window, cx);
+        }
         if self.layout.file(id).is_some() {
             return self.render_file_pane(id, window, cx);
         }
@@ -7277,12 +7320,7 @@ impl Shell {
                             .xsmall()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                                this.layout.set_zoomed_pane(None);
-                                this.change(true, cx, |l| {
-                                    l.focus(id);
-                                    l.split(Axis::Vertical);
-                                });
+                                this.split_pane(id, Axis::Vertical, cx);
                             })),
                         format!("pane-split-down-{}", id.get()),
                         text::SPLIT_DOWN.get(),
@@ -7310,12 +7348,7 @@ impl Shell {
                             .xsmall()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                                this.layout.set_zoomed_pane(None);
-                                this.change(true, cx, |l| {
-                                    l.focus(id);
-                                    l.split(Axis::Horizontal);
-                                });
+                                this.split_pane(id, Axis::Horizontal, cx);
                             })),
                         format!("pane-split-right-{}", id.get()),
                         text::SPLIT_RIGHT.get(),
@@ -8439,11 +8472,11 @@ impl Render for Shell {
                     }
                 }),
             )
-            .on_action(cx.listener(|this, _: &NewTab, _, cx| {
+            .on_action(cx.listener(|this, _: &NewTab, window, cx| {
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
-                this.new_tab_on_launch_host(cx);
+                this.on_new_tab_shortcut(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
                 if this.page_open() || this.dashboard.is_some() {
@@ -8647,16 +8680,7 @@ impl Render for Shell {
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
-                if this.link == Link::Up && this.agents.is_some() {
-                    this.new_default_agent(cx);
-                } else {
-                    this.notice = Some(
-                        krill_app::i18n::catalog::checks::D_AGENTS_NONE
-                            .get()
-                            .to_owned(),
-                    );
-                    cx.notify();
-                }
+                this.on_new_agent_tab_shortcut(cx);
             }))
             .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| {
                 if this.page_open() {
@@ -9120,10 +9144,10 @@ impl Shell {
             return;
         }
         self.layout.set_zoomed_pane(None);
-        if self.layout.tabs().is_empty() {
-            self.new_tab_on_launch_host(cx);
+        if let Some(focused) = self.layout.focused() {
+            self.split_pane(focused, axis, cx);
         } else {
-            self.change(true, cx, |l| l.split(axis));
+            self.new_tab_on_launch_host(cx);
         }
     }
 

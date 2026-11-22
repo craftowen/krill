@@ -143,6 +143,11 @@ impl Shell {
     /// 탭·패인 헤더 제목. 터미널 제목이 비어 있으면 사이드바의 대화·자동 제목을 쓴다.
     /// 세션이 아직 없으면 제목 → 실행한 에이전트 이름 → "새 터미널" 순서로 고른다.
     pub(super) fn pane_label(&self, pane: PaneId, cx: &App) -> String {
+        if self.is_split_launcher(pane) {
+            return krill_app::i18n::catalog::shell::LAUNCHER_TAB_TITLE
+                .get()
+                .to_owned();
+        }
         if let Some(path) = self.layout.file(pane) {
             return krill_app::editor::file_name(path);
         }
@@ -270,8 +275,9 @@ impl Shell {
                     description
                 };
                 let pane = tab.focused;
-                // 파일 탭에는 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
-                let description = if self.layout.file(pane).is_some() {
+                let is_launcher = self.is_split_launcher(pane);
+                // 파일·빈 런처 탭에는 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
+                let description = if self.layout.file(pane).is_some() || is_launcher {
                     label.clone()
                 } else {
                     description
@@ -282,7 +288,7 @@ impl Shell {
                     .as_ref()
                     .filter(|r| tab.root.contains(r.pane))
                     .map(|r| r.input.clone());
-                let tab_hover_spec = if self.layout.file(pane).is_none() {
+                let tab_hover_spec = if self.layout.file(pane).is_none() && !is_launcher {
                     let sidebar_ref = self.sidebar.read(cx);
                     let now_ns = sidebar_ref.now_unix_ns();
                     let prompt_history = self
@@ -386,6 +392,11 @@ impl Shell {
                             .child(if let Some(fp) = file_prefix {
                                 // MK-119: 파일 탭은 [파일 아이콘][미저장 점]으로 바꾼다.
                                 fp.into_any_element()
+                            } else if is_launcher {
+                                gpui_component::Icon::new(IconName::Plus)
+                                    .with_size(ui::ICON_SM)
+                                    .text_color(p.muted_foreground)
+                                    .into_any_element()
                             } else {
                                 // OWE-662: [상태 글리프(미확인이면 벨)][봇 배지/에이전트 아이콘][제목].
                                 div()
@@ -616,7 +627,7 @@ impl Shell {
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.new_tab_on_launch_host(cx);
+                                this.on_new_tab_button(cx);
                             })),
                         "new-tab",
                         text::NEW_TAB.get(),
