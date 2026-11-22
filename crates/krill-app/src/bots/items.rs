@@ -120,9 +120,51 @@ pub(super) struct ItemsState {
     pub(super) hover_uid: Option<String>,
     /// Home: the open item's description is unclamped.
     pub(super) desc_open: bool,
+    /// Home: when the bot's automations ran and run next.
+    pub(super) upcoming: Option<krill_proto::bots::BotUpcoming>,
+    /// Home: why the last Look now failed.
+    pub(super) look_error: Option<String>,
+    /// Home: each bot's suggestions seen mark as its Home opened, so new rows keep their dot.
+    pub(super) up_next_seen_at_open: BTreeMap<BotId, u64>,
+    /// Home: the Snooze until dialog, while open.
+    pub(super) snooze_pick: Option<super::home_snooze::SnoozePick>,
+    /// Home: rows checked for a batch action (Orca's selection pill).
+    pub(super) selected: std::collections::BTreeSet<String>,
+    /// Home: the row last checked, where a shift-click range starts.
+    pub(super) select_anchor: Option<String>,
+    /// Home: the open rows in the list's order, for ranges and stepping.
+    pub(super) shown_order: Vec<String>,
+    /// Home: the Cancel dialog, while open.
+    pub(super) cancel_ask: Option<super::home_select::CancelAsk>,
+    /// Home: Stale's "Cancel all" asks to confirm.
+    pub(super) stale_confirm: Option<()>,
+    /// Home: each bot's item seen mark as its Home opened, so rows changed since keep their dot.
+    pub(super) seen_at_open: BTreeMap<BotId, u64>,
+    /// Home: reads the automations' runs again each minute, so "next" moves on (Orca `useBotNow`).
+    pub(super) upcoming_poll: Option<gpui::Task<()>>,
+    /// Home: PR chips' state by URL.
+    pub(super) pr_reads: BTreeMap<String, super::home_item_parts::PrRead>,
+    /// Home: "changed {field}" rows opened (`event:field`).
+    pub(super) open_changes: std::collections::BTreeSet<String>,
+    /// Home: an open ask of several questions, per (item, event).
+    pub(super) ask_steps: BTreeMap<(String, u64), super::home_item_parts::AskSteps>,
+    /// Home: the bot folder's files, for @ mentions (read once per bot).
+    pub(super) mention_files: BTreeMap<BotId, Vec<String>>,
+    /// Home: items whose Activity shows its earlier events too.
+    pub(super) events_all: std::collections::BTreeSet<String>,
+    /// Home: files attached to a comment not sent yet, per item.
+    pub(super) attachments: BTreeMap<String, Vec<PathBuf>>,
+    /// Home: the waiting ask whose "Replying to" mark was hidden, per item.
+    pub(super) reply_hidden: BTreeMap<String, u64>,
+    /// Home: each bot session's agent state, from the shell (its waiting chats are asks).
+    pub(super) session_states: BTreeMap<SessionId, krill_proto::control::AgentState>,
 }
 
 impl ItemsState {
+    pub(super) fn items_input_composing(&self, window: &mut Window, app: &mut App) -> bool {
+        self.input_is_composing(window, app)
+    }
+
     pub(super) fn input_is_composing(&self, window: &mut Window, app: &mut App) -> bool {
         opt_input_composing(self.new_title_input.as_ref(), window, app)
             || opt_input_composing(self.new_desc_input.as_ref(), window, app)
@@ -873,7 +915,7 @@ impl View {
         cx.notify();
     }
 
-    fn upsert_item(&mut self, updated: BotItem, bot_id: &BotId) {
+    pub(super) fn upsert_item(&mut self, updated: BotItem, bot_id: &BotId) {
         if let Some(slot) = self.items.items.iter_mut().find(|i| i.uid == updated.uid) {
             *slot = updated;
         } else {

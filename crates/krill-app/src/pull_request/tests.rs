@@ -1367,3 +1367,16 @@ fn pr_dialog_traps_tab_exposes_dialog_role_and_guards_submitting_and_ime_escape(
     visual.run_until_parked();
     assert_eq!(*events.lock().unwrap(), [Event::Close]);
 }
+
+#[test]
+fn view_reads_a_pr_url_state_and_title() {
+    assert_eq!(
+        parse_view(br#"{"state":"OPEN","isDraft":true,"title":"Fix it"}"#),
+        Some((Status::Draft, "Fix it".to_owned()))
+    );
+    assert_eq!(
+        parse_view(br#"{"state":"MERGED","isDraft":false,"title":"Done"}"#),
+        Some((Status::Merged, "Done".to_owned()))
+    );
+    assert_eq!(parse_view(b"[]"), None);
+}

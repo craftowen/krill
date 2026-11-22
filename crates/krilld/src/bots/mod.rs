@@ -456,7 +456,7 @@ impl BotsManager {
                     if let Ok(cron) = Cron::parse(&sched.cron)
                         && cron.matches(cal)
                     {
-                        self.run_schedule(registry, &bot.id, sched, minute);
+                        self.run_schedule(registry, &bot.id, sched, Some(minute));
                     }
                 }
             }
@@ -466,26 +466,29 @@ impl BotsManager {
 
     /// Runs one due schedule as its bot. While the schedule's conversation is still on its last
     /// turn this minute is skipped; once idle, the prompt becomes its next turn instead of a new session.
+    /// `minute` is the cron minute it fires for; `None` runs it now (Run now), unclaimed.
     fn run_schedule(
         &self,
         registry: &Registry,
         bot_id: &BotId,
         sched: &krill_proto::bots::BotScheduleConfig,
-        minute: u64,
+        minute: Option<u64>,
     ) {
+        if self.schedule_running(registry, bot_id, &sched.id)
+            || minute.is_some_and(|minute| {
+                !self
+                    .scheduler_state
+                    .try_claim_cron_minute(bot_id, &sched.id, minute)
+                    .unwrap_or(false)
+            })
+        {
+            return;
+        }
         let key = (bot_id.clone(), sched.id.clone());
         let target = lock(&self.active_cron_sessions)
             .get(&key)
             .copied()
             .filter(|&sid| registry.is_session_live(sid));
-        if target.is_some_and(|sid| self.runtime.turn_running(sid))
-            || !self
-                .scheduler_state
-                .try_claim_cron_minute(bot_id, &sched.id, minute)
-                .unwrap_or(false)
-        {
-            return;
-        }
         if let Some(sid) = target {
             self.runtime
                 .deliver_turn(registry, &self.store, sid, bot_id, &sched.prompt)
@@ -505,6 +508,14 @@ impl BotsManager {
         ) {
             lock(&self.active_cron_sessions).insert(key, sid);
         }
+    }
+
+    /// The schedule's conversation is still on a turn.
+    fn schedule_running(&self, registry: &Registry, bot_id: &BotId, sched_id: &str) -> bool {
+        lock(&self.active_cron_sessions)
+            .get(&(bot_id.clone(), sched_id.to_owned()))
+            .copied()
+            .is_some_and(|sid| registry.is_session_live(sid) && self.runtime.turn_running(sid))
     }
 
     /// Cleanly shuts down all lazy background components.
@@ -1470,6 +1481,36 @@ impl BotsManager {
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
+            BotRpcRequest::GetBotUpcoming { bot_id } => match self.store.get_bot(&bot_id) {
+                Ok(Some(bot)) => BotRpcResponse::Upcoming(krill_proto::bots::BotUpcoming {
+                    items_seen_event_id: self.items.items_seen_event_id(&bot_id).unwrap_or(0),
+                    ..look_around::bot_upcoming(
+                        &bot,
+                        &self.scheduler_state,
+                        |id| self.schedule_running(registry, &bot_id, id),
+                        ts,
+                    )
+                }),
+                Ok(None) => BotRpcResponse::Error(format!("bot not found: {}", bot_id.as_str())),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::RunScheduleNow {
+                bot_id,
+                schedule_id,
+            } => match self.store.get_bot(&bot_id) {
+                Ok(Some(bot)) => match bot.schedules.iter().find(|s| s.id == schedule_id) {
+                    Some(sched) if self.schedule_running(registry, &bot_id, &schedule_id) => {
+                        BotRpcResponse::Error(format!("{} is already running", sched.name))
+                    }
+                    Some(sched) => {
+                        self.run_schedule(registry, &bot_id, sched, None);
+                        BotRpcResponse::Ok
+                    }
+                    None => BotRpcResponse::Error(format!("schedule not found: {schedule_id}")),
+                },
+                Ok(None) => BotRpcResponse::Error(format!("bot not found: {}", bot_id.as_str())),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
             BotRpcRequest::GetDefaultTrackerBots => match self.store.get_default_tracker_bots() {
                 Ok(defaults) => BotRpcResponse::DefaultTrackerBots(defaults),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
@@ -1862,6 +1903,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::GetBotAvatar { .. }
         | BotRpcRequest::GetDefaultTrackerBots
         | BotRpcRequest::ListAgentModels { .. }
+        | BotRpcRequest::GetBotUpcoming { .. }
         | BotRpcRequest::SendBotMail { .. } => Ok(()),
         BotRpcRequest::SendGroupMessage { sender, .. } => {
             let trimmed = sender.trim();
@@ -1884,6 +1926,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::UndoMemoryTidy { bot_id, .. }
         | BotRpcRequest::SetMemoryTopic { bot_id, .. }
         | BotRpcRequest::RunLookAround { bot_id }
+        | BotRpcRequest::RunScheduleNow { bot_id, .. }
         | BotRpcRequest::DismissSuggestion { bot_id, .. }
         | BotRpcRequest::MarkBotItemsOpened { bot_id, .. }
         | BotRpcRequest::PostBotReply { bot_id, .. } => {

@@ -295,6 +295,20 @@ impl Service {
             .unwrap_or_default()
     }
 
+    /// A pull request's state and title by its URL (a bot item's PR chip), under the same pacing
+    /// as every other gh call.
+    pub fn view_url(&self, url: &str, now: Instant) -> Result<(Status, String), &'static str> {
+        let _slot = self.reserve_slot(now)?;
+        let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
+        let mut cmd = crate::platform::background_command(executable);
+        cmd.env_remove("GH_REPO")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["pr", "view", url, "--json", "state,isDraft,title"]);
+        let bytes = execute(&mut cmd, TIMEOUT).map_err(|_| text::GH_FAILED.get())?;
+        parse_view(&bytes).ok_or(text::GH_FAILED.get())
+    }
+
     pub fn create(&self, folder: &Path, branch: &str, now: Instant) -> Result<(), &'static str> {
         let _slot = self.reserve_slot(now)?;
         self.runner
@@ -782,6 +796,27 @@ struct PullRequest {
     draft: bool,
     #[serde(rename = "headRefOid", default)]
     head_ref_oid: String,
+}
+
+/// `gh pr view --json state,isDraft,title`.
+fn parse_view(bytes: &[u8]) -> Option<(Status, String)> {
+    #[derive(Deserialize)]
+    struct View {
+        state: String,
+        #[serde(rename = "isDraft", default)]
+        draft: bool,
+        #[serde(default)]
+        title: String,
+    }
+    let pr: View = serde_json::from_slice(bytes).ok()?;
+    let status = match pr.state.as_str() {
+        "OPEN" if pr.draft => Status::Draft,
+        "OPEN" => Status::Open,
+        "MERGED" => Status::Merged,
+        "CLOSED" => Status::Closed,
+        _ => return None,
+    };
+    Some((status, pr.title))
 }
 
 #[cfg(test)]

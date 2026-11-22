@@ -6,10 +6,17 @@
 //! as regular workspace `[Chat | Term]` tabs via [`OpenSession`].
 
 pub mod avatar;
+mod connector_logos;
 mod connectors;
+mod connectors_panel;
 mod groups;
 mod home;
 mod home_item;
+mod home_item_parts;
+mod home_needs;
+mod home_select;
+mod home_snooze;
+mod home_time;
 mod home_upcoming;
 mod items;
 pub mod new_bot;
@@ -46,6 +53,7 @@ use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 pub use home::HomeFilter;
+
 pub use rpc::{
     BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
     SidebarState, daemon_bot_rpc, fetch_sidebar_state,
@@ -70,6 +78,14 @@ pub struct RequestNewBot;
 pub struct OpenSession {
     pub bot_id: BotId,
     pub session_id: SessionId,
+}
+
+/// Open the bot's Home Chat with `text` in its composer, to finish and send (Orca's "New
+/// automation" draft).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftInHomeChat {
+    pub bot_id: BotId,
+    pub text: String,
 }
 
 /// Notify the host `Shell` when bots or their attention counts (`needs_you` + pending access) change.
@@ -183,6 +199,7 @@ impl EventEmitter<Close> for View {}
 impl EventEmitter<RequestNewBot> for View {}
 impl EventEmitter<OpenRemoteSettings> for View {}
 impl EventEmitter<OpenSession> for View {}
+impl EventEmitter<DraftInHomeChat> for View {}
 impl EventEmitter<BadgeChanged> for View {}
 impl EventEmitter<SessionsChanged> for View {}
 impl EventEmitter<OpenSettingsPage> for View {}
@@ -827,6 +844,15 @@ impl View {
                     } else {
                         Ok(None)
                     };
+                    let upcoming = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::GetBotUpcoming {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::Upcoming(up)) => Some(up),
+                        _ => None,
+                    };
                     let avatar_img = if has_avatar {
                         match call_checked(&rpc, &BotRpcRequest::GetBotAvatar { bot_id: bot_id_bg })
                         {
@@ -854,6 +880,7 @@ impl View {
                         tracker_res,
                         composio_res,
                         avatar_img,
+                        upcoming,
                     }
                 })
                 .await;
@@ -939,6 +966,7 @@ impl View {
                 if let Some(img) = loaded.avatar_img {
                     this.settings.avatar_cache.insert(bot_id.clone(), img);
                 }
+                this.items.upcoming = loaded.upcoming;
 
                 this.connectors.needs_sync_from_bot = true;
                 if let Some(version) = errors.iter().find_map(|e| unsupported_version(e)) {
@@ -2418,6 +2446,8 @@ struct DetailBundle {
     tracker_res: Result<Option<krill_proto::bots::DefaultTrackerBots>, String>,
     composio_res: Result<Option<Vec<krill_proto::bots::ComposioConnectionInfo>>, String>,
     avatar_img: Option<std::sync::Arc<gpui::Image>>,
+    /// `None` from a krilld that predates it, too: Home then leaves times out.
+    upcoming: Option<krill_proto::bots::BotUpcoming>,
 }
 
 impl Render for View {

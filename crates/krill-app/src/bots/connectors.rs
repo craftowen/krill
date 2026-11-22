@@ -27,6 +27,13 @@ use super::{View, clear_input_on_window, opt_input_composing};
 
 #[derive(Default)]
 pub(super) struct ConnectorsState {
+    /// The bot page's Connectors tab: the connector whose page shows in the list's place.
+    pub(super) page: Option<ExternalSource>,
+    /// The bot page's Connectors tab: "Add to {bot}" is open.
+    pub(super) adding: Option<()>,
+    /// "Add to {bot}": the rail's pick (0 all apps, 1 the bot's own, then a category) and search.
+    pub(super) add_rail: u8,
+    pub(super) add_search: Option<Entity<InputState>>,
     pub(super) bot_statuses: Vec<BotConnectorStatus>,
     pub(super) bot_access_requests: Vec<BotAccessRequest>,
     pub(super) show_all_access_requests: bool,
@@ -210,7 +217,7 @@ struct SecretRowSpec {
 type ClearSecretCallback = Box<dyn Fn(&mut View, &mut Context<View>) + 'static>;
 
 impl View {
-    fn ensure_connector_inputs(
+    pub(super) fn ensure_connector_inputs(
         &mut self,
         bot: &BotConfig,
         window: &mut Window,
@@ -1368,6 +1375,9 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        if self.mode == super::Mode::Panel {
+            return self.render_connectors_panel(bot, p, window, cx);
+        }
         self.ensure_connector_inputs(bot, window, cx);
         let c = bot.connectors.clone();
         let bot_id = bot.id.clone();
@@ -1441,7 +1451,7 @@ impl View {
             .child(composio_card)
     }
 
-    fn render_telegram_card(
+    pub(super) fn render_telegram_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,
@@ -1610,7 +1620,7 @@ impl View {
             )
     }
 
-    fn render_slack_card(
+    pub(super) fn render_slack_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,
@@ -1872,7 +1882,7 @@ impl View {
             )
     }
 
-    fn render_discord_card(
+    pub(super) fn render_discord_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,
@@ -2056,7 +2066,7 @@ impl View {
             )
     }
 
-    fn render_google_card(
+    pub(super) fn render_google_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,
@@ -2307,7 +2317,7 @@ impl View {
             )
     }
 
-    fn render_github_card(
+    pub(super) fn render_github_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,
@@ -2539,7 +2549,7 @@ impl View {
             )
     }
 
-    fn render_linear_card(
+    pub(super) fn render_linear_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,
@@ -2738,7 +2748,7 @@ impl View {
             )
     }
 
-    fn render_composio_card(
+    pub(super) fn render_composio_card(
         &self,
         bot: &BotConfig,
         c: &BotConnectorConfig,

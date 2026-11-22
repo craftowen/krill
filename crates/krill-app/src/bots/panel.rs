@@ -26,6 +26,8 @@ impl View {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.selected_bot_id.as_ref() != Some(bot_id) {
+            self.connectors.page = None;
+            self.connectors.adding = None;
             self.select_bot(bot_id.clone(), cx);
             // A bot newer than this view's list: fetch the list again.
             if self.selected_bot_id.as_ref() == Some(bot_id)
@@ -38,6 +40,14 @@ impl View {
             // Settings opens on Orca's list, not on the page it was last left at.
             self.settings.page = super::settings_root::SettingsPage::Root;
             self.set_detail_tab(tab, cx);
+            if tab == DetailTab::Items {
+                // A fresh opening: rows and suggestions changed since get their dots again.
+                self.items.seen_at_open.remove(bot_id);
+                self.items.up_next_seen_at_open.remove(bot_id);
+            }
+        }
+        if tab == DetailTab::Items {
+            self.ensure_upcoming_poll(cx);
         }
         self.selected_bot_id.as_ref() == Some(bot_id)
     }
@@ -72,10 +82,18 @@ impl View {
         };
         let body = match self.detail_tab {
             DetailTab::Items => self.render_home_tab(&bot, p, window, cx),
-            DetailTab::SoulMemory => self.render_soul_memory_tab(&bot, p, window, cx),
-            DetailTab::Connectors => self.render_connectors_tab(&bot, p, window, cx),
-            DetailTab::ToolsSharing => self.render_tools_sharing_tab(&bot, p, window, cx),
-            DetailTab::Settings => self.render_settings_tab(&bot, p, window, cx),
+            DetailTab::SoulMemory => self
+                .render_soul_memory_tab(&bot, p, window, cx)
+                .into_any_element(),
+            DetailTab::Connectors => self
+                .render_connectors_tab(&bot, p, window, cx)
+                .into_any_element(),
+            DetailTab::ToolsSharing => self
+                .render_tools_sharing_tab(&bot, p, window, cx)
+                .into_any_element(),
+            DetailTab::Settings => self
+                .render_settings_tab(&bot, p, window, cx)
+                .into_any_element(),
         };
         root.child(body)
     }

@@ -10,11 +10,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use krill_proto::bots::{
-    BotAccessRequestStatus, BotId, BotItemLink, BotItemStatus, BotSuggestion,
-    DEFAULT_LOOK_AROUND_MAX_SUGGESTIONS, ExternalSource, soul_description,
+    BotAccessRequestStatus, BotConfig, BotId, BotItemLink, BotItemStatus, BotScheduleUpcoming,
+    BotSuggestion, BotUpcoming, DEFAULT_LOOK_AROUND_MAX_SUGGESTIONS, ExternalSource,
+    soul_description,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::write_atomic_0600;
+use krill_proto::schedule::Cron;
 use serde::{Deserialize, Serialize};
 
 use crate::bots::items::BotItemsStore;
@@ -57,6 +59,15 @@ struct PersistedSchedulerState {
     memory_tidy: BTreeMap<BotId, PersistedMemoryTidyState>,
     #[serde(default)]
     cron_claimed_minute: BTreeMap<String, u64>,
+}
+
+/// What [`SchedulerStateStore::last_runs`] reads.
+#[derive(Debug, Default)]
+struct LastRuns {
+    look: Option<u64>,
+    tidy: Option<u64>,
+    tidy_off: bool,
+    crons: BTreeMap<String, u64>,
 }
 
 /// Strictly-lazy durable scheduler state store (`<bots_root>/scheduler-state.json`).
@@ -265,6 +276,26 @@ impl SchedulerStateStore {
             }
             Ok(true)
         })
+    }
+
+    /// When `bot_id` last looked around and last tidied, whether tidying turned itself off, and
+    /// the epoch minute each of its schedules last fired, for its Home.
+    fn last_runs(&self, bot_id: &BotId) -> LastRuns {
+        let prefix = format!("{}:", bot_id.as_str());
+        self.with_state_read(|st| {
+            let tidy = st.memory_tidy.get(bot_id);
+            LastRuns {
+                look: st.look_around_last_run_ms.get(bot_id).copied(),
+                tidy: tidy.and_then(|r| r.last_run_ms),
+                tidy_off: tidy.is_some_and(|r| r.auto_disabled),
+                crons: st
+                    .cron_claimed_minute
+                    .iter()
+                    .filter_map(|(k, m)| Some((k.strip_prefix(&prefix)?.to_owned(), *m)))
+                    .collect(),
+            }
+        })
+        .unwrap_or_default()
     }
 
     /// Removes all persisted state for a deleted bot.
@@ -718,6 +749,95 @@ pub fn up_next_unseen_count(
         .count()
 }
 
+/// The bot's automations' last and next runs (Orca's Automations card). `running` says whether a
+/// schedule's conversation is on a turn now.
+pub fn bot_upcoming(
+    bot: &BotConfig,
+    state: &SchedulerStateStore,
+    running: impl Fn(&str) -> bool,
+    now_ms: u64,
+) -> BotUpcoming {
+    let LastRuns {
+        look: look_last,
+        tidy: tidy_last,
+        tidy_off,
+        crons,
+    } = state.last_runs(&bot.id);
+    let tz = bot.schedules.iter().find_map(|s| s.timezone.as_deref());
+    let after = |last: Option<u64>, interval_secs: u64| {
+        let due = last.map_or(now_ms, |l| {
+            l.saturating_add(interval_secs.max(60).saturating_mul(1_000))
+        });
+        due.max(now_ms)
+    };
+    let look_next = bot.look_around.enabled.then(|| {
+        let mut next = after(look_last, bot.look_around.interval_secs);
+        // Weekdays only: a weekend looks first thing Monday.
+        for _ in 0..3 {
+            if !bot.look_around.weekdays_only || !is_weekend_in_tz(next / 1_000, tz) {
+                break;
+            }
+            let [minute, hour, ..] = cron_calendar_for_tz(next / 1_000, tz).unwrap_or_default();
+            let into_day = u64::from(hour * 60 + minute).saturating_mul(60_000);
+            next = (next - next % 60_000)
+                .saturating_sub(into_day)
+                .saturating_add(86_400_000);
+        }
+        next
+    });
+    let tidy_next = (bot.memory_tidy.enabled && !tidy_off)
+        .then(|| after(tidy_last, bot.memory_tidy.interval_secs));
+    let now_secs = now_ms / 1_000;
+    let schedules = bot
+        .schedules
+        .iter()
+        .map(|s| {
+            let next_ms = s
+                .enabled
+                .then(|| Cron::parse(&s.cron).ok())
+                .flatten()
+                .and_then(|cron| {
+                    // The cron reads the schedule's wall clock: step in its local minutes.
+                    let off = tz_offset_minutes(now_secs, s.timezone.as_deref());
+                    let local = i64::try_from(now_secs / 60).ok()?.checked_add(off)?;
+                    let next = cron.next_minute_after(u64::try_from(local).ok()?)?;
+                    let utc = i64::try_from(next).ok()?.checked_sub(off)?;
+                    u64::try_from(utc).ok()?.checked_mul(60_000)
+                });
+            BotScheduleUpcoming {
+                id: s.id.clone(),
+                next_ms,
+                last_ms: crons.get(&s.id).map(|m| m.saturating_mul(60_000)),
+                running: running(&s.id),
+            }
+        })
+        .collect();
+    BotUpcoming {
+        look_around_last_ms: look_last,
+        look_around_next_ms: look_next,
+        tidy_last_ms: tidy_last,
+        tidy_next_ms: tidy_next,
+        schedules,
+        up_next_seen_ms: state.up_next_seen_at(&bot.id),
+        items_seen_event_id: 0,
+    }
+}
+
+/// `tz`'s offset from UTC in minutes at `unix_secs` (within a day either way).
+fn tz_offset_minutes(unix_secs: u64, tz: Option<&str>) -> i64 {
+    let (Ok([lm, lh, _, _, lw]), Ok([um, uh, _, _, uw])) = (
+        cron_calendar_for_tz(unix_secs, tz),
+        crate::sys::cron_calendar(unix_secs),
+    ) else {
+        return 0;
+    };
+    let days = match (i64::from(lw) - i64::from(uw)).rem_euclid(7) {
+        6 => -1,
+        d => d,
+    };
+    days * 1_440 + (i64::from(lh) - i64::from(uh)) * 60 + i64::from(lm) - i64::from(um)
+}
+
 /// Computes `[minute, hour, day, month, weekday]` (`weekday` 0=Sun..6=Sat) in `tz` (default UTC).
 pub fn cron_calendar_for_tz(unix_secs: u64, tz: Option<&str>) -> io::Result<[u32; 5]> {
     let raw = tz.map(str::trim).filter(|s| !s.is_empty());
@@ -1069,6 +1189,39 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn upcoming_says_when_each_automation_runs_next() {
+        let root = temp_dir("upcoming");
+        let sched = SchedulerStateStore::new(root);
+        let mut bot = BotConfig::new(BotId::new("b1").unwrap(), "Scout", "claude", 0).unwrap();
+        bot.look_around.weekdays_only = false;
+        bot.look_around.interval_secs = 3_600;
+        bot.schedules.push(krill_proto::bots::BotScheduleConfig {
+            id: "s1".to_owned(),
+            name: "Morning".to_owned(),
+            cron: "0 9 * * *".to_owned(),
+            prompt: "hi".to_owned(),
+            enabled: true,
+            timezone: Some("+02:00".to_owned()),
+        });
+        // 2026-11-23 (a Monday) 06:30 UTC = 08:30 at +02:00.
+        let now = 1_795_415_400_000;
+        let up = bot_upcoming(&bot, &sched, |_| false, now);
+        // Never looked: due now.
+        assert_eq!(up.look_around_next_ms, Some(now));
+        assert_eq!(up.schedules[0].next_ms, Some(now + 30 * 60_000));
+        sched.record_look_around(&bot.id, now).unwrap();
+        let up = bot_upcoming(&bot, &sched, |id| id == "s1", now + 60_000);
+        assert_eq!(up.look_around_last_ms, Some(now));
+        assert_eq!(up.look_around_next_ms, Some(now + 3_600_000));
+        assert!(up.schedules[0].running);
+        bot.look_around.enabled = false;
+        bot.schedules[0].enabled = false;
+        let up = bot_upcoming(&bot, &sched, |_| false, now);
+        assert_eq!(up.look_around_next_ms, None);
+        assert_eq!(up.schedules[0].next_ms, None);
     }
 
     #[test]
