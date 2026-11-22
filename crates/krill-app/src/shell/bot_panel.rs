@@ -191,7 +191,10 @@ impl Shell {
     }
 
     /// The Bots view behind the panel bodies, built once per host (once its connection is up).
-    fn bot_panel_view(&mut self, cx: &mut Context<Self>) -> Option<Entity<krill_app::bots::View>> {
+    pub(super) fn bot_panel_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<krill_app::bots::View>> {
         if let Some(view) = &self.bot_ui.panel.view
             && view.read(cx).host() == &self.launch_host
         {

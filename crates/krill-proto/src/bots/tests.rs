@@ -2430,3 +2430,91 @@ fn settings_extras_roundtrip_and_defaults() {
         r#"{"items_stale":"14","look_around_every":"twice-daily","tidy_every":"week"}"#
     );
 }
+
+#[test]
+fn group_room_v2_rpc_roundtrip() {
+    let bot1 = BotId::new("alice").unwrap();
+    let bot2 = BotId::new("bob").unwrap();
+    let group = BotGroupChat {
+        id: "grp-1".to_owned(),
+        name: "Triage".to_owned(),
+        bot_ids: vec![bot1.clone(), bot2.clone()],
+        description: String::new(),
+        created_at_ms: 10,
+        updated_at_ms: 20,
+    };
+    let reqs = [
+        BotRpcRequest::ListGroupSummaries,
+        BotRpcRequest::ReadGroupRoom {
+            group_id: "grp-1".to_owned(),
+            thread_id: Some("thr-1".to_owned()),
+            before_message_id: Some("gmsg-5".to_owned()),
+            limit: Some(40),
+        },
+        BotRpcRequest::SetGroupReplyAudience {
+            group_id: "grp-1".to_owned(),
+            audience: BotGroupReplyAudience::Bot {
+                bot_id: bot1.clone(),
+            },
+        },
+        BotRpcRequest::SendGroupMessageWithAudience {
+            group_id: "grp-1".to_owned(),
+            thread_id: None,
+            sender: "owner".to_owned(),
+            text: "@everyone check".to_owned(),
+            audience: BotGroupReplyAudience::Mentions,
+        },
+        BotRpcRequest::StopGroupMember {
+            group_id: "grp-1".to_owned(),
+            thread_id: None,
+            bot_id: Some(bot2.clone()),
+        },
+    ];
+    for req in reqs {
+        let frame = req.encode().unwrap();
+        let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(BotRpcRequest::decode(kind, &body).unwrap(), req);
+    }
+
+    let summary = BotGroupSummary {
+        group: group.clone(),
+        reply_audience: BotGroupReplyAudience::All,
+        threads: vec![BotGroupThread {
+            thread_id: "thr-1".to_owned(),
+            group_id: "grp-1".to_owned(),
+            title: "Main thread".to_owned(),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        }],
+        latest_message: None,
+        active_turns: vec![BotGroupTurnInfo {
+            group_id: "grp-1".to_owned(),
+            thread_id: "thr-1".to_owned(),
+            bot_id: bot1.clone(),
+            session_id: crate::SessionId(99),
+            message_id: "gmsg-1".to_owned(),
+            started_at_ms: 15,
+        }],
+    };
+    let resps = [
+        BotRpcResponse::GroupSummaries(vec![summary.clone()]),
+        BotRpcResponse::GroupRoom(BotGroupRoomView {
+            group,
+            reply_audience: BotGroupReplyAudience::All,
+            threads: summary.threads,
+            active_thread_id: Some("thr-1".to_owned()),
+            messages: Vec::new(),
+            has_earlier: true,
+            active_turns: summary.active_turns,
+        }),
+        BotRpcResponse::GroupReplyAudienceUpdated {
+            group_id: "grp-1".to_owned(),
+            audience: BotGroupReplyAudience::Bot { bot_id: bot1 },
+        },
+    ];
+    for resp in resps {
+        let frame = resp.encode().unwrap();
+        let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(BotRpcResponse::decode(kind, &body).unwrap(), resp);
+    }
+}

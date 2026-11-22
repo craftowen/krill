@@ -212,6 +212,8 @@ impl Shell {
             }
         } else if self.is_split_launcher(id) {
             self.split_launcher_has_focus(id, window, cx) || self.focus.is_focused(window)
+        } else if self.is_group_pane(id) {
+            self.group_pane_has_focus(id, window, cx) || self.focus.is_focused(window)
         } else if self.is_pane_chat_view(id, cx) {
             self.chat_pane_has_focus(id, window, cx) || self.focus.is_focused(window)
         } else {

@@ -344,12 +344,25 @@ impl Shell {
         bots: Vec<krill_app::bots::SidebarBot>,
         cx: &mut Context<Self>,
     ) {
+        let groups = self.sidebar_groups.clone();
+        self.apply_sidebar_state(attention, bots, groups, cx);
+    }
+
+    pub(super) fn apply_sidebar_state(
+        &mut self,
+        attention: usize,
+        bots: Vec<krill_app::bots::SidebarBot>,
+        groups: Vec<krill_proto::bots::BotGroupSummary>,
+        cx: &mut Context<Self>,
+    ) {
         if self.bots_attention_count != attention
             || self.sidebar_bots != bots
+            || self.sidebar_groups != groups
             || !self.bot_ui.loaded
         {
             self.bots_attention_count = attention;
             self.sidebar_bots = bots;
+            self.sidebar_groups = groups;
             self.bot_ui.loaded = true;
             self.bot_ui.panel.stale = true;
             // A restored chat may only now turn out to be a bot's: root its Files there.
@@ -420,7 +433,12 @@ impl Shell {
                 this.sidebar.update(cx, |sb, cx| {
                     sb.set_bot_sessions(host, state.sessions, cx);
                 });
-                this.apply_sidebar_bots(state.snapshot.attention, state.snapshot.bots, cx);
+                this.apply_sidebar_state(
+                    state.snapshot.attention,
+                    state.snapshot.bots,
+                    state.groups,
+                    cx,
+                );
                 if !state.avatars.is_empty() {
                     this.store_bot_avatars(state.avatars);
                     cx.notify();

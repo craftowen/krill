@@ -54,6 +54,7 @@ impl Shell {
         let collapsed = self.bot_ui.collapsed;
         let searching = self.bot_ui.search.is_some();
         let has_bots = !self.sidebar_bots.is_empty();
+        let has_entries = has_bots || !self.sidebar_groups.is_empty();
         let all_folded = self.bots_all_folded();
         let fold_all_label = if all_folded {
             text::SB_EXPAND_ALL.get()
@@ -159,7 +160,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .when(has_bots, |d| {
+                    .when(has_entries, |d| {
                         d.child(
                             Button::new("bots-section-search")
                                 .ghost()
@@ -220,7 +221,7 @@ impl Shell {
                         .icon(gpui_component::Icon::default().data(ui::icons::USERS_SVG))
                         .disabled(!groups_ok)
                         .on_click(act(|s, window, cx| {
-                            s.open_bots_screen(BotsScreen::Groups, window, cx);
+                            s.open_new_group_dialog(window, cx);
                         })),
                 )
             })
@@ -363,6 +364,89 @@ impl Shell {
         for m in &matches {
             list = list.child(self.render_bot_search_result(shown[m.index], m, p, cx));
         }
+        let mut group_matches = 0usize;
+        for summary in &self.sidebar_groups {
+            let group = &summary.group;
+            let name_ranges = view::match_text(&group.name, query);
+            let member_match = name_ranges.is_none()
+                && group.bot_ids.iter().any(|bid| {
+                    self.sidebar_bots
+                        .iter()
+                        .find(|b| &b.id == bid)
+                        .is_some_and(|b| view::match_text(&b.name, query).is_some())
+                });
+            if name_ranges.is_some() || member_match {
+                group_matches += 1;
+                let ranges = name_ranges.unwrap_or_default();
+                let gid = group.id.clone();
+                let face_members = krill_app::bots::group_faces::resolve_members(
+                    &group.bot_ids,
+                    &self.sidebar_bots,
+                    &|id| self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone()),
+                );
+                let faces = krill_app::bots::group_faces::render_group_faces(
+                    &face_members,
+                    super::rows::AVATAR,
+                    p.sidebar,
+                    p,
+                );
+                let sel = format!("bot-group-search-result-{gid}");
+                let sel_dbg = sel.clone();
+                let member_names: Vec<&str> =
+                    face_members.iter().map(|m| m.bot.name.as_str()).collect();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(sel))
+                        .debug_selector(move || sel_dbg.clone())
+                        .role(gpui::Role::Button)
+                        .tab_index(0)
+                        .aria_label(group.name.clone())
+                        .ml_1()
+                        .pr_1p5()
+                        .pt(px(5.))
+                        .pb_1p5()
+                        .pl_1p5()
+                        .rounded(ui::RADIUS_LG)
+                        .border_1()
+                        .border_color(ui::TRANSPARENT)
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(p.sidebar_accent.opacity(0.4)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_bot_search(window, cx);
+                            this.bot_ui.collapsed = false;
+                            this.open_bot_group(&gid, None, Some(window), cx);
+                        }))
+                        .child(div().mr_2().child(faces))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(ui::TEXT_MD)
+                                        .line_height(px(20.))
+                                        .text_color(p.foreground)
+                                        .child(marked(&group.name, &ranges, p)),
+                                )
+                                .when(!member_names.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(ui::TEXT_SM)
+                                            .line_height(px(16.))
+                                            .text_color(p.muted_foreground)
+                                            .child(member_names.join(", ")),
+                                    )
+                                }),
+                        ),
+                );
+            }
+        }
         let note = |id: &'static str| {
             div()
                 .id(id)
@@ -385,7 +469,7 @@ impl Shell {
                 .hover(gpui::Styled::underline)
                 .child(label)
         };
-        if matches.is_empty() && hidden_paused == 0 {
+        if matches.is_empty() && group_matches == 0 && hidden_paused == 0 {
             list = list.child(
                 note("bots-search-empty")
                     .child(text::SB_NO_MATCHES.get())
@@ -411,7 +495,7 @@ impl Shell {
                             },
                         )),
                     )
-                    .when(matches.is_empty(), |d| {
+                    .when(matches.is_empty() && group_matches == 0, |d| {
                         d.child("·").child(
                             link("bots-search-clear", text::SB_CLEAR_SEARCH.get()).on_click(
                                 cx.listener(|this, _, window, cx| {

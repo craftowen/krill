@@ -55,7 +55,7 @@ impl Group {
         }
     }
 
-    const fn folded_by_default(self) -> bool {
+    pub(super) const fn folded_by_default(self) -> bool {
         matches!(
             self,
             Self::Planned | Self::Snoozed | Self::Stale | Self::Closed
@@ -781,7 +781,7 @@ impl View {
         clippy::too_many_arguments,
         reason = "a render helper over the list's shared state"
     )]
-    fn render_home_row(
+    pub(super) fn render_home_row(
         &self,
         bot: &BotConfig,
         item: &BotItem,

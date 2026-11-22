@@ -54,10 +54,11 @@ pub use types::{
     BOT_LOOK_AROUND_FOCUS_MAX_BYTES, BOT_NAME_MAX_BYTES, BOT_SLUG_MAX_BYTES, BotAccessRequest,
     BotAccessRequestStatus, BotAvatarData, BotConfig, BotConnectorConfig, BotConnectorStatus,
     BotConnectorTestResult, BotErrorCategory, BotErrorDetail, BotEventRuleConfig, BotGroupChat,
-    BotGroupMessage, BotGroupReplyMode, BotGroupThread, BotGroupView, BotId, BotItem, BotItemActor,
-    BotItemDecision, BotItemEvent, BotItemEventKind, BotItemLink, BotItemStatus, BotItemsPage,
-    BotItemsStale, BotLookAroundConfig, BotMcpAuthKind, BotMcpOAuthState, BotMcpToolConfig,
-    BotMember, BotMemoryHistoryEntry, BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo,
+    BotGroupMessage, BotGroupReplyAudience, BotGroupReplyMode, BotGroupRoomView, BotGroupSummary,
+    BotGroupThread, BotGroupTurnInfo, BotGroupView, BotId, BotItem, BotItemActor, BotItemDecision,
+    BotItemEvent, BotItemEventKind, BotItemLink, BotItemStatus, BotItemsPage, BotItemsStale,
+    BotLookAroundConfig, BotMcpAuthKind, BotMcpOAuthState, BotMcpToolConfig, BotMember,
+    BotMemoryHistoryEntry, BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo,
     BotNotifications, BotOffer, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
     BotSuggestion, BotToolRelayStatus, BotToolServerStatus, BotValidationError, ComposioConfig,
     ComposioConnectionInfo, ConnectorHealthState, DEFAULT_CONNECTOR_POLL_INTERVAL_SECS,
@@ -65,8 +66,8 @@ pub use types::{
     DEFAULT_MEMORY_TIDY_INTERVAL_SECS, DefaultTrackerBots, DiscordConfig, ExternalBotCandidate,
     ExternalBotSourceApp, ExternalConversationLink, ExternalSource, GitHubTrackerConfig,
     GoogleConfig, GoogleServicesConfig, LinearTrackerConfig, LookAroundEvery, SlackConfig,
-    TelegramConfig, TidyEvery, bot_slug_from_name, is_windows_reserved_slug, validate_bot_id,
-    validate_bot_name, validate_bot_slug,
+    TelegramConfig, TidyEvery, bot_slug_from_name, extract_group_mention_ids,
+    is_windows_reserved_slug, validate_bot_id, validate_bot_name, validate_bot_slug,
 };
 
 #[cfg(test)]

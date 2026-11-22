@@ -91,6 +91,48 @@ pub fn arrange(bots: &[ArrangeFacts<'_>], view: BotSidebarView) -> Vec<usize> {
     shown
 }
 
+/// One interleaved sidebar entry under the Bots section (`SidebarBotsSection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarEntry {
+    Bot(usize),
+    Group(usize),
+}
+
+/// Arrange combined bot + group rows in Manual/Smart/Recent/Name order.
+#[must_use]
+pub fn arrange_entries(
+    bots: &[ArrangeFacts<'_>],
+    groups: &[ArrangeFacts<'_>],
+    view: BotSidebarView,
+) -> Vec<SidebarEntry> {
+    let mut entries: Vec<(SidebarEntry, &ArrangeFacts<'_>)> = bots
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !(view.hide_paused && f.paused))
+        .map(|(i, f)| (SidebarEntry::Bot(i), f))
+        .chain(
+            groups
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !(view.hide_paused && f.paused))
+                .map(|(i, f)| (SidebarEntry::Group(i), f)),
+        )
+        .collect();
+
+    match view.sort {
+        BotSidebarSort::Manual => {}
+        BotSidebarSort::Name => entries.sort_by_cached_key(|(_, f)| f.name.to_lowercase()),
+        BotSidebarSort::Recent => entries.sort_by_key(|(_, f)| std::cmp::Reverse(f.activity_at)),
+        BotSidebarSort::Smart => entries.sort_by_key(|(_, f)| {
+            (
+                std::cmp::Reverse(f.needs_you),
+                std::cmp::Reverse(f.activity_at),
+            )
+        }),
+    }
+    entries.into_iter().map(|(entry, _)| entry).collect()
+}
+
 /// A marked span, in byte offsets of the searched text.
 pub type SearchRange = std::ops::Range<usize>;
 

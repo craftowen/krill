@@ -1509,49 +1509,18 @@ fn v2_groups_settings_memory_undo_decisions_and_connectors(cx: &mut TestAppConte
     assert!(state.lock().unwrap().topics.contains_key("ops"));
     assert!(state.lock().unwrap().suggestions[0].dismissed);
 
-    // Groups screen: create group -> thread -> @mention message -> stop
+    // Group items panel: merges member bot items and switches chat/bot filters
     vcx.update(|_, cx| {
-        view.update(cx, View::open_groups);
-    });
-    vcx.run_until_parked();
-    assert!(vcx.debug_bounds("bots-groups-view").is_some());
-    vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            if let Some(inp) = &v.groups.name_input {
-                inp.update(cx, |s, cx| s.set_value("Triage Room", window, cx));
-            }
-            v.groups.member_bot_ids = vec![bot1.clone(), bot2.clone()];
-            v.submit_create_or_update_group(cx);
+            v.show_group_in_panel("grp-triage", &[bot1.clone(), bot2.clone()], &[], cx);
+            v.set_group_chat_scope(super::GroupChatScope::AllTheirWork, cx);
         });
     });
     vcx.run_until_parked();
-    let gid = view.read_with(vcx, |v, _| v.groups.groups[0].id.clone());
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            if let Some(t) = &v.groups.thread_title_input {
-                t.update(cx, |s, cx| s.set_value("Incident", window, cx));
-            }
-            v.create_group_thread(gid.clone(), cx);
-        });
-    });
-    vcx.run_until_parked();
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            if let Some(c) = &v.groups.composer_input {
-                c.update(cx, |s, cx| s.set_value("@bot-1 check", window, cx));
-            }
-            v.send_group_message(gid.clone(), cx);
-        });
-    });
-    vcx.run_until_parked();
-    assert!(
-        state
-            .lock()
-            .unwrap()
-            .group_messages
-            .iter()
-            .any(|m| m.body == "@bot-1 check")
-    );
+    assert!(view.read_with(vcx, |v, _| {
+        v.group_panel_active()
+            && v.group_items_filter().chat_scope == super::GroupChatScope::AllTheirWork
+    }));
 
     // Connectors rollback + reload error propagation + pairing + tracker + MCP OAuth
     vcx.update(|_, cx| {

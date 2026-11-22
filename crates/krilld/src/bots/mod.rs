@@ -1108,7 +1108,10 @@ impl BotsManager {
                 bot_ids,
                 ts,
             ) {
-                Ok(group) => BotRpcResponse::Group(group),
+                Ok(group) => {
+                    self.groups.prune_audience_for_updated_group(&group);
+                    BotRpcResponse::Group(group)
+                }
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::DeleteGroup { group_id } => {
@@ -1166,36 +1169,7 @@ impl BotsManager {
                 reply_mode,
                 ts,
             ) {
-                Ok(plan) => {
-                    let mut dispatched_bots = Vec::new();
-                    for target in &plan.target_bots {
-                        if let Ok((sid, _)) = self.runtime.deliver_or_wake_bot(
-                            registry,
-                            &self.store,
-                            &self.secrets,
-                            &self.tool_relay,
-                            &self.composio_base_url,
-                            &target.id,
-                            &plan.prompt_for_bot,
-                            ts,
-                        ) {
-                            self.groups
-                                .record_turn_started(
-                                    &plan.group.id,
-                                    &plan.thread.thread_id,
-                                    target,
-                                    sid,
-                                    ts,
-                                )
-                                .ok();
-                            dispatched_bots.push(target.id.clone());
-                        }
-                    }
-                    BotRpcResponse::GroupMessagePosted {
-                        message: plan.posted_message,
-                        dispatched_bots,
-                    }
-                }
+                Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::StopGroup {
@@ -1205,6 +1179,77 @@ impl BotsManager {
                 .groups
                 .stop_group(&self.store, &group_id, thread_id.as_deref())
             {
+                Ok(stopped) => {
+                    for (bid, sid) in stopped {
+                        self.runtime
+                            .stop_session(registry, &self.tool_relay, &bid, sid)
+                            .ok();
+                    }
+                    BotRpcResponse::Ok
+                }
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ListGroupSummaries => {
+                match self.groups.list_group_summaries(&self.store) {
+                    Ok(summaries) => BotRpcResponse::GroupSummaries(summaries),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
+            BotRpcRequest::ReadGroupRoom {
+                group_id,
+                thread_id,
+                before_message_id,
+                limit,
+            } => match self.groups.read_group_room(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                before_message_id.as_deref(),
+                limit,
+            ) {
+                Ok(room) => BotRpcResponse::GroupRoom(room),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::SetGroupReplyAudience { group_id, audience } => {
+                match self
+                    .groups
+                    .set_reply_audience(&self.store, &group_id, audience)
+                {
+                    Ok(saved) => BotRpcResponse::GroupReplyAudienceUpdated {
+                        group_id,
+                        audience: saved,
+                    },
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
+            BotRpcRequest::SendGroupMessageWithAudience {
+                group_id,
+                thread_id,
+                sender,
+                text,
+                audience,
+            } => match self.groups.prepare_message_dispatch_with_audience(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                &sender,
+                &text,
+                audience,
+                ts,
+            ) {
+                Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::StopGroupMember {
+                group_id,
+                thread_id,
+                bot_id,
+            } => match self.groups.stop_group_member(
+                &self.store,
+                &group_id,
+                thread_id.as_deref(),
+                bot_id.as_ref(),
+            ) {
                 Ok(stopped) => {
                     for (bid, sid) in stopped {
                         self.runtime
@@ -1754,6 +1799,36 @@ impl BotsManager {
         }
     }
 
+    fn execute_group_dispatch(
+        &self,
+        registry: &Registry,
+        plan: groups::GroupDispatchPlan,
+        ts: u64,
+    ) -> BotRpcResponse {
+        let mut dispatched_bots = Vec::new();
+        for target in &plan.target_bots {
+            if let Ok((sid, _)) = self.runtime.deliver_or_wake_bot(
+                registry,
+                &self.store,
+                &self.secrets,
+                &self.tool_relay,
+                &self.composio_base_url,
+                &target.id,
+                &plan.prompt_for_bot,
+                ts,
+            ) {
+                self.groups
+                    .record_turn_started(&plan.group.id, &plan.thread.thread_id, target, sid, ts)
+                    .ok();
+                dispatched_bots.push(target.id.clone());
+            }
+        }
+        BotRpcResponse::GroupMessagePosted {
+            message: plan.posted_message,
+            dispatched_bots,
+        }
+    }
+
     fn reconcile_enabled_workers(&self) {
         if let Ok(bots) = self.store.list_bots() {
             self.reconcile_enabled_workers_for(&bots);
@@ -1979,6 +2054,8 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::GetBotItem { .. }
         | BotRpcRequest::ListGroups
         | BotRpcRequest::ReadGroup { .. }
+        | BotRpcRequest::ListGroupSummaries
+        | BotRpcRequest::ReadGroupRoom { .. }
         | BotRpcRequest::ConnectorStatus { .. }
         | BotRpcRequest::ToolRelayStatus
         | BotRpcRequest::ListBotSessions { .. }
@@ -1993,7 +2070,8 @@ fn authorize_bot_session_rpc(
         // A bot proposes bots only from its own chat; the owner answers them.
         BotRpcRequest::OfferBot { bot_id, .. } if bot_id == caller_bot => Ok(()),
         BotRpcRequest::OfferBot { .. } => deny("cannot propose a bot for another bot"),
-        BotRpcRequest::SendGroupMessage { sender, .. } => {
+        BotRpcRequest::SendGroupMessage { sender, .. }
+        | BotRpcRequest::SendGroupMessageWithAudience { sender, .. } => {
             let trimmed = sender.trim();
             if trimmed.is_empty()
                 || trimmed == caller_bot.as_str()
@@ -2087,6 +2165,8 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ReorderGroups { .. }
         | BotRpcRequest::NewGroupThread { .. }
         | BotRpcRequest::StopGroup { .. }
+        | BotRpcRequest::SetGroupReplyAudience { .. }
+        | BotRpcRequest::StopGroupMember { .. }
         | BotRpcRequest::SetConnectorConfig { .. }
         | BotRpcRequest::SetSecret { .. }
         | BotRpcRequest::DeleteSecret { .. }

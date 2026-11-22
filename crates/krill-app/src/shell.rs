@@ -47,6 +47,8 @@ mod workspaces;
 // 앱의 마지막 생존 시각 저장.
 mod artifacts;
 mod away;
+mod bot_group_chat;
+mod bot_group_panel;
 mod bot_panel;
 mod bot_section;
 
@@ -820,6 +822,8 @@ pub struct Shell {
     pub(super) bots_attention_count: usize,
     /// Rows of the sidebar Bots section, refreshed with the attention badge.
     pub(super) sidebar_bots: Vec<krill_app::bots::SidebarBot>,
+    /// Multi-bot group rooms displayed in the sidebar Bots section and right panel.
+    pub(super) sidebar_groups: Vec<krill_proto::bots::BotGroupSummary>,
     /// Orca's sidebar Bots section, New bot and templates dialogs.
     bot_ui: bot_section::BotUi,
     /// Orca's empty split/new-tab pane launcher state, keyed by pane id.
@@ -1487,6 +1491,7 @@ impl Shell {
             bots_cache: None,
             bots_attention_count: 0,
             sidebar_bots: Vec::new(),
+            sidebar_groups: Vec::new(),
             bot_ui: bot_section::BotUi::default(),
             split_launchers: HashMap::new(),
             bots_badge_task: None,
@@ -4679,6 +4684,9 @@ impl Shell {
             if self.split_launchers.contains_key(&p) {
                 continue; // 빈 분할·새 탭 런처 칸은 사용자가 고를 때까지 PTY를 만들지 않는다
             }
+            if self.is_group_pane(p) {
+                continue; // 멀티 봇 그룹 페이지 칸은 PTY를 만들지 않는다
+            }
             // 업데이트 health는 로컬 칸 연결로 판정한다. 원격 칸만 보이면 호스트가 꺼졌거나 SSH가 느릴 때
             // 30초 안에 붙지 못해 업데이트가 매번 롤백됐다(설 실기, v0.1.10→0.1.11).
             any_terminal |= self.layout.host(p).is_local();
@@ -5649,7 +5657,9 @@ impl Shell {
     }
 
     fn is_terminal_pane(&self, pane: PaneId) -> bool {
-        self.layout.pane_exists(pane) && self.layout.file(pane).is_none()
+        self.layout.pane_exists(pane)
+            && self.layout.file(pane).is_none()
+            && !self.is_group_pane(pane)
     }
 
     /// 세션 연결이 시작되기 전(`layout_loading` 중이거나 `target` 준비 전)에도 보이는 터미널 칸의
@@ -6768,8 +6778,8 @@ impl Shell {
     }
 
     fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A bot page has no Changes tab (Orca hides it there).
-        if self.page_open() || self.focused_bot().is_some() {
+        // A bot page or group page has no Changes tab (Orca hides it there).
+        if self.page_open() || self.focused_bot().is_some() || self.focused_bot_group().is_some() {
             return;
         }
         if self.panel_collapsed {
@@ -6798,6 +6808,10 @@ impl Shell {
         // OWE-860: 설정에서 ⌘⇧E를 누르면 설정을 닫고 탐색기로 전환한다.
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
+        }
+        // A group page has no Files/Search panel tabs (it shows BotGroupItemsPanel).
+        if self.focused_bot_group().is_some() {
+            return;
         }
         // A bot page shows its Files tab in place of the usual panel tabs.
         let bot_page = self.focused_bot().is_some();
@@ -6835,8 +6849,9 @@ impl Shell {
     }
 
     fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A bot page has no Search tab (Orca hides it there).
-        if !self.page_open() && self.focused_bot().is_some() {
+        // A bot page or group page has no Search tab (Orca hides it there).
+        if !self.page_open() && (self.focused_bot().is_some() || self.focused_bot_group().is_some())
+        {
             return;
         }
         // OWE-860: 설정에서 ⌘⇧F를 누르면 설정을 닫고 작업공간 검색으로 전환한다.
@@ -7207,6 +7222,9 @@ impl Shell {
         const PANE_HEADER_GROUP: &str = "pane-header";
         if self.is_split_launcher(id) {
             return self.render_split_launcher_pane(id, window, cx);
+        }
+        if self.is_group_pane(id) {
+            return self.render_group_chat_pane(id, window, cx);
         }
         if self.layout.file(id).is_some() {
             return self.render_file_pane(id, window, cx);
@@ -8451,12 +8469,21 @@ impl Render for Shell {
                 0.
             },
         );
-        // Orca's bot page: a chat in a bot's folder gets the bot's own right sidebar.
-        let bot_page = self.focused_bot().cloned();
+        // Orca's bot page: a chat in a bot's folder gets the bot's own right sidebar,
+        // and a group chat page gets the merged BotGroupItemsPanel.
+        let group_page = self.focused_bot_group().cloned();
+        let bot_page = if group_page.is_none() {
+            self.focused_bot().cloned()
+        } else {
+            None
+        };
         self.sync_bot_files_chrome(bot_page.is_some(), cx);
-        let panel_body = match bot_page.filter(|_| show_panel) {
-            Some(bot) => self.render_bot_panel(&bot, panel_width, window, cx),
-            None => self.diff.clone().into_any_element(),
+        let panel_body = if let Some(group) = group_page.filter(|_| show_panel) {
+            self.render_bot_group_panel(&group, panel_width, window, cx)
+        } else if let Some(bot) = bot_page.filter(|_| show_panel) {
+            self.render_bot_panel(&bot, panel_width, window, cx)
+        } else {
+            self.diff.clone().into_any_element()
         };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);

@@ -10,7 +10,9 @@ pub mod avatar_gen;
 mod connector_logos;
 mod connectors;
 mod connectors_panel;
-mod groups;
+pub mod group_dialog;
+pub mod group_faces;
+pub mod group_panel;
 mod home;
 mod home_item;
 mod home_item_parts;
@@ -59,6 +61,8 @@ use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::bots as text;
 use crate::ui;
 
+pub use group_dialog::BotGroupMembersDialog;
+pub use group_panel::{GroupChatScope, GroupItemsFilter};
 pub use home::HomeFilter;
 
 pub use rpc::{
@@ -136,7 +140,6 @@ pub enum Screen {
     #[default]
     Detail,
     Import,
-    Groups,
 }
 
 #[derive(Default)]
@@ -182,7 +185,7 @@ pub struct View {
     import_state: tools_sharing::ImportState,
     import_dialog: import_dialog::ImportDialog,
     settings: settings::SettingsState,
-    groups: groups::GroupsState,
+    group_panel: group_panel::GroupPanelState,
     load_gen: u64,
     detail_gen: u64,
     load_task: Option<Task<()>>,
@@ -197,8 +200,6 @@ pub struct View {
     memory_task: Option<Task<()>>,
     connector_task: Option<Task<()>>,
     tools_task: Option<Task<()>>,
-    group_task: Option<Task<()>>,
-    group_poll_task: Option<Task<()>>,
     oauth_poll_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     language: crate::i18n::Language,
@@ -312,7 +313,7 @@ impl View {
             import_state: tools_sharing::ImportState::default(),
             import_dialog: import_dialog::ImportDialog::new(cx),
             settings: settings::SettingsState::default(),
-            groups: groups::GroupsState::default(),
+            group_panel: group_panel::GroupPanelState::default(),
             load_gen: 0,
             detail_gen: 0,
             load_task: None,
@@ -327,8 +328,6 @@ impl View {
             memory_task: None,
             connector_task: None,
             tools_task: None,
-            group_task: None,
-            group_poll_task: None,
             oauth_poll_task: None,
             avatar_task: None,
             language: crate::i18n::language(),
@@ -435,7 +434,6 @@ impl View {
         self.armed_delete_bot = None;
         self.soul_memory.armed_forget = None;
         self.pending_switch_bot = None;
-        self.group_poll_task = None;
         self.oauth_poll_task = None;
         cx.notify();
     }
@@ -1407,7 +1405,6 @@ impl View {
             || self.tools.input_is_composing(window, app)
             || self.import_state.input_is_composing(window, app)
             || self.settings.input_is_composing(window, app)
-            || self.groups.input_is_composing(window, app)
     }
 
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) {
@@ -1433,11 +1430,6 @@ impl View {
                 return;
             }
             cx.emit(Close);
-            return;
-        }
-        if matches!(self.screen, Screen::Groups) && !self.bots.is_empty() {
-            self.screen = Screen::Detail;
-            cx.notify();
             return;
         }
         cx.emit(Close);
@@ -1774,17 +1766,6 @@ impl View {
                     .flex_col()
                     .gap_1p5()
                     .child(
-                        ui::segment(
-                            p,
-                            "bots-nav-groups",
-                            text::GROUP_CHATS_HEADING.get(),
-                            self.screen == Screen::Groups,
-                        )
-                        .debug_selector(|| "bots-nav-groups".into())
-                        .w_full()
-                        .on_click(cx.listener(|this, _, _, cx| this.open_groups(cx))),
-                    )
-                    .child(
                         ui::primary("bots-new-btn", text::NEW_BOT.get())
                             .debug_selector(|| "bots-new-btn".into())
                             .w_full()
@@ -1828,15 +1809,6 @@ impl View {
             );
         }
         bar.child(
-            ui::segment(
-                p,
-                "bots-compact-groups",
-                text::GROUP_CHATS_HEADING.get(),
-                self.screen == Screen::Groups,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.open_groups(cx))),
-        )
-        .child(
             ui::primary("bots-new-btn", text::NEW_BOT.get())
                 .debug_selector(|| "bots-new-btn".into())
                 .on_click(cx.listener(|this, _, _, cx| this.open_create(cx))),
@@ -2495,7 +2467,6 @@ impl Render for View {
             self.tools.refresh_placeholders(window, cx);
             self.import_state.refresh_placeholders(window, cx);
             self.settings.refresh_placeholders(window, cx);
-            self.groups.refresh_placeholders(window, cx);
         }
 
         let rem = window.rem_size();
@@ -2541,7 +2512,6 @@ impl Render for View {
         let selected_bot = self.selected_bot().cloned();
         let right_pane = match self.screen {
             Screen::Import => div().id("bots-import-unreachable"),
-            Screen::Groups => self.render_groups_view(p, window, cx),
             Screen::Detail => {
                 if let Some(bot) = selected_bot {
                     let tab_body = match self.detail_tab {

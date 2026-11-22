@@ -23,6 +23,7 @@ use krill_proto::bots::{BotId, BotRpcRequest, BotRpcResponse, BotTemplate};
 use super::Shell;
 
 mod chats;
+mod group_rows;
 mod header;
 mod rows;
 #[cfg(test)]
@@ -58,6 +59,8 @@ pub(super) struct BotUi {
     pub chat_steps: HashMap<krill_proto::SessionId, usize>,
     /// The bot row being renamed in place.
     pub renaming: Option<(BotId, Entity<InputState>, Subscription)>,
+    /// The group row being renamed in place.
+    pub renaming_group: Option<(String, Entity<InputState>, Subscription)>,
     /// Decoded `avatar.png` per bot and the config time it belongs to (`None`: unreadable,
     /// so the poll doesn't fetch it again until the bot changes).
     pub avatars: HashMap<BotId, (u64, Option<Arc<Image>>)>,
@@ -70,12 +73,17 @@ pub(super) struct BotUi {
     pub pending: Option<BotDialogRequest>,
     pub new_bot: Option<(Entity<new_bot::NewBot>, Subscription)>,
     pub templates: Option<(Entity<templates::Templates>, Subscription)>,
+    pub group_dialog: Option<(Entity<krill_app::bots::BotGroupMembersDialog>, Subscription)>,
     /// Bot waiting for "Delete bot" confirmation.
     pub delete: Option<SidebarBot>,
+    /// Group waiting for "Delete group" confirmation.
+    pub delete_group: Option<krill_proto::bots::BotGroupChat>,
     pub delete_focus: Option<FocusHandle>,
     pub spinners: ui::status::SpinnerSlots,
     /// The right sidebar of a bot page.
     pub panel: super::bot_panel::BotPanel,
+    /// Full workspace Group Chat page state.
+    pub group_chat: super::bot_group_chat::BotGroupUiState,
 }
 
 impl Shell {
@@ -91,7 +99,7 @@ impl Shell {
             reason = "tests have no daemon without an override"
         )
     )]
-    fn bot_rpc_on(&self, host: &HostId) -> Option<krill_app::bots::BotRpcCall> {
+    pub(super) fn bot_rpc_on(&self, host: &HostId) -> Option<krill_app::bots::BotRpcCall> {
         #[cfg(test)]
         {
             self.bot_rpc_overrides
@@ -723,8 +731,14 @@ impl Shell {
         if let Some((d, _)) = &self.bot_ui.templates {
             out.push(d.clone().into_any_element());
         }
+        if let Some((d, _)) = &self.bot_ui.group_dialog {
+            out.push(d.clone().into_any_element());
+        }
         if let Some(bot) = self.bot_ui.delete.clone() {
             out.push(self.render_bot_delete(&bot, window, cx));
+        }
+        if let Some(group) = self.bot_ui.delete_group.clone() {
+            out.push(self.render_group_delete(&group, window, cx));
         }
         out
     }
@@ -830,7 +844,6 @@ impl Shell {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BotsScreen {
     Import,
-    Groups,
 }
 
 impl Shell {
@@ -844,7 +857,6 @@ impl Shell {
         if let Some(view) = self.bots_cache.clone() {
             view.update(cx, |v, cx| match screen {
                 BotsScreen::Import => v.open_import(cx),
-                BotsScreen::Groups => v.open_groups(cx),
             });
         }
     }
