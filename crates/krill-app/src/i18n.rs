@@ -2507,6 +2507,8 @@ catalog! {
         NOTE_YOU_CANCELED => ("내가 {item} 취소", "You canceled {item}"),
         NOTE_YOU_MOVED => ("내가 {item}을(를) {status}(으)로 이동", "You moved {item} to {status}"),
         NOTE_YOU_CHANGED => ("내가 {item} 수정", "You changed {item}"),
+        NOTICE_UPDATE => ("{name}의 업데이트", "Update from {name}"),
+        NOTICE_MESSAGE => ("{name}의 메시지", "Message from {name}"),
         REVIEW_DONE => ("Term에서 확인했어요 · 입력 다시 허용", "Checked in Term · enable sending"),
         PROMPT_REVIEW => ("본문을 붙여넣은 뒤 전송을 마치지 못했습니다. 초안을 보존했습니다. 중복 전송 전에 Term에서 확인하세요.", "The text was pasted but submission did not finish. Your draft is preserved. Check in Term before sending again."),
         MULTILINE_BLOCKED => ("이 터미널은 여러 줄 붙여넣기를 지원하지 않습니다. 초안을 보존했습니다. Term에서 확인하세요.", "This terminal does not support multiline paste. Your draft is preserved. Check in Term."),

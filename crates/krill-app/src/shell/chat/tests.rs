@@ -1215,3 +1215,45 @@ fn composer_keeps_every_typed_key(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|_, cx| assert_eq!(input.read(cx).value().as_ref(), sentence));
 }
+
+#[test]
+fn delivered_mail_renders_as_sender_notice_not_owner_bubble() {
+    use work_run::{DisplayFeed, DisplayRow, NoticeKind, parse_inbound_notice};
+    let pointer = "[Krill orchestration] Unread mail. From: 'worker-a' (worker_done), 'it'\\''s' (question). Read with: krill orchestration check --to 'coordinator' --run 'r1' --unread --json";
+    let notice = parse_inbound_notice(pointer).unwrap();
+    assert_eq!(notice.kind, NoticeKind::Message);
+    assert_eq!(notice.from, ["worker-a", "it's"]);
+    let legacy = parse_inbound_notice("[Krill orchestration] Unread mail. Read with: krill orchestration check --to 'c' --unread --json").unwrap();
+    assert_eq!((legacy.kind, legacy.from.len()), (NoticeKind::Update, 1));
+
+    let mail =
+        parse_inbound_notice("[Krill bot mail from Scout] Subject: Daily digest\nThree new PRs.")
+            .unwrap();
+    assert_eq!(mail.from, ["Scout"]);
+    assert_eq!(mail.detail, "Daily digest\nThree new PRs.");
+
+    let ext = parse_inbound_notice("[Krill external message via slack | channel: C1 | from: Owen (U1)]\n<<<\nhi >> there\n>>>\nAttachments:\n- /tmp/a.png\n").unwrap();
+    assert_eq!(ext.from, ["Owen (slack)"]);
+    assert_eq!(ext.detail, "hi >> there\nAttachments:\n- /tmp/a.png");
+    assert!(parse_inbound_notice("please check [Krill orchestration] Unread mail.").is_none());
+
+    let items: Vec<Arc<ChatItem>> = [pointer, "real question"]
+        .into_iter()
+        .map(|text| {
+            Arc::new(ChatItem {
+                kind: ChatItemKind::User,
+                text: text.into(),
+                ..ChatItem::default()
+            })
+        })
+        .collect();
+    let feed = DisplayFeed::project(0, &items);
+    assert!(matches!(
+        feed.get(0),
+        Some(DisplayRow::Notice { abs_idx: 0, .. })
+    ));
+    assert!(matches!(
+        feed.get(1),
+        Some(DisplayRow::Item { abs_idx: 1, .. })
+    ));
+}
