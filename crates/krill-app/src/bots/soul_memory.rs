@@ -1070,7 +1070,7 @@ impl View {
                         this.soul_memory
                             .suggestions
                             .retain(|s| s.id != suggestion_id);
-                        this.items.items.insert(0, *item);
+                        this.items.push_front_item(*item);
                         this.sync_open_items_for_bot(&bot_id);
                         this.emit_badge(cx);
                     }

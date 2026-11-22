@@ -3,14 +3,20 @@
 //! Shares item rows, status buckets, snooze/cancel dialogs, needs-you asks, and `BotItemPane`
 //! directly with [`super::home`] and [`super::home_item`].
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 
-use gpui::{AnyElement, Context, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, ListAlignment, ListState, SharedString, Window, div, prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, IconName, Sizable as _};
 use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemStatus, BotRpcRequest, BotRpcResponse};
 
-use super::home::{Group, grouped, status_name};
+use super::home::{
+    Group, ITEMS_LIST_OVERDRAW_PX, RowAnchor, activity_at, group_of, number_column_chars,
+    reconcile_list_state, status_name,
+};
 use super::home_needs::Need;
 use super::rpc::call_checked;
 use super::{View, now_unix_ms};
@@ -18,6 +24,78 @@ use crate::i18n::catalog::bots as text;
 use crate::ui;
 
 const GROUP_ROWS: usize = 5;
+
+#[derive(Debug, Clone)]
+enum GroupListRow {
+    FilterChips,
+    BucketHeader {
+        bucket: Group,
+        first_bucket: bool,
+        count: usize,
+        needs_count: usize,
+        open: bool,
+    },
+    Need {
+        owner_bot_id: BotId,
+        need: Need,
+    },
+    Item {
+        bucket: Group,
+        item_index: usize,
+    },
+    ShowMore {
+        bucket: Group,
+        shown: usize,
+        more: usize,
+    },
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupCacheKey {
+    group_id: String,
+    items_rev: u64,
+    items_len: usize,
+    member_ids: Vec<BotId>,
+    thread_ids: Vec<String>,
+    filter: GroupItemsFilter,
+    folds: Vec<&'static str>,
+    group_shown: Vec<(&'static str, usize)>,
+    needs_keys: Vec<(BotId, String)>,
+    minute_bucket: u64,
+}
+
+pub(super) struct GroupListCache {
+    list_state: ListState,
+    key: Option<GroupCacheKey>,
+    last_group_id: String,
+    rows: Vec<GroupListRow>,
+    row_keys: Vec<RowAnchor>,
+    number_chars: usize,
+    owner_index: HashMap<BotId, usize>,
+    #[cfg(test)]
+    pub(super) rebuild_count: usize,
+    #[cfg(test)]
+    pub(super) rendered_item_rows: std::cell::Cell<usize>,
+}
+
+impl Default for GroupListCache {
+    fn default() -> Self {
+        Self {
+            list_state: ListState::new(0, ListAlignment::Top, px(ITEMS_LIST_OVERDRAW_PX)),
+            key: None,
+            last_group_id: String::new(),
+            rows: Vec::new(),
+            row_keys: Vec::new(),
+            number_chars: 3,
+            owner_index: HashMap::new(),
+            #[cfg(test)]
+            rebuild_count: 0,
+            #[cfg(test)]
+            rendered_item_rows: std::cell::Cell::new(0),
+        }
+    }
+}
 
 /// Chat filter scope inside [`BotGroupItemsPanel`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,6 +140,7 @@ pub(super) struct GroupPanelState {
     pub all_items: Vec<BotItem>,
     pub closed_loaded_key: Option<(String, Vec<BotId>)>,
     pub gen_seq: u64,
+    pub(super) list_cache: GroupListCache,
 }
 
 impl GroupPanelState {
@@ -284,12 +363,373 @@ impl View {
 
     fn sync_group_items_backing(&mut self) {
         if self.group_panel.active {
-            self.items.items = self.resolved_group_items();
+            let next = self.resolved_group_items();
+            let same = next.len() == self.items.items.len()
+                && next
+                    .iter()
+                    .zip(&self.items.items)
+                    .all(|(a, b)| a.uid == b.uid && a.version == b.version && a.status == b.status);
+            if !same {
+                self.items.set_items(next);
+            }
             if let Some(uid) = &self.items.open_uid
                 && let Some(item) = self.items.items.iter().find(|i| &i.uid == uid)
             {
                 self.selected_bot_id = Some(item.owner_bot_id.clone());
             }
+        }
+    }
+
+    fn sync_group_list_cache(&mut self, now: u64) {
+        let filter = self.group_panel.filter.clone();
+        let active_bots: Vec<BotConfig> = self
+            .group_panel
+            .member_ids
+            .iter()
+            .filter(|bid| filter.bot_ids.is_empty() || filter.bot_ids.contains(*bid))
+            .filter_map(|bid| self.bots.iter().find(|b| &b.id == bid).cloned())
+            .collect();
+        let mut group_needs: Vec<(BotId, Need)> = Vec::new();
+        for bot in &active_bots {
+            for need in self.home_needs(bot) {
+                group_needs.push((bot.id.clone(), need));
+            }
+        }
+        let next_key = GroupCacheKey {
+            group_id: self.group_panel.group_id.clone(),
+            items_rev: self.items.items_rev,
+            items_len: self.items.items.len(),
+            member_ids: self.group_panel.member_ids.clone(),
+            thread_ids: self.group_panel.thread_ids.clone(),
+            filter: filter.clone(),
+            folds: self.items.folds.iter().copied().collect(),
+            group_shown: self
+                .items
+                .group_shown
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect(),
+            needs_keys: group_needs
+                .iter()
+                .map(|(bid, n)| (bid.clone(), n.key.clone()))
+                .collect(),
+            minute_bucket: now / 60_000,
+        };
+        if self.group_panel.list_cache.key.as_ref() == Some(&next_key) {
+            return;
+        }
+        let reset_scroll = self.group_panel.list_cache.last_group_id != self.group_panel.group_id;
+        self.group_panel
+            .list_cache
+            .last_group_id
+            .clone_from(&self.group_panel.group_id);
+        self.group_panel.list_cache.key = Some(next_key);
+        #[cfg(test)]
+        {
+            self.group_panel.list_cache.rebuild_count += 1;
+        }
+
+        let mut grouped_indices: [Vec<usize>; 6] = Default::default();
+        let mut max_number = 0u64;
+        let mut shown_count = 0usize;
+        for (idx, item) in self.items.items.iter().enumerate() {
+            max_number = max_number.max(item.number);
+            if !filter.bot_ids.is_empty() && !filter.bot_ids.contains(&item.owner_bot_id) {
+                continue;
+            }
+            if !item_matches_group_scope(
+                item,
+                &self.group_panel.group_id,
+                &self.group_panel.thread_ids,
+                &filter.chat_scope,
+            ) {
+                continue;
+            }
+            if filter.needs_you_only && item.status != BotItemStatus::NeedsYou {
+                continue;
+            }
+            shown_count += 1;
+            let live = self.item_live(item);
+            let bucket = group_of(item, live, Some(5), now);
+            grouped_indices[bucket as usize].push(idx);
+        }
+        for (i, indices) in grouped_indices.iter_mut().enumerate() {
+            if i == Group::Snoozed as usize {
+                indices.sort_by_key(|&idx| {
+                    let it = &self.items.items[idx];
+                    (it.snoozed_until_ms.unwrap_or(0), Reverse(it.number))
+                });
+            } else {
+                indices.sort_by_key(|&idx| {
+                    let it = &self.items.items[idx];
+                    (Reverse(activity_at(it, now)), Reverse(it.number))
+                });
+            }
+        }
+
+        self.items.shown_order = Group::ALL
+            .iter()
+            .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
+            .flat_map(|g| {
+                grouped_indices[*g as usize]
+                    .iter()
+                    .map(|&idx| self.items.items[idx].uid.clone())
+            })
+            .collect();
+        if !self.items.selected.is_empty() {
+            let live_uids: std::collections::HashSet<&str> =
+                self.items.items.iter().map(|i| i.uid.as_str()).collect();
+            self.items
+                .selected
+                .retain(|uid| live_uids.contains(uid.as_str()));
+        }
+
+        let has_chips = !filter.bot_ids.is_empty()
+            || !matches!(filter.chat_scope, GroupChatScope::AllTheirWork)
+            || filter.needs_you_only;
+        let mut rows = Vec::new();
+        let mut row_keys = Vec::new();
+        if has_chips {
+            rows.push(GroupListRow::FilterChips);
+            row_keys.push(RowAnchor::FilterChip);
+        }
+        let mut first_bucket = true;
+        for bucket in Group::ALL {
+            let indices = &grouped_indices[bucket as usize];
+            if indices.is_empty() && (bucket != Group::NeedsYou || group_needs.is_empty()) {
+                continue;
+            }
+            let open = bucket.folded_by_default() == self.items.folds.contains(bucket.id());
+            rows.push(GroupListRow::BucketHeader {
+                bucket,
+                first_bucket,
+                count: indices.len(),
+                needs_count: if bucket == Group::NeedsYou {
+                    group_needs.len()
+                } else {
+                    0
+                },
+                open,
+            });
+            row_keys.push(RowAnchor::GroupHeader(bucket as u8));
+            first_bucket = false;
+            if !open {
+                continue;
+            }
+            if bucket == Group::NeedsYou {
+                for (owner_bot_id, need) in &group_needs {
+                    row_keys.push(RowAnchor::Need(format!(
+                        "{}:{}",
+                        owner_bot_id.as_str(),
+                        need.key
+                    )));
+                    rows.push(GroupListRow::Need {
+                        owner_bot_id: owner_bot_id.clone(),
+                        need: need.clone(),
+                    });
+                }
+            }
+            let shown = self
+                .items
+                .group_shown
+                .get(bucket.id())
+                .copied()
+                .unwrap_or(GROUP_ROWS);
+            for &idx in indices.iter().take(shown) {
+                row_keys.push(RowAnchor::Item(self.items.items[idx].uid.clone()));
+                rows.push(GroupListRow::Item {
+                    bucket,
+                    item_index: idx,
+                });
+            }
+            let more = indices.len().saturating_sub(shown);
+            if more > 0 {
+                rows.push(GroupListRow::ShowMore {
+                    bucket,
+                    shown,
+                    more,
+                });
+                row_keys.push(RowAnchor::ShowMore(bucket as u8));
+            }
+        }
+        if shown_count == 0 && group_needs.is_empty() {
+            rows.push(GroupListRow::Empty);
+            row_keys.push(RowAnchor::HomeNote);
+        }
+
+        let owner_index: HashMap<BotId, usize> = self
+            .bots
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id.clone(), i))
+            .collect();
+        let old_keys = std::mem::replace(&mut self.group_panel.list_cache.row_keys, row_keys);
+        reconcile_list_state(
+            &mut self.group_panel.list_cache.list_state,
+            &old_keys,
+            &self.group_panel.list_cache.row_keys,
+            reset_scroll,
+        );
+        self.group_panel.list_cache.rows = rows;
+        self.group_panel.list_cache.number_chars = number_column_chars(max_number);
+        self.group_panel.list_cache.owner_index = owner_index;
+    }
+
+    fn render_group_virtual_row(
+        &self,
+        row: &GroupListRow,
+        number_chars: usize,
+        now: u64,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match row {
+            GroupListRow::FilterChips => {
+                let chips = self.render_group_filter_chips(&self.group_panel.filter, p, cx);
+                div()
+                    .pb(px(12.))
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .px_2()
+                    .children(chips)
+                    .into_any_element()
+            }
+            GroupListRow::BucketHeader {
+                bucket,
+                first_bucket,
+                count,
+                needs_count,
+                open,
+            } => {
+                let bucket = *bucket;
+                let open = *open;
+                let summary = (!open).then(|| {
+                    if bucket == Group::NeedsYou {
+                        (count + needs_count).to_string()
+                    } else {
+                        count.to_string()
+                    }
+                });
+                let header = super::home::section_header(
+                    &format!("bot-group-bucket-{}", bucket.id()),
+                    match bucket {
+                        Group::NeedsYou => text::HM_STATUS_NEEDS_YOU.get(),
+                        Group::Working => text::HM_STATUS_WORKING.get(),
+                        Group::Planned => text::HM_STATUS_PLANNED.get(),
+                        Group::Snoozed => text::HM_GROUP_SNOOZED.get(),
+                        Group::Stale => text::HM_GROUP_STALE.get(),
+                        Group::Closed => text::HM_GROUP_CLOSED.get(),
+                    },
+                    open,
+                    summary,
+                    p,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.items.folds.remove(bucket.id()) {
+                        this.items.folds.insert(bucket.id());
+                    }
+                    cx.notify();
+                }));
+                div()
+                    .when(!first_bucket, gpui::Styled::pt_2)
+                    .pb_0p5()
+                    .child(header)
+                    .into_any_element()
+            }
+            GroupListRow::Need { owner_bot_id, need } => {
+                let Some(owner) = self
+                    .group_panel
+                    .list_cache
+                    .owner_index
+                    .get(owner_bot_id)
+                    .and_then(|&i| self.bots.get(i))
+                else {
+                    return div().into_any_element();
+                };
+                div()
+                    .pb_0p5()
+                    .child(self.render_need_row(owner, need, p, cx))
+                    .into_any_element()
+            }
+            GroupListRow::Item { bucket, item_index } => {
+                let Some(item) = self.items.items.get(*item_index) else {
+                    return div().into_any_element();
+                };
+                let Some(owner) = self
+                    .group_panel
+                    .list_cache
+                    .owner_index
+                    .get(&item.owner_bot_id)
+                    .and_then(|&i| self.bots.get(i))
+                else {
+                    return div().into_any_element();
+                };
+                #[cfg(test)]
+                {
+                    let n = self.group_panel.list_cache.rendered_item_rows.get();
+                    self.group_panel.list_cache.rendered_item_rows.set(n + 1);
+                }
+                let row = self.render_home_row(owner, item, *bucket, number_chars, now, p, cx);
+                let upload = self.settings.avatar_cache.get(&owner.id).cloned();
+                let badge = super::avatar::render(
+                    &super::avatar::Avatar::of(owner),
+                    upload,
+                    &owner.name,
+                    px(14.),
+                    px(4.),
+                    p,
+                );
+                div()
+                    .pb_0p5()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_none().child(badge))
+                    .child(div().flex_1().min_w_0().child(row))
+                    .into_any_element()
+            }
+            GroupListRow::ShowMore {
+                bucket,
+                shown,
+                more,
+            } => {
+                let (bucket, shown, more) = (*bucket, *shown, *more);
+                div()
+                    .pb_0p5()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("grp-more-{}", bucket.id())))
+                            .debug_selector(move || format!("grp-more-{}", bucket.id()))
+                            .role(gpui::Role::Button)
+                            .self_start()
+                            .py_0p5()
+                            .pl_8()
+                            .pr_2()
+                            .cursor_pointer()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.text_color(p.foreground))
+                            .child(text::HM_SHOW_MORE.format(&[("n", &more.to_string())]))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.items
+                                    .group_shown
+                                    .insert(bucket.id(), shown + GROUP_ROWS.max(more));
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            }
+            GroupListRow::Empty => div()
+                .pt_3()
+                .child(Self::render_group_items_empty(
+                    &self.group_panel.filter,
+                    p,
+                    cx,
+                ))
+                .into_any_element(),
         }
     }
 
@@ -318,102 +758,48 @@ impl View {
         }
 
         let now = now_unix_ms();
-        let all = self.resolved_group_items();
-        let filter = self.group_panel.filter.clone();
-        let shown: Vec<&BotItem> = all
-            .iter()
-            .filter(|i| filter.bot_ids.is_empty() || filter.bot_ids.contains(&i.owner_bot_id))
-            .filter(|i| {
-                item_matches_group_scope(
-                    i,
-                    &self.group_panel.group_id,
-                    &self.group_panel.thread_ids,
-                    &filter.chat_scope,
-                )
-            })
-            .filter(|i| !filter.needs_you_only || i.status == BotItemStatus::NeedsYou)
-            .collect();
-
-        let groups = grouped(shown.iter().copied(), |i| self.item_live(i), Some(5), now);
-        self.items.shown_order = Group::ALL
-            .iter()
-            .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
-            .flat_map(|g| groups[*g as usize].iter().map(|i| i.uid.clone()))
-            .collect();
-        self.items
-            .selected
-            .retain(|uid| all.iter().any(|i| &i.uid == uid));
-        let number_chars = all
-            .iter()
-            .map(|i| format!("#{}", i.number).len())
-            .max()
-            .unwrap_or(3);
-
-        // Gather needs across active member bots.
-        let active_bots: Vec<BotConfig> = self
-            .group_panel
-            .member_ids
-            .iter()
-            .filter(|bid| filter.bot_ids.is_empty() || filter.bot_ids.contains(*bid))
-            .filter_map(|bid| self.bots.iter().find(|b| &b.id == bid).cloned())
-            .collect();
-        let mut group_needs: Vec<(BotConfig, Need)> = Vec::new();
-        for bot in &active_bots {
-            for need in self.home_needs(bot) {
-                group_needs.push((bot.clone(), need));
-            }
+        self.sync_group_list_cache(now);
+        #[cfg(test)]
+        {
+            self.group_panel.list_cache.rendered_item_rows.set(0);
         }
 
-        let mut body = div()
+        let list_state = self.group_panel.list_cache.list_state.clone();
+        let number_chars = self.group_panel.list_cache.number_chars;
+        let list = gpui::list(
+            list_state,
+            cx.processor(move |this, ix: usize, _, cx| {
+                let p = ui::palette(cx);
+                let Some(row) = this.group_panel.list_cache.rows.get(ix) else {
+                    return div().into_any_element();
+                };
+                this.render_group_virtual_row(row, number_chars, now, p, cx)
+            }),
+        )
+        .size_full()
+        .pl(px(14.))
+        .pr_2()
+        .pt(px(10.))
+        .pb_3();
+
+        let body = div()
             .id("bot-group-items-body")
             .debug_selector(|| "bot-group-items-body".into())
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .pl(px(14.))
-            .pr_2()
-            .pt(px(10.))
-            .pb_3()
+            .size_full()
             .flex()
             .flex_col()
-            .gap(px(12.));
-
-        let chips = self.render_group_filter_chips(&filter, p, cx);
-        if !chips.is_empty() {
-            body = body.child(div().flex().flex_wrap().gap_1().px_2().children(chips));
-        }
-
-        let mut list = div()
-            .id("bot-group-items-list")
-            .debug_selector(|| "bot-group-items-list".into())
-            .role(gpui::Role::List)
-            .flex()
-            .flex_col()
-            .gap_2();
-        for group_bucket in Group::ALL {
-            let rows = &groups[group_bucket as usize];
-            if rows.is_empty() && (group_bucket != Group::NeedsYou || group_needs.is_empty()) {
-                continue;
-            }
-            list = list.child(self.render_group_bucket(
-                group_bucket,
-                rows,
-                if group_bucket == Group::NeedsYou {
-                    &group_needs
-                } else {
-                    &[]
-                },
-                number_chars,
-                now,
-                p,
-                cx,
-            ));
-        }
-
-        let any_items = !shown.is_empty() || !group_needs.is_empty();
-        body = body.child(list).when(!any_items, |d| {
-            d.child(Self::render_group_items_empty(&filter, p, cx))
-        });
+            .child(
+                div()
+                    .id("bot-group-items-list")
+                    .debug_selector(|| "bot-group-items-list".into())
+                    .role(gpui::Role::List)
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .child(list),
+            );
 
         let first_bot_id = self
             .group_panel
@@ -535,107 +921,6 @@ impl View {
                     .on_click(on_clear),
             )
             .into_any_element()
-    }
-
-    #[expect(clippy::too_many_arguments, reason = "group bucket row renderer")]
-    fn render_group_bucket(
-        &self,
-        bucket: Group,
-        rows: &[&BotItem],
-        needs: &[(BotConfig, Need)],
-        number_chars: usize,
-        now: u64,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let open = bucket.folded_by_default() == self.items.folds.contains(bucket.id());
-        let summary = (!open).then(|| {
-            if bucket == Group::NeedsYou {
-                (rows.len() + needs.len()).to_string()
-            } else {
-                rows.len().to_string()
-            }
-        });
-        let header = super::home::section_header(
-            &format!("bot-group-bucket-{}", bucket.id()),
-            match bucket {
-                Group::NeedsYou => text::HM_STATUS_NEEDS_YOU.get(),
-                Group::Working => text::HM_STATUS_WORKING.get(),
-                Group::Planned => text::HM_STATUS_PLANNED.get(),
-                Group::Snoozed => text::HM_GROUP_SNOOZED.get(),
-                Group::Stale => text::HM_GROUP_STALE.get(),
-                Group::Closed => text::HM_GROUP_CLOSED.get(),
-            },
-            open,
-            summary,
-            p,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if !this.items.folds.remove(bucket.id()) {
-                this.items.folds.insert(bucket.id());
-            }
-            cx.notify();
-        }));
-        let mut section = div().flex().flex_col().gap_0p5().child(header);
-        if !open {
-            return section;
-        }
-        for (owner, need) in needs {
-            section = section.child(self.render_need_row(owner, need, p, cx));
-        }
-        let shown = self
-            .items
-            .group_shown
-            .get(bucket.id())
-            .copied()
-            .unwrap_or(GROUP_ROWS);
-        for item in rows.iter().take(shown) {
-            if let Some(owner) = self.bots.iter().find(|b| b.id == item.owner_bot_id) {
-                let row = self.render_home_row(owner, item, bucket, number_chars, now, p, cx);
-                let badge = super::avatar::render(
-                    &super::avatar::Avatar::of(owner),
-                    None,
-                    &owner.name,
-                    px(14.),
-                    px(4.),
-                    p,
-                );
-                section = section.child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().flex_none().child(badge))
-                        .child(div().flex_1().min_w_0().child(row)),
-                );
-            }
-        }
-        let more = rows.len().saturating_sub(shown);
-        if more > 0 {
-            section = section.child(
-                div()
-                    .id(SharedString::from(format!("grp-more-{}", bucket.id())))
-                    .role(gpui::Role::Button)
-                    .self_start()
-                    .py_0p5()
-                    .pl_8()
-                    .pr_2()
-                    .cursor_pointer()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .hover(|d| d.text_color(p.foreground))
-                    .child(text::HM_SHOW_MORE.format(&[("n", &more.to_string())]))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.items
-                            .group_shown
-                            .insert(bucket.id(), shown + GROUP_ROWS.max(more));
-                        cx.notify();
-                    })),
-            );
-        }
-        section
     }
 
     fn render_group_items_empty(

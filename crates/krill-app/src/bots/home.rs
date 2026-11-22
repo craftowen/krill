@@ -6,22 +6,202 @@
 //! the header (with the filter icon) above it.
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 
-use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, FontWeight, ListAlignment, ListState, SharedString, Window, div,
+    prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::SessionId;
-use krill_proto::bots::{BotConfig, BotItem, BotItemActor, BotItemLink, BotItemStatus};
+use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemActor, BotItemLink, BotItemStatus};
 
+use super::home_needs::Need;
 use super::{View, now_unix_ms};
 use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
 /// Rows a group shows before "Show N more" (Orca `BOT_ITEM_GROUP_ROWS`).
 const GROUP_ROWS: usize = 5;
+/// Viewport overdraw in pixels for virtualized Home & Group item lists (Orca `OVERSCAN_PX = 300`).
+pub(super) const ITEMS_LIST_OVERDRAW_PX: f32 = 300.;
 const DAY_MS: u64 = 86_400_000;
+
+/// Width in characters of `#{n}` without heap allocation.
+pub(super) fn number_column_chars(max_number: u64) -> usize {
+    let digits = if max_number == 0 {
+        1
+    } else {
+        usize::try_from(max_number.ilog10()).unwrap_or(0) + 1
+    };
+    (digits + 1).max(3)
+}
+
+/// Stable identity key for a flattened virtual row, used to preserve the scroll anchor across
+/// item updates and group folds (Orca #45971).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RowAnchor {
+    FilterChip,
+    GroupHeader(u8),
+    StaleConfirm,
+    Need(String),
+    Item(String),
+    ShowMore(u8),
+    HomeNote,
+    Automations,
+    Suggestions,
+}
+
+/// Reconciles a `gpui::ListState` against updated row anchors via minimal `splice` while keeping
+/// the top visible row anchored across updates (matching `sidebar/viewport.rs` and Orca #45971).
+pub(super) fn reconcile_list_state(
+    state: &mut ListState,
+    old_keys: &[RowAnchor],
+    new_keys: &[RowAnchor],
+    reset_scroll: bool,
+) {
+    if reset_scroll {
+        state.reset(new_keys.len());
+        return;
+    }
+    if old_keys == new_keys {
+        return;
+    }
+    let old_offset = state.logical_scroll_top();
+    let new_index: BTreeMap<&RowAnchor, usize> = new_keys
+        .iter()
+        .enumerate()
+        .map(|(idx, key)| (key, idx))
+        .collect();
+    let mut next_offset = old_offset;
+    let anchor = old_keys
+        .iter()
+        .enumerate()
+        .skip(old_offset.item_ix)
+        .chain(old_keys.iter().enumerate().take(old_offset.item_ix).rev())
+        .find_map(|(old_ix, key)| new_index.get(key).copied().map(|ix| (old_ix, ix)));
+    if let Some((old_ix, ix)) = anchor {
+        next_offset.item_ix = ix;
+        if old_ix != old_offset.item_ix {
+            next_offset.offset_in_item = px(0.);
+        }
+    } else {
+        next_offset.item_ix = old_offset.item_ix.min(new_keys.len().saturating_sub(1));
+        next_offset.offset_in_item = px(0.);
+    }
+    let prefix = old_keys
+        .iter()
+        .zip(new_keys)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = old_keys
+        .iter()
+        .skip(prefix)
+        .rev()
+        .zip(new_keys.iter().skip(prefix).rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    state.splice(
+        prefix..old_keys.len() - suffix,
+        new_keys.len() - prefix - suffix,
+    );
+    if !new_keys.is_empty() && (old_offset.item_ix > 0 || old_offset.offset_in_item > px(0.)) {
+        state.scroll_to(next_offset);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeNoteKind {
+    Empty,
+    FilteredEmpty,
+    AllClear,
+}
+
+#[derive(Debug, Clone)]
+enum HomeRow {
+    FilterChip,
+    GroupHeader {
+        group: Group,
+        first_group: bool,
+        count: usize,
+        fresh: usize,
+        needs_count: usize,
+        open: bool,
+    },
+    StaleConfirm {
+        stale_days: u64,
+        item_indices: Vec<usize>,
+    },
+    Need(Need),
+    Item {
+        group: Group,
+        item_index: usize,
+    },
+    ShowMore {
+        group: Group,
+        shown: usize,
+        more: usize,
+    },
+    HomeNote(HomeNoteKind),
+    Automations,
+    Suggestions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomeCacheKey {
+    bot_id: BotId,
+    items_rev: u64,
+    items_len: usize,
+    first_sig: Option<(String, u64)>,
+    last_sig: Option<(String, u64)>,
+    filter_on: bool,
+    folds: Vec<&'static str>,
+    group_shown: Vec<(&'static str, usize)>,
+    stale_days: Option<u64>,
+    stale_confirm: bool,
+    needs_keys: Vec<String>,
+    live_working_sessions: Vec<SessionId>,
+    seen_mark: u64,
+    has_suggestions: bool,
+    minute_bucket: u64,
+}
+
+/// Cached virtualized projection of the bot Home tab so hover, selection, and scroll never
+/// re-clone, re-group, or mount hundreds of off-screen rows (Orca #45971).
+pub(super) struct HomeListCache {
+    pub(super) list_state: ListState,
+    key: Option<HomeCacheKey>,
+    last_bot_id: Option<BotId>,
+    seen_checked: Option<(BotId, u64, u64)>,
+    rows: Vec<HomeRow>,
+    row_keys: Vec<RowAnchor>,
+    number_chars: usize,
+    #[cfg(test)]
+    pub(super) rebuild_count: usize,
+    #[cfg(test)]
+    pub(super) rendered_item_rows: std::cell::Cell<usize>,
+}
+
+impl Default for HomeListCache {
+    fn default() -> Self {
+        Self {
+            list_state: ListState::new(0, ListAlignment::Top, px(ITEMS_LIST_OVERDRAW_PX)),
+            key: None,
+            last_bot_id: None,
+            seen_checked: None,
+            rows: Vec::new(),
+            row_keys: Vec::new(),
+            number_chars: 3,
+            #[cfg(test)]
+            rebuild_count: 0,
+            #[cfg(test)]
+            rendered_item_rows: std::cell::Cell::new(0),
+        }
+    }
+}
 
 /// Orca's item groups, in list order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +588,361 @@ impl View {
             })
     }
 
+    /// Rebuilds the cached virtualized Home row projection only when inputs change (O(1) on hover,
+    /// selection, and scroll).
+    fn sync_home_list_cache(&mut self, bot: &BotConfig, now: u64, cx: &mut Context<Self>) {
+        let filter_on = self.items.needs_you_only;
+        let stale_days = self.settings_extras(&bot.id).items_stale.days();
+        let needs = self.home_needs(bot);
+        let live_working_sessions: Vec<SessionId> = self
+            .bot_sessions
+            .iter()
+            .filter(|s| s.bot_id == bot.id && s.live && s.working)
+            .map(|s| s.session_id)
+            .collect();
+        let seen_mark = self.seen_mark(bot);
+        let first_sig = self.items.items.first().map(|i| (i.uid.clone(), i.version));
+        let last_sig = self.items.items.last().map(|i| (i.uid.clone(), i.version));
+        let next_key = HomeCacheKey {
+            bot_id: bot.id.clone(),
+            items_rev: self.items.items_rev,
+            items_len: self.items.items.len(),
+            first_sig,
+            last_sig,
+            filter_on,
+            folds: self.items.folds.iter().copied().collect(),
+            group_shown: self
+                .items
+                .group_shown
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect(),
+            stale_days,
+            stale_confirm: self.items.stale_confirm.is_some(),
+            needs_keys: needs.iter().map(|n| n.key.clone()).collect(),
+            live_working_sessions,
+            seen_mark,
+            has_suggestions: !self.soul_memory.suggestions.is_empty(),
+            minute_bucket: now / 60_000,
+        };
+        let upcoming_seen = self.items.upcoming.as_ref().map(|u| u.items_seen_event_id);
+        if let Some(host_seen) = upcoming_seen {
+            let check_key = (bot.id.clone(), self.items.items_rev, host_seen);
+            if self.items.home_list.seen_checked.as_ref() != Some(&check_key) {
+                self.items.home_list.seen_checked = Some(check_key);
+                self.note_items_seen(bot, cx);
+            }
+        }
+        if self.items.home_list.key.as_ref() == Some(&next_key) {
+            return;
+        }
+        let reset_scroll = self.items.home_list.last_bot_id.as_ref() != Some(&bot.id);
+        self.items.home_list.last_bot_id = Some(bot.id.clone());
+        self.items.home_list.key = Some(next_key);
+        #[cfg(test)]
+        {
+            self.items.home_list.rebuild_count += 1;
+        }
+
+        // Group indices without cloning `BotItem`s.
+        let mut grouped_indices: [Vec<usize>; 6] = Default::default();
+        let mut max_number = 0u64;
+        for (idx, item) in self.items.items.iter().enumerate() {
+            max_number = max_number.max(item.number);
+            if filter_on && item.status != BotItemStatus::NeedsYou {
+                continue;
+            }
+            let live = self.item_live(item);
+            let group = group_of(item, live, stale_days, now);
+            grouped_indices[group as usize].push(idx);
+        }
+        for (i, indices) in grouped_indices.iter_mut().enumerate() {
+            if i == Group::Snoozed as usize {
+                indices.sort_by_key(|&idx| {
+                    let it = &self.items.items[idx];
+                    (it.snoozed_until_ms.unwrap_or(0), Reverse(it.number))
+                });
+            } else {
+                indices.sort_by_key(|&idx| {
+                    let it = &self.items.items[idx];
+                    (Reverse(activity_at(it, now)), Reverse(it.number))
+                });
+            }
+        }
+
+        self.items.shown_order = Group::ALL
+            .iter()
+            .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
+            .flat_map(|g| {
+                grouped_indices[*g as usize]
+                    .iter()
+                    .map(|&idx| self.items.items[idx].uid.clone())
+            })
+            .collect();
+        if !self.items.selected.is_empty() {
+            let live_uids: std::collections::HashSet<&str> =
+                self.items.items.iter().map(|i| i.uid.as_str()).collect();
+            self.items
+                .selected
+                .retain(|uid| live_uids.contains(uid.as_str()));
+        }
+
+        let seen = self.seen_mark(bot);
+        let mut rows = Vec::new();
+        let mut row_keys = Vec::new();
+        if filter_on {
+            rows.push(HomeRow::FilterChip);
+            row_keys.push(RowAnchor::FilterChip);
+        }
+        let mut first_group = true;
+        for group in Group::ALL {
+            let indices = &grouped_indices[group as usize];
+            if indices.is_empty() && (group != Group::NeedsYou || needs.is_empty()) {
+                continue;
+            }
+            let open = group.folded_by_default() == self.items.folds.contains(group.id());
+            let fresh = if !open && group == Group::Closed {
+                indices
+                    .iter()
+                    .filter(|&&idx| others_last_event(&self.items.items[idx]) > seen)
+                    .count()
+            } else {
+                0
+            };
+            rows.push(HomeRow::GroupHeader {
+                group,
+                first_group,
+                count: indices.len(),
+                fresh,
+                needs_count: if group == Group::NeedsYou {
+                    needs.len()
+                } else {
+                    0
+                },
+                open,
+            });
+            row_keys.push(RowAnchor::GroupHeader(group as u8));
+            first_group = false;
+
+            if group == Group::Stale && self.items.stale_confirm.is_some() {
+                rows.push(HomeRow::StaleConfirm {
+                    stale_days: stale_days.unwrap_or(5),
+                    item_indices: indices.clone(),
+                });
+                row_keys.push(RowAnchor::StaleConfirm);
+            }
+            if !open {
+                continue;
+            }
+            if group == Group::NeedsYou {
+                for need in &needs {
+                    row_keys.push(RowAnchor::Need(need.key.clone()));
+                    rows.push(HomeRow::Need(need.clone()));
+                }
+            }
+            let shown = self
+                .items
+                .group_shown
+                .get(group.id())
+                .copied()
+                .unwrap_or(GROUP_ROWS);
+            for &idx in indices.iter().take(shown) {
+                row_keys.push(RowAnchor::Item(self.items.items[idx].uid.clone()));
+                rows.push(HomeRow::Item {
+                    group,
+                    item_index: idx,
+                });
+            }
+            let more = indices.len().saturating_sub(shown);
+            if more > 0 {
+                rows.push(HomeRow::ShowMore { group, shown, more });
+                row_keys.push(RowAnchor::ShowMore(group as u8));
+            }
+        }
+        let note = if self.items.items.is_empty() {
+            Some(HomeNoteKind::Empty)
+        } else if filter_on {
+            grouped_indices
+                .iter()
+                .all(Vec::is_empty)
+                .then_some(HomeNoteKind::FilteredEmpty)
+        } else {
+            (grouped_indices[Group::NeedsYou as usize].is_empty()
+                && grouped_indices[Group::Working as usize].is_empty())
+            .then_some(HomeNoteKind::AllClear)
+        };
+        if let Some(kind) = note {
+            rows.push(HomeRow::HomeNote(kind));
+            row_keys.push(RowAnchor::HomeNote);
+        }
+        rows.push(HomeRow::Automations);
+        row_keys.push(RowAnchor::Automations);
+        if !self.soul_memory.suggestions.is_empty() {
+            rows.push(HomeRow::Suggestions);
+            row_keys.push(RowAnchor::Suggestions);
+        }
+
+        let old_keys = std::mem::replace(&mut self.items.home_list.row_keys, row_keys);
+        reconcile_list_state(
+            &mut self.items.home_list.list_state,
+            &old_keys,
+            &self.items.home_list.row_keys,
+            reset_scroll,
+        );
+        self.items.home_list.rows = rows;
+        self.items.home_list.number_chars = number_column_chars(max_number);
+    }
+
+    fn render_home_virtual_row(
+        &mut self,
+        bot: &BotConfig,
+        row: &HomeRow,
+        number_chars: usize,
+        now: u64,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match row {
+            HomeRow::FilterChip => div()
+                .pb(px(14.))
+                .child(Self::render_filter_chip(p, cx))
+                .into_any_element(),
+            HomeRow::GroupHeader {
+                group,
+                first_group,
+                count,
+                fresh,
+                needs_count,
+                open,
+            } => {
+                let group = *group;
+                let open = *open;
+                let summary = (!open).then(|| {
+                    if *fresh > 0 {
+                        format!(
+                            "{} · {}",
+                            count,
+                            hm::NEW_COUNT.format(&[("n", &fresh.to_string())])
+                        )
+                    } else if group == Group::NeedsYou {
+                        (count + needs_count).to_string()
+                    } else {
+                        count.to_string()
+                    }
+                });
+                let header = section_header(
+                    &format!("bot-home-group-{}", group.id()),
+                    group.title(),
+                    open,
+                    summary,
+                    p,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.items.folds.remove(group.id()) {
+                        this.items.folds.insert(group.id());
+                    }
+                    cx.notify();
+                }));
+                div()
+                    .when(!first_group, gpui::Styled::pt_2)
+                    .pb_0p5()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(header))
+                    .when(group == Group::Stale, |d| {
+                        d.child(
+                            ui::ghost("bot-home-stale-cancel", hm::CANCEL_ALL.get())
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.items.stale_confirm = Some(());
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            }
+            HomeRow::StaleConfirm {
+                stale_days,
+                item_indices,
+            } => {
+                let stale: Vec<&BotItem> = item_indices
+                    .iter()
+                    .filter_map(|&idx| self.items.items.get(idx))
+                    .collect();
+                div()
+                    .pb_0p5()
+                    .child(Self::render_stale_confirm(
+                        &bot.id,
+                        &stale,
+                        *stale_days,
+                        p,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+            HomeRow::Need(need) => div()
+                .pb_0p5()
+                .child(self.render_need_row(bot, need, p, cx))
+                .into_any_element(),
+            HomeRow::Item { group, item_index } => {
+                let Some(item) = self.items.items.get(*item_index) else {
+                    return div().into_any_element();
+                };
+                #[cfg(test)]
+                {
+                    let n = self.items.home_list.rendered_item_rows.get();
+                    self.items.home_list.rendered_item_rows.set(n + 1);
+                }
+                div()
+                    .pb_0p5()
+                    .child(self.render_home_row(bot, item, *group, number_chars, now, p, cx))
+                    .into_any_element()
+            }
+            HomeRow::ShowMore { group, shown, more } => {
+                let (group, shown, more) = (*group, *shown, *more);
+                let sel = format!("bot-home-show-more-{}", group.id());
+                let debug = sel.clone();
+                div()
+                    .pb_0p5()
+                    .child(
+                        div()
+                            .id(SharedString::from(sel))
+                            .debug_selector(move || debug.clone())
+                            .role(gpui::Role::Button)
+                            .tab_index(0)
+                            .self_start()
+                            .py_0p5()
+                            .pl_8()
+                            .pr_2()
+                            .cursor_pointer()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.text_color(p.foreground))
+                            .child(text::HM_SHOW_MORE.format(&[("n", &more.to_string())]))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.items
+                                    .group_shown
+                                    .insert(group.id(), shown + GROUP_ROWS.max(more));
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            }
+            HomeRow::HomeNote(kind) => div()
+                .pt(px(14.))
+                .child(Self::render_home_note_kind(bot, *kind, p, cx))
+                .into_any_element(),
+            HomeRow::Automations => div()
+                .pt(px(14.))
+                .child(self.render_automations(bot, p, cx))
+                .into_any_element(),
+            HomeRow::Suggestions => div()
+                .pt(px(14.))
+                .children(self.render_suggestions(bot, p, cx))
+                .into_any_element(),
+        }
+    }
+
     pub(super) fn render_home_tab(
         &mut self,
         bot: &BotConfig,
@@ -429,69 +964,52 @@ impl View {
                 .into_any_element();
         }
         let now = now_unix_ms();
-        let filter_on = self.items.needs_you_only;
-        let all = self.items.items.clone();
-        let shown = all
-            .iter()
-            .filter(|i| !filter_on || i.status == BotItemStatus::NeedsYou);
-        let stale_days = self.settings_extras(&bot.id).items_stale.days();
-        let groups = grouped(shown, |i| self.item_live(i), stale_days, now);
-        self.items.shown_order = Group::ALL
-            .iter()
-            .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
-            .flat_map(|g| groups[*g as usize].iter().map(|i| i.uid.clone()))
-            .collect();
-        self.items
-            .selected
-            .retain(|uid| all.iter().any(|i| &i.uid == uid));
-        self.note_items_seen(bot, &all, cx);
-        // Every row's number column fits the widest number, so titles start in one column.
-        let number_chars = all
-            .iter()
-            .map(|i| format!("#{}", i.number).len())
-            .max()
-            .unwrap_or(3);
+        self.sync_home_list_cache(bot, now, cx);
+        #[cfg(test)]
+        {
+            self.items.home_list.rendered_item_rows.set(0);
+        }
 
-        let mut body = div()
+        let list_state = self.items.home_list.list_state.clone();
+        let number_chars = self.items.home_list.number_chars;
+        let bot_owned = bot.clone();
+        let list = gpui::list(
+            list_state,
+            cx.processor(move |this, ix: usize, _, cx| {
+                let p = ui::palette(cx);
+                let Some(row) = this.items.home_list.rows.get(ix).cloned() else {
+                    return div().into_any_element();
+                };
+                this.render_home_virtual_row(&bot_owned, &row, number_chars, now, p, cx)
+            }),
+        )
+        .size_full()
+        .pl(px(14.))
+        .pr_2()
+        .pt(px(14.))
+        .pb_3();
+
+        let body = div()
             .id("bots-tab-items-body")
             .debug_selector(|| "bots-tab-items-body".into())
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .pl(px(14.))
-            .pr_2()
-            .pt(px(14.))
-            .pb_3()
+            .size_full()
             .flex()
             .flex_col()
-            .gap(px(14.));
-        if filter_on {
-            body = body.child(Self::render_filter_chip(p, cx));
-        }
-        let mut list = div()
-            .id("bot-home-items")
-            .debug_selector(|| "bot-home-items".into())
-            .role(gpui::Role::List)
-            .flex()
-            .flex_col()
-            .gap_2();
-        let needs = self.home_needs(bot);
-        for group in Group::ALL {
-            let rows = &groups[group as usize];
-            if rows.is_empty() && (group != Group::NeedsYou || needs.is_empty()) {
-                continue;
-            }
-            list = list.child(self.render_home_group(bot, group, rows, number_chars, now, p, cx));
-        }
-        body = body
-            .child(list)
-            .children(Self::render_home_note(bot, &all, &groups, filter_on, p, cx));
+            .child(
+                div()
+                    .id("bot-home-items")
+                    .debug_selector(|| "bot-home-items".into())
+                    .role(gpui::Role::List)
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .child(list),
+            );
         let pill = self.render_selection_pill(&bot.id, p, cx);
         let snooze = self.render_snooze_pick(p, window, cx);
         let cancel = self.render_cancel_ask(p, window, cx);
-        let body = body
-            .child(self.render_automations(bot, p, cx))
-            .children(self.render_suggestions(bot, p, cx));
         div()
             .id("bots-tab-items")
             .relative()
@@ -514,7 +1032,7 @@ impl View {
     }
 
     /// Keeps the item seen mark Home opened with, and moves the bot's mark past what it shows.
-    fn note_items_seen(&mut self, bot: &BotConfig, all: &[BotItem], cx: &mut Context<Self>) {
+    fn note_items_seen(&mut self, bot: &BotConfig, cx: &mut Context<Self>) {
         let Some(host_seen) = self.items.upcoming.as_ref().map(|u| u.items_seen_event_id) else {
             return;
         };
@@ -523,7 +1041,13 @@ impl View {
             .seen_at_open
             .entry(bot.id.clone())
             .or_insert(host_seen);
-        let newest = all.iter().map(others_last_event).max().unwrap_or(0);
+        let newest = self
+            .items
+            .items
+            .iter()
+            .map(others_last_event)
+            .max()
+            .unwrap_or(0);
         if newest > host_seen.max(seen) {
             if let Some(up) = self.items.upcoming.as_mut() {
                 up.items_seen_event_id = newest;
@@ -572,76 +1096,59 @@ impl View {
     }
 
     /// Orca's item notes: a new bot's empty state, nothing matching, or all clear.
-    fn render_home_note(
+    fn render_home_note_kind(
         bot: &BotConfig,
-        all: &[BotItem],
-        groups: &[Vec<&BotItem>; 6],
-        filter_on: bool,
+        kind: HomeNoteKind,
         p: &ui::Palette,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if all.is_empty() {
-            return Some(
-                div()
-                    .id("bot-home-empty")
-                    .debug_selector(|| "bot-home-empty".into())
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .px_6()
-                    .py_12()
-                    .text_center()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .child(
-                        Icon::new(IconName::ListChecks)
-                            .size(px(20.))
-                            .text_color(p.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_MD)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.foreground)
-                            .child(text::HM_EMPTY_TITLE.get()),
-                    )
-                    .child(text::HM_EMPTY_BODY.format(&[("bot", &bot.name)]))
-                    .into_any_element(),
-            );
-        }
-        if filter_on {
-            if groups.iter().any(|g| !g.is_empty()) {
-                return None;
-            }
-            return Some(
-                div()
-                    .id("bot-home-filtered-empty")
-                    .debug_selector(|| "bot-home-filtered-empty".into())
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .px_6()
-                    .py_10()
-                    .text_center()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .child(text::HM_NOTHING_NEEDS_YOU.get())
-                    .child(
-                        ui::secondary("bot-home-clear-filters", text::HM_CLEAR_FILTERS.get())
-                            .xsmall()
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.set_needs_you_only(false, cx)),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        let quiet = groups[Group::NeedsYou as usize].is_empty()
-            && groups[Group::Working as usize].is_empty();
-        quiet.then(|| {
-            div()
+    ) -> AnyElement {
+        match kind {
+            HomeNoteKind::Empty => div()
+                .id("bot-home-empty")
+                .debug_selector(|| "bot-home-empty".into())
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .px_6()
+                .py_12()
+                .text_center()
+                .text_size(ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(
+                    Icon::new(IconName::ListChecks)
+                        .size(px(20.))
+                        .text_color(p.muted_foreground),
+                )
+                .child(
+                    div()
+                        .text_size(ui::TEXT_MD)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.foreground)
+                        .child(text::HM_EMPTY_TITLE.get()),
+                )
+                .child(text::HM_EMPTY_BODY.format(&[("bot", &bot.name)]))
+                .into_any_element(),
+            HomeNoteKind::FilteredEmpty => div()
+                .id("bot-home-filtered-empty")
+                .debug_selector(|| "bot-home-filtered-empty".into())
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .px_6()
+                .py_10()
+                .text_center()
+                .text_size(ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(text::HM_NOTHING_NEEDS_YOU.get())
+                .child(
+                    ui::secondary("bot-home-clear-filters", text::HM_CLEAR_FILTERS.get())
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| this.set_needs_you_only(false, cx))),
+                )
+                .into_any_element(),
+            HomeNoteKind::AllClear => div()
                 .debug_selector(|| "bot-home-all-clear".into())
                 .px_6()
                 .py_6()
@@ -649,130 +1156,8 @@ impl View {
                 .text_size(ui::TEXT_SM)
                 .text_color(p.muted_foreground)
                 .child(text::HM_ALL_CLEAR.get())
-                .into_any_element()
-        })
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a render helper over the list's shared state"
-    )]
-    fn render_home_group(
-        &self,
-        bot: &BotConfig,
-        group: Group,
-        rows: &[&BotItem],
-        number_chars: usize,
-        now: u64,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let open = group.folded_by_default() == self.items.folds.contains(group.id());
-        let seen = self.seen_mark(bot);
-        let fresh = if group == Group::Closed {
-            rows.iter().filter(|i| others_last_event(i) > seen).count()
-        } else {
-            0
-        };
-        let summary = (!open).then(|| {
-            if fresh > 0 {
-                format!(
-                    "{} · {}",
-                    rows.len(),
-                    hm::NEW_COUNT.format(&[("n", &fresh.to_string())])
-                )
-            } else if group == Group::NeedsYou {
-                (rows.len() + self.home_needs(bot).len()).to_string()
-            } else {
-                rows.len().to_string()
-            }
-        });
-        let header = section_header(
-            &format!("bot-home-group-{}", group.id()),
-            group.title(),
-            open,
-            summary,
-            p,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if !this.items.folds.remove(group.id()) {
-                this.items.folds.insert(group.id());
-            }
-            cx.notify();
-        }));
-        let header = div()
-            .flex()
-            .items_center()
-            .child(div().flex_1().min_w_0().child(header))
-            .when(group == Group::Stale, |d| {
-                d.child(
-                    ui::ghost("bot-home-stale-cancel", hm::CANCEL_ALL.get())
-                        .xsmall()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.items.stale_confirm = Some(());
-                            cx.notify();
-                        })),
-                )
-            });
-        let needs = if group == Group::NeedsYou {
-            self.home_needs(bot)
-        } else {
-            Vec::new()
-        };
-        let mut section = div().flex().flex_col().gap_0p5().child(header);
-        if group == Group::Stale && self.items.stale_confirm.is_some() {
-            let stale_days = self
-                .settings_extras(&bot.id)
-                .items_stale
-                .days()
-                .unwrap_or(5);
-            section = section.child(Self::render_stale_confirm(&bot.id, rows, stale_days, p, cx));
+                .into_any_element(),
         }
-        if !open {
-            return section;
-        }
-        // Orca's own asks come first; then the items the bot set to Needs you.
-        for need in &needs {
-            section = section.child(self.render_need_row(bot, need, p, cx));
-        }
-        let shown = self
-            .items
-            .group_shown
-            .get(group.id())
-            .copied()
-            .unwrap_or(GROUP_ROWS);
-        for item in rows.iter().take(shown) {
-            section =
-                section.child(self.render_home_row(bot, item, group, number_chars, now, p, cx));
-        }
-        let more = rows.len().saturating_sub(shown);
-        if more > 0 {
-            let sel = format!("bot-home-show-more-{}", group.id());
-            let debug = sel.clone();
-            section = section.child(
-                div()
-                    .id(SharedString::from(sel))
-                    .debug_selector(move || debug.clone())
-                    .role(gpui::Role::Button)
-                    .tab_index(0)
-                    .self_start()
-                    .py_0p5()
-                    .pl_8()
-                    .pr_2()
-                    .cursor_pointer()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .hover(|d| d.text_color(p.foreground))
-                    .child(text::HM_SHOW_MORE.format(&[("n", &more.to_string())]))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.items
-                            .group_shown
-                            .insert(group.id(), shown + GROUP_ROWS.max(more));
-                        cx.notify();
-                    })),
-            );
-        }
-        section
     }
 
     /// Orca's `BotItemRow`: status glyph, `#N`, the title, its age; hovering an open row swaps
@@ -935,7 +1320,7 @@ impl View {
                     .child(age),
             );
         if hovered && !closed {
-            row = row.child(Self::render_row_actions(bot, item, p, cx));
+            row = row.child(Self::render_row_actions(bot, item, now, p, cx));
         }
         row
     }
@@ -944,6 +1329,7 @@ impl View {
     fn render_row_actions(
         bot: &BotConfig,
         item: &BotItem,
+        now: u64,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -955,7 +1341,7 @@ impl View {
                 this.update_item_status(bot_id.clone(), uid.clone(), BotItemStatus::Done, cx);
             })
         };
-        let snoozed = is_snoozed(item, now_unix_ms());
+        let snoozed = is_snoozed(item, now);
         let title = item.title.clone();
         let snooze_menu = {
             let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
@@ -1124,4 +1510,251 @@ pub struct HomeFilter {
     pub needs_you_only: bool,
     /// Items that need you, the menu's count.
     pub needs_you: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::{Modifiers, px};
+    use krill_proto::bots::{
+        BotConfig, BotId, BotItem, BotItemStatus, BotRpcRequest, BotRpcResponse,
+    };
+
+    use super::*;
+
+    fn make_planned_items(bot_id: &BotId, count: usize, now: u64) -> Vec<BotItem> {
+        (1..=count)
+            .map(|n| {
+                let n_u64 = u64::try_from(n).unwrap_or(0);
+                let ts = now.saturating_sub(n_u64 * 1_000);
+                BotItem {
+                    uid: format!("it-{n}"),
+                    number: n_u64,
+                    owner_bot_id: bot_id.clone(),
+                    title: format!("Planned item #{n}"),
+                    description: None,
+                    done_means: None,
+                    status: BotItemStatus::Planned,
+                    close_note: None,
+                    links: Vec::new(),
+                    events: Vec::new(),
+                    snoozed_until_ms: None,
+                    version: 1,
+                    last_activity_at_ms: ts,
+                    created_at_ms: ts,
+                    updated_at_ms: ts,
+                    closed_at_ms: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn number_column_chars_matches_formatted_width() {
+        assert_eq!(number_column_chars(0), 3);
+        assert_eq!(number_column_chars(9), 3);
+        assert_eq!(number_column_chars(99), 3);
+        assert_eq!(number_column_chars(100), 4);
+        assert_eq!(number_column_chars(500), 4);
+        assert_eq!(number_column_chars(12345), 6);
+    }
+
+    #[gpui::test]
+    fn home_panel_virtualizes_500_items_and_skips_regroup_on_hover(cx: &mut gpui::TestAppContext) {
+        let now = now_unix_ms();
+        let bot_id = BotId::new("perf-bot").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Perf Bot", "agy", now).unwrap();
+        let items = Arc::new(Mutex::new(make_planned_items(&bot_id, 500, now)));
+        let bot_rpc = bot.clone();
+        let items_rpc = items.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => {
+                Ok(BotRpcResponse::Items(items_rpc.lock().unwrap().clone()))
+            }
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+                krill_proto::bots::BotUpcoming::default(),
+            )),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(360.), px(480.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Expand Planned group and click "Show 495 more".
+        let header = vcx
+            .debug_bounds("bot-home-group-planned")
+            .expect("planned header");
+        vcx.simulate_click(header.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let more = vcx
+            .debug_bounds("bot-home-show-more-planned")
+            .expect("show more");
+        vcx.simulate_click(more.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        // Only the viewport + overscan rows mount, NOT all 500 items (Orca #45971).
+        let rendered_top =
+            vcx.update(|_, cx| view.read(cx).items.home_list.rendered_item_rows.get());
+        assert!(rendered_top > 0, "visible items must render");
+        assert!(
+            rendered_top <= 50,
+            "expected virtualized window of <= 50 rows for 500 items, rendered {rendered_top}"
+        );
+        assert!(vcx.debug_bounds("bot-home-item-it-1").is_some());
+        assert!(
+            vcx.debug_bounds("bot-home-item-it-450").is_none(),
+            "far off-screen row must stay unmounted"
+        );
+
+        // Hovering a visible row does NOT rebuild/re-group the 500-item cache.
+        let rebuilds_before_hover = vcx.update(|_, cx| view.read(cx).items.home_list.rebuild_count);
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.items.hover_uid = Some("it-1".to_owned());
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        let rebuilds_after_hover = vcx.update(|_, cx| view.read(cx).items.home_list.rebuild_count);
+        assert_eq!(
+            rebuilds_before_hover, rebuilds_after_hover,
+            "hover must hit the cached Home projection without re-grouping 500 items"
+        );
+
+        // Scrolling down to item #300 mounts item #300 and unmounts item #1.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.items.home_list.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 300,
+                    offset_in_item: px(0.),
+                });
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        let rendered_mid =
+            vcx.update(|_, cx| view.read(cx).items.home_list.rendered_item_rows.get());
+        assert!(
+            rendered_mid > 0 && rendered_mid <= 50,
+            "rendered_mid={rendered_mid}"
+        );
+        assert!(vcx.debug_bounds("bot-home-item-it-300").is_some());
+        assert!(vcx.debug_bounds("bot-home-item-it-1").is_none());
+
+        // Updating item #300 to newest moves it to top while staying virtualized.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                let mut updated = v
+                    .items
+                    .items
+                    .iter()
+                    .find(|i| i.uid == "it-300")
+                    .unwrap()
+                    .clone();
+                updated.title = "Updated #300".to_owned();
+                updated.version += 1;
+                updated.last_activity_at_ms = now + 5_000;
+                v.upsert_item(updated, &bot_id);
+                v.items.home_list.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.),
+                });
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("bot-home-item-it-300").is_some());
+        let rendered_after =
+            vcx.update(|_, cx| view.read(cx).items.home_list.rendered_item_rows.get());
+        assert!(
+            rendered_after > 0 && rendered_after <= 50,
+            "rendered_after={rendered_after}"
+        );
+    }
+
+    #[gpui::test]
+    fn group_panel_virtualizes_300_items_across_bots(cx: &mut gpui::TestAppContext) {
+        let now = now_unix_ms();
+        let b1 = BotId::new("g-bot-1").unwrap();
+        let b2 = BotId::new("g-bot-2").unwrap();
+        let cfg1 = BotConfig::new(b1.clone(), "Alpha", "agy", now).unwrap();
+        let cfg2 = BotConfig::new(b2.clone(), "Beta", "agy", now).unwrap();
+        let mut all_items = make_planned_items(&b1, 150, now);
+        for mut it in make_planned_items(&b2, 150, now) {
+            it.uid = format!("b2-{}", it.uid);
+            all_items.push(it);
+        }
+        let bots_rpc = vec![cfg1, cfg2];
+        let items_rpc = all_items.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(items_rpc.clone())),
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(360.), px(480.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_group_in_panel("grp-perf", &[b1.clone(), b2.clone()], &[], cx);
+                v.set_group_chat_scope(super::super::group_panel::GroupChatScope::AllTheirWork, cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        let header = vcx
+            .debug_bounds("bot-group-bucket-planned")
+            .expect("group planned header");
+        vcx.simulate_click(header.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let more = vcx
+            .debug_bounds("grp-more-planned")
+            .expect("group show more");
+        vcx.simulate_click(more.center(), Modifiers::default());
+        vcx.run_until_parked();
+
+        let mounted = vcx.update(|_, cx| {
+            view.read(cx)
+                .group_panel
+                .list_cache
+                .rendered_item_rows
+                .get()
+        });
+        assert!(mounted > 0, "visible group items must mount");
+        assert!(
+            mounted <= 50,
+            "expected virtualized group list of <= 50 rows for 300 items, mounted {mounted}"
+        );
+        assert!(vcx.debug_bounds("bot-home-item-it-1").is_some());
+        assert!(vcx.debug_bounds("bot-home-item-b2-it-150").is_none());
+    }
 }
