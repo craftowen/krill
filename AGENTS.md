@@ -59,7 +59,7 @@ packaging/            # macOS 번들·DMG·Ed25519 매니페스트·설치 스�
 ## 반드시 지킬 것
 
 1. **세션은 절대 잃지 않는다.** PTY는 krill-holder만 소유한다. krilld·앱·CLI의 어떤 실패도 PTY를 닫으면 안 된다. 의심되면 생존 테스트(앱 kill -9 / krilld kill -9)를 돌린다.
-2. **메모리 예산**: 앱 ≤ 120MB, 데몬 ≤ 60MB(터미널 10개, phys_footprint). 셀 스크롤백 1만 줄 금지(핫 1,000행 + zstd 콜드).
+2. **메모리 예산**: 데몬 ≤ 60MB, 앱+데몬 합계 ≤ 200MB(터미널 10개, phys_footprint; 앱 120MB 개별 상한은 2026-11-21 해제). 셀 스크롤백 1만 줄 금지(핫 1,000행 + zstd 콜드).
 3. **질의 응답자는 krilld 하나.** UI는 터미널 질의에 응답하지 않는다.
 4. **Zed 터미널 코드는 GPL-3.0 — 읽고 베끼지 않는다**(클린룸). gpui 자체는 Apache-2.0.
 5. **unsafe는 krill-holder·krilld의 FFI 모듈(Unix·Windows FFI 포함)과 krill-app의 platform 모듈(objc2·Win32)에만.** 모든 `unsafe` 블록에 `// SAFETY:` 주석.
