@@ -49,6 +49,7 @@ struct MockState {
     oauth_states: BTreeMap<(BotId, String), BotMcpOAuthState>,
     composio_connections: Vec<ComposioConnectionInfo>,
     default_trackers: DefaultTrackerBots,
+    extras: krill_proto::bots::BotSettingsExtras,
     fail_get_soul: Option<String>,
     fail_get_memory: Option<String>,
     fail_create_item: Option<String>,
@@ -781,6 +782,26 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
             BotRpcRequest::GetDefaultTrackerBots => Ok(BotRpcResponse::DefaultTrackerBots(
                 st.default_trackers.clone(),
             )),
+            BotRpcRequest::GetBotSettingsExtras { .. } => {
+                Ok(BotRpcResponse::BotSettingsExtras(st.extras))
+            }
+            BotRpcRequest::UpdateBotSettingsExtras {
+                items_stale,
+                look_around_every,
+                tidy_every,
+                ..
+            } => {
+                if let Some(v) = items_stale {
+                    st.extras.items_stale = *v;
+                }
+                if let Some(v) = look_around_every {
+                    st.extras.look_around_every = *v;
+                }
+                if let Some(v) = tidy_every {
+                    st.extras.tidy_every = *v;
+                }
+                Ok(BotRpcResponse::BotSettingsExtras(st.extras))
+            }
             BotRpcRequest::ConnectorStatus { bot_id } => {
                 let filtered = st
                     .statuses
@@ -1845,15 +1866,18 @@ fn home_groups_items_as_orca_does() {
     let stale = at("d", 4, BotItemStatus::NeedsYou, 6 * 24 * 60);
     let done = at("e", 5, BotItemStatus::Done, 1);
     let newer_done = at("f", 6, BotItemStatus::Canceled, 0);
-    assert_eq!(group_of(&needs, false, now), Group::NeedsYou);
-    assert_eq!(group_of(&snoozed, false, now), Group::Snoozed);
-    assert_eq!(group_of(&stale, false, now), Group::Stale);
+    assert_eq!(group_of(&needs, false, Some(5), now), Group::NeedsYou);
+    assert_eq!(group_of(&snoozed, false, Some(5), now), Group::Snoozed);
+    assert_eq!(group_of(&stale, false, Some(5), now), Group::Stale);
     // A live worker keeps an old In progress item out of Stale.
     let old_working = at("g", 7, BotItemStatus::Working, 6 * 24 * 60);
-    assert_eq!(group_of(&old_working, false, now), Group::Stale);
-    assert_eq!(group_of(&old_working, true, now), Group::Working);
+    assert_eq!(group_of(&old_working, false, Some(5), now), Group::Stale);
+    assert_eq!(group_of(&old_working, true, Some(5), now), Group::Working);
+    // Settings › Items: a longer wait keeps it out of Stale, and Never keeps everything out.
+    assert_eq!(group_of(&stale, false, Some(7), now), Group::NeedsYou);
+    assert_eq!(group_of(&stale, false, None, now), Group::NeedsYou);
     let items = [needs, working, snoozed, stale, done, newer_done];
-    let groups = grouped(&items, |_| false, now);
+    let groups = grouped(&items, |_| false, Some(5), now);
     let uids =
         |g: Group| -> Vec<&str> { groups[g as usize].iter().map(|i| i.uid.as_str()).collect() };
     assert_eq!(uids(Group::NeedsYou), ["a"]);
@@ -2423,4 +2447,147 @@ fn home_item_steps_shows_its_chat_and_steps_several_questions(cx: &mut TestAppCo
     // Answered, it moved to In progress below #2: ↑ steps back to it.
     click(vcx, "bot-item-prev");
     vcx.update(|_, cx| assert_eq!(view.read(cx).items.open_uid.as_deref(), Some("b")));
+}
+
+use crate::i18n::catalog::bots as text;
+
+/// Orca's settings view: each root row opens its own page, the crumb names it, Back returns to
+/// the list; Settings › Items reaches Home's Stale group.
+#[gpui::test]
+fn settings_rows_open_their_own_pages(cx: &mut TestAppContext) {
+    let now = super::now_unix_ms();
+    let mut mock = MockState::default();
+    mock.bots.push(sample_bot("bot-1", "Helper"));
+    let mut old = sample_item("bot-1", "old", 1, BotItemStatus::NeedsYou);
+    old.last_activity_at_ms = now - 6 * 24 * 3_600_000;
+    mock.items.push(old);
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.simulate_resize(gpui::size(px(340.), px(1400.)));
+    vcx.run_until_parked();
+    let bot = BotId::new("bot-1").unwrap();
+    let show = |vcx: &mut VisualTestContext, tab: DetailTab| {
+        vcx.update(|_, cx| view.update(cx, |v, cx| _ = v.show_in_panel(&bot, tab, cx)));
+        vcx.run_until_parked();
+    };
+    let click = |vcx: &mut VisualTestContext, sel: &'static str| {
+        let at = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        vcx.simulate_click(at.center(), Modifiers::default());
+        vcx.run_until_parked();
+    };
+    // Five days by default: the six-day-old item is Stale.
+    show(vcx, DetailTab::Items);
+    assert!(vcx.debug_bounds("bot-home-group-stale").is_some());
+
+    show(vcx, DetailTab::Settings);
+    assert!(vcx.debug_bounds("bot-settings-root").is_some());
+    for (row, page, title) in [
+        (
+            "bot-settings-agent",
+            "bot-settings-agent-page",
+            text::SV_AGENT_MODEL.get(),
+        ),
+        (
+            "bot-settings-permissions",
+            "bot-settings-permissions-page",
+            text::SV_PERMISSIONS.get(),
+        ),
+        (
+            "bot-settings-computer",
+            "bot-settings-computer-page",
+            text::SV_COMPUTER.get(),
+        ),
+        (
+            "bot-settings-look-around-open",
+            "bot-settings-look-around-page",
+            text::SV_LOOK_AROUND.get(),
+        ),
+        (
+            "bot-settings-memory-upkeep-open",
+            "bot-settings-tidy-up-page",
+            text::SV_MEMORY_UPKEEP.get(),
+        ),
+        (
+            "bot-settings-schedules",
+            "bot-settings-schedules-page",
+            text::SV_SCHEDULES.get(),
+        ),
+        (
+            "bot-settings-soul",
+            "bot-settings-soul-page",
+            text::SV_SOUL.get(),
+        ),
+        (
+            "bot-settings-memory",
+            "bot-settings-memory-page",
+            text::SV_MEMORY.get(),
+        ),
+        (
+            "bot-settings-who-can-ask",
+            "bot-settings-who-can-ask-page",
+            text::SV_WHO_CAN_ASK.get(),
+        ),
+        (
+            "bot-settings-tools",
+            "bot-settings-tools-page",
+            text::SV_TOOLS.get(),
+        ),
+        (
+            "bot-settings-skills",
+            "bot-settings-skills-page",
+            text::SV_SKILLS.get(),
+        ),
+        (
+            "bot-settings-sharing",
+            "bot-settings-sharing-page",
+            text::SV_SHARING.get(),
+        ),
+    ] {
+        click(vcx, row);
+        assert!(vcx.debug_bounds(page).is_some(), "{row} opens {page}");
+        assert!(vcx.debug_bounds("bot-settings-root").is_none());
+        vcx.update(|_, cx| assert_eq!(view.read(cx).settings_subpage(), Some(title)));
+        vcx.update(|_, cx| view.update(cx, View::close_settings_subpage));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("bot-settings-root").is_some(),
+            "back from {page}"
+        );
+    }
+
+    // Memory: What it knows, then History.
+    click(vcx, "bot-settings-memory");
+    click(vcx, "bot-memory-tab-history");
+    vcx.update(|_, cx| assert!(view.read(cx).settings.memory_history_tab));
+    vcx.update(|_, cx| view.update(cx, View::close_settings_subpage));
+    vcx.run_until_parked();
+
+    // Settings › Items › Never: nothing goes Stale on Home.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.update_settings_extras(
+                bot.clone(),
+                super::settings_root::Extras {
+                    items_stale: Some(krill_proto::bots::BotItemsStale::Never),
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    assert!(state.lock().unwrap().requests.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::UpdateBotSettingsExtras {
+            items_stale: Some(krill_proto::bots::BotItemsStale::Never),
+            ..
+        }
+    )));
+    show(vcx, DetailTab::Items);
+    assert!(vcx.debug_bounds("bot-home-group-stale").is_none());
 }

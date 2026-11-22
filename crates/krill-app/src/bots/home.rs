@@ -21,8 +21,6 @@ use crate::ui;
 
 /// Rows a group shows before "Show N more" (Orca `BOT_ITEM_GROUP_ROWS`).
 const GROUP_ROWS: usize = 5;
-/// Orca's default stale setting. Krill has no per-bot setting yet, so every bot uses it.
-const STALE_DAYS: u64 = 5;
 const DAY_MS: u64 = 86_400_000;
 
 /// Orca's item groups, in list order.
@@ -111,26 +109,30 @@ pub(super) fn others_last_event(item: &BotItem) -> u64 {
         .unwrap_or(0)
 }
 
-/// Orca's derived Stale: Needs you, or In progress with no live worker, untouched for the stale
-/// days; Planned for three times that. A snoozed item is never stale.
-fn is_stale(item: &BotItem, live: bool, now: u64) -> bool {
+/// Orca's derived Stale: Needs you, or In progress with no live worker, untouched for the bot's
+/// stale days (Settings › Items, `None` for Never); Planned for three times that. A snoozed item
+/// is never stale.
+fn is_stale(item: &BotItem, live: bool, stale_days: Option<u64>, now: u64) -> bool {
+    let Some(days) = stale_days else {
+        return false;
+    };
     if is_snoozed(item, now) {
         return false;
     }
     let idle = now.saturating_sub(activity_at(item, now));
     match item.status {
-        BotItemStatus::NeedsYou => idle >= STALE_DAYS * DAY_MS,
-        BotItemStatus::Working => !live && idle >= STALE_DAYS * DAY_MS,
-        BotItemStatus::Planned => idle >= 3 * STALE_DAYS * DAY_MS,
+        BotItemStatus::NeedsYou => idle >= days * DAY_MS,
+        BotItemStatus::Working => !live && idle >= days * DAY_MS,
+        BotItemStatus::Planned => idle >= 3 * days * DAY_MS,
         BotItemStatus::Done | BotItemStatus::Canceled => false,
     }
 }
 
-pub(super) fn group_of(item: &BotItem, live: bool, now: u64) -> Group {
+pub(super) fn group_of(item: &BotItem, live: bool, stale_days: Option<u64>, now: u64) -> Group {
     match item.status {
         BotItemStatus::Done | BotItemStatus::Canceled => Group::Closed,
         _ if is_snoozed(item, now) => Group::Snoozed,
-        _ if is_stale(item, live, now) => Group::Stale,
+        _ if is_stale(item, live, stale_days, now) => Group::Stale,
         BotItemStatus::NeedsYou => Group::NeedsYou,
         BotItemStatus::Working => Group::Working,
         BotItemStatus::Planned => Group::Planned,
@@ -142,11 +144,12 @@ pub(super) fn group_of(item: &BotItem, live: bool, now: u64) -> Group {
 pub(super) fn grouped<'a>(
     items: impl IntoIterator<Item = &'a BotItem>,
     live: impl Fn(&BotItem) -> bool,
+    stale_days: Option<u64>,
     now: u64,
 ) -> [Vec<&'a BotItem>; 6] {
     let mut groups: [Vec<&BotItem>; 6] = Default::default();
     for item in items {
-        groups[group_of(item, live(item), now) as usize].push(item);
+        groups[group_of(item, live(item), stale_days, now) as usize].push(item);
     }
     for (i, rows) in groups.iter_mut().enumerate() {
         if i == Group::Snoozed as usize {
@@ -412,6 +415,8 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Stale waits the bot's Settings › Items days.
+        self.ensure_settings_extras(&bot.id, cx);
         if let Some(item) = self
             .items
             .open_uid
@@ -429,7 +434,8 @@ impl View {
         let shown = all
             .iter()
             .filter(|i| !filter_on || i.status == BotItemStatus::NeedsYou);
-        let groups = grouped(shown, |i| self.item_live(i), now);
+        let stale_days = self.settings_extras(&bot.id).items_stale.days();
+        let groups = grouped(shown, |i| self.item_live(i), stale_days, now);
         self.items.shown_order = Group::ALL
             .iter()
             .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
@@ -715,7 +721,12 @@ impl View {
         };
         let mut section = div().flex().flex_col().gap_0p5().child(header);
         if group == Group::Stale && self.items.stale_confirm.is_some() {
-            section = section.child(Self::render_stale_confirm(&bot.id, rows, STALE_DAYS, p, cx));
+            let stale_days = self
+                .settings_extras(&bot.id)
+                .items_stale
+                .days()
+                .unwrap_or(5);
+            section = section.child(Self::render_stale_confirm(&bot.id, rows, stale_days, p, cx));
         }
         if !open {
             return section;

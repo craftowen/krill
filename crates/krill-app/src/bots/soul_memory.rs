@@ -160,7 +160,7 @@ impl SoulMemoryState {
 }
 
 impl View {
-    fn ensure_soul_memory_inputs(
+    pub(super) fn ensure_soul_memory_inputs(
         &mut self,
         bot: &BotConfig,
         window: &mut Window,

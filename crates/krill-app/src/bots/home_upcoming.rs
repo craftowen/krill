@@ -644,7 +644,7 @@ impl View {
                     .child(div().min_w_0().truncate().child(label))
                     .child(Icon::new(IconName::ChevronRight).size(px(14.)))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings.page = SettingsPage::Agent;
+                        this.settings.page = SettingsPage::Schedules;
                         cx.emit(OpenSettingsPage(DetailTab::Settings));
                     })),
             );
@@ -729,8 +729,9 @@ impl View {
         let sel = format!("bot-home-automation-{}", row.key.replace(':', "-"));
         let debug = sel.clone();
         let open_page = match row.kind {
-            AutoKind::Schedule => SettingsPage::Agent,
-            AutoKind::Tidy | AutoKind::Look => SettingsPage::Root,
+            AutoKind::Schedule => SettingsPage::Schedules,
+            AutoKind::Tidy => SettingsPage::TidyUp,
+            AutoKind::Look => SettingsPage::LookAround,
         };
         let open_bot = bot.clone();
         let title_label: SharedString = match &state {
@@ -823,7 +824,7 @@ impl View {
                 groups.push(vec![(
                     hm::TIDY_SETTINGS.get(),
                     IconName::Settings,
-                    RowAction::Settings(SettingsPage::Root),
+                    RowAction::Settings(SettingsPage::TidyUp),
                     false,
                 )]);
             }
@@ -842,7 +843,7 @@ impl View {
                 groups.push(vec![(
                     hm::LOOK_SETTINGS.get(),
                     IconName::Settings,
-                    RowAction::Settings(SettingsPage::Root),
+                    RowAction::Settings(SettingsPage::LookAround),
                     false,
                 )]);
             }
@@ -859,7 +860,7 @@ impl View {
                 groups.push(vec![(
                     hm::OPEN_IN_SETTINGS.get(),
                     IconName::ArrowUpRight,
-                    RowAction::Settings(SettingsPage::Agent),
+                    RowAction::Settings(SettingsPage::Schedules),
                     false,
                 )]);
             }

@@ -361,15 +361,24 @@ impl BotsManager {
                 if bot.paused {
                     continue;
                 }
+                let bot_tz = bot
+                    .schedules
+                    .iter()
+                    .find_map(|s| s.timezone.clone())
+                    .or_else(look_around::local_tz);
+                let bot_tz = bot_tz.as_deref();
+                let extras = self.store.settings_extras(&bot.id).unwrap_or_default();
                 if bot.memory_tidy.enabled
                     && self.scheduler_state.tidy_is_due(
                         &bot.id,
-                        bot.memory_tidy.interval_secs,
+                        extras.tidy_every,
+                        bot_tz,
                         ts_ms,
                     )
                     && self.memory_tidy_tracker.is_due(
                         &bot.id,
-                        bot.memory_tidy.interval_secs,
+                        extras.tidy_every,
+                        bot_tz,
                         ts_ms,
                     )
                 {
@@ -382,19 +391,19 @@ impl BotsManager {
                     .ok();
                     self.memory_tidy_tracker.record(&bot.id, ts_ms);
                 }
-                let bot_tz = bot.schedules.iter().find_map(|s| s.timezone.as_deref());
                 if bot.look_around.enabled
                     && self.scheduler_state.look_around_is_due(
                         &bot.id,
-                        bot.look_around.interval_secs,
+                        extras.look_around_every,
                         bot.look_around.weekdays_only,
                         bot_tz,
                         ts_ms,
                     )
                     && self.look_around_tracker.is_due(
                         &bot.id,
-                        bot.look_around.interval_secs,
+                        extras.look_around_every,
                         bot.look_around.weekdays_only,
+                        bot_tz,
                         ts_ms,
                     )
                     && look_around::run_look_around_tracked(
@@ -1526,6 +1535,32 @@ impl BotsManager {
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
+            BotRpcRequest::GetBotSettingsExtras { bot_id } => {
+                match self.store.settings_extras(&bot_id) {
+                    Ok(extras) => BotRpcResponse::BotSettingsExtras(extras),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
+            BotRpcRequest::UpdateBotSettingsExtras {
+                bot_id,
+                items_stale,
+                look_around_every,
+                tidy_every,
+            } => match self.store.update_settings_extras(
+                &bot_id,
+                items_stale,
+                look_around_every,
+                tidy_every,
+            ) {
+                Ok(extras) => BotRpcResponse::BotSettingsExtras(extras),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::RemoveBotMember { bot_id, member } => {
+                match self.store.remove_member(&bot_id, &member, now_ms()) {
+                    Ok(bot) => BotRpcResponse::Bot(Box::new(bot)),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::TestConnector { bot_id, source } => {
                 let bot = match self.store.get_bot(&bot_id) {
                     Ok(Some(b)) => b,
@@ -1904,6 +1939,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::GetDefaultTrackerBots
         | BotRpcRequest::ListAgentModels { .. }
         | BotRpcRequest::GetBotUpcoming { .. }
+        | BotRpcRequest::GetBotSettingsExtras { .. }
         | BotRpcRequest::SendBotMail { .. } => Ok(()),
         BotRpcRequest::SendGroupMessage { sender, .. } => {
             let trimmed = sender.trim();
@@ -2020,7 +2056,9 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::CancelMcpOAuth { .. }
         | BotRpcRequest::ListComposioConnections { .. }
         | BotRpcRequest::StartComposioConnect { .. }
-        | BotRpcRequest::DisconnectComposioAccount { .. } => deny("owner-only bot RPC"),
+        | BotRpcRequest::DisconnectComposioAccount { .. }
+        | BotRpcRequest::UpdateBotSettingsExtras { .. }
+        | BotRpcRequest::RemoveBotMember { .. } => deny("owner-only bot RPC"),
     }
 }
 

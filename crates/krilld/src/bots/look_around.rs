@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use krill_proto::bots::{
     BotAccessRequestStatus, BotConfig, BotId, BotItemLink, BotItemStatus, BotScheduleUpcoming,
     BotSuggestion, BotUpcoming, DEFAULT_LOOK_AROUND_MAX_SUGGESTIONS, ExternalSource,
-    soul_description,
+    LookAroundEvery, TidyEvery, soul_description,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::write_atomic_0600;
@@ -95,7 +95,7 @@ impl SchedulerStateStore {
     pub fn look_around_is_due(
         &self,
         bot_id: &BotId,
-        interval_secs: u64,
+        every: LookAroundEvery,
         weekdays_only: bool,
         tz: Option<&str>,
         now_ms: u64,
@@ -104,11 +104,13 @@ impl SchedulerStateStore {
         if weekdays_only && is_weekend_in_tz(secs, tz) {
             return false;
         }
-        let interval_ms = interval_secs.max(60).saturating_mul(1_000);
+        let Some(slot) = latest_slot_ms(now_ms, tz, every.hours()) else {
+            return false;
+        };
         self.with_state_read(|st| {
             st.look_around_last_run_ms
                 .get(bot_id)
-                .is_none_or(|&last| now_ms.saturating_sub(last) >= interval_ms)
+                .is_none_or(|&last| last < slot)
         })
         .unwrap_or(false)
     }
@@ -182,8 +184,16 @@ impl SchedulerStateStore {
     }
 
     #[must_use]
-    pub fn tidy_is_due(&self, bot_id: &BotId, interval_secs: u64, now_ms: u64) -> bool {
-        let interval_ms = interval_secs.max(60).saturating_mul(1_000);
+    pub fn tidy_is_due(
+        &self,
+        bot_id: &BotId,
+        every: TidyEvery,
+        tz: Option<&str>,
+        now_ms: u64,
+    ) -> bool {
+        let Some(after) = tidy_due_after_ms(every, tz, now_ms) else {
+            return false;
+        };
         self.with_state_read(|st| {
             let Some(rec) = st.memory_tidy.get(bot_id) else {
                 return true;
@@ -191,8 +201,7 @@ impl SchedulerStateStore {
             if rec.auto_disabled {
                 return false;
             }
-            rec.last_run_ms
-                .is_none_or(|last| now_ms.saturating_sub(last) >= interval_ms)
+            rec.last_run_ms.is_none_or(|last| last < after)
         })
         .unwrap_or(false)
     }
@@ -388,18 +397,19 @@ impl LookAroundTracker {
     pub fn is_due(
         &self,
         bot_id: &BotId,
-        interval_secs: u64,
+        every: LookAroundEvery,
         weekdays_only: bool,
+        tz: Option<&str>,
         now_ms: u64,
     ) -> bool {
-        if weekdays_only && is_weekend_utc(now_ms / 1_000) {
+        if weekdays_only && is_weekend_in_tz(now_ms / 1_000, tz) {
             return false;
         }
-        let interval_ms = interval_secs.max(60).saturating_mul(1_000);
+        let Some(slot) = latest_slot_ms(now_ms, tz, every.hours()) else {
+            return false;
+        };
         let guard = lock(&self.last_run_ms);
-        guard
-            .get(bot_id)
-            .is_none_or(|&last| now_ms.saturating_sub(last) >= interval_ms)
+        guard.get(bot_id).is_none_or(|&last| last < slot)
     }
 
     pub fn record(&self, bot_id: &BotId, now_ms: u64) {
@@ -836,6 +846,39 @@ fn tz_offset_minutes(unix_secs: u64, tz: Option<&str>) -> i64 {
         d => d,
     };
     days * 1_440 + (i64::from(lh) - i64::from(uh)) * 60 + i64::from(lm) - i64::from(um)
+}
+
+/// Start (unix ms) of today's latest `hours` slot (local 0-23) at or before `now_ms`; `None` before
+/// the first one, as Orca's Look around runs nothing at night.
+#[must_use]
+pub fn latest_slot_ms(now_ms: u64, tz: Option<&str>, hours: &[u32]) -> Option<u64> {
+    let secs = now_ms / 1_000;
+    let [minute, hour, ..] = cron_calendar_for_tz(secs, tz).ok()?;
+    let slot = hours.iter().copied().filter(|&h| h <= hour).max()?;
+    let into = u64::from(hour - slot) * 3_600 + u64::from(minute) * 60 + secs % 60;
+    Some(secs.saturating_sub(into).saturating_mul(1_000))
+}
+
+/// The last tidy-up must be older than this for the next to run: the latest 3 AM for each night,
+/// six days before it for once a week. A computer asleep at 3 AM tidies once it is awake.
+#[must_use]
+pub fn tidy_due_after_ms(every: TidyEvery, tz: Option<&str>, now_ms: u64) -> Option<u64> {
+    // Before 3 AM the latest 3 AM was yesterday's: look from four hours earlier.
+    let night = latest_slot_ms(now_ms, tz, &[3])
+        .or_else(|| latest_slot_ms(now_ms.saturating_sub(4 * 3_600_000), tz, &[3]))?;
+    Some(match every {
+        TidyEvery::Night => night,
+        TidyEvery::Week => night.saturating_sub(6 * 86_400_000),
+    })
+}
+
+/// This computer's IANA zone from `/etc/localtime`, so presets run on the owner's wall clock.
+#[must_use]
+pub fn local_tz() -> Option<String> {
+    let target = std::fs::read_link("/etc/localtime").ok()?;
+    let target = target.to_string_lossy();
+    let (_, name) = target.split_once("zoneinfo/")?;
+    Some(name.to_owned())
 }
 
 /// Computes `[minute, hour, day, month, weekday]` (`weekday` 0=Sun..6=Sat) in `tz` (default UTC).

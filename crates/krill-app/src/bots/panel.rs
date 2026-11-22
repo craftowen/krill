@@ -28,6 +28,8 @@ impl View {
         if self.selected_bot_id.as_ref() != Some(bot_id) {
             self.connectors.page = None;
             self.connectors.adding = None;
+            // Another bot opens Settings on its list, with its own field values.
+            self.settings.reset_pages();
             self.select_bot(bot_id.clone(), cx);
             // A bot newer than this view's list: fetch the list again.
             if self.selected_bot_id.as_ref() == Some(bot_id)
@@ -37,8 +39,11 @@ impl View {
             }
         }
         if self.detail_tab != tab {
-            // Settings opens on Orca's list, not on the page it was last left at.
-            self.settings.page = super::settings_root::SettingsPage::Root;
+            // Settings opens on Orca's list, not on the page it was last left at; a row that
+            // asked for a page (Home's Upcoming) set it just before.
+            if self.detail_tab == DetailTab::Settings {
+                self.settings.reset_pages();
+            }
             self.set_detail_tab(tab, cx);
             if tab == DetailTab::Items {
                 // A fresh opening: rows and suggestions changed since get their dots again.

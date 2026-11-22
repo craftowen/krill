@@ -740,8 +740,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// Orca's settings view: `< {bot} / Settings` over the list, `< Settings / {page}` over a
-    /// page it opened. Back climbs one level.
+    /// Orca's settings view crumb: `< {bot} / Settings` over the list, `< {bot} / Settings /
+    /// {page}` over a page it opened. Back climbs one level; the bot's name leaves Settings.
     fn render_bot_settings_page(
         bot: &SidebarBot,
         page: DetailTab,
@@ -749,23 +749,34 @@ impl Shell {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let subpage = view.as_ref().and_then(|v| v.read(cx).settings_subpage());
-        let (parent, current): (SharedString, SharedString) = match (page, subpage) {
-            (DetailTab::Settings, None) => {
-                (bot.name.clone().into(), text::SV_SETTINGS.get().into())
-            }
-            (DetailTab::Settings, Some(sub)) => (text::SV_SETTINGS.get().into(), sub.into()),
-            (DetailTab::SoulMemory, _) => (
-                text::SV_SETTINGS.get().into(),
-                text::SV_SOUL_MEMORY.get().into(),
-            ),
-            (DetailTab::ToolsSharing, _) => (
-                text::SV_SETTINGS.get().into(),
-                text::TAB_TOOLS_SHARING.get().into(),
-            ),
-            _ => (bot.name.clone().into(), text::SV_SETTINGS.get().into()),
+        let subpage = match page {
+            DetailTab::Settings => view.as_ref().and_then(|v| v.read(cx).settings_subpage()),
+            DetailTab::SoulMemory => Some(text::SV_SOUL_MEMORY.get()),
+            DetailTab::ToolsSharing => Some(text::TAB_TOOLS_SHARING.get()),
+            _ => None,
         };
+        let crumb = |id: &'static str, label: SharedString| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex_none()
+                .min_w_0()
+                .truncate()
+                .px_1()
+                .rounded(ui::RADIUS_XS)
+                .text_color(p.muted_foreground)
+                .cursor_pointer()
+                .hover(|d| d.text_color(p.sidebar_foreground))
+                .child(label)
+        };
+        let to_root = view.clone();
         let back_view = view.clone();
+        let back_label = if subpage.is_some() {
+            text::SV_BACK_SETTINGS.get()
+        } else {
+            text::BP_BACK_HOME.get()
+        };
+        let sep = || div().flex_none().text_color(p.muted_foreground).child("/");
         div()
             .id("bot-settings-page")
             .debug_selector(|| "bot-settings-page".into())
@@ -775,25 +786,25 @@ impl Shell {
             .child(
                 div()
                     .flex_none()
-                    .px_2()
-                    .pt_2()
-                    .pb_1()
+                    .h(px(44.))
+                    .pl(px(6.))
+                    .pr(px(10.))
+                    .border_b_1()
+                    .border_color(p.border)
                     .flex()
                     .items_center()
                     .gap_1()
+                    .text_size(ui::TEXT_MD)
                     .child(
                         Button::new("bot-settings-back")
                             .debug_selector(|| "bot-settings-back".into())
                             .ghost()
-                            .xsmall()
+                            .small()
                             .icon(IconName::ChevronLeft)
-                            .tooltip(text::BP_BACK_HOME.get())
-                            .accessibility_label(text::BP_BACK_HOME.get())
+                            .tooltip(back_label)
+                            .accessibility_label(back_label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 match (page, subpage) {
-                                    (DetailTab::Settings, None) => {
-                                        this.bot_ui.panel.settings = None;
-                                    }
                                     (DetailTab::Settings, Some(_)) => {
                                         if let Some(v) = &back_view {
                                             v.update(
@@ -802,29 +813,63 @@ impl Shell {
                                             );
                                         }
                                     }
+                                    (DetailTab::Settings, None) => {
+                                        this.bot_ui.panel.settings = None;
+                                    }
                                     _ => this.bot_ui.panel.settings = Some(DetailTab::Settings),
                                 }
                                 cx.notify();
                             })),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_size(ui::TEXT_SM)
-                            .child(div().text_color(p.muted_foreground).child(parent))
-                            .child(div().text_color(p.muted_foreground).child("/"))
+                        crumb("bot-settings-crumb-bot", bot.name.clone().into()).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.bot_ui.panel.settings = None;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(sep())
+                    .map(|d| match subpage {
+                        Some(sub) => d
+                            .child(
+                                crumb(
+                                    "bot-settings-crumb-settings",
+                                    text::SV_SETTINGS.get().into(),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        match (&to_root, page) {
+                                            (Some(v), DetailTab::Settings) => v.update(
+                                                cx,
+                                                krill_app::bots::View::close_settings_subpage,
+                                            ),
+                                            _ => {
+                                                this.bot_ui.panel.settings =
+                                                    Some(DetailTab::Settings);
+                                            }
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(sep())
                             .child(
                                 div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.sidebar_foreground)
-                                    .child(current),
+                                    .child(sub),
                             ),
-                    ),
+                        None => d.child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(p.sidebar_foreground)
+                                .child(text::SV_SETTINGS.get()),
+                        ),
+                    }),
             )
             .child(div().flex_1().min_h_0().flex().flex_col().children(view))
     }

@@ -1,0 +1,1720 @@
+// Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License):
+// src/renderer/src/components/bots/settings-view/BotSettingsSubpage.tsx, BotComputerPage.tsx,
+// BotWhoCanAskPage.tsx, BotSharingPage.tsx, settings/bots/BotGeneralSettings.tsx,
+// BotLookAroundSection.tsx, BotTidyUpSection.tsx and bots/BotTidyUpReview.tsx.
+//! One drill-in of the bot settings view each: the root's rows open these, Back returns.
+
+use gpui::{
+    AnyElement, AppContext as _, ClickEvent, Context, FontWeight, InteractiveElement as _,
+    IntoElement as _, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use krill_proto::agent::Permission;
+use krill_proto::bots::{
+    BotAgentModels, BotConfig, BotMember, BotRpcRequest, BotRpcResponse, ExternalSource,
+    LookAroundEvery, TidyEvery, UpdateBotParams,
+};
+
+use crate::i18n::catalog::bots as text;
+use crate::i18n::catalog::chat as chat_text;
+use crate::ui;
+
+use super::View;
+use super::rpc::{
+    BOT_EFFORT_OPTIONS, BOT_RUNTIMES, call_checked, effort_label, runtime_display_label,
+    runtime_models,
+};
+use super::settings_root::{
+    Extras, Open, Row, SettingsPage, computer_name, patch, row_select, row_switch,
+};
+
+/// Orca's `LOOK_AROUND_EVERY_LABELS`.
+pub(super) fn look_around_every_label(every: LookAroundEvery) -> &'static str {
+    match every {
+        LookAroundEvery::Every4h => text::SV_LOOK_EVERY_4H.get(),
+        LookAroundEvery::Every2h => text::SV_LOOK_EVERY_2H.get(),
+        LookAroundEvery::TwiceDaily => text::SV_LOOK_EVERY_TWICE.get(),
+        LookAroundEvery::Mornings => text::SV_LOOK_EVERY_MORNINGS.get(),
+    }
+}
+
+fn tidy_every_label(every: TidyEvery) -> &'static str {
+    match every {
+        TidyEvery::Night => text::SV_TIDY_EVERY_NIGHT.get(),
+        TidyEvery::Week => text::SV_TIDY_EVERY_WEEK.get(),
+    }
+}
+
+/// "Nov 6" (or "11월 6일") for a fact's `YYYY-MM-DD`; anything else as written.
+pub(super) fn short_date(ymd: &str) -> String {
+    let mut parts = ymd.splitn(3, '-').skip(1).map(str::parse::<usize>);
+    let month = |m: usize| text::SV_MONTHS.get().split(',').nth(m.wrapping_sub(1));
+    match (parts.next(), parts.next()) {
+        (Some(Ok(m)), Some(Ok(d))) if month(m).is_some() => text::SV_SHORT_DATE
+            .format(&[("mon", month(m).unwrap_or_default()), ("d", &d.to_string())]),
+        _ => ymd.to_owned(),
+    }
+}
+
+/// "Nov 22 14:44" on this computer's clock.
+pub(super) fn when_label(at_ms: u64) -> String {
+    let epoch = i64::try_from(at_ms / 1_000).unwrap_or(i64::MAX);
+    let day = crate::local_time::format_timestamp(epoch)
+        .map(|s| short_date(&s.chars().take(10).collect::<String>()))
+        .unwrap_or_default();
+    let clock = crate::local_time::format_clock(epoch).unwrap_or_default();
+    format!("{day} {clock}")
+}
+
+/// What the last tidy-up changed, read from its History row (Orca's `BotTidyUpReview` run).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct TidyRun {
+    pub at_ms: u64,
+    pub merged: usize,
+    pub moved: usize,
+    pub archive: Option<String>,
+    pub undoable: bool,
+    pub undone: bool,
+}
+
+impl TidyRun {
+    pub(super) const fn changes(&self) -> usize {
+        self.merged + self.moved
+    }
+}
+
+/// Krill's tidy-up drops repeats and moves overflow to `memory/archive-YYYY-MM.md`, noting the
+/// move in one added line; everything else it removed was a repeat.
+pub(super) fn tidy_run(entry: &krill_proto::bots::BotMemoryHistoryEntry) -> TidyRun {
+    let (moved, archive) = entry
+        .added
+        .iter()
+        .find_map(|line| {
+            let (_, rest) = line.split_once("Archived ")?;
+            let (n, rest) = rest.split_once(' ')?;
+            let n = n.parse::<usize>().ok()?;
+            let archive = rest.split_once("memory/").map(|(_, f)| f.trim().to_owned());
+            Some((n, archive))
+        })
+        .unwrap_or((0, None));
+    TidyRun {
+        at_ms: entry.timestamp_ms,
+        merged: entry.removed.len().saturating_sub(moved),
+        moved,
+        archive,
+        undoable: entry.undoable,
+        undone: entry.undone,
+    }
+}
+
+impl View {
+    pub(super) fn render_settings_subpage(
+        &mut self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        match self.settings.page {
+            SettingsPage::Root => self.render_settings_root(bot, p, cx),
+            SettingsPage::Agent => self.render_agent_page(bot, p, cx),
+            SettingsPage::Permissions => Self::render_permissions_page(bot, p, cx),
+            SettingsPage::Computer => self.render_computer_page(bot, p, cx),
+            SettingsPage::LookAround => self.render_look_around_page(bot, p, window, cx),
+            SettingsPage::TidyUp => self.render_tidy_up_page(bot, p, window, cx),
+            SettingsPage::Schedules => self.render_schedules_page(bot, p, window, cx),
+            SettingsPage::Soul => self.render_soul_page(bot, p, window, cx),
+            SettingsPage::Memory => self.render_memory_page(bot, p, window, cx),
+            SettingsPage::WhoCanAsk => self.render_who_can_ask_page(bot, p, cx),
+            SettingsPage::Tools => self.render_tools_page(bot, p, window, cx),
+            SettingsPage::Skills => Self::render_skills_page(bot, p, cx),
+            SettingsPage::Sharing => self.render_sharing_page(bot, p, cx),
+        }
+    }
+
+    /// Orca's `SettingsSubsectionHeader`: a 14 px title, a muted line and an action.
+    pub(super) fn subsection_header(
+        title: &str,
+        description: Option<SharedString>,
+        action: Option<AnyElement>,
+        p: &ui::Palette,
+    ) -> gpui::Div {
+        div()
+            .w_full()
+            .flex()
+            .items_start()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(title.to_owned()),
+                    )
+                    .children(description.map(|d| {
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(d)
+                    })),
+            )
+            .children(action.map(|a| div().flex_none().child(a)))
+    }
+
+    /// Orca's `SettingsRow`: label and description, the control beside (or under, when narrow).
+    pub(super) fn settings_form_row(
+        label: &str,
+        description: Vec<SharedString>,
+        control: Option<AnyElement>,
+        p: &ui::Palette,
+    ) -> gpui::Div {
+        let has_desc = !description.is_empty();
+        div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_x_4()
+            .gap_y_2()
+            .py(if has_desc { px(12.) } else { px(8.) })
+            .child(
+                div()
+                    .min_w(px(128.))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .child(label.to_owned()),
+                    )
+                    .children(description.into_iter().map(|d| {
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(d)
+                    })),
+            )
+            .children(control.map(|c| div().flex_none().max_w_full().child(c)))
+    }
+
+    fn render_agent_page(
+        &mut self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.ensure_agent_models(&bot.agent_id, cx);
+        let runtime = bot.agent_id.clone();
+        let this = cx.weak_entity();
+        let switch_bot = bot.clone();
+        let runtime_button = Button::new("bot-settings-agent-runtime")
+            .debug_selector(|| "bot-settings-agent-runtime".into())
+            .outline()
+            .small()
+            .w_full()
+            .dropdown_caret(true)
+            .accessibility_label(runtime_display_label(&runtime))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(ui::icons::agent_brand_icon(
+                        &runtime,
+                        ui::ICON_SM,
+                        p.foreground,
+                    ))
+                    .child(div().truncate().child(runtime_display_label(&runtime))),
+            )
+            .dropdown_menu(move |mut menu, _, _| {
+                for rt in BOT_RUNTIMES {
+                    let this = this.clone();
+                    let bot = switch_bot.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(rt.label())
+                            .icon(ui::icons::agent_menu_icon(rt.id))
+                            .checked(bot.agent_id == rt.id)
+                            .on_click(move |_, _, cx| {
+                                if bot.agent_id == rt.id {
+                                    return;
+                                }
+                                // A new agent starts on its own default model and effort.
+                                let params = UpdateBotParams {
+                                    agent_id: Some(rt.id.to_owned()),
+                                    model: krill_proto::bots::FieldPatch::Clear,
+                                    effort: krill_proto::bots::FieldPatch::Clear,
+                                    ..patch(&bot)
+                                };
+                                this.update(cx, |v, cx| v.patch_bot(params, cx)).ok();
+                            }),
+                    );
+                }
+                menu
+            });
+
+        let choices = match &self.settings.agent_models {
+            Some((agent, found))
+                if agent == &runtime
+                    && !found.models.is_empty()
+                    && crate::agent_models::prefers_discovered(&runtime) =>
+            {
+                found.models.clone()
+            }
+            _ => runtime_models(&runtime),
+        };
+        let current = bot.model.clone().filter(|m| !m.trim().is_empty());
+        let model_label = current.as_deref().map_or_else(
+            || text::MODEL_DEFAULT.get().to_owned(),
+            |id| {
+                choices
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map_or_else(|| id.to_owned(), |m| m.label.clone())
+            },
+        );
+        let this = cx.weak_entity();
+        let model_bot = bot.clone();
+        let model_button = Button::new("bot-settings-agent-model")
+            .debug_selector(|| "bot-settings-agent-model".into())
+            .outline()
+            .small()
+            .w_full()
+            .dropdown_caret(true)
+            .label(model_label)
+            .dropdown_menu(move |mut menu, _, _| {
+                let pick = |choice: Option<String>| {
+                    let this = this.clone();
+                    let bot = model_bot.clone();
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+                        let params = UpdateBotParams {
+                            model: choice
+                                .clone()
+                                .map_or(krill_proto::bots::FieldPatch::Clear, |m| {
+                                    krill_proto::bots::FieldPatch::Set(m)
+                                }),
+                            ..patch(&bot)
+                        };
+                        this.update(cx, |v, cx| v.patch_bot(params, cx)).ok();
+                    }
+                };
+                menu = menu.max_h(px(360.)).scrollable(true).item(
+                    PopupMenuItem::new(text::MODEL_DEFAULT.get())
+                        .checked(current.is_none())
+                        .on_click(pick(None)),
+                );
+                for choice in &choices {
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label.clone())
+                            .checked(current.as_deref() == Some(choice.id.as_str()))
+                            .on_click(pick(Some(choice.id.clone()))),
+                    );
+                }
+                menu
+            });
+        let effort = bot.effort.clone().unwrap_or_default();
+        let effort_bot = bot.clone();
+        let ent = cx.entity();
+        let effort_select = row_select(
+            "bot-settings-agent-effort",
+            text::FIELD_EFFORT.get(),
+            BOT_EFFORT_OPTIONS
+                .iter()
+                .position(|e| *e == effort)
+                .unwrap_or(0),
+            BOT_EFFORT_OPTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, effort_label(e).into()))
+                .collect(),
+            |b| b.small().w_full(),
+            move |i, _, cx| {
+                let Some(eff) = BOT_EFFORT_OPTIONS.get(i) else {
+                    return;
+                };
+                let params = UpdateBotParams {
+                    effort: if eff.is_empty() {
+                        krill_proto::bots::FieldPatch::Clear
+                    } else {
+                        krill_proto::bots::FieldPatch::Set((*eff).to_owned())
+                    },
+                    ..patch(&effort_bot)
+                };
+                ent.update(cx, |this, cx| this.patch_bot(params, cx));
+            },
+        );
+
+        let body = div()
+            .w_full()
+            .rounded(ui::RADIUS_LG)
+            .bg(p.foreground.opacity(0.035))
+            .px_3()
+            .py(px(10.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_MD)
+                            .font_weight(FontWeight::MEDIUM)
+                            .line_height(px(18.))
+                            .text_color(p.foreground)
+                            .child(text::SV_AGENT_GROUP.get()),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .line_height(px(16.))
+                            .text_color(p.muted_foreground)
+                            .child(text::SV_AGENT_DESC.get()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(120.)).child(runtime_button))
+                    .child(div().flex_1().min_w(px(120.)).child(model_button))
+                    .child(div().flex_1().min_w(px(120.)).child(effort_select)),
+            );
+        Self::settings_screen("bot-settings-agent-page").child(body)
+    }
+
+    /// The agent's own model list, as the chat composer and New bot show it.
+    fn ensure_agent_models(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        if self
+            .settings
+            .agent_models
+            .as_ref()
+            .is_some_and(|(a, _)| a == agent_id)
+            || self.settings.models_task.is_some()
+        {
+            return;
+        }
+        let rpc = self.rpc.clone();
+        let agent = agent_id.to_owned();
+        self.settings.models_task = Some(cx.spawn(async move |this, cx| {
+            let query = agent.clone();
+            let reply = cx
+                .background_executor()
+                .spawn(async move {
+                    call_checked(&rpc, &BotRpcRequest::ListAgentModels { agent_id: query })
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.settings.models_task = None;
+                let found = match reply {
+                    Ok(BotRpcResponse::AgentModels(models)) => models,
+                    _ => BotAgentModels::default(),
+                };
+                this.settings.agent_models = Some((agent, found));
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn render_permissions_page(
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let rows = [
+            (
+                Permission::Manual,
+                "bot-settings-permission-ask",
+                ui::icons::HAND_SVG,
+                chat_text::PERMISSION_ASK_DESC.get(),
+            ),
+            (
+                Permission::Yolo,
+                "bot-settings-permission-full",
+                ui::icons::SHIELD_ALERT_SVG,
+                chat_text::PERMISSION_FULL_ACCESS_DESC.get(),
+            ),
+        ]
+        .into_iter()
+        .map(|(mode, id, icon, desc)| {
+            let on = bot.permission_mode == mode;
+            let bot = bot.clone();
+            Row::new(id, Some(icon), Self::permission_label(mode))
+                .detail(desc)
+                .wrap_detail()
+                .end(div().w(px(16.)).when(on, |d| {
+                    d.child(
+                        Icon::new(IconName::Check)
+                            .size(px(ui::ICON_LG))
+                            .text_color(p.foreground),
+                    )
+                }))
+                .opens(Open::run(move |this, _, cx| {
+                    if this
+                        .selected_bot()
+                        .is_some_and(|b| b.permission_mode != mode)
+                    {
+                        let params = UpdateBotParams {
+                            permission_mode: Some(mode),
+                            ..patch(&bot)
+                        };
+                        this.patch_bot(params, cx);
+                    }
+                }))
+        })
+        .collect();
+        Self::settings_screen("bot-settings-permissions-page").child(Self::render_inset_group(
+            None,
+            None,
+            rows,
+            Some(text::SV_PERMISSIONS_FOOT.get().into()),
+            false,
+            p,
+            cx,
+        ))
+    }
+
+    /// The bot's folder: its custom workspace, else its home under the bots folder.
+    pub(super) fn bot_folder_path(&self, bot: &BotConfig) -> Option<std::path::PathBuf> {
+        bot.workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                self.host
+                    .is_local()
+                    .then(krill_proto::daemon::state_dir)
+                    .flatten()
+                    .map(|state| state.join("bots").join(&bot.folder))
+            })
+    }
+
+    fn render_computer_page(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let local = self.host.is_local();
+        let name = computer_name(self);
+        let path = self.bot_folder_path(bot);
+        let shown = path.as_ref().map_or_else(
+            || format!("~/…/bots/{}", bot.folder),
+            |p| match krill_proto::os::home_dir() {
+                Some(home) => krill_proto::bots::tilde_display(p, &home),
+                None => p.display().to_string(),
+            },
+        );
+        let mut folder = Row::new(
+            "bot-settings-computer-folder",
+            Some(ui::icons::FOLDER_SVG),
+            text::SV_FOLDER.get(),
+        )
+        .detail(shown);
+        if let Some(path) = path {
+            folder = folder.end(
+                Button::new("bot-settings-copy-path")
+                    .debug_selector(|| "bot-settings-copy-path".into())
+                    .ghost()
+                    .small()
+                    .icon(IconName::Copy)
+                    .tooltip(text::SV_COPY_PATH.get())
+                    .accessibility_label(text::SV_COPY_PATH.get())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            path.to_string_lossy().into_owned(),
+                        ));
+                        this.notice = Some(text::SV_PATH_COPIED.get().into());
+                        cx.notify();
+                    })),
+            );
+        }
+        let rows = vec![
+            Row::new(
+                "bot-settings-computer-name",
+                Some(if local {
+                    ui::icons::LAPTOP_SVG
+                } else {
+                    ui::icons::SERVER_SVG
+                }),
+                name.clone(),
+            )
+            .detail(if local {
+                text::SV_THIS_COMPUTER.get()
+            } else {
+                text::SV_PAIRED_SERVER.get()
+            }),
+            folder,
+        ];
+        let foot = if local {
+            text::SV_COMPUTER_FOOT.get().to_owned()
+        } else {
+            text::SV_COMPUTER_HOST_FOOT.format(&[("host", &name)])
+        };
+        Self::settings_screen("bot-settings-computer-page").child(Self::render_inset_group(
+            None,
+            None,
+            rows,
+            Some(foot.into()),
+            false,
+            p,
+            cx,
+        ))
+    }
+
+    /// Look for: saved on Enter and when focus leaves, as Orca's field does.
+    fn ensure_look_focus_input(
+        &mut self,
+        bot: &BotConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.look_focus_input.is_some() {
+            return;
+        }
+        let focus = bot.look_around.focus.clone();
+        let input = cx.new(|cx| {
+            let mut st =
+                InputState::new(window, cx).placeholder(text::SV_LOOK_FOCUS_PLACEHOLDER.get());
+            if !focus.is_empty() {
+                st.set_value(focus, window, cx);
+            }
+            st
+        });
+        self.settings.look_focus_sub =
+            Some(
+                cx.subscribe_in(&input, window, |this, ent, ev: &InputEvent, _, cx| {
+                    if !matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        return;
+                    }
+                    let typed = ent.read(cx).value().trim().to_owned();
+                    let Some(bot) = this.selected_bot().cloned() else {
+                        return;
+                    };
+                    if typed != bot.look_around.focus {
+                        let mut look = bot.look_around.clone();
+                        look.focus = typed;
+                        this.patch_bot(
+                            UpdateBotParams {
+                                look_around: Some(look),
+                                ..patch(&bot)
+                            },
+                            cx,
+                        );
+                    }
+                }),
+            );
+        self.settings.look_focus_input = Some(input);
+    }
+
+    fn render_look_around_page(
+        &mut self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.ensure_look_focus_input(bot, window, cx);
+        let look = bot.look_around.clone();
+        let ent = cx.entity();
+        let switch_bot = bot.clone();
+        let header = Self::subsection_header(
+            text::SV_LOOK_AROUND.get(),
+            Some(if look.enabled {
+                look_around_every_label(self.settings_extras(&bot.id).look_around_every).into()
+            } else {
+                text::SV_OFF.get().into()
+            }),
+            Some(
+                row_switch(
+                    p,
+                    "bot-look-around-switch",
+                    text::SV_LOOK_AROUND.get(),
+                    look.enabled,
+                    move |on, _, cx| {
+                        let mut look = switch_bot.look_around.clone();
+                        look.enabled = on;
+                        let params = UpdateBotParams {
+                            look_around: Some(look),
+                            ..patch(&switch_bot)
+                        };
+                        ent.update(cx, |this, cx| this.patch_bot(params, cx));
+                    },
+                )
+                .into_any_element(),
+            ),
+            p,
+        );
+        let mut section = div().w_full().flex().flex_col().gap_4().child(header);
+        if !look.enabled {
+            section = section.child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SV_LOOK_ON_DESC.get()),
+            );
+            return Self::settings_screen("bot-settings-look-around-page").child(section);
+        }
+        let ent = cx.entity();
+        let every_bot = bot.clone();
+        let every = row_select(
+            "bot-look-around-every",
+            text::SV_HOW_OFTEN.get(),
+            self.settings_extras(&bot.id).look_around_every,
+            LookAroundEvery::ALL
+                .into_iter()
+                .map(|e| (e, look_around_every_label(e).into()))
+                .collect(),
+            |b| b.small().w(px(256.)),
+            move |every, _, cx| {
+                ent.update(cx, |this, cx| {
+                    this.update_settings_extras(
+                        every_bot.id.clone(),
+                        Extras {
+                            look_around_every: Some(every),
+                            ..Extras::default()
+                        },
+                        cx,
+                    );
+                });
+            },
+        );
+        let ent = cx.entity();
+        let weekdays_bot = bot.clone();
+        let weekdays = row_switch(
+            p,
+            "bot-look-around-weekdays",
+            text::SV_WEEKDAYS.get(),
+            look.weekdays_only,
+            move |on, _, cx| {
+                let mut look = weekdays_bot.look_around.clone();
+                look.weekdays_only = on;
+                let params = UpdateBotParams {
+                    look_around: Some(look),
+                    ..patch(&weekdays_bot)
+                };
+                ent.update(cx, |this, cx| this.patch_bot(params, cx));
+            },
+        );
+        let running = self.soul_memory.look_around_running;
+        let latest = self
+            .soul_memory
+            .suggestions
+            .iter()
+            .map(|s| s.created_at_ms)
+            .max();
+        let last_line = latest.map_or_else(
+            || text::SV_LOOK_NOT_YET.get().to_owned(),
+            |at| {
+                format!(
+                    "{} · {}",
+                    when_label(at),
+                    text::SV_LOOK_SUGGESTIONS
+                        .format(&[("n", &self.soul_memory.suggestions.len().to_string())])
+                )
+            },
+        );
+        let look_bot = bot.id.clone();
+        let look_now = ui::secondary(
+            "bot-look-around-now",
+            if running {
+                text::SV_LOOKING.get()
+            } else {
+                text::SV_LOOK_NOW.get()
+            },
+        )
+        .debug_selector(|| "bot-look-around-now".into())
+        .small()
+        .disabled(running || bot.paused)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.run_look_around(look_bot.clone(), cx);
+        }));
+        section = section
+            .child(Self::settings_form_row(
+                text::SV_HOW_OFTEN.get(),
+                Vec::new(),
+                Some(every.into_any_element()),
+                p,
+            ))
+            .child(Self::settings_form_row(
+                text::SV_WEEKDAYS.get(),
+                Vec::new(),
+                Some(weekdays.into_any_element()),
+                p,
+            ))
+            .child(
+                div()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .child(text::SV_LOOK_FOCUS.get()),
+                    )
+                    .children(
+                        self.settings
+                            .look_focus_input
+                            .as_ref()
+                            .map(|i| Input::new(i).small()),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::SV_LOOK_FOCUS_DESC.get()),
+                    ),
+            )
+            .child(Self::settings_form_row(
+                text::SV_LAST_LOOKED.get(),
+                vec![last_line.into(), text::SV_WHILE_RUNNING.get().into()],
+                Some(look_now.into_any_element()),
+                p,
+            ));
+        Self::settings_screen("bot-settings-look-around-page").child(section)
+    }
+
+    /// The last tidy-up as its History row tells it, once History is read.
+    pub(super) fn last_tidy_run(&self) -> Option<TidyRun> {
+        let id = self
+            .soul_memory
+            .tidy_status
+            .as_ref()?
+            .last_tidy_id
+            .as_deref()?;
+        self.soul_memory
+            .memory_history
+            .iter()
+            .find(|e| e.entry_id == id)
+            .map(tidy_run)
+    }
+
+    fn render_tidy_up_page(
+        &mut self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let tidy = bot.memory_tidy;
+        let status = self.soul_memory.tidy_status.clone().unwrap_or_default();
+        let last = self.last_tidy_run();
+        let line = if tidy.enabled {
+            let every = match self.settings_extras(&bot.id).tidy_every {
+                TidyEvery::Night => text::SV_TIDY_NIGHT_LINE.get(),
+                TidyEvery::Week => text::SV_TIDY_WEEK_LINE.get(),
+            };
+            match status.last_run_ms {
+                Some(at) => format!(
+                    "{every} · {}",
+                    text::SV_LAST_TIDIED_WHEN.format(&[("when", &when_label(at))])
+                ),
+                None => every.to_owned(),
+            }
+        } else {
+            text::SV_OFF.get().to_owned()
+        };
+        let ent = cx.entity();
+        let switch_bot = bot.clone();
+        let header = Self::subsection_header(
+            text::SV_MEMORY_UPKEEP.get(),
+            Some(line.into()),
+            Some(
+                row_switch(
+                    p,
+                    "bot-tidy-up-switch",
+                    text::SV_MEMORY_UPKEEP.get(),
+                    tidy.enabled,
+                    move |on, _, cx| {
+                        let mut tidy = switch_bot.memory_tidy;
+                        tidy.enabled = on;
+                        let params = UpdateBotParams {
+                            memory_tidy: Some(tidy),
+                            ..patch(&switch_bot)
+                        };
+                        ent.update(cx, |this, cx| this.patch_bot(params, cx));
+                    },
+                )
+                .into_any_element(),
+            ),
+            p,
+        );
+        let mut section = div().w_full().flex().flex_col().gap_4().child(header);
+        if status.auto_disabled || !tidy.enabled {
+            section = section.child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(if status.auto_disabled {
+                        text::SV_TIDY_TURNED_OFF.get()
+                    } else {
+                        text::SV_TIDY_ON_DESC.get()
+                    }),
+            );
+        }
+        if tidy.enabled {
+            let ent = cx.entity();
+            let every_bot = bot.clone();
+            let every = row_select(
+                "bot-tidy-up-every",
+                text::SV_HOW_OFTEN.get(),
+                self.settings_extras(&bot.id).tidy_every,
+                [TidyEvery::Night, TidyEvery::Week]
+                    .into_iter()
+                    .map(|e| (e, tidy_every_label(e).into()))
+                    .collect(),
+                |b| b.small().w(px(256.)),
+                move |every, _, cx| {
+                    ent.update(cx, |this, cx| {
+                        this.update_settings_extras(
+                            every_bot.id.clone(),
+                            Extras {
+                                tidy_every: Some(every),
+                                ..Extras::default()
+                            },
+                            cx,
+                        );
+                    });
+                },
+            );
+            let running = self.soul_memory.tidy_running;
+            let last_line: AnyElement = match &last {
+                Some(run) => div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(format!(
+                        "{} · {} ·",
+                        when_label(run.at_ms),
+                        text::SV_TIDY_CHANGES.format(&[("n", &run.changes().to_string())])
+                    ))
+                    .child(
+                        div()
+                            .id("bot-tidy-up-review")
+                            .debug_selector(|| "bot-tidy-up-review".into())
+                            .underline()
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(p.foreground))
+                            .child(text::SV_TIDY_REVIEW.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings.tidy_review = true;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+                None => text::SV_TIDY_NEVER.get().into_any_element(),
+            };
+            let tidy_bot = bot.id.clone();
+            let tidy_now = ui::secondary(
+                "bot-tidy-up-now",
+                if running {
+                    text::SV_TIDYING.get()
+                } else {
+                    text::SV_TIDY_NOW.get()
+                },
+            )
+            .debug_selector(|| "bot-tidy-up-now".into())
+            .small()
+            .disabled(running || bot.paused)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.run_memory_tidy(tidy_bot.clone(), cx);
+            }));
+            let last_row = div()
+                .w_full()
+                .py_3()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_between()
+                .gap_x_4()
+                .gap_y_2()
+                .child(
+                    div()
+                        .min_w(px(128.))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_LG)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(text::SV_LAST_TIDIED.get()),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(last_line)
+                                .when_some(
+                                    self.soul_memory
+                                        .last_tidy_summary
+                                        .clone()
+                                        .filter(|_| !status.auto_disabled && last.is_none()),
+                                    gpui::ParentElement::child,
+                                )
+                                .child(text::SV_WHILE_RUNNING.get()),
+                        ),
+                )
+                .child(div().flex_none().child(tidy_now));
+            section = section
+                .child(Self::settings_form_row(
+                    text::SV_HOW_OFTEN.get(),
+                    vec![text::SV_TIDY_EVERY_DESC.get().into()],
+                    Some(every.into_any_element()),
+                    p,
+                ))
+                .child(last_row);
+        }
+        let screen = Self::settings_screen("bot-settings-tidy-up-page").child(section);
+        match last.filter(|_| self.settings.tidy_review) {
+            Some(run) => screen.child(Self::render_tidy_review(bot, &run, p, window, cx)),
+            None => screen,
+        }
+    }
+
+    /// Orca's "Last night's tidy-up" dialog: what it changed, and Undo for the whole run.
+    fn render_tidy_review(
+        bot: &BotConfig,
+        run: &TidyRun,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hour = crate::local_time::format_clock(i64::try_from(run.at_ms / 1_000).unwrap_or(0))
+            .and_then(|c| c.split(':').next().and_then(|h| h.parse::<u32>().ok()))
+            .unwrap_or(12);
+        let title = if hour < 9 {
+            text::SV_TIDY_REVIEW_TITLE_NIGHT.get()
+        } else {
+            text::SV_TIDY_REVIEW_TITLE.get()
+        };
+        let mut tidied: Vec<String> = Vec::new();
+        if run.merged > 0 {
+            tidied.push(text::SV_TIDY_MERGED.format(&[("n", &run.merged.to_string())]));
+        }
+        if run.moved > 0 {
+            tidied.push(text::SV_TIDY_MOVED.format(&[
+                ("n", &run.moved.to_string()),
+                ("file", run.archive.as_deref().unwrap_or("archive.md")),
+            ]));
+        }
+        let undo_bot = bot.id.clone();
+        let dialog = div()
+            .id("bot-tidy-review")
+            .debug_selector(|| "bot-tidy-review".into())
+            .w(px(512.))
+            .max_w_full()
+            .rounded(ui::RADIUS_LG)
+            .border_1()
+            .border_color(p.border)
+            .bg(p.popover)
+            .shadow_lg()
+            .p_6()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XL)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .text_color(p.muted_foreground)
+                            .child(when_label(run.at_ms)),
+                    ),
+            )
+            .when(!tidied.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::SV_TIDY_TIDIED.get()),
+                        )
+                        .children(tidied.into_iter().map(|line| {
+                            div()
+                                .text_size(ui::TEXT_LG)
+                                .text_color(p.foreground)
+                                .child(line)
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(if run.undone {
+                        text::SV_TIDY_UNDONE.get()
+                    } else {
+                        text::SV_TIDY_UNDO_NOTE.get()
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        Button::new("bot-tidy-review-undo")
+                            .debug_selector(|| "bot-tidy-review-undo".into())
+                            .ghost()
+                            .small()
+                            .icon(IconName::Undo2)
+                            .label(text::SV_TIDY_UNDO_ALL.get())
+                            .disabled(run.undone || !run.undoable)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.undo_memory_tidy(undo_bot.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                ui::secondary(
+                                    "bot-tidy-review-history",
+                                    text::SV_TIDY_OPEN_HISTORY.get(),
+                                )
+                                .small()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.open_settings_page(SettingsPage::Memory, cx);
+                                        this.settings.memory_history_tab = true;
+                                    },
+                                )),
+                            )
+                            .child(
+                                ui::primary("bot-tidy-review-done", text::SV_TIDY_DONE.get())
+                                    .debug_selector(|| "bot-tidy-review-done".into())
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings.tidy_review = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+        ui::modal_backdrop(
+            window.viewport_size(),
+            div()
+                .id("bot-tidy-review-backdrop")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.settings.tidy_review = false;
+                    cx.notify();
+                }))
+                .child(dialog),
+        )
+        .into_any_element()
+    }
+
+    fn render_who_can_ask_page(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut screen = Self::settings_screen("bot-settings-who-can-ask-page");
+        if self
+            .connectors
+            .bot_access_requests
+            .iter()
+            .any(|r| r.status == krill_proto::bots::BotAccessRequestStatus::Pending)
+        {
+            screen = screen.child(self.render_access_requests_card(&bot.id, p, cx));
+        }
+        // One list per place people reach the bot: each Slack workspace, Telegram, Discord….
+        let mut places: Vec<(ExternalSource, Option<String>)> = Vec::new();
+        for m in bot
+            .members
+            .iter()
+            .filter(|m| m.source != ExternalSource::Google)
+        {
+            let key = (m.source, m.workspace_id.clone());
+            if !places.contains(&key) {
+                places.push(key);
+            }
+        }
+        for source in bot.connectors.enabled_sources() {
+            if source != ExternalSource::Google
+                && source != ExternalSource::Composio
+                && !places.iter().any(|(s, _)| *s == source)
+            {
+                places.push((source, None));
+            }
+        }
+        if places.is_empty() {
+            return screen.child(Self::render_inset_group(
+                None,
+                None,
+                vec![
+                    Row::new(
+                        "bot-who-can-ask-none",
+                        Some(ui::icons::PLUG_SVG),
+                        text::SV_NO_CONNECTORS.get(),
+                    )
+                    .detail(text::SV_NO_CONNECTORS_DESC.format(&[("name", &bot.name)]))
+                    .wrap_detail()
+                    .opens(Open::Tab(super::DetailTab::Connectors)),
+                ],
+                None,
+                false,
+                p,
+                cx,
+            ));
+        }
+        for (source, workspace) in places {
+            let people: Vec<&BotMember> = bot
+                .members
+                .iter()
+                .filter(|m| m.source == source && m.workspace_id == workspace)
+                .collect();
+            let title = workspace.as_deref().map_or_else(
+                || source_label(source).to_owned(),
+                |w| format!("{} · {w}", source_label(source)),
+            );
+            let list = Self::who_can_ask_card(bot, &people, p, cx);
+            screen = screen.child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.muted_foreground)
+                            .child(div().truncate().child(title)),
+                    )
+                    .child(
+                        div()
+                            .rounded(ui::RADIUS_LG)
+                            .bg(p.foreground.opacity(0.035))
+                            .p_3()
+                            .child(list),
+                    ),
+            );
+        }
+        screen
+    }
+
+    /// Orca's `BotWhoCanAskList` for one connector: who can ask, as one sentence and chips, then
+    /// Before you share (Keep only me, Ask for approval).
+    fn who_can_ask_card(
+        bot: &BotConfig,
+        people: &[&BotMember],
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let name = |m: &BotMember| {
+            if m.name.trim().is_empty() {
+                m.id.clone()
+            } else {
+                m.name.clone()
+            }
+        };
+        let names: Vec<String> = people.iter().map(|m| name(m)).collect();
+        let summary = match names.as_slice() {
+            [] => text::SV_WHO_SUMMARY_ONLY.format(&[("name", &bot.name)]),
+            [one] => text::SV_WHO_SUMMARY_ONE.format(&[("person", one), ("name", &bot.name)]),
+            [rest @ .., last] if names.len() <= 3 => text::SV_WHO_SUMMARY_SOME.format(&[
+                ("people", &rest.join(", ")),
+                ("last", last),
+                ("name", &bot.name),
+            ]),
+            _ => text::SV_WHO_SUMMARY_MANY
+                .format(&[("n", &names.len().to_string()), ("name", &bot.name)]),
+        };
+        let control = if people.is_empty() {
+            text::SV_WHO_CONTROL_NONE.format(&[("name", &bot.name)])
+        } else {
+            text::SV_WHO_CONTROL_MANY.format(&[("name", &bot.name)])
+        };
+        let chip = |id: SharedString, face: AnyElement, label: String| {
+            div()
+                .id(id)
+                .h(px(28.))
+                .pl_1()
+                .pr(px(10.))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .rounded_full()
+                .border_1()
+                .border_color(p.border)
+                .text_size(ui::TEXT_MD)
+                .text_color(p.foreground)
+                .child(face)
+                .child(label)
+        };
+        let face = |s: String| {
+            div()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(p.foreground.opacity(0.06))
+                .text_size(ui::TEXT_2XS)
+                .text_color(p.muted_foreground)
+                .child(s)
+                .into_any_element()
+        };
+        let mut chips = div().flex().flex_wrap().gap_2().child(
+            chip(
+                "bot-who-you".into(),
+                div()
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::User)
+                            .size(px(ui::ICON_SM))
+                            .text_color(p.muted_foreground),
+                    )
+                    .into_any_element(),
+                text::SV_WHO_YOU.get().to_owned(),
+            )
+            .child(
+                div()
+                    .text_color(p.muted_foreground)
+                    .child(format!("· {}", text::SV_WHO_OWNER.get())),
+            ),
+        );
+        for m in people {
+            let initials: String = name(m)
+                .split_whitespace()
+                .filter_map(|w| w.chars().next())
+                .take(2)
+                .collect::<String>()
+                .to_uppercase();
+            let bot_id = bot.id.clone();
+            let member = (*m).clone();
+            chips = chips.child(
+                chip(
+                    SharedString::from(format!("bot-who-{}", m.id)),
+                    face(initials),
+                    name(m),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "bot-who-can-ask-remove-{}",
+                        m.id
+                    )))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip(text::SV_REMOVE.get())
+                    .accessibility_label(text::SV_REMOVE.get())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_bot_members(bot_id.clone(), vec![member.clone()], cx);
+                    })),
+                ),
+            );
+        }
+        let mut advice: Vec<AnyElement> = Vec::new();
+        let fix = |icon: &'static [u8], title: String, detail: String, action: AnyElement| {
+            div()
+                .flex()
+                .items_start()
+                .gap(px(10.))
+                .child(
+                    Icon::default()
+                        .data(icon)
+                        .size(px(ui::ICON_LG))
+                        .mt_0p5()
+                        .text_color(p.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_MD)
+                                .text_color(p.foreground)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(detail),
+                        ),
+                )
+                .child(div().flex_none().child(action))
+                .into_any_element()
+        };
+        if !people.is_empty() {
+            let bot_id = bot.id.clone();
+            let all: Vec<BotMember> = people.iter().map(|m| (*m).clone()).collect();
+            advice.push(fix(
+                ui::icons::USERS_SVG,
+                text::SV_WHO_FIX_ONLY_ME.format(&[("name", &bot.name)]),
+                text::SV_WHO_FIX_ONLY_ME_DETAIL.get().to_owned(),
+                ui::secondary(
+                    "bot-who-keep-only-me",
+                    text::SV_WHO_FIX_ONLY_ME_ACTION.get(),
+                )
+                .small()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remove_bot_members(bot_id.clone(), all.clone(), cx);
+                }))
+                .into_any_element(),
+            ));
+        }
+        if !people.is_empty() && bot.permission_mode == Permission::Yolo {
+            let ask_bot = bot.clone();
+            advice.push(fix(
+                ui::icons::HAND_SVG,
+                text::SV_WHO_FIX_ASK.get().to_owned(),
+                text::SV_WHO_FIX_ASK_DETAIL.format(&[("name", &bot.name)]),
+                ui::secondary("bot-who-switch-ask", text::SV_WHO_FIX_ASK_ACTION.get())
+                    .small()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let params = UpdateBotParams {
+                            permission_mode: Some(Permission::Manual),
+                            ..patch(&ask_bot)
+                        };
+                        this.patch_bot(params, cx);
+                    }))
+                    .into_any_element(),
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.muted_foreground)
+                            .child(text::SV_WHO_HEADING.format(&[("name", &bot.name)])),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(control),
+                    ),
+            )
+            .child(chips)
+            .when(!advice.is_empty(), |d| {
+                d.child(
+                    div()
+                        .rounded(ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(p.border)
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_XS)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.muted_foreground)
+                                .child(text::SV_WHO_ADVICE.get()),
+                        )
+                        .children(advice),
+                )
+            })
+    }
+
+    fn render_skills_page(
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let rows: Vec<Row> = bot
+            .skills
+            .iter()
+            .map(|s| {
+                Row::new(
+                    SharedString::from(format!("bot-skill-{s}")),
+                    Some(ui::icons::BOOK_OPEN_SVG),
+                    s.clone(),
+                )
+            })
+            .collect();
+        let header = Self::subsection_header(
+            text::SV_SKILLS.get(),
+            Some(text::SV_SKILLS_DESC.get().into()),
+            None,
+            p,
+        );
+        let screen = Self::settings_screen("bot-settings-skills-page").child(header);
+        if rows.is_empty() {
+            return screen.child(
+                div()
+                    .px_1()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SV_NONE.get()),
+            );
+        }
+        screen.child(Self::render_inset_group(
+            None, None, rows, None, false, p, cx,
+        ))
+    }
+
+    fn render_sharing_page(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let export_bot = bot.id.clone();
+        let share = vec![
+            Row::new(
+                "bot-sharing-export",
+                Some(ui::icons::SHARE_2_SVG),
+                text::SV_SHARE_FILE.get(),
+            )
+            .detail(text::SV_SHARE_FILE_DESC.get())
+            .wrap_detail()
+            .end(
+                ui::secondary("bots-sharing-export", text::SV_SHARE_BOT.get())
+                    .debug_selector(|| "bots-sharing-export".into())
+                    .small()
+                    .disabled(self.tools.busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.export_bot_zip(export_bot.clone(), cx);
+                    })),
+            ),
+        ];
+        let receive = vec![
+            Row::new(
+                "bot-sharing-import-zip",
+                Some(ui::icons::DOWNLOAD_SVG),
+                text::SV_IMPORT_FILE.get(),
+            )
+            .opens(Open::run(|this, _, cx| this.import_bot_zip_from_dialog(cx))),
+            Row::new(
+                "bot-sharing-import-external",
+                Some(ui::icons::FOLDER_PLUS_SVG),
+                text::IMPORT_EXTERNAL_TITLE.get(),
+            )
+            .opens(Open::run(|this, _, cx| this.open_import(cx))),
+        ];
+        Self::settings_screen("bot-settings-sharing-page")
+            .child(Self::render_inset_group(
+                None, None, share, None, false, p, cx,
+            ))
+            .child(Self::render_inset_group(
+                None, None, receive, None, false, p, cx,
+            ))
+    }
+
+    /// Orca's `BotToolsSection`: the bot's own tools in one card, then Add a tool, which opens
+    /// Krill's catalog and custom server form under it.
+    fn render_tools_page(
+        &mut self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let tools: Vec<_> = bot.mcp_tools.iter().filter(|t| t.enabled).collect();
+        let line = if tools.is_empty() {
+            text::SV_NONE.get().to_owned()
+        } else {
+            tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let row =
+            |id: SharedString, icon: AnyElement, title: SharedString, detail: Option<String>| {
+                div()
+                    .id(id)
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(32.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(ui::RADIUS_MD)
+                            .bg(p.muted)
+                            .child(icon),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.foreground)
+                                    .child(title),
+                            )
+                            .children(detail.map(|d| {
+                                div()
+                                    .truncate()
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(d)
+                            })),
+                    )
+            };
+        let wrench = || {
+            Icon::default()
+                .data(ui::icons::WRENCH_SVG)
+                .size(px(ui::ICON_LG))
+                .text_color(p.muted_foreground)
+                .into_any_element()
+        };
+        let mut card = div()
+            .w_full()
+            .overflow_hidden()
+            .rounded(ui::RADIUS_XL)
+            .border_1()
+            .border_color(p.border)
+            .bg(p.card)
+            .flex()
+            .flex_col();
+        for (i, t) in tools.iter().enumerate() {
+            let detail = t
+                .endpoint_url
+                .clone()
+                .or_else(|| (!t.command.is_empty()).then(|| t.command.join(" ")));
+            card = card
+                .child(row(
+                    SharedString::from(format!("bot-tool-{i}")),
+                    wrench(),
+                    t.name.clone().into(),
+                    detail,
+                ))
+                .child(div().h(px(1.)).bg(p.border));
+        }
+        let adding = self.settings.tools_adding;
+        card = card.child(
+            row(
+                "bot-tool-add".into(),
+                Icon::new(if adding {
+                    IconName::Minus
+                } else {
+                    IconName::Plus
+                })
+                .size(px(ui::ICON_LG))
+                .text_color(p.muted_foreground)
+                .into_any_element(),
+                text::SV_TOOLS_ADD.get().into(),
+                None,
+            )
+            .debug_selector(|| "bot-tool-add".into())
+            .cursor_pointer()
+            .hover(|d| d.bg(p.accent.opacity(0.4)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.settings.tools_adding = !this.settings.tools_adding;
+                cx.notify();
+            })),
+        );
+        let mut screen = Self::settings_screen("bot-settings-tools-page").child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(Self::subsection_header(
+                    text::SV_TOOLS.get(),
+                    Some(line.into()),
+                    None,
+                    p,
+                ))
+                .child(card),
+        );
+        if adding {
+            let cards = self.tools_cards(bot, p, window, cx);
+            screen = screen
+                .child(cards.curated)
+                .child(cards.custom)
+                .child(cards.relay);
+        }
+        screen
+    }
+}
+
+/// A connector's name, as Who can ask heads its list.
+fn source_label(source: ExternalSource) -> &'static str {
+    match source {
+        ExternalSource::Slack => "Slack",
+        ExternalSource::Telegram => "Telegram",
+        ExternalSource::Discord => "Discord",
+        ExternalSource::Linear => "Linear",
+        ExternalSource::GitHub => "GitHub",
+        ExternalSource::Google => "Google",
+        ExternalSource::Composio => "Composio",
+    }
+}

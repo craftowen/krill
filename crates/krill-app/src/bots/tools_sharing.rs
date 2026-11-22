@@ -26,6 +26,14 @@ use crate::ui;
 use super::rpc::{call_checked, mcp_secret_ref};
 use super::{Close, DetailTab, Screen, View, clear_input_on_window, opt_input_composing};
 
+/// The Tools and sharing tab's cards.
+pub(super) struct ToolsCards {
+    pub(super) relay: gpui::AnyElement,
+    pub(super) curated: gpui::AnyElement,
+    pub(super) custom: gpui::AnyElement,
+    pub(super) sharing: gpui::AnyElement,
+}
+
 #[derive(Default)]
 pub(super) struct ToolsState {
     pub(super) relay_status: Option<BotToolRelayStatus>,
@@ -979,6 +987,32 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let cards = self.tools_cards(bot, p, window, cx);
+        div()
+            .id("bots-tab-tools-body")
+            .debug_selector(|| "bots-tab-tools-body".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_5()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(cards.relay)
+            .child(cards.curated)
+            .child(cards.custom)
+            .child(cards.sharing)
+    }
+
+    /// The tab's cards, also shown one page each in the panel's Settings › Tools and Sharing.
+    pub(super) fn tools_cards(
+        &mut self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolsCards {
         self.ensure_tools_inputs(window, cx);
         let bot_id = bot.id.clone();
         let busy = self.tools.busy;
@@ -1753,21 +1787,12 @@ impl View {
                     ),
             );
 
-        div()
-            .id("bots-tab-tools-body")
-            .debug_selector(|| "bots-tab-tools-body".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px_5()
-            .py_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(relay_card)
-            .child(ui::card(p).child(curated_list))
-            .child(custom_card)
-            .child(sharing_card)
+        ToolsCards {
+            relay: relay_card.into_any_element(),
+            curated: ui::card(p).child(curated_list).into_any_element(),
+            custom: custom_card.into_any_element(),
+            sharing: sharing_card.into_any_element(),
+        }
     }
 
     pub(super) fn render_import_view(

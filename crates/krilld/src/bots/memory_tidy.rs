@@ -12,7 +12,7 @@ use std::io;
 use std::sync::Mutex;
 
 use krill_proto::bots::{
-    BOT_MEMORY_INDEX_LINE_CAP, BOT_MEMORY_SOURCE_SEPARATOR, BotId, BotMemoryTidyStatus,
+    BOT_MEMORY_INDEX_LINE_CAP, BOT_MEMORY_SOURCE_SEPARATOR, BotId, BotMemoryTidyStatus, TidyEvery,
     parse_memory_facts, validate_memory_edit,
 };
 use krill_proto::os::write_atomic_0600;
@@ -34,12 +34,12 @@ pub struct MemoryTidyTracker {
 
 impl MemoryTidyTracker {
     #[must_use]
-    pub fn is_due(&self, bot_id: &BotId, interval_secs: u64, now_ms: u64) -> bool {
-        let interval_ms = interval_secs.max(60).saturating_mul(1_000);
+    pub fn is_due(&self, bot_id: &BotId, every: TidyEvery, tz: Option<&str>, now_ms: u64) -> bool {
+        let Some(after) = super::look_around::tidy_due_after_ms(every, tz, now_ms) else {
+            return false;
+        };
         let guard = lock(&self.last_run_ms);
-        guard
-            .get(bot_id)
-            .is_none_or(|&last| now_ms.saturating_sub(last) >= interval_ms)
+        guard.get(bot_id).is_none_or(|&last| last < after)
     }
 
     pub fn record(&self, bot_id: &BotId, now_ms: u64) {
@@ -504,8 +504,50 @@ mod tests {
         let status = sched.get_tidy_state(&bot.id).unwrap();
         assert_eq!(status.consecutive_failures, AUTO_DISABLE_AFTER_FAILURES);
         assert!(status.auto_disabled);
-        assert!(!sched.tidy_is_due(&bot.id, 60, 1_000_000));
+        assert!(!sched.tidy_is_due(&bot.id, TidyEvery::Night, None, 1_000_000));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn presets_run_at_their_local_hours() {
+        use super::super::look_around::{latest_slot_ms, tidy_due_after_ms};
+        use krill_proto::bots::LookAroundEvery;
+        const H: u64 = 3_600_000;
+        let day = 20_000 * 24 * H; // a UTC midnight
+        // Before 8 AM nothing has come due today; at 13:30 the 12:00 slot of every 4 hours has.
+        assert_eq!(
+            latest_slot_ms(day + 7 * H, None, LookAroundEvery::Every4h.hours()),
+            None
+        );
+        assert_eq!(
+            latest_slot_ms(
+                day + 13 * H + 30 * 60_000,
+                None,
+                LookAroundEvery::Every4h.hours()
+            ),
+            Some(day + 12 * H)
+        );
+        assert_eq!(
+            latest_slot_ms(
+                day + 23 * H,
+                Some("+09:00"),
+                LookAroundEvery::Mornings.hours()
+            ),
+            Some(day + 23 * H)
+        );
+        // Each night: today's 3 AM from 3 AM on, yesterday's before it; a week is six days earlier.
+        assert_eq!(
+            tidy_due_after_ms(TidyEvery::Night, None, day + 5 * H),
+            Some(day + 3 * H)
+        );
+        assert_eq!(
+            tidy_due_after_ms(TidyEvery::Night, None, day + H),
+            Some(day + 3 * H - 24 * H)
+        );
+        assert_eq!(
+            tidy_due_after_ms(TidyEvery::Week, None, day + 5 * H),
+            Some(day + 3 * H - 6 * 24 * H)
+        );
     }
 }

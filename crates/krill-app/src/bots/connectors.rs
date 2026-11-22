@@ -2972,7 +2972,7 @@ impl View {
             )
     }
 
-    fn render_access_requests_card(
+    pub(super) fn render_access_requests_card(
         &self,
         bot_id: &BotId,
         p: &ui::Palette,
