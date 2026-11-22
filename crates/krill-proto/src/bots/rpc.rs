@@ -1271,6 +1271,12 @@ pub struct BotScheduleUpcoming {
     /// Its conversation is on a turn right now.
     #[serde(default)]
     pub running: bool,
+    /// Last start/run error sentence, if the most recent attempt could not start or failed.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Structured refusal for the most recent failed attempt so each reader can word it locally.
+    #[serde(default)]
+    pub last_refusal: Option<super::BotSessionRefusal>,
 }
 
 /// Versioned extensible RPC response enum paired with [`BotRpcRequest`].
@@ -1368,6 +1374,8 @@ pub enum BotRpcResponse {
         group_id: String,
         audience: BotGroupReplyAudience,
     },
+    /// Structured refusal when a bot chat or schedule run could not start (`b10792b6`).
+    SessionRefused(Box<super::BotSessionRefusal>),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1552,6 +1560,9 @@ impl fmt::Debug for BotRpcResponse {
                 .field("group_id", group_id)
                 .field("audience", audience)
                 .finish(),
+            Self::SessionRefused(refusal) => {
+                f.debug_tuple("SessionRefused").field(refusal).finish()
+            }
         }
     }
 }

@@ -2174,14 +2174,151 @@ pub(crate) mod agy {
         }
     }
 
-    /// agy 한 번 실행. 타임아웃·출력 상한을 지킨다. 파이프 교착을 피하려고 stdout은 별도 스레드에서 읽는다.
-    pub(crate) fn run_agy(
+    /// Reason an `agy` subprocess failed when invoked through [`run_agy_cancellable`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RunAgyError {
+        /// Cancelled by [`ListingGate`] before an account sign-in/switch operation.
+        Stopped,
+        /// Non-zero exit, spawn error, timeout, or oversized stdout.
+        Failed,
+    }
+
+    /// Error returned when a model listing is refused or stopped by [`ListingGate`] (Orca `#46647`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct ListingStoppedError;
+
+    struct ListingGateState {
+        active_ops: usize,
+        generation: u64,
+        next_id: u64,
+        in_flight: BTreeMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    static LISTING_GATE: std::sync::LazyLock<(Mutex<ListingGateState>, std::sync::Condvar)> =
+        std::sync::LazyLock::new(|| {
+            (
+                Mutex::new(ListingGateState {
+                    active_ops: 0,
+                    generation: 0,
+                    next_id: 1,
+                    in_flight: BTreeMap::new(),
+                }),
+                std::sync::Condvar::new(),
+            )
+        });
+
+    /// RAII registration for one in-flight `agy` model-catalog listing.
+    pub(crate) struct ListingGuard {
+        id: u64,
+        generation: u64,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ListingGuard {
+        pub(crate) fn cancel_flag(&self) -> &std::sync::atomic::AtomicBool {
+            &self.cancel
+        }
+
+        pub(crate) fn generation(&self) -> u64 {
+            self.generation
+        }
+
+        pub(crate) fn is_stopped(&self) -> bool {
+            self.cancel.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl Drop for ListingGuard {
+        fn drop(&mut self) {
+            let (mtx, cvar) = &*LISTING_GATE;
+            let mut st = lock(mtx);
+            st.in_flight.remove(&self.id);
+            if st.in_flight.is_empty() {
+                cvar.notify_all();
+            }
+        }
+    }
+
+    /// Enters the Antigravity listing launch gate. Refuses new listings while an account sign-in,
+    /// token sync, or switch is running (`ListingStoppedError`).
+    pub(crate) fn enter_listing() -> Result<ListingGuard, ListingStoppedError> {
+        let (mtx, _) = &*LISTING_GATE;
+        let mut st = lock(mtx);
+        if st.active_ops > 0 {
+            return Err(ListingStoppedError);
+        }
+        let id = st.next_id;
+        st.next_id = st.next_id.saturating_add(1);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        st.in_flight.insert(id, std::sync::Arc::clone(&cancel));
+        Ok(ListingGuard {
+            id,
+            generation: st.generation,
+            cancel,
+        })
+    }
+
+    pub(crate) fn current_listing_generation() -> u64 {
+        let (mtx, _) = &*LISTING_GATE;
+        lock(mtx).generation
+    }
+
+    /// Stops all in-flight `agy` model listings, refuses new listings while `op` runs, and clears
+    /// stale model catalog entries afterward so a stale server cannot race with or delete a new
+    /// token (Orca `fcc3027d` / `#46647`).
+    pub(crate) fn run_account_op<T>(op: impl FnOnce() -> T) -> T {
+        struct OpGuard;
+        impl Drop for OpGuard {
+            fn drop(&mut self) {
+                let (mtx, cvar) = &*LISTING_GATE;
+                let mut st = lock(mtx);
+                st.active_ops = st.active_ops.saturating_sub(1);
+                cvar.notify_all();
+            }
+        }
+        let (mtx, cvar) = &*LISTING_GATE;
+        {
+            let mut st = lock(mtx);
+            st.active_ops = st.active_ops.saturating_add(1);
+            st.generation = st.generation.saturating_add(1);
+            for flag in st.in_flight.values() {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !st.in_flight.is_empty() {
+                let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                if rem.is_zero() {
+                    break;
+                }
+                let (next, res) = cvar
+                    .wait_timeout(st, rem)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st = next;
+                if res.timed_out() {
+                    break;
+                }
+            }
+        }
+        let _guard = OpGuard;
+        let out = op();
+        crate::mobile::evict_agy_models_cache();
+        out
+    }
+
+    /// agy 한 번 실행. 타임아웃·출력 상한·취소 플래그를 지킨다. 파이프 교착을 피하려고 stdout은 별도 스레드에서 읽는다.
+    pub(crate) fn run_agy_cancellable(
         exe: &Path,
         args: &[String],
         ssh_connection: bool,
         timeout: Duration,
         max_bytes: u64,
-    ) -> Option<Vec<u8>> {
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u8>, RunAgyError> {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RunAgyError::Stopped);
+        }
         let mut cmd = Command::new(exe);
         cmd.args(args)
             .stdin(Stdio::null())
@@ -2192,8 +2329,9 @@ pub(crate) mod agy {
         } else {
             cmd.env_remove("SSH_CONNECTION");
         }
-        let mut child = crate::child::spawn(crate::child::own_group(&mut cmd)).ok()?;
-        let stdout = child.stdout.take()?;
+        let mut child = crate::child::spawn(crate::child::own_group(&mut cmd))
+            .map_err(|_| RunAgyError::Failed)?;
+        let stdout = child.stdout.take().ok_or(RunAgyError::Failed)?;
         let reader = std::thread::Builder::new()
             .name("agy-read".into())
             .spawn(move || {
@@ -2203,9 +2341,14 @@ pub(crate) mod agy {
                 stdout.take(limit).read_to_end(&mut buf).ok()?;
                 (u64::try_from(buf.len()).ok()? <= max_bytes).then_some(buf)
             })
-            .ok()?;
+            .map_err(|_| RunAgyError::Failed)?;
         let deadline = Instant::now() + timeout;
+        let mut stopped = false;
         let ok = loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                stopped = true;
+                break false;
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
                 Ok(None) if Instant::now() >= deadline => break false,
@@ -2215,10 +2358,27 @@ pub(crate) mod agy {
         };
         // Drop the job/group before joining stdout so lingering grandchild helpers cannot block EOF.
         drop(child);
-        if !ok {
-            return None;
+        if stopped || cancel.load(std::sync::atomic::Ordering::Acquire) {
+            drop(reader.join());
+            return Err(RunAgyError::Stopped);
         }
-        reader.join().ok()?
+        if !ok {
+            drop(reader.join());
+            return Err(RunAgyError::Failed);
+        }
+        reader.join().ok().flatten().ok_or(RunAgyError::Failed)
+    }
+
+    /// agy 한 번 실행. 타임아웃·출력 상한을 지킨다. 파이프 교착을 피하려고 stdout은 별도 스레드에서 읽는다.
+    pub(crate) fn run_agy(
+        exe: &Path,
+        args: &[String],
+        ssh_connection: bool,
+        timeout: Duration,
+        max_bytes: u64,
+    ) -> Option<Vec<u8>> {
+        let never = std::sync::atomic::AtomicBool::new(false);
+        run_agy_cancellable(exe, args, ssh_connection, timeout, max_bytes, &never).ok()
     }
 
     // 가짜 agy 실행 파일(셸 스크립트·실행 권한)을 쓰므로 unix 전용이다.

@@ -1049,6 +1049,7 @@ impl View {
             .and_then(|b| b.workspace.clone())
             .filter(|s| !s.trim().is_empty());
         let rpc = self.rpc.clone();
+        let host_name = self.refusal_host_name();
         self.chats.opening = true;
         self.error = None;
         self.open_chat_task = Some(cx.spawn(async move |this, cx| {
@@ -1056,13 +1057,14 @@ impl View {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    call_checked(
+                    rpc::call_checked_on(
                         &rpc,
                         &BotRpcRequest::StartBotSession {
                             bot_id: bot_id_bg,
                             cwd,
                             prompt: None,
                         },
+                        host_name.as_deref(),
                     )
                 })
                 .await;

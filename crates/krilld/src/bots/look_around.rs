@@ -46,6 +46,15 @@ pub struct PersistedMemoryTidyState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredScheduleError {
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<krill_proto::bots::BotSessionRefusal>,
+    #[serde(default)]
+    at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedSchedulerState {
     #[serde(default)]
     look_around_last_run_ms: BTreeMap<BotId, u64>,
@@ -59,6 +68,8 @@ struct PersistedSchedulerState {
     memory_tidy: BTreeMap<BotId, PersistedMemoryTidyState>,
     #[serde(default)]
     cron_claimed_minute: BTreeMap<String, u64>,
+    #[serde(default)]
+    schedule_last_error: BTreeMap<String, StoredScheduleError>,
 }
 
 /// What [`SchedulerStateStore::last_runs`] reads.
@@ -68,6 +79,7 @@ struct LastRuns {
     tidy: Option<u64>,
     tidy_off: bool,
     crons: BTreeMap<String, u64>,
+    cron_errors: BTreeMap<String, StoredScheduleError>,
 }
 
 /// Strictly-lazy durable scheduler state store (`<bots_root>/scheduler-state.json`).
@@ -287,6 +299,36 @@ impl SchedulerStateStore {
         })
     }
 
+    pub fn record_schedule_error(
+        &self,
+        bot_id: &BotId,
+        sched_id: &str,
+        message: String,
+        refusal: Option<krill_proto::bots::BotSessionRefusal>,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        let key = format!("{}:{sched_id}", bot_id.as_str());
+        self.with_state_mut(|st| {
+            st.schedule_last_error.insert(
+                key,
+                StoredScheduleError {
+                    message,
+                    refusal,
+                    at_ms: now_ms,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    pub fn clear_schedule_error(&self, bot_id: &BotId, sched_id: &str) -> io::Result<()> {
+        let key = format!("{}:{sched_id}", bot_id.as_str());
+        self.with_state_mut(|st| {
+            st.schedule_last_error.remove(&key);
+            Ok(())
+        })
+    }
+
     /// When `bot_id` last looked around and last tidied, whether tidying turned itself off, and
     /// the epoch minute each of its schedules last fired, for its Home.
     fn last_runs(&self, bot_id: &BotId) -> LastRuns {
@@ -302,6 +344,11 @@ impl SchedulerStateStore {
                     .iter()
                     .filter_map(|(k, m)| Some((k.strip_prefix(&prefix)?.to_owned(), *m)))
                     .collect(),
+                cron_errors: st
+                    .schedule_last_error
+                    .iter()
+                    .filter_map(|(k, err)| Some((k.strip_prefix(&prefix)?.to_owned(), err.clone())))
+                    .collect(),
             }
         })
         .unwrap_or_default()
@@ -316,6 +363,8 @@ impl SchedulerStateStore {
             st.dismissed_suggestions.remove(bot_id);
             st.memory_tidy.remove(bot_id);
             st.cron_claimed_minute
+                .retain(|k, _| !k.starts_with(&prefix));
+            st.schedule_last_error
                 .retain(|k, _| !k.starts_with(&prefix));
             Ok(())
         })
@@ -772,6 +821,7 @@ pub fn bot_upcoming(
         tidy: tidy_last,
         tidy_off,
         crons,
+        cron_errors,
     } = state.last_runs(&bot.id);
     let tz = bot.schedules.iter().find_map(|s| s.timezone.as_deref());
     let after = |last: Option<u64>, interval_secs: u64| {
@@ -814,11 +864,14 @@ pub fn bot_upcoming(
                     let utc = i64::try_from(next).ok()?.checked_sub(off)?;
                     u64::try_from(utc).ok()?.checked_mul(60_000)
                 });
+            let last_err = cron_errors.get(&s.id);
             BotScheduleUpcoming {
                 id: s.id.clone(),
                 next_ms,
                 last_ms: crons.get(&s.id).map(|m| m.saturating_mul(60_000)),
                 running: running(&s.id),
+                last_error: last_err.map(|e| e.message.clone()),
+                last_refusal: last_err.and_then(|e| e.refusal.clone()),
             }
         })
         .collect();

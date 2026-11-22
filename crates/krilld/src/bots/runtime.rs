@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use krill_proto::SessionId;
 use krill_proto::agent_history::ChatItemKind;
 use krill_proto::bots::{
-    BOT_QUIET_MARKER, BotConfig, BotId, BotSessionSummary, MemorySnapshot,
-    build_launch_preamble_in, find_bot_template, init_bot_home,
+    BOT_QUIET_MARKER, BotConfig, BotId, BotRpcResponse, BotSessionRefusal, BotSessionSummary,
+    MemorySnapshot, build_launch_preamble_in, find_bot_template, init_bot_home,
 };
 use krill_proto::hook::HookEvent;
 use krill_proto::orchestration::{MessageType, OrchestrationStore, SendParams};
@@ -138,6 +138,45 @@ struct PersistedBotBinding {
     owner_turn_pending: bool,
     #[serde(default)]
     last_prompt: Option<String>,
+}
+
+/// Structured error from starting a bot session (`b10792b6`, `e1779f39`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BotStartError {
+    Refused(BotSessionRefusal),
+    Other(String),
+}
+
+impl BotStartError {
+    #[must_use]
+    pub fn refusal(&self) -> Option<&BotSessionRefusal> {
+        match self {
+            Self::Refused(r) => Some(r),
+            Self::Other(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Refused(r) => r.message_en(Some("this computer")),
+            Self::Other(msg) => msg.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn into_rpc_response(self) -> BotRpcResponse {
+        match self {
+            Self::Refused(r) => BotRpcResponse::SessionRefused(Box::new(r)),
+            Self::Other(msg) => BotRpcResponse::Error(msg),
+        }
+    }
+}
+
+impl std::fmt::Display for BotStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
 }
 
 /// Runtime coordinator tracking live bot sessions and handling hooks/mail/replies.
@@ -304,16 +343,19 @@ impl BotRuntime {
         cwd_override: Option<&str>,
         prompt: Option<&str>,
         link_id: Option<String>,
-    ) -> Result<(SessionId, u32), String> {
+    ) -> Result<(SessionId, u32), BotStartError> {
         let bot = store
             .get_bot(bot_id)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| format!("bot not found: {}", bot_id.as_str()))?;
+            .map_err(|err| BotStartError::Other(err.to_string()))?
+            .ok_or_else(|| BotStartError::Other(format!("bot not found: {}", bot_id.as_str())))?;
         if bot.paused {
-            return Err(format!("bot '{}' is paused", bot.name));
+            return Err(BotStartError::Refused(BotSessionRefusal::bot_paused(
+                &bot.name,
+            )));
         }
 
-        let home = init_bot_home(store.root(), &bot, None).map_err(|err| err.to_string())?;
+        let home = init_bot_home(store.root(), &bot, None)
+            .map_err(|err| BotStartError::Other(err.to_string()))?;
         let soul = store.get_soul(bot_id).unwrap_or_default();
         let memory = store.get_memory(bot_id).unwrap_or_default();
         let launch_cwd = resolve_launch_cwd(&bot, &home, cwd_override);
@@ -343,9 +385,15 @@ impl BotRuntime {
             Ok(None) => Some(
                 relay
                     .mint_grant_for_creds(&bot.id, vec!["krill".to_owned()])
-                    .map_err(|err| format!("failed to prepare bot tool relay: {err}"))?,
+                    .map_err(|err| {
+                        BotStartError::Other(format!("failed to prepare bot tool relay: {err}"))
+                    })?,
             ),
-            Err(err) => return Err(format!("failed to prepare bot tool relay: {err}")),
+            Err(err) => {
+                return Err(BotStartError::Other(format!(
+                    "failed to prepare bot tool relay: {err}"
+                )));
+            }
         };
 
         let mut extra_env: Vec<(Vec<u8>, Vec<u8>)> = vec![
@@ -544,7 +592,7 @@ impl BotRuntime {
                 Some(&formatted),
                 Some(link.id.clone()),
             )
-            .map_err(io::Error::other)?;
+            .map_err(|err| io::Error::other(err.message()))?;
         if let Some(updated) = store.bind_link_session(&link.id, sid, now_ms)? {
             link = updated;
         }
@@ -569,17 +617,19 @@ impl BotRuntime {
             let _ = now_ms;
             return Ok((sid, false));
         }
-        let (sid, _pid) = self.start_bot_session(
-            registry,
-            store,
-            secrets,
-            relay,
-            composio_base_url,
-            bot_id,
-            None,
-            Some(prompt),
-            None,
-        )?;
+        let (sid, _pid) = self
+            .start_bot_session(
+                registry,
+                store,
+                secrets,
+                relay,
+                composio_base_url,
+                bot_id,
+                None,
+                Some(prompt),
+                None,
+            )
+            .map_err(|err| err.message())?;
         Ok((sid, true))
     }
 
@@ -689,13 +739,13 @@ impl BotRuntime {
         composio_base_url: &str,
         bot_id: &BotId,
         now_ms: u64,
-    ) -> Result<(SessionId, u32), String> {
+    ) -> Result<(SessionId, u32), BotStartError> {
         let bot = store
             .get_bot(bot_id)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| format!("bot not found: {}", bot_id.as_str()))?;
+            .map_err(|err| BotStartError::Other(err.to_string()))?
+            .ok_or_else(|| BotStartError::Other(format!("bot not found: {}", bot_id.as_str())))?;
         self.reset_chat(registry, store, relay, bot_id, None, now_ms)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| BotStartError::Other(err.to_string()))?;
         let kickoff_prompt = bot
             .template_id
             .as_deref()
@@ -839,6 +889,7 @@ impl BotRuntime {
     }
 
     /// Hook callback including optional [`GroupCoordinator`] for group-chat reply completion.
+    /// Returns `Some(error_text)` when an idle Antigravity `Stop` ended with `terminationReason: "ERROR"`.
     pub fn on_hook_event_with_groups(
         &self,
         registry: &Registry,
@@ -847,11 +898,9 @@ impl BotRuntime {
         groups: Option<&GroupCoordinator>,
         session_id: SessionId,
         event: &HookEvent,
-    ) {
+    ) -> Option<String> {
         let binding_opt = lock(&self.sessions).get(&session_id).cloned();
-        let Some(binding) = binding_opt else {
-            return;
-        };
+        let binding = binding_opt?;
 
         // 1. Report tool/turn activity to messaging connectors.
         if let Some(activity) = extract_tool_activity(&event.payload)
@@ -862,10 +911,26 @@ impl BotRuntime {
 
         // 2. On turn stop: heal silent MEMORY.md deletions, mark first_run_completed, extract reply.
         if !status::is_turn_stop(&event.payload) {
-            return;
+            return None;
         }
 
         let ts = now_ms();
+        let agy_failed = status::is_agy_stop_failed(&event.payload);
+        if agy_failed {
+            // Quota/provider error Stop: skip transcript read and `first_run_completed`, and report
+            // the provider error text instead of the last progress update (Orca `b342cee0` / `#46999`).
+            let err_text = status::agy_stop_error_message(&event.payload)
+                .unwrap_or_else(|| "Turn failed".to_owned());
+            if let Some(entry) = lock(&self.sessions).get_mut(&session_id) {
+                entry.explicit_reply_posted = false;
+                entry.owner_turn_pending = false;
+            }
+            self.persist_bindings();
+            if let Some(mgr) = connectors {
+                mgr.on_turn_complete(&binding.bot_id, session_id, Some(err_text.as_str()));
+            }
+            return Some(err_text);
+        }
 
         // Heal any silent fact deletions against pre-turn snapshot.
         if let Ok(current_mem) = store.get_memory(&binding.bot_id) {
@@ -943,6 +1008,7 @@ impl BotRuntime {
         if let Some(mgr) = connectors {
             mgr.on_turn_complete(&binding.bot_id, session_id, final_reply.as_deref());
         }
+        None
     }
 
     /// Cleans up session state and revokes the session's ephemeral `BotToolRelay` token.

@@ -1046,6 +1046,22 @@
     Default: "기본",
     Save: "저장",
     Saved: "저장됨",
+    Automations: "자동화",
+    "Couldn’t start the chat": "채팅을 시작하지 못했습니다",
+    "Your {0} CLI is {1}. Chats need {2} or newer.": "{0} CLI 버전이 {1}입니다. 채팅을 시작하려면 {2} 이상이 필요합니다.",
+    "Your {0} CLI is too old. Chats need {1} or newer.": "{0} CLI가 너무 오래되었습니다. 채팅을 시작하려면 {1} 이상이 필요합니다.",
+    "Your {0} CLI is older than chats support.": "{0} CLI 버전이 채팅 지원 기준보다 오래되었습니다.",
+    "{0} CLI is not installed on desktop.": "데스크톱에 {0} CLI가 설치되어 있지 않습니다.",
+    "Bot '{0}' is paused. Resume it to start a chat.": "'{0}' 봇이 일시 정지되었습니다. 재개한 뒤 채팅을 시작하세요.",
+    "This bot is paused. Resume it to start a chat.": "봇이 일시 정지되었습니다. 재개한 뒤 채팅을 시작하세요.",
+    "Agent '{0}' is not available on desktop.": "데스크톱에서 '{0}' 에이전트를 사용할 수 없습니다.",
+    "Couldn’t start {0} chat: {1}": "{0} 채팅을 시작하지 못했습니다: {1}",
+    "Couldn’t start {0} chat.": "{0} 채팅을 시작하지 못했습니다.",
+    "{0} launch configuration is invalid.": "{0} 실행 설정이 올바르지 않습니다.",
+    "Chats are not supported on desktop.": "데스크톱에서 채팅을 지원하지 않습니다.",
+    "Sign in to {0} on desktop to start a chat.": "채팅을 시작하려면 데스크톱에서 {0}에 로그인하세요.",
+    "{0} quota reached: {1}": "{0} 사용량 한도에 도달했습니다: {1}",
+    "{0} usage quota has been reached.": "{0} 사용량 한도에 도달했습니다.",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;

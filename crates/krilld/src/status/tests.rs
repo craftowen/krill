@@ -814,3 +814,64 @@ fn is_turn_stop_distinguishes_final_turn_stop_from_startup_and_mid_turn_hooks() 
         br#"{"hook_event_name":"Stop","isSubagent":true}"#
     ));
 }
+
+#[test]
+fn distinguishes_agy_quota_stop_from_busy_and_successful_turns() {
+    // Mirrors Orca `antigravity-events.test.ts` (#46999).
+    let st = Statuses::open(None);
+    let quota_err =
+        "generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached.";
+    let busy_stop = format!(
+        r#"{{"hook_event_name":"Stop","fullyIdle":false,"terminationReason":"ERROR","error":"{quota_err}","last_assistant_message":"Running the baseline benchmarks."}}"#
+    );
+    let idle_error_stop = format!(
+        r#"{{"hook_event_name":"Stop","fullyIdle":true,"terminationReason":"ERROR","error":"{quota_err}","last_assistant_message":"Running the baseline benchmarks."}}"#
+    );
+    let ok_stop_mentioning_err = format!(
+        r#"{{"hook_event_name":"Stop","fullyIdle":true,"terminationReason":"NO_TOOL_CALL","last_assistant_message":"{quota_err}"}}"#
+    );
+
+    assert!(!super::is_agy_stop_failed(busy_stop.as_bytes()));
+    assert!(super::is_agy_stop_failed(idle_error_stop.as_bytes()));
+    assert_eq!(
+        super::agy_stop_error_message(idle_error_stop.as_bytes()).as_deref(),
+        Some(quota_err)
+    );
+    assert!(!super::is_agy_stop_failed(
+        ok_stop_mentioning_err.as_bytes()
+    ));
+
+    // Start turn -> Working.
+    let e1 = event(1, 10, "agy", r#"{"hook_event_name":"PreInvocation"}"#);
+    st.hook(&[(S1, &e1)]).unwrap();
+    assert_eq!(st.get(S1).state, AgentState::Working);
+    assert!(!st.get(S1).turn_failed());
+
+    // Mid-turn Stop with fullyIdle=false stays Working (not failed).
+    let e2 = event(2, 20, "agy", &busy_stop);
+    st.hook(&[(S1, &e2)]).unwrap();
+    assert_eq!(st.get(S1).state, AgentState::Working);
+    assert!(!st.get(S1).turn_failed());
+    assert_eq!(st.get(S1).turn_error, None);
+
+    // Idle Stop with terminationReason=ERROR ends as failed with error text.
+    let e3 = event(3, 30, "agy", &idle_error_stop);
+    st.hook(&[(S1, &e3)]).unwrap();
+    let failed = st.get(S1);
+    assert_eq!(failed.state, AgentState::Done);
+    assert!(failed.turn_failed());
+    assert_eq!(failed.turn_error.as_deref(), Some(quota_err));
+
+    // Next turn clears turn_error, and a normal NO_TOOL_CALL Stop mentioning the error succeeds.
+    let e4 = event(4, 40, "agy", r#"{"hook_event_name":"PreInvocation"}"#);
+    st.hook(&[(S1, &e4)]).unwrap();
+    assert_eq!(st.get(S1).state, AgentState::Working);
+    assert_eq!(st.get(S1).turn_error, None);
+
+    let e5 = event(5, 50, "agy", &ok_stop_mentioning_err);
+    st.hook(&[(S1, &e5)]).unwrap();
+    let ok = st.get(S1);
+    assert_eq!(ok.state, AgentState::Done);
+    assert!(!ok.turn_failed());
+    assert_eq!(ok.turn_error, None);
+}

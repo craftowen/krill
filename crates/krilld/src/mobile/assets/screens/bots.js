@@ -43,7 +43,77 @@
   const formatText = (ctx) => (s, ...v) =>
     v.reduce((out, val, i) => out.replaceAll(`{${i}}`, String(val)), ctx.t?.(s, ...v) ?? s);
 
+  const refusalAgentLabel = (agent) => {
+    const id = String(agent || "").trim().toLowerCase();
+    if (id === "agy" || id === "antigravity") return "Antigravity";
+    if (id === "claude") return "Claude Code";
+    if (id === "codex") return "Codex";
+    if (id === "opencode" || id === "opencode2") return "OpenCode";
+    if (id === "cursor") return "Cursor";
+    if (id === "hermes") return "Hermes";
+    if (id === "gemini") return "Gemini";
+    return M.agentName?.(id) || agent || "Agent";
+  };
+
+  /** Reads a structured bot chat refusal carried on an RPC error (`e1779f39`, `5fba3d89`). */
+  const readBotRefusal = (err) => {
+    const candidate = err?.data?.refusal || err?.response?.error?.data?.refusal || err?.refusal;
+    return candidate && typeof candidate === "object" && typeof candidate.code === "string"
+      ? candidate
+      : null;
+  };
+
+  /** Formats a bot chat refusal in phone-side words (never calling a paired desktop "this computer"). */
+  const mobileBotRefusalText = (refusal, t) => {
+    if (!refusal || typeof refusal !== "object") return t("Couldn’t start the chat");
+    const agent = refusalAgentLabel(refusal.agent);
+    const detail = typeof refusal.detail === "string" ? refusal.detail.trim() : "";
+    switch (refusal.code) {
+      case "cli_too_old":
+        if (refusal.installed_version && refusal.minimum_version) {
+          return t(
+            "Your {0} CLI is {1}. Chats need {2} or newer.",
+            agent,
+            refusal.installed_version,
+            refusal.minimum_version,
+          );
+        }
+        if (refusal.minimum_version) {
+          return t("Your {0} CLI is too old. Chats need {1} or newer.", agent, refusal.minimum_version);
+        }
+        return t("Your {0} CLI is older than chats support.", agent);
+      case "cli_not_installed":
+        return t("{0} CLI is not installed on desktop.", agent);
+      case "bot_paused":
+        return detail
+          ? t("Bot '{0}' is paused. Resume it to start a chat.", detail)
+          : t("This bot is paused. Resume it to start a chat.");
+      case "unknown_agent":
+        return t("Agent '{0}' is not available on desktop.", agent);
+      case "invalid_launch_config":
+        return detail
+          ? t("Couldn’t start {0} chat: {1}", agent, detail)
+          : t("{0} launch configuration is invalid.", agent);
+      case "host_unsupported":
+        return detail ? t(detail) : t("Chats are not supported on desktop.");
+      case "auth_required":
+        return t("Sign in to {0} on desktop to start a chat.", agent);
+      case "quota_exceeded":
+        return detail
+          ? t("{0} quota reached: {1}", agent, detail)
+          : t("{0} usage quota has been reached.", agent);
+      case "spawn_failed":
+        return detail
+          ? t("Couldn’t start {0} chat: {1}", agent, detail)
+          : t("Couldn’t start {0} chat.", agent);
+      default:
+        return detail ? t(detail) : t("Couldn’t start the chat");
+    }
+  };
+
   const safeMsg = (e, t) => {
+    const refusal = readBotRefusal(e);
+    if (refusal) return mobileBotRefusalText(refusal, t);
     const raw = String(e?.message || e || "").trim();
     if (!raw) return t("Request failed. Check the desktop connection and try again.");
     if (/os error|sqlite|rusqlite|secrets\.enc|vault|dpapi|\/Users\/|\/home\/|\/var\/|\/tmp\/|\\\\/i.test(raw)) {
@@ -117,12 +187,33 @@
     ctx.go(`/bots/${encodeURIComponent(botId)}`);
   };
 
+  /** Ensures a bot's Home Chat starts after an agent switch; resolves with the worded refusal, or null (`5fba3d89`). */
+  async function ensureBotHomeChat(ctx, t, botId, hostId) {
+    try {
+      await rpcHost(ctx, hostId, {
+        action: "bots.chat.open",
+        bot_id: botId,
+      });
+      return null;
+    } catch (error) {
+      const refusal = readBotRefusal(error);
+      return refusal ? mobileBotRefusalText(refusal, t) : null;
+    }
+  }
+
   async function openBotSession(ctx, t, botId, prompt, hostId) {
-    const res = await rpcHost(ctx, hostId, {
-      action: "bots.chat.open",
-      bot_id: botId,
-      ...(prompt ? { prompt } : {}),
-    });
+    let res;
+    try {
+      res = await rpcHost(ctx, hostId, {
+        action: "bots.chat.open",
+        bot_id: botId,
+        ...(prompt ? { prompt } : {}),
+      });
+    } catch (error) {
+      const refusal = readBotRefusal(error);
+      if (refusal) throw Object.assign(Error(mobileBotRefusalText(refusal, t)), { data: error?.data });
+      throw error;
+    }
     const sid = Number(res?.session_id);
     if (!Number.isSafeInteger(sid) || sid <= 0) throw Error(t("Could not open bot chat"));
     if (hostId && ctx.activateHost) ctx.activateHost(hostId);
@@ -1213,6 +1304,7 @@
     let statuses = [];
     let suggestions = [];
     let requests = [];
+    let upcoming = null;
     let avatarInfo = null;
     let includeClosed = false;
     let includeSnoozed = false;
@@ -1236,7 +1328,7 @@
       failure = null;
       draw();
       try {
-        const [botsRes, itemsRes, statusRes, sugRes, accRes] = await Promise.all([
+        const [botsRes, itemsRes, statusRes, sugRes, accRes, upRes] = await Promise.all([
           ctx.rpc({ action: "bots.list", limit: 100 }),
           ctx.rpc({
             action: "bots.items",
@@ -1248,6 +1340,7 @@
           ctx.rpc({ action: "bots.connectors.status", bot_id: botId }),
           ctx.rpc({ action: "bots.suggestions.list", bot_id: botId, include_dismissed: false }),
           ctx.rpc({ action: "bots.access.list", bot_id: botId, limit: 50 }),
+          ctx.rpc({ action: "bots.upcoming", bot_id: botId }).catch(() => null),
         ]);
         if (ctx.signal.aborted || seq !== loadSeq) return;
         bot = (botsRes?.bots || []).find((b) => b.id === botId) || null;
@@ -1257,6 +1350,7 @@
         statuses = statusRes?.statuses || [];
         suggestions = sugRes?.suggestions || [];
         requests = accRes?.requests || [];
+        upcoming = upRes && typeof upRes === "object" ? upRes : null;
         if (bot?.avatar && !avatarInfo) {
           ctx.rpc({ action: "bots.avatar.read", bot_id: botId })
             .then((av) => {
@@ -1441,6 +1535,7 @@
           const nextAgent = agentSelect.value || "claude";
           const nextModel = modelSelect.value || "";
           const nextEffort = effortSelect.value || "";
+          const agentChanged = nextAgent !== curAgent;
           const res = await ctx.rpc({
             action: "bots.update",
             bot_id: botId,
@@ -1450,7 +1545,12 @@
           });
           if (res?.bot) bot = res.bot;
           ctx.closeSheet?.();
-          ctx.toast?.(t("Saved"));
+          if (agentChanged && !bot?.paused) {
+            const refusal = await ensureBotHomeChat(ctx, t, botId);
+            ctx.toast?.(refusal || t("Saved"), refusal ? 3000 : undefined);
+          } else {
+            ctx.toast?.(t("Saved"));
+          }
           await refreshHost(ctx, null)?.catch?.(() => {});
           await load();
         };
@@ -1503,6 +1603,30 @@
         top.append(left, actions);
         hero.append(top);
         nodes.push(hero);
+      }
+
+      // Failed automation run cards (`e1779f39`): surface why a scheduled run could not start.
+      const failedRuns = (upcoming?.schedules || []).filter((s) => s?.last_refusal || s?.last_error);
+      if (failedRuns.length) {
+        const autoSec = el("section", undefined, "bots-section");
+        autoSec.append(el("h2", t("Automations"), "section-title"));
+        const group = el("div", undefined, "inset-group");
+        for (const run of failedRuns) {
+          const cfg = (bot?.schedules || []).find((s) => s.id === run.id);
+          const row = el("div", undefined, "bots-row bot-automation-run-row");
+          const main = el("div", undefined, "bots-row-main");
+          const errText = run.last_refusal
+            ? mobileBotRefusalText(run.last_refusal, t)
+            : String(run.last_error || "");
+          main.append(
+            el("strong", cfg?.name || run.id),
+            el("small", errText, "account-error"),
+          );
+          row.append(main, ctx.dot("blocked"));
+          group.append(row);
+        }
+        autoSec.append(group);
+        nodes.push(autoSec);
       }
 
       // Connector health summary

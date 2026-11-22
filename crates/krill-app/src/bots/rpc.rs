@@ -258,12 +258,48 @@ pub fn join_errors(errors: &[String]) -> String {
     seen.join(" | ")
 }
 
-/// Invokes a bot RPC call and promotes [`BotRpcResponse::Error`] into `Err(msg)`.
-pub fn call_checked(call: &BotRpcCall, req: &BotRpcRequest) -> Result<BotRpcResponse, String> {
+/// Localized name for the local computer when wording host-side bot refusals.
+#[must_use]
+pub fn local_host_label() -> &'static str {
+    match crate::i18n::language() {
+        crate::i18n::Language::Ko => "이 컴퓨터",
+        crate::i18n::Language::En => "this computer",
+    }
+}
+
+/// Formats a structured [`krill_proto::bots::BotSessionRefusal`] from the reader's perspective,
+/// naming `host_name` (e.g. `"this computer"` / `"이 컴퓨터"` locally, or the paired server's
+/// display name remotely, or `None` for unnamed paired servers so a remote host is never called
+/// "this computer"). Mirrors Orca `botRefusalText` (`b10792b6`, `e1779f39`).
+#[must_use]
+pub fn bot_refusal_text(
+    refusal: &krill_proto::bots::BotSessionRefusal,
+    host_name: Option<&str>,
+) -> String {
+    match crate::i18n::language() {
+        crate::i18n::Language::Ko => refusal.message_ko(host_name),
+        crate::i18n::Language::En => refusal.message_en(host_name),
+    }
+}
+
+/// Invokes a bot RPC call and promotes [`BotRpcResponse::Error`] and
+/// [`BotRpcResponse::SessionRefused`] into `Err(msg)`, wording refusals for `host_name`.
+pub fn call_checked_on(
+    call: &BotRpcCall,
+    req: &BotRpcRequest,
+    host_name: Option<&str>,
+) -> Result<BotRpcResponse, String> {
     match call(req)? {
         BotRpcResponse::Error(msg) => Err(msg),
+        BotRpcResponse::SessionRefused(refusal) => Err(bot_refusal_text(&refusal, host_name)),
         other => Ok(other),
     }
+}
+
+/// Invokes a bot RPC call and promotes [`BotRpcResponse::Error`] and
+/// [`BotRpcResponse::SessionRefused`] into `Err(msg)`.
+pub fn call_checked(call: &BotRpcCall, req: &BotRpcRequest) -> Result<BotRpcResponse, String> {
+    call_checked_on(call, req, Some(local_host_label()))
 }
 
 /// Unwraps a [`BotRpcResponse`] where only side-effect success (`Ok` / non-Error reply) matters.
