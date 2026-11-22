@@ -341,7 +341,7 @@ pub(super) fn resolved_composer_choices(
 
 impl Shell {
     pub(super) fn render_chat_composer(
-        &self,
+        &mut self,
         pane: super::super::PaneId,
         key: ChatKey,
         input_state: &gpui::Entity<TextareaState>,
@@ -812,7 +812,128 @@ impl Shell {
                 })
         });
 
-        let attachment_chips = (!attachments.is_empty()).then(|| {
+        // Orca NativeChatComposerField: numbered image thumbnails above the prompt, the
+        // matching `Image #n` pills, then any other files as chips.
+        let image_slots: Vec<(usize, std::path::PathBuf)> = attachments
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.is_image)
+            .map(|(idx, a)| (idx, a.path.clone()))
+            .collect();
+        let image_paths: Vec<std::path::PathBuf> =
+            image_slots.iter().map(|(_, path)| path.clone()).collect();
+        let image_numbers: Vec<usize> = (1..=image_paths.len()).collect();
+        let file_attachments: Vec<(usize, DraftAttachment)> = attachments
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.is_image)
+            .map(|(idx, a)| (idx, a.clone()))
+            .collect();
+        let image_thumbs = (!image_slots.is_empty()).then(|| {
+            let mut row = div()
+                .id(SharedString::from(format!(
+                    "chat-attachment-images-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-attachment-images".into())
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .px_1()
+                .pt_1p5()
+                .mb_2();
+            for (n, (idx, path)) in image_slots.iter().enumerate() {
+                let idx = *idx;
+                let loaded = self.chat_thumbnail(path, cx);
+                let number = n + 1;
+                let remove_key = key.clone();
+                let open_paths = image_paths.clone();
+                let open_numbers = image_numbers.clone();
+                let label = format!(
+                    "{}: {}",
+                    ctext::IMAGE_NUMBER.format(&[("number", &number.to_string())]),
+                    ctext::IMAGE_VIEW.get()
+                );
+                let tile = super::images::image_tile(
+                    SharedString::from(format!("chat-attachment-image-{idx}-{}", pane.get())),
+                    &loaded,
+                    super::images::COMPOSER_TILE,
+                    Some(number),
+                    palette,
+                )
+                .debug_selector(move || format!("chat-attachment-image-{n}"))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_chat_image_viewer(
+                        open_paths.clone(),
+                        open_numbers.clone(),
+                        n,
+                        window,
+                        cx,
+                    );
+                }))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-attachment-remove-{idx}-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(move || format!("chat-attachment-remove-{idx}"))
+                        .absolute()
+                        .top(px(-6.))
+                        .right(px(-6.))
+                        .size_4()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.background)
+                        .text_color(palette.muted_foreground)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(palette.accent).text_color(palette.accent_foreground))
+                        .tooltip(|window, cx| {
+                            Tooltip::new(ctext::ATTACH_REMOVE.get()).build(window, cx)
+                        })
+                        .child(Icon::new(IconName::Close).size(px(12.)))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remove_chat_attachment(&remove_key, idx, cx);
+                        })),
+                );
+                row = row.child(tile);
+            }
+            row
+        });
+        let image_pills = (!image_slots.is_empty()).then(|| {
+            div()
+                .debug_selector(|| "chat-attachment-image-pills".into())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .px_1p5()
+                .children((1..=image_slots.len()).map(|number| {
+                    div()
+                        .debug_selector(move || format!("chat-attachment-image-pill-{number}"))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.secondary)
+                        .px_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(palette.muted_foreground)
+                        .child(Icon::new(gpui_kit_assets::IconName::Image).size(px(12.)))
+                        .child(ctext::IMAGE_NUMBER.format(&[("number", &number.to_string())]))
+                }))
+        });
+        let attachment_chips = (!file_attachments.is_empty()).then(|| {
             div()
                 .id(SharedString::from(format!(
                     "chat-attachment-chips-{}",
@@ -825,22 +946,13 @@ impl Shell {
                 .gap_1p5()
                 .px_1p5()
                 .pt_0p5()
-                .children(attachments.iter().enumerate().map(|(idx, attachment)| {
+                .children(file_attachments.into_iter().map(|(idx, attachment)| {
                     let remove_key = key.clone();
-                    let label = if attachment.is_image {
-                        format!(
-                            "{} ({}, {})",
-                            attachment.display_name,
-                            ctext::ATTACH_IMAGE_BADGE.get(),
-                            super::catalog::format_byte_len(attachment.byte_len)
-                        )
-                    } else {
-                        format!(
-                            "{} ({})",
-                            attachment.display_name,
-                            super::catalog::format_byte_len(attachment.byte_len)
-                        )
-                    };
+                    let label = format!(
+                        "{} ({})",
+                        attachment.display_name,
+                        super::catalog::format_byte_len(attachment.byte_len)
+                    );
                     div()
                         .id(SharedString::from(format!(
                             "chat-attachment-chip-{idx}-{}",
@@ -860,13 +972,9 @@ impl Shell {
                         .text_size(ui::TEXT_XS)
                         .text_color(palette.foreground)
                         .child(
-                            Icon::new(if attachment.is_image {
-                                gpui_kit_assets::IconName::Image
-                            } else {
-                                gpui_kit_assets::IconName::File
-                            })
-                            .size(px(ui::ICON_SM))
-                            .text_color(palette.muted_foreground),
+                            Icon::new(gpui_kit_assets::IconName::File)
+                                .size(px(ui::ICON_SM))
+                                .text_color(palette.muted_foreground),
                         )
                         .child(div().min_w_0().truncate().child(label))
                         .child(
@@ -1298,6 +1406,8 @@ impl Shell {
             .children(model_picker)
             .children(autocomplete_popover)
             .children(queued_strip)
+            .children(image_thumbs)
+            .children(image_pills)
             .children(attachment_chips)
             .child(
                 Textarea::new(input_state)

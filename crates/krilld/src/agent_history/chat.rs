@@ -408,31 +408,36 @@ fn poll_transcript_file_until(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let ends_with_newline = line.last() == Some(&b'\n');
-        if !ends_with_newline {
+        let mut n_u64 = u64::try_from(n).unwrap_or(0);
+        if line.last() == Some(&b'\n') {
+            batch_bytes = batch_bytes.saturating_add(n_u64);
+        } else {
             if n < max_line {
                 // 에이전트가 아직 줄바꿈 전까지 flush 중인 부분 줄이면 오프셋을 전진하지 않는다.
                 break;
             }
             // 단일 JSONL 줄이 512 KiB(MAX_POLL_BYTES)를 초과한 경우:
             // 8 KiB 고정 버퍼로 줄 끝(`\n`)까지 스캔해 오프셋 고착(무한 루프)을 방지한다.
-            let mut skipped = u64::try_from(n).unwrap_or(0);
+            // 대부분은 붙여 넣은 스크린샷의 base64라, 그것만 걸러 낸 나머지가 상한 안이면 그대로 읽는다.
+            let mut filter = InlineImageFilter::default();
+            let mut reduced = Vec::new();
+            filter.feed(&line, &mut reduced, max_line);
+            let mut skipped = n_u64;
             let mut found_newline = false;
             while skipped < MAX_SKIP_BYTES {
                 let buf = match reader.fill_buf() {
                     Ok([]) | Err(_) => break,
                     Ok(b) => b,
                 };
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let step = pos + 1;
-                    reader.consume(step);
-                    skipped = skipped.saturating_add(u64::try_from(step).unwrap_or(0));
+                let newline = buf.iter().position(|&b| b == b'\n');
+                let step = newline.map_or(buf.len(), |pos| pos + 1);
+                filter.feed(buf.get(..step).unwrap_or(buf), &mut reduced, max_line);
+                reader.consume(step);
+                skipped = skipped.saturating_add(u64::try_from(step).unwrap_or(0));
+                if newline.is_some() {
                     found_newline = true;
                     break;
                 }
-                let len = buf.len();
-                reader.consume(len);
-                skipped = skipped.saturating_add(u64::try_from(len).unwrap_or(0));
             }
             if !found_newline {
                 // 거대 줄조차 아직 `\n`이 디스크에 기록되지 않았으면 다음 폴링에서 다시 읽는다.
@@ -441,20 +446,27 @@ fn poll_transcript_file_until(
             if !items.is_empty() && items.len() >= MAX_CHAT_ITEMS {
                 break;
             }
-            consumed = consumed.saturating_add(skipped);
-            batch_bytes = batch_bytes.saturating_add(64 * 1024);
-            items.push(ChatItem {
-                kind: ChatItemKind::ToolResult,
-                text: "Skipped oversized entry".into(),
-                ..Default::default()
-            });
-            if items.len() >= MAX_CHAT_ITEMS {
-                break;
+            if filter.overflow {
+                consumed = consumed.saturating_add(skipped);
+                batch_bytes = batch_bytes.saturating_add(64 * 1024);
+                items.push(ChatItem {
+                    kind: ChatItemKind::ToolResult,
+                    text: "Skipped oversized entry".into(),
+                    ..Default::default()
+                });
+                if items.len() >= MAX_CHAT_ITEMS {
+                    break;
+                }
+                continue;
             }
-            continue;
+            // Charge the batch what is parsed, not the dropped image bytes, so the meta record
+            // naming this prompt's images usually lands in the same poll and folds in.
+            // ponytail: a batch can still end between the two; that prompt then shows its images
+            // as a separate bubble.
+            batch_bytes = batch_bytes.saturating_add(u64::try_from(reduced.len()).unwrap_or(0));
+            line = reduced;
+            n_u64 = skipped;
         }
-        let n_u64 = u64::try_from(n).unwrap_or(0);
-        batch_bytes = batch_bytes.saturating_add(n_u64);
         let trimmed = trim_ascii_whitespace(&line);
         if trimmed.is_empty() {
             consumed = consumed.saturating_add(n_u64);
@@ -475,12 +487,23 @@ fn poll_transcript_file_until(
         };
         let mut line_items = Vec::new();
         parse_line_into_items(agent, &val, &mut line_items);
+        // Claude names a prompt's pasted images in the next record: fold them into that prompt.
+        if let [only] = line_items.as_slice()
+            && only.kind == ChatItemKind::User
+            && only.text.is_empty()
+            && let Some(previous) = items.last_mut()
+            && previous.kind == ChatItemKind::User
+        {
+            let paths: Vec<String> = only.file_path.lines().map(str::to_owned).collect();
+            add_image_paths(previous, &paths);
+            line_items.clear();
+        }
         // Only Codex's two representations of the same adjacent event may merge.
         // Separate records with the same text must remain separate messages.
         if previous_codex_record
             .zip(codex_record)
             .is_some_and(|(a, b)| a != b)
-            && let Some(previous) = items.last()
+            && let Some(previous) = items.last_mut()
             && let Some(current) = line_items.first()
             && matches!(
                 current.kind,
@@ -489,6 +512,8 @@ fn poll_transcript_file_until(
             && previous.kind == current.kind
             && previous.text == current.text
         {
+            let paths: Vec<String> = current.file_path.lines().map(str::to_owned).collect();
+            add_image_paths(previous, &paths);
             line_items.remove(0);
             previous_codex_record = None;
         } else {
@@ -1877,6 +1902,13 @@ fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) 
             parse_opencode_value(v, None, out, &mut remaining);
         }
     }
+    for item in out
+        .iter_mut()
+        .skip(start)
+        .filter(|item| item.kind == ChatItemKind::User)
+    {
+        take_leading_image_paths(item);
+    }
     let at = record_time(v);
     if !at.is_empty() {
         for item in out.iter_mut().skip(start) {
@@ -1911,7 +1943,7 @@ fn record_time(v: &Value) -> String {
 
 fn parse_claude_line(v: &Value, out: &mut Vec<ChatItem>) {
     // 압축 요약(`isCompactSummary`)은 모델용 컨텍스트라 Claude Code 화면에도 나오지 않는다.
-    if ["isSidechain", "isMeta", "isCompactSummary"]
+    if ["isSidechain", "isCompactSummary"]
         .iter()
         .any(|k| v.get(*k).and_then(Value::as_bool) == Some(true))
     {
@@ -1923,6 +1955,19 @@ fn parse_claude_line(v: &Value, out: &mut Vec<ChatItem>) {
         .and_then(Value::as_str)
         .unwrap_or("");
     let msg = v.get("message").unwrap_or(v);
+    if v.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        // Claude Code follows a prompt with pasted images by a meta record naming each file
+        // (`[Image: source: …]`). Only those paths are kept; the poll folds them into the prompt.
+        if rec_type == "user" {
+            let paths = content_image_paths(msg);
+            if !paths.is_empty() {
+                let mut item = ChatItem::default();
+                add_image_paths(&mut item, &paths);
+                push_item(out, item);
+            }
+        }
+        return;
+    }
     match rec_type {
         "user" => parse_content_blocks(ChatItemKind::User, msg, out),
         "assistant" => parse_content_blocks(ChatItemKind::Assistant, msg, out),
@@ -2364,7 +2409,50 @@ fn parse_opencode_part(default_kind: ChatItemKind, part: &Value, out: &mut Vec<C
     }
 }
 
+/// Image paths named by a record's text content (a string or text blocks).
+fn content_image_paths(record: &Value) -> Vec<String> {
+    let Some(content) = record.get("content") else {
+        return Vec::new();
+    };
+    if let Some(s) = content.as_str() {
+        return user_image_paths(s);
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            block
+                .as_str()
+                .or_else(|| block.get("text").and_then(Value::as_str))
+        })
+        .flat_map(user_image_paths)
+        .collect()
+}
+
 fn parse_content_blocks(default_kind: ChatItemKind, record: &Value, out: &mut Vec<ChatItem>) {
+    let start = out.len();
+    parse_content_blocks_inner(default_kind, record, out);
+    if default_kind != ChatItemKind::User {
+        return;
+    }
+    let paths = content_image_paths(record);
+    if paths.is_empty() {
+        return;
+    }
+    if let Some(user) = out
+        .get_mut(start..)
+        .and_then(|added| added.iter_mut().find(|i| i.kind == ChatItemKind::User))
+    {
+        add_image_paths(user, &paths);
+    } else {
+        let mut item = ChatItem::default();
+        add_image_paths(&mut item, &paths);
+        push_item(out, item);
+    }
+}
+
+fn parse_content_blocks_inner(default_kind: ChatItemKind, record: &Value, out: &mut Vec<ChatItem>) {
     let Some(content) = record
         .get("content")
         .or_else(|| record.get("text"))
@@ -2901,10 +2989,147 @@ fn clean_user_or_assistant_text(kind: ChatItemKind, raw: &str) -> String {
 }
 
 fn push_item(out: &mut Vec<ChatItem>, item: ChatItem) {
-    if item.text.is_empty() && item.options.is_empty() && item.tool_name.is_empty() {
+    if item.text.is_empty()
+        && item.options.is_empty()
+        && item.tool_name.is_empty()
+        && item.file_path.is_empty()
+    {
         return;
     }
     out.push(item);
+}
+
+/// Drops inline base64 image payloads (`"data":"…"`, `"image_url":"…"`) from an oversized
+/// JSONL record so the prompt text around a pasted screenshot still fits the line cap.
+#[derive(Default)]
+struct InlineImageFilter {
+    skipping: bool,
+    escaped: bool,
+    overflow: bool,
+}
+
+impl InlineImageFilter {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>, cap: usize) {
+        for &b in chunk {
+            if self.overflow {
+                return;
+            }
+            if self.skipping {
+                if self.escaped {
+                    self.escaped = false;
+                    continue;
+                }
+                match b {
+                    b'\\' => {
+                        self.escaped = true;
+                        continue;
+                    }
+                    b'"' => self.skipping = false,
+                    _ => continue,
+                }
+            }
+            if out.len() >= cap {
+                self.overflow = true;
+                return;
+            }
+            out.push(b);
+            if out.ends_with(br#""data":""#) || out.ends_with(br#""image_url":""#) {
+                self.skipping = true;
+            }
+        }
+    }
+}
+
+/// Image paths a user record names: Claude's `[Image: source: <path>]` notes and Codex's
+/// `<image name=[Image #1] path="<path>">` wrappers.
+fn user_image_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("[Image: source: ") {
+        let after = rest.get(at + "[Image: source: ".len()..).unwrap_or("");
+        let end = after.find(']').unwrap_or(after.len());
+        let raw = after.get(..end).unwrap_or("");
+        // Claude appends `, original WxH, displayed at …` when it resized the picture.
+        let path = raw
+            .find(", original ")
+            .map_or(raw, |cut| raw.get(..cut).unwrap_or(raw));
+        if !path.trim().is_empty() {
+            paths.push(path.trim().to_owned());
+        }
+        rest = after.get(end..).unwrap_or("");
+    }
+    let mut rest = text;
+    while let Some(at) = rest.find("<image ") {
+        let tag = rest.get(at..).unwrap_or("");
+        let tag_end = tag.find('>').unwrap_or(tag.len());
+        let head = tag.get(..tag_end).unwrap_or("");
+        if let Some(p) = head.find("path=\"") {
+            let value = head.get(p + "path=\"".len()..).unwrap_or("");
+            let value = value
+                .get(..value.find('"').unwrap_or(value.len()))
+                .unwrap_or("");
+            if !value.trim().is_empty() {
+                paths.push(value.trim().to_owned());
+            }
+        }
+        rest = tag.get(tag_end..).unwrap_or("");
+    }
+    paths
+}
+
+/// Krill sends attachments as shell-quoted paths ahead of the prompt. When the agent keeps them
+/// as text, they become the prompt's images instead of raw temp paths in the bubble.
+fn take_leading_image_paths(item: &mut ChatItem) {
+    const IMAGE_EXTENSIONS: [&str; 9] = [
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic",
+    ];
+    let is_image_file = |token: &str| {
+        let absolute =
+            token.starts_with('/') || token.get(1..3).is_some_and(|s| s == ":\\" || s == ":/");
+        absolute
+            && Path::new(token)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    };
+    let mut rest = item.text.as_str();
+    let mut paths = Vec::new();
+    loop {
+        let s = rest.trim_start();
+        let (token, after) = if let Some(quoted) = s.strip_prefix('\'') {
+            let Some(split) = quoted.split_once('\'') else {
+                break;
+            };
+            split
+        } else {
+            let end = s.find(char::is_whitespace).unwrap_or(s.len());
+            (s.get(..end).unwrap_or(""), s.get(end..).unwrap_or(""))
+        };
+        if !is_image_file(token) {
+            break;
+        }
+        paths.push(token.to_owned());
+        rest = after;
+    }
+    if paths.is_empty() {
+        return;
+    }
+    item.text = rest.trim().to_owned();
+    add_image_paths(item, &paths);
+}
+
+/// Adds `paths` to a user item's `file_path` (one path per line), skipping repeats.
+fn add_image_paths(item: &mut ChatItem, paths: &[String]) {
+    for path in paths {
+        if item.file_path.lines().any(|existing| existing == path) {
+            continue;
+        }
+        if !item.file_path.is_empty() {
+            item.file_path.push('\n');
+        }
+        item.file_path.push_str(path);
+    }
+    item.file_path = bounded(&item.file_path, MAX_CHAT_TEXT);
 }
 
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
@@ -4011,6 +4236,65 @@ mod performance_tests {
             Some((live, "live".into()))
         );
         assert!(id_budget.remaining > 2000);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pasted_image_paths_ride_on_the_user_prompt_even_when_the_record_is_oversized() {
+        let dir = std::env::temp_dir().join(format!("chat-image-paths-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        // A retina screenshot's base64 alone is past the 512 KiB line cap.
+        let base64 = "A".repeat(900 * 1024);
+        let claude_path = dir.join("claude-images.jsonl");
+        let claude_lines = [
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"[Image #1] 왜 이렇게 뜨냐?"}},{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{base64}"}}}}]}}}}"#
+            ),
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"[Image: source: /tmp/krill-paste/a.png]"},{"type":"text","text":"[Image: source: /tmp/claude/images/2.png, original 5200x2742, displayed at 2000x1055.]"}]}}"#.to_owned(),
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"봤습니다"}]}}"#.to_owned(),
+        ];
+        fs::write(&claude_path, format!("{}\n", claude_lines.join("\n"))).unwrap();
+        let mut items = Vec::new();
+        let mut offset = 0;
+        // The oversized record ends its poll batch; keep reading like the app does.
+        for _ in 0..4 {
+            let snap = poll_transcript_file(VaultAgent::Claude, "claude-img", &claude_path, offset);
+            items.extend(snap.items);
+            offset = snap.next_offset;
+        }
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].kind, ChatItemKind::User);
+        assert_eq!(items[0].text, "[Image #1] 왜 이렇게 뜨냐?");
+        assert_eq!(
+            items[0].file_path,
+            "/tmp/krill-paste/a.png\n/tmp/claude/images/2.png"
+        );
+        assert_eq!(items[1].text, "봤습니다");
+
+        let mut raw = ChatItem {
+            text: "/var/folders/x/T/krill-paste/clipboard-1.png '/Users/me/스크린샷 1.PNG' 이거 봐 /tmp/c.png".into(),
+            ..ChatItem::default()
+        };
+        take_leading_image_paths(&mut raw);
+        assert_eq!(raw.text, "이거 봐 /tmp/c.png");
+        assert_eq!(
+            raw.file_path,
+            "/var/folders/x/T/krill-paste/clipboard-1.png\n/Users/me/스크린샷 1.PNG"
+        );
+
+        let codex_path = dir.join("rollout-codex-images.jsonl");
+        let codex_lines = [
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/b.png\">"},{"type":"input_image","image_url":"data:image/png;base64,AAA"},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"이거 봐"}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"이거 봐"}}"#,
+        ];
+        fs::write(&codex_path, format!("{}\n", codex_lines.join("\n"))).unwrap();
+        let snap = poll_transcript_file(VaultAgent::Codex, "codex-img", &codex_path, 0);
+        assert_eq!(snap.items.len(), 1, "{:?}", snap.items);
+        assert_eq!(snap.items[0].text, "이거 봐");
+        assert_eq!(snap.items[0].file_path, "/tmp/b.png");
+
         fs::remove_dir_all(dir).unwrap();
     }
 
