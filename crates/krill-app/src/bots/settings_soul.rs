@@ -526,7 +526,7 @@ impl View {
         let title = div()
             .font_family(ui::FONT_MONO)
             .text_size(ui::TEXT_2XS)
-            .child("MEMORY.md")
+            .child(text::SV_MEMORY_FILE.get())
             .into_any_element();
         let action = div()
             .flex()
@@ -1049,7 +1049,7 @@ impl View {
                             .font_family(ui::FONT_MONO)
                             .text_size(ui::TEXT_2XS)
                             .text_color(p.muted_foreground)
-                            .child(format!("memory/{topic}.md")),
+                            .child(text::SV_TOPIC_FILE.format(&[("topic", &topic)])),
                     )
                     .child(Textarea::new(input).small())
                     .child(
