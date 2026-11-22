@@ -2917,10 +2917,18 @@ fn phase3b_minimap_quote_history_long_paste_reuse_and_conditional_fork(
     assert!(cx.debug_bounds("chat-quote-item").is_some());
     assert!(cx.debug_bounds("chat-reuse-item").is_some());
 
-    // 4th user turn: minimap rail appears; claude agent reveals Fork button.
+    // 4th user turn: minimap rail appears; claude agent reveals Fork on its latest response
+    // (Orca's "Fork from this response").
     snap.agent = "claude".into();
     snap.next_offset = 40;
-    snap.items = vec![make_user("turn four prompt preview")];
+    snap.items = vec![
+        make_user("turn four prompt preview"),
+        ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "four".into(),
+            ..Default::default()
+        },
+    ];
     set_phase2b_session_state(&shell, cx, AgentState::Done, 400);
     shell.update(cx, |s, cx| {
         let log = s.chat.logs.entry(key.clone()).or_default();
@@ -3135,13 +3143,15 @@ fn rate_limit_banner_names_weekly_limit_and_switches_inline_without_settings(
     use std::rc::Rc;
     let (shell, cx, _) = rate_limited_fixture(cx, "chat-rate-limit-inline", true, false);
     let clock = super::rate_limit::reset_clock(RL_RESET).unwrap();
-    let expected = ctext::RATE_LIMIT_RESETS_AT.format(&[
-        ("kind", ctext::RATE_LIMIT_KIND_WEEKLY.get()),
-        ("time", &clock),
-    ]);
     shell.read_with(cx, |s, cx| {
         let info = s.chat_limit_info(&local_key(SESSION), cx);
-        assert_eq!(super::rate_limit::banner_text(info, RL_NOW), expected);
+        assert_eq!(
+            super::rate_limit::banner_words(info, "claude", false),
+            (
+                ctext::LIMIT_TITLE_WEEKLY.format(&[("agent", "Claude")]),
+                ctext::LIMIT_CAN_CONTINUE_AT.format(&[("time", &clock)])
+            )
+        );
     });
     assert!(cx.debug_bounds("chat-rate-limit-text").is_some());
     assert!(cx.debug_bounds("chat-auto-continue-arm").is_some());
@@ -3236,4 +3246,213 @@ fn auto_continue_arms_from_setting_cancels_and_sends_once_after_reset(cx: &mut T
     cx.run_until_parked();
     shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
     assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+}
+
+fn bot_for(session: SessionId, paused: bool) -> krill_app::bots::SidebarBot {
+    let id = krill_proto::bots::BotId::new("orca-like").unwrap();
+    let mut cfg =
+        krill_proto::bots::BotConfig::new(id.clone(), "Shop", "claude", 1_700_000_000_000).unwrap();
+    cfg.paused = paused;
+    cfg.schedules = vec![krill_proto::bots::BotScheduleConfig {
+        id: "s1".into(),
+        name: "Morning triage".into(),
+        cron: "0 9 * * *".into(),
+        prompt: "Triage new issues.".into(),
+        enabled: true,
+        timezone: None,
+    }];
+    let summary = krill_proto::bots::BotSessionSummary {
+        session_id: session,
+        bot_id: id,
+        link_id: None,
+        pid: 1,
+        live: true,
+        working: false,
+        label: String::new(),
+        created_at_ms: 0,
+    };
+    let mut row =
+        krill_app::bots::rpc::sidebar_snapshot(&[cfg], &[], &[], std::slice::from_ref(&summary))
+            .bots
+            .remove(0);
+    row.sessions = vec![summary];
+    row
+}
+
+/// Orca's bot chat rows: the Home pill, the paused banner and its Resume, a settled turn folded
+/// behind "Worked for" that opens on press, a connector sender tag over the words alone, a
+/// schedule's turn as "Scheduled · name" with its instructions, and a memory receipt.
+#[gpui::test]
+fn bot_chat_draws_orca_rows_and_they_open_on_press(cx: &mut TestAppContext) {
+    let at = |kind: ChatItemKind, text: &str, at: &str| ChatItem {
+        kind,
+        text: text.into(),
+        at: at.into(),
+        ..Default::default()
+    };
+    let slack = format!(
+        "[Krill external message via slack | channel: C1 | from: Sam Lee (U1)]\n{}",
+        krill_proto::bots::fence_quoted_text("배포 언제?")
+    );
+    let (shell, cx) = fixture(
+        cx,
+        "chat-bot-orca-rows",
+        vec![
+            at(ChatItemKind::User, "fix it", "2026-11-22T01:00:00Z"),
+            at(ChatItemKind::Assistant, "looking", "2026-11-22T01:00:02Z"),
+            at(ChatItemKind::ToolCall, "Read a.rs", "2026-11-22T01:00:05Z"),
+            at(ChatItemKind::ToolResult, "ok", "2026-11-22T01:00:06Z"),
+            at(ChatItemKind::Assistant, "fixed", "2026-11-22T01:00:16Z"),
+            at(ChatItemKind::User, &slack, "2026-11-22T01:01:00Z"),
+            at(ChatItemKind::Assistant, "tonight", "2026-11-22T01:01:04Z"),
+            at(
+                ChatItemKind::User,
+                "Triage new issues.",
+                "2026-11-22T02:00:00Z",
+            ),
+            at(
+                ChatItemKind::Assistant,
+                "nothing urgent",
+                "2026-11-22T02:00:09Z",
+            ),
+        ],
+    );
+    shell.update(cx, |s, cx| {
+        s.sidebar_bots = vec![bot_for(SESSION, true)];
+        let bot = s.sidebar_bots[0].id.clone();
+        s.chat.bot_notes.insert(
+            bot,
+            (
+                std::time::Instant::now(),
+                memory_notes(&[krill_proto::bots::BotMemoryHistoryEntry {
+                    entry_id: format!("turn-s{}-1-1", SESSION.0),
+                    bot_id: krill_proto::bots::BotId::new("orca-like").unwrap(),
+                    timestamp_ms: 1_795_314_062_000,
+                    actor: "bot:orca-like".into(),
+                    action: "turn".into(),
+                    added: vec!["Ships at 6pm".into()],
+                    removed: Vec::new(),
+                    before_content: String::new(),
+                    after_content: String::new(),
+                    undoable: true,
+                    undone: false,
+                }]),
+            ),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-bot-home-banner").is_some());
+    assert!(cx.debug_bounds("chat-bot-paused-banner").is_some());
+    assert!(cx.debug_bounds("chat-bot-paused-resume").is_some());
+    // The first turn folds its work behind "16s 작업 완료"; its answer stays.
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_none());
+    let bar = cx.debug_bounds("chat-turn-bar-0").unwrap();
+    cx.simulate_click(bar.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-work-run-toggle").is_some());
+    // A connector's message is #189's source card, not an owner bubble.
+    assert!(cx.debug_bounds("chat-asker-tag").is_none());
+    // The schedule's turn, then its instructions on press.
+    let run = cx.debug_bounds("chat-scheduled-run").unwrap();
+    assert!(cx.debug_bounds("chat-scheduled-copy").is_none());
+    cx.simulate_click(run.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-scheduled-copy").is_some());
+    // The memory receipt opens to its Open memory link.
+    let memory = cx.debug_bounds("chat-memory-note").unwrap();
+    assert!(cx.debug_bounds("chat-memory-open").is_none());
+    cx.simulate_click(memory.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-memory-open").is_some());
+    // Orca's message rows: Copy and the time, as icons.
+    assert!(cx.debug_bounds("chat-copy-item").is_some());
+    assert!(cx.debug_bounds("chat-message-time").is_some());
+}
+
+/// The image viewer zooms in and out, fits again, and copies the picture as PNG.
+#[gpui::test]
+fn chat_image_viewer_zooms_fits_and_copies_png(cx: &mut TestAppContext) {
+    let dir = state_path("chat-viewer-zoom");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("pic.png");
+    image::RgbaImage::from_pixel(40, 30, image::Rgba([10, 20, 30, 255]))
+        .save(&png)
+        .unwrap();
+    let (shell, cx) = fixture(cx, "chat-viewer-zoom-ui", vec![]);
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.open_chat_image_viewer(vec![png.clone()], vec![1], 0, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let fit = cx.debug_bounds("chat-image-viewer-fit").unwrap();
+    let zoom_in = cx.debug_bounds("chat-image-viewer-zoom-in").unwrap();
+    cx.simulate_click(zoom_in.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let zoom = shell.read_with(cx, |s, _| s.chat.images.viewer.as_ref().unwrap().zoom);
+    assert!((zoom - 1.25).abs() < 0.001, "{zoom}");
+    cx.simulate_click(fit.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let zoom = shell.read_with(cx, |s, _| s.chat.images.viewer.as_ref().unwrap().zoom);
+    assert!((zoom - 1.).abs() < f32::EPSILON);
+    let copy = cx.debug_bounds("chat-image-viewer-copy").unwrap();
+    cx.simulate_click(copy.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let copied = cx.update(|_, cx| cx.read_from_clipboard());
+    assert!(
+        copied.is_some_and(|item| item.entries().iter().any(|e| matches!(
+            e,
+            gpui::ClipboardEntry::Image(img) if img.bytes.starts_with(b"\x89PNG")
+        ))),
+        "the picture is on the clipboard as PNG"
+    );
+}
+
+/// Orca's create offer card: "New bot", its name and purpose, Not now and Create bot while open;
+/// answered, only its status (and Open once created).
+#[gpui::test]
+fn bot_create_offer_card_offers_create_and_not_now_until_answered(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-bot-offer",
+        vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: "help".into(),
+            ..Default::default()
+        }],
+    );
+    let offer = |dismissed: bool| krill_proto::bots::BotOffer {
+        offer_id: "offer-1".into(),
+        bot_id: krill_proto::bots::BotId::new("orca-like").unwrap(),
+        session_id: Some(SESSION.0),
+        name: "Ledger".into(),
+        purpose: "Keeps the spend sheet.".into(),
+        offered_at_ms: 1,
+        created: None,
+        dismissed,
+    };
+    let show = |shell: &Entity<Shell>, cx: &mut VisualTestContext, dismissed: bool| {
+        shell.update(cx, |s, cx| {
+            s.sidebar_bots = vec![bot_for(SESSION, false)];
+            let bot = s.sidebar_bots[0].id.clone();
+            s.chat.bot_notes.insert(
+                bot,
+                (
+                    std::time::Instant::now(),
+                    offer_notes(vec![offer(dismissed)]),
+                ),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+    };
+    show(&shell, cx, false);
+    assert!(cx.debug_bounds("chat-create-offer").is_some());
+    assert!(cx.debug_bounds("chat-offer-create").is_some());
+    assert!(cx.debug_bounds("chat-offer-not-now").is_some());
+    show(&shell, cx, true);
+    assert!(cx.debug_bounds("chat-create-offer").is_some());
+    assert!(cx.debug_bounds("chat-offer-create").is_none());
 }

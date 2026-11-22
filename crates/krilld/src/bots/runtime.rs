@@ -853,6 +853,19 @@ impl BotRuntime {
         if let Ok(current_mem) = store.get_memory(&binding.bot_id) {
             let (restored_content, restored_facts) =
                 binding.memory_snapshot.restore_missing(&current_mem);
+            // What this turn changed itself, said in its chat. Read before the heal is recorded.
+            let before = binding.memory_snapshot.content();
+            if before != restored_content {
+                store
+                    .record_turn_memory(
+                        &binding.bot_id,
+                        session_id.0,
+                        before,
+                        &restored_content,
+                        ts,
+                    )
+                    .ok();
+            }
             if !restored_facts.is_empty() {
                 store
                     .apply_memory_with_history(

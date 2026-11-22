@@ -1004,7 +1004,8 @@ fn bot_chat_hides_preamble_turn_and_interleaves_item_notes_by_turn_time() {
     };
     // Turns: "first" at 100, "second" at 200 (newest first).
     let notes = [note(150, "between"), note(250, "after"), note(50, "before")];
-    let feed = work_run::DisplayFeed::project_with_notes(0, &items, None, &notes, &[200, 100]);
+    let feed =
+        work_run::DisplayFeed::project_with_notes(0, &items, None, &notes, &[200, 100], None);
     let shape: Vec<String> = feed
         .rows()
         .iter()
@@ -1052,11 +1053,11 @@ fn chat_page_parses_timestamps_and_remote_autocomplete_items_validate_paths() {
     let page = parse_chat_page(&page_json.to_string()).expect("chat page should parse");
     assert_eq!(page.snapshot.items.len(), 1);
     assert_eq!(page.snapshot.items[0].at, "2026-11-21T12:34:56+09:00");
+    // The message time reads the offset (Orca formats it in the viewer's zone): 03:34:56Z.
     assert_eq!(
-        format_chat_timestamp(&page.snapshot.items[0].at).as_deref(),
-        Some("12:34")
+        krill_proto::time::parse_reset_epoch(&page.snapshot.items[0].at),
+        Some(1_795_232_096)
     );
-    assert!(format_chat_timestamp("1732150800").is_some());
 
     let slash_json = serde_json::json!({
         "ok": true,
@@ -1256,4 +1257,94 @@ fn delivered_mail_renders_as_sender_notice_not_owner_bubble() {
         feed.get(1),
         Some(DisplayRow::Item { abs_idx: 1, .. })
     ));
+}
+
+/// Bot chats fold each settled turn behind its answer under a "Worked for" line (Orca's turn
+/// fold); the running turn and an opened one keep their work in view.
+#[test]
+fn bot_chat_folds_settled_turns_behind_their_answer() {
+    let at = |kind: ChatItemKind, text: &str, at: &str| {
+        Arc::new(ChatItem {
+            kind,
+            text: text.into(),
+            at: at.into(),
+            ..Default::default()
+        })
+    };
+    let items = vec![
+        at(ChatItemKind::User, "fix it", "2026-11-22T01:00:00Z"),
+        at(ChatItemKind::Assistant, "looking", "2026-11-22T01:00:02Z"),
+        at(ChatItemKind::ToolCall, "Read a.rs", "2026-11-22T01:00:05Z"),
+        at(ChatItemKind::ToolResult, "ok", "2026-11-22T01:00:06Z"),
+        at(ChatItemKind::Assistant, "fixed", "2026-11-22T01:00:16Z"),
+        at(ChatItemKind::User, "thanks", "2026-11-22T01:01:00Z"),
+        at(ChatItemKind::ToolCall, "Read b.rs", "2026-11-22T01:01:01Z"),
+    ];
+    let shape = |fold: &work_run::TurnFold| -> Vec<String> {
+        work_run::DisplayFeed::project_with_notes(0, &items, None, &[], &[], Some(fold))
+            .rows()
+            .iter()
+            .map(|row| match row {
+                work_run::DisplayRow::Item { item, .. } => item.text.clone(),
+                work_run::DisplayRow::WorkRun(_) => "run".into(),
+                work_run::DisplayRow::TurnBar {
+                    worked_secs,
+                    folds,
+                    expanded,
+                    ..
+                } => format!("bar:{worked_secs}:{folds}:{expanded}"),
+                _ => "other".into(),
+            })
+            .collect()
+    };
+    let live = work_run::TurnFold {
+        live: true,
+        expanded: std::collections::BTreeSet::default(),
+    };
+    assert_eq!(
+        shape(&live),
+        ["fix it", "bar:16:true:false", "fixed", "thanks", "run"]
+    );
+    let opened = work_run::TurnFold {
+        live: false,
+        expanded: [0].into_iter().collect(),
+    };
+    assert_eq!(
+        shape(&opened),
+        [
+            "fix it",
+            "bar:16:true:true",
+            // "looking" is the run's own preamble line.
+            "run",
+            "fixed",
+            "thanks",
+            "bar:1:true:false"
+        ]
+    );
+    assert_eq!(work_run::format_turn_duration(16), "16s");
+    assert_eq!(work_run::format_turn_duration(125), "2m 5s");
+    assert_eq!(work_run::format_turn_duration(3_725), "1h 2m 5s");
+}
+
+/// Orca's memory note summary: counts while one or two kinds changed, a total past that.
+#[test]
+fn memory_receipt_summary_reads_like_orca() {
+    let receipt = |added: usize, removed: usize, other_changes: bool| work_run::MemoryReceipt {
+        added: vec!["a".into(); added],
+        removed: vec!["r".into(); removed],
+        other_changes,
+    };
+    assert_eq!(
+        receipt(1, 0, false).summary(),
+        "메모리 업데이트됨 · 1개 추가"
+    );
+    assert_eq!(
+        receipt(1, 2, false).summary(),
+        "메모리 업데이트됨 · 1개 추가, 2개 제거"
+    );
+    assert_eq!(
+        receipt(1, 1, true).summary(),
+        "메모리 업데이트됨 · 3개 변경"
+    );
+    assert_eq!(receipt(0, 0, false).summary(), "메모리 업데이트됨");
 }

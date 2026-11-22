@@ -313,6 +313,8 @@ pub struct SidebarBot {
     /// Live chats, Home Chat (no external link) first, then newest.
     pub sessions: Vec<BotSessionSummary>,
     pub updated_at_ms: u64,
+    /// Its schedules' names and prompts: a turn one started reads as Orca's "Scheduled · name".
+    pub schedules: Vec<(String, String)>,
 }
 
 impl SidebarBot {
@@ -411,6 +413,11 @@ pub fn sidebar_snapshot(
                         .collect(),
                     sessions: live,
                     updated_at_ms: bot.updated_at_ms,
+                    schedules: bot
+                        .schedules
+                        .iter()
+                        .map(|s| (s.name.clone(), s.prompt.clone()))
+                        .collect(),
                 }
             })
             .collect(),

@@ -786,32 +786,6 @@ impl Shell {
             }
             row
         });
-        let image_pills = (!image_slots.is_empty()).then(|| {
-            div()
-                .debug_selector(|| "chat-attachment-image-pills".into())
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                .px_1p5()
-                .children((1..=image_slots.len()).map(|number| {
-                    div()
-                        .debug_selector(move || format!("chat-attachment-image-pill-{number}"))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(palette.border)
-                        .bg(palette.secondary)
-                        .px_1p5()
-                        .text_size(ui::TEXT_XS)
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(palette.muted_foreground)
-                        .child(Icon::default().data(ui::icons::IMAGE_SVG).size(px(12.)))
-                        .child(ctext::IMAGE_NUMBER.format(&[("number", &number.to_string())]))
-                }))
-        });
         let attachment_chips = (!file_attachments.is_empty()).then(|| {
             div()
                 .id(SharedString::from(format!(
@@ -1286,12 +1260,29 @@ impl Shell {
             .children(autocomplete_popover)
             .children(queued_strip)
             .children(image_thumbs)
-            .children(image_pills)
             .children(attachment_chips)
             .child(
                 Textarea::new(input_state)
                     .small()
                     .appearance(false)
+                    // Orca `NativeChatImageReferencePill`: an image sits in the prompt as a chip
+                    // numbered like its thumbnail, "이미지가 제거됨" once the thumbnail is gone.
+                    .token({
+                        let image_paths = image_paths.clone();
+                        move |token, _, cx| {
+                            let number = token
+                                .token()
+                                .id()
+                                .strip_prefix(super::IMAGE_TOKEN_PREFIX)
+                                .and_then(|path| {
+                                    image_paths
+                                        .iter()
+                                        .position(|p| p.as_os_str() == std::ffi::OsStr::new(path))
+                                })
+                                .map(|ix| ix + 1);
+                            super::image_token_pill(number, token.is_selected(), cx)
+                        }
+                    })
                     .w_full()
                     .min_w_0()
                     .accessibility_id("chat-composer-input")
@@ -1633,6 +1624,8 @@ impl Shell {
 }
 
 impl Shell {
+    /// Orca's `NativeChatUsageLimitRow`: the gauge, "{agent} 사용량 한도에 도달했습니다" with when it
+    /// can continue, then Switch account and the auto-continue clock as icon buttons.
     fn render_rate_limit_banner(&self, key: &ChatKey, cx: &mut Context<Self>) -> AnyElement {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let palette = ui::palette(cx);
@@ -1643,58 +1636,29 @@ impl Shell {
                 && rate_limit::reset_clock(i.reset_at).is_some()
         });
         let scheduled = self.chat.auto_continue.get(key).map(|e| e.reset_at);
-        let text = |message: String| {
-            div()
-                .min_w_0()
-                .text_size(ui::TEXT_SM)
-                .text_color(palette.warning_foreground)
-                .child(message)
-        };
-        let mut actions = div().flex_none().flex().items_center().gap_1();
-        if let Some(reset_at) = scheduled {
-            let time = rate_limit::reset_clock(reset_at).unwrap_or_default();
-            actions = actions
-                .child(
-                    text(ctext::AUTO_CONTINUE_SCHEDULED.format(&[("time", &time)]))
-                        .debug_selector(|| "chat-auto-continue-scheduled".into()),
-                )
-                .child(
-                    Button::new("chat-auto-continue-cancel")
-                        .debug_selector(|| "chat-auto-continue-cancel".into())
-                        .label(ctext::AUTO_CONTINUE_CANCEL.get())
-                        .small()
-                        .ghost()
-                        .on_click(cx.listener({
-                            let key = key.clone();
-                            move |this, _, _, cx| this.cancel_auto_continue(&key, cx)
-                        })),
-                );
-        } else if resumable {
-            actions = actions.child(
-                Button::new("chat-auto-continue-arm")
-                    .debug_selector(|| "chat-auto-continue-arm".into())
-                    .label(ctext::AUTO_CONTINUE_ARM.get())
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener({
-                        let key = key.clone();
-                        move |this, _, _, cx| {
-                            this.arm_auto_continue(&key, cx);
-                        }
-                    })),
-            );
-        }
+        let agent = self
+            .chat
+            .logs
+            .get(key)
+            .map(|log| log.agent.clone())
+            .unwrap_or_default();
+        let (title, status) = rate_limit::banner_words(info, &agent, scheduled.is_some());
+        let muted = palette.muted_foreground;
+        let mut tools = div().flex_none().flex().items_center().gap_0p5();
         let alternatives = self
             .sidebar
             .read(cx)
             .session_account_alternatives(&key.0, key.1);
         let switch = Button::new("chat-switch-account")
             .debug_selector(|| "chat-switch-account".into())
+            .icon(gpui_kit_assets::IconName::ArrowLeftRight)
             .small()
-            .ghost();
+            .ghost()
+            .text_color(muted);
         let switch = if alternatives.is_empty() {
             switch
-                .label(ctext::ADD_ACCOUNT.get())
+                .tooltip(ctext::ADD_ACCOUNT.get())
+                .accessibility_label(ctext::ADD_ACCOUNT.get())
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_settings(krill_app::settings::AdminTab::Accounts, Some(window), cx);
                 }))
@@ -1703,7 +1667,8 @@ impl Shell {
             let shell = cx.weak_entity();
             let key = key.clone();
             switch
-                .label(ctext::SWITCH_ACCOUNT.get())
+                .tooltip(ctext::SWITCH_ACCOUNT.get())
+                .accessibility_label(ctext::SWITCH_ACCOUNT.get())
                 .dropdown_menu(move |mut menu, _, _| {
                     let now = krill_app::accounts::display::now();
                     for (account, label) in &alternatives {
@@ -1749,29 +1714,103 @@ impl Shell {
                 })
                 .into_any_element()
         };
+        tools = tools.child(switch);
+        // The clock: pressed while it will continue by itself (Orca's auto-continue toggle).
+        if let Some(reset_at) = scheduled {
+            let time = rate_limit::reset_clock(reset_at).unwrap_or_default();
+            let label = ctext::LIMIT_CANCEL_AT.format(&[("time", &time)]);
+            tools = tools.child(
+                Button::new("chat-auto-continue-cancel")
+                    .debug_selector(|| "chat-auto-continue-cancel".into())
+                    .icon(gpui_kit_assets::IconName::Clock)
+                    .tooltip(label.clone())
+                    .accessibility_label(label)
+                    .small()
+                    .ghost()
+                    .selected(true)
+                    .on_click(cx.listener({
+                        let key = key.clone();
+                        move |this, _, _, cx| this.cancel_auto_continue(&key, cx)
+                    })),
+            );
+        } else if resumable {
+            tools = tools.child(
+                Button::new("chat-auto-continue-arm")
+                    .debug_selector(|| "chat-auto-continue-arm".into())
+                    .icon(gpui_kit_assets::IconName::Clock)
+                    .tooltip(ctext::LIMIT_TURN_ON_AUTO.get())
+                    .accessibility_label(ctext::LIMIT_TURN_ON_AUTO.get())
+                    .small()
+                    .ghost()
+                    .text_color(muted)
+                    .on_click(cx.listener({
+                        let key = key.clone();
+                        move |this, _, _, cx| {
+                            this.arm_auto_continue(&key, cx);
+                        }
+                    })),
+            );
+        }
         div()
             .id("chat-rate-limit-banner")
             .debug_selector(|| "chat-rate-limit-banner".into())
             .w_full()
             .min_w_0()
             .flex_none()
-            .px_3()
-            .py_2()
             .rounded(ui::RADIUS_MD)
             .border_1()
-            .border_color(palette.warning)
-            .bg(palette.warning.opacity(0.14))
+            .border_color(palette.border)
+            .bg(palette.muted.opacity(0.2))
+            .min_h(gpui::px(40.))
+            .py_1p5()
+            .pl_2p5()
+            .pr_1p5()
             .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_2()
+            .items_start()
+            .gap_x_2()
+            .text_size(ui::TEXT_LG)
             .child(
-                text(rate_limit::banner_text(info, now))
+                div()
                     .flex_1()
-                    .debug_selector(|| "chat-rate-limit-text".into()),
+                    .min_w_0()
+                    .pt_1()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div().flex_none().mt_px().child(
+                            gpui_component::Icon::new(gpui_kit_assets::IconName::Gauge)
+                                .with_size(ui::ICON_LG)
+                                .text_color(palette.warning),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_wrap()
+                            .items_baseline()
+                            .gap_x_1p5()
+                            .child(
+                                div()
+                                    .debug_selector(|| "chat-rate-limit-text".into())
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(palette.foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .when(scheduled.is_some(), |d| {
+                                        d.debug_selector(|| "chat-auto-continue-scheduled".into())
+                                    })
+                                    .text_size(ui::TEXT_SM)
+                                    .text_color(muted)
+                                    .child(status),
+                            ),
+                    ),
             )
-            .child(actions.child(switch))
+            .child(tools)
             .into_any_element()
     }
 }

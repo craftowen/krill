@@ -21,7 +21,7 @@ use super::types::{
     BotGroupView, BotId, BotItem, BotItemDecision, BotItemLink, BotItemStatus, BotItemsPage,
     BotItemsStale, BotLookAroundConfig, BotMcpOAuthState, BotMcpToolConfig, BotMember,
     BotMemoryHistoryEntry, BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo,
-    BotNotifications, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
+    BotNotifications, BotOffer, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
     BotSuggestion, BotToolRelayStatus, ComposioConnectionInfo, DefaultTrackerBots,
     ExternalBotCandidate, ExternalBotSourceApp, ExternalSource, LookAroundEvery, TidyEvery,
 };
@@ -575,6 +575,23 @@ pub enum BotRpcRequest {
         bot_id: BotId,
         member: BotMember,
     },
+    /// A bot proposes a new bot (Orca `bots.createOffer`): its chat shows a card, and nothing is
+    /// created until the owner presses Create bot.
+    OfferBot {
+        bot_id: BotId,
+        name: String,
+        purpose: String,
+    },
+    /// The bot's proposals, newest last (its chat's create offer cards).
+    ListBotOffers {
+        bot_id: BotId,
+    },
+    /// The owner answered a proposal: `created` names the bot made from it, `None` is Not now.
+    ResolveBotOffer {
+        offer_id: String,
+        #[serde(default)]
+        created: Option<BotId>,
+    },
 }
 
 impl BotRpcRequest {
@@ -608,6 +625,7 @@ impl BotRpcRequest {
                 | Self::ListAgentModels { .. }
                 | Self::GetBotUpcoming { .. }
                 | Self::GetBotSettingsExtras { .. }
+                | Self::ListBotOffers { .. }
         )
     }
 }
@@ -1082,6 +1100,25 @@ impl fmt::Debug for BotRpcRequest {
                 .field("bot_id", bot_id)
                 .field("member", &member.id)
                 .finish(),
+            Self::OfferBot {
+                bot_id,
+                name,
+                purpose,
+            } => f
+                .debug_struct("OfferBot")
+                .field("bot_id", bot_id)
+                .field("name", name)
+                .field("purpose_bytes", &purpose.len())
+                .finish(),
+            Self::ListBotOffers { bot_id } => f
+                .debug_struct("ListBotOffers")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::ResolveBotOffer { offer_id, created } => f
+                .debug_struct("ResolveBotOffer")
+                .field("offer_id", offer_id)
+                .field("created", created)
+                .finish(),
         }
     }
 }
@@ -1224,6 +1261,7 @@ pub enum BotRpcResponse {
     AgentModels(BotAgentModels),
     Upcoming(BotUpcoming),
     BotSettingsExtras(BotSettingsExtras),
+    BotOffers(Vec<BotOffer>),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1387,6 +1425,7 @@ impl fmt::Debug for BotRpcResponse {
             Self::BotSettingsExtras(extras) => {
                 f.debug_tuple("BotSettingsExtras").field(extras).finish()
             }
+            Self::BotOffers(offers) => f.debug_tuple("BotOffers").field(offers).finish(),
         }
     }
 }

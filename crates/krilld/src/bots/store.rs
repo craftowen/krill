@@ -23,7 +23,7 @@ use krill_proto::SessionId;
 use krill_proto::bots::{
     ActsFor, BOT_MEMORY_SEED, BotAccessRequest, BotAccessRequestStatus, BotAvatarData, BotConfig,
     BotConnectorConfig, BotEventRuleConfig, BotGroupChat, BotId, BotItemsStale, BotMcpToolConfig,
-    BotMember, BotMemoryHistoryEntry, BotMemoryTopicInfo, BotPackageExportOptions,
+    BotMember, BotMemoryHistoryEntry, BotMemoryTopicInfo, BotOffer, BotPackageExportOptions,
     BotScheduleConfig, BotSettingsExtras, BotSlug, BotSuggestion, CreateBotParams,
     CreateBotV2Params, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
     ExternalConversationLink, ExternalSource, FieldPatch, LookAroundEvery, MAX_AVATAR_PNG_BYTES,
@@ -44,6 +44,7 @@ use crate::bots::memory_history;
 use crate::bots::secrets::ensure_no_symlink_path;
 use crate::session::lock;
 
+const BOT_OFFERS_FILE: &str = "offers.json";
 const BOTS_INDEX_FILE: &str = "bots.json";
 /// Settings Orca keeps on the bot that the wire `BotConfig` can't carry (see `BotSettingsExtras`).
 const SETTINGS_EXTRAS_FILE: &str = "bot-settings.json";
@@ -799,6 +800,89 @@ impl BotStore {
         let home = self.bot_home(&bot);
         ensure_bot_subdirs_safe(&home)?;
         memory_history::list_history(&home, limit)
+    }
+
+    /// Records a bot's proposal of a new bot (Orca `bots.createOffer`). A name an existing bot
+    /// already has is refused, as Orca does, so the card never offers a duplicate.
+    pub fn offer_bot(
+        &self,
+        bot_id: &BotId,
+        session: Option<u64>,
+        name: &str,
+        purpose: &str,
+        now_ms: u64,
+    ) -> io::Result<BotOffer> {
+        let (name, purpose) = (name.trim(), purpose.trim());
+        if name.is_empty() || name.chars().count() > 64 || purpose.chars().count() > 2_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a proposal needs a name (up to 64 characters) and a purpose (up to 2000)",
+            ));
+        }
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        if !bots.iter().any(|b| &b.id == bot_id) {
+            return Err(not_found_bot(bot_id));
+        }
+        if bots.iter().any(|b| b.name.eq_ignore_ascii_case(name)) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Your owner already has a bot named {name}; no card was shown. Pick another name."
+                ),
+            ));
+        }
+        let mut offers: Vec<BotOffer> = self.read_json_or_default(BOT_OFFERS_FILE)?;
+        let offer = BotOffer {
+            offer_id: format!("offer-{now_ms}-{}", offers.len() + 1),
+            bot_id: bot_id.clone(),
+            session_id: session,
+            name: name.to_owned(),
+            purpose: purpose.to_owned(),
+            offered_at_ms: now_ms,
+            created: None,
+            dismissed: false,
+        };
+        offers.push(offer.clone());
+        // ponytail: keeps the newest 200 proposals across bots; per-bot caps if one bot floods.
+        let excess = offers.len().saturating_sub(200);
+        offers.drain(..excess);
+        self.write_json(BOT_OFFERS_FILE, &offers)?;
+        Ok(offer)
+    }
+
+    /// `bot_id`'s proposals, oldest first.
+    pub fn list_bot_offers(&self, bot_id: &BotId) -> io::Result<Vec<BotOffer>> {
+        let offers: Vec<BotOffer> = self.read_json_or_default(BOT_OFFERS_FILE)?;
+        Ok(offers.into_iter().filter(|o| &o.bot_id == bot_id).collect())
+    }
+
+    /// The owner answered a proposal: made `created`, or Not now.
+    pub fn resolve_bot_offer(&self, offer_id: &str, created: Option<BotId>) -> io::Result<()> {
+        let _guard = lock(&self.io_lock);
+        let mut offers: Vec<BotOffer> = self.read_json_or_default(BOT_OFFERS_FILE)?;
+        let offer = offers
+            .iter_mut()
+            .find(|o| o.offer_id == offer_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such bot proposal"))?;
+        offer.dismissed = created.is_none();
+        offer.created = created;
+        self.write_json(BOT_OFFERS_FILE, &offers)
+    }
+
+    /// Records the `MEMORY.md` edit a bot's turn in chat `session` made itself (Orca's turn memory receipt).
+    pub fn record_turn_memory(
+        &self,
+        bot_id: &BotId,
+        session: u64,
+        before: &str,
+        after: &str,
+        now_ms: u64,
+    ) -> io::Result<Option<BotMemoryHistoryEntry>> {
+        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(&bot);
+        ensure_bot_subdirs_safe(&home)?;
+        memory_history::record_turn_change(&home, bot_id, session, before, after, now_ms)
     }
 
     /// Rewrites a single fact line in `MEMORY.md` and records history.
@@ -2381,6 +2465,49 @@ mod tests {
         let updated = store.remove_member(&bot.id, &person, 2_000).unwrap();
         assert!(updated.members.is_empty());
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_bot_proposes_bots_and_the_owner_answers_each_once() {
+        let store = BotStore::new(temp_dir("offers"));
+        let params = |name: &str| CreateBotParams {
+            name: name.to_owned(),
+            agent_id: "claude".to_owned(),
+            description: String::new(),
+            emoji: None,
+            avatar: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            workspace: None,
+            template_id: None,
+            initial_soul: None,
+        };
+        let shop = store.create_bot(params("Shop"), 1_000).unwrap();
+        // An existing name is refused, so no card offers a duplicate.
+        let taken = store.offer_bot(&shop.id, Some(7), "shop", "again", 2_000);
+        assert_eq!(taken.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        let offer = store
+            .offer_bot(
+                &shop.id,
+                Some(7),
+                " Ledger ",
+                "Keeps the spend sheet.",
+                3_000,
+            )
+            .unwrap();
+        assert_eq!((offer.name.as_str(), offer.session_id), ("Ledger", Some(7)));
+        let listed = store.list_bot_offers(&shop.id).unwrap();
+        assert_eq!(listed, vec![offer.clone()]);
+        let ledger = store.create_bot(params("Ledger"), 4_000).unwrap();
+        store
+            .resolve_bot_offer(&offer.offer_id, Some(ledger.id.clone()))
+            .unwrap();
+        let answered = &store.list_bot_offers(&shop.id).unwrap()[0];
+        assert_eq!(answered.created.as_ref(), Some(&ledger.id));
+        assert!(!answered.dismissed);
+        assert!(store.list_bot_offers(&ledger.id).unwrap().is_empty());
+        assert!(store.resolve_bot_offer("missing", None).is_err());
     }
 
     #[test]

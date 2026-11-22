@@ -37,6 +37,7 @@ pub(super) fn local_key(session: SessionId) -> ChatKey {
 
 mod actions;
 mod body;
+mod bot_rows;
 mod catalog;
 mod code_view;
 mod composer;
@@ -186,6 +187,8 @@ pub(crate) struct SessionChatLog {
     pub unread_from: Option<usize>,
     /// A bot chat's item changes and its newest owner turns' times (newest first).
     item_notes: (Vec<Arc<work_run::ItemNote>>, Vec<u64>),
+    /// A bot chat folds each settled turn behind its answer (Orca); `None` elsewhere.
+    turn_fold: Option<work_run::TurnFold>,
 }
 
 impl SessionChatLog {
@@ -200,6 +203,7 @@ impl SessionChatLog {
                     self.unread_from,
                     &self.item_notes.0,
                     &self.item_notes.1,
+                    self.turn_fold.as_ref(),
                 ))
             }
         }))
@@ -209,6 +213,34 @@ impl SessionChatLog {
     pub(super) fn set_item_notes(&mut self, notes: Vec<Arc<work_run::ItemNote>>, turns: Vec<u64>) {
         if self.item_notes.0 != notes || self.item_notes.1 != turns {
             self.item_notes = (notes, turns);
+            self.cached_feed = None;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// Turns the bot chat turn fold on (`Some(live)`: whether the last turn still runs) or off.
+    pub(super) fn set_turn_fold(&mut self, live: Option<bool>) {
+        let next = live.map(|live| work_run::TurnFold {
+            live,
+            expanded: self
+                .turn_fold
+                .as_ref()
+                .map(|f| f.expanded.clone())
+                .unwrap_or_default(),
+        });
+        if self.turn_fold != next {
+            self.turn_fold = next;
+            self.cached_feed = None;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// Opens or closes the work folded behind the turn the prompt at `user_abs_idx` started.
+    pub(super) fn toggle_turn(&mut self, user_abs_idx: usize) {
+        if let Some(fold) = self.turn_fold.as_mut() {
+            if !fold.expanded.remove(&user_abs_idx) {
+                fold.expanded.insert(user_abs_idx);
+            }
             self.cached_feed = None;
             self.revision = self.revision.wrapping_add(1);
         }
@@ -507,6 +539,14 @@ pub(crate) struct ChatState {
     /// Each bot's item changes, as chat lines, and when they were read (Orca's item note rows).
     bot_notes: BTreeMap<krill_proto::bots::BotId, (std::time::Instant, Vec<BotNote>)>,
     bot_notes_tasks: BTreeMap<krill_proto::bots::BotId, Task<()>>,
+    /// Each bot's SOUL.md first paragraph, the persona line its empty chat says (Orca).
+    pub(super) bot_souls: BTreeMap<krill_proto::bots::BotId, String>,
+    /// Memory receipts the reader opened, by their time (Orca's memory note disclosure).
+    pub(super) open_memory_notes: BTreeSet<u64>,
+    /// Images whose chip was put in each composer's text (Orca's inline image reference).
+    pub(super) image_tokens: std::collections::HashMap<ChatKey, BTreeSet<std::path::PathBuf>>,
+    /// When a bot's remote host was first seen down (Orca's outage card counts from there).
+    pub(super) outage_since: BTreeMap<String, std::time::Instant>,
     poll_timer: Option<Task<()>>,
     poll_failed: BTreeSet<ChatKey>,
     lists: BTreeMap<(PaneId, SessionId), ChatList>,
@@ -653,38 +693,6 @@ fn parse_chat_page(raw: &str) -> Option<ChatPage> {
         has_earlier: data.get("has_earlier")?.as_bool()?,
         snapshot,
     })
-}
-
-/// Formats an RFC 3339 or numeric epoch timestamp string into a concise `HH:MM` clock label.
-pub(super) fn format_chat_timestamp(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some((_, clock)) = trimmed.split_once(['T', 't'])
-        && clock.len() >= 5
-        && clock.as_bytes().get(2) == Some(&b':')
-        && clock
-            .get(..2)
-            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_digit()))
-        && clock
-            .get(3..5)
-            .is_some_and(|m| m.bytes().all(|b| b.is_ascii_digit()))
-        && trimmed.contains(['+', '-'])
-        && !trimmed.ends_with(['Z', 'z'])
-    {
-        return clock.get(..5).map(str::to_owned);
-    }
-    let parsed = krill_proto::time::parse_reset_epoch(trimmed)?;
-    let secs = if parsed > 10_000_000_000 {
-        parsed / 1_000
-    } else {
-        parsed
-    };
-    let day_secs = secs.rem_euclid(86_400);
-    let hour = day_secs / 3_600;
-    let minute = (day_secs % 3_600) / 60;
-    Some(format!("{hour:02}:{minute:02}"))
 }
 
 fn ratio_percent(used: u64, limit: u64) -> Option<u8> {
@@ -1276,24 +1284,49 @@ impl Shell {
         {
             let id = bot_id.clone();
             let task = cx.spawn(async move |this, cx| {
-                let request = krill_proto::bots::BotRpcRequest::ListItems {
-                    bot_id: Some(id.clone()),
-                    include_closed: true,
-                };
-                let items = cx
+                use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
+                let bot = id.clone();
+                let (items, soul, memory, offers) = cx
                     .background_executor()
-                    .spawn(async move { rpc(&request) })
+                    .spawn(async move {
+                        (
+                            rpc(&BotRpcRequest::ListItems {
+                                bot_id: Some(bot.clone()),
+                                include_closed: true,
+                            }),
+                            rpc(&BotRpcRequest::GetSoul {
+                                bot_id: bot.clone(),
+                            }),
+                            rpc(&BotRpcRequest::GetMemoryHistory {
+                                bot_id: bot.clone(),
+                                limit: Some(50),
+                            }),
+                            rpc(&BotRpcRequest::ListBotOffers { bot_id: bot }),
+                        )
+                    })
                     .await;
                 this.update(cx, |this, cx| {
                     this.chat.bot_notes_tasks.remove(&id);
-                    let notes = match items {
-                        Ok(krill_proto::bots::BotRpcResponse::Items(items)) => bot_notes(&items),
-                        _ => this
-                            .chat
-                            .bot_notes
-                            .remove(&id)
-                            .map(|(_, n)| n)
-                            .unwrap_or_default(),
+                    if let Ok(BotRpcResponse::Text(soul)) = soul {
+                        match krill_proto::bots::soul_description(&soul) {
+                            Some(line) => this.chat.bot_souls.insert(id.clone(), line),
+                            None => this.chat.bot_souls.remove(&id),
+                        };
+                    }
+                    let previous = this.chat.bot_notes.remove(&id).map(|(_, n)| n);
+                    let notes = match (items, memory) {
+                        (Ok(BotRpcResponse::Items(items)), memory) => {
+                            let mut notes = bot_notes(&items);
+                            if let Ok(BotRpcResponse::MemoryHistory(entries)) = memory {
+                                notes.extend(memory_notes(&entries));
+                            }
+                            if let Ok(BotRpcResponse::BotOffers(offers)) = offers {
+                                notes.extend(offer_notes(offers));
+                            }
+                            notes.sort_by_key(|n| n.note.at_ms);
+                            notes
+                        }
+                        _ => previous.unwrap_or_default(),
                     };
                     this.chat
                         .bot_notes
@@ -2590,8 +2623,11 @@ impl Shell {
                 .get(key)
                 .cloned()
                 .unwrap_or_default();
-            let Some(submitted_payload) = build_submitted_chat_payload(&display_text, &attachments)
-            else {
+            let Some(submitted_payload) = build_chat_payload_with_tokens(
+                &display_text,
+                input.read(cx).tokens(),
+                &attachments,
+            ) else {
                 return;
             };
             self.cancel_auto_continue(key, cx);
@@ -2642,7 +2678,8 @@ impl Shell {
             .get(key)
             .cloned()
             .unwrap_or_default();
-        let Some(submitted_payload) = build_submitted_chat_payload(&display_text, &attachments)
+        let Some(submitted_payload) =
+            build_chat_payload_with_tokens(&display_text, input.read(cx).tokens(), &attachments)
         else {
             return;
         };
@@ -3134,6 +3171,94 @@ fn classify_chat_clipboard_item(item: &gpui::ClipboardItem) -> ChatClipboardCont
         }
     }
     ChatClipboardContent::None
+}
+
+/// The id prefix of an image chip in the composer text (its token id is this and the image path).
+pub(super) const IMAGE_TOKEN_PREFIX: &str = "chat-image:";
+
+/// Orca's composer image chip (`NativeChatPromptPill`, `promptPill` badge): the image icon and
+/// "이미지 #n", or "이미지가 제거됨" with a crossed-out image once it is gone.
+pub(super) fn image_token_pill(
+    number: Option<usize>,
+    selected: bool,
+    cx: &gpui::App,
+) -> gpui::AnyElement {
+    use gpui::prelude::FluentBuilder as _;
+    use gpui::{InteractiveElement as _, IntoElement as _, ParentElement as _, Styled as _};
+    let palette = krill_app::ui::palette(cx);
+    let selector = number.map_or_else(
+        || "chat-attachment-image-pill-removed".to_owned(),
+        |n| format!("chat-attachment-image-pill-{n}"),
+    );
+    gpui::div()
+        .debug_selector(move || selector.clone())
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded_full()
+        .border_1()
+        .border_color(palette.border)
+        .when(number.is_none(), |d| d.border_dashed().opacity(0.7))
+        .when(selected, |d| d.border_color(palette.ring))
+        .bg(palette.secondary)
+        .px_1p5()
+        .text_size(krill_app::ui::TEXT_XS)
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(palette.muted_foreground)
+        .child(
+            gpui_component::Icon::default()
+                .data(if number.is_some() {
+                    krill_app::ui::icons::IMAGE_SVG
+                } else {
+                    krill_app::ui::icons::IMAGE_OFF_SVG
+                })
+                .size(gpui::px(12.)),
+        )
+        .child(number.map_or_else(
+            || ctext::IMAGE_REMOVED.get().to_owned(),
+            |n| ctext::IMAGE_NUMBER.format(&[("number", &n.to_string())]),
+        ))
+        .into_any_element()
+}
+
+/// Orca places a pasted image where its chip sits: each image chip becomes that image's quoted
+/// path in place, a chip whose image was removed drops out, and images without a chip (or other
+/// files) lead the prompt as before.
+pub(super) fn build_chat_payload_with_tokens(
+    display_text: &str,
+    tokens: &[gpui_component::input::InlineTokenSpan],
+    attachments: &[DraftAttachment],
+) -> Option<String> {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let mut text = String::with_capacity(display_text.len());
+    let mut used: Vec<&std::path::Path> = Vec::new();
+    let mut at = 0;
+    for span in tokens {
+        let Some(path) = span.token().id().strip_prefix(IMAGE_TOKEN_PREFIX) else {
+            continue;
+        };
+        let range = span.range();
+        let (Some(before), true) = (display_text.get(at..range.start), range.end >= at) else {
+            continue;
+        };
+        text.push_str(before);
+        if let Some(att) = attachments
+            .iter()
+            .find(|a| a.is_image && a.path.as_os_str() == std::ffi::OsStr::new(path))
+        {
+            let quoted = krill_term::paste::shell_quote(att.path.as_os_str().as_bytes());
+            text.push_str(&String::from_utf8_lossy(&quoted));
+            used.push(&att.path);
+        }
+        at = range.end;
+    }
+    text.push_str(display_text.get(at..).unwrap_or_default());
+    let rest: Vec<DraftAttachment> = attachments
+        .iter()
+        .filter(|a| !used.contains(&a.path.as_path()))
+        .cloned()
+        .collect();
+    build_submitted_chat_payload(&text, &rest)
 }
 
 pub(super) fn build_submitted_chat_payload(
@@ -4006,6 +4131,140 @@ impl Shell {
         cx.notify();
     }
 
+    /// Not now (`created: None`) or the bot made from a proposal, recorded on the proposal.
+    pub(super) fn resolve_bot_offer(
+        &mut self,
+        offer_id: &str,
+        created: Option<krill_proto::bots::BotId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rpc) = self.bot_rpc() else {
+            return;
+        };
+        let request = krill_proto::bots::BotRpcRequest::ResolveBotOffer {
+            offer_id: offer_id.to_owned(),
+            created,
+        };
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { krill_app::bots::rpc::call_checked(&rpc, &request) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(err) = res {
+                    this.notice = Some(err);
+                }
+                // Read the cards again now rather than on the next refresh.
+                this.chat.bot_notes.clear();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Create bot on a proposal: a bot with its name, its purpose as its SOUL.md line, the
+    /// proposer's agent, and the card's mascot (Orca's create offer).
+    pub(super) fn create_offered_bot(
+        &mut self,
+        key: &ChatKey,
+        offer: &krill_proto::bots::BotOffer,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rpc) = self.bot_rpc() else {
+            return;
+        };
+        let agent_id = self
+            .chat_bot(key)
+            .map_or_else(|| "claude".to_owned(), |bot| bot.agent_id.clone());
+        let params = krill_proto::bots::CreateBotParams {
+            name: offer.name.clone(),
+            agent_id,
+            description: offer.purpose.clone(),
+            emoji: None,
+            avatar: view::offer_mascot(offer),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            workspace: None,
+            template_id: None,
+            initial_soul: Some(format!("# {}\n\n{}\n", offer.name, offer.purpose)),
+        };
+        let offer_id = offer.offer_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let request = krill_proto::bots::BotRpcRequest::CreateBot(Box::new(params));
+                    let bot = match krill_app::bots::rpc::call_checked(&rpc, &request)? {
+                        krill_proto::bots::BotRpcResponse::Bot(bot) => bot.id,
+                        other => return Err(format!("unexpected CreateBot response: {other:?}")),
+                    };
+                    krill_app::bots::rpc::call_checked(
+                        &rpc,
+                        &krill_proto::bots::BotRpcRequest::ResolveBotOffer {
+                            offer_id,
+                            created: Some(bot.clone()),
+                        },
+                    )?;
+                    Ok(bot)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(err) = res {
+                    this.notice = Some(err);
+                }
+                this.chat.bot_notes.clear();
+                this.refresh_bots_badge(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Puts a chip for each newly attached image at the caret (Orca inserts the image reference
+    /// where you paste). A chip is put once; deleting it leaves the image attached.
+    pub(super) fn sync_chat_image_tokens(
+        &mut self,
+        key: &ChatKey,
+        input: &gpui::Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let images: Vec<std::path::PathBuf> = self
+            .chat
+            .draft_attachments
+            .get(key)
+            .map(|list| {
+                list.iter()
+                    .filter(|a| a.is_image)
+                    .map(|a| a.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let placed = self.chat.image_tokens.entry(key.clone()).or_default();
+        placed.retain(|path| images.contains(path));
+        for (ix, path) in images.iter().enumerate() {
+            if placed.contains(path) {
+                continue;
+            }
+            placed.insert(path.clone());
+            let number = (ix + 1).to_string();
+            let token = gpui_component::input::InlineToken::new(
+                format!("{IMAGE_TOKEN_PREFIX}{}", path.display()),
+                format!("[Image #{number}]"),
+            )
+            .with_label(ctext::IMAGE_NUMBER.format(&[("number", &number)]));
+            input.update(cx, |state, cx| {
+                state.replace_with_token(token, window, cx).ok();
+            });
+        }
+        if placed.is_empty() {
+            self.chat.image_tokens.remove(key);
+        }
+    }
+
     pub(super) fn remove_chat_attachment(
         &mut self,
         key: &ChatKey,
@@ -4614,7 +4873,7 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
                     .iter()
                     .any(|sec| sec.text.to_lowercase().contains(query_lower))
         }),
-        work_run::DisplayRow::UnreadDivider { .. } => false,
+        work_run::DisplayRow::UnreadDivider { .. } | work_run::DisplayRow::TurnBar { .. } => false,
         work_run::DisplayRow::Notice { notice, .. } => {
             notice.detail.to_lowercase().contains(query_lower)
                 || notice
@@ -4622,10 +4881,21 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
                     .iter()
                     .any(|f| f.to_lowercase().contains(query_lower))
         }
-        work_run::DisplayRow::ItemNote { note, .. } => {
-            note.title.to_lowercase().contains(query_lower)
-                || note.detail.to_lowercase().contains(query_lower)
-        }
+        work_run::DisplayRow::ItemNote { note, .. } => match &note.action {
+            work_run::NoteAction::Memory(receipt) => receipt
+                .added
+                .iter()
+                .chain(&receipt.removed)
+                .any(|fact| fact.to_lowercase().contains(query_lower)),
+            work_run::NoteAction::CreateOffer(offer) => {
+                offer.name.to_lowercase().contains(query_lower)
+                    || offer.purpose.to_lowercase().contains(query_lower)
+            }
+            _ => {
+                note.title.to_lowercase().contains(query_lower)
+                    || note.detail.to_lowercase().contains(query_lower)
+            }
+        },
     }
 }
 
@@ -4634,6 +4904,53 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
 pub(crate) struct BotNote {
     pub note: Arc<work_run::ItemNote>,
     pub session: Option<SessionId>,
+}
+
+/// A bot's proposals of new bots, as cards in the chat that made them (Orca's create offer).
+fn offer_notes(offers: Vec<krill_proto::bots::BotOffer>) -> Vec<BotNote> {
+    use work_run::{ItemNote, NoteAction, NoteActor};
+    offers
+        .into_iter()
+        .map(|offer| BotNote {
+            session: offer.session_id.map(SessionId),
+            note: Arc::new(ItemNote {
+                at_ms: offer.offered_at_ms,
+                actor: NoteActor::Bot,
+                title: offer.name.clone(),
+                action: NoteAction::CreateOffer(Box::new(offer)),
+                status: krill_proto::bots::BotItemStatus::Planned,
+                detail: String::new(),
+            }),
+        })
+        .collect()
+}
+
+/// A bot's own memory edits as chat lines (Orca's turn memory receipts). Owner and housekeeping
+/// edits (tidy, heal) are not said in chat.
+fn memory_notes(entries: &[krill_proto::bots::BotMemoryHistoryEntry]) -> Vec<BotNote> {
+    use work_run::{ItemNote, MemoryReceipt, NoteAction, NoteActor};
+    entries
+        .iter()
+        .filter(|e| e.actor.starts_with("bot:") || e.actor == "bot")
+        .map(|e| {
+            let other_changes = e.added.is_empty() && e.removed.is_empty();
+            BotNote {
+                note: Arc::new(ItemNote {
+                    at_ms: e.timestamp_ms,
+                    actor: NoteActor::Bot,
+                    action: NoteAction::Memory(MemoryReceipt {
+                        added: e.added.clone(),
+                        removed: e.removed.clone(),
+                        other_changes,
+                    }),
+                    title: String::new(),
+                    status: krill_proto::bots::BotItemStatus::Done,
+                    detail: String::new(),
+                }),
+                session: e.turn_session().map(SessionId),
+            }
+        })
+        .collect()
 }
 
 /// A bot's item events as chat lines, oldest first (snoozes are not said in chat).

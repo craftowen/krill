@@ -1520,6 +1520,33 @@ impl BotsManager {
                 Ok(None) => BotRpcResponse::Error(format!("bot not found: {}", bot_id.as_str())),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
+            BotRpcRequest::OfferBot {
+                bot_id,
+                name,
+                purpose,
+            } => match self.store.offer_bot(
+                &bot_id,
+                caller_bot.as_ref().map(|(_, sid)| sid.0),
+                &name,
+                &purpose,
+                ts,
+            ) {
+                Ok(_) => BotRpcResponse::Text(format!(
+                    "Your owner now sees a card proposing {}. Nothing is created until they press Create bot; if they create it, it starts with this purpose in its SOUL.md.",
+                    name.trim()
+                )),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ListBotOffers { bot_id } => match self.store.list_bot_offers(&bot_id) {
+                Ok(offers) => BotRpcResponse::BotOffers(offers),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ResolveBotOffer { offer_id, created } => {
+                match self.store.resolve_bot_offer(&offer_id, created) {
+                    Ok(()) => BotRpcResponse::Ok,
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::GetDefaultTrackerBots => match self.store.get_default_tracker_bots() {
                 Ok(defaults) => BotRpcResponse::DefaultTrackerBots(defaults),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
@@ -1940,7 +1967,11 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ListAgentModels { .. }
         | BotRpcRequest::GetBotUpcoming { .. }
         | BotRpcRequest::GetBotSettingsExtras { .. }
+        | BotRpcRequest::ListBotOffers { .. }
         | BotRpcRequest::SendBotMail { .. } => Ok(()),
+        // A bot proposes bots only from its own chat; the owner answers them.
+        BotRpcRequest::OfferBot { bot_id, .. } if bot_id == caller_bot => Ok(()),
+        BotRpcRequest::OfferBot { .. } => deny("cannot propose a bot for another bot"),
         BotRpcRequest::SendGroupMessage { sender, .. } => {
             let trimmed = sender.trim();
             if trimmed.is_empty()
@@ -2058,7 +2089,8 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::StartComposioConnect { .. }
         | BotRpcRequest::DisconnectComposioAccount { .. }
         | BotRpcRequest::UpdateBotSettingsExtras { .. }
-        | BotRpcRequest::RemoveBotMember { .. } => deny("owner-only bot RPC"),
+        | BotRpcRequest::RemoveBotMember { .. }
+        | BotRpcRequest::ResolveBotOffer { .. } => deny("owner-only bot RPC"),
     }
 }
 
@@ -3648,6 +3680,76 @@ mod tests {
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn a_bot_session_proposes_bots_only_for_itself_and_cannot_answer_them() {
+        use crate::bots::runtime::BotSessionBinding;
+        use krill_proto::bots::MemorySnapshot;
+
+        let state = temp_state("bot-offer-authz");
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        reg.bind_self_arc();
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+        let create = |name: &str| match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: name.to_owned(),
+                agent_id: "claude".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) {
+            BotRpcResponse::Bot(b) => *b,
+            other => panic!("create {name}: {other:?}"),
+        };
+        let alpha = create("Offer Alpha");
+        let beta = create("Offer Beta");
+        let sid = SessionId(711);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            sid,
+            BotSessionBinding {
+                bot_id: alpha.id.clone(),
+                link_id: None,
+                memory_snapshot: MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 11,
+                label: "Alpha".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: false,
+                last_prompt: None,
+            },
+        );
+        let as_bot = |req| mgr.handle_rpc_for_peer(&reg, Some(sid), false, req);
+        let offer = |bot_id: &BotId| BotRpcRequest::OfferBot {
+            bot_id: bot_id.clone(),
+            name: "Ledger".to_owned(),
+            purpose: "Keeps the spend sheet.".to_owned(),
+        };
+        assert!(matches!(as_bot(offer(&alpha.id)), BotRpcResponse::Text(_)));
+        assert!(matches!(as_bot(offer(&beta.id)), BotRpcResponse::Error(_)));
+        let BotRpcResponse::BotOffers(offers) = as_bot(BotRpcRequest::ListBotOffers {
+            bot_id: alpha.id.clone(),
+        }) else {
+            panic!("offers");
+        };
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].session_id, Some(sid.0));
+        let answer = BotRpcRequest::ResolveBotOffer {
+            offer_id: offers[0].offer_id.clone(),
+            created: None,
+        };
+        assert!(matches!(as_bot(answer.clone()), BotRpcResponse::Error(_)));
+        assert!(matches!(mgr.handle_rpc(&reg, answer), BotRpcResponse::Ok));
     }
 
     #[cfg(unix)]

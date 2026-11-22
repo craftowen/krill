@@ -27,16 +27,6 @@ pub(super) enum LimitKind {
 }
 
 impl LimitKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::FiveHour => ctext::RATE_LIMIT_KIND_FIVE_HOUR.get(),
-            Self::Weekly => ctext::RATE_LIMIT_KIND_WEEKLY.get(),
-            Self::Model => ctext::RATE_LIMIT_KIND_MODEL.get(),
-            Self::Extra => ctext::RATE_LIMIT_KIND_EXTRA.get(),
-            Self::Generic => ctext::RATE_LIMIT_KIND_GENERIC.get(),
-        }
-    }
-
     fn of_meter(key: &str) -> Self {
         match key {
             "five_hour" | "5h" => Self::FiveHour,
@@ -123,19 +113,39 @@ pub(super) fn limit_info(snap: &AccountsSnapshot, account_id: &str, now: u64) ->
 }
 
 /// Banner sentence: the limit kind and its local reset clock, or the generic text.
-pub(super) fn banner_text(info: Option<LimitInfo>, now: u64) -> String {
-    info.filter(|i| i.reset_at.saturating_sub(now) <= RESET_HORIZON_SECS)
-        .and_then(|i| Some((i.kind, reset_clock(i.reset_at)?)))
-        .map_or_else(
-            || ctext::RATE_LIMIT_BANNER.get().to_owned(),
-            |(kind, time)| {
-                ctext::RATE_LIMIT_RESETS_AT.format(&[("kind", kind.label()), ("time", &time)])
-            },
-        )
+/// Orca's `NativeChatUsageLimitRow` words: "{agent} 주간 한도에 도달했습니다" and "{time}에 계속 가능"
+/// ("{time}에 계속" once it will continue by itself).
+pub(super) fn banner_words(
+    info: Option<LimitInfo>,
+    agent: &str,
+    scheduled: bool,
+) -> (String, String) {
+    let agent = krill_proto::agent_history::VaultAgent::parse(agent)
+        .map_or_else(|| ctext::LIMIT_AGENT.get(), |a| a.label());
+    let title = match info.map(|i| i.kind) {
+        Some(LimitKind::Weekly) => &ctext::LIMIT_TITLE_WEEKLY,
+        Some(LimitKind::Extra) => &ctext::LIMIT_TITLE_EXTRA,
+        _ => &ctext::LIMIT_TITLE_USAGE,
+    }
+    .format(&[("agent", agent)]);
+    let status = info.and_then(|i| reset_clock(i.reset_at)).map_or_else(
+        || ctext::LIMIT_RESET_UNKNOWN.get().to_owned(),
+        |time| {
+            if scheduled {
+                ctext::LIMIT_CONTINUES_AT.format(&[("time", &time)])
+            } else {
+                ctext::LIMIT_CAN_CONTINUE_AT.format(&[("time", &time)])
+            }
+        },
+    );
+    (title, status)
 }
 
+/// The reset in the reader's clock, as Orca's message times read (`오후 6:18`).
 pub(super) fn reset_clock(epoch: u64) -> Option<String> {
-    display::local_clock(i64::try_from(epoch).ok()?)
+    let epoch = i64::try_from(epoch).ok()?;
+    let now = i64::try_from(display::now()).ok()?;
+    krill_app::chat_message_time(epoch, now).map(|(short, _)| short)
 }
 
 /// A scheduled "continue" prompt for one chat after its limit resets.
@@ -434,20 +444,27 @@ mod tests {
     }
 
     #[test]
-    fn banner_names_the_limit_and_local_reset_clock_within_a_day() {
+    fn banner_names_the_agent_limit_and_when_it_can_continue() {
         let reset_at = NOW + 3_600;
         let info = limit_info(&snap(None, Some(win(100, reset_at))), "main", NOW);
         let clock = reset_clock(reset_at).unwrap();
-        assert_eq!(clock.len(), 5);
         assert_eq!(
-            banner_text(info, NOW),
-            ctext::RATE_LIMIT_RESETS_AT.format(&[
-                ("kind", ctext::RATE_LIMIT_KIND_WEEKLY.get()),
-                ("time", &clock)
-            ])
+            banner_words(info, "claude", false),
+            (
+                "Claude 주간 한도에 도달했습니다".to_owned(),
+                format!("{clock}에 계속 가능")
+            )
         );
-        let far = limit_info(&snap(None, Some(win(100, NOW + 3 * 86_400))), "main", NOW);
-        assert_eq!(banner_text(far, NOW), ctext::RATE_LIMIT_BANNER.get());
-        assert_eq!(banner_text(None, NOW), ctext::RATE_LIMIT_BANNER.get());
+        assert_eq!(
+            banner_words(info, "claude", true).1,
+            format!("{clock}에 계속")
+        );
+        assert_eq!(
+            banner_words(None, "mystery", false),
+            (
+                "에이전트 사용량 한도에 도달했습니다".to_owned(),
+                "초기화 시각 알 수 없음".to_owned()
+            )
+        );
     }
 }

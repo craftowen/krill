@@ -50,7 +50,7 @@ pub use types::{
     BotItemDecision, BotItemEvent, BotItemEventKind, BotItemLink, BotItemStatus, BotItemsPage,
     BotItemsStale, BotLookAroundConfig, BotMcpAuthKind, BotMcpOAuthState, BotMcpToolConfig,
     BotMember, BotMemoryHistoryEntry, BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo,
-    BotNotifications, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
+    BotNotifications, BotOffer, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
     BotSuggestion, BotToolRelayStatus, BotToolServerStatus, BotValidationError, ComposioConfig,
     ComposioConnectionInfo, ConnectorHealthState, DEFAULT_CONNECTOR_POLL_INTERVAL_SECS,
     DEFAULT_LOOK_AROUND_INTERVAL_SECS, DEFAULT_LOOK_AROUND_MAX_SUGGESTIONS,

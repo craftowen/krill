@@ -52,6 +52,50 @@ pub(super) struct ImageViewer {
     pub index: usize,
     pub image: Loaded,
     focus: Option<gpui::FocusHandle>,
+    /// Scale over the fitted picture (Orca `usePanZoomViewport`); 1 is fitted.
+    pub zoom: f32,
+    pub pan: gpui::Point<Pixels>,
+    /// Where the last drag move was, while the picture is being dragged.
+    drag: Option<gpui::Point<Pixels>>,
+    copied_at: Option<std::time::Instant>,
+}
+
+/// Orca `IMAGE_VIEWER_ZOOM_STEP`.
+const ZOOM_STEP: f32 = 1.25;
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 8.;
+
+impl ImageViewer {
+    fn fitted(&self) -> bool {
+        (self.zoom - 1.).abs() < f32::EPSILON && self.pan == gpui::Point::default()
+    }
+
+    fn zoom_by(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        if (self.zoom - 1.).abs() < 0.01 {
+            self.zoom = 1.;
+        }
+    }
+
+    fn fit(&mut self) {
+        self.zoom = 1.;
+        self.pan = gpui::Point::default();
+    }
+}
+
+/// PNG bytes of the picture at `path` for the clipboard (Orca `copyImageAsPng`).
+fn png_bytes(path: &Path) -> Option<Vec<u8>> {
+    if std::fs::metadata(path).ok()?.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(bytes);
+    }
+    let picture = image::load_from_memory(&bytes).ok()?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 #[derive(Default)]
@@ -60,7 +104,7 @@ pub(crate) struct ChatImages {
     pub(super) viewer: Option<ImageViewer>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ChatImages {
     pub(super) fn thumbs_for_test(&self, path: &Path) -> Option<&Loaded> {
         self.thumbs.get(path)
@@ -303,6 +347,10 @@ impl Shell {
             index,
             image: Loaded::Loading,
             focus: None,
+            zoom: 1.,
+            pan: gpui::Point::default(),
+            drag: None,
+            copied_at: None,
         });
         self.load_chat_viewer_image(cx);
         cx.notify();
@@ -361,8 +409,41 @@ impl Shell {
             cx.drop_image(image, Some(window));
         }
         viewer.index = to;
+        viewer.fit();
         self.load_chat_viewer_image(cx);
         cx.notify();
+    }
+
+    /// Orca's Copy as PNG: the picture on show, as PNG, on the clipboard.
+    fn copy_chat_image_png(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .chat
+            .images
+            .viewer
+            .as_ref()
+            .and_then(|v| v.paths.get(v.index).cloned())
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let bytes = cx
+                .background_executor()
+                .spawn(async move { png_bytes(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(bytes) = bytes {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_image(
+                        &gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
+                    ));
+                    if let Some(viewer) = this.chat.images.viewer.as_mut() {
+                        viewer.copied_at = Some(std::time::Instant::now());
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(super) fn close_chat_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -404,12 +485,50 @@ impl Shell {
             },
             |n| ctext::IMAGE_NUMBER.format(&[("number", &n.to_string())]),
         );
+        let viewport = window.viewport_size();
+        // The picture fits 96px clear of the edges; zoomed, it is sized and placed by hand.
+        let area = gpui::size(
+            (viewport.width - px(192.)).max(px(1.)),
+            (viewport.height - px(192.)).max(px(1.)),
+        );
+        let fitted = viewer.fitted();
+        let (zoom, pan) = (viewer.zoom, viewer.pan);
+        let grab = |el: gpui::Img| {
+            el.debug_selector(|| "chat-image-viewer-picture".into())
+                .id("chat-image-viewer-picture")
+                .cursor_grab()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
+                        if let Some(viewer) = this.chat.images.viewer.as_mut() {
+                            viewer.drag = Some(e.position);
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+        };
         let picture = match &viewer.image {
-            Loaded::Ready(image) => img(image.clone())
-                .debug_selector(|| "chat-image-viewer-picture".into())
+            Loaded::Ready(image) if fitted => grab(img(image.clone()))
                 .size_full()
                 .object_fit(ObjectFit::ScaleDown)
                 .into_any_element(),
+            Loaded::Ready(image) => {
+                let size = image.size(0);
+                // Decoded sides are capped at `VIEWER_MAX_SIDE`, so they fit in f32 exactly.
+                let side = |v: i32| f32::from(u16::try_from(v.max(1)).unwrap_or(u16::MAX));
+                let (w, h) = (side(size.width.0), side(size.height.0));
+                let fit = (f32::from(area.width) / w)
+                    .min(f32::from(area.height) / h)
+                    .min(1.);
+                let (dw, dh) = (w * fit * zoom, h * fit * zoom);
+                grab(img(image.clone()))
+                    .absolute()
+                    .left(px((f32::from(area.width) - dw) / 2.) + pan.x)
+                    .top(px((f32::from(area.height) - dh) / 2.) + pan.y)
+                    .w(px(dw))
+                    .h(px(dh))
+                    .into_any_element()
+            }
             Loaded::Loading => Icon::default()
                 .data(ui::icons::IMAGE_SVG)
                 .size(px(ui::ICON_LG))
@@ -439,6 +558,10 @@ impl Shell {
                 .accessibility_label(label)
         };
         let stepping = count > 1;
+        let ready = matches!(viewer.image, Loaded::Ready(_));
+        let copied = viewer
+            .copied_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
         let toolbar = div()
             .absolute()
             .top(px(48.))
@@ -505,6 +628,67 @@ impl Shell {
                     })
                     .child(
                         tool(
+                            "chat-image-viewer-zoom-out",
+                            IconName::Minus,
+                            ctext::IMAGE_ZOOM_OUT.get(),
+                        )
+                        .icon(gpui_kit_assets::IconName::ZoomOut)
+                        .disabled(!ready || zoom <= MIN_ZOOM)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(viewer) = this.chat.images.viewer.as_mut() {
+                                viewer.zoom_by(1. / ZOOM_STEP);
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        tool(
+                            "chat-image-viewer-zoom-in",
+                            IconName::Plus,
+                            ctext::IMAGE_ZOOM_IN.get(),
+                        )
+                        .icon(gpui_kit_assets::IconName::ZoomIn)
+                        .disabled(!ready || zoom >= MAX_ZOOM)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(viewer) = this.chat.images.viewer.as_mut() {
+                                viewer.zoom_by(ZOOM_STEP);
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        tool(
+                            "chat-image-viewer-fit",
+                            IconName::Maximize,
+                            ctext::IMAGE_FIT.get(),
+                        )
+                        .disabled(!ready || fitted)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(viewer) = this.chat.images.viewer.as_mut() {
+                                viewer.fit();
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        tool(
+                            "chat-image-viewer-copy",
+                            if copied {
+                                IconName::Check
+                            } else {
+                                IconName::Copy
+                            },
+                            if copied {
+                                ctext::IMAGE_COPIED_PNG.get()
+                            } else {
+                                ctext::IMAGE_COPY_PNG.get()
+                            },
+                        )
+                        .disabled(!ready)
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_chat_image_png(cx))),
+                    )
+                    .child(
+                        tool(
                             "chat-image-viewer-close",
                             IconName::Close,
                             ctext::IMAGE_CLOSE.get(),
@@ -514,7 +698,6 @@ impl Shell {
                         })),
                     ),
             );
-        let viewport = window.viewport_size();
         let surface = div()
             .id("chat-image-viewer")
             .debug_selector(|| "chat-image-viewer".into())
@@ -539,6 +722,43 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close_chat_image_viewer(window, cx)),
             )
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                let Some(viewer) = this.chat.images.viewer.as_mut() else {
+                    return;
+                };
+                if let Some(last) = viewer.drag {
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        viewer.drag = None;
+                        return;
+                    }
+                    viewer.pan += e.position - last;
+                    viewer.drag = Some(e.position);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    if let Some(viewer) = this.chat.images.viewer.as_mut() {
+                        viewer.drag = None;
+                    }
+                }),
+            )
+            // Orca: a pinch (ctrl + wheel) zooms; scrolling pans a zoomed picture.
+            .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, window, cx| {
+                let Some(viewer) = this.chat.images.viewer.as_mut() else {
+                    return;
+                };
+                let delta = e.delta.pixel_delta(window.line_height());
+                if e.modifiers.control {
+                    viewer.zoom_by((-f32::from(delta.y) / 150.).exp2());
+                } else if !viewer.fitted() {
+                    viewer.pan += delta;
+                } else {
+                    return;
+                }
+                cx.notify();
+            }))
             .child(
                 div()
                     .absolute()

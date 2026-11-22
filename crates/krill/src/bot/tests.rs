@@ -2240,3 +2240,26 @@ fn connector_noop_google_defaults_resolve_bot_json_errors_and_p2_fixes() {
         assert!(USAGE.contains(flag), "missing {flag} in bot USAGE");
     }
 }
+
+#[test]
+fn offer_proposes_a_bot_from_the_bots_own_chat() {
+    assert_eq!(
+        parse_command(
+            &s(&[
+                "offer",
+                "--name",
+                "Ledger",
+                "--purpose",
+                "Keeps the spend sheet."
+            ]),
+            Some("shop")
+        )
+        .unwrap(),
+        BotCommand::Offer {
+            bot: "shop".to_owned(),
+            name: "Ledger".to_owned(),
+            purpose: "Keeps the spend sheet.".to_owned(),
+        }
+    );
+    assert!(parse_command(&s(&["offer", "--name", "Ledger"]), Some("shop")).is_err());
+}
