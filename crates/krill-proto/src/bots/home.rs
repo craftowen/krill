@@ -605,6 +605,7 @@ Which command for which job. What a command prints now is current; an earlier li
 - Proactive suggestions (Look around): `krill bot suggest --title \"...\" --why \"...\" --ask \"...\" [--link <url>]`.\n\
 - Connectors and MCP tools: `krill bot connectors`, `krill bot tools`, plus built-in Krill Bot MCP tools (`/bot-tools/krill/mcp`) when configured in your MCP servers.\n\
 - Other bots & handoffs: `krill bot list`, `krill bot send --to <name> --subject \"...\" --body \"...\"`.\n\
+- Do something later, on a schedule, or once: `krill bot schedules add --name \"...\" --cron \"<min hour day month weekday>\" --prompt \"<what to do then>\" [--timezone <IANA zone>]` (cron is UTC unless `--timezone` names a zone); see, pause, resume, or remove yours with `krill bot schedules ls`, `disable <id>`, `enable <id>`, `rm <id>`. Each run wakes you with the prompt in that schedule's own conversation. For a one-time run, add it with `--id <id>` and a cron for that exact minute and date, and have the prompt end with `krill bot schedules rm <id>`. Set these up yourself; never ask your owner to run a command for them.\n\
 - Code work delegation: start a worker in a fresh worktree (`krill orchestration worker-start --agent {agent} ...`) rather than editing repository code directly from your home folder.",
         agent = config.agent_id
     );

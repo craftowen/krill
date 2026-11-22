@@ -547,20 +547,7 @@ impl BotRuntime {
         now_ms: u64,
     ) -> Result<(SessionId, bool), String> {
         if let Some(sid) = self.live_session_for_bot(registry, bot_id) {
-            {
-                let mut sessions = lock(&self.sessions);
-                if let Some(binding) = sessions.get_mut(&sid) {
-                    binding.explicit_reply_posted = false;
-                    binding.owner_turn_pending = true;
-                    binding.last_prompt = Some(prompt.to_owned());
-                    if let Ok(mem) = store.get_memory(bot_id) {
-                        binding.memory_snapshot = MemorySnapshot::capture(&mem);
-                    }
-                }
-            }
-            self.persist_bindings();
-            self.deliver_serialized_input(registry, sid, prompt.as_bytes(), true)
-                .map_err(|e| e.to_string())?;
+            self.deliver_turn(registry, store, sid, bot_id, prompt)?;
             let _ = now_ms;
             return Ok((sid, false));
         }
@@ -576,6 +563,38 @@ impl BotRuntime {
             None,
         )?;
         Ok((sid, true))
+    }
+
+    /// Delivers `prompt` into the live bot session `sid` as the bot's next turn.
+    pub fn deliver_turn(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        sid: SessionId,
+        bot_id: &BotId,
+        prompt: &str,
+    ) -> Result<(), String> {
+        {
+            let mut sessions = lock(&self.sessions);
+            if let Some(binding) = sessions.get_mut(&sid) {
+                binding.explicit_reply_posted = false;
+                binding.owner_turn_pending = true;
+                binding.last_prompt = Some(prompt.to_owned());
+                if let Ok(mem) = store.get_memory(bot_id) {
+                    binding.memory_snapshot = MemorySnapshot::capture(&mem);
+                }
+            }
+        }
+        self.persist_bindings();
+        self.deliver_serialized_input(registry, sid, prompt.as_bytes(), true)
+            .map_err(|e| e.to_string())
+    }
+
+    /// True while the bot session `sid` is still working on a delivered turn.
+    pub fn turn_running(&self, sid: SessionId) -> bool {
+        lock(&self.sessions)
+            .get(&sid)
+            .is_some_and(|b| b.owner_turn_pending)
     }
 
     /// Stops all live sessions for `bot_id` (or a specific `session_id`) so the next run starts clean.

@@ -32,6 +32,7 @@ use krill_proto::bots::{
     ActsFor, BotAccessRequestStatus, BotConfig, BotConnectorStatus, BotId, BotItemActor,
     BotItemDecision, BotItemStatus, BotRpcRequest, BotRpcResponse, BotSlug, ConnectorHealthState,
     CreateBotItemParams, ExternalConversationLink, ExternalSource, FieldPatch, UpdateBotItemParams,
+    UpdateBotParams,
 };
 use krill_proto::hook::HookEvent;
 use krill_proto::orchestration::OrchestrationStore;
@@ -455,39 +456,55 @@ impl BotsManager {
                     if let Ok(cron) = Cron::parse(&sched.cron)
                         && cron.matches(cal)
                     {
-                        // Skip spawning overlapping cron session if previous run is still live.
-                        let still_live = lock(&self.active_cron_sessions)
-                            .get(&(bot.id.clone(), sched.id.clone()))
-                            .copied()
-                            .is_some_and(|sid| registry.is_session_live(sid));
-                        if still_live {
-                            continue;
-                        }
-                        let fresh = self
-                            .scheduler_state
-                            .try_claim_cron_minute(&bot.id, &sched.id, minute)
-                            .unwrap_or(false);
-                        if fresh
-                            && let Ok((sid, _)) = self.runtime.start_bot_session(
-                                registry,
-                                &self.store,
-                                &self.secrets,
-                                &self.tool_relay,
-                                &self.composio_base_url,
-                                &bot.id,
-                                None,
-                                Some(&sched.prompt),
-                                None,
-                            )
-                        {
-                            lock(&self.active_cron_sessions)
-                                .insert((bot.id.clone(), sched.id.clone()), sid);
-                        }
+                        self.run_schedule(registry, &bot.id, sched, minute);
                     }
                 }
             }
         }))
         .ok();
+    }
+
+    /// Runs one due schedule as its bot. While the schedule's conversation is still on its last
+    /// turn this minute is skipped; once idle, the prompt becomes its next turn instead of a new session.
+    fn run_schedule(
+        &self,
+        registry: &Registry,
+        bot_id: &BotId,
+        sched: &krill_proto::bots::BotScheduleConfig,
+        minute: u64,
+    ) {
+        let key = (bot_id.clone(), sched.id.clone());
+        let target = lock(&self.active_cron_sessions)
+            .get(&key)
+            .copied()
+            .filter(|&sid| registry.is_session_live(sid));
+        if target.is_some_and(|sid| self.runtime.turn_running(sid))
+            || !self
+                .scheduler_state
+                .try_claim_cron_minute(bot_id, &sched.id, minute)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some(sid) = target {
+            self.runtime
+                .deliver_turn(registry, &self.store, sid, bot_id, &sched.prompt)
+                .ok();
+            return;
+        }
+        if let Ok((sid, _)) = self.runtime.start_bot_session(
+            registry,
+            &self.store,
+            &self.secrets,
+            &self.tool_relay,
+            &self.composio_base_url,
+            bot_id,
+            None,
+            Some(&sched.prompt),
+            None,
+        ) {
+            lock(&self.active_cron_sessions).insert(key, sid);
+        }
     }
 
     /// Cleanly shuts down all lazy background components.
@@ -1891,6 +1908,17 @@ fn authorize_bot_session_rpc(
         BotRpcRequest::UpdateItem(params) => {
             ensure_bot_owns_item(items, caller_bot, &params.item_id)
         }
+        // A bot manages its own schedules (Orca `automations create --bot <self>`). A schedule only
+        // wakes the bot with a prompt in its own session, so it grants nothing the bot lacks.
+        BotRpcRequest::UpdateBot(params) if params.schedules.is_some() => {
+            if &params.bot_id != caller_bot {
+                deny("cannot modify another bot's schedules")
+            } else if updates_only_schedules(params) {
+                Ok(())
+            } else {
+                deny("owner-only bot RPC")
+            }
+        }
         BotRpcRequest::AddItemComment { item_id, .. }
         | BotRpcRequest::AddItemLink { item_id, .. } => {
             ensure_bot_owns_item(items, caller_bot, item_id)
@@ -1939,6 +1967,44 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::StartComposioConnect { .. }
         | BotRpcRequest::DisconnectComposioAccount { .. } => deny("owner-only bot RPC"),
     }
+}
+
+/// True when an `UpdateBot` changes nothing but `schedules`. Destructured so a new field must be classified here.
+fn updates_only_schedules(params: &UpdateBotParams) -> bool {
+    let UpdateBotParams {
+        bot_id: _,
+        schedules: _,
+        name,
+        description,
+        emoji,
+        avatar,
+        agent_id,
+        model,
+        effort,
+        permission_mode,
+        workspace,
+        paused,
+        first_run_completed,
+        notifications,
+        look_around,
+        memory_tidy,
+        mcp_tools,
+    } = params;
+    name.is_none()
+        && description.is_none()
+        && emoji.is_unchanged()
+        && avatar.is_unchanged()
+        && agent_id.is_none()
+        && model.is_unchanged()
+        && effort.is_unchanged()
+        && permission_mode.is_none()
+        && workspace.is_unchanged()
+        && paused.is_none()
+        && first_run_completed.is_none()
+        && notifications.is_none()
+        && look_around.is_none()
+        && memory_tidy.is_none()
+        && mcp_tools.is_none()
 }
 
 fn ensure_bot_owns_item(
@@ -3346,6 +3412,146 @@ mod tests {
             ),
             BotRpcResponse::ConnectorTest(ref res) if !res.ok && res.detail.contains("Missing Slack bot token")
         ));
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn bot_session_manages_only_its_own_schedules() {
+        use crate::bots::runtime::BotSessionBinding;
+        use krill_proto::agent::Permission;
+        use krill_proto::bots::{BotScheduleConfig, MemorySnapshot};
+
+        let state = temp_state("bot-sched-authz");
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        reg.bind_self_arc();
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+        let create = |name: &str| match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: name.to_owned(),
+                agent_id: "claude".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) {
+            BotRpcResponse::Bot(b) => *b,
+            other => panic!("create {name}: {other:?}"),
+        };
+        let bot_a = create("Sched Alpha");
+        let bot_b = create("Sched Beta");
+        let bot_sid = SessionId(710);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            bot_sid,
+            BotSessionBinding {
+                bot_id: bot_a.id.clone(),
+                link_id: None,
+                memory_snapshot: MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 10,
+                label: "Alpha".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: false,
+                last_prompt: None,
+            },
+        );
+        // Same shape `krill bot schedules add|rm|enable|disable` sends.
+        let schedules_only = |bot_id: &BotId, schedules: Vec<BotScheduleConfig>| UpdateBotParams {
+            bot_id: bot_id.clone(),
+            name: None,
+            description: None,
+            emoji: FieldPatch::Unchanged,
+            avatar: FieldPatch::Unchanged,
+            agent_id: None,
+            model: FieldPatch::Unchanged,
+            effort: FieldPatch::Unchanged,
+            permission_mode: None,
+            workspace: FieldPatch::Unchanged,
+            paused: None,
+            first_run_completed: None,
+            notifications: None,
+            schedules: Some(schedules),
+            look_around: None,
+            memory_tidy: None,
+            mcp_tools: None,
+        };
+        let call = |params: UpdateBotParams| {
+            mgr.handle_rpc_for_peer(
+                &reg,
+                Some(bot_sid),
+                false,
+                BotRpcRequest::UpdateBot(Box::new(params)),
+            )
+        };
+        let poke = BotScheduleConfig {
+            id: "sched-poke".to_owned(),
+            name: "Poke".to_owned(),
+            cron: "*/30 * * * *".to_owned(),
+            prompt: "Check the Poke thread".to_owned(),
+            enabled: true,
+            timezone: None,
+        };
+
+        // Add, list, and remove its own schedule.
+        assert!(matches!(
+            call(schedules_only(&bot_a.id, vec![poke.clone()])),
+            BotRpcResponse::Bot(ref b) if b.schedules == vec![poke.clone()]
+        ));
+        assert!(matches!(
+            mgr.handle_rpc_for_peer(
+                &reg,
+                Some(bot_sid),
+                false,
+                BotRpcRequest::GetBot {
+                    bot_id: bot_a.id.clone()
+                }
+            ),
+            BotRpcResponse::Bot(ref b) if b.schedules.len() == 1
+        ));
+        assert!(matches!(
+            call(schedules_only(&bot_a.id, Vec::new())),
+            BotRpcResponse::Bot(ref b) if b.schedules.is_empty()
+        ));
+
+        // Another bot's schedules stay out of reach.
+        assert!(matches!(
+            call(schedules_only(&bot_b.id, vec![poke.clone()])),
+            BotRpcResponse::Error(ref e) if e.contains("another bot's schedules")
+        ));
+        // A schedule edit cannot carry other bot settings with it.
+        let mut escalate = schedules_only(&bot_a.id, vec![poke.clone()]);
+        escalate.permission_mode = Some(Permission::Manual);
+        assert!(matches!(
+            call(escalate),
+            BotRpcResponse::Error(ref e) if e.contains("owner-only")
+        ));
+        let mut rename = schedules_only(&bot_a.id, Vec::new());
+        rename.schedules = None;
+        rename.name = Some("Renamed".to_owned());
+        assert!(matches!(
+            call(rename),
+            BotRpcResponse::Error(ref e) if e.contains("owner-only")
+        ));
+        let get =
+            |id: &BotId| match mgr.handle_rpc(&reg, BotRpcRequest::GetBot { bot_id: id.clone() }) {
+                BotRpcResponse::Bot(b) => *b,
+                other => panic!("get bot: {other:?}"),
+            };
+        assert!(get(&bot_b.id).schedules.is_empty());
+        let a = get(&bot_a.id);
+        assert!(a.schedules.is_empty());
+        assert_eq!(a.name, "Sched Alpha");
+        assert_eq!(a.permission_mode, bot_a.permission_mode);
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();
