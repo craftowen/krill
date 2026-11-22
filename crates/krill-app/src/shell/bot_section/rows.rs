@@ -483,7 +483,7 @@ impl Shell {
         };
         let line = self.render_bot_line(bot, facts, p);
         let trailing = self.render_fold_strip(bot, facts, folded, &group, p, cx);
-        let hover = self.bot_hover_card(bot, facts, cx.weak_entity());
+        let hover = self.bot_hover_card(bot, facts, cx.weak_entity(), cx);
 
         div()
             .id(SharedString::from(row_id))
@@ -925,9 +925,10 @@ impl Shell {
         bot: &SidebarBot,
         facts: &BotFacts,
         this: gpui::WeakEntity<Self>,
+        cx: &gpui::App,
     ) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + 'static {
         let bot = bot.clone();
-        let host_label = (!self.launch_host.is_local()).then(|| self.bot_host_label());
+        let host_label = (!self.launch_host.is_local()).then(|| self.bot_host_label(cx));
         let state: String = if bot.paused {
             text::PAUSED_BADGE.get().to_owned()
         } else {

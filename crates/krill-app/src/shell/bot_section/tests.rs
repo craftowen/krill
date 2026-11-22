@@ -33,7 +33,7 @@ fn bot(
     )
     .unwrap();
     cfg.avatar = Some("B1".to_owned());
-    cfg.description = desc.to_owned();
+    desc.clone_into(&mut cfg.description);
     let mut row = krill_app::bots::rpc::sidebar_snapshot(&[cfg], &[], &[], &sessions)
         .bots
         .remove(0);
