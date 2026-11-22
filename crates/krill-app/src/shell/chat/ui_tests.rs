@@ -2257,16 +2257,19 @@ fn chat_attachments_stage_from_drop_and_paste_remove_individually_and_submit_she
     });
     cx.run_until_parked();
 
+    // Files stay chips; the pasted image becomes a numbered thumbnail with its `Image #1` pill.
     assert!(cx.debug_bounds("chat-attachment-chips").is_some());
     assert!(cx.debug_bounds("chat-attachment-chip-0").is_some());
-    assert!(cx.debug_bounds("chat-attachment-chip-1").is_some());
+    assert!(cx.debug_bounds("chat-attachment-chip-1").is_none());
+    assert!(cx.debug_bounds("chat-attachment-image-0").is_some());
+    assert!(cx.debug_bounds("chat-attachment-image-pill-1").is_some());
 
-    // Remove the dropped file (chip 0), then stage `spec'1.md` and remove image chip (chip 0).
+    // Remove the dropped file (slot 0), then stage `spec'1.md` and remove the image (now slot 0).
     let remove0 = cx.debug_bounds("chat-attachment-remove-0").unwrap();
     cx.simulate_click(remove0.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("chat-attachment-chip-0").is_some());
-    assert!(cx.debug_bounds("chat-attachment-chip-1").is_none());
+    assert!(cx.debug_bounds("chat-attachment-chips").is_none());
+    assert!(cx.debug_bounds("chat-attachment-image-0").is_some());
 
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
@@ -2282,6 +2285,8 @@ fn chat_attachments_stage_from_drop_and_paste_remove_individually_and_submit_she
     let remove_img = cx.debug_bounds("chat-attachment-remove-0").unwrap();
     cx.simulate_click(remove_img.center(), gpui::Modifiers::default());
     cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-attachment-image-0").is_none());
+    assert!(cx.debug_bounds("chat-attachment-image-pills").is_none());
     assert!(cx.debug_bounds("chat-attachment-chip-0").is_some());
     assert!(cx.debug_bounds("chat-attachment-chip-1").is_none());
 
@@ -2301,6 +2306,112 @@ fn chat_attachments_stage_from_drop_and_paste_remove_individually_and_submit_she
         "shell-escaped attachment payload must quote single quotes safely, got {payload:?}"
     );
     assert!(payload.contains("please inspect"));
+}
+
+#[gpui::test]
+fn chat_images_show_as_numbered_thumbnails_and_open_in_a_viewer_that_esc_closes(
+    cx: &mut gpui::TestAppContext,
+) {
+    let dir = TestTempDir::new("chat-images");
+    let write_png = |name: &str, w: u32, h: u32| {
+        let path = dir.path().join(name);
+        image::RgbaImage::from_pixel(w, h, image::Rgba([200, 40, 40, 255]))
+            .save(&path)
+            .unwrap();
+        path
+    };
+    let sent_a = write_png("sent-a.png", 400, 200);
+    let sent_b = write_png("sent-b.png", 30, 90);
+    let draft = write_png("draft.png", 64, 64);
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-images-flow",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "[Image #3] [Image #4] 이거 봐".into(),
+                file_path: format!("{}\n{}", sent_a.display(), sent_b.display()),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "봤습니다.".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    cx.run_until_parked();
+
+    // The sent prompt draws both images as 80 px tiles numbered like its `[Image #n]` text,
+    // and no file link for them.
+    let tiles = [
+        cx.debug_bounds("chat-message-image-0").unwrap(),
+        cx.debug_bounds("chat-message-image-1").unwrap(),
+    ];
+    assert!(cx.debug_bounds("chat-message-image-2").is_none());
+    assert!((tiles[0].size.width - px(80.)).abs() <= px(1.));
+    assert!(cx.debug_bounds("chat-open-file").is_none());
+    shell.read_with(cx, |shell, _| {
+        assert!(matches!(
+            shell.chat.images.thumbs_for_test(&sent_a),
+            Some(super::images::Loaded::Ready(_))
+        ));
+    });
+
+    cx.simulate_click(tiles[1].center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_some());
+    assert!(cx.debug_bounds("chat-image-viewer-picture").is_some());
+    shell.read_with(cx, |shell, _| {
+        let viewer = shell.chat.images.viewer.as_ref().unwrap();
+        assert_eq!(viewer.index, 1);
+        assert_eq!(viewer.numbers, vec![3, 4]);
+    });
+    cx.simulate_keystrokes("left");
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(shell.chat.images.viewer.as_ref().unwrap().index, 0);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_none());
+
+    // A drafted image: a 56 px thumbnail with its `#1` badge and remove button, an `Image #1`
+    // pill, and a click opens the viewer; the close button shuts it.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.attach_dropped_paths_to_chat(
+                &local_key(SESSION),
+                &gpui::ExternalPaths(vec![draft.clone()].into()),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let thumb = cx.debug_bounds("chat-attachment-image-0").unwrap();
+    assert!((thumb.size.width - px(56.)).abs() <= px(1.));
+    assert!(cx.debug_bounds("chat-attachment-image-pill-1").is_some());
+    assert!(cx.debug_bounds("chat-attachment-remove-0").is_some());
+    cx.simulate_click(thumb.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_some());
+    assert!(cx.debug_bounds("chat-image-viewer-next").is_none());
+    let close = cx.debug_bounds("chat-image-viewer-close").unwrap();
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_none());
+    shell.read_with(cx, |shell, _| assert!(shell.chat.images.viewer.is_none()));
+}
+
+#[test]
+fn image_numbers_follow_the_prompt_markers_or_count_from_one() {
+    use super::images::image_numbers;
+    assert_eq!(image_numbers("[Image #3] [Image #4] 봐", 2), vec![3, 4]);
+    assert_eq!(image_numbers("[Image #2] 하나만", 2), vec![1, 2]);
+    assert_eq!(image_numbers("표기 없음", 3), vec![1, 2, 3]);
+    assert_eq!(image_numbers("[Image #1] [Image #1]", 1), vec![1]);
 }
 
 #[gpui::test]

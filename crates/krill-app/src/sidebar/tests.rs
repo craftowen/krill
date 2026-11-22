@@ -1670,6 +1670,25 @@ fn bot_home_folders_stay_out_of_projects() {
     assert!(options::is_bot_home(std::path::Path::new(
         "C:/Users/me/AppData/Local/Krill/bots/helper"
     )));
+
+    // Older builds registered the home as a folder project when a tab opened from a bot chat:
+    // it still stays out, with the sessions that belong to it.
+    let mut session = cwd(1, home);
+    session.worktree = Some(PathBuf::from(home));
+    let registered = Snapshot {
+        sessions: vec![session],
+        trees: BTreeMap::from([(PathBuf::from(home), vec![PathBuf::from(home)])]),
+    };
+    let all = rows(&registered, &Preferences::new(), &BTreeSet::new());
+    assert!(!all.contains(&Row::Repository(home.into())), "{all:?}");
+    assert!(!all.contains(&Row::Worktree(home.into())), "{all:?}");
+
+    let state = std::env::temp_dir().join(format!("bot-home-register-{}", std::process::id()));
+    let bot_home = state.join("dev.krill.app/bots/helper");
+    std::fs::create_dir_all(&bot_home).unwrap();
+    assert!(!external::register_project(&state, &bot_home).unwrap());
+    assert!(!state.join(external::PROJECTS_FILE).exists());
+    std::fs::remove_dir_all(&state).ok();
 }
 
 /// OWE-654: git 밖 세션은 폴더 프로젝트 > 세션으로 묶이고, 데몬이 알려 준 세션은 하나도 빠지지 않는다

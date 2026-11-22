@@ -40,6 +40,7 @@ mod body;
 mod catalog;
 mod code_view;
 mod composer;
+mod images;
 mod prompt;
 #[cfg(test)]
 mod prompt_tests;
@@ -553,6 +554,7 @@ pub(crate) struct ChatState {
     prompt_confirmed: Option<bool>,
     pub pending_prompts: std::collections::HashMap<ChatKey, Vec<PendingChatPrompt>>,
     pub draft_attachments: std::collections::HashMap<ChatKey, Vec<DraftAttachment>>,
+    pub(super) images: images::ChatImages,
     pub pending_revision: u64,
     next_pending_id: u64,
     pending_epochs: std::collections::HashMap<(ChatKey, u64), u64>,
@@ -3762,8 +3764,13 @@ impl Shell {
                 (abs_idx >= entry.origin_item
                     && !log.consumed_user_indices.contains(&abs_idx)
                     && item.kind == ChatItemKind::User
-                    && normalized(&item.text) == target_norm)
-                    .then_some(abs_idx)
+                    && (normalized(&item.text) == target_norm
+                        // Agents rewrite attached image paths (`[Image #1] …`, or krilld lifts
+                        // them into `file_path`); match on the typed text then.
+                        || (!entry.attachments.is_empty()
+                            && normalized(&krill_proto::git::clean_user_prompt(&item.text))
+                                == normalized(&entry.display_text))))
+                .then_some(abs_idx)
             });
             if let Some(abs_idx) = found_abs {
                 log.consumed_user_indices.insert(abs_idx);

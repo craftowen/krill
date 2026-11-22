@@ -994,38 +994,40 @@ impl Shell {
                 *copied_key == key && *idx == abs_idx && at.elapsed() < Duration::from_secs(2)
             });
 
-        let open_file_button = (!item.file_path.is_empty()).then(|| {
-            let open_host = self.layout.host(pane).clone();
-            let raw_path = std::path::PathBuf::from(&item.file_path);
-            let path = if raw_path.is_relative() {
-                self.pane_cwd(pane, cx)
-                    .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
-            } else {
-                raw_path
-            };
-            Button::new(SharedString::from(format!(
-                "chat-open-file-{}-{abs_idx}",
-                pane.get()
-            )))
-            .debug_selector(|| "chat-open-file".into())
-            .label(
-                std::path::Path::new(&item.file_path)
-                    .file_name()
-                    .map_or_else(
-                        || item.file_path.clone(),
-                        |name| name.to_string_lossy().into_owned(),
-                    ),
-            )
-            .max_w(gpui::rems(5.5))
-            .overflow_hidden()
-            .tooltip(item.file_path.clone())
-            .accessibility_label(item.file_path.clone())
-            .ghost()
-            .xsmall()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_file_on_at(open_host.clone(), path.clone(), 1, 1, cx);
-            }))
-        });
+        // A user prompt's `file_path` lists its images; they draw as tiles, not a file link.
+        let open_file_button = (!item.file_path.is_empty() && item.kind != ChatItemKind::User)
+            .then(|| {
+                let open_host = self.layout.host(pane).clone();
+                let raw_path = std::path::PathBuf::from(&item.file_path);
+                let path = if raw_path.is_relative() {
+                    self.pane_cwd(pane, cx)
+                        .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
+                } else {
+                    raw_path
+                };
+                Button::new(SharedString::from(format!(
+                    "chat-open-file-{}-{abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-open-file".into())
+                .label(
+                    std::path::Path::new(&item.file_path)
+                        .file_name()
+                        .map_or_else(
+                            || item.file_path.clone(),
+                            |name| name.to_string_lossy().into_owned(),
+                        ),
+                )
+                .max_w(gpui::rems(5.5))
+                .overflow_hidden()
+                .tooltip(item.file_path.clone())
+                .accessibility_label(item.file_path.clone())
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_file_on_at(open_host.clone(), path.clone(), 1, 1, cx);
+                }))
+            });
 
         let is_reasoning = matches!(item.kind, ChatItemKind::Reasoning);
         let copy_button = (!item.text.trim().is_empty()).then(|| {
@@ -1089,6 +1091,19 @@ impl Shell {
 
         match item.kind {
             ChatItemKind::User => {
+                let image_paths = super::images::item_image_paths(item);
+                let image_numbers = super::images::image_numbers(&item.text, image_paths.len());
+                let readable = !self.layout.host(pane).is_remote();
+                let images = self
+                    .chat_message_images(
+                        &format!("chat-item-{}-{abs_idx}", pane.get()),
+                        &image_paths,
+                        &image_numbers,
+                        readable,
+                        cx,
+                    )
+                    .map(gpui::Styled::mb_0p5);
+                let has_text = !item.text.trim().is_empty();
                 let foldable = is_user_prompt_foldable(&item.text);
                 let prompt_expanded = self
                     .chat
@@ -1137,14 +1152,17 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap_1p5()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .when(foldable && !prompt_expanded, |d| {
-                                d.max_h(gpui::px(176.)).overflow_hidden()
-                            })
-                            .child(body),
-                    )
+                    .children(images)
+                    .when(has_text, |d| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .when(foldable && !prompt_expanded, |d| {
+                                    d.max_h(gpui::px(176.)).overflow_hidden()
+                                })
+                                .child(body),
+                        )
+                    })
                     .children(foldable.then(|| {
                         div().flex().justify_start().child(
                             Button::new(SharedString::from(format!(
@@ -2109,7 +2127,7 @@ impl Shell {
     }
 
     fn render_pending_chat_card(
-        &self,
+        &mut self,
         key: ChatKey,
         pane: PaneId,
         pending: &super::PendingChatPrompt,
@@ -2126,23 +2144,32 @@ impl Shell {
                     *copied_key == key && *copied_id == pending_id
                 });
 
-        let attachment_strip = (!pending.attachments.is_empty()).then(|| {
+        let pending_images: Vec<std::path::PathBuf> = pending
+            .attachments
+            .iter()
+            .filter(|a| a.is_image)
+            .map(|a| a.path.clone())
+            .collect();
+        let pending_numbers: Vec<usize> = (1..=pending_images.len()).collect();
+        let image_strip = self
+            .chat_message_images(
+                &format!("chat-pending-{pending_id}-{}", pane.get()),
+                &pending_images,
+                &pending_numbers,
+                true,
+                cx,
+            )
+            .map(gpui::Styled::mb_0p5);
+        let file_attachments: Vec<&super::DraftAttachment> =
+            pending.attachments.iter().filter(|a| !a.is_image).collect();
+        let attachment_strip = (!file_attachments.is_empty()).then(|| {
             div().flex().flex_wrap().items_center().gap_1().children(
-                pending.attachments.iter().map(|attachment| {
-                    let badge = if attachment.is_image {
-                        format!(
-                            "{} ({}, {})",
-                            attachment.display_name,
-                            ctext::ATTACH_IMAGE_BADGE.get(),
-                            super::catalog::format_byte_len(attachment.byte_len)
-                        )
-                    } else {
-                        format!(
-                            "{} ({})",
-                            attachment.display_name,
-                            super::catalog::format_byte_len(attachment.byte_len)
-                        )
-                    };
+                file_attachments.into_iter().map(|attachment| {
+                    let badge = format!(
+                        "{} ({})",
+                        attachment.display_name,
+                        super::catalog::format_byte_len(attachment.byte_len)
+                    );
                     div()
                         .max_w(gpui::px(260.))
                         .rounded(ui::RADIUS_SM)
@@ -2157,13 +2184,9 @@ impl Shell {
                         .text_size(ui::TEXT_XS)
                         .text_color(palette.muted_foreground)
                         .child(
-                            gpui_component::Icon::new(if attachment.is_image {
-                                IconName::Image
-                            } else {
-                                IconName::File
-                            })
-                            .size(gpui::px(ui::ICON_SM))
-                            .text_color(palette.muted_foreground),
+                            gpui_component::Icon::new(IconName::File)
+                                .size(gpui::px(ui::ICON_SM))
+                                .text_color(palette.muted_foreground),
                         )
                         .child(div().min_w_0().truncate().child(badge))
                 }),
@@ -2198,6 +2221,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap_1p5()
+            .children(image_strip)
             .children(attachment_strip)
             .children(text_block);
 

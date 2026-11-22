@@ -8246,6 +8246,7 @@ impl Render for Shell {
         self.open_pending_overlays(window, cx);
         self.open_pending_bot_dialogs(window, cx);
         let bot_dialogs = self.bot_dialogs(window, cx);
+        let chat_image_viewer = self.render_chat_image_viewer(window, cx);
         // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
         // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
@@ -9081,6 +9082,7 @@ impl Render for Shell {
             .children(self.jump.as_ref().map(|(palette, _)| palette.clone()))
             .children(self.add_project.as_ref().map(|(dialog, _)| dialog.clone()))
             .children(bot_dialogs)
+            .children(chat_image_viewer)
             .children(
                 self.continue_session
                     .as_ref()
