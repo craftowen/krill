@@ -11,6 +11,22 @@ pub(crate) fn prewarm_agy_launch(home: &std::path::Path, config: Option<std::pat
     pwa_rpc::composer::prewarm_agy_launch(home, config);
 }
 
+pub(crate) fn evict_agy_models_cache() {
+    pwa_rpc::composer::evict_agy_cache();
+}
+
+pub(crate) fn fold_agy_model_selection(
+    config: Option<&std::path::Path>,
+    model: &str,
+    effort: Option<&str>,
+) -> Option<(String, String)> {
+    pwa_rpc::composer::fold_agy_model_selection(config, model, effort)
+}
+
+pub(crate) fn agy_version_problem(exe: &std::path::Path, ssh: bool) -> Option<(String, String)> {
+    pwa_rpc::composer::agy_version_problem(exe, ssh)
+}
+
 pub(crate) fn agy_composer_ready(screen: &krill_proto::screen::Screen) -> bool {
     pwa_rpc::composer::agy_composer_ready(screen)
 }

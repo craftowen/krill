@@ -3067,3 +3067,88 @@ fn switching_bot_provider_in_settings_refreshes_models_and_clears_old_sessions(
         "SessionsChanged must emit cleared session map"
     );
 }
+
+#[test]
+fn bot_refusal_text_and_automation_rows_surface_specific_reasons() {
+    // Mirrors Orca `bot-presentation.test.ts` (#46838, #46892) and run-card refusal wording.
+    use krill_proto::bots::{
+        BotScheduleConfig, BotScheduleUpcoming, BotSessionRefusal, BotUpcoming,
+    };
+
+    let too_old = BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0");
+    let local_msg = super::rpc::bot_refusal_text(&too_old, Some("this computer"));
+    assert!(local_msg.contains("Hermes"), "{local_msg}");
+    assert!(local_msg.contains("0.20.5"), "{local_msg}");
+    assert!(local_msg.contains("0.23.0"), "{local_msg}");
+
+    // Paired server without a name must never be called "this computer".
+    let remote_msg = super::rpc::bot_refusal_text(&too_old, None);
+    assert!(remote_msg.contains("Hermes"), "{remote_msg}");
+    assert!(
+        !remote_msg.contains("this computer") && !remote_msg.contains("이 컴퓨터"),
+        "{remote_msg}"
+    );
+
+    // call_checked_on promotes SessionRefused into a host-worded Err instead of generic text.
+    let refused_rpc: super::rpc::BotRpcCall = Arc::new(move |_| {
+        Ok(BotRpcResponse::SessionRefused(Box::new(
+            BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0"),
+        )))
+    });
+    let err = super::rpc::call_checked_on(
+        &refused_rpc,
+        &BotRpcRequest::StartBotSession {
+            bot_id: BotId::new("refused-bot").unwrap(),
+            cwd: None,
+            prompt: None,
+        },
+        Some("Mac Studio"),
+    )
+    .unwrap_err();
+    assert!(err.contains("Hermes"), "{err}");
+    assert!(err.contains("Mac Studio"), "{err}");
+    assert!(err.contains("0.20.5"), "{err}");
+    assert!(err.contains("0.23.0"), "{err}");
+
+    // Schedule run cards carry `last_refusal` so Home Automation rows mark them failed with reason.
+    let mut bot = sample_bot("sched-refused", "Nightly Bot");
+    bot.schedules.push(BotScheduleConfig {
+        id: "nightly".to_owned(),
+        name: "Nightly triage".to_owned(),
+        cron: "0 9 * * *".to_owned(),
+        prompt: "Triage issues".to_owned(),
+        enabled: true,
+        timezone: None,
+    });
+    let up = BotUpcoming {
+        schedules: vec![BotScheduleUpcoming {
+            id: "nightly".to_owned(),
+            next_ms: Some(200_000),
+            last_ms: None,
+            running: false,
+            last_error: Some(
+                "Your Hermes CLI on this computer is 0.20.5. Chats need 0.23.0 or newer."
+                    .to_owned(),
+            ),
+            last_refusal: Some(too_old),
+        }],
+        ..BotUpcoming::default()
+    };
+    let rows = super::home_upcoming::automation_rows_on(
+        &bot,
+        Some(&up),
+        false,
+        None,
+        Some("Build Server"),
+        100_000,
+    );
+    let sched_row = rows
+        .iter()
+        .find(|r| r.id == "nightly")
+        .expect("schedule row");
+    let failed = sched_row.failed.as_deref().expect("failed reason");
+    assert!(failed.contains("Hermes"), "{failed}");
+    assert!(failed.contains("Build Server"), "{failed}");
+    assert!(failed.contains("0.20.5"), "{failed}");
+    assert!(failed.contains("0.23.0"), "{failed}");
+}

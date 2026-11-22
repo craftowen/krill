@@ -1011,7 +1011,55 @@ async function botsScreens(){
  await df.byText('Save Soul').action();
  assert(df.calls.some(c=>c.action==='bots.soul.set'&&c.content==='# Soul'));
  df.abort.abort();
- console.log('PASS mobile bots screens: routes, Home entry, #/bots, #/bots/:id, #/up-next, decisions, groups, soul/memory, no innerHTML');
+
+ // Refused bot chats on mobile: Open Chat, agent switch Home Chat (#46862), and failed automation run cards (#46892).
+ const tooOldRefusal={code:'cli_too_old',agent:'hermes',installed_version:'0.20.5',minimum_version:'0.23.0'};
+ const rf=fixture('bots',{
+  route:{botId:'b1'},
+  state:{snapshot:{capabilities:{bots:true}}},
+  rpc:req=>{
+   if(req.action==='bots.list')return {bots:[{...botsData[0],agent_id:'claude',schedules:[{id:'nightly',name:'Nightly triage',cron:'0 9 * * *',prompt:'Triage',enabled:true}]}]};
+   if(req.action==='bots.items')return {items:[]};
+   if(req.action==='bots.connectors.status')return {statuses:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.upcoming')return {schedules:[{id:'nightly',running:false,last_error:'Your Hermes CLI on this computer is 0.20.5. Chats need 0.23.0 or newer.',last_refusal:tooOldRefusal}]};
+   if(req.action==='bots.models')return {models:[]};
+   if(req.action==='bots.update')return {bot:{...botsData[0],agent_id:req.agent_id||'hermes'}};
+   if(req.action==='bots.chat.open'){const err=Error('Your Hermes CLI on this computer is 0.20.5. Chats need 0.23.0 or newer.');err.data={refusal:tooOldRefusal};throw err;}
+   return {};
+  }
+ });
+ const toasts=[];
+ rf.ctx.toast=(m)=>toasts.push(m);
+ await rf.flush();
+ // Failed automation run card shows phone-side refusal text without calling desktop "this computer".
+ const runRow=rf.find('.bot-automation-run-row');
+ assert(runRow,'failed automation run card must render on mobile');
+ assert(runRow.textContent.includes('Hermes')&&runRow.textContent.includes('0.20.5')&&runRow.textContent.includes('0.23.0'),runRow.textContent);
+ assert(!runRow.textContent.includes('this computer'),runRow.textContent);
+ // Explicit Open Chat tap rejects with worded refusal.
+ let openErr=null;
+ try{await rf.byText('Open Chat').action();}catch(e){openErr=e;}
+ assert(openErr&&openErr.message.includes('Hermes')&&openErr.message.includes('0.20.5')&&openErr.message.includes('0.23.0'),String(openErr));
+ assert(!openErr.message.includes('this computer'),openErr.message);
+ // Switching agent in Agent sheet ensures Home Chat and toasts why it was refused (#46862).
+ await rf.byText('Agent').action();
+ const switchBody=rf.ctx.el('div');
+ rf.sheets.at(-1)[3](switchBody);
+ await rf.flush();
+ const swSelects=switchBody.querySelectorAll('select');
+ swSelects[0].value='agy';
+ emit(swSelects[0],'change');
+ await rf.flush();
+ const swSave=switchBody.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Save');
+ await swSave.action();
+ await rf.flush();
+ const lastToast=toasts.at(-1)||'';
+ assert(lastToast.includes('Hermes')&&lastToast.includes('0.20.5')&&lastToast.includes('0.23.0'),lastToast);
+ assert(!lastToast.includes('this computer'),lastToast);
+ rf.abort.abort();
+ console.log('PASS mobile bots screens: routes, Home entry, #/bots, #/bots/:id, #/up-next, decisions, groups, soul/memory, refusals, no innerHTML');
 }
 async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

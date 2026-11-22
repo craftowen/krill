@@ -39,6 +39,7 @@ const NOTE: &str = "Antigravity also saves this as the default for new sessions.
 const NOT_CONFIRMED: &str = "Antigravity received the model command, but its confirmation was not recognized. It will not be resent.";
 
 /// One row of `agy models`. When present, the effort is part of the id, so `/model <id>` sets both at once.
+#[derive(Debug, PartialEq, Eq)]
 struct Level {
     effort: Option<String>,
     id: String,
@@ -46,6 +47,7 @@ struct Level {
 }
 
 /// What the picker shows: one model, with its efforts as a second choice when available.
+#[derive(Debug, PartialEq, Eq)]
 struct Family {
     id: String,
     label: String,
@@ -79,10 +81,30 @@ struct Slot {
     attempted: Option<Instant>,
 }
 
+/// Outcome of a single `agy` model-catalog fetch (Orca `fcc3027d` / `#46647`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchError {
+    /// Stopped or refused by the Antigravity launch gate; must never be cached as a probe failure.
+    Stopped,
+    /// Genuine probe error (`NOT_INSTALLED`, `UNVERIFIED`, `LIST_FAILED`).
+    Failed(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerifiedExe {
+    Ok,
+    TooOld(String),
+    Failed(&'static str),
+}
+
 static CACHE: Mutex<BTreeMap<Option<PathBuf>, Slot>> = Mutex::new(BTreeMap::new());
 type ExeStamp = (PathBuf, Option<std::time::SystemTime>, u64, bool);
-static VERIFIED_EXE: Mutex<BTreeMap<ExeStamp, Result<(), &'static str>>> =
-    Mutex::new(BTreeMap::new());
+static VERIFIED_EXE: Mutex<BTreeMap<ExeStamp, VerifiedExe>> = Mutex::new(BTreeMap::new());
+
+/// Evicts cached Antigravity model listings (e.g. after sign-in or account switch).
+pub(crate) fn evict_cache() {
+    lock(&CACHE).clear();
+}
 
 pub(super) fn prewarm(context: &Context) {
     prewarm_path(&context.home, context.config.clone());
@@ -90,6 +112,65 @@ pub(super) fn prewarm(context: &Context) {
 
 pub(crate) fn prewarm_path(home: &Path, config: Option<PathBuf>) {
     let _ = ensure_cached(home, config);
+}
+
+fn to_listed_models(families: &[Family]) -> Vec<krill_proto::agent::AgyListedModel> {
+    families
+        .iter()
+        .map(|family| {
+            let efforts: Vec<String> = family
+                .levels
+                .iter()
+                .filter_map(|level| level.effort.clone())
+                .collect();
+            if efforts.len() > 1 {
+                krill_proto::agent::AgyListedModel {
+                    id: family.id.clone(),
+                    efforts,
+                }
+            } else {
+                // Single-level or standalone models stay named by their own ID so callers keep it.
+                let id = family
+                    .levels
+                    .first()
+                    .map_or_else(|| family.id.clone(), |l| l.id.clone());
+                krill_proto::agent::AgyListedModel {
+                    id,
+                    efforts: Vec::new(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Peeks the cached Antigravity model listing and folds a level model ID (e.g.
+/// `gemini-4-argon-medium`) onto its listed family + effort (`("gemini-4-argon", "medium")`) so
+/// effort stays adjustable after launch (Orca `c5de2672` / `#46941`).
+/// Cold listings, standalone models, and unlisted efforts return `None` so callers keep the ID.
+pub(crate) fn fold_listed_family(
+    config: Option<&Path>,
+    model: &str,
+    effort: Option<&str>,
+) -> Option<(String, String)> {
+    let families = {
+        let cache = lock(&CACHE);
+        cache
+            .get(&config.map(Path::to_path_buf))
+            .or_else(|| cache.get(&None))
+            .and_then(|slot| slot.families.clone())
+    }?;
+    let listed = to_listed_models(&families);
+    krill_proto::agent::antigravity_listed_family_selection(model, effort, &listed)
+}
+
+/// Checks if the Antigravity CLI at `exe` is older than [`FLOOR`] (`1.4.12`), returning
+/// `(installed_version, minimum_version)` so a refused bot chat can name both versions.
+pub(crate) fn installed_version_problem(exe: &Path, ssh: bool) -> Option<(String, String)> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    match verify_exe_status(exe, ssh, &never) {
+        Ok(VerifiedExe::TooOld(installed)) => Some((installed, "1.4.12".to_owned())),
+        _ => None,
+    }
 }
 
 /// Returns what is known now and refreshes on its own thread, so a poll never waits on `agy`.
@@ -117,81 +198,134 @@ fn ensure_cached(home: &Path, config: Option<PathBuf>) -> (Option<Families>, Opt
 }
 
 fn refresh(config: Option<PathBuf>, home: &Path) {
-    let result = fetch(config.as_deref(), home);
+    let gen_before = direct::agy::current_listing_generation();
+    let result = fetch_gated(config.as_deref(), home);
     let mut cache = lock(&CACHE);
     let slot = cache.entry(config).or_default();
     match result {
         Ok(families) => {
+            // Discard stale listing if an account operation ran while we were fetching.
+            if direct::agy::current_listing_generation() != gen_before {
+                slot.attempted = None;
+                return;
+            }
             slot.families = Some(Arc::new(families));
             slot.failure = None;
             slot.loaded = Some(Instant::now());
         }
-        Err(reason) => {
+        Err(FetchError::Stopped) => {
+            // Gate refusal or gate-driven stop says nothing about the account: never cache as a
+            // probe failure, and allow an immediate retry once the gate opens.
+            slot.attempted = None;
+        }
+        Err(FetchError::Failed(reason)) => {
+            if direct::agy::current_listing_generation() != gen_before {
+                slot.attempted = None;
+                return;
+            }
             slot.families = None;
             slot.failure = Some(reason);
         }
     }
 }
 
-fn verify_exe(exe: &Path, ssh: bool) -> Result<(), &'static str> {
+fn verify_exe_status(
+    exe: &Path,
+    ssh: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<VerifiedExe, FetchError> {
     let stamp = std::fs::metadata(exe)
         .ok()
         .map(|m| (exe.to_path_buf(), m.modified().ok(), m.len(), ssh));
     if let Some(ref key) = stamp
-        && let Some(&cached) = lock(&VERIFIED_EXE).get(key)
+        && let Some(cached) = lock(&VERIFIED_EXE).get(key).cloned()
     {
-        return cached;
+        return Ok(cached);
     }
-    let version = direct::agy::run_agy(
+    let version = match direct::agy::run_agy_cancellable(
         exe,
         &["--version".to_owned()],
         ssh,
         VERSION_TIMEOUT,
         MAX_BYTES,
-    )
-    .ok_or(LIST_FAILED)?;
-    let result = if String::from_utf8_lossy(&version)
-        .split_whitespace()
-        .find(|word| word.contains('.'))
-        .is_some_and(|word| native::at_least(word, FLOOR))
-    {
-        Ok(())
-    } else {
-        Err(UNVERIFIED)
+        cancel,
+    ) {
+        Ok(bytes) => bytes,
+        Err(direct::agy::RunAgyError::Stopped) => return Err(FetchError::Stopped),
+        Err(direct::agy::RunAgyError::Failed) => return Ok(VerifiedExe::Failed(LIST_FAILED)),
+    };
+    let text = String::from_utf8_lossy(&version);
+    let found_version = text.split_whitespace().find(|word| word.contains('.'));
+    let result = match found_version {
+        Some(word) if native::at_least(word, FLOOR) => VerifiedExe::Ok,
+        Some(word) => VerifiedExe::TooOld(word.trim_start_matches('v').to_owned()),
+        None => VerifiedExe::Failed(UNVERIFIED),
     };
     if let Some(key) = stamp {
         let mut verified = lock(&VERIFIED_EXE);
         if verified.len() >= 16 && !verified.contains_key(&key) {
             verified.pop_first();
         }
-        verified.insert(key, result);
+        verified.insert(key, result.clone());
     }
-    result
+    Ok(result)
 }
 
+#[cfg(all(test, unix))]
 fn fetch(config: Option<&Path>, home: &Path) -> Result<Vec<Family>, &'static str> {
+    match fetch_gated(config, home) {
+        Ok(families) => Ok(families),
+        Err(FetchError::Failed(reason)) => Err(reason),
+        Err(FetchError::Stopped) => Err(LIST_FAILED),
+    }
+}
+
+fn fetch_gated(config: Option<&Path>, home: &Path) -> Result<Vec<Family>, FetchError> {
     let exe = direct::agy_exe()
         .or_else(|| krill_proto::agent::which("agy", home.join(".local/bin").as_os_str()))
-        .ok_or(NOT_INSTALLED)?;
+        .ok_or(FetchError::Failed(NOT_INSTALLED))?;
+    let gate = direct::agy::enter_listing().map_err(|_| FetchError::Stopped)?;
     let file_token = accounts::host_default_dir(home, ProviderKind::Antigravity)
         .join("antigravity-oauth-token")
         .is_file();
     let ssh = config.is_some() || file_token;
-    verify_exe(&exe, ssh)?;
+    match verify_exe_status(&exe, ssh, gate.cancel_flag())? {
+        VerifiedExe::Ok => {}
+        VerifiedExe::TooOld(_) => return Err(FetchError::Failed(UNVERIFIED)),
+        VerifiedExe::Failed(reason) => return Err(FetchError::Failed(reason)),
+    }
     let mut args = Vec::new();
     if let Some(dir) = config {
         let gemini = dir.join(".gemini");
         args.push(format!(
             "--gemini_dir={}",
-            gemini.to_str().ok_or(LIST_FAILED)?
+            gemini.to_str().ok_or(FetchError::Failed(LIST_FAILED))?
         ));
     }
     args.push("models".to_owned());
-    let output =
-        direct::agy::run_agy(&exe, &args, ssh, LIST_TIMEOUT, MAX_BYTES).ok_or(LIST_FAILED)?;
+    let output = match direct::agy::run_agy_cancellable(
+        &exe,
+        &args,
+        ssh,
+        LIST_TIMEOUT,
+        MAX_BYTES,
+        gate.cancel_flag(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(direct::agy::RunAgyError::Stopped) => return Err(FetchError::Stopped),
+        Err(direct::agy::RunAgyError::Failed) => {
+            if gate.is_stopped() || direct::agy::current_listing_generation() != gate.generation() {
+                return Err(FetchError::Stopped);
+            }
+            return Err(FetchError::Failed(LIST_FAILED));
+        }
+    };
+    if gate.is_stopped() || direct::agy::current_listing_generation() != gate.generation() {
+        return Err(FetchError::Stopped);
+    }
     let families = parse(&String::from_utf8_lossy(&output));
     if families.is_empty() {
-        return Err(LIST_FAILED);
+        return Err(FetchError::Failed(LIST_FAILED));
     }
     Ok(families)
 }
@@ -568,9 +702,18 @@ impl Adapter for Agy {
         let (families, failure) = cached(context);
         let families = families.ok_or_else(|| io::Error::other(failure.unwrap_or(LOADING)))?;
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let folded = krill_proto::agent::antigravity_listed_family_selection(
+            model,
+            effort,
+            &to_listed_models(&families),
+        );
+        let (target_model, target_effort) = match &folded {
+            Some((fam, eff)) => (fam.as_str(), Some(eff.as_str())),
+            None => (model, effort),
+        };
         let family = families
             .iter()
-            .find(|family| family.id == model)
+            .find(|family| family.id == target_model)
             .ok_or_else(|| invalid("Model is not in this session's discovered catalog"))?;
         let tap = live.tap()?;
         let (before, revision, seq) = tap.capture();
@@ -578,7 +721,7 @@ impl Adapter for Agy {
             return Err(io::Error::other(WAIT));
         }
         let current = footer_with(&before, Some(&families));
-        let level = match effort {
+        let level = match target_effort {
             Some(effort) => family.level(Some(effort)),
             None => current
                 .as_ref()

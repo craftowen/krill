@@ -1394,9 +1394,13 @@ impl Sidebar {
                         })
                         .text_color(p.sidebar_accent_foreground)
                     })
-                    .child(
-                        status::status_glyph_slot(
-                            session.status.state,
+                    .child({
+                        let tip = session.status.turn_error.as_deref().map_or_else(
+                            || state_tip.clone(),
+                            |err| format!("{state_tip} · {err}"),
+                        );
+                        status::status_glyph_for(
+                            &session.status,
                             unread,
                             Size::Sm,
                             self.spinner_slots(index),
@@ -1404,12 +1408,11 @@ impl Sidebar {
                         )
                         .debug_selector(move || format!("session-state-{index}"))
                         .id(("session-status", index))
-                        .aria_label(state_tip.clone())
+                        .aria_label(tip.clone())
                         .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(state_tip.clone())
-                                .build(window, cx)
-                        }),
-                    )
+                            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                        })
+                    })
                     .child(status::agent_icon(
                         status::infer_agent_from_status(&session.status, &name),
                         ui::ICON_XS,
@@ -2647,8 +2650,8 @@ impl Sidebar {
                                         .cursor_pointer()
                                         .when(sess_focused, |d| d.bg(p.worktree_sidebar_accent))
                                         .hover(|d| d.bg(p.worktree_sidebar_accent))
-                                        .child(status::status_glyph_slot(
-                                            sess.status.state,
+                                        .child(status::status_glyph_for(
+                                            &sess.status,
                                             sess_unread,
                                             Size::Sm,
                                             self.spinner_slots(index),

@@ -222,6 +222,22 @@ pub(crate) fn prewarm_agy_launch(home: &Path, config: Option<PathBuf>) {
     agy::prewarm_path(home, config);
 }
 
+pub(crate) fn evict_agy_cache() {
+    agy::evict_cache();
+}
+
+pub(crate) fn fold_agy_model_selection(
+    config: Option<&Path>,
+    model: &str,
+    effort: Option<&str>,
+) -> Option<(String, String)> {
+    agy::fold_listed_family(config, model, effort)
+}
+
+pub(crate) fn agy_version_problem(exe: &Path, ssh: bool) -> Option<(String, String)> {
+    agy::installed_version_problem(exe, ssh)
+}
+
 pub(crate) fn agy_composer_ready(screen: &krill_proto::screen::Screen) -> bool {
     agy::composer_ready(screen)
 }

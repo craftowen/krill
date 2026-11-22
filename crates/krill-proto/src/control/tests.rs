@@ -116,6 +116,7 @@ fn fixtures_v1() {
                         subagents: Vec::new(),
                         root_shell: None,
                         startup_stall: None,
+                        turn_error: None,
                     },
                 },
             ])),
@@ -1082,6 +1083,7 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
                 subagents: Vec::new(),
                 root_shell: None,
                 startup_stall: None,
+                turn_error: None,
             },
         },
     ];

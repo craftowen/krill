@@ -120,6 +120,33 @@ pub fn status_glyph_slot(
     glyph_frame(state, unread, size, slots, cx)
 }
 
+/// Renders the glyph for a full [`krill_proto::control::AgentStatus`]. A terminal turn that ended
+/// in a provider error (e.g. Antigravity quota stop, Orca `b342cee0` / `#46999`) shows a red
+/// `CircleX` instead of a green check.
+pub fn status_glyph_for(
+    status: &krill_proto::control::AgentStatus,
+    unread: bool,
+    size: Size,
+    slots: Option<&SpinnerSlots>,
+    cx: &App,
+) -> gpui::Div {
+    if status.turn_failed() {
+        let p = palette(cx);
+        return div()
+            .size(px(size.outer()))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                Icon::new(IconName::CircleX)
+                    .with_size(px(size.outer()))
+                    .text_color(p.destructive),
+            );
+    }
+    glyph_frame(status.state, unread, size, slots, cx)
+}
+
 /// `slots`에 적힌 자리마다 도는 스피너를 그린다. 이 요소를 그리는 뷰(루트)만 틱마다 다시 렌더된다.
 /// 자리를 적은 캐시 뷰보다 뒤(위)에 두고, 그 뷰의 메뉴·모달은 deferred라 이 위에 그려진다.
 pub fn spinner_overlay(slots: &SpinnerSlots) -> impl gpui::IntoElement {

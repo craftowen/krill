@@ -1510,7 +1510,11 @@
         if (kind !== 6) throw Error("Update the desktop for mobile workflows");
         const reply = JSON.parse(r.text());
         if (!reply.ok)
-          throw Object.assign(Error(reply.error), { definitive: !0 });
+          throw Object.assign(Error(reply.error), {
+            definitive: !0,
+            ...(reply.code !== undefined ? { code: reply.code } : {}),
+            ...(reply.data !== undefined ? { data: reply.data } : {}),
+          });
         return reply.data;
       }
       // A read that loses its socket waits for the next connection and is asked once more there.

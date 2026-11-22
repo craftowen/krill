@@ -639,3 +639,121 @@ fn a_poll_never_waits_for_the_listing() {
     assert_eq!(ready["supported"], false, "listing alone grants no control");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn stops_waiting_listing_server_before_launch_gate_changes_account() {
+    // Mirrors Orca `acp-listing-session-models.test.ts` (#46647): an in-flight listing must be
+    // stopped before an account sign-in/switch mutates credentials, concurrent listings during
+    // the op must fail as Stopped (not cached as probe failure), and subsequent listings succeed.
+    let root = std::env::temp_dir().join(format!("krill-agy-gate-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let bin = root.join("home/.local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let started_flag = root.join("started");
+    let exe = bin.join("agy");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.5.14; exit 0; fi\n\
+         touch '{}'\n\
+         sleep 30\n",
+        started_flag.display()
+    );
+    fs::write(&exe, script).unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg = root.join("account");
+    let home = root.join("home");
+
+    let cfg_bg = cfg.clone();
+    let home_bg = home.clone();
+    let handle = std::thread::spawn(move || fetch_gated(Some(&cfg_bg), &home_bg));
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    while !started_flag.exists() && Instant::now() < wait_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(started_flag.exists(), "listing process should have started");
+
+    let mut refused = None;
+    direct::agy::run_account_op(|| {
+        // New listing while gate is held must be refused as Stopped, never a probe failure.
+        refused = Some(fetch_gated(Some(&cfg), &home));
+    });
+    assert_eq!(refused, Some(Err(FetchError::Stopped)));
+
+    let stopped = handle.join().unwrap();
+    assert_eq!(
+        stopped,
+        Err(FetchError::Stopped),
+        "in-flight listing must be stopped cleanly by the gate"
+    );
+
+    // Refresh via gate-stopped error must not cache a probe failure.
+    let cfg_opt = Some(cfg.clone());
+    lock(&CACHE).remove(&cfg_opt);
+    direct::agy::run_account_op(|| {
+        refresh(cfg_opt.clone(), &home);
+    });
+    {
+        let cache = lock(&CACHE);
+        let slot = cache.get(&cfg_opt);
+        assert!(
+            slot.and_then(|s| s.failure).is_none(),
+            "gate refusal must not be cached as a probe failure"
+        );
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn fold_listed_family_maps_multi_level_ids_and_keeps_standalone_ids() {
+    // Mirrors Orca `antigravity-model-listing.test.ts` (#46941).
+    let families = parse(MODELS);
+    let listed = to_listed_models(&families);
+    assert_eq!(
+        krill_proto::agent::antigravity_listed_family_selection(
+            "gemini-4-argon-medium",
+            Some("medium"),
+            &listed
+        ),
+        Some(("gemini-4-argon".to_owned(), "medium".to_owned()))
+    );
+    assert_eq!(
+        krill_proto::agent::antigravity_listed_family_selection(
+            "gemini-4-argon-medium",
+            None,
+            &listed
+        ),
+        Some(("gemini-4-argon".to_owned(), "medium".to_owned()))
+    );
+    assert_eq!(
+        krill_proto::agent::antigravity_listed_family_selection(
+            "gemini-4-argon-medium",
+            Some("high"),
+            &listed
+        ),
+        Some(("gemini-4-argon".to_owned(), "high".to_owned()))
+    );
+    assert_eq!(
+        krill_proto::agent::antigravity_listed_family_selection(
+            "gemini-4-argon-medium",
+            Some("xhigh"),
+            &listed
+        ),
+        None
+    );
+    assert_eq!(
+        krill_proto::agent::antigravity_listed_family_selection(
+            "gpt-oss-120b-medium",
+            Some("medium"),
+            &listed
+        ),
+        None
+    );
+    assert_eq!(
+        krill_proto::agent::antigravity_listed_family_selection(
+            "gemini-pro-orchestrator-neon",
+            None,
+            &listed
+        ),
+        None
+    );
+}

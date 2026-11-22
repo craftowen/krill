@@ -705,6 +705,42 @@ pub fn strip_agy_effort_suffix(model: &str) -> (&str, Option<&str>) {
     (model, None)
 }
 
+/// One row from an Antigravity model listing used to fold a level ID back onto its listed family
+/// (Orca `c5de2672` / `#46941`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyListedModel {
+    pub id: String,
+    pub efforts: Vec<String>,
+}
+
+/// Folds an Antigravity level model ID (e.g. `gemini-4-argon-medium`) onto its listed family row
+/// and effort (`("gemini-4-argon", "medium")`) so the chat's effort picker stays adjustable.
+///
+/// Returns `None` when the listing names `model` on its own, the listing is cold/empty, or the
+/// family does not offer both the level implied by `model` and the requested `effort` — callers
+/// then keep the level ID, which `agy` also accepts.
+#[must_use]
+pub fn antigravity_listed_family_selection(
+    model: &str,
+    effort: Option<&str>,
+    listed: &[AgyListedModel],
+) -> Option<(String, String)> {
+    let (family, level) = strip_agy_effort_suffix(model);
+    let level = level?;
+    if listed.iter().any(|entry| entry.id == model) {
+        return None;
+    }
+    let family_row = listed.iter().find(|entry| entry.id == family)?;
+    let target_effort = effort.unwrap_or(level);
+    let has_level = family_row.efforts.iter().any(|e| e == level);
+    let has_target = family_row.efforts.iter().any(|e| e == target_effort);
+    if has_level && has_target {
+        Some((family.to_owned(), target_effort.to_owned()))
+    } else {
+        None
+    }
+}
+
 /// 에이전트 ID와 프로필에 대해 `overrides`가 문법·공급자·프로필 인자와 충돌하지 않는지 검증하고
 /// 정규화된 [`LaunchOverrides`]를 돌려준다.
 pub fn validate_launch_overrides(

@@ -1661,12 +1661,23 @@ impl Registry {
             Program::Login => crate::agent::login_in(state.as_deref()),
             Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
             Program::Agent { id } => {
-                let (base_id, overrides) = krill_proto::agent::decode_agent_program_id(&id)
+                let (base_id, mut overrides) = krill_proto::agent::decode_agent_program_id(&id)
                     .map_err(|_| Failure::BadRequest)?;
                 let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
                 let (canonical, base_profile) =
                     agents.resolve(base_id).ok_or(Failure::UnknownAgent)?;
                 let mut profile = base_profile.clone();
+                if canonical == "agy"
+                    && let Some(ref model) = overrides.model
+                    && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
+                        None,
+                        model,
+                        overrides.effort.as_deref(),
+                    )
+                {
+                    overrides.model = Some(family);
+                    overrides.effort = Some(eff);
+                }
                 if !overrides.is_empty() {
                     krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)
                         .map_err(|_| Failure::BadRequest)?;
@@ -4137,30 +4148,60 @@ impl Registry {
         cwd: &Path,
         extra_env: Vec<(Vec<u8>, Vec<u8>)>,
         bot_mcp: Option<&crate::agent::BotMcpLaunchConfig>,
-    ) -> Result<(SessionId, u32, bool), String> {
+    ) -> Result<(SessionId, u32, bool), crate::bots::runtime::BotStartError> {
+        use crate::bots::runtime::BotStartError;
+        use krill_proto::bots::BotSessionRefusal;
         use krill_proto::os::ffi::OsStrExt as _;
-        let holder = self
-            .holder
-            .as_ref()
-            .ok_or_else(|| "daemon holder unavailable (cannot spawn bot session)".to_owned())?;
+        let holder = self.holder.as_ref().ok_or_else(|| {
+            BotStartError::Refused(BotSessionRefusal::host_unsupported(
+                "Daemon session holder is unavailable.",
+            ))
+        })?;
         let agents = self
             .agents
             .agents()
-            .map_err(|_| "failed to load agent profiles".to_owned())?;
+            .map_err(|_| BotStartError::Other("failed to load agent profiles".to_owned()))?;
         let (canonical, base_profile) = agents
             .resolve(agent_id)
-            .ok_or_else(|| format!("unknown bot agent profile: {agent_id}"))?;
+            .ok_or_else(|| BotStartError::Refused(BotSessionRefusal::unknown_agent(agent_id)))?;
         let mut profile = base_profile.clone();
-        let overrides = krill_proto::agent::LaunchOverrides {
+        let mut overrides = krill_proto::agent::LaunchOverrides {
             model: model.map(ToOwned::to_owned),
             effort: effort.map(ToOwned::to_owned),
         };
+        if canonical == "agy"
+            && let Some(ref m) = overrides.model
+            && let Some((family, eff)) =
+                crate::mobile::fold_agy_model_selection(None, m, overrides.effort.as_deref())
+        {
+            overrides.model = Some(family);
+            overrides.effort = Some(eff);
+        }
         if !overrides.is_empty() {
-            krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)?;
+            krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)
+                .map_err(|err| {
+                    BotStartError::Refused(BotSessionRefusal::invalid_launch_config(canonical, err))
+                })?;
+        }
+        // Admission check: verify the agent CLI is installed and meets minimum version before spawn.
+        if let Some(program) = profile.program() {
+            let exe = resolve_bot_cli_executable(program);
+            let Some(exe) = exe else {
+                return Err(BotStartError::Refused(
+                    BotSessionRefusal::cli_not_installed(canonical),
+                ));
+            };
+            if canonical == "agy"
+                && let Some((installed, minimum)) = crate::mobile::agy_version_problem(&exe, true)
+            {
+                return Err(BotStartError::Refused(BotSessionRefusal::cli_too_old(
+                    canonical, installed, minimum,
+                )));
+            }
         }
         let session = self
             .reserve_session_id(None)
-            .map_err(|err| format!("failed to reserve session id: {err}"))?;
+            .map_err(|err| BotStartError::Other(format!("failed to reserve session id: {err}")))?;
         let state = self.state_dir();
         let mut cwd_bytes = cwd.as_os_str().as_bytes().to_vec();
         sanitize_spawn_cwd(&mut cwd_bytes);
@@ -4174,7 +4215,9 @@ impl Registry {
             Some(cwd),
             bot_mcp,
         )
-        .map_err(|err| format!("failed to prepare agent launch: {err}"))?;
+        .map_err(|err| {
+            BotStartError::Refused(BotSessionRefusal::spawn_failed(canonical, err.to_string()))
+        })?;
         launch.env.extend(extra_env);
         crate::agent::pre_trust_workspace(&profile, &cwd_bytes, account.as_ref());
         let metadata = control::AgentLaunch {
@@ -4185,7 +4228,7 @@ impl Registry {
             .remember_session(session, &metadata, session_id, cwd_bytes.clone(), account)
             .map_err(|err| {
                 self.discard_settings(session);
-                format!("failed to persist session metadata: {err}")
+                BotStartError::Other(format!("failed to persist session metadata: {err}"))
             })?;
         // 지침이 시스템 프롬프트로 갔는지: 아니면 호출자가 첫 입력으로 보낸다. 재개 때 다시 넘기도록 남긴다.
         let given = bot_mcp
@@ -4197,13 +4240,23 @@ impl Registry {
                 .map_err(|err| {
                     self.discard_settings(session);
                     self.agents.forget(session);
-                    format!("failed to persist session metadata: {err}")
+                    BotStartError::Other(format!("failed to persist session metadata: {err}"))
                 })?;
         }
         let instructions_given = given.is_some();
         self.spawn_holder(holder, session, launch.argv, launch.env, cwd_bytes, 120, 40)
             .map(|(sid, pid)| (sid, pid, instructions_given))
-            .map_err(|fail| format!("failed to spawn bot session: {fail:?}"))
+            .map_err(|fail| match fail {
+                Failure::Os(errno)
+                    if io::Error::from_raw_os_error(errno).kind() == io::ErrorKind::NotFound =>
+                {
+                    BotStartError::Refused(BotSessionRefusal::cli_not_installed(canonical))
+                }
+                other => BotStartError::Refused(BotSessionRefusal::spawn_failed(
+                    canonical,
+                    other.to_string(),
+                )),
+            })
     }
 
     fn check_messages_wait(
@@ -5201,6 +5254,27 @@ fn oversized_reply(reply: &Reply, bytes: u64) -> Reply {
     } else {
         Reply::Failed(Failure::Os(libc::EMSGSIZE))
     }
+}
+
+/// Resolves a bot agent profile's executable path against the login `PATH` and `~/.local/bin`
+/// so missing CLIs produce a clear refusal before spawning a PTY.
+fn resolve_bot_cli_executable(program: &str) -> Option<PathBuf> {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    let login_path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
+    if let Some(found) = krill_proto::agent::which(program, login_path) {
+        return Some(found);
+    }
+    if let Some(env_path) = std::env::var_os("PATH")
+        && let Some(found) = krill_proto::agent::which(program, &env_path)
+    {
+        return Some(found);
+    }
+    krill_proto::os::home_dir()
+        .and_then(|home| krill_proto::agent::which(program, home.join(".local/bin").as_os_str()))
 }
 
 fn sanitize_spawn_cwd(cwd: &mut Vec<u8>) {

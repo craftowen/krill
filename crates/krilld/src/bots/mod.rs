@@ -319,7 +319,7 @@ impl BotsManager {
             return;
         }
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runtime.on_hook_event_with_groups(
+            let turn_err = self.runtime.on_hook_event_with_groups(
                 registry,
                 &self.store,
                 self.connectors.get().map(Arc::as_ref),
@@ -327,6 +327,25 @@ impl BotsManager {
                 session_id,
                 event,
             );
+            if let Some(err_text) = turn_err {
+                let matching_scheds: Vec<(BotId, String)> = lock(&self.active_cron_sessions)
+                    .iter()
+                    .filter(|(_, sid)| **sid == session_id)
+                    .map(|((bid, sched_id), _)| (bid.clone(), sched_id.clone()))
+                    .collect();
+                let ts = now_ms();
+                for (bid, sched_id) in matching_scheds {
+                    let refusal = self.store.get_bot(&bid).ok().flatten().map(|bot| {
+                        krill_proto::bots::BotSessionRefusal::quota_exceeded(
+                            &bot.agent_id,
+                            err_text.clone(),
+                        )
+                    });
+                    self.scheduler_state
+                        .record_schedule_error(&bid, &sched_id, err_text.clone(), refusal, ts)
+                        .ok();
+                }
+            }
         }))
         .ok();
     }
@@ -465,7 +484,8 @@ impl BotsManager {
                     if let Ok(cron) = Cron::parse(&sched.cron)
                         && cron.matches(cal)
                     {
-                        self.run_schedule(registry, &bot.id, sched, Some(minute));
+                        self.run_schedule(registry, &bot.id, sched, Some(minute))
+                            .ok();
                     }
                 }
             }
@@ -482,7 +502,7 @@ impl BotsManager {
         bot_id: &BotId,
         sched: &krill_proto::bots::BotScheduleConfig,
         minute: Option<u64>,
-    ) {
+    ) -> Result<(), runtime::BotStartError> {
         if self.schedule_running(registry, bot_id, &sched.id)
             || minute.is_some_and(|minute| {
                 !self
@@ -491,7 +511,7 @@ impl BotsManager {
                     .unwrap_or(false)
             })
         {
-            return;
+            return Ok(());
         }
         let key = (bot_id.clone(), sched.id.clone());
         let target = lock(&self.active_cron_sessions)
@@ -499,12 +519,32 @@ impl BotsManager {
             .copied()
             .filter(|&sid| registry.is_session_live(sid));
         if let Some(sid) = target {
-            self.runtime
+            match self
+                .runtime
                 .deliver_turn(registry, &self.store, sid, bot_id, &sched.prompt)
-                .ok();
-            return;
+            {
+                Ok(()) => {
+                    self.scheduler_state
+                        .clear_schedule_error(bot_id, &sched.id)
+                        .ok();
+                    return Ok(());
+                }
+                Err(err) => {
+                    let start_err = runtime::BotStartError::Other(err);
+                    self.scheduler_state
+                        .record_schedule_error(
+                            bot_id,
+                            &sched.id,
+                            start_err.message(),
+                            None,
+                            now_ms(),
+                        )
+                        .ok();
+                    return Err(start_err);
+                }
+            }
         }
-        if let Ok((sid, _)) = self.runtime.start_bot_session(
+        match self.runtime.start_bot_session(
             registry,
             &self.store,
             &self.secrets,
@@ -515,7 +555,25 @@ impl BotsManager {
             Some(&sched.prompt),
             None,
         ) {
-            lock(&self.active_cron_sessions).insert(key, sid);
+            Ok((sid, _)) => {
+                lock(&self.active_cron_sessions).insert(key, sid);
+                self.scheduler_state
+                    .clear_schedule_error(bot_id, &sched.id)
+                    .ok();
+                Ok(())
+            }
+            Err(err) => {
+                self.scheduler_state
+                    .record_schedule_error(
+                        bot_id,
+                        &sched.id,
+                        err.message(),
+                        err.refusal().cloned(),
+                        now_ms(),
+                    )
+                    .ok();
+                Err(err)
+            }
         }
     }
 
@@ -587,27 +645,73 @@ impl BotsManager {
                 Ok(None) => BotRpcResponse::Error(format!("bot not found: {}", bot_id.as_str())),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
-            BotRpcRequest::CreateBot(params) => match self.store.create_bot(*params, ts) {
-                Ok(bot) => {
-                    self.reconcile_for_bot(&bot);
-                    BotRpcResponse::Bot(Box::new(bot))
+            BotRpcRequest::CreateBot(mut params) => {
+                if krill_proto::agent::canonical_id(params.agent_id.trim()) == "agy"
+                    && let Some(ref model) = params.model
+                    && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
+                        None,
+                        model,
+                        params.effort.as_deref(),
+                    )
+                {
+                    params.model = Some(family);
+                    params.effort = Some(eff);
                 }
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
-            BotRpcRequest::CreateBotV2(params) => match self.store.create_bot_v2(*params, ts) {
-                Ok(bot) => {
-                    self.reconcile_for_bot(&bot);
-                    BotRpcResponse::Bot(Box::new(bot))
+                match self.store.create_bot(*params, ts) {
+                    Ok(bot) => {
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
-            BotRpcRequest::UpdateBot(params) => {
-                let prev_agent = self
-                    .store
-                    .get_bot(&params.bot_id)
-                    .ok()
-                    .flatten()
+            }
+            BotRpcRequest::CreateBotV2(mut params) => {
+                if krill_proto::agent::canonical_id(params.base.agent_id.trim()) == "agy"
+                    && let Some(ref model) = params.base.model
+                    && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
+                        None,
+                        model,
+                        params.base.effort.as_deref(),
+                    )
+                {
+                    params.base.model = Some(family);
+                    params.base.effort = Some(eff);
+                }
+                match self.store.create_bot_v2(*params, ts) {
+                    Ok(bot) => {
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
+            BotRpcRequest::UpdateBot(mut params) => {
+                let prev_bot = self.store.get_bot(&params.bot_id).ok().flatten();
+                let prev_agent = prev_bot
+                    .as_ref()
                     .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
+                let effective_agent = params
+                    .agent_id
+                    .as_deref()
+                    .map(|a| krill_proto::agent::canonical_id(a.trim()))
+                    .or(prev_agent.as_deref());
+                if effective_agent == Some("agy")
+                    && let krill_proto::bots::FieldPatch::Set(ref model) = params.model
+                {
+                    let req_effort = match &params.effort {
+                        krill_proto::bots::FieldPatch::Set(e) => Some(e.as_str()),
+                        krill_proto::bots::FieldPatch::Clear => None,
+                        krill_proto::bots::FieldPatch::Unchanged => {
+                            prev_bot.as_ref().and_then(|b| b.effort.as_deref())
+                        }
+                    };
+                    if let Some((family, eff)) =
+                        crate::mobile::fold_agy_model_selection(None, model, req_effort)
+                    {
+                        params.model = krill_proto::bots::FieldPatch::Set(family);
+                        params.effort = krill_proto::bots::FieldPatch::Set(eff);
+                    }
+                }
                 match self.store.update_bot(*params, ts) {
                     Ok(bot) => {
                         let next_agent = krill_proto::agent::canonical_id(&bot.agent_id);
@@ -688,7 +792,7 @@ impl BotsManager {
                     session_id,
                     pid,
                 },
-                Err(err) => BotRpcResponse::Error(err),
+                Err(err) => err.into_rpc_response(),
             },
             BotRpcRequest::ListBotSessions { bot_id } => {
                 BotRpcResponse::BotSessions(self.runtime.list_sessions(registry, bot_id.as_ref()))
@@ -729,7 +833,7 @@ impl BotsManager {
                     session_id,
                     pid,
                 },
-                Err(err) => BotRpcResponse::Error(err),
+                Err(err) => err.into_rpc_response(),
             },
             BotRpcRequest::TakeOverWorkspace { bot_id, session_id } => {
                 match self.runtime.take_over_workspace(
@@ -967,7 +1071,7 @@ impl BotsManager {
                             session_id,
                             pid,
                         },
-                        Err(err) => BotRpcResponse::Error(err),
+                        Err(err) => err.into_rpc_response(),
                     },
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
@@ -1582,10 +1686,10 @@ impl BotsManager {
                     Some(sched) if self.schedule_running(registry, &bot_id, &schedule_id) => {
                         BotRpcResponse::Error(format!("{} is already running", sched.name))
                     }
-                    Some(sched) => {
-                        self.run_schedule(registry, &bot_id, sched, None);
-                        BotRpcResponse::Ok
-                    }
+                    Some(sched) => match self.run_schedule(registry, &bot_id, sched, None) {
+                        Ok(()) => BotRpcResponse::Ok,
+                        Err(err) => err.into_rpc_response(),
+                    },
                     None => BotRpcResponse::Error(format!("schedule not found: {schedule_id}")),
                 },
                 Ok(None) => BotRpcResponse::Error(format!("bot not found: {}", bot_id.as_str())),
@@ -4404,6 +4508,198 @@ mod tests {
         assert!(bot_json.contains("\"agent_id\": \"agy\""), "{bot_json}");
 
         mgr2.shutdown();
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn bot_start_refusals_and_schedule_run_failures_surface_structured_reasons() {
+        use krill_proto::bots::{BotRefusalCode, BotScheduleConfig};
+        use krill_proto::hook::{EventId, HookEvent, Input};
+
+        let state = std::env::temp_dir().join(format!(
+            "krilld-bot-refusal-and-quota-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&state).ok();
+        fs::create_dir_all(&state).unwrap();
+
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        let BotRpcResponse::Bot(created) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Refusal Bot".to_owned(),
+                agent_id: "agy".to_owned(),
+                description: "refusal test".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) else {
+            panic!("expected Bot");
+        };
+
+        // 1. Add a schedule and pause the bot -> StartBotSession and RunScheduleNow return BotPaused refusal.
+        let BotRpcResponse::Bot(_) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::UpdateBot(Box::new(UpdateBotParams {
+                bot_id: created.id.clone(),
+                name: None,
+                description: None,
+                emoji: FieldPatch::Unchanged,
+                avatar: FieldPatch::Unchanged,
+                agent_id: None,
+                model: FieldPatch::Unchanged,
+                effort: FieldPatch::Unchanged,
+                permission_mode: None,
+                workspace: FieldPatch::Unchanged,
+                paused: Some(true),
+                first_run_completed: None,
+                notifications: None,
+                schedules: Some(vec![BotScheduleConfig {
+                    id: "nightly".to_owned(),
+                    name: "Nightly triage".to_owned(),
+                    cron: "0 9 * * *".to_owned(),
+                    prompt: "Check inbox".to_owned(),
+                    enabled: true,
+                    timezone: None,
+                }]),
+                look_around: None,
+                memory_tidy: None,
+                mcp_tools: None,
+            })),
+        ) else {
+            panic!("expected updated Bot");
+        };
+
+        let BotRpcResponse::SessionRefused(refusal) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::StartBotSession {
+                bot_id: created.id.clone(),
+                cwd: None,
+                prompt: None,
+            },
+        ) else {
+            panic!("expected SessionRefused for paused bot");
+        };
+        assert_eq!(refusal.code, BotRefusalCode::BotPaused);
+        assert!(
+            refusal
+                .message_en(Some("this computer"))
+                .contains("Refusal Bot")
+        );
+
+        // 2. RunScheduleNow on the paused bot returns SessionRefused AND records it in GetBotUpcoming.
+        let BotRpcResponse::SessionRefused(sched_refusal) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::RunScheduleNow {
+                bot_id: created.id.clone(),
+                schedule_id: "nightly".to_owned(),
+            },
+        ) else {
+            panic!("expected SessionRefused from RunScheduleNow");
+        };
+        assert_eq!(sched_refusal.code, BotRefusalCode::BotPaused);
+
+        let BotRpcResponse::Upcoming(up) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::GetBotUpcoming {
+                bot_id: created.id.clone(),
+            },
+        ) else {
+            panic!("expected Upcoming");
+        };
+        let sched_up = up
+            .schedules
+            .iter()
+            .find(|s| s.id == "nightly")
+            .expect("nightly upcoming");
+        assert_eq!(
+            sched_up.last_refusal.as_ref().map(|r| r.code),
+            Some(BotRefusalCode::BotPaused)
+        );
+        assert!(
+            sched_up
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Refusal Bot"))
+        );
+
+        // 3. Quota-stopped Antigravity Stop hook skips `first_run_completed`, clears pending turn,
+        //    and records the quota error on the active schedule instead of stale progress text.
+        let sid = SessionId(709);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            sid,
+            crate::bots::runtime::BotSessionBinding {
+                bot_id: created.id.clone(),
+                link_id: None,
+                memory_snapshot: krill_proto::bots::MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 0,
+                label: "Refusal Bot".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: true,
+                last_prompt: Some("Check inbox".to_owned()),
+            },
+        );
+        lock(&mgr.active_cron_sessions).insert((created.id.clone(), "nightly".to_owned()), sid);
+
+        let quota_err =
+            "generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached.";
+        let quota_stop = HookEvent {
+            id: EventId {
+                unix_ns: 100,
+                pid: 1,
+            },
+            agent: "agy".to_owned(),
+            ppid: 1,
+            input: Input::Complete,
+            payload: format!(
+                r#"{{"hook_event_name":"Stop","fullyIdle":true,"terminationReason":"ERROR","error":"{quota_err}","last_assistant_message":"Running the baseline benchmarks."}}"#
+            )
+            .into_bytes(),
+        };
+        mgr.on_hook_event(&reg, sid, &quota_stop);
+        assert!(
+            !mgr.runtime.turn_running(sid),
+            "quota-stopped turn must clear owner_turn_pending"
+        );
+        assert!(
+            !mgr.store
+                .get_bot(&created.id)
+                .unwrap()
+                .unwrap()
+                .first_run_completed,
+            "quota-stopped turn must NOT mark first_run_completed"
+        );
+        let BotRpcResponse::Upcoming(up_after) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::GetBotUpcoming {
+                bot_id: created.id.clone(),
+            },
+        ) else {
+            panic!("expected Upcoming");
+        };
+        let sched_after = up_after
+            .schedules
+            .iter()
+            .find(|s| s.id == "nightly")
+            .expect("nightly upcoming after quota stop");
+        assert_eq!(sched_after.last_error.as_deref(), Some(quota_err));
+        assert_eq!(
+            sched_after.last_refusal.as_ref().map(|r| r.code),
+            Some(BotRefusalCode::QuotaExceeded)
+        );
+
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();
     }

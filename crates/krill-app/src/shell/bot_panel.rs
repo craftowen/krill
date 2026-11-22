@@ -1190,7 +1190,11 @@ impl Shell {
             .cursor_pointer()
             .hover(|d| d.bg(p.sidebar_accent))
             .child(div().w(px(16.)).flex_none().flex().justify_center().child(
-                ui::status::status_glyph(state, false, ui::status::Size::Sm, cx),
+                if let Some(s) = session {
+                    ui::status::status_glyph_for(&s.status, false, ui::status::Size::Sm, None, cx)
+                } else {
+                    ui::status::status_glyph(state, false, ui::status::Size::Sm, cx)
+                },
             ))
             .child(
                 div()

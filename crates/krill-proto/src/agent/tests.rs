@@ -637,3 +637,56 @@ future_key = 42
     assert!(validate_custom_agent_id("gemini").is_err());
     assert!(validate_custom_agent_id(&"a".repeat(49)).is_err());
 }
+
+#[test]
+fn antigravity_listed_family_selection_folds_only_grouped_family_level_ids() {
+    // Mirrors Orca `antigravity-model-listing.test.ts` (#46941).
+    let listed = vec![
+        AgyListedModel {
+            id: "gemini-4-argon".to_owned(),
+            efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+        },
+        AgyListedModel {
+            id: "gemini-3.5-flash-medium".to_owned(),
+            efforts: Vec::new(),
+        },
+        AgyListedModel {
+            id: "gemini-3.5-flash".to_owned(),
+            efforts: Vec::new(),
+        },
+        AgyListedModel {
+            id: "gemini-3.5-flash-low".to_owned(),
+            efforts: Vec::new(),
+        },
+        AgyListedModel {
+            id: "gpt-oss-120b-medium".to_owned(),
+            efforts: Vec::new(),
+        },
+    ];
+    let pick = |model: &str, effort: Option<&str>| {
+        antigravity_listed_family_selection(model, effort, &listed)
+    };
+    assert_eq!(
+        pick("gemini-4-argon-medium", Some("medium")),
+        Some(("gemini-4-argon".to_owned(), "medium".to_owned()))
+    );
+    assert_eq!(
+        pick("gemini-4-argon-medium", None),
+        Some(("gemini-4-argon".to_owned(), "medium".to_owned()))
+    );
+    assert_eq!(
+        pick("gemini-4-argon-medium", Some("high")),
+        Some(("gemini-4-argon".to_owned(), "high".to_owned()))
+    );
+    assert_eq!(pick("gemini-4-argon-medium", Some("xhigh")), None);
+    assert_eq!(pick("gemini-3.5-flash-medium", Some("medium")), None);
+    assert_eq!(pick("gpt-oss-120b-medium", Some("medium")), None);
+
+    // Even when a live menu gives `gemini-3.5-flash` efforts, a listed level ID stays itself.
+    let mut live = listed.clone();
+    live[2].efforts = vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()];
+    assert_eq!(
+        antigravity_listed_family_selection("gemini-3.5-flash-medium", Some("medium"), &live),
+        None
+    );
+}

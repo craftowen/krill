@@ -86,6 +86,7 @@ fn trim_snapshot_card_fields(data: &mut Value, drop_command_context: bool) {
             "title",
             "foreground",
             "startup_stall",
+            "turn_error",
             "cwd",
             "branch",
             "group_label",
@@ -782,6 +783,10 @@ enum Action {
     BotsModels {
         agent_id: String,
     },
+    #[serde(rename = "bots.upcoming")]
+    BotsUpcoming {
+        bot_id: String,
+    },
     #[serde(rename = "bots.update")]
     BotsUpdate {
         bot_id: String,
@@ -1194,6 +1199,20 @@ pub(crate) fn sanitize_tap_reason(error: &io::Error) -> &'static str {
     }
 }
 
+/// Carries a structured [`krill_proto::bots::BotSessionRefusal`] through `io::Error` so
+/// `Backend::request` emits `data.refusal` instead of collapsing it into a generic error
+/// (Orca `e1779f39` / `#46892`, `5fba3d89` / `#46862`).
+#[derive(Debug)]
+struct BotRefusedIoError(krill_proto::bots::BotSessionRefusal);
+
+impl std::fmt::Display for BotRefusedIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message_en(Some("this computer")))
+    }
+}
+
+impl std::error::Error for BotRefusedIoError {}
+
 impl Backend {
     pub(super) fn new(registry: Weak<Registry>, dir: Option<&Path>, hello: ServerHello) -> Self {
         Self {
@@ -1222,7 +1241,20 @@ impl Backend {
         })();
         let value = match result {
             Ok(data) => json!({"ok":true,"data":data}),
-            Err(e) => json!({"ok":false,"error":sanitize_mobile_rpc_error(&e)}),
+            Err(e) => {
+                if let Some(refused) = e
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<BotRefusedIoError>())
+                {
+                    json!({
+                        "ok": false,
+                        "error": refused.0.message_en(Some("this computer")),
+                        "data": { "refusal": &refused.0 }
+                    })
+                } else {
+                    json!({"ok":false,"error":sanitize_mobile_rpc_error(&e)})
+                }
+            }
         };
         let out = serde_json::to_string(&value)
             .ok()
@@ -1734,6 +1766,13 @@ impl Backend {
                     agent_id: canon,
                 })? {
                     krill_proto::bots::BotRpcResponse::AgentModels(found) => Ok(to_value(found)?),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsUpcoming { bot_id } => {
+                let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::GetBotUpcoming { bot_id })? {
+                    krill_proto::bots::BotRpcResponse::Upcoming(up) => Ok(to_value(up)?),
                     _ => Err(invalid()),
                 }
             }
@@ -2735,6 +2774,9 @@ impl Backend {
         let mgr = registry.bots().map_err(io::Error::other)?;
         match mgr.handle_rpc(&registry, req) {
             krill_proto::bots::BotRpcResponse::Error(msg) => Err(io::Error::other(msg)),
+            krill_proto::bots::BotRpcResponse::SessionRefused(refusal) => {
+                Err(io::Error::other(BotRefusedIoError(*refusal)))
+            }
             resp => {
                 if mutates {
                     *crate::session::lock(&self.snapshot_cache) = None;
@@ -3317,7 +3359,7 @@ impl Backend {
             let git = git_cwd(&cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"startup_stall":state.startup_stall,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":card_state(state.state,info.status.is_some()),"agent":agent,"title":title,"foreground":state.foreground,"startup_stall":state.startup_stall,"turn_error":state.turn_error,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "profile_id":stored_launch.as_ref().map(|s|s.profile.as_str()),
                 "account_id":stored_launch.as_ref().and_then(|s|s.account.as_ref()).map(|a|a.id.as_str()),
                 "command_context":composer::command_context(stored_launch.as_ref(), &agent_profiles, &agent),

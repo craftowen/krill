@@ -2511,10 +2511,67 @@ fn group_room_v2_rpc_roundtrip() {
             group_id: "grp-1".to_owned(),
             audience: BotGroupReplyAudience::Bot { bot_id: bot1 },
         },
+        BotRpcResponse::SessionRefused(Box::new(BotSessionRefusal::cli_too_old(
+            "hermes", "0.20.5", "0.23.0",
+        ))),
+        BotRpcResponse::Upcoming(BotUpcoming {
+            schedules: vec![
+                BotScheduleUpcoming {
+                    id: "nightly".to_owned(),
+                    next_ms: Some(1_000),
+                    last_ms: None,
+                    running: false,
+                    last_error: Some(
+                        "Your Hermes CLI on this computer is 0.20.5. Chats need 0.23.0 or newer."
+                            .to_owned(),
+                    ),
+                    last_refusal: Some(BotSessionRefusal::cli_too_old(
+                        "hermes", "0.20.5", "0.23.0",
+                    )),
+                },
+                BotScheduleUpcoming {
+                    id: "clean".to_owned(),
+                    next_ms: Some(2_000),
+                    last_ms: Some(1_500),
+                    running: false,
+                    last_error: None,
+                    last_refusal: None,
+                },
+            ],
+            ..BotUpcoming::default()
+        }),
     ];
     for resp in resps {
         let frame = resp.encode().unwrap();
         let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
         assert_eq!(BotRpcResponse::decode(kind, &body).unwrap(), resp);
     }
+}
+
+#[test]
+fn bot_session_refusal_formats_versions_and_host_names_in_en_and_ko() {
+    let too_old = BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0");
+    assert_eq!(
+        too_old.message_en(Some("this computer")),
+        "Your Hermes CLI on this computer is 0.20.5. Chats need 0.23.0 or newer."
+    );
+    assert_eq!(
+        too_old.message_en(Some("Mac Studio")),
+        "Your Hermes CLI on Mac Studio is 0.20.5. Chats need 0.23.0 or newer."
+    );
+    let phone_msg = too_old.message_en(None);
+    assert!(phone_msg.contains("Hermes"), "{phone_msg}");
+    assert!(phone_msg.contains("0.20.5"), "{phone_msg}");
+    assert!(phone_msg.contains("0.23.0"), "{phone_msg}");
+    assert!(!phone_msg.contains("this computer"), "{phone_msg}");
+
+    let ko_msg = too_old.message_ko(Some("이 컴퓨터"));
+    assert!(ko_msg.contains("Hermes") && ko_msg.contains("0.20.5") && ko_msg.contains("0.23.0"));
+
+    let agy_missing = BotSessionRefusal::cli_not_installed("antigravity");
+    assert_eq!(
+        agy_missing.message_en(Some("this computer")),
+        "Antigravity CLI is not installed on this computer."
+    );
+    assert!(!agy_missing.message_en(None).contains("this computer"));
 }

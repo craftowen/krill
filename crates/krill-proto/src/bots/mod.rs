@@ -6,6 +6,7 @@ pub mod external;
 pub mod home;
 pub mod package;
 pub mod proposal;
+pub mod refusal;
 pub mod rpc;
 pub mod types;
 
@@ -43,6 +44,7 @@ pub use proposal::{
     bot_made_for_workspaces_kickoff, parse_template_proposal_fields, proposal_identity,
     proposal_soul, template_proposal,
 };
+pub use refusal::{BotRefusalCode, BotSessionRefusal, bot_agent_display_name};
 pub use rpc::{
     BOT_REPLY, BOT_REQ, BotAgentModel, BotAgentModels, BotRpcRequest, BotRpcResponse,
     BotScheduleUpcoming, BotUpcoming, CreateBotItemParams, CreateBotParams, CreateBotV2Params,

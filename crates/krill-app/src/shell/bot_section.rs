@@ -350,18 +350,26 @@ impl Shell {
             return;
         }
         let name = bot.map(|b| b.name.clone()).unwrap_or_default();
+        let host_name: Option<String> = match &self.launch_host {
+            HostId::Local => Some(krill_app::bots::rpc::local_host_label().to_owned()),
+            HostId::Remote(id) => {
+                let label = self.remote_host_name(id, cx);
+                (!label.trim().is_empty() && label != *id).then_some(label)
+            }
+        };
         let opening = bot_id.clone();
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
                 .spawn(async move {
-                    krill_app::bots::rpc::call_checked(
+                    krill_app::bots::rpc::call_checked_on(
                         &rpc,
                         &BotRpcRequest::StartBotSession {
                             bot_id,
                             cwd: None,
                             prompt: kickoff,
                         },
+                        host_name.as_deref(),
                     )
                 })
                 .await;

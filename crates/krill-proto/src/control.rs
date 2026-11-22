@@ -491,6 +491,10 @@ pub struct AgentStatus {
     /// Holds the stuck command (`brew shellenv zsh`) or the shell name. Fifth States extension.
     #[serde(default, skip)]
     pub startup_stall: Option<String>,
+    /// Error message when a terminal turn ended with provider failure (e.g. Antigravity `Stop`
+    /// with `terminationReason: "ERROR"`, Orca `b342cee0` / `#46999`). Sixth States extension.
+    #[serde(default, skip)]
+    pub turn_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +576,12 @@ impl AgentStatus {
         matches!(self.source, Some(Source::Title | Source::Screen)).then_some("추정")
     }
 
+    /// True when the last terminal turn ended in a provider error (e.g. quota exhaustion).
+    #[must_use]
+    pub fn turn_failed(&self) -> bool {
+        self.state == AgentState::Done && self.turn_error.is_some()
+    }
+
     /// 근거가 하나도 없는 세션.
     pub const UNKNOWN: Self = Self {
         state: AgentState::Unknown,
@@ -584,6 +594,7 @@ impl AgentStatus {
         subagents: Vec::new(),
         root_shell: None,
         startup_stall: None,
+        turn_error: None,
     };
 }
 
@@ -1335,7 +1346,8 @@ impl Msg for Reply {
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::States(rows) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            let has_stall = rows.iter().any(|r| r.status.startup_stall.is_some());
+            let has_turn_error = rows.iter().any(|r| r.status.turn_error.is_some());
+            let has_stall = has_turn_error || rows.iter().any(|r| r.status.startup_stall.is_some());
             let has_root = has_stall || rows.iter().any(|r| r.status.root_shell.is_some());
             let has_subagents = has_root || rows.iter().any(|r| !r.status.subagents.is_empty());
             let has_title = has_subagents || rows.iter().any(|r| r.status.title.is_some());
@@ -1383,6 +1395,19 @@ impl Msg for Reply {
                                 .startup_stall
                                 .as_deref()
                                 .filter(|c| !c.is_empty() && c.len() <= MAX_AGENT_TEXT),
+                        )
+                        .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            if has_turn_error {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(
+                            &row.status
+                                .turn_error
+                                .as_deref()
+                                .filter(|e| !e.is_empty() && e.len() <= MAX_TITLE_TEXT),
                         )
                         .map_err(crate::ipc::Error::Codec)?,
                     );
@@ -1500,6 +1525,22 @@ impl Msg for Reply {
                             ));
                         }
                         row.status.startup_stall = stall;
+                        tail = next;
+                    }
+                }
+                if !tail.is_empty() {
+                    for row in rows.iter_mut() {
+                        let (err, next) = postcard::take_from_bytes::<Option<String>>(tail)
+                            .map_err(crate::ipc::Error::Codec)?;
+                        if err
+                            .as_ref()
+                            .is_some_and(|e| e.is_empty() || e.len() > MAX_TITLE_TEXT)
+                        {
+                            return Err(crate::ipc::Error::Codec(
+                                postcard::Error::DeserializeBadEncoding,
+                            ));
+                        }
+                        row.status.turn_error = err;
                         tail = next;
                     }
                 }

@@ -165,9 +165,20 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
     }) {
         return;
     }
+    crate::usage::direct::agy::run_account_op(|| {
+        sync_account_gated(home, &host_token_path, accounts, target_dir);
+    });
+}
+
+fn sync_account_gated(
+    home: &Path,
+    host_token_path: &Path,
+    accounts: &[StoredAccount],
+    target_dir: Option<&Path>,
+) {
     let real_keychain = use_real_keychain(home);
     let mut current_keychain = if real_keychain { read_keychain() } else { None };
-    let mut current_file = read_token_file(&host_token_path);
+    let mut current_file = read_token_file(host_token_path);
 
     // 1. 호스트에서 갱신된 토큰이 있으면 같은 이메일을 가진 프로필 슬롯에 먼저 보존한다.
     if current_file.is_some() || current_keychain.is_some() {
@@ -203,7 +214,7 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
                 continue;
             }
             let is_target = target_dir == Some(prof_dir);
-            let host_path_opt = host_from_file.then_some(host_token_path.as_path());
+            let host_path_opt = host_from_file.then_some(host_token_path);
             if token_is_newer(
                 ProviderKind::Antigravity,
                 host_raw,
@@ -225,7 +236,7 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
                     false,
                 )
             {
-                write_atomic_0600(&host_token_path, &prof_raw).ok();
+                write_atomic_0600(host_token_path, &prof_raw).ok();
                 if real_keychain {
                     write_keychain(&prof_raw);
                     current_keychain = Some(prof_raw.clone());
@@ -248,7 +259,7 @@ fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Pat
     };
     let mut host_changed = false;
     if current_file.as_ref() != Some(&target_raw) {
-        write_atomic_0600(&host_token_path, &target_raw).ok();
+        write_atomic_0600(host_token_path, &target_raw).ok();
         host_changed = true;
     }
     if real_keychain && current_keychain.as_ref() != Some(&target_raw) {

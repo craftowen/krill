@@ -78,6 +78,9 @@ pub struct Statuses {
     map: Mutex<BTreeMap<SessionId, Record>>,
     /// 서브에이전트 목록. 저장하지 않는다(krilld 재기동이면 빈 목록).
     subagents: Mutex<BTreeMap<SessionId, subagents::Roster>>,
+    /// 마지막 턴이 프로바이더 오류(예: Antigravity `Stop` + `terminationReason: "ERROR"`)로 끝났을 때의 오류 문구.
+    /// 저장하지 않는다(`agent-state` v1 형식 유지).
+    turn_errors: Mutex<BTreeMap<SessionId, String>>,
 }
 
 impl Statuses {
@@ -93,6 +96,7 @@ impl Statuses {
             commit: Mutex::new(()),
             map: Mutex::new(map),
             subagents: Mutex::default(),
+            turn_errors: Mutex::default(),
         }
     }
 
@@ -103,6 +107,9 @@ impl Statuses {
             .map_or(AgentStatus::UNKNOWN, |r| r.status.clone());
         if let Some(r) = lock(&self.subagents).get(&session) {
             status.subagents = r.list();
+        }
+        if status.state == AgentState::Done {
+            status.turn_error = lock(&self.turn_errors).get(&session).cloned();
         }
         status
     }
@@ -123,6 +130,7 @@ impl Statuses {
         let _commit = lock(&self.commit);
         let mut next = lock(&self.map).clone();
         let mut n = 0;
+        let mut error_updates: Vec<(SessionId, Option<String>)> = Vec::new();
         for &(session, e) in events {
             let state = if let Some(state) = normalize(&e.payload) {
                 state
@@ -149,11 +157,38 @@ impl Statuses {
             r.set(state, Source::Hook, e.id.unix_ns);
             r.status.agent.clone_from(&e.agent);
             r.last.push(e.id);
+            if state == AgentState::Done && is_agy_stop_failed(&e.payload) {
+                let msg =
+                    agy_stop_error_message(&e.payload).unwrap_or_else(|| "Turn failed".to_owned());
+                let clean = krill_proto::screen::sanitize_title_max(
+                    &msg,
+                    krill_proto::control::MAX_TITLE_TEXT,
+                );
+                let final_msg = if clean.trim().is_empty() {
+                    "Turn failed".to_owned()
+                } else {
+                    clean
+                };
+                error_updates.push((session, Some(final_msg)));
+            } else {
+                error_updates.push((session, None));
+            }
             n += 1;
         }
         if n > 0 {
             self.save(&next)?;
             *lock(&self.map) = next;
+            let mut errors = lock(&self.turn_errors);
+            for (session, err) in error_updates {
+                match err {
+                    Some(msg) => {
+                        errors.insert(session, msg);
+                    }
+                    None => {
+                        errors.remove(&session);
+                    }
+                }
+            }
         }
         Ok(n)
     }
@@ -161,6 +196,7 @@ impl Statuses {
     /// 세션 루트 프로세스가 끝났다(holder `Exited`). 그 전에 시작한 hook 이벤트는 더는 상태를 바꾸지 않는다.
     pub fn exited(&self, session: SessionId) {
         lock(&self.subagents).remove(&session);
+        lock(&self.turn_errors).remove(&session);
         let _commit = lock(&self.commit);
         let mut map = lock(&self.map).clone();
         let r = map.entry(session).or_insert_with(|| Record {
@@ -232,6 +268,7 @@ impl Statuses {
     /// 지운 세션의 상태를 버린다.
     pub fn remove(&self, session: SessionId) {
         lock(&self.subagents).remove(&session);
+        lock(&self.turn_errors).remove(&session);
         let _commit = lock(&self.commit);
         let mut map = lock(&self.map).clone();
         if map.remove(&session).is_some() {
@@ -242,6 +279,7 @@ impl Statuses {
 
     /// `live`에 없는 세션의 상태를 버린다(krilld 기동 때: 그사이 사라진 세션).
     pub fn retain(&self, live: &[SessionId]) {
+        lock(&self.turn_errors).retain(|id, _| live.contains(id));
         let _commit = lock(&self.commit);
         let mut map = lock(&self.map).clone();
         let before = map.len();
@@ -309,6 +347,11 @@ struct Fields {
     is_subagent: bool,
     #[serde(alias = "fullyIdle")]
     fully_idle: Option<bool>,
+    #[serde(alias = "terminationReason")]
+    termination_reason: Option<String>,
+    error: Option<String>,
+    #[serde(alias = "lastAssistantMessage")]
+    last_assistant_message: Option<String>,
 }
 
 /// Claude·Codex·Cursor·OpenCode·Antigravity hook payload 하나를 상태로. 상태를 바꾸지 않는 이벤트(서브에이전트·압축 등)와
@@ -390,6 +433,50 @@ pub(crate) fn is_turn_stop(payload: &[u8]) -> bool {
         Some("AfterAgent" | "stop") => true,
         _ => false,
     }
+}
+
+/// Returns true when an Antigravity `Stop` hook still has work in flight (`fullyIdle: false`).
+#[must_use]
+pub fn is_agy_stop_still_busy(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Fields>(payload).is_ok_and(|f| f.fully_idle == Some(false))
+}
+
+/// Returns true when an idle Antigravity `Stop` hook ended on a provider error such as quota
+/// exhaustion (`terminationReason: "ERROR"`, Orca `b342cee0` / `#46999`).
+/// Non-idle stops (`fullyIdle: false`) stay working and return `false`.
+#[must_use]
+pub fn is_agy_stop_failed(payload: &[u8]) -> bool {
+    let Ok(f) = serde_json::from_slice::<Fields>(payload) else {
+        return false;
+    };
+    let is_stop = matches!(f.hook_event_name.as_deref(), Some("Stop" | "stop"));
+    if !is_stop || f.fully_idle == Some(false) {
+        return false;
+    }
+    f.termination_reason
+        .as_deref()
+        .is_some_and(|r| r.trim().eq_ignore_ascii_case("error"))
+}
+
+/// Extracts the error text for a failed Antigravity `Stop` turn (Orca `b342cee0` / `#46999`):
+/// prefers `error` over `last_assistant_message`, skipping transcript reads.
+#[must_use]
+pub fn agy_stop_error_message(payload: &[u8]) -> Option<String> {
+    if !is_agy_stop_failed(payload) {
+        return None;
+    }
+    let f = serde_json::from_slice::<Fields>(payload).ok()?;
+    f.error
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            f.last_assistant_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .map(ToOwned::to_owned)
 }
 
 /// 서브에이전트가 띄운 권한·질문(`Waiting`)이 끝났음을 뜻하는 서브에이전트 후속 이벤트인가(Orca `claude-roster-state` 준용).

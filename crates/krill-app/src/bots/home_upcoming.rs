@@ -14,8 +14,8 @@ use krill_proto::bots::{
 
 use super::home::section_header;
 use super::home_time::{every_text, looked_text, quiet_line, ran_text, upcoming_at};
-use super::rpc::call_checked;
-use super::settings_root::{OpenSettingsPage, SettingsPage};
+use super::rpc::{bot_refusal_text, call_checked, call_checked_on, local_host_label};
+use super::settings_root::{OpenSettingsPage, SettingsPage, computer_name};
 use super::{DetailTab, View, now_unix_ms};
 use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
@@ -117,11 +117,24 @@ impl AutoRow {
 
 /// Orca's `botUpcomingRows` + `botAutomationCardRows`: Tidy memory, Look around, then the
 /// schedules, with their runs.
+#[cfg(test)]
 pub(super) fn automation_rows(
     bot: &BotConfig,
     up: Option<&BotUpcoming>,
     looking: bool,
     look_error: Option<&str>,
+    now: u64,
+) -> Vec<AutoRow> {
+    automation_rows_on(bot, up, looking, look_error, Some(local_host_label()), now)
+}
+
+/// Like [`automation_rows`], wording any schedule run refusal for `host_name`.
+pub(super) fn automation_rows_on(
+    bot: &BotConfig,
+    up: Option<&BotUpcoming>,
+    looking: bool,
+    look_error: Option<&str>,
+    host_name: Option<&str>,
     now: u64,
 ) -> Vec<AutoRow> {
     let ahead = |at: Option<u64>| at.map(|at| at.max(now));
@@ -161,13 +174,19 @@ pub(super) fn automation_rows(
     ];
     rows.extend(bot.schedules.iter().map(|s| {
         let facts = up.and_then(|u| u.schedules.iter().find(|x| x.id == s.id));
+        let failed = facts.and_then(|f| {
+            f.last_refusal
+                .as_ref()
+                .map(|r| bot_refusal_text(r, host_name))
+                .or_else(|| f.last_error.clone())
+        });
         AutoRow {
             key: format!("automation:{}", s.id),
             kind: AutoKind::Schedule,
             id: s.id.clone(),
             title: s.name.clone(),
             on: s.enabled,
-            failed: None,
+            failed,
             running: facts.is_some_and(|f| f.running),
             next_at: facts.and_then(|f| f.next_ms).filter(|&at| at > now),
             exact_next: true,
@@ -358,6 +377,7 @@ impl View {
         cx: &mut Context<Self>,
     ) {
         let rpc = self.rpc.clone();
+        let host_name = self.refusal_host_name();
         let Some(bot_id) = self.selected_bot_id.clone() else {
             return;
         };
@@ -366,7 +386,7 @@ impl View {
             let (res, up) = cx
                 .background_executor()
                 .spawn(async move {
-                    let res = call_checked(&rpc, &req);
+                    let res = call_checked_on(&rpc, &req, host_name.as_deref());
                     let up = match call_checked(&rpc, &BotRpcRequest::GetBotUpcoming { bot_id }) {
                         Ok(BotRpcResponse::Upcoming(up)) => Some(up),
                         _ => None,
@@ -520,13 +540,26 @@ impl View {
         }));
     }
 
+    /// Host name used when wording bot chat refusals: `"this computer"` / `"이 컴퓨터"` locally,
+    /// the paired host's display name remotely, or `None` when a paired host has no name.
+    pub(super) fn refusal_host_name(&self) -> Option<String> {
+        if self.host.is_local() {
+            Some(local_host_label().to_owned())
+        } else {
+            let label = computer_name(self);
+            (label != "?" && !label.trim().is_empty()).then_some(label)
+        }
+    }
+
     /// The bot's Automations rows as Home shows them.
     pub(super) fn home_automation_rows(&self, bot: &BotConfig, now: u64) -> Vec<AutoRow> {
-        automation_rows(
+        let host_name = self.refusal_host_name();
+        automation_rows_on(
             bot,
             self.items.upcoming.as_ref(),
             self.soul_memory.look_around_running,
             self.items.look_error.as_deref(),
+            host_name.as_deref(),
             now,
         )
     }

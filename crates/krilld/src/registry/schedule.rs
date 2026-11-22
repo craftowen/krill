@@ -647,12 +647,58 @@ fn schedule_program(
         program
     };
     args.extend(extra_args);
+    if is_agent && resolved.is_some_and(|(canon, _)| canon == "agy") {
+        normalize_agy_schedule_args(&mut args);
+    }
     if !is_agent && !prompt.is_empty() {
         args.push(prompt.into());
     }
     Program::Custom {
         program: executable.as_bytes().to_vec(),
         args: args.into_iter().map(String::into_bytes).collect(),
+    }
+}
+
+/// Folds an Antigravity level model ID in schedule `--model` / `--effort` flags onto its listed
+/// family + effort so effort stays adjustable after launch (Orca `c5de2672` / `#46941`).
+fn normalize_agy_schedule_args(args: &mut Vec<String>) {
+    let mut model_idx: Option<usize> = None;
+    let mut effort_idx: Option<usize> = None;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--model" if i + 1 < args.len() => {
+                model_idx = Some(i + 1);
+                i += 2;
+            }
+            "--effort" if i + 1 < args.len() => {
+                effort_idx = Some(i + 1);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(m_idx) = model_idx else {
+        return;
+    };
+    let Some(current_model) = args.get(m_idx).map(String::as_str) else {
+        return;
+    };
+    let current_effort = effort_idx.and_then(|idx| args.get(idx)).map(String::as_str);
+    if let Some((family, eff)) =
+        crate::mobile::fold_agy_model_selection(None, current_model, current_effort)
+    {
+        if let Some(slot) = args.get_mut(m_idx) {
+            *slot = family;
+        }
+        if let Some(e_idx) = effort_idx
+            && let Some(slot) = args.get_mut(e_idx)
+        {
+            *slot = eff;
+        } else {
+            args.push("--effort".to_owned());
+            args.push(eff);
+        }
     }
 }
 

@@ -228,6 +228,9 @@ impl BotClient for DaemonBotClient {
             .map_err(|e| CliError::fail(format!("decode bot reply: {e}")))?;
         match reply {
             Reply::Bot(BotRpcResponse::Error(msg)) => Err(CliError::fail(msg)),
+            Reply::Bot(BotRpcResponse::SessionRefused(refusal)) => {
+                Err(CliError::fail(refusal.message_en(Some("this computer"))))
+            }
             Reply::Bot(resp) => Ok(resp),
             Reply::Failed(failure) => Err(CliError::fail(failure.to_string())),
             _ => Err(CliError::fail("unexpected non-bot reply from krilld")),
