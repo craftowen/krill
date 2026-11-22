@@ -4,6 +4,7 @@ use crate::agent::control::{LaunchAccount, StoredLaunch};
 use crate::session::Tap;
 use krill_proto::agent::{Agents, Profile, canonical_id};
 use krill_proto::agent_history::ChatPollSnapshot;
+use krill_proto::bots::{BotAgentModel, BotAgentModels};
 use krill_proto::screen::Screen;
 use std::collections::BTreeMap;
 use std::fs;
@@ -219,6 +220,37 @@ fn no_current_model() -> io::Error {
 
 pub(crate) fn prewarm_agy_launch(home: &Path, config: Option<PathBuf>) {
     agy::prewarm_path(home, config);
+}
+
+/// Models a new bot can launch `agent` with, read from the same catalog the chat composer shows.
+/// Waits like an explicit composer read does, so a cold Antigravity list is fetched, not skipped.
+pub(crate) fn launch_models(home: &Path, agents: &Agents, agent: &str) -> BotAgentModels {
+    let context = resolve(home, home, agent, None, agents, |key| {
+        std::env::var(key).ok()
+    });
+    if context.agent == "agy" {
+        agy::Agy.settle(&context);
+        return agy::launch_models(&context);
+    }
+    let catalog = context.models();
+    let models = catalog
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?;
+            let label = item.get("label").and_then(Value::as_str).unwrap_or(id);
+            Some(BotAgentModel {
+                id: id.to_owned(),
+                label: label.to_owned(),
+            })
+        })
+        .collect();
+    BotAgentModels {
+        models,
+        reason: None,
+    }
 }
 
 pub(super) fn command_context(

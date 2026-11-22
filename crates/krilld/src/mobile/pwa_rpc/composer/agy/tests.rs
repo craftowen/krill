@@ -577,6 +577,29 @@ fn a_missing_install_says_why() {
 }
 
 #[test]
+fn a_new_bot_gets_every_row_with_the_effort_in_its_id() {
+    let (root, context) = fixture("bot", "1.4.12", "0").unwrap();
+    Agy.settle(&context);
+    let listed = launch_models(&context);
+    assert_eq!(listed.reason, None);
+    assert_eq!(listed.models.len(), 13, "{listed:?}");
+    assert_eq!(
+        listed.models[0],
+        BotAgentModel {
+            id: "gemini-4-argon-low".into(),
+            label: "Gemini 4 Argon (Low)".into(),
+        }
+    );
+    assert!(
+        listed
+            .models
+            .iter()
+            .any(|m| m.id == "gemini-pro-orchestrator")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn a_poll_never_waits_for_the_listing() {
     let (root, context) = fixture("poll", "1.4.12", "1").unwrap();
     let first = Agy.catalog(&context);

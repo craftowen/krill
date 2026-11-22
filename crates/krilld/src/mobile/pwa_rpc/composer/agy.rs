@@ -5,6 +5,7 @@ use super::{
 };
 use crate::session::lock;
 use crate::usage::{accounts, direct};
+use krill_proto::bots::{BotAgentModel, BotAgentModels};
 use krill_proto::screen::{Color, Flags, Screen};
 use krill_proto::usage::ProviderKind;
 use std::collections::BTreeMap;
@@ -451,6 +452,24 @@ fn confirmed(screen: &Screen, label: &str) -> bool {
     }
     let text = native::words(rows.get(newest..).unwrap_or_default());
     text == format!("⎿ Model set to {label}") || text == format!("⎿ Model already set to {label}")
+}
+
+/// Every `agy models` row, effort kept in the id: what `agy --model` accepts at launch.
+pub(super) fn launch_models(context: &Context) -> BotAgentModels {
+    let (families, failure) = cached(context);
+    let models: Vec<_> = families
+        .iter()
+        .flat_map(|families| families.iter())
+        .flat_map(|family| &family.levels)
+        .map(|level| BotAgentModel {
+            id: level.id.clone(),
+            label: level.label.clone(),
+        })
+        .collect();
+    let reason = models
+        .is_empty()
+        .then(|| failure.unwrap_or(LOADING).to_owned());
+    BotAgentModels { models, reason }
 }
 
 pub(super) struct Agy;

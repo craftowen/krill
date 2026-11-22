@@ -17,7 +17,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_proto::bots::{
-    BotConfig, BotRpcRequest, BotRpcResponse, BotTemplate, CreateBotParams, CreateBotV2Params,
+    BotAgentModel, BotAgentModels, BotConfig, BotRpcRequest, BotRpcResponse, BotTemplate,
+    CreateBotParams, CreateBotV2Params,
 };
 
 use super::avatar::{self, PICKER_MASCOTS, PICTURE_MAX_BYTES, PictureError, prepare_picture};
@@ -88,7 +89,10 @@ pub struct NewBot {
     /// Single line: only single-line inputs centre their text like Orca's field.
     purpose: Entity<InputState>,
     runtime: &'static str,
-    model: Option<&'static str>,
+    model: Option<String>,
+    /// krilld's list for `runtime` (the chat composer's source); `None` while it is asked.
+    discovered: Option<BotAgentModels>,
+    models_task: Option<Task<()>>,
     changing: bool,
     template: Option<&'static BotTemplate>,
     /// Template skills the user kept checked.
@@ -153,7 +157,7 @@ impl NewBot {
             cx.subscribe_in(&name, window, Self::on_input),
             cx.subscribe_in(&purpose, window, Self::on_input),
         ];
-        Self {
+        let mut this = Self {
             focus: cx.focus_handle(),
             carousel_focus: cx.focus_handle().tab_stop(true),
             rpc,
@@ -172,6 +176,8 @@ impl NewBot {
                 .copied()
                 .unwrap_or("claude"),
             model: None,
+            discovered: None,
+            models_task: None,
             changing: false,
             template,
             skills: template.map(|t| t.skills.to_vec()).unwrap_or_default(),
@@ -180,7 +186,9 @@ impl NewBot {
             task: None,
             picture_task: None,
             _subs: subs,
-        }
+        };
+        this.load_models(cx);
+        this
     }
 
     #[must_use]
@@ -355,17 +363,76 @@ impl NewBot {
         true
     }
 
-    fn set_runtime(&mut self, runtime: &'static str, cx: &mut Context<Self>) {
+    pub(super) fn set_runtime(&mut self, runtime: &'static str, cx: &mut Context<Self>) {
         if self.runtime != runtime {
             self.runtime = runtime;
             self.model = None;
+            self.load_models(cx);
         }
         cx.notify();
     }
 
-    fn set_model(&mut self, model: Option<&'static str>, cx: &mut Context<Self>) {
+    pub(super) fn set_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
         self.model = model;
         cx.notify();
+    }
+
+    /// Asks krilld for the agent's own model list, the one the chat composer shows. The built-in
+    /// list stays up meanwhile, and when the daemon is too old to answer.
+    fn load_models(&mut self, cx: &mut Context<Self>) {
+        let rpc = self.rpc.clone();
+        let agent_id = self.runtime.to_owned();
+        self.discovered = None;
+        // Replacing the task drops a reply for the runtime picked before.
+        self.models_task = Some(cx.spawn(async move |this, cx| {
+            let reply = cx
+                .background_executor()
+                .spawn(
+                    async move { call_checked(&rpc, &BotRpcRequest::ListAgentModels { agent_id }) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                // An older daemon (or a failed call) lists nothing, so the built-in list stays.
+                this.discovered = Some(match reply {
+                    Ok(BotRpcResponse::AgentModels(models)) => models,
+                    _ => BotAgentModels::default(),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// What the model picker lists: krilld's models, or the built-in ones until it reports any.
+    pub(super) fn model_choices(&self) -> Vec<BotAgentModel> {
+        match &self.discovered {
+            Some(found)
+                if !found.models.is_empty()
+                    && crate::agent_models::prefers_discovered(self.runtime) =>
+            {
+                found.models.clone()
+            }
+            _ => runtime_models(self.runtime),
+        }
+    }
+
+    /// Like the composer's picker notice: still loading, or why the agent listed nothing.
+    pub(super) fn model_notice(&self) -> Option<SharedString> {
+        let Some(found) = &self.discovered else {
+            return Some(text::MODELS_LOADING.get().into());
+        };
+        found
+            .reason
+            .clone()
+            .filter(|_| found.models.is_empty())
+            .map(Into::into)
+    }
+
+    fn model_label(&self, id: &str) -> String {
+        self.model_choices()
+            .into_iter()
+            .find(|m| m.id == id)
+            .map_or_else(|| id.to_owned(), |m| m.label)
     }
 
     pub(super) fn toggle_skill(&mut self, skill: &'static str, cx: &mut Context<Self>) {
@@ -403,7 +470,7 @@ impl NewBot {
                 description,
                 emoji: None,
                 avatar,
-                model: self.model.map(str::to_owned),
+                model: self.model.clone(),
                 effort: None,
                 permission_mode: None,
                 workspace: None,
@@ -779,12 +846,8 @@ impl NewBot {
                 .child(s)
         };
         let mut agent = runtime_display_label(self.runtime);
-        if let Some(model) = self.model {
-            let label = runtime_models(self.runtime)
-                .iter()
-                .find(|(id, _)| *id == model)
-                .map_or(model, |(_, l)| *l);
-            agent = format!("{agent} ({label})");
+        if let Some(model) = &self.model {
+            agent = format!("{agent} ({})", self.model_label(model));
         }
         // "Runs on {host} with {agent}": icons sit next to the names, word order per language.
         let line = text::NB_RUNS_LINE.get();
@@ -884,11 +947,13 @@ impl NewBot {
                 menu
             });
         let this = cx.weak_entity();
-        let current = self.model;
-        let presets = runtime_models(runtime);
-        let model_label = current
-            .and_then(|m| presets.iter().find(|(id, _)| *id == m).map(|(_, l)| *l))
-            .unwrap_or(text::MODEL_DEFAULT.get());
+        let current = self.model.clone();
+        let choices = self.model_choices();
+        let model_label = current.as_deref().map_or_else(
+            || text::MODEL_DEFAULT.get().to_owned(),
+            |m| self.model_label(m),
+        );
+        let notice = self.model_notice();
         let model_button = Button::new("new-bot-model")
             .outline()
             .small()
@@ -897,23 +962,28 @@ impl NewBot {
             .label(model_label)
             .debug_selector(|| "new-bot-model".into())
             .dropdown_menu(move |mut menu, _, _| {
-                let pick = |choice: Option<&'static str>| {
+                let pick = |choice: Option<String>| {
                     let this = this.clone();
                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        this.update(cx, |v, cx| v.set_model(choice, cx)).ok();
+                        this.update(cx, |v, cx| v.set_model(choice.clone(), cx))
+                            .ok();
                     }
                 };
-                menu = menu.item(
+                // agy lists every model × effort pair, so long lists scroll.
+                menu = menu.max_h(px(360.)).scrollable(true).item(
                     PopupMenuItem::new(text::MODEL_DEFAULT.get())
                         .checked(current.is_none())
                         .on_click(pick(None)),
                 );
-                for (id, label) in presets {
+                for choice in &choices {
                     menu = menu.item(
-                        PopupMenuItem::new(*label)
-                            .checked(current == Some(*id))
-                            .on_click(pick(Some(*id))),
+                        PopupMenuItem::new(choice.label.clone())
+                            .checked(current.as_deref() == Some(choice.id.as_str()))
+                            .on_click(pick(Some(choice.id.clone()))),
                     );
+                }
+                if let Some(notice) = &notice {
+                    menu = menu.label(notice.clone());
                 }
                 menu
             });

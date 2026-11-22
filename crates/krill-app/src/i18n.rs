@@ -455,6 +455,7 @@ catalog! {
         TAB_TOOLS_SHARING => ("도구 · 공유", "Tools & Sharing"),
         CREATE_DESC => ("이름과 기억, 자동화를 가진 AI 동료입니다. 정한 폴더에서 일합니다.", "Your AI teammate, with a name, memory and automations. It works in the folder you pick."),
         MODEL_DEFAULT => ("기본값", "Default"),
+        MODELS_LOADING => ("모델 목록을 불러오는 중…", "Loading models…"),
         TEMPLATES_HEADING => ("기본 템플릿 ({n})", "Built-in templates ({n})"),
         CAT_ALL => ("전체", "All"),
         CAT_CODING => ("코딩", "Coding"),

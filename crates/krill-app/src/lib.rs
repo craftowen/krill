@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod add_project;
 pub mod agent_history;
+pub mod agent_models;
 pub mod alert;
 pub mod appearance;
 pub mod artifacts;

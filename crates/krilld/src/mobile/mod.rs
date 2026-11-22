@@ -10,6 +10,14 @@ pub mod relay;
 pub(crate) fn prewarm_agy_launch(home: &std::path::Path, config: Option<std::path::PathBuf>) {
     pwa_rpc::composer::prewarm_agy_launch(home, config);
 }
+
+pub(crate) fn bot_launch_models(
+    home: &std::path::Path,
+    agents: &krill_proto::agent::Agents,
+    agent: &str,
+) -> krill_proto::bots::BotAgentModels {
+    pwa_rpc::composer::launch_models(home, agents, agent)
+}
 mod relay_auth;
 pub mod tailscale_serve;
 mod workspaces;

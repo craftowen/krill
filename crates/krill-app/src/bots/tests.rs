@@ -54,6 +54,8 @@ struct MockState {
     fail_create_item: Option<String>,
     fail_reload_connectors: Option<String>,
     fail_set_connector_config: Option<String>,
+    /// `ListAgentModels` replies by agent; a missing agent answers like a daemon that predates it.
+    agent_models: BTreeMap<String, krill_proto::bots::BotAgentModels>,
 }
 
 fn sample_bot(id: &str, name: &str) -> BotConfig {
@@ -832,6 +834,12 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     imported,
                 })
             }
+            BotRpcRequest::ListAgentModels { agent_id } => Ok(st
+                .agent_models
+                .get(agent_id)
+                .map_or(BotRpcResponse::Ok, |m| {
+                    BotRpcResponse::AgentModels(m.clone())
+                })),
             _ => Ok(BotRpcResponse::Ok),
         }
     })
@@ -1606,10 +1614,19 @@ fn sidebar_snapshot_counts_attention_per_bot_and_offers_models_per_runtime() {
         assert!(
             models
                 .iter()
-                .all(|(id, label)| !id.is_empty() && !label.is_empty())
+                .all(|m| !m.id.is_empty() && m.id != "default" && !m.label.is_empty())
         );
     }
-    assert!(runtime_models("claude").iter().any(|(id, _)| *id == "opus"));
+    // The composer's list: "Default" is the picker's own row, Fable is 5.2.
+    let claude = runtime_models("claude");
+    assert!(claude.iter().any(|m| m.id == "opus"));
+    assert!(
+        claude
+            .iter()
+            .any(|m| m.id == "fable" && m.label == "Fable 5.2")
+    );
+    // agy ids change per account and release; only `agy models` names them.
+    assert!(runtime_models("agy").is_empty());
     assert!(runtime_models("pi").is_empty());
 }
 
@@ -1655,6 +1672,107 @@ fn new_bot_dialog_saves_the_mascot_and_clears_unchecked_template_skills(cx: &mut
     assert!(reqs.iter().any(|r| matches!(
         r,
         BotRpcRequest::UpdateBotExtras(p) if p.skills.as_deref() == Some(&[][..])
+    )));
+}
+
+#[gpui::test]
+fn new_bot_dialog_lists_the_agents_own_models_and_launches_the_pick(cx: &mut TestAppContext) {
+    use krill_proto::bots::{BotAgentModel, BotAgentModels};
+    let model = |id: &str, label: &str| BotAgentModel {
+        id: id.to_owned(),
+        label: label.to_owned(),
+    };
+    let mut mock = MockState::default();
+    mock.agent_models.insert(
+        "agy".to_owned(),
+        BotAgentModels {
+            models: vec![
+                model("gemini-4-neon-low", "Gemini 4 Neon (Low)"),
+                model("gemini-4-neon-high", "Gemini 4 Neon (High)"),
+            ],
+            reason: None,
+        },
+    );
+    // Claude Code reports only configured models; its native aliases stay listed.
+    mock.agent_models.insert(
+        "claude".to_owned(),
+        BotAgentModels {
+            models: vec![model("opus[1m]", "opus[1m]")],
+            reason: None,
+        },
+    );
+    mock.agent_models.insert(
+        "grok".to_owned(),
+        BotAgentModels {
+            models: Vec::new(),
+            reason: Some("grok was not found on this computer.".to_owned()),
+        },
+    );
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (dialog, vcx) = cx.add_window_view(|window, cx| {
+        super::new_bot::NewBot::new(rpc, "My Mac".into(), false, Vec::new(), None, window, cx)
+    });
+    let ids = |vcx: &mut gpui::VisualTestContext| {
+        vcx.update(|_, cx| {
+            dialog
+                .read(cx)
+                .model_choices()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        })
+    };
+
+    vcx.update(|_, cx| dialog.update(cx, |d, cx| d.set_runtime("agy", cx)));
+    // Cold: nothing guessed for agy, and the picker says it is loading.
+    assert!(ids(vcx).is_empty());
+    assert!(vcx.update(|_, cx| dialog.read(cx).model_notice().is_some()));
+    vcx.run_until_parked();
+    assert_eq!(ids(vcx), ["gemini-4-neon-low", "gemini-4-neon-high"]);
+    assert_eq!(vcx.update(|_, cx| dialog.read(cx).model_notice()), None);
+
+    vcx.update(|_, cx| dialog.update(cx, |d, cx| d.set_runtime("claude", cx)));
+    vcx.run_until_parked();
+    let claude = ids(vcx);
+    assert!(claude.contains(&"fable".to_owned()) && !claude.contains(&"opus[1m]".to_owned()));
+
+    // A daemon that predates the request keeps the built-in list, without a notice.
+    vcx.update(|_, cx| dialog.update(cx, |d, cx| d.set_runtime("codex", cx)));
+    vcx.run_until_parked();
+    assert!(ids(vcx).contains(&"gpt-5.4".to_owned()));
+    assert_eq!(vcx.update(|_, cx| dialog.read(cx).model_notice()), None);
+
+    vcx.update(|_, cx| dialog.update(cx, |d, cx| d.set_runtime("grok", cx)));
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| dialog.read(cx).model_notice())
+            .as_deref(),
+        Some("grok was not found on this computer.")
+    );
+
+    vcx.update(|_, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_runtime("agy", cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_model(Some("gemini-4-neon-high".to_owned()), cx);
+            d.submit(cx);
+        });
+    });
+    vcx.run_until_parked();
+    let reqs = state.lock().unwrap().requests.clone();
+    assert!(reqs.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::CreateBotV2(p)
+            if p.base.agent_id == "agy" && p.base.model.as_deref() == Some("gemini-4-neon-high")
     )));
 }
 
