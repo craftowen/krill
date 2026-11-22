@@ -937,7 +937,10 @@ pub(super) fn rows_with_options<'a>(
             .collect()
     };
 
-    let is_removed = |path: &Path| ctx.removed_projects.is_some_and(|r| r.contains(path));
+    // A bot's home folder lists under the bot in the Bots section, never as a project, even
+    // when an older build registered it in `projects.toml`.
+    let is_removed =
+        |path: &Path| ctx.removed_projects.is_some_and(|r| r.contains(path)) || is_bot_home(path);
 
     match options.group_by {
         GroupBy::Repo => {
@@ -1186,7 +1189,6 @@ pub(super) fn rows_with_options<'a>(
     {
         if let Some(cwd) = &s.cwd
             && !is_removed(cwd)
-            && !is_bot_home(cwd)
         {
             folders
                 .entry(cwd)

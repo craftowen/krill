@@ -463,6 +463,10 @@ const MAX_PROJECTS_BYTES: u64 = 512 * 1024;
 /// 보관(`archived`)된 동일 경로는 보관 해제하고 `Ok(true)`를 돌려준다.
 /// 파싱 실패·상한 초과 등에서는 폴더 열기를 막지 않도록 `Ok(false)`로 조용히 넘어간다.
 pub fn register_project(state_dir: &Path, path: &Path) -> io::Result<bool> {
+    // Opening a tab from a bot chat starts in the bot's home; that folder belongs to the bot.
+    if super::options::is_bot_home(path) {
+        return Ok(false);
+    }
     let cleaned = path
         .to_str()
         .and_then(|s| {
