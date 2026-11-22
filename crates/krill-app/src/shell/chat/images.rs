@@ -167,7 +167,8 @@ pub(super) fn image_tile(
                 .size_full()
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
-            Loaded::Loading | Loaded::Failed => Icon::new(gpui_kit_assets::IconName::Image)
+            Loaded::Loading | Loaded::Failed => Icon::default()
+                .data(ui::icons::IMAGE_SVG)
                 .size(px(ui::ICON_MD))
                 .text_color(p.muted_foreground)
                 .into_any_element(),
@@ -409,7 +410,8 @@ impl Shell {
                 .size_full()
                 .object_fit(ObjectFit::ScaleDown)
                 .into_any_element(),
-            Loaded::Loading => Icon::new(gpui_kit_assets::IconName::Image)
+            Loaded::Loading => Icon::default()
+                .data(ui::icons::IMAGE_SVG)
                 .size(px(ui::ICON_LG))
                 .text_color(p.muted_foreground)
                 .into_any_element(),
@@ -419,7 +421,11 @@ impl Shell {
                 .gap_2()
                 .text_size(ui::TEXT_SM)
                 .text_color(p.muted_foreground)
-                .child(Icon::new(gpui_kit_assets::IconName::Image).size(px(ui::ICON_MD)))
+                .child(
+                    Icon::default()
+                        .data(ui::icons::IMAGE_SVG)
+                        .size(px(ui::ICON_MD)),
+                )
                 .child(ctext::IMAGE_PREVIEW_UNAVAILABLE.get())
                 .into_any_element(),
         };

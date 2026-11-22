@@ -929,7 +929,7 @@ impl Shell {
                         .text_size(ui::TEXT_XS)
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(palette.muted_foreground)
-                        .child(Icon::new(gpui_kit_assets::IconName::Image).size(px(12.)))
+                        .child(Icon::default().data(ui::icons::IMAGE_SVG).size(px(12.)))
                         .child(ctext::IMAGE_NUMBER.format(&[("number", &number.to_string())]))
                 }))
         });
