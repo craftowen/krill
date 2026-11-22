@@ -1467,10 +1467,23 @@ mod tests {
         let row_sel: &'static str = Box::leak(
             format!("split-launcher-row-default-agent-{}", launcher_pane.get()).into_boxed_str(),
         );
+        let picker_sel: &'static str = Box::leak(
+            format!("split-launcher-agent-picker-{}", launcher_pane.get()).into_boxed_str(),
+        );
         let row_bounds = vcx
             .debug_bounds(row_sel)
             .expect("default agent row rendered");
-        vcx.simulate_click(row_bounds.center(), Modifiers::default());
+        let picker_bounds = vcx
+            .debug_bounds(picker_sel)
+            .expect("agent picker chevron rendered");
+        // Click the left label side of the row rather than row_bounds.center(), which
+        // can land on the inline agent-picker chevron depending on system font metrics.
+        let click_point = gpui::point(row_bounds.origin.x + px(32.), row_bounds.center().y);
+        assert!(
+            !picker_bounds.contains(&click_point),
+            "click point {click_point:?} must not hit agent picker {picker_bounds:?}"
+        );
+        vcx.simulate_click(click_point, Modifiers::default());
         vcx.run_until_parked();
 
         let recorded = calls.lock().unwrap();
