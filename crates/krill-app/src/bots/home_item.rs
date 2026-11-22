@@ -31,12 +31,50 @@ const STATUSES: [BotItemStatus; 5] = [
     BotItemStatus::Canceled,
 ];
 
-/// The event whose decisions the item waits on: the latest one with decisions, while it needs you.
+/// The event whose decisions the item waits on (Orca `botItemWaitingAsk`): the latest ask that
+/// still has an open line while the item is open and either `NeedsYou` or already partially
+/// answered (krilld moves the item to `Working` on the first reply, while later lines stay open).
 pub(super) fn waiting_question(item: &BotItem) -> Option<&BotItemEvent> {
-    if item.status != BotItemStatus::NeedsYou {
+    if !item.status.is_open() {
         return None;
     }
-    item.events.iter().rev().find(|e| !e.decisions.is_empty())
+    let mut current: Option<&BotItemEvent> = None;
+    for (idx, event) in item.events.iter().enumerate() {
+        if event.kind == BotItemEventKind::Status {
+            let to = event_status(event);
+            if matches!(to, Some(BotItemStatus::Done | BotItemStatus::Canceled)) {
+                current = None;
+            } else if !matches!(event.actor, BotItemActor::Owner { .. })
+                && to == Some(BotItemStatus::NeedsYou)
+            {
+                if event.decisions.is_empty() {
+                    let same_write_ask = current.is_some_and(|ask| {
+                        item.events[..idx]
+                            .iter()
+                            .rev()
+                            .find(|e| e.kind == BotItemEventKind::Commented)
+                            .is_some_and(|c| {
+                                c.id == ask.id && c.created_at_ms == event.created_at_ms
+                            })
+                    });
+                    if !same_write_ask {
+                        current = None;
+                    }
+                } else {
+                    current = Some(event);
+                }
+            }
+            continue;
+        }
+        if !matches!(event.actor, BotItemActor::Owner { .. }) && !event.decisions.is_empty() {
+            current = Some(event);
+        }
+    }
+    let ask = current?;
+    let answered = super::home_item_parts::answered_lines(item, ask);
+    let has_open = answered.iter().any(Option::is_none);
+    let has_answered = answered.iter().any(Option::is_some);
+    (has_open && (item.status == BotItemStatus::NeedsYou || has_answered)).then_some(ask)
 }
 
 /// The status a `status -> x` event moved to (krilld's event text).
@@ -76,25 +114,58 @@ impl View {
         if body.is_empty() {
             return;
         }
-        let ask = self
-            .items
-            .items
-            .iter()
-            .find(|i| i.uid == uid)
+        let item_snapshot = self.items.items.iter().find(|i| i.uid == uid).cloned();
+        let ask = item_snapshot
+            .as_ref()
             .and_then(|i| waiting_question(i).cloned());
-        match ask {
-            // Several questions: the box answers the line it is on, with the picks held so far.
-            Some(ask) if ask.decisions.len() > 1 => {
+        match (item_snapshot.as_ref(), ask) {
+            // Several questions: words from the box post at once (Orca #46693), answering the
+            // open line the box names with any held picks, or riding along as a plain comment
+            // when "Replying to" was dismissed.
+            (Some(item), Some(ask)) if ask.decisions.len() > 1 => {
                 let key = (uid.clone(), ask.id);
-                let line = self.items.ask_steps.get(&key).map_or(0, |s| s.current);
-                self.send_held_answers(uid, &key, &ask.decisions, Some((line, body)), cx);
-                if let Some(input) = input {
-                    let mut slot = Some(input);
-                    super::clear_input_on_window(&mut slot, self.window_handle, cx);
+                let state = super::home_item_parts::question_step_state(
+                    item,
+                    &ask,
+                    self.items.ask_steps.get(&key),
+                );
+                let reply_hidden = self.items.reply_hidden.get(&uid) == Some(&ask.id);
+                if reply_hidden {
+                    if state.kept.iter().any(Option::is_some) {
+                        self.send_held_answers(
+                            uid,
+                            &key,
+                            &ask.decisions,
+                            state.kept,
+                            None,
+                            Some(body),
+                            input,
+                            cx,
+                        );
+                    } else {
+                        self.submit_item_comment(uid, &body, input, cx);
+                    }
+                } else {
+                    self.send_held_answers(
+                        uid,
+                        &key,
+                        &ask.decisions,
+                        state.kept,
+                        Some((state.current, body)),
+                        None,
+                        input,
+                        cx,
+                    );
                 }
             }
-            Some(_) => self.answer_item_decision(uid, Some(body), None, input, cx),
-            None => self.submit_item_comment(uid, &body, input, cx),
+            (_, Some(ask)) => {
+                if self.items.reply_hidden.get(&uid) == Some(&ask.id) {
+                    self.submit_item_comment(uid, &body, input, cx);
+                } else {
+                    self.answer_item_decision(uid, Some(body), None, input, cx);
+                }
+            }
+            (_, None) => self.submit_item_comment(uid, &body, input, cx),
         }
     }
 
@@ -834,18 +905,43 @@ impl View {
                 ))
         }));
         let several = event.decisions.len() > 1;
+        let answered = (!(event.decisions.is_empty() || (waiting && several)))
+            .then(|| super::home_item_parts::answered_lines(item, event));
         let mut questions: gpui::Div = div()
             .flex()
             .flex_col()
             .when(several, gpui::Styled::gap_1p5)
             .when(!several, gpui::Styled::gap_3);
-        for (d, decision) in event.decisions.iter().enumerate() {
-            questions =
-                questions.child(self.render_question(item, event, d, decision, waiting, p, cx));
-        }
         if waiting && several {
             // An ask of several questions waits one line at a time.
             questions = self.render_question_steps(item, event, p, cx);
+        } else {
+            for (d, decision) in event.decisions.iter().enumerate() {
+                if let Some(words) = answered
+                    .as_ref()
+                    .and_then(|a| a.get(d))
+                    .and_then(Option::as_deref)
+                {
+                    let q = super::home_item_parts::question_line(&decision.question);
+                    questions = questions.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .text_size(ui::TEXT_MD)
+                            .line_height(px(19.))
+                            .text_color(p.muted_foreground)
+                            .child(format!("{q} → "))
+                            .child(
+                                div()
+                                    .text_color(p.foreground.opacity(0.72))
+                                    .child(words.to_owned()),
+                            ),
+                    );
+                } else {
+                    questions = questions
+                        .child(self.render_question(item, event, d, decision, waiting, p, cx));
+                }
+            }
         }
         if !event.decisions.is_empty() {
             body = body.child(
@@ -856,7 +952,7 @@ impl View {
                     .child(questions),
             );
         }
-        let needs_you_tag = waiting.then(|| {
+        let needs_you_tag = (waiting && item.status == BotItemStatus::NeedsYou).then(|| {
             div()
                 .ml_auto()
                 .flex_none()
@@ -1055,15 +1151,19 @@ impl View {
             .filter(|w| self.items.reply_hidden.get(&uid) != Some(&w.id))
             .map(|w| {
                 let key = (uid.clone(), w.id);
-                let line = self
-                    .items
-                    .ask_steps
-                    .get(&key)
-                    .map_or(0, |s| s.current)
-                    .min(w.decisions.len().saturating_sub(1));
+                let line = if w.decisions.len() > 1 {
+                    super::home_item_parts::question_step_state(
+                        item,
+                        w,
+                        self.items.ask_steps.get(&key),
+                    )
+                    .current
+                } else {
+                    0
+                };
                 w.decisions.get(line).map_or_else(
-                    || super::home_item_parts::question_line(&w.text).to_owned(),
-                    |d| super::home_item_parts::question_line(&d.question).to_owned(),
+                    || super::home_item_parts::question_line(&w.text),
+                    |d| super::home_item_parts::question_line(&d.question),
                 )
             })
             .filter(|q| !q.is_empty());
