@@ -76,6 +76,8 @@ pub(super) struct BotPanel {
     pub stale: bool,
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
     pub chat_query: String,
+    /// What the header last drew from `view`: its filter and whether an item is open.
+    pub home_chrome: (Option<krill_app::bots::HomeFilter>, bool),
 }
 
 /// How a bot chat is named: Home Chat for the Home Chat (krilld lists it first), else its own
@@ -160,6 +162,17 @@ impl Shell {
             cx.new(|cx| krill_app::bots::View::new_on_host(host, target, None, cx).into_panel())
         };
         Self::subscribe_bots_view(&view, false, cx);
+        // The header (drawn here) shows the view's filter and hides over an open item: redraw
+        // when those change, not on every change inside the view.
+        cx.observe(&view, |this, view, cx| {
+            let v = view.read(cx);
+            let chrome = (v.home_filter(), v.home_item_open());
+            if this.bot_ui.panel.home_chrome != chrome {
+                this.bot_ui.panel.home_chrome = chrome;
+                cx.notify();
+            }
+        })
+        .detach();
         self.bot_ui.panel.view = Some(view.clone());
         self.bot_ui.panel.shown = None;
         self.bot_ui.panel.stale = false;

@@ -221,6 +221,10 @@ pub(super) fn clock_label(ts_ms: u64, now_ms: u64) -> String {
     }
 }
 
+// Lucide `circle-check` / `circle-slash` at Orca's `absoluteStrokeWidth` 2 px in a 10 px box (4.8 of 24).
+const CIRCLE_CHECK_BOLD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="m8 12 3 3 5-6"/></svg>"#;
+const CIRCLE_SLASH_BOLD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="M8.5 15.5 15.5 8.5"/></svg>"#;
+
 /// Orca's `BotItemStatusIcon`: every glyph in one 10 px box. Planned a dashed ring, In progress a
 /// spinner while its worker runs (a ring otherwise), Needs you an orange dot (grey once stale),
 /// Done a check, Canceled a slashed circle.
@@ -255,11 +259,13 @@ pub(super) fn status_icon(
             .border_dashed()
             .border_color(p.muted_foreground)
             .into_any_element(),
-        BotItemStatus::Done => Icon::new(IconName::CircleCheck)
+        BotItemStatus::Done => Icon::default()
+            .data(CIRCLE_CHECK_BOLD_SVG)
             .size(px(10.))
             .text_color(p.success)
             .into_any_element(),
-        BotItemStatus::Canceled => Icon::new(IconName::CircleSlash)
+        BotItemStatus::Canceled => Icon::default()
+            .data(CIRCLE_SLASH_BOLD_SVG)
             .size(px(10.))
             .text_color(p.muted_foreground)
             .into_any_element(),
