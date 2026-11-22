@@ -1561,6 +1561,26 @@ impl BotsManager {
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
+            BotRpcRequest::ListImportedSources => match self.store.list_imported_sources() {
+                Ok(sources) => BotRpcResponse::ImportedSources(sources),
+                Err(err) => BotRpcResponse::Error(err.to_string()),
+            },
+            BotRpcRequest::ImportExternalBotCopy {
+                source,
+                path,
+                params,
+            } => {
+                match self
+                    .store
+                    .import_external_bot_copy(source, &path, *params, ts)
+                {
+                    Ok(bot) => {
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::TestConnector { bot_id, source } => {
                 let bot = match self.store.get_bot(&bot_id) {
                     Ok(Some(b)) => b,
@@ -1940,6 +1960,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ListAgentModels { .. }
         | BotRpcRequest::GetBotUpcoming { .. }
         | BotRpcRequest::GetBotSettingsExtras { .. }
+        | BotRpcRequest::ListImportedSources
         | BotRpcRequest::SendBotMail { .. } => Ok(()),
         BotRpcRequest::SendGroupMessage { sender, .. } => {
             let trimmed = sender.trim();
@@ -2049,6 +2070,7 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::ImportBotZipV2 { .. }
         | BotRpcRequest::UploadBotAvatar { .. }
         | BotRpcRequest::ImportExternalBots { .. }
+        | BotRpcRequest::ImportExternalBotCopy { .. }
         | BotRpcRequest::SetDefaultTrackerBot { .. }
         | BotRpcRequest::TestConnector { .. }
         | BotRpcRequest::StartMcpOAuth { .. }
@@ -3127,6 +3149,76 @@ mod tests {
             ),
             BotRpcResponse::ImportedExternalBots { .. }
         ));
+        assert!(matches!(
+            mgr.handle_rpc(&reg, BotRpcRequest::ListImportedSources),
+            BotRpcResponse::ImportedSources(_)
+        ));
+        // Creating a copy from an external candidate dir records the source and allows a 2nd copy.
+        let ext_dir = state.join("ext-copy-src");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::write(ext_dir.join("SOUL.md"), "# Ext\n\nHelps out.\n").unwrap();
+        let copy1 = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::ImportExternalBotCopy {
+                source: Some(krill_proto::bots::ExternalBotSourceApp::OpenClaw),
+                path: ext_dir.to_string_lossy().into_owned(),
+                params: Box::new(krill_proto::bots::CreateBotV2Params::from(
+                    CreateBotParams {
+                        name: "Ext Copy 1".to_owned(),
+                        agent_id: "claude".to_owned(),
+                        description: String::new(),
+                        emoji: None,
+                        avatar: Some("mascot:B1".to_owned()),
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                )),
+            },
+        ) {
+            BotRpcResponse::Bot(b) => Some(b),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(copy1.name, "Ext Copy 1");
+        assert_eq!(copy1.avatar.as_deref(), Some("mascot:B1"));
+        let imported_sources = match mgr.handle_rpc(&reg, BotRpcRequest::ListImportedSources) {
+            BotRpcResponse::ImportedSources(s) => s,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(imported_sources.len(), 1);
+        assert_eq!(imported_sources[0].1, copy1.id);
+        let copy2 = match mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::ImportExternalBotCopy {
+                source: Some(krill_proto::bots::ExternalBotSourceApp::OpenClaw),
+                path: ext_dir.to_string_lossy().into_owned(),
+                params: Box::new(krill_proto::bots::CreateBotV2Params::from(
+                    CreateBotParams {
+                        name: "Ext Copy 2".to_owned(),
+                        agent_id: "codex".to_owned(),
+                        description: String::new(),
+                        emoji: None,
+                        avatar: Some("mascot:B2".to_owned()),
+                        model: None,
+                        effort: None,
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                )),
+            },
+        ) {
+            BotRpcResponse::Bot(b) => Some(b),
+            _ => None,
+        }
+        .unwrap();
+        assert_eq!(copy2.name, "Ext Copy 2");
+        assert_ne!(copy1.id, copy2.id);
         assert!(matches!(
             mgr.handle_rpc(
                 &reg,

@@ -1633,7 +1633,7 @@ impl BotStore {
         dry_run: bool,
         now_ms: u64,
     ) -> io::Result<(Vec<ExternalBotCandidate>, Vec<BotConfig>)> {
-        let candidates = discover_external_bots(source, custom_path);
+        let candidates = proto_discover_external_bots(source, custom_path);
         if dry_run || candidates.is_empty() {
             return Ok((candidates, Vec::new()));
         }
@@ -1645,79 +1645,233 @@ impl BotStore {
         let mut imported = Vec::new();
 
         for cand in &candidates {
-            let src_dir = Path::new(&cand.path);
-            let canonical_key = canonicalize(src_dir)
-                .map_or_else(|_| cand.path.clone(), |p| p.to_string_lossy().into_owned());
-            if let Some(existing_id) = imported_ledger.get(&canonical_key)
-                && bots.iter().any(|b| b.id.as_str() == existing_id)
-            {
-                // Idempotent: already imported and still present in Krill.
-                continue;
+            if let Some(cfg) = self.import_external_candidate(
+                cand,
+                None,
+                false,
+                &mut bots,
+                &mut imported_ledger,
+                now_ms,
+            )? {
+                imported.push(cfg);
             }
+        }
 
-            let manifest = read_external_manifest(src_dir);
+        if !imported.is_empty() {
+            self.write_json(BOTS_INDEX_FILE, &bots)?;
+            self.write_json(IMPORTED_SOURCES_FILE, &imported_ledger)?;
+        }
+
+        Ok((candidates, imported))
+    }
+
+    /// Returns active `(canonical_source_path, bot_id)` pairs from `imported_sources.json`.
+    pub fn list_imported_sources(&self) -> io::Result<Vec<(String, BotId)>> {
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let ledger: BTreeMap<String, String> = self.read_json_or_default(IMPORTED_SOURCES_FILE)?;
+        Ok(ledger
+            .into_iter()
+            .filter_map(|(path, id)| {
+                bots.iter()
+                    .find(|b| b.id.as_str() == id)
+                    .map(|b| (path, b.id.clone()))
+            })
+            .collect())
+    }
+
+    /// Imports a single discovered external bot directory, allowing a new copy even when an earlier
+    /// bot came from the same source, and applying the owner's chosen `params`.
+    pub fn import_external_bot_copy(
+        &self,
+        source: Option<ExternalBotSourceApp>,
+        path: &str,
+        params: CreateBotV2Params,
+        now_ms: u64,
+    ) -> io::Result<BotConfig> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "import source path cannot be empty",
+            ));
+        }
+        let target_path = Path::new(trimmed);
+        let canonical_target = canonicalize(target_path)
+            .map_or_else(|_| trimmed.to_owned(), |p| p.to_string_lossy().into_owned());
+        let candidates = proto_discover_external_bots(source, Some(target_path));
+        let cand = candidates
+            .iter()
+            .find(|c| {
+                let c_canon = canonicalize(Path::new(&c.path))
+                    .map_or_else(|_| c.path.clone(), |p| p.to_string_lossy().into_owned());
+                c_canon == canonical_target
+            })
+            .or_else(|| candidates.first())
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no external bot found at {trimmed}"),
+                )
+            })?;
+
+        let _guard = lock(&self.io_lock);
+        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut imported_ledger: BTreeMap<String, String> =
+            self.read_json_or_default(IMPORTED_SOURCES_FILE)?;
+        let cfg = self
+            .import_external_candidate(
+                &cand,
+                Some(params),
+                true,
+                &mut bots,
+                &mut imported_ledger,
+                now_ms,
+            )?
+            .ok_or_else(|| io::Error::other("import produced no bot"))?;
+        self.write_json(BOTS_INDEX_FILE, &bots)?;
+        self.write_json(IMPORTED_SOURCES_FILE, &imported_ledger)?;
+        Ok(cfg)
+    }
+
+    fn import_external_candidate(
+        &self,
+        cand: &ExternalBotCandidate,
+        params: Option<CreateBotV2Params>,
+        force_copy: bool,
+        bots: &mut Vec<BotConfig>,
+        imported_ledger: &mut BTreeMap<String, String>,
+        now_ms: u64,
+    ) -> io::Result<Option<BotConfig>> {
+        let src_dir = Path::new(&cand.path);
+        let canonical_key = canonicalize(src_dir)
+            .map_or_else(|_| cand.path.clone(), |p| p.to_string_lossy().into_owned());
+        if !force_copy
+            && let Some(existing_id) = imported_ledger.get(&canonical_key)
+            && bots.iter().any(|b| b.id.as_str() == existing_id)
+        {
+            return Ok(None);
+        }
+
+        let manifest = read_external_manifest(src_dir);
+        if !force_copy {
             if let Some(ref ext_id) = manifest.id
                 && bots.iter().any(|b| b.id.as_str() == ext_id)
             {
                 imported_ledger.insert(canonical_key, ext_id.clone());
-                continue;
+                return Ok(None);
             }
             if let Some(ref ext_slug) = manifest.slug
                 && let Some(existing) = bots.iter().find(|b| b.slug.as_str() == ext_slug)
             {
                 imported_ledger.insert(canonical_key, existing.id.as_str().to_owned());
-                continue;
+                return Ok(None);
             }
+        }
 
-            let soul = read_external_soul(src_dir, &cand.name);
-            let memory = read_external_memory(src_dir);
-            let clean_name =
-                validate_bot_name(&cand.name).unwrap_or_else(|_| "Imported Bot".to_owned());
-            let base_slug = manifest
-                .slug
-                .as_deref()
-                .and_then(|s| BotSlug::new(s).ok())
-                .unwrap_or_else(|| bot_slug_from_name(&clean_name));
-            let slug = allocate_unique_slug(&bots, &base_slug)?;
-            let id = manifest
-                .id
-                .as_deref()
-                .and_then(|raw| BotId::new(raw).ok())
-                .filter(|bid| !bots.iter().any(|b| &b.id == bid))
-                .map_or_else(|| allocate_unique_id(&bots, slug.as_str()), Ok)?;
-            let agent_id = if cand.agent.trim().is_empty() {
-                "claude".to_owned()
-            } else {
-                cand.agent.trim().to_owned()
-            };
+        let soul = read_external_soul(src_dir, &cand.name);
+        let memory = read_external_memory(src_dir);
+        let requested_name = params
+            .as_ref()
+            .map(|p| p.base.name.as_str())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(&cand.name);
+        let clean_name =
+            validate_bot_name(requested_name).unwrap_or_else(|_| "Imported Bot".to_owned());
+        let base_slug = manifest
+            .slug
+            .as_deref()
+            .filter(|_| !force_copy)
+            .and_then(|s| BotSlug::new(s).ok())
+            .unwrap_or_else(|| bot_slug_from_name(&clean_name));
+        let slug = allocate_unique_slug(bots, &base_slug)?;
+        let id = manifest
+            .id
+            .as_deref()
+            .filter(|_| !force_copy)
+            .and_then(|raw| BotId::new(raw).ok())
+            .filter(|bid| !bots.iter().any(|b| &b.id == bid))
+            .map_or_else(|| allocate_unique_id(bots, slug.as_str()), Ok)?;
+        let agent_id = params
+            .as_ref()
+            .map(|p| p.base.agent_id.trim())
+            .filter(|a| !a.is_empty())
+            .map_or_else(
+                || {
+                    if cand.agent.trim().is_empty() {
+                        "claude".to_owned()
+                    } else {
+                        cand.agent.trim().to_owned()
+                    }
+                },
+                str::to_owned,
+            );
 
-            let mut cfg = BotConfig::new(id, &clean_name, &agent_id, now_ms)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-            cfg.slug = slug.clone();
-            slug.as_str().clone_into(&mut cfg.folder);
-            cfg.description = manifest
-                .description
-                .unwrap_or_else(|| soul_description(&soul).unwrap_or_default());
-            cfg.emoji = manifest.emoji;
-            cfg.model = manifest.model;
-            cfg.avatar_color = manifest.avatar_color;
-            cfg.members = manifest.members;
-            cfg.skills = manifest.skill_projects;
+        let mut cfg = BotConfig::new(id, &clean_name, &agent_id, now_ms)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
+        cfg.slug = slug.clone();
+        slug.as_str().clone_into(&mut cfg.folder);
+        cfg.description = manifest
+            .description
+            .unwrap_or_else(|| soul_description(&soul).unwrap_or_default());
+        cfg.emoji = manifest.emoji;
+        cfg.model = manifest.model;
+        cfg.avatar_color = manifest.avatar_color;
+        cfg.members = manifest.members;
+        cfg.skills = manifest.skill_projects;
 
-            let home_path = self.bot_home(&cfg);
-            let home_existed = home_path.exists();
-            let result = (|| -> io::Result<()> {
-                let home = init_bot_home(&self.root, &cfg, Some(&soul))?;
-                ensure_bot_subdirs_safe(&home)?;
-                write_atomic_0600(&home.join("SOUL.md"), soul.as_bytes())?;
-                if let Some(mem) = memory {
-                    write_atomic_0600(&home.join("MEMORY.md"), mem.as_bytes())?;
-                }
-                copy_external_markdown_dir(&src_dir.join("memory"), &home.join("memory"))?;
-                copy_external_skills_dir(&src_dir.join("skills"), &home.join("skills"))?;
-                copy_external_skill_projects(src_dir, &cfg.skills, &home.join("skills"))?;
-                materialize_bot_skills(&home, &cfg.skills)?;
+        if let Some(p) = params {
+            if p.base.model.is_some() {
+                cfg.model = p.base.model;
+            }
+            if p.base.effort.is_some() {
+                cfg.effort = p.base.effort;
+            }
+            if let Some(perm) = p.base.permission_mode {
+                cfg.permission_mode = perm;
+            }
+            if p.base.avatar.is_some() {
+                cfg.avatar = p.base.avatar;
+            }
+            if let Some(color) = p
+                .avatar_color
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty())
+            {
+                cfg.avatar_color = Some(color);
+            }
+            if let Some(ws) = p
+                .base
+                .workspace
+                .map(|w| w.trim().to_owned())
+                .filter(|w| !w.is_empty())
+            {
+                cfg.workspace = Some(ws);
+            }
+            if !p.base.description.trim().is_empty() {
+                p.base.description.trim().clone_into(&mut cfg.description);
+            }
+            if !p.skills.is_empty() {
+                cfg.skills = normalize_skill_list(&p.skills)?;
+            }
+        }
 
+        let home_path = self.bot_home(&cfg);
+        let home_existed = home_path.exists();
+        let result = (|| -> io::Result<()> {
+            let home = init_bot_home(&self.root, &cfg, Some(&soul))?;
+            ensure_bot_subdirs_safe(&home)?;
+            write_atomic_0600(&home.join("SOUL.md"), soul.as_bytes())?;
+            if let Some(mem) = memory {
+                write_atomic_0600(&home.join("MEMORY.md"), mem.as_bytes())?;
+            }
+            copy_external_markdown_dir(&src_dir.join("memory"), &home.join("memory"))?;
+            copy_external_skills_dir(&src_dir.join("skills"), &home.join("skills"))?;
+            copy_external_skill_projects(src_dir, &cfg.skills, &home.join("skills"))?;
+            materialize_bot_skills(&home, &cfg.skills)?;
+
+            if cfg.avatar.is_none() {
                 let ext_avatar = src_dir.join(AVATAR_FILE);
                 if fs::symlink_metadata(&ext_avatar)
                     .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
@@ -1733,27 +1887,25 @@ impl BotStore {
                     cfg.avatar = Some(AVATAR_FILE.to_owned());
                     init_bot_home(&self.root, &cfg, None)?;
                 }
-                Ok(())
-            })();
-
-            if let Err(err) = result {
-                if !home_existed {
-                    fs::remove_dir_all(&home_path).ok();
-                }
-                return Err(err);
             }
+            Ok(())
+        })();
 
+        if let Err(err) = result {
+            if !home_existed {
+                fs::remove_dir_all(&home_path).ok();
+            }
+            return Err(err);
+        }
+
+        let recorded_active = imported_ledger
+            .get(&canonical_key)
+            .is_some_and(|existing| bots.iter().any(|b| b.id.as_str() == existing));
+        if !recorded_active {
             imported_ledger.insert(canonical_key, cfg.id.as_str().to_owned());
-            bots.push(cfg.clone());
-            imported.push(cfg);
         }
-
-        if !imported.is_empty() {
-            self.write_json(BOTS_INDEX_FILE, &bots)?;
-            self.write_json(IMPORTED_SOURCES_FILE, &imported_ledger)?;
-        }
-
-        Ok((candidates, imported))
+        bots.push(cfg.clone());
+        Ok(Some(cfg))
     }
 
     /// The bot's Items, Look around and Memory upkeep presets; defaults until changed.

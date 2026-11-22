@@ -575,6 +575,15 @@ pub enum BotRpcRequest {
         bot_id: BotId,
         member: BotMember,
     },
+    /// Lists external bot source paths already imported into active Krill bots.
+    ListImportedSources,
+    /// Imports a single discovered external candidate even if an earlier bot came from the same
+    /// folder, applying the owner's chosen name, mascot/color, and agent settings.
+    ImportExternalBotCopy {
+        source: Option<ExternalBotSourceApp>,
+        path: String,
+        params: Box<CreateBotV2Params>,
+    },
 }
 
 impl BotRpcRequest {
@@ -608,6 +617,7 @@ impl BotRpcRequest {
                 | Self::ListAgentModels { .. }
                 | Self::GetBotUpcoming { .. }
                 | Self::GetBotSettingsExtras { .. }
+                | Self::ListImportedSources
         )
     }
 }
@@ -1082,6 +1092,17 @@ impl fmt::Debug for BotRpcRequest {
                 .field("bot_id", bot_id)
                 .field("member", &member.id)
                 .finish(),
+            Self::ListImportedSources => f.write_str("ListImportedSources"),
+            Self::ImportExternalBotCopy {
+                source,
+                path,
+                params,
+            } => f
+                .debug_struct("ImportExternalBotCopy")
+                .field("source", source)
+                .field("path", path)
+                .field("name", &params.base.name)
+                .finish(),
         }
     }
 }
@@ -1224,6 +1245,7 @@ pub enum BotRpcResponse {
     AgentModels(BotAgentModels),
     Upcoming(BotUpcoming),
     BotSettingsExtras(BotSettingsExtras),
+    ImportedSources(Vec<(String, BotId)>),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1387,6 +1409,10 @@ impl fmt::Debug for BotRpcResponse {
             Self::BotSettingsExtras(extras) => {
                 f.debug_tuple("BotSettingsExtras").field(extras).finish()
             }
+            Self::ImportedSources(sources) => f
+                .debug_tuple("ImportedSources")
+                .field(&sources.len())
+                .finish(),
         }
     }
 }

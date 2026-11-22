@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod external;
 pub mod home;
 pub mod package;
+pub mod proposal;
 pub mod rpc;
 pub mod types;
 
@@ -16,8 +17,10 @@ pub use catalog::{
     find_composio_app, generate_slack_socket_mode_manifest,
 };
 pub use external::{
-    discover_external_bots, discover_external_bots_filtered, discover_external_bots_in,
-    expand_tilde, map_orca_agent_id, tilde_display,
+    BOT_IMPORT_EXPORT_PROMPT, BOT_IMPORT_REPLY_FILE, BOT_IMPORT_REPLY_MAX, BotImportNudgeInfo,
+    bot_import_app_label, bot_import_nudge, bot_name_from_export_folder, discover_external_bots,
+    discover_external_bots_filtered, discover_external_bots_in, expand_tilde, map_orca_agent_id,
+    tilde_display,
 };
 pub use home::{
     BOT_FIRST_RUN_RULES, BOT_MEMORY_INDEX_LINE_CAP, BOT_MEMORY_SEED, BOT_MEMORY_SOURCE_SEPARATOR,
@@ -34,6 +37,11 @@ pub use package::{
     SanitizedBotManifest, SanitizedMcpTool, crc32, export_bot_home_zip, export_bot_zip,
     import_bot_zip, read_store_zip, scan_export_secrets, strip_png_metadata,
     validate_bot_package_path, validate_zip_entry_path, write_store_zip,
+};
+pub use proposal::{
+    BOT_PROPOSAL_PURPOSE_MAX, BotProposal, HANDED_WORKSPACES_MAX, HandedWorkspace,
+    bot_made_for_workspaces_kickoff, parse_template_proposal_fields, proposal_identity,
+    proposal_soul, template_proposal,
 };
 pub use rpc::{
     BOT_REPLY, BOT_REQ, BotAgentModel, BotAgentModels, BotRpcRequest, BotRpcResponse,

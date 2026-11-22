@@ -9041,6 +9041,11 @@ impl Render for Shell {
             .child(self.render_status_bar(window, cx))
             .children(self.modal.clone().map(|modal| {
                 use krill_app::i18n::catalog;
+                // Import is Orca's small dialog, not the Bots page.
+                let dialog_width = match &modal {
+                    Modal::Bots(v) => v.read(cx).dialog_width(),
+                    _ => None,
+                };
                 let (backdrop_id, modal_id, label, view): (_, _, _, gpui::AnyView) = match modal {
                     Modal::Settings(v) if v.read(cx).mobile_page() => (
                         "admin-modal-backdrop",
@@ -9100,8 +9105,9 @@ impl Render for Shell {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
-                                .w(modal.width)
-                                .h(modal.height)
+                                .w(dialog_width.unwrap_or(modal.width))
+                                .when(dialog_width.is_none(), |d| d.h(modal.height))
+                                .when(dialog_width.is_some(), |d| d.max_h(modal.height))
                                 .rounded(krill_app::ui::RADIUS_XL)
                                 .bg(p.background)
                                 .border_1()

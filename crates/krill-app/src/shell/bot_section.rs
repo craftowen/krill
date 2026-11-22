@@ -225,7 +225,7 @@ impl Shell {
     pub(super) fn on_new_bot_event(
         &mut self,
         ev: &new_bot::Event,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match ev {
@@ -237,6 +237,11 @@ impl Shell {
                 cx.notify();
             }
             new_bot::Event::BrowseTemplates => self.request_bot_templates(cx),
+            new_bot::Event::OpenImport => {
+                self.bot_ui.new_bot = None;
+                self.bot_ui.back_to_templates = false;
+                self.open_bots_screen(BotsScreen::Import, window, cx);
+            }
             new_bot::Event::UpdateHost => {
                 self.bot_ui.new_bot = None;
                 self.bot_ui.back_to_templates = false;
