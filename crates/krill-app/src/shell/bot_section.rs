@@ -25,7 +25,7 @@ use super::Shell;
 mod chats;
 mod header;
 mod rows;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 /// A right-click menu action on the Shell.
