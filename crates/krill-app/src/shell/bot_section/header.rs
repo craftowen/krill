@@ -139,7 +139,7 @@ impl Shell {
             );
         }
 
-        let mut header = div()
+        let header = div()
             .id("bots-section-header")
             .debug_selector(|| "bots-section-header".into())
             .group("bots-section-header")
@@ -151,34 +151,32 @@ impl Shell {
             .gap_1p5()
             .child(title);
         if collapsed {
-            header = header.child(self.render_collapsed_faces(p, cx));
+            return header.child(self.render_collapsed_faces(p, cx));
         }
-        header.child(div().flex_1()).when(!collapsed, |d| {
-            d.child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .when(has_entries, |d| {
-                        d.child(
-                            Button::new("bots-section-search")
-                                .ghost()
-                                .xsmall()
-                                .toggled(searching)
-                                .icon(IconName::Search)
-                                .accessibility_label(text::SB_SEARCH.get())
-                                .when(!searching, |b| b.tooltip(text::SB_SEARCH.get()))
-                                .debug_selector(|| "bots-section-search".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_bot_search(window, cx);
-                                })),
-                        )
-                        .child(self.render_bot_options_button(p, cx))
-                    })
-                    .child(self.render_bots_new_menu(cx)),
-            )
-        })
+        header.child(div().flex_1()).child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .when(has_entries, |d| {
+                    d.child(
+                        Button::new("bots-section-search")
+                            .ghost()
+                            .xsmall()
+                            .toggled(searching)
+                            .icon(IconName::Search)
+                            .accessibility_label(text::SB_SEARCH.get())
+                            .when(!searching, |b| b.tooltip(text::SB_SEARCH.get()))
+                            .debug_selector(|| "bots-section-search".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_bot_search(window, cx);
+                            })),
+                    )
+                    .child(self.render_bot_options_button(p, cx))
+                })
+                .child(self.render_bots_new_menu(cx)),
+        )
     }
 
     fn render_bots_new_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -283,16 +281,21 @@ impl Shell {
             })
     }
 
-    /// Collapsed section: up to five round avatars, then `+N` (attention first, like Orca).
-    fn render_collapsed_faces(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
+    /// Collapsed section: up to five round avatars, then `+N` (attention first, like Orca),
+    /// kept flush next to the `Bots` label (`justify-start`, Orca #45567).
+    fn render_collapsed_faces(
+        &self,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let mut bots: Vec<&SidebarBot> = self.sidebar_bots.iter().collect();
         bots.sort_by_key(|b| (b.attention == 0, b.working() == 0));
         let shown = bots.len().min(5);
-        let mut row = div().flex().items_center();
+        let mut inner = div().flex().items_center();
         for (i, bot) in bots.iter().take(shown).enumerate() {
             let id = bot.id.clone();
             let sel = format!("bots-collapsed-{}", bot.id.as_str());
-            row = row.child(
+            inner = inner.child(
                 div()
                     .id(SharedString::from(sel.clone()))
                     .debug_selector(move || sel.clone())
@@ -309,7 +312,7 @@ impl Shell {
             );
         }
         if bots.len() > shown {
-            row = row.child(
+            inner = inner.child(
                 div()
                     .ml_1()
                     .text_size(ui::TEXT_2XS)
@@ -317,7 +320,17 @@ impl Shell {
                     .child(format!("+{}", bots.len() - shown)),
             );
         }
-        row
+        div()
+            .id("bots-collapsed-preview")
+            .debug_selector(|| "bots-collapsed-preview".into())
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_start()
+            .overflow_hidden()
+            .p_1()
+            .child(inner)
     }
 
     /// Orca `BotSidebarSearchPanel`: the field under the header, then (with a query) results in

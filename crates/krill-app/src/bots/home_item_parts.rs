@@ -51,17 +51,73 @@ pub(super) struct PrRead {
 /// An open ask of several questions, stepped one line at a time.
 #[derive(Debug, Clone, Default)]
 pub(super) struct AskSteps {
-    pub current: usize,
+    /// The line explicitly stepped to (`‹`/`›` or clicking a held line); `None` follows the first
+    /// open unheld line.
+    pub chosen: Option<usize>,
     /// Per line, a quick reply picked here and not sent yet.
     pub held: Vec<Option<String>>,
 }
 
-/// Orca's `botItemQuestionLine`: a question's first line.
-pub(super) fn question_line(q: &str) -> &str {
-    q.lines()
+/// Derived state for a waiting multi-question ask, matching Orca `useBotItemQuestionSteps`.
+pub(super) struct QuestionStepState {
+    pub answered: Vec<Option<String>>,
+    pub lines: Vec<usize>,
+    pub kept: Vec<Option<String>>,
+    pub current: usize,
+}
+
+pub(super) fn question_step_state(
+    item: &BotItem,
+    ask: &BotItemEvent,
+    steps: Option<&AskSteps>,
+) -> QuestionStepState {
+    let answered = answered_lines(item, ask);
+    let lines: Vec<usize> = (0..ask.decisions.len())
+        .filter(|&i| answered[i].is_none())
+        .collect();
+    let kept: Vec<Option<String>> = (0..ask.decisions.len())
+        .map(|i| {
+            if answered[i].is_some() {
+                None
+            } else {
+                steps.and_then(|s| s.held.get(i).cloned().flatten())
+            }
+        })
+        .collect();
+    let first_open = lines
+        .iter()
+        .copied()
+        .find(|&i| kept[i].is_none())
+        .or_else(|| lines.first().copied())
+        .unwrap_or(0);
+    let current = steps
+        .and_then(|s| s.chosen)
+        .filter(|c| lines.contains(c))
+        .unwrap_or(first_open);
+    QuestionStepState {
+        answered,
+        lines,
+        kept,
+        current,
+    }
+}
+
+/// Orca's `botItemQuestionLine`: a question's first line with leading Markdown marks stripped.
+pub(super) fn question_line(q: &str) -> String {
+    let first = q
+        .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("")
+        .unwrap_or("");
+    let stripped = first
+        .trim_start_matches(['#', '>', '-', '*', '+'])
+        .trim_start();
+    stripped
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_owned()
 }
 
 /// Orca's `botItemNamedAnswers`: per question, what an owner's comment answered it with
@@ -774,8 +830,9 @@ impl View {
         Some((title, finished))
     }
 
-    /// Orca's `BotItemQuestionStep`: the lines answered so far fold above, the open one shows
-    /// with ‹ n of total › and its quick replies; picks wait until the last line or Send now.
+    /// Orca's `BotItemQuestionStep` (#46693): the lines answered so far fold above, the open one
+    /// shows with ‹ n of total › and its quick replies; picks wait until the last line or Send now.
+    /// No "Type your answer" chip on the step card — the comment box below is the one place to type.
     pub(super) fn render_question_steps(
         &self,
         item: &BotItem,
@@ -784,17 +841,12 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let key = (item.uid.clone(), ask.id);
-        let answered = answered_lines(item, ask);
-        let steps = self.items.ask_steps.get(&key).cloned().unwrap_or_default();
-        let held = |i: usize| steps.held.get(i).cloned().flatten();
-        let lines: Vec<usize> = (0..ask.decisions.len())
-            .filter(|&i| answered[i].is_none())
-            .collect();
-        let current = if lines.contains(&steps.current) {
-            steps.current
-        } else {
-            lines.first().copied().unwrap_or(0)
-        };
+        let state = question_step_state(item, ask, self.items.ask_steps.get(&key));
+        let answered = state.answered;
+        let lines = state.lines;
+        let kept = state.kept;
+        let current = state.current;
+        let held = |i: usize| kept.get(i).cloned().flatten();
         let mut out = div().flex().flex_col();
         // Lines answered (or held here) fold above as "Question → answer".
         let folded: Vec<(usize, String, bool)> = (0..ask.decisions.len())
@@ -809,11 +861,12 @@ impl View {
         if !folded.is_empty() {
             let mut col = div().mb_3().flex().flex_col().gap_1();
             for (i, words, reopens) in folded {
-                let q = question_line(&ask.decisions[i].question).to_owned();
+                let q = question_line(&ask.decisions[i].question);
                 let reopen_key = key.clone();
                 col = col.child(
                     div()
                         .id(("bot-item-answer-line", i))
+                        .debug_selector(move || format!("bot-item-answer-line-{i}"))
                         .text_size(ui::TEXT_MD)
                         .line_height(px(19.))
                         .text_color(p.muted_foreground)
@@ -827,7 +880,7 @@ impl View {
                                         .ask_steps
                                         .entry(reopen_key.clone())
                                         .or_default()
-                                        .current = i;
+                                        .chosen = Some(i);
                                     cx.notify();
                                 }))
                         })
@@ -852,7 +905,7 @@ impl View {
                 .disabled(to.is_none())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(to) = to {
-                        this.items.ask_steps.entry(k.clone()).or_default().current = to;
+                        this.items.ask_steps.entry(k.clone()).or_default().chosen = Some(to);
                         cx.notify();
                     }
                 }))
@@ -906,7 +959,8 @@ impl View {
             let filled = decision.recommended == Some(o) && picked.is_none();
             let (k, words, uid) = (key.clone(), option.clone(), item.uid.clone());
             let decisions = ask.decisions.clone();
-            let answered_now = answered.clone();
+            let lines_now = lines.clone();
+            let kept_now = kept.clone();
             replies = replies.child(
                 div()
                     .id(SharedString::from(format!(
@@ -949,18 +1003,27 @@ impl View {
                     })
                     .child(option.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let steps = this.items.ask_steps.entry(k.clone()).or_default();
-                        steps.held.resize(decisions.len(), None);
-                        steps.held[current] = Some(words.clone());
-                        // The step moves on to the first open line; the last one sends them all.
-                        let open: Vec<usize> = (0..decisions.len())
-                            .filter(|&i| answered_now[i].is_none() && steps.held[i].is_none())
-                            .collect();
-                        if let Some(&first) = open.first() {
-                            steps.current = first;
-                            cx.notify();
+                        let mut next_held = kept_now.clone();
+                        next_held.resize(decisions.len(), None);
+                        next_held[current] = Some(words.clone());
+                        // Quick reply answers the line; when every open line has a pick, send all.
+                        let all_open_answered = lines_now.iter().all(|&i| next_held[i].is_some());
+                        if all_open_answered {
+                            this.send_held_answers(
+                                uid.clone(),
+                                &k,
+                                &decisions,
+                                next_held,
+                                None,
+                                None,
+                                None,
+                                cx,
+                            );
                         } else {
-                            this.send_held_answers(uid.clone(), &k, &decisions, None, cx);
+                            let steps = this.items.ask_steps.entry(k.clone()).or_default();
+                            steps.held = next_held;
+                            steps.chosen = None;
+                            cx.notify();
                         }
                     })),
             );
@@ -968,7 +1031,12 @@ impl View {
         out = out.child(replies);
         let held_count = lines.iter().filter(|&&i| held(i).is_some()).count();
         if held_count > 0 {
-            let (k, uid, decisions) = (key.clone(), item.uid.clone(), ask.decisions.clone());
+            let (k, uid, decisions, kept_send) = (
+                key.clone(),
+                item.uid.clone(),
+                ask.decisions.clone(),
+                kept.clone(),
+            );
             out = out.child(
                 div()
                     .mt_3()
@@ -997,7 +1065,16 @@ impl View {
                             .child(Icon::new(IconName::ArrowUp).size(px(14.)))
                             .child(hm::SEND_NOW.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.send_held_answers(uid.clone(), &k, &decisions, None, cx);
+                                this.send_held_answers(
+                                    uid.clone(),
+                                    &k,
+                                    &decisions,
+                                    kept_send.clone(),
+                                    None,
+                                    None,
+                                    None,
+                                    cx,
+                                );
                             })),
                     ),
             );
@@ -1005,33 +1082,48 @@ impl View {
         out
     }
 
-    /// Posts the answers held for an ask (and `typed` for its current line) as one comment.
+    /// Posts the answers held for an ask (and `typed` for its current line, or a trailing plain
+    /// `extra_comment` when "Replying to" was dismissed) as one comment.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "posts held picks with optional typed line answer or trailing comment"
+    )]
     pub(super) fn send_held_answers(
         &mut self,
         uid: String,
         key: &(String, u64),
         decisions: &[BotItemDecision],
+        mut answers: Vec<Option<String>>,
         typed: Option<(usize, String)>,
+        extra_comment: Option<String>,
+        clear_input: Option<gpui::Entity<gpui_component::input::InputState>>,
         cx: &mut Context<Self>,
     ) {
-        let mut answers = self
-            .items
-            .ask_steps
-            .get(key)
-            .map(|s| s.held.clone())
-            .unwrap_or_default();
+        if self.items.busy {
+            return;
+        }
         answers.resize(decisions.len(), None);
         if let Some((i, words)) = typed
             && let Some(slot) = answers.get_mut(i)
         {
             *slot = Some(words);
         }
-        let body = answers_text(decisions, &answers);
+        let mut body = answers_text(decisions, &answers);
+        if let Some(extra) = extra_comment {
+            let extra = extra.trim();
+            if !extra.is_empty() {
+                if body.is_empty() {
+                    extra.clone_into(&mut body);
+                } else {
+                    body = format!("{body}\n{extra}");
+                }
+            }
+        }
         if body.is_empty() {
             return;
         }
         self.items.ask_steps.remove(key);
-        self.answer_item_decision(uid, Some(body), None, None, cx);
+        self.answer_item_decision(uid, Some(body), None, clear_input, cx);
     }
 
     /// The workers each of the bot's chats started (Orca's chat tree): the Dispatch links its
@@ -1211,5 +1303,429 @@ mod tests {
             ..e
         };
         assert!(edited_fields(&old).is_empty());
+    }
+
+    #[test]
+    fn question_line_strips_markdown_marks() {
+        assert_eq!(question_line("## **Ship it?**\nDetails"), "Ship it?");
+        assert_eq!(question_line("- Run `cargo test`?"), "Run cargo test?");
+    }
+
+    #[test]
+    fn waiting_question_stays_open_across_partial_multi_question_replies() {
+        use krill_proto::bots::{BotId, BotItemStatus};
+
+        let ask = BotItemEvent {
+            id: 10,
+            item_uid: "u1".to_owned(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Bot {
+                bot_id: BotId::new("bot-1").unwrap(),
+                session_id: None,
+            },
+            text: "Audit done.".to_owned(),
+            decisions: vec![d("Q1?"), d("Q2?"), d("Q3?")],
+            created_at_ms: 100,
+        };
+        let mut item = BotItem {
+            uid: "u1".to_owned(),
+            number: 1,
+            owner_bot_id: BotId::new("bot-1").unwrap(),
+            title: "Multi ask".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::NeedsYou,
+            close_note: None,
+            links: vec![],
+            events: vec![ask.clone()],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: 100,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            closed_at_ms: None,
+        };
+        assert_eq!(
+            super::super::home_item::waiting_question(&item).map(|e| e.id),
+            Some(10)
+        );
+        assert_eq!(question_step_state(&item, &ask, None).current, 0);
+
+        // First line answered via free-form text: krilld moves status to Working,
+        // yet Q2 and Q3 remain open and waiting_question stays active on Q2.
+        item.status = BotItemStatus::Working;
+        item.events.push(BotItemEvent {
+            id: 11,
+            item_uid: "u1".to_owned(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Owner { device: None },
+            text: "Q1? → Custom answer".to_owned(),
+            decisions: vec![],
+            created_at_ms: 200,
+        });
+        item.events.push(BotItemEvent {
+            id: 12,
+            item_uid: "u1".to_owned(),
+            kind: BotItemEventKind::Status,
+            actor: BotItemActor::Owner { device: None },
+            text: "status -> working".to_owned(),
+            decisions: vec![],
+            created_at_ms: 200,
+        });
+        assert_eq!(
+            super::super::home_item::waiting_question(&item).map(|e| e.id),
+            Some(10)
+        );
+        let state = question_step_state(&item, &ask, None);
+        assert_eq!(state.lines, vec![1, 2]);
+        assert_eq!(state.current, 1);
+
+        // Answering Q2 and Q3 closes the waiting ask completely.
+        item.events.push(BotItemEvent {
+            id: 13,
+            item_uid: "u1".to_owned(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Owner { device: None },
+            text: "Q2? → Yes\nQ3? → Later".to_owned(),
+            decisions: vec![],
+            created_at_ms: 300,
+        });
+        assert!(super::super::home_item::waiting_question(&item).is_none());
+    }
+
+    #[gpui::test]
+    fn multi_question_free_form_reply_sends_immediately_and_advances(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        use gpui::{Modifiers, px};
+        use krill_proto::bots::{BotConfig, BotId, BotItemStatus, BotRpcRequest, BotRpcResponse};
+
+        struct State {
+            item: BotItem,
+            answers: Vec<String>,
+            comments: Vec<String>,
+            next_event_id: u64,
+        }
+
+        let bot_id = BotId::new("bot-1").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Helper", "agy", 1_700_000_000_000).unwrap();
+        let initial_item = BotItem {
+            uid: "multi-1".to_owned(),
+            number: 42,
+            owner_bot_id: bot_id.clone(),
+            title: "Per-chat layouts".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::NeedsYou,
+            close_note: None,
+            links: vec![],
+            events: vec![BotItemEvent {
+                id: 61,
+                item_uid: "multi-1".to_owned(),
+                kind: BotItemEventKind::Commented,
+                actor: BotItemActor::Bot {
+                    bot_id: bot_id.clone(),
+                    session_id: None,
+                },
+                text: "Three quick calls.".to_owned(),
+                decisions: vec![
+                    BotItemDecision {
+                        question: "Where should the switcher live?".to_owned(),
+                        options: vec!["Top strip".to_owned(), "Right panel".to_owned()],
+                        recommended: Some(0),
+                    },
+                    BotItemDecision {
+                        question: "Keep sidebar chat rows?".to_owned(),
+                        options: vec!["No".to_owned(), "Yes".to_owned()],
+                        recommended: Some(0),
+                    },
+                    BotItemDecision {
+                        question: "Shortcut to switch chats?".to_owned(),
+                        options: vec!["Cmd+1-9".to_owned(), "Ctrl+1-9".to_owned()],
+                        recommended: Some(0),
+                    },
+                ],
+                created_at_ms: 1_700_000_000_000,
+            }],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: 1_700_000_000_000,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            closed_at_ms: None,
+        };
+
+        let state = Arc::new(Mutex::new(State {
+            item: initial_item,
+            answers: Vec::new(),
+            comments: Vec::new(),
+            next_event_id: 62,
+        }));
+        let bot_for_rpc = bot.clone();
+        let state_for_rpc = state.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_for_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(vec![
+                state_for_rpc.lock().unwrap().item.clone(),
+            ])),
+            BotRpcRequest::AnswerBotItem {
+                answer_text: Some(text),
+                ..
+            } => {
+                let mut st = state_for_rpc.lock().unwrap();
+                st.answers.push(text.clone());
+                let id = st.next_event_id;
+                st.next_event_id += 2;
+                let item_uid = st.item.uid.clone();
+                st.item.status = BotItemStatus::Working;
+                st.item.version += 1;
+                st.item.events.push(BotItemEvent {
+                    id,
+                    item_uid: item_uid.clone(),
+                    kind: BotItemEventKind::Commented,
+                    actor: BotItemActor::Owner { device: None },
+                    text: text.clone(),
+                    decisions: vec![],
+                    created_at_ms: 1_700_000_001_000,
+                });
+                st.item.events.push(BotItemEvent {
+                    id: id + 1,
+                    item_uid,
+                    kind: BotItemEventKind::Status,
+                    actor: BotItemActor::Owner { device: None },
+                    text: "status -> working".to_owned(),
+                    decisions: vec![],
+                    created_at_ms: 1_700_000_001_000,
+                });
+                Ok(BotRpcResponse::Item(Box::new(st.item.clone())))
+            }
+            BotRpcRequest::AddItemComment { text, .. } => {
+                let mut st = state_for_rpc.lock().unwrap();
+                st.comments.push(text.clone());
+                let id = st.next_event_id;
+                st.next_event_id += 1;
+                let item_uid = st.item.uid.clone();
+                st.item.events.push(BotItemEvent {
+                    id,
+                    item_uid,
+                    kind: BotItemEventKind::Commented,
+                    actor: BotItemActor::Owner { device: None },
+                    text: text.clone(),
+                    decisions: vec![],
+                    created_at_ms: 1_700_000_002_000,
+                });
+                Ok(BotRpcResponse::Item(Box::new(st.item.clone())))
+            }
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+                krill_proto::bots::BotUpcoming::default(),
+            )),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(420.), px(900.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.open_home_item("multi-1".to_owned(), cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Step card has NO "Type your answer" chip and NO "Send now" before anything is held.
+        assert!(vcx.debug_bounds("bot-item-step-reply-0-0").is_some());
+        assert!(vcx.debug_bounds("bot-item-type-answer-61-0").is_none());
+        assert!(vcx.debug_bounds("bot-item-send-held").is_none());
+
+        // 1) Typing a free-form answer for Q1 sends IMMEDIATELY (without files or waiting for Q2/Q3).
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.send_item_comment(
+                    "multi-1".to_owned(),
+                    "Top strip with a review pass",
+                    None,
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            state.lock().unwrap().answers,
+            vec!["Where should the switcher live? → Top strip with a review pass"]
+        );
+
+        // After host sets status=Working + records Q1 answer, Q1 folds above and step advances to Q2!
+        assert!(vcx.debug_bounds("bot-item-answer-line-0").is_some());
+        assert!(vcx.debug_bounds("bot-item-step-reply-1-0").is_some());
+
+        // 2) Pick Q2 via quick reply (held), then click "Send now" — wait: test held + typed on Q3!
+        let q2_chip = vcx
+            .debug_bounds("bot-item-step-reply-1-0")
+            .expect("Q2 quick reply");
+        vcx.simulate_click(q2_chip.center(), Modifiers::default());
+        vcx.run_until_parked();
+        // Held on device, not sent yet; "Send now" appears and step moves to Q3.
+        assert_eq!(state.lock().unwrap().answers.len(), 1);
+        assert!(vcx.debug_bounds("bot-item-send-held").is_some());
+        assert!(vcx.debug_bounds("bot-item-step-reply-2-0").is_some());
+
+        // 3) Free-form reply on Q3 sends BOTH held Q2 pick and typed Q3 reply at once!
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.send_item_comment("multi-1".to_owned(), "Use Alt+1-9", None, cx);
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            state.lock().unwrap().answers,
+            vec![
+                "Where should the switcher live? → Top strip with a review pass",
+                "Keep sidebar chat rows? → No\nShortcut to switch chats? → Use Alt+1-9",
+            ]
+        );
+        // All 3 questions answered: stepper & Send now disappear.
+        assert!(vcx.debug_bounds("bot-item-send-held").is_none());
+        assert!(vcx.debug_bounds("bot-item-step-reply-2-0").is_none());
+    }
+
+    #[gpui::test]
+    fn multi_question_send_now_and_dismissed_replying_to_work(cx: &mut gpui::TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        use gpui::{Modifiers, px};
+        use krill_proto::bots::{BotConfig, BotId, BotItemStatus, BotRpcRequest, BotRpcResponse};
+
+        let bot_id = BotId::new("bot-2").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "Helper", "agy", 1_700_000_000_000).unwrap();
+        let item = BotItem {
+            uid: "multi-2".to_owned(),
+            number: 43,
+            owner_bot_id: bot_id.clone(),
+            title: "Send now test".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::NeedsYou,
+            close_note: None,
+            links: vec![],
+            events: vec![BotItemEvent {
+                id: 71,
+                item_uid: "multi-2".to_owned(),
+                kind: BotItemEventKind::Commented,
+                actor: BotItemActor::Bot {
+                    bot_id: bot_id.clone(),
+                    session_id: None,
+                },
+                text: "Pick".to_owned(),
+                decisions: vec![d("First?"), d("Second?"), d("Third?")],
+                created_at_ms: 1_700_000_000_000,
+            }],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: 1_700_000_000_000,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            closed_at_ms: None,
+        };
+        let answers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let comments = Arc::new(Mutex::new(Vec::<String>::new()));
+        let item_state = Arc::new(Mutex::new(item));
+        let bot_for_rpc = bot.clone();
+        let ans_rpc = answers.clone();
+        let com_rpc = comments.clone();
+        let it_rpc = item_state.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_for_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => {
+                Ok(BotRpcResponse::Items(vec![it_rpc.lock().unwrap().clone()]))
+            }
+            BotRpcRequest::AnswerBotItem {
+                answer_text: Some(text),
+                ..
+            } => {
+                ans_rpc.lock().unwrap().push(text.clone());
+                let mut it = it_rpc.lock().unwrap();
+                let ev_id = 72 + u64::try_from(it.events.len()).unwrap_or(0);
+                let item_uid = it.uid.clone();
+                it.status = BotItemStatus::Working;
+                it.events.push(BotItemEvent {
+                    id: ev_id,
+                    item_uid,
+                    kind: BotItemEventKind::Commented,
+                    actor: BotItemActor::Owner { device: None },
+                    text: text.clone(),
+                    decisions: vec![],
+                    created_at_ms: 1_700_000_001_000,
+                });
+                Ok(BotRpcResponse::Item(Box::new(it.clone())))
+            }
+            BotRpcRequest::AddItemComment { text, .. } => {
+                com_rpc.lock().unwrap().push(text.clone());
+                Ok(BotRpcResponse::Item(Box::new(
+                    it_rpc.lock().unwrap().clone(),
+                )))
+            }
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+                krill_proto::bots::BotUpcoming::default(),
+            )),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(420.), px(900.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.open_home_item("multi-2".to_owned(), cx);
+            });
+        });
+        vcx.run_until_parked();
+
+        // Pick Q1, then click Send now: posts only Q1 immediately.
+        let q1 = vcx.debug_bounds("bot-item-step-reply-0-0").expect("Q1");
+        vcx.simulate_click(q1.center(), Modifiers::default());
+        vcx.run_until_parked();
+        let send_now = vcx.debug_bounds("bot-item-send-held").expect("Send now");
+        vcx.simulate_click(send_now.center(), Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(answers.lock().unwrap().as_slice(), ["First? → Yes"]);
+
+        // Now hide "Replying to" with no held picks: typed text sends as a plain comment.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.items.reply_hidden.insert("multi-2".to_owned(), 71);
+                v.send_item_comment("multi-2".to_owned(), "Side note only", None, cx);
+            });
+        });
+        vcx.run_until_parked();
+        assert_eq!(comments.lock().unwrap().as_slice(), ["Side note only"]);
+        assert_eq!(answers.lock().unwrap().len(), 1);
     }
 }

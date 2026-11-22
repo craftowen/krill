@@ -92,6 +92,11 @@ pub(super) enum LinkKindChoice {
 #[derive(Default)]
 pub(super) struct ItemsState {
     pub(super) items: Vec<BotItem>,
+    /// Monotonic revision bumped whenever `items` changes so Home's virtualized list cache
+    /// skips O(N) re-grouping and cloning on hover, scroll, and selection updates.
+    pub(super) items_rev: u64,
+    /// Home: virtualized row projection and `gpui::ListState` for `bots-tab-items-body`.
+    pub(super) home_list: super::home::HomeListCache,
     pub(super) filter: ItemFilter,
     pub(super) new_title_input: Option<Entity<InputState>>,
     pub(super) new_desc_input: Option<Entity<InputState>>,
@@ -161,6 +166,25 @@ pub(super) struct ItemsState {
 }
 
 impl ItemsState {
+    pub(super) fn bump_items_rev(&mut self) {
+        self.items_rev = self.items_rev.wrapping_add(1);
+    }
+
+    pub(super) fn set_items(&mut self, items: Vec<BotItem>) {
+        self.items = items;
+        self.bump_items_rev();
+    }
+
+    pub(super) fn clear_items(&mut self) {
+        self.items.clear();
+        self.bump_items_rev();
+    }
+
+    pub(super) fn push_front_item(&mut self, item: BotItem) {
+        self.items.insert(0, item);
+        self.bump_items_rev();
+    }
+
     pub(super) fn items_input_composing(&self, window: &mut Window, app: &mut App) -> bool {
         self.input_is_composing(window, app)
     }
@@ -500,7 +524,7 @@ impl View {
                 this.items.busy = false;
                 match res {
                     Ok(item) => {
-                        this.items.items.insert(0, item);
+                        this.items.push_front_item(item);
                         let handle = this.window_handle;
                         clear_input_on_window(&mut this.items.new_title_input, handle, cx);
                         clear_input_on_window(&mut this.items.new_desc_input, handle, cx);
@@ -921,6 +945,7 @@ impl View {
         } else {
             self.items.items.insert(0, updated);
         }
+        self.items.bump_items_rev();
         self.sync_open_items_for_bot(bot_id);
     }
 

@@ -909,7 +909,7 @@ impl View {
                 }
                 let mut errors = Vec::new();
                 match loaded.items_res {
-                    Ok(items) => this.items.items = items,
+                    Ok(items) => this.items.set_items(items),
                     Err(e) => errors.push(e),
                 }
                 let soul_opt = match loaded.soul_res {
@@ -1374,7 +1374,7 @@ impl View {
                             if let Some(next_id) = this.selected_bot_id.clone() {
                                 this.load_selected_bot_detail(next_id, cx);
                             } else {
-                                this.items.items.clear();
+                                this.items.clear_items();
                                 this.soul_memory.set_loaded(String::new(), String::new());
                             }
                         }

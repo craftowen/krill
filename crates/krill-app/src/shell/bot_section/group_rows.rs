@@ -145,9 +145,11 @@ impl Shell {
                 self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone())
             });
         let faces = group_faces::render_group_faces(&face_members, AVATAR, p.sidebar, p);
-        let badge = matches!(facts.status, RowStatus::Permission | RowStatus::Working)
+        let badge = (facts.status == RowStatus::Permission)
             .then(|| avatar_badge(facts.status, false, p, cx))
             .flatten();
+        let trailing_working = (!facts.all_paused && facts.status == RowStatus::Working)
+            .then(|| self.render_row_working_mark(&format!("group-{gid}"), cx));
 
         let unread = facts.status == RowStatus::Permission;
         let name: AnyElement = match renaming {
@@ -275,7 +277,8 @@ impl Shell {
                                     }),
                             )
                             .children(line_el),
-                    ),
+                    )
+                    .children(trailing_working),
             )
             .context_menu(Self::group_row_menu(summary, cx.weak_entity()))
             .into_any_element()
