@@ -97,26 +97,64 @@ pub(super) fn chat_title(bot: &SidebarBot, s: &BotSessionSummary) -> SharedStrin
     }
 }
 
+fn same_bot_folder(bot_dir: &std::path::Path, candidate: &std::path::Path) -> bool {
+    if krill_proto::path::equivalent(bot_dir, candidate) {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(bot_dir), std::fs::canonicalize(candidate)),
+        (Ok(a), Ok(b)) if krill_proto::path::equivalent(&a, &b)
+    )
+}
+
+fn path_within_bot_folder(file: &std::path::Path, bot_dir: &std::path::Path) -> bool {
+    if file.starts_with(bot_dir) {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(file), std::fs::canonicalize(bot_dir)),
+        (Ok(f), Ok(b)) if f.starts_with(&b)
+    )
+}
+
 impl Shell {
-    /// The bot whose page is on screen: the focused chat is one of its chats or runs in its
-    /// folder, or the focused file is in its folder (Orca's bot workspace).
-    pub(super) fn focused_bot(&self) -> Option<&SidebarBot> {
-        let pane = self.layout.focused()?;
+    /// The bot owning `pane`: its explicit split launcher binding, one of its live chats,
+    /// a session/terminal running in its folder, or a file inside its folder.
+    pub(super) fn bot_for_pane(&self, pane: krill_app::layout::PaneId) -> Option<&SidebarBot> {
+        if let Some(bot_id) = self
+            .split_launchers
+            .get(&pane)
+            .and_then(|l| l.bot_id.as_ref())
+        {
+            return self.sidebar_bots.iter().find(|b| &b.id == bot_id);
+        }
         if self.layout.host(pane) != &self.launch_host {
             return None;
         }
         if let Some(file) = self.layout.file(pane) {
-            return self
-                .sidebar_bots
-                .iter()
-                .find(|b| self.bot_folder(b).is_some_and(|f| file.starts_with(f)));
+            return self.sidebar_bots.iter().find(|b| {
+                self.bot_folder(b)
+                    .is_some_and(|f| path_within_bot_folder(file, &f))
+            });
         }
         let session = self.layout.session(pane);
-        let cwd = self.folder();
+        let cwd = {
+            use krill_proto::os::ffi::OsStringExt as _;
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(self.launch_for(pane).cwd))
+        };
         self.sidebar_bots.iter().find(|b| {
             session.is_some_and(|s| b.sessions.iter().any(|x| x.session_id == s))
-                || self.bot_folder(b).is_some_and(|f| f == cwd)
+                || self
+                    .bot_folder(b)
+                    .is_some_and(|f| same_bot_folder(&f, &cwd))
         })
+    }
+
+    /// The bot whose page is on screen: the focused chat is one of its chats or runs in its
+    /// folder, or the focused file is in its folder (Orca's bot workspace).
+    pub(super) fn focused_bot(&self) -> Option<&SidebarBot> {
+        let pane = self.layout.focused()?;
+        self.bot_for_pane(pane)
     }
 
     /// Opens Bot settings in the right sidebar when `bot_id` is the bot page on screen.

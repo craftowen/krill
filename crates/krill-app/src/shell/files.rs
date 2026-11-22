@@ -1314,11 +1314,7 @@ impl Shell {
                     .xsmall()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.layout.set_zoomed_pane(None);
-                        this.change(true, cx, |l| {
-                            l.focus(id);
-                            l.split(krill_app::layout::Axis::Horizontal);
-                        });
+                        this.split_pane(id, krill_app::layout::Axis::Horizontal, cx);
                     })),
                 format!("file-pane-split-right-{}", id.get()),
                 text::SPLIT_RIGHT.get(),
@@ -2283,6 +2279,8 @@ impl Shell {
                     .cloned();
                 if let Some(state) = editor {
                     state.update(cx, |s, cx| s.focus(window, cx));
+                } else if let Some(pane) = focused.filter(|p| self.is_split_launcher(*p)) {
+                    self.focus_split_launcher(pane, window, cx);
                 } else if let Some(chat_key) = focused
                     .filter(|p| self.is_pane_chat_view(*p, cx))
                     .and_then(|p| self.chat_key(p))

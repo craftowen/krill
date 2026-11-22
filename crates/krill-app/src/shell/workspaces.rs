@@ -214,6 +214,9 @@ impl Shell {
     }
 
     fn workspace_awaiting_create(&self, workspace: &Workspace, cx: &App) -> bool {
+        if self.split_launcher_awaiting_launch(workspace, cx) {
+            return true;
+        }
         // Create can appear in the daemon list before its reply reaches the
         // launching pane. Wait for that pane's ID before importing missing IDs.
         // A pane whose Create reply was lost never receives it, so import instead.
@@ -554,11 +557,16 @@ impl Shell {
         }
     }
 
-    fn pane_workspace(&self, pane: PaneId, cx: &App) -> Option<Workspace> {
+    pub(super) fn pane_workspace(&self, pane: PaneId, cx: &App) -> Option<Workspace> {
         if !self.layout.pane_exists(pane) {
             return None;
         }
         let host = self.layout.host(pane).clone();
+        if let Some(bot) = self.bot_for_pane(pane)
+            && let Some(folder) = self.bot_folder(bot)
+        {
+            return Some(Workspace { host, folder });
+        }
         // 실행 폴더는 영속 상태다. 라이브 cwd(cd)는 워크스페이스 소속을 바꾸지 않는다.
         let folder = self
             .layout
