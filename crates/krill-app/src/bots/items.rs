@@ -108,6 +108,18 @@ pub(super) struct ItemsState {
     pub(super) edit_desc_input: Option<Entity<InputState>>,
     pub(super) edit_done_input: Option<Entity<InputState>>,
     pub(super) busy: bool,
+    /// Home (the right sidebar): Orca's "Needs you only" filter.
+    pub(super) needs_you_only: bool,
+    /// Home: the item open in the list's place.
+    pub(super) open_uid: Option<String>,
+    /// Home: sections folded or unfolded away from their default.
+    pub(super) folds: std::collections::BTreeSet<&'static str>,
+    /// Home: rows a group shows after "Show N more".
+    pub(super) group_shown: BTreeMap<&'static str, usize>,
+    /// Home: the row under the pointer, which shows its actions.
+    pub(super) hover_uid: Option<String>,
+    /// Home: the open item's description is unclamped.
+    pub(super) desc_open: bool,
 }
 
 impl ItemsState {
@@ -291,7 +303,12 @@ impl View {
         }
     }
 
-    fn ensure_per_item_inputs(&mut self, uid: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_per_item_inputs(
+        &mut self,
+        uid: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !cx.has_global::<gpui_component::Theme>() {
             return;
         }
@@ -308,7 +325,7 @@ impl View {
                         && !crate::jump::entity_input_is_composing(inp, window, cx)
                     {
                         let body = inp.read(cx).value().to_string();
-                        this.submit_item_comment(
+                        this.send_item_comment(
                             uid_owned.clone(),
                             &body,
                             Some(input_clone.clone()),

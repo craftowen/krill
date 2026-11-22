@@ -76,6 +76,8 @@ pub(super) struct BotPanel {
     pub stale: bool,
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
     pub chat_query: String,
+    /// What the header last drew from `view`: its filter and whether an item is open.
+    pub home_chrome: (Option<krill_app::bots::HomeFilter>, bool),
 }
 
 /// How a bot chat is named: Home Chat for the Home Chat (krilld lists it first), else its own
@@ -160,6 +162,17 @@ impl Shell {
             cx.new(|cx| krill_app::bots::View::new_on_host(host, target, None, cx).into_panel())
         };
         Self::subscribe_bots_view(&view, false, cx);
+        // The header (drawn here) shows the view's filter and hides over an open item: redraw
+        // when those change, not on every change inside the view.
+        cx.observe(&view, |this, view, cx| {
+            let v = view.read(cx);
+            let chrome = (v.home_filter(), v.home_item_open());
+            if this.bot_ui.panel.home_chrome != chrome {
+                this.bot_ui.panel.home_chrome = chrome;
+                cx.notify();
+            }
+        })
+        .detach();
         self.bot_ui.panel.view = Some(view.clone());
         self.bot_ui.panel.shown = None;
         self.bot_ui.panel.stale = false;
@@ -228,18 +241,23 @@ impl Shell {
             BotPanelTab::Files => self.diff.clone().into_any_element(),
             BotPanelTab::Chats => self.render_bot_chats(bot, p, cx).into_any_element(),
             BotPanelTab::Connectors => div().size_full().children(view).into_any_element(),
-            BotPanelTab::Home => match self.bot_ui.panel.settings {
-                Some(page) => {
+            BotPanelTab::Home => {
+                if let Some(page) = self.bot_ui.panel.settings {
                     Self::render_bot_settings_page(bot, page, view, p, cx).into_any_element()
+                } else {
+                    // An open item takes Home's place, header and all (Orca's item pane).
+                    let item_open = view.as_ref().is_some_and(|v| v.read(cx).home_item_open());
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .when(!item_open, |d| {
+                            d.child(self.render_bot_panel_header(bot, view.as_ref(), p, cx))
+                        })
+                        .child(div().flex_1().min_h_0().children(view))
+                        .into_any_element()
                 }
-                None => div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(self.render_bot_panel_header(bot, p, cx))
-                    .child(div().flex_1().min_h_0().children(view))
-                    .into_any_element(),
-            },
+            }
         };
         div()
             .id("bot-panel")
@@ -279,13 +297,22 @@ impl Shell {
         for tab in BotPanelTab::ALL {
             let active = tab == current;
             let selector = tab.selector();
+            // Orca's count pill: a filled circle, the number in the background color.
             let badge = (tab == BotPanelTab::Home && bot.attention > 0).then(|| {
                 div()
+                    .debug_selector(|| "bot-panel-home-badge".into())
+                    .h(px(16.))
+                    .min_w(px(16.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .px_1()
                     .rounded_full()
-                    .bg(p.sidebar_accent)
+                    .bg(p.foreground)
                     .text_size(ui::TEXT_2XS)
-                    .text_color(p.sidebar_foreground)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.background)
                     .child(bot.attention.to_string())
             });
             tabs = tabs.child(
@@ -358,19 +385,118 @@ impl Shell {
             )
     }
 
-    /// Orca's `BotPanelHeader`: face, name and what it is doing, Bot settings and More.
+    /// Orca's `BotPanelHeader`: face (with its state in the corner), name and what it is doing,
+    /// the Items filter, Bot settings and More.
     fn render_bot_panel_header(
         &self,
         bot: &SidebarBot,
+        view: Option<&Entity<krill_app::bots::View>>,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let (activity, attention) = Self::bot_activity(bot);
-        let status = if activity.trim().is_empty() {
+        // Orca says Idle while nothing waits or runs; the bot's job is the sidebar's line only.
+        let quiet = !bot.paused && bot.attention == 0 && bot.working() == 0;
+        let status = if quiet || activity.trim().is_empty() {
             text::BP_IDLE.get().to_owned()
         } else {
             activity
         };
+        let state = if bot.attention > 0 {
+            krill_proto::control::AgentState::Waiting
+        } else if bot.working() > 0 {
+            krill_proto::control::AgentState::Working
+        } else {
+            krill_proto::control::AgentState::Exited
+        };
+        let face = div()
+            .relative()
+            .flex_none()
+            .child(self.bot_avatar(bot, 36., px(9.), p))
+            .when(!bot.paused, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "bot-panel-header-state".into())
+                        .absolute()
+                        .bottom(px(-4.))
+                        .right(px(-4.))
+                        .size(px(14.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(p.sidebar)
+                        .child(ui::status::status_glyph(
+                            state,
+                            false,
+                            ui::status::Size::Sm,
+                            cx,
+                        )),
+                )
+            });
+        let filter = view.and_then(|v| {
+            let f = v.read(cx).home_filter()?;
+            let v = v.clone();
+            Some(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(
+                        Button::new("bot-panel-filter")
+                            .debug_selector(|| "bot-panel-filter".into())
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(gpui_kit_assets::IconName::ListFilter))
+                            .tooltip(text::HM_FILTER_LABEL.get())
+                            .accessibility_label(text::HM_FILTER_LABEL.get())
+                            .dropdown_menu(move |menu, _, _| {
+                                let v = v.clone();
+                                let count = f.needs_you.to_string();
+                                menu.item(
+                                    PopupMenuItem::element(move |_, cx| {
+                                        let p = ui::palette(cx);
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .gap_3()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .child(text::HM_FILTER_NEEDS_YOU.get()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(ui::TEXT_XS)
+                                                    .text_color(p.muted_foreground)
+                                                    .child(count.clone()),
+                                            )
+                                    })
+                                    .checked(f.needs_you_only)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            v.update(cx, |v, cx| {
+                                                v.set_needs_you_only(!f.needs_you_only, cx);
+                                            });
+                                        },
+                                    ),
+                                )
+                            }),
+                    )
+                    // Orca's dot on the icon while a filter is on.
+                    .when(f.needs_you_only, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(px(4.))
+                                .right(px(4.))
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(p.foreground),
+                        )
+                    }),
+            )
+        });
         let paused = bot.paused;
         let pause_id = bot.id.clone();
         let folder = self.bot_folder(bot);
@@ -379,13 +505,15 @@ impl Shell {
             .id("bot-panel-header")
             .debug_selector(|| "bot-panel-header".into())
             .flex_none()
-            .px_2()
-            .pt_2()
+            // Orca's panel padding (pl-3.5 pr-2 pt-3) plus the header's own (px-2 pt-1 pb-1).
+            .pl(px(22.))
+            .pr(px(16.))
+            .pt(px(16.))
             .pb_1()
             .flex()
             .items_center()
             .gap(px(10.))
-            .child(self.bot_avatar(bot, 36., ui::RADIUS_MD, p))
+            .child(face)
             .child(
                 div()
                     .flex_1()
@@ -412,6 +540,7 @@ impl Shell {
                             .child(status),
                     ),
             )
+            .children(filter)
             .child(
                 Button::new("bot-panel-settings")
                     .debug_selector(|| "bot-panel-settings".into())

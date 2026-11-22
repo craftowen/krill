@@ -797,6 +797,14 @@ mod tests {
             IconName::ArrowUp,
             IconName::Image,
             IconName::Terminal,
+            // The bot Home (right sidebar).
+            IconName::AlarmClock,
+            IconName::AlarmClockOff,
+            IconName::CalendarClock,
+            IconName::CircleSlash,
+            IconName::GitPullRequest,
+            IconName::ListFilter,
+            IconName::X,
         ] {
             let path = icon.path();
             assert!(
@@ -814,12 +822,15 @@ mod tests {
 gpui_kit_assets::icon_assets!(
     AppIcons,
     [
+        AlarmClock,
+        AlarmClockOff,
         Bell,
         Bot,
         Box,
         Braces,
         Brain,
         Briefcase,
+        CalendarClock,
         Check,
         ChevronDown,
         ChevronLeft,
@@ -827,6 +838,7 @@ gpui_kit_assets::icon_assets!(
         ChevronUp,
         CircleAlert,
         CircleCheck,
+        CircleSlash,
         CircleX,
         Clock,
         Close,
@@ -841,6 +853,7 @@ gpui_kit_assets::icon_assets!(
         Folder,
         FolderOpen,
         Gauge,
+        GitPullRequest,
         Globe,
         Image,
         Info,
@@ -848,6 +861,7 @@ gpui_kit_assets::icon_assets!(
         Layers,
         Link,
         ListChecks,
+        ListFilter,
         Loader,
         LoaderCircle,
         Lock,
@@ -881,7 +895,8 @@ gpui_kit_assets::icon_assets!(
         TextWrap,
         TriangleAlert,
         User,
-        Wrench
+        Wrench,
+        X,
     ]
 );
 

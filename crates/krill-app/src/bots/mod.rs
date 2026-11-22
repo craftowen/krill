@@ -8,6 +8,9 @@
 pub mod avatar;
 mod connectors;
 mod groups;
+mod home;
+mod home_item;
+mod home_upcoming;
 mod items;
 pub mod new_bot;
 mod panel;
@@ -42,6 +45,7 @@ use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::bots as text;
 use crate::ui;
 
+pub use home::HomeFilter;
 pub use rpc::{
     BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
     SidebarState, daemon_bot_rpc, fetch_sidebar_state,
@@ -582,6 +586,13 @@ impl View {
         self.pending_switch_bot = None;
         self.error = None;
         self.notice = None;
+        if self.selected_bot_id.as_ref() != Some(&bot_id) {
+            // Home's open item, filter and folds are the last bot's.
+            self.items.open_uid = None;
+            self.items.needs_you_only = false;
+            self.items.folds.clear();
+            self.items.group_shown.clear();
+        }
         self.selected_bot_id = Some(bot_id.clone());
         self.screen = Screen::Detail;
         self.connectors.needs_sync_from_bot = true;

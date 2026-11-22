@@ -7532,6 +7532,27 @@ fn bot_rows_start_one_home_chat_and_explain_a_paused_bot(cx: &mut TestAppContext
     cx.update(|_, cx| assert!(view.read(cx).notice.is_some()));
 }
 
+fn needs_you_item(bot_id: &krill_proto::bots::BotId) -> krill_proto::bots::BotItem {
+    krill_proto::bots::BotItem {
+        uid: format!("{}-item", bot_id.as_str()),
+        number: 1,
+        owner_bot_id: bot_id.clone(),
+        title: "Pick a release day".to_owned(),
+        description: None,
+        done_means: None,
+        status: krill_proto::bots::BotItemStatus::NeedsYou,
+        close_note: None,
+        links: Vec::new(),
+        events: Vec::new(),
+        snoozed_until_ms: None,
+        version: 1,
+        last_activity_at_ms: 1_700_000_000_000,
+        created_at_ms: 1_700_000_000_000,
+        updated_at_ms: 1_700_000_000_000,
+        closed_at_ms: None,
+    }
+}
+
 #[gpui::test]
 fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppContext) {
     use krill_proto::bots::{BotConfig, BotId, BotRpcRequest, BotRpcResponse};
@@ -7556,7 +7577,9 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
         seen.lock().unwrap().push(req.clone());
         Ok(match req {
             BotRpcRequest::ListBots => BotRpcResponse::Bots(daemon_bots.lock().unwrap().clone()),
-            BotRpcRequest::ListItems { .. } => BotRpcResponse::Items(Vec::new()),
+            BotRpcRequest::ListItems { bot_id, .. } => {
+                BotRpcResponse::Items(bot_id.iter().map(needs_you_item).collect())
+            }
             BotRpcRequest::ConnectorStatus { .. } => BotRpcResponse::ConnectorStatuses(Vec::new()),
             BotRpcRequest::ListAccessRequests { .. } => BotRpcResponse::AccessRequests(Vec::new()),
             BotRpcRequest::ToolRelayStatus => {
@@ -7604,6 +7627,11 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
     assert!(
         cx.debug_bounds("bots-tab-items-body").is_some(),
         "Home lists the bot's items"
+    );
+    // The header redraws once the panel's items arrive: its filter icon shows with them.
+    assert!(
+        cx.debug_bounds("bot-panel-filter").is_some(),
+        "the header's filter shows once the bot has items"
     );
 
     let click = |cx: &mut gpui::VisualTestContext, sel: &'static str| {
