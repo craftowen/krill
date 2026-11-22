@@ -1692,3 +1692,169 @@ fn saving_bot_settings_leaves_an_orca_background_alone(cx: &mut TestAppContext) 
     );
     assert_eq!(st.bots[0].avatar_color.as_deref(), Some("#c9b8e8"));
 }
+
+#[test]
+fn home_groups_items_as_orca_does() {
+    use super::home::{Group, group_of, grouped, short_age, snooze_presets};
+    let now = 1_795_341_600_000; // Sun 2026-11-22 10:00 UTC
+    let at = |uid: &str, n: u64, status: BotItemStatus, ago_min: u64| {
+        let mut item = sample_item("bot-1", uid, n, status);
+        item.last_activity_at_ms = now - ago_min * 60_000;
+        item
+    };
+    let needs = at("a", 1, BotItemStatus::NeedsYou, 5);
+    let working = at("b", 2, BotItemStatus::Working, 10);
+    let mut snoozed = at("c", 3, BotItemStatus::Planned, 1);
+    snoozed.snoozed_until_ms = Some(now + 60_000);
+    let stale = at("d", 4, BotItemStatus::NeedsYou, 6 * 24 * 60);
+    let done = at("e", 5, BotItemStatus::Done, 1);
+    let newer_done = at("f", 6, BotItemStatus::Canceled, 0);
+    assert_eq!(group_of(&needs, false, now), Group::NeedsYou);
+    assert_eq!(group_of(&snoozed, false, now), Group::Snoozed);
+    assert_eq!(group_of(&stale, false, now), Group::Stale);
+    // A live worker keeps an old In progress item out of Stale.
+    let old_working = at("g", 7, BotItemStatus::Working, 6 * 24 * 60);
+    assert_eq!(group_of(&old_working, false, now), Group::Stale);
+    assert_eq!(group_of(&old_working, true, now), Group::Working);
+    let items = [needs, working, snoozed, stale, done, newer_done];
+    let groups = grouped(&items, |_| false, now);
+    let uids =
+        |g: Group| -> Vec<&str> { groups[g as usize].iter().map(|i| i.uid.as_str()).collect() };
+    assert_eq!(uids(Group::NeedsYou), ["a"]);
+    assert_eq!(uids(Group::Working), ["b"]);
+    assert_eq!(uids(Group::Closed), ["f", "e"], "latest change first");
+
+    assert_eq!(short_age(now - 30_000, now), "now");
+    assert_eq!(short_age(now - 6 * 60_000, now), "6m");
+    assert_eq!(short_age(now - 22 * 3_600_000, now), "22h");
+    assert_eq!(short_age(now - 50 * 3_600_000, now), "2d");
+
+    // Sunday 10:00: later is 6 PM, then Monday 9 AM twice.
+    let at_ms = |p: &[(String, u64); 3]| p.iter().map(|(_, at)| *at).collect::<Vec<_>>();
+    assert_eq!(
+        at_ms(&snooze_presets(now, 0)),
+        [1_795_370_400_000, 1_795_424_400_000, 1_795_424_400_000]
+    );
+    // Monday 18:30: three hours out (rounded up to the hour), Tuesday, next Monday.
+    assert_eq!(
+        at_ms(&snooze_presets(1_795_458_600_000, 0)),
+        [1_795_471_200_000, 1_795_510_800_000, 1_796_029_200_000]
+    );
+}
+
+#[gpui::test]
+fn home_panel_groups_filters_and_opens_an_item(cx: &mut TestAppContext) {
+    let now = super::now_unix_ms();
+    let mut mock = MockState::default();
+    mock.bots.push(sample_bot("bot-1", "PR Bot"));
+    mock.bots.push(sample_bot("bot-2", "Quiet Bot"));
+    let mut add = |uid: &str, n: u64, status: BotItemStatus| {
+        let mut item = sample_item("bot-1", uid, n, status);
+        item.last_activity_at_ms = now;
+        mock.items.push(item);
+    };
+    add("ask", 3, BotItemStatus::NeedsYou);
+    add("run", 7, BotItemStatus::Working);
+    add("plan", 8, BotItemStatus::Planned);
+    add("shipped", 5, BotItemStatus::Done);
+    let ask = mock.items.iter_mut().find(|i| i.uid == "ask").unwrap();
+    ask.events.push(BotItemEvent {
+        id: 2,
+        item_uid: "ask".to_owned(),
+        kind: BotItemEventKind::Status,
+        actor: BotItemActor::Bot {
+            bot_id: BotId::new("bot-1").unwrap(),
+            session_id: None,
+        },
+        text: "status -> needs_you".to_owned(),
+        decisions: vec![BotItemDecision {
+            question: "Ship it?".to_owned(),
+            options: vec!["Yes".to_owned(), "No".to_owned()],
+            recommended: Some(0),
+        }],
+        created_at_ms: now,
+    });
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.simulate_resize(gpui::size(px(340.), px(900.)));
+    vcx.run_until_parked();
+    let show = |vcx: &mut VisualTestContext, id: &str| {
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&BotId::new(id).unwrap(), DetailTab::Items, cx);
+            });
+        });
+        vcx.run_until_parked();
+    };
+    show(vcx, "bot-1");
+    let click = |vcx: &mut VisualTestContext, sel: &'static str| {
+        let at = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        vcx.simulate_click(at.center(), Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // Needs you and In progress open; Planned and Closed folded to their headers.
+    let ask_row = vcx
+        .debug_bounds("bot-home-item-ask")
+        .expect("needs you row");
+    let run_row = vcx
+        .debug_bounds("bot-home-item-run")
+        .expect("in progress row");
+    assert!(ask_row.top() < run_row.top());
+    assert!(vcx.debug_bounds("bot-home-group-planned").is_some());
+    assert!(vcx.debug_bounds("bot-home-item-plan").is_none());
+    assert!(vcx.debug_bounds("bot-home-item-shipped").is_none());
+    assert!(vcx.debug_bounds("bot-home-automation-tidy").is_some());
+    assert!(vcx.debug_bounds("bot-home-automation-look").is_some());
+    assert!(vcx.debug_bounds("bot-home-automations-empty").is_some());
+    // No always-open add form, no status chips.
+    assert!(vcx.debug_bounds("bots-item-add-btn").is_none());
+    assert!(vcx.debug_bounds("bots-items-filters").is_none());
+
+    click(vcx, "bot-home-group-closed");
+    assert!(vcx.debug_bounds("bot-home-item-shipped").is_some());
+
+    // Needs you only.
+    vcx.update(|_, cx| {
+        let f = view
+            .read(cx)
+            .home_filter()
+            .expect("filter shows with items");
+        assert_eq!(f.needs_you, 1);
+        view.update(cx, |v, cx| v.set_needs_you_only(true, cx));
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bot-home-item-ask").is_some());
+    assert!(vcx.debug_bounds("bot-home-item-run").is_none());
+    click(vcx, "bot-home-filter-chip-clear");
+    assert!(vcx.debug_bounds("bot-home-item-run").is_some());
+
+    // A row opens its item in the list's place; a quick reply answers its question.
+    click(vcx, "bot-home-item-ask");
+    assert!(vcx.debug_bounds("bot-item-pane").is_some());
+    assert!(vcx.debug_bounds("bot-home-items").is_none());
+    assert!(vcx.debug_bounds("bot-item-done-means").is_some());
+    assert!(vcx.debug_bounds("bot-item-comment-box").is_some());
+    vcx.update(|_, cx| assert!(view.read(cx).home_item_open()));
+    click(vcx, "bot-item-reply-2-0-0");
+    assert!(state.lock().unwrap().requests.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::AnswerBotItem {
+            item_id,
+            option_index: Some(0),
+            ..
+        } if item_id == "ask"
+    )));
+    click(vcx, "bot-item-back");
+    assert!(vcx.debug_bounds("bot-home-items").is_some());
+
+    // A bot with no items: Orca's empty state.
+    show(vcx, "bot-2");
+    assert!(vcx.debug_bounds("bot-home-empty").is_some());
+    vcx.update(|_, cx| assert!(view.read(cx).home_filter().is_none()));
+}

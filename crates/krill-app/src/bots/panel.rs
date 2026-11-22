@@ -71,7 +71,7 @@ impl View {
             return root;
         };
         let body = match self.detail_tab {
-            DetailTab::Items => self.render_items_tab(&bot, p, window, cx),
+            DetailTab::Items => self.render_home_tab(&bot, p, window, cx),
             DetailTab::SoulMemory => self.render_soul_memory_tab(&bot, p, window, cx),
             DetailTab::Connectors => self.render_connectors_tab(&bot, p, window, cx),
             DetailTab::ToolsSharing => self.render_tools_sharing_tab(&bot, p, window, cx),
