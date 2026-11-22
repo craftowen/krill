@@ -1087,3 +1087,109 @@ fn rewritten_wide_char_wrap_reflows_without_a_gap() {
         Some("abcde한글")
     );
 }
+
+#[test]
+fn screen_and_history_normalize_overcaptured_osc8_and_sgr4_links() {
+    let look = fresh();
+
+    // 1. OSC 8 only
+    let mut e = Engine::new(WinSize { cols: 80, rows: 4 });
+    e.feed(
+        "새로고침(\x1b]8;;http://127.0.0.1:8787)하면\x1b\\http://127.0.0.1:8787)하면\x1b]8;;\x1b\\ 캔들"
+            .as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert_eq!(s.link_at(0, 9), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(0, 29), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(0, 30), None);
+    assert!(s.rows[0][9].flags.contains(Flags::LINK));
+    assert!(!s.rows[0][30].flags.contains(Flags::LINK));
+
+    // 2. OSC 8 + SGR 4 + blue fg (Codex-style)
+    let mut e = Engine::new(WinSize { cols: 80, rows: 4 });
+    e.feed(
+        "새로고침(\x1b[4;38;2;99;168;248m\x1b]8;;http://127.0.0.1:8787)하면\x07http://127.0.0.1:8787)하면\x1b]8;;\x07\x1b[24;39m 캔들"
+            .as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert_eq!(s.link_at(0, 9), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(0, 30), None);
+    assert!(s.rows[0][29].flags.contains(Flags::LINK | Flags::UNDERLINE));
+    assert!(!s.rows[0][30].flags.contains(Flags::LINK));
+    assert!(!s.rows[0][30].flags.contains(Flags::UNDERLINE));
+    assert_eq!(s.rows[0][30].fg, Color::Default);
+
+    // 3. Percent-encoded OSC 8 URI
+    let mut e = Engine::new(WinSize { cols: 80, rows: 4 });
+    e.feed(
+        "(\x1b]8;;http://127.0.0.1:8787)%ED%95%98%EB%A9%B4\x07http://127.0.0.1:8787)하면\x1b]8;;\x07"
+            .as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert_eq!(s.link_at(0, 1), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(0, 22), None);
+
+    // 4. SGR 4 only
+    let mut e = Engine::new(WinSize { cols: 80, rows: 4 });
+    e.feed(
+        "새로고침(\x1b[4mhttp://127.0.0.1:8787)하면\x1b[24m 캔들".as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert!(s.rows[0][29].flags.contains(Flags::UNDERLINE));
+    assert!(!s.rows[0][30].flags.contains(Flags::UNDERLINE));
+    assert!(!s.rows[0][31].flags.contains(Flags::UNDERLINE));
+
+    // 5. Enclosing SGR 4 paragraph preserves underline on `)하면`
+    let mut e = Engine::new(WinSize { cols: 80, rows: 4 });
+    e.feed(
+        "\x1b[4m새로고침(\x1b]8;;http://127.0.0.1:8787)하면\x07http://127.0.0.1:8787)하면\x1b]8;;\x07 캔들\x1b[24m"
+            .as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert_eq!(s.link_at(0, 9), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(0, 30), None);
+    assert!(s.rows[0][30].flags.contains(Flags::UNDERLINE));
+
+    // 6. Titled and truncated OSC 8 links are preserved untouched
+    let mut e = Engine::new(WinSize { cols: 80, rows: 4 });
+    e.feed(
+        "\x1b]8;;https://example.com/한글\x1b\\문서\x1b]8;;\x1b\\ \x1b]8;;https://example.com/long/full\x1b\\https://example.com/long...\x1b]8;;\x1b\\"
+            .as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert_eq!(s.link_at(0, 0), Some("https://example.com/한글"));
+    assert_eq!(s.link_at(0, 5), Some("https://example.com/long/full"));
+    assert_eq!(s.link_at(0, 31), Some("https://example.com/long/full"));
+
+    // 7. Wrapped 2-row OSC 8 trimmed cleanly across rows
+    let mut e = Engine::new(WinSize { cols: 30, rows: 4 });
+    e.feed(
+        "새로고침(\x1b]8;;http://127.0.0.1:8787)하면\x07http://127.0.0.1:8787)하면\x1b]8;;\x07"
+            .as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let s = e.screen();
+    assert_eq!(s.link_at(0, 9), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(0, 29), Some("http://127.0.0.1:8787"));
+    assert_eq!(s.link_at(1, 0), None);
+    assert!(!s.rows[1][0].flags.contains(Flags::LINK));
+
+    // 8. History rows normalized via `history_rows()`
+    e.feed(b"\r\nline1\r\nline2\r\nline3\r\nline4", Feed::Live, &look);
+    let (_, hist) = e.history_rows(0, 10);
+    assert!(hist[0][9].flags.contains(Flags::LINK));
+    assert!(!hist[1][0].flags.contains(Flags::LINK));
+}

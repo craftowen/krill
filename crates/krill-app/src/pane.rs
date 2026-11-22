@@ -1891,7 +1891,8 @@ impl<W: Write> Pane<W> {
         }
         #[cfg(target_os = "macos")]
         let _work = crate::responsiveness::work("pane.refresh");
-        let s = self.history.compose(&self.view.screen);
+        let mut s = self.history.compose(&self.view.screen);
+        krill_proto::screen::normalize_screen_links(&mut s.rows, &mut s.links);
         let previous = std::mem::replace(&mut self.shown, Rc::new(s));
         self.search
             .refresh_screen_hit(&self.shown, self.view.revision);

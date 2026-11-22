@@ -1015,11 +1015,12 @@ impl Engine {
             let grid = self.term.grid();
             let from = start.saturating_sub(batch_start);
             let to = end.saturating_sub(batch_start).min(n);
-            for i in from..to {
-                if let Ok(k) = i32::try_from(n - i) {
-                    out.push(capture_row(&grid[Line(-k)], self.term.colors()).0);
-                }
-            }
+            let (mut rows, mut links): (Vec<_>, Vec<_>) = (from..to)
+                .filter_map(|i| i32::try_from(n - i).ok())
+                .map(|k| capture_row(&grid[Line(-k)], self.term.colors()))
+                .unzip();
+            krill_proto::screen::normalize_screen_links(&mut rows, &mut links);
+            out.extend(rows);
         }
         *at = batch_end;
         self.clear_history();
@@ -1047,11 +1048,12 @@ impl Engine {
         let grid = self.term.grid();
         let total = grid.history_size();
         let top = skip.saturating_add(count).min(total);
-        let rows = (skip.saturating_add(1)..=top)
+        let (mut rows, mut links): (Vec<_>, Vec<_>) = (skip.saturating_add(1)..=top)
             .rev()
             .filter_map(|k| i32::try_from(k).ok())
-            .map(|k| capture_row(&grid[Line(-k)], self.term.colors()).0)
-            .collect();
+            .map(|k| capture_row(&grid[Line(-k)], self.term.colors()))
+            .unzip();
+        krill_proto::screen::normalize_screen_links(&mut rows, &mut links);
         (total, rows)
     }
 
@@ -1111,9 +1113,10 @@ impl Engine {
         let point = grid.cursor.point;
         let line = u16::try_from(point.line.0).unwrap_or(0);
         let column = u16::try_from(point.column.0).unwrap_or(0);
-        let (rows, links) = (0..i32::from(lines))
+        let (mut rows, mut links): (Vec<_>, Vec<_>) = (0..i32::from(lines))
             .map(|l| capture_row(&grid[Line(l)], self.term.colors()))
             .unzip();
+        krill_proto::screen::normalize_screen_links(&mut rows, &mut links);
         let style = self.term.cursor_style();
         Screen {
             cols,

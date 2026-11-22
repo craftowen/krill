@@ -334,6 +334,105 @@ fn url_at_parses_plaintext_http_https_and_trims_punctuation() {
 }
 
 #[test]
+fn url_at_strips_trailing_delimiters_before_particles_and_suffixes() {
+    let cases = [
+        (
+            "새로고침(http://127.0.0.1:8787)하면",
+            12,
+            9,
+            21,
+            "http://127.0.0.1:8787",
+        ),
+        (
+            "새로고침(http://127.0.0.1:8787/)하면",
+            12,
+            9,
+            22,
+            "http://127.0.0.1:8787/",
+        ),
+        (
+            "참고(https://example.com/문서)하면",
+            10,
+            5,
+            24,
+            "https://example.com/문서",
+        ),
+        (
+            "[https://example.com/문서]에서",
+            5,
+            1,
+            24,
+            "https://example.com/문서",
+        ),
+        (
+            "(http://127.0.0.1:8787)foo",
+            5,
+            1,
+            21,
+            "http://127.0.0.1:8787",
+        ),
+        (
+            "(https://example.com/a/b)foo",
+            5,
+            1,
+            23,
+            "https://example.com/a/b",
+        ),
+        (
+            "http://127.0.0.1:8787(로컬)",
+            5,
+            0,
+            21,
+            "http://127.0.0.1:8787",
+        ),
+        (
+            "http://127.0.0.1:8787/dashboard(차트)",
+            5,
+            0,
+            31,
+            "http://127.0.0.1:8787/dashboard",
+        ),
+        (
+            "http://127.0.0.1:8787,http://127.0.0.1:8788",
+            5,
+            0,
+            21,
+            "http://127.0.0.1:8787",
+        ),
+        (
+            "http://127.0.0.1:8787,http://127.0.0.1:8788",
+            25,
+            22,
+            21,
+            "http://127.0.0.1:8788",
+        ),
+        (
+            "(https://en.wikipedia.org/wiki/Rust_(programming_language))하면",
+            10,
+            1,
+            57,
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+        ),
+        ("[http://[::1]:8787]하면", 5, 1, 17, "http://[::1]:8787"),
+    ];
+    for (text, hit_col, expected_col, expected_cols, expected_uri) in cases {
+        let r = row(text);
+        let link = url_at(&r, hit_col).unwrap_or_else(|| panic!("missing link for {text}"));
+        assert_eq!(
+            link,
+            UrlLink {
+                column: expected_col,
+                cols: expected_cols,
+                uri: expected_uri.into(),
+            },
+            "{text}"
+        );
+        let tail_col = expected_col + expected_cols;
+        assert_eq!(url_at(&r, tail_col), None, "tail should not match: {text}");
+    }
+}
+
+#[test]
 fn input_policy_native_home_lookup_uses_userprofile_on_windows() {
     const CHILD: &str = "KRILL_TEST_NATIVE_LINK_HOME";
     if let Some(home) = std::env::var_os(CHILD) {
