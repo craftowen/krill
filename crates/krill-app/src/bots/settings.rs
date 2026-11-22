@@ -24,6 +24,10 @@ use super::rpc::{
 use super::{View, clear_input_on_window, now_unix_ms, opt_input_composing};
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent UI flags of one settings view"
+)]
 pub(super) struct SettingsState {
     pub(super) synced_bot_id: Option<BotId>,
     pub(super) needs_sync_from_bot: bool,
@@ -48,9 +52,44 @@ pub(super) struct SettingsState {
     pub(super) saving: bool,
     /// The panel's settings list or one of its pages (Orca's settings view).
     pub(super) page: super::settings_root::SettingsPage,
+    /// Memory opens on History (from a tidy-up's review) instead of What it knows.
+    pub(super) memory_history_tab: bool,
+    /// The last tidy-up's review is open over Memory upkeep.
+    pub(super) tidy_review: bool,
+    /// The bot agent's own models (Agent and model), by agent.
+    pub(super) agent_models: Option<(String, krill_proto::bots::BotAgentModels)>,
+    pub(super) models_task: Option<gpui::Task<()>>,
+    pub(super) look_focus_input: Option<Entity<InputState>>,
+    pub(super) look_focus_sub: Option<gpui::Subscription>,
+    /// Soul's Read or Edit; `None` reads a soul with words and edits an empty one.
+    pub(super) soul_editing: Option<bool>,
+    pub(super) memory_add_input: Option<Entity<InputState>>,
+    pub(super) memory_add_sub: Option<gpui::Subscription>,
+    /// The History row opened to its lines.
+    pub(super) history_open: Option<String>,
+    /// Tools › Add a tool is open (Krill's catalog and custom server form).
+    pub(super) tools_adding: bool,
+    /// The topic file opened under Memory.
+    pub(super) topic_open: Option<String>,
+    /// Each bot's Items, Look around and Memory upkeep presets, as krilld last answered.
+    pub(super) extras: BTreeMap<BotId, krill_proto::bots::BotSettingsExtras>,
+    pub(super) extras_task: Option<gpui::Task<()>>,
 }
 
 impl SettingsState {
+    /// Back to the list, dropping the pages' per-bot fields.
+    pub(super) fn reset_pages(&mut self) {
+        self.page = super::settings_root::SettingsPage::Root;
+        self.memory_history_tab = false;
+        self.tidy_review = false;
+        self.look_focus_input = None;
+        self.look_focus_sub = None;
+        self.soul_editing = None;
+        self.history_open = None;
+        self.topic_open = None;
+        self.tools_adding = false;
+    }
+
     pub(super) fn sync_from_bot(&mut self, bot: &BotConfig) {
         self.synced_bot_id = Some(bot.id.clone());
         self.agent_id.clone_from(&bot.agent_id);
@@ -614,10 +653,11 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.mode == super::Mode::Panel
-            && self.settings.page == super::settings_root::SettingsPage::Root
-        {
-            return self.render_settings_root(bot, p, cx);
+        if self.mode == super::Mode::Panel {
+            if self.settings.page == super::settings_root::SettingsPage::Schedules {
+                self.ensure_settings_inputs(bot, window, cx);
+            }
+            return self.render_settings_subpage(bot, p, window, cx);
         }
         self.ensure_settings_inputs(bot, window, cx);
         let bot_id_save = bot.id.clone();

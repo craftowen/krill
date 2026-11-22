@@ -350,6 +350,101 @@ pub struct BotLookAroundConfig {
     pub focus: String,
 }
 
+/// Orca's Look around presets: local hours a look runs at; nothing runs at night.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LookAroundEvery {
+    #[default]
+    #[serde(rename = "every-4h")]
+    Every4h,
+    #[serde(rename = "every-2h")]
+    Every2h,
+    #[serde(rename = "twice-daily")]
+    TwiceDaily,
+    #[serde(rename = "mornings")]
+    Mornings,
+}
+
+impl LookAroundEvery {
+    /// Settings' order.
+    pub const ALL: [Self; 4] = [
+        Self::Every4h,
+        Self::Every2h,
+        Self::TwiceDaily,
+        Self::Mornings,
+    ];
+
+    /// Local hours each preset looks at.
+    #[must_use]
+    pub const fn hours(self) -> &'static [u32] {
+        match self {
+            Self::Every4h => &[8, 12, 16, 20],
+            Self::Every2h => &[8, 10, 12, 14, 16, 18, 20],
+            Self::TwiceDaily => &[8, 13],
+            Self::Mornings => &[8],
+        }
+    }
+}
+
+/// Orca's Memory upkeep presets: each night or once a week, after 3 AM local time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TidyEvery {
+    #[default]
+    Night,
+    Week,
+}
+
+/// Orca's "Mark items stale after": days an untouched item waits before Home moves it to Stale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BotItemsStale {
+    #[serde(rename = "3")]
+    Days3,
+    #[default]
+    #[serde(rename = "5")]
+    Days5,
+    #[serde(rename = "7")]
+    Days7,
+    #[serde(rename = "14")]
+    Days14,
+    #[serde(rename = "never")]
+    Never,
+}
+
+impl BotItemsStale {
+    /// Settings' order.
+    pub const ALL: [Self; 5] = [
+        Self::Days3,
+        Self::Days5,
+        Self::Days7,
+        Self::Days14,
+        Self::Never,
+    ];
+
+    /// The days, or `None` for Never.
+    #[must_use]
+    pub const fn days(self) -> Option<u64> {
+        match self {
+            Self::Days3 => Some(3),
+            Self::Days5 => Some(5),
+            Self::Days7 => Some(7),
+            Self::Days14 => Some(14),
+            Self::Never => None,
+        }
+    }
+}
+
+/// Settings Orca keeps on the bot that Krill's postcard `BotConfig` can't grow without breaking
+/// N-1 peers: they travel on their own RPC (`GetBotSettingsExtras`) and live in their own file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotSettingsExtras {
+    #[serde(default)]
+    pub items_stale: BotItemsStale,
+    #[serde(default)]
+    pub look_around_every: LookAroundEvery,
+    #[serde(default)]
+    pub tidy_every: TidyEvery,
+}
+
 impl Default for BotLookAroundConfig {
     fn default() -> Self {
         Self {

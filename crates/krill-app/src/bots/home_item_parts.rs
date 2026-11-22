@@ -226,7 +226,11 @@ impl View {
             .items
             .iter()
             .filter(|i| !filter_on || i.status == krill_proto::bots::BotItemStatus::NeedsYou);
-        grouped(shown, |i| self.item_live(i), now)
+        let stale_days = self.selected_bot_id.as_ref().map_or_else(
+            || krill_proto::bots::BotItemsStale::default().days(),
+            |id| self.settings_extras(id).items_stale.days(),
+        );
+        grouped(shown, |i| self.item_live(i), stale_days, now)
             .iter()
             .flat_map(|g| g.iter().map(|i| i.uid.clone()))
             .collect()

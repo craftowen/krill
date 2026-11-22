@@ -7749,11 +7749,16 @@ fn bot_page_right_sidebar_has_home_connectors_chats_and_files(cx: &mut TestAppCo
     // Orca's settings list: a row opens its page, Back climbs one level at a time.
     assert!(cx.debug_bounds("bot-settings-root").is_some());
     click(cx, "bot-settings-agent");
-    assert!(cx.debug_bounds("bots-tab-settings-body").is_some());
+    assert!(cx.debug_bounds("bot-settings-agent-page").is_some());
     click(cx, "bot-settings-back");
     assert!(cx.debug_bounds("bot-settings-root").is_some());
     click(cx, "bot-settings-soul");
-    assert!(cx.debug_bounds("bots-tab-soul-memory-body").is_some());
+    assert!(cx.debug_bounds("bot-settings-soul-page").is_some());
+    // The crumb's Settings goes back to the list too.
+    click(cx, "bot-settings-crumb-settings");
+    assert!(cx.debug_bounds("bot-settings-root").is_some());
+    click(cx, "bot-settings-memory");
+    assert!(cx.debug_bounds("bot-settings-memory-page").is_some());
     click(cx, "bot-settings-back");
     assert!(cx.debug_bounds("bot-settings-root").is_some());
     click(cx, "bot-settings-back");

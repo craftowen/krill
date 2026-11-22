@@ -22,12 +22,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use krill_proto::SessionId;
 use krill_proto::bots::{
     ActsFor, BOT_MEMORY_SEED, BotAccessRequest, BotAccessRequestStatus, BotAvatarData, BotConfig,
-    BotConnectorConfig, BotEventRuleConfig, BotGroupChat, BotId, BotMcpToolConfig, BotMember,
-    BotMemoryHistoryEntry, BotMemoryTopicInfo, BotPackageExportOptions, BotScheduleConfig, BotSlug,
-    BotSuggestion, CreateBotParams, CreateBotV2Params, DefaultTrackerBots, ExternalBotCandidate,
-    ExternalBotSourceApp, ExternalConversationLink, ExternalSource, FieldPatch,
-    MAX_AVATAR_PNG_BYTES, MAX_RPC_ZIP_BYTES, MemoryDeletionViolation, UpdateBotExtrasParams,
-    UpdateBotParams, append_memory_fact, assert_bot_owns_home, bot_slug_from_name, default_mascot,
+    BotConnectorConfig, BotEventRuleConfig, BotGroupChat, BotId, BotItemsStale, BotMcpToolConfig,
+    BotMember, BotMemoryHistoryEntry, BotMemoryTopicInfo, BotPackageExportOptions,
+    BotScheduleConfig, BotSettingsExtras, BotSlug, BotSuggestion, CreateBotParams,
+    CreateBotV2Params, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
+    ExternalConversationLink, ExternalSource, FieldPatch, LookAroundEvery, MAX_AVATAR_PNG_BYTES,
+    MAX_RPC_ZIP_BYTES, MemoryDeletionViolation, TidyEvery, UpdateBotExtrasParams, UpdateBotParams,
+    append_memory_fact, assert_bot_owns_home, bot_slug_from_name, default_mascot,
     discover_external_bots as proto_discover_external_bots, export_bot_home_zip, find_bot_mcp_app,
     find_bot_template, forget_memory_fact, import_bot_zip, init_bot_home, materialize_bot_skills,
     soul_description, strip_png_metadata, validate_bot_name, validate_bot_slug,
@@ -44,6 +45,8 @@ use crate::bots::secrets::ensure_no_symlink_path;
 use crate::session::lock;
 
 const BOTS_INDEX_FILE: &str = "bots.json";
+/// Settings Orca keeps on the bot that the wire `BotConfig` can't carry (see `BotSettingsExtras`).
+const SETTINGS_EXTRAS_FILE: &str = "bot-settings.json";
 const LINKS_FILE: &str = "links.json";
 const ACCESS_REQUESTS_FILE: &str = "access_requests.json";
 const ACCESS_META_FILE: &str = "access_meta.json";
@@ -1753,6 +1756,67 @@ impl BotStore {
         Ok((candidates, imported))
     }
 
+    /// The bot's Items, Look around and Memory upkeep presets; defaults until changed.
+    pub fn settings_extras(&self, bot_id: &BotId) -> io::Result<BotSettingsExtras> {
+        let _guard = lock(&self.io_lock);
+        let all: BTreeMap<String, BotSettingsExtras> =
+            self.read_json_or_default(SETTINGS_EXTRAS_FILE)?;
+        Ok(all.get(bot_id.as_str()).copied().unwrap_or_default())
+    }
+
+    /// Changes the presets that are `Some` and returns the bot's presets after it.
+    pub fn update_settings_extras(
+        &self,
+        bot_id: &BotId,
+        items_stale: Option<BotItemsStale>,
+        look_around_every: Option<LookAroundEvery>,
+        tidy_every: Option<TidyEvery>,
+    ) -> io::Result<BotSettingsExtras> {
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        if !bots.iter().any(|b| &b.id == bot_id) {
+            return Err(not_found_bot(bot_id));
+        }
+        let mut all: BTreeMap<String, BotSettingsExtras> =
+            self.read_json_or_default(SETTINGS_EXTRAS_FILE)?;
+        // Deleted bots' presets go with them.
+        all.retain(|id, _| bots.iter().any(|b| b.id.as_str() == id));
+        let extras = all.entry(bot_id.as_str().to_owned()).or_default();
+        if let Some(v) = items_stale {
+            extras.items_stale = v;
+        }
+        if let Some(v) = look_around_every {
+            extras.look_around_every = v;
+        }
+        if let Some(v) = tidy_every {
+            extras.tidy_every = v;
+        }
+        let out = *extras;
+        self.write_json(SETTINGS_EXTRAS_FILE, &all)?;
+        Ok(out)
+    }
+
+    /// Takes `member` off the bot's Who can ask; people join only by an approved request.
+    pub fn remove_member(
+        &self,
+        bot_id: &BotId,
+        member: &BotMember,
+        now_ms: u64,
+    ) -> io::Result<BotConfig> {
+        let _guard = lock(&self.io_lock);
+        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bot = bots
+            .iter_mut()
+            .find(|b| &b.id == bot_id)
+            .ok_or_else(|| not_found_bot(bot_id))?;
+        bot.members.retain(|m| m != member);
+        bot.updated_at_ms = now_ms;
+        let updated = bot.clone();
+        init_bot_home(&self.root, &updated, None)?;
+        self.write_json(BOTS_INDEX_FILE, &bots)?;
+        Ok(updated)
+    }
+
     // ---------- Internal JSON Helpers ----------
 
     /// `bots.json`, with a mascot for a bot saved without any picture (Orca never shows one
@@ -2257,6 +2321,66 @@ mod tests {
             listed[0].avatar.as_deref(),
             Some(default_mascot(created.id.as_str()))
         );
+    }
+
+    #[test]
+    fn settings_extras_persist_per_bot_and_members_only_leave() {
+        let root = temp_dir("extras");
+        let store = BotStore::new(root.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Helper".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.settings_extras(&bot.id).unwrap(),
+            BotSettingsExtras::default()
+        );
+        let after = store
+            .update_settings_extras(&bot.id, Some(BotItemsStale::Never), None, None)
+            .unwrap();
+        let after = store
+            .update_settings_extras(&bot.id, None, Some(LookAroundEvery::Mornings), None)
+            .unwrap_or(after);
+        assert_eq!(
+            after.items_stale,
+            BotItemsStale::Never,
+            "a later edit keeps it"
+        );
+        assert_eq!(after.look_around_every, LookAroundEvery::Mornings);
+        assert_eq!(store.settings_extras(&bot.id).unwrap(), after);
+        let ghost = BotId::new("ghost").unwrap();
+        assert!(
+            store
+                .update_settings_extras(&ghost, None, None, None)
+                .is_err()
+        );
+
+        let person = BotMember {
+            id: "U1".to_owned(),
+            name: "Ana".to_owned(),
+            source: ExternalSource::Slack,
+            workspace_id: None,
+        };
+        let mut bots: Vec<BotConfig> = store.read_json_or_default(BOTS_INDEX_FILE).unwrap();
+        bots[0].members.push(person.clone());
+        store.write_json(BOTS_INDEX_FILE, &bots).unwrap();
+        let updated = store.remove_member(&bot.id, &person, 2_000).unwrap();
+        assert!(updated.members.is_empty());
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

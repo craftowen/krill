@@ -19,11 +19,11 @@ use super::types::{
     BotAccessRequest, BotAvatarData, BotConfig, BotConnectorConfig, BotConnectorStatus,
     BotConnectorTestResult, BotEventRuleConfig, BotGroupChat, BotGroupMessage, BotGroupReplyMode,
     BotGroupView, BotId, BotItem, BotItemDecision, BotItemLink, BotItemStatus, BotItemsPage,
-    BotLookAroundConfig, BotMcpOAuthState, BotMcpToolConfig, BotMemoryHistoryEntry,
-    BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo, BotNotifications,
-    BotScheduleConfig, BotSessionSummary, BotSlug, BotSuggestion, BotToolRelayStatus,
-    ComposioConnectionInfo, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
-    ExternalSource,
+    BotItemsStale, BotLookAroundConfig, BotMcpOAuthState, BotMcpToolConfig, BotMember,
+    BotMemoryHistoryEntry, BotMemoryTidyConfig, BotMemoryTidyStatus, BotMemoryTopicInfo,
+    BotNotifications, BotScheduleConfig, BotSessionSummary, BotSettingsExtras, BotSlug,
+    BotSuggestion, BotToolRelayStatus, ComposioConnectionInfo, DefaultTrackerBots,
+    ExternalBotCandidate, ExternalBotSourceApp, ExternalSource, LookAroundEvery, TidyEvery,
 };
 
 /// Dedicated client-to-daemon frame kind for Krill Bots RPC.
@@ -555,6 +555,26 @@ pub enum BotRpcRequest {
         bot_id: BotId,
         schedule_id: String,
     },
+    /// Settings › Items, Look around and Memory upkeep presets (Orca's `itemsStale`, `every`).
+    GetBotSettingsExtras {
+        bot_id: BotId,
+    },
+    /// Changes only the fields that are `Some`; answers with the bot's extras after it.
+    UpdateBotSettingsExtras {
+        bot_id: BotId,
+        #[serde(default)]
+        items_stale: Option<BotItemsStale>,
+        #[serde(default)]
+        look_around_every: Option<LookAroundEvery>,
+        #[serde(default)]
+        tidy_every: Option<TidyEvery>,
+    },
+    /// Settings › Who can ask: takes one person off the bot; people join only by an approved
+    /// access request. Answers with the bot.
+    RemoveBotMember {
+        bot_id: BotId,
+        member: BotMember,
+    },
 }
 
 impl BotRpcRequest {
@@ -587,6 +607,7 @@ impl BotRpcRequest {
                 | Self::GetDefaultTrackerBots
                 | Self::ListAgentModels { .. }
                 | Self::GetBotUpcoming { .. }
+                | Self::GetBotSettingsExtras { .. }
         )
     }
 }
@@ -1040,6 +1061,27 @@ impl fmt::Debug for BotRpcRequest {
                 .field("bot_id", bot_id)
                 .field("schedule_id", schedule_id)
                 .finish(),
+            Self::GetBotSettingsExtras { bot_id } => f
+                .debug_struct("GetBotSettingsExtras")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::UpdateBotSettingsExtras {
+                bot_id,
+                items_stale,
+                look_around_every,
+                tidy_every,
+            } => f
+                .debug_struct("UpdateBotSettingsExtras")
+                .field("bot_id", bot_id)
+                .field("items_stale", items_stale)
+                .field("look_around_every", look_around_every)
+                .field("tidy_every", tidy_every)
+                .finish(),
+            Self::RemoveBotMember { bot_id, member } => f
+                .debug_struct("RemoveBotMember")
+                .field("bot_id", bot_id)
+                .field("member", &member.id)
+                .finish(),
         }
     }
 }
@@ -1181,6 +1223,7 @@ pub enum BotRpcResponse {
     DefaultTrackerBots(DefaultTrackerBots),
     AgentModels(BotAgentModels),
     Upcoming(BotUpcoming),
+    BotSettingsExtras(BotSettingsExtras),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1341,6 +1384,9 @@ impl fmt::Debug for BotRpcResponse {
             }
             Self::AgentModels(models) => f.debug_tuple("AgentModels").field(models).finish(),
             Self::Upcoming(up) => f.debug_tuple("Upcoming").field(up).finish(),
+            Self::BotSettingsExtras(extras) => {
+                f.debug_tuple("BotSettingsExtras").field(extras).finish()
+            }
         }
     }
 }

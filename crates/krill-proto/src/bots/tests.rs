@@ -1673,8 +1673,35 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
             false,
         ),
         (BotRpcRequest::GetDefaultTrackerBots, true),
+        (
+            BotRpcRequest::GetBotSettingsExtras {
+                bot_id: bot_id.clone(),
+            },
+            true,
+        ),
+        (
+            BotRpcRequest::UpdateBotSettingsExtras {
+                bot_id: bot_id.clone(),
+                items_stale: Some(BotItemsStale::Never),
+                look_around_every: Some(LookAroundEvery::Mornings),
+                tidy_every: None,
+            },
+            false,
+        ),
+        (
+            BotRpcRequest::RemoveBotMember {
+                bot_id: bot_id.clone(),
+                member: BotMember {
+                    id: "U1".to_owned(),
+                    name: "Ana".to_owned(),
+                    source: ExternalSource::Slack,
+                    workspace_id: Some("T1".to_owned()),
+                },
+            },
+            false,
+        ),
     ];
-    assert_eq!(v2_requests.len(), 44);
+    assert_eq!(v2_requests.len(), 47);
 
     for (req, expected_ro) in v2_requests {
         assert_eq!(
@@ -2356,4 +2383,28 @@ proptest::proptest! {
         proptest::prop_assert!(close.bytes().all(|b| b == b'>'));
         proptest::prop_assert!(!text.contains(close));
     }
+}
+
+/// Orca's presets travel on their own RPC, so `BotConfig` keeps its N-1 bytes; the answer
+/// round-trips and an absent preset reads as Orca's default.
+#[test]
+fn settings_extras_roundtrip_and_defaults() {
+    let extras = BotSettingsExtras {
+        items_stale: BotItemsStale::Days14,
+        look_around_every: LookAroundEvery::TwiceDaily,
+        tidy_every: TidyEvery::Week,
+    };
+    let resp = BotRpcResponse::BotSettingsExtras(extras);
+    let frame = resp.encode().unwrap();
+    let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(BotRpcResponse::decode(kind, &body).unwrap(), resp);
+    let empty: BotSettingsExtras = serde_json::from_str("{}").unwrap();
+    assert_eq!(empty.items_stale.days(), Some(5));
+    assert_eq!(empty.look_around_every.hours(), &[8, 12, 16, 20]);
+    assert_eq!(empty.tidy_every, TidyEvery::Night);
+    assert_eq!(BotItemsStale::Never.days(), None);
+    assert_eq!(
+        serde_json::to_string(&extras).unwrap(),
+        r#"{"items_stale":"14","look_around_every":"twice-daily","tidy_every":"week"}"#
+    );
 }
