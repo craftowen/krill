@@ -389,6 +389,9 @@ impl Shell {
             work_run::DisplayRow::ItemNote { note, .. } => {
                 Self::render_item_note(pane, row_ix, note, cx)
             }
+            work_run::DisplayRow::Notice { notice, .. } => {
+                Self::render_inbound_notice(pane, row_ix, notice, cx)
+            }
             work_run::DisplayRow::UnreadDivider { first_abs_idx } => {
                 let palette = ui::palette(cx);
                 div()
@@ -1949,6 +1952,108 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Orca's "Update from"/"Message from" row: the item note row's look with each sender as a
+    /// chip, and the mail's words under it.
+    fn render_inbound_notice(
+        pane: super::super::PaneId,
+        row_ix: usize,
+        notice: &work_run::InboundNotice,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        let (line, icon) = match notice.kind {
+            work_run::NoticeKind::Update => (ctext::NOTICE_UPDATE.get(), ui::icons::ACTIVITY_SVG),
+            work_run::NoticeKind::Message => {
+                (ctext::NOTICE_MESSAGE.get(), ui::icons::MESSAGE_SQUARE_SVG)
+            }
+        };
+        let (lead, tail) = line.split_once("{name}").unwrap_or((line, ""));
+        let chips = notice.from.iter().map(|name| {
+            div()
+                .debug_selector(|| "chat-notice-chip".into())
+                .flex_none()
+                .max_w(gpui::px(256.))
+                .min_w_0()
+                .px_1p5()
+                .rounded(ui::RADIUS_SM)
+                .bg(palette.foreground.opacity(0.07))
+                .text_size(ui::TEXT_XS)
+                .text_color(palette.foreground)
+                .child(div().min_w_0().truncate().child(name.clone()))
+        });
+        div()
+            .id(SharedString::from(format!(
+                "chat-notice-{}-{row_ix}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-notice".into())
+            .when(!notice.detail.is_empty(), gpui::Styled::pb_2)
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .min_h(gpui::px(24.))
+                    .flex()
+                    .items_start()
+                    .gap_1p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(muted)
+                    .child(
+                        div().flex_none().mt(gpui::px(4.)).child(
+                            gpui_component::Icon::default()
+                                .data(icon)
+                                .with_size(ui::ICON_MD)
+                                .text_color(muted),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .min_h(gpui::px(24.))
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_1()
+                                    .when(!lead.trim().is_empty(), |d| {
+                                        d.child(lead.trim().to_owned())
+                                    })
+                                    // The tail hugs the last chip so a Korean particle
+                                    // ("의 업데이트") reads as one word with the name.
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .child(div().flex().gap_1().children(chips))
+                                            .when(!tail.is_empty(), |d| {
+                                                d.child(tail.trim_end().to_owned())
+                                            }),
+                                    ),
+                            )
+                            .when(!notice.detail.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .min_w_0()
+                                        .text_color(palette.foreground)
+                                        .child(notice.detail.clone()),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Orca's bot item note row: a list mark, then the change with the item as a chip that
     /// opens the bot's items, and a comment's words after it.
     fn render_item_note(
@@ -2337,7 +2442,8 @@ impl Shell {
                                 .map(work_run::format_elapsed_secs),
                             work_run::DisplayRow::Item { .. }
                             | work_run::DisplayRow::UnreadDivider { .. }
-                            | work_run::DisplayRow::ItemNote { .. } => None,
+                            | work_run::DisplayRow::ItemNote { .. }
+                            | work_run::DisplayRow::Notice { .. } => None,
                         })
                     } else {
                         None

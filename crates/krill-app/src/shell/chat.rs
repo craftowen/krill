@@ -4608,6 +4608,13 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
                     .any(|sec| sec.text.to_lowercase().contains(query_lower))
         }),
         work_run::DisplayRow::UnreadDivider { .. } => false,
+        work_run::DisplayRow::Notice { notice, .. } => {
+            notice.detail.to_lowercase().contains(query_lower)
+                || notice
+                    .from
+                    .iter()
+                    .any(|f| f.to_lowercase().contains(query_lower))
+        }
         work_run::DisplayRow::ItemNote { note, .. } => {
             note.title.to_lowercase().contains(query_lower)
                 || note.detail.to_lowercase().contains(query_lower)

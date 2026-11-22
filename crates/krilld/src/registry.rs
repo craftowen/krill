@@ -4493,8 +4493,17 @@ impl Registry {
                 .as_deref()
                 .map(|id| format!(" --run {}", quote(id)))
                 .unwrap_or_default();
+            // Senders and types only (the chat draws them as cards); content stays in the mailbox.
+            let mut senders: Vec<String> = Vec::new();
+            for m in store.messages.iter().filter(|m| ids.contains(&m.id)) {
+                let sender = format!("{} ({})", quote(&m.from), m.msg_type.as_str());
+                if !senders.contains(&sender) {
+                    senders.push(sender);
+                }
+            }
             let pointer = format!(
-                "[Krill orchestration] Unread mail. Read with: krill orchestration check --to {}{} --unread --json",
+                "[Krill orchestration] Unread mail. From: {}. Read with: krill orchestration check --to {}{} --unread --json",
+                senders.join(", "),
                 quote(recipient),
                 run_flag
             );
@@ -6003,6 +6012,7 @@ mod orchestration_delivery_tests {
             1,
             "expected exactly one pointer in same Done epoch, got: {text:?}"
         );
+        assert!(text.contains("Unread mail. From: 'worker-1' (status). Read with:"));
         assert!(text.ends_with('\r'));
 
         // 3. After a new turn runs and finishes without acking the second message, the new Done

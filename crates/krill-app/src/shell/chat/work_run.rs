@@ -97,6 +97,16 @@ impl DisplayFeed {
                     }),
                     _ => Arc::clone(item),
                 };
+                if item.kind == ChatItemKind::User
+                    && let Some(notice) = parse_inbound_notice(&item.text)
+                {
+                    rows.push(DisplayRow::Notice {
+                        abs_idx,
+                        notice: Arc::new(notice),
+                    });
+                    rel_idx += 1;
+                    continue;
+                }
                 rows.push(DisplayRow::Item { abs_idx, item });
                 rel_idx += 1;
                 continue;
@@ -174,6 +184,11 @@ pub(super) enum DisplayRow {
     UnreadDivider {
         first_abs_idx: usize,
     },
+    /// Mail Krill delivered into the session, in place of its owner bubble.
+    Notice {
+        abs_idx: usize,
+        notice: Arc<InboundNotice>,
+    },
     /// A change to one of the bot's items, drawn before the transcript row at `anchor_abs_idx`.
     ItemNote {
         anchor_abs_idx: usize,
@@ -184,7 +199,7 @@ pub(super) enum DisplayRow {
 impl DisplayRow {
     pub(super) fn span(&self) -> RawSpan {
         match self {
-            Self::Item { abs_idx, .. } => RawSpan::single(*abs_idx),
+            Self::Item { abs_idx, .. } | Self::Notice { abs_idx, .. } => RawSpan::single(*abs_idx),
             Self::WorkRun(run) => run.span,
             Self::UnreadDivider { first_abs_idx } => RawSpan::single(*first_abs_idx),
             Self::ItemNote { anchor_abs_idx, .. } => RawSpan::single(*anchor_abs_idx),
@@ -220,6 +235,98 @@ pub(crate) struct ItemNote {
     pub status: krill_proto::bots::BotItemStatus,
     /// A comment's words.
     pub detail: String,
+}
+
+/// Whether a delivered notice is a report or something that wants an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    Update,
+    Message,
+}
+
+/// Mail Krill typed into a bot's session (worker reports, bot mail, external messages), drawn as
+/// an activity line naming its senders instead of an owner bubble.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InboundNotice {
+    pub kind: NoticeKind,
+    pub from: Vec<String>,
+    pub detail: String,
+}
+
+/// Parses the prompts krilld delivers (`registry.rs` idle mail pointer, `bots/runtime.rs` bot
+/// mail and external messages). `None` for anything else.
+pub(crate) fn parse_inbound_notice(text: &str) -> Option<InboundNotice> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix("[Krill orchestration] Unread mail.") {
+        let mut kind = NoticeKind::Update;
+        let mut from = Vec::new();
+        let mut list = rest
+            .trim_start()
+            .strip_prefix("From: ")
+            .and_then(|s| s.split_once(". Read with:"))
+            .map_or("", |(list, _)| list);
+        // `'<shell-quoted name>' (<type>)`, comma separated.
+        while let Some((name, after)) = list.strip_prefix('\'').and_then(|s| s.split_once("' (")) {
+            let Some((ty, after)) = after.split_once(')') else {
+                break;
+            };
+            if matches!(ty, "question" | "escalation" | "decision_gate") {
+                kind = NoticeKind::Message;
+            }
+            from.push(name.replace("'\\''", "'"));
+            list = after.strip_prefix(", ").unwrap_or_default();
+        }
+        if from.is_empty() {
+            // Pointers from daemons before senders were named.
+            from.push("Krill orchestration".to_owned());
+        }
+        return Some(InboundNotice {
+            kind,
+            from,
+            detail: String::new(),
+        });
+    }
+    if let Some(rest) = text.strip_prefix("[Krill bot mail from ") {
+        let (from, rest) = rest.split_once("] Subject: ")?;
+        let (subject, body) = rest.split_once('\n').unwrap_or((rest, ""));
+        let detail = [subject.trim(), body.trim()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(InboundNotice {
+            kind: NoticeKind::Message,
+            from: vec![from.to_owned()],
+            detail,
+        });
+    }
+    let rest = text.strip_prefix("[Krill external message via ")?;
+    let (head, body) = rest.split_once("]\n")?;
+    let source = head.split(" | ").next().unwrap_or_default();
+    let sender = head
+        .split_once(" | from: ")
+        .map_or("", |(_, s)| s)
+        .rsplit_once(" (")
+        .map_or("", |(name, _)| name);
+    // Drop the `<<<` / `>>>` fences around the quoted text.
+    let mut lines: Vec<&str> = body.lines().collect();
+    if lines
+        .first()
+        .is_some_and(|l| l.len() >= 3 && l.bytes().all(|b| b == b'<'))
+    {
+        lines.remove(0);
+    }
+    if let Some(end) = lines
+        .iter()
+        .rposition(|l| l.len() >= 3 && l.bytes().all(|b| b == b'>'))
+    {
+        lines.remove(end);
+    }
+    Some(InboundNotice {
+        kind: NoticeKind::Message,
+        from: vec![format!("{sender} ({source})")],
+        detail: lines.join("\n").trim().to_owned(),
+    })
 }
 
 fn interleave_notes(
