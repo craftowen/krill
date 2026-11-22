@@ -2910,3 +2910,160 @@ fn settings_roundtrip_preserves_new_bot_nudge_and_avatar_agent() {
     assert!(back.bot_import_nudge_dismissed);
     assert_eq!(back.avatar_generation_agent.as_deref(), Some("codex"));
 }
+
+#[test]
+fn agy_effort_options_and_alias_helpers_cover_all_cli_levels() {
+    use super::rpc::{effort_label, effort_options_for_runtime, runtime_display_label};
+
+    let agy_efforts = effort_options_for_runtime("agy");
+    assert_eq!(agy_efforts, &["", "low", "medium", "high", "xhigh", "max"]);
+    assert_eq!(effort_options_for_runtime("antigravity"), agy_efforts);
+    assert_eq!(
+        runtime_display_label("antigravity"),
+        runtime_display_label("agy")
+    );
+    for level in ["", "low", "medium", "high", "xhigh", "max"] {
+        assert!(!effort_label(level).is_empty(), "missing label for {level}");
+    }
+    let (_, builtin_efforts) = crate::agent_models::builtin("agy");
+    assert_eq!(builtin_efforts, &["low", "medium", "high", "xhigh", "max"]);
+}
+
+#[gpui::test]
+fn new_bot_picker_supports_agy_effort_and_clears_effort_on_suffixed_model(cx: &mut TestAppContext) {
+    use super::new_bot::{HostChoice, NewBot};
+    use crate::hosts::HostId;
+
+    let state = Arc::new(Mutex::new(MockState::default()));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state);
+    let (dialog, vcx) = cx.add_window_view(|window, cx| {
+        NewBot::new(
+            vec![HostChoice {
+                id: HostId::Local,
+                label: "My Mac".into(),
+                rpc,
+            }],
+            Vec::new(),
+            None,
+            window,
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_runtime("agy", cx);
+            assert!(
+                d.setup().supports_effort(),
+                "agy must support effort in picker"
+            );
+            d.set_effort(Some("xhigh".to_owned()), cx);
+            assert_eq!(d.setup().effort.as_deref(), Some("xhigh"));
+            d.set_model(Some("gemini-3.8-flash-low".to_owned()), cx);
+            assert_eq!(d.setup().model.as_deref(), Some("gemini-3.8-flash-low"));
+            assert_eq!(
+                d.setup().effort,
+                None,
+                "selecting an effort-suffixed agy model must clear separate effort"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn switching_bot_provider_in_settings_refreshes_models_and_clears_old_sessions(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::bots::{BotAgentModel, BotAgentModels};
+
+    let mut mock = MockState::default();
+    let mut bot = sample_bot("switch-bot", "Switch Bot");
+    bot.agent_id = "claude".to_owned();
+    bot.model = Some("opus".to_owned());
+    bot.effort = Some("high".to_owned());
+    let bot_id = bot.id.clone();
+    mock.bots.push(bot);
+    mock.sessions.push(BotSessionSummary {
+        session_id: SessionId(55),
+        bot_id: bot_id.clone(),
+        link_id: None,
+        pid: 1234,
+        live: true,
+        working: false,
+        label: "Switch Bot".to_owned(),
+        created_at_ms: 1_000,
+    });
+    mock.agent_models.insert(
+        "agy".to_owned(),
+        BotAgentModels {
+            models: vec![
+                BotAgentModel {
+                    id: "gemini-3.8-flash-low".to_owned(),
+                    label: "Gemini 3.8 Flash (Low)".to_owned(),
+                },
+                BotAgentModel {
+                    id: "gemini-4-neon-high".to_owned(),
+                    label: "Gemini 4 Neon (High)".to_owned(),
+                },
+            ],
+            reason: None,
+        },
+    );
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+
+    let sessions_emitted = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let emitted_ref = sessions_emitted.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, ev: &super::SessionsChanged, _| {
+            emitted_ref.lock().unwrap().push(ev.sessions.len());
+        })
+        .detach();
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&bot_id, DetailTab::Settings, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let params = krill_proto::bots::UpdateBotParams {
+        agent_id: Some("agy".to_owned()),
+        model: krill_proto::bots::FieldPatch::Clear,
+        effort: krill_proto::bots::FieldPatch::Clear,
+        ..super::settings_root::patch(&state.lock().unwrap().bots[0])
+    };
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.patch_bot(params, cx));
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        let updated = v.selected_bot().unwrap();
+        assert_eq!(updated.agent_id, "agy");
+        assert_eq!(updated.model, None);
+        assert_eq!(updated.effort, None);
+        assert!(
+            v.sessions_for_bot(&bot_id).is_empty(),
+            "old provider sessions must be dropped from view state"
+        );
+        let (agent, models) = v.settings.agent_models.as_ref().expect("agy models loaded");
+        assert_eq!(agent, "agy");
+        assert_eq!(models.models.len(), 2);
+        assert_eq!(models.models[0].id, "gemini-3.8-flash-low");
+    });
+    assert!(
+        sessions_emitted.lock().unwrap().contains(&0),
+        "SessionsChanged must emit cleared session map"
+    );
+}

@@ -19,7 +19,8 @@ use crate::ui;
 
 use super::avatar;
 use super::rpc::{
-    BOT_EFFORT_OPTIONS, BOT_RUNTIMES, call_checked, decode_png_avatar, effort_label, expect_variant,
+    BOT_RUNTIMES, call_checked, decode_png_avatar, effort_label, effort_options_for_runtime,
+    expect_variant,
 };
 use super::{View, clear_input_on_window, now_unix_ms, opt_input_composing};
 
@@ -58,6 +59,7 @@ pub(super) struct SettingsState {
     pub(super) tidy_review: bool,
     /// The bot agent's own models (Agent and model), by agent.
     pub(super) agent_models: Option<(String, krill_proto::bots::BotAgentModels)>,
+    pub(super) models_loading_for: Option<String>,
     pub(super) models_task: Option<gpui::Task<()>>,
     pub(super) look_focus_input: Option<Entity<InputState>>,
     pub(super) look_focus_sub: Option<gpui::Subscription>,
@@ -92,7 +94,7 @@ impl SettingsState {
 
     pub(super) fn sync_from_bot(&mut self, bot: &BotConfig) {
         self.synced_bot_id = Some(bot.id.clone());
-        self.agent_id.clone_from(&bot.agent_id);
+        krill_proto::agent::canonical_id(&bot.agent_id).clone_into(&mut self.agent_id);
         self.effort = bot.effort.clone().unwrap_or_default();
         self.permission_mode = bot.permission_mode;
         self.avatar_color = bot
@@ -472,6 +474,11 @@ impl View {
         };
 
         let rpc = self.rpc.clone();
+        let prev_agent = self
+            .bots
+            .iter()
+            .find(|b| b.id == params.bot_id)
+            .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
         self.settings.saving = true;
         self.error = None;
         self.notice = None;
@@ -495,8 +502,18 @@ impl View {
                 this.settings.saving = false;
                 match res {
                     Ok(Some(updated)) => {
+                        let provider_changed = prev_agent.as_deref().is_some_and(|prev| {
+                            prev != krill_proto::agent::canonical_id(&updated.agent_id)
+                        });
                         this.settings.sync_from_bot(&updated);
+                        if provider_changed {
+                            this.settings.agent_models = None;
+                            this.settings.models_loading_for = None;
+                            this.settings.models_task = None;
+                            this.bot_sessions.retain(|s| s.bot_id != updated.id);
+                        }
                         this.upsert_bot_config(updated);
+                        this.emit_badge(cx);
                         this.emit_sessions_changed(cx);
                         this.notice = Some(SharedString::from(text::SAVED.get()));
                     }
@@ -666,8 +683,9 @@ impl View {
         let bot_id_sched_add = bot.id.clone();
 
         let mut runtime_pills = div().flex().flex_wrap().items_center().gap_1p5();
+        let active_runtime = krill_proto::agent::canonical_id(&self.settings.agent_id);
         for rt in BOT_RUNTIMES {
-            let is_active = self.settings.agent_id == rt.id;
+            let is_active = active_runtime == rt.id;
             runtime_pills = runtime_pills.child(
                 ui::segment(
                     p,
@@ -675,31 +693,43 @@ impl View {
                     rt.label(),
                     is_active,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    rt.id.clone_into(&mut this.settings.agent_id);
-                    cx.notify();
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if krill_proto::agent::canonical_id(&this.settings.agent_id) != rt.id {
+                        rt.id.clone_into(&mut this.settings.agent_id);
+                        this.settings.effort.clear();
+                        this.settings.agent_models = None;
+                        this.settings.models_loading_for = None;
+                        this.settings.models_task = None;
+                        if let Some(input) = &this.settings.model_input {
+                            input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+                        }
+                        cx.notify();
+                    }
                 })),
             );
         }
 
         let effort_pills = ui::segmented_control(
             p,
-            BOT_EFFORT_OPTIONS.into_iter().map(|eff| {
-                let id = format!(
-                    "bots-settings-effort-{}",
-                    if eff.is_empty() { "default" } else { eff }
-                );
-                ui::segment(
-                    p,
-                    SharedString::from(id),
-                    effort_label(eff),
-                    self.settings.effort == eff,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    eff.clone_into(&mut this.settings.effort);
-                    cx.notify();
-                }))
-            }),
+            effort_options_for_runtime(&self.settings.agent_id)
+                .iter()
+                .copied()
+                .map(|eff| {
+                    let id = format!(
+                        "bots-settings-effort-{}",
+                        if eff.is_empty() { "default" } else { eff }
+                    );
+                    ui::segment(
+                        p,
+                        SharedString::from(id),
+                        effort_label(eff),
+                        self.settings.effort == eff,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        eff.clone_into(&mut this.settings.effort);
+                        cx.notify();
+                    }))
+                }),
         );
 
         let perm_pills = ui::segmented_control(

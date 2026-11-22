@@ -778,6 +778,32 @@ enum Action {
     },
     #[serde(rename = "bots.templates")]
     BotsTemplates {},
+    #[serde(rename = "bots.models")]
+    BotsModels {
+        agent_id: String,
+    },
+    #[serde(rename = "bots.update")]
+    BotsUpdate {
+        bot_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        clear_model: bool,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        clear_effort: bool,
+        #[serde(default)]
+        permission_mode: Option<krill_proto::agent::Permission>,
+        #[serde(default)]
+        paused: Option<bool>,
+    },
     #[serde(rename = "bots.create")]
     BotsCreate {
         name: String,
@@ -1559,7 +1585,8 @@ impl Backend {
                 })?)
             }
             Action::Handoff { session, agent } => {
-                if !["codex", "claude"].contains(&agent.as_str()) {
+                let agent = krill_proto::agent::canonical_id(&agent);
+                if !["codex", "claude", "agy"].contains(&agent) {
                     return Err(invalid());
                 }
                 let cwd = self.cwd(session)?;
@@ -1574,7 +1601,7 @@ impl Backend {
                         "--from",
                         &session.to_string(),
                         "--to-agent",
-                        &agent,
+                        agent,
                         "--lines",
                         "3",
                         "--json",
@@ -1699,6 +1726,85 @@ impl Backend {
                     })
                     .collect();
                 Ok(json!({"templates": templates}))
+            }
+            Action::BotsModels { agent_id } => {
+                let agent_id = validate_bot_token(&agent_id, 64)?;
+                let canon = krill_proto::agent::canonical_id(&agent_id).to_owned();
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListAgentModels {
+                    agent_id: canon,
+                })? {
+                    krill_proto::bots::BotRpcResponse::AgentModels(found) => Ok(to_value(found)?),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsUpdate {
+                bot_id,
+                name,
+                description,
+                agent_id,
+                model,
+                clear_model,
+                effort,
+                clear_effort,
+                permission_mode,
+                paused,
+            } => {
+                self.ensure_bots_active()?;
+                let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
+                let name = name
+                    .map(|n| krill_proto::bots::validate_bot_name(&n).map_err(|_| invalid()))
+                    .transpose()?;
+                let description = validate_opt_bot_text(
+                    description.as_deref(),
+                    krill_proto::bots::BOT_DESCRIPTION_MAX_BYTES,
+                    true,
+                    true,
+                )?;
+                let agent_id = validate_opt_bot_token(agent_id.as_deref(), 64)?
+                    .map(|a| krill_proto::agent::canonical_id(&a).to_owned());
+                let model = if clear_model {
+                    krill_proto::bots::FieldPatch::Clear
+                } else {
+                    match validate_opt_bot_token(model.as_deref(), 128)? {
+                        Some(m) => krill_proto::bots::FieldPatch::Set(m),
+                        None => krill_proto::bots::FieldPatch::Unchanged,
+                    }
+                };
+                let effort = if clear_effort {
+                    krill_proto::bots::FieldPatch::Clear
+                } else {
+                    match validate_opt_bot_token(effort.as_deref(), 64)? {
+                        Some(e) => krill_proto::bots::FieldPatch::Set(e),
+                        None => krill_proto::bots::FieldPatch::Unchanged,
+                    }
+                };
+                let params = krill_proto::bots::UpdateBotParams {
+                    bot_id,
+                    name,
+                    description,
+                    emoji: krill_proto::bots::FieldPatch::Unchanged,
+                    avatar: krill_proto::bots::FieldPatch::Unchanged,
+                    agent_id,
+                    model,
+                    effort,
+                    permission_mode,
+                    workspace: krill_proto::bots::FieldPatch::Unchanged,
+                    paused,
+                    first_run_completed: None,
+                    notifications: None,
+                    schedules: None,
+                    look_around: None,
+                    memory_tidy: None,
+                    mcp_tools: None,
+                };
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::UpdateBot(Box::new(
+                    params,
+                )))? {
+                    krill_proto::bots::BotRpcResponse::Bot(bot) => {
+                        Ok(json!({"bot": to_value(*bot)?}))
+                    }
+                    _ => Err(invalid()),
+                }
             }
             Action::BotsCreate {
                 name,
@@ -7051,6 +7157,9 @@ mod revision_tests {
         // Verify serde parsing of all new v2 Action variants.
         for payload in [
             r#"{"action":"bots.create","name":"Triage","agent_id":"claude","slug":"triage","skills":["rust"]}"#,
+            r#"{"action":"bots.models","agent_id":"antigravity"}"#,
+            r#"{"action":"bots.update","bot_id":"b1","agent_id":"antigravity","model":"gemini-3.8-flash-low","clear_effort":true}"#,
+            r#"{"action":"handoff","session":1,"agent":"antigravity"}"#,
             r#"{"action":"bots.chat.open","bot_id":"b1","prompt":"check inbox"}"#,
             r#"{"action":"bots.items","limit":25,"cursor":"10","include_snoozed":true}"#,
             r#"{"action":"bots.item.answer","item_id":"item-1","option_index":0,"answer_text":"Go"}"#,

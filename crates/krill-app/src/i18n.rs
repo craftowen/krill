@@ -1015,6 +1015,8 @@ catalog! {
         EFFORT_LOW => ("낮음", "Low"),
         EFFORT_MEDIUM => ("중간", "Medium"),
         EFFORT_HIGH => ("높음", "High"),
+        EFFORT_XHIGH => ("매우 높음", "Extra high"),
+        EFFORT_MAX => ("최대", "Max"),
         FIELD_PERMISSION => ("권한 모드", "Permission mode"),
         PERMISSION_MANUAL => ("수동 승인 (Manual)", "Manual"),
         PERMISSION_YOLO => ("자동 실행 (Yolo)", "Yolo"),

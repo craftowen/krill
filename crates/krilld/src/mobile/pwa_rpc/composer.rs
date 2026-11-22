@@ -222,6 +222,10 @@ pub(crate) fn prewarm_agy_launch(home: &Path, config: Option<PathBuf>) {
     agy::prewarm_path(home, config);
 }
 
+pub(crate) fn agy_composer_ready(screen: &krill_proto::screen::Screen) -> bool {
+    agy::composer_ready(screen)
+}
+
 /// Models a new bot can launch `agent` with, read from the same catalog the chat composer shows.
 /// Waits like an explicit composer read does, so a cold Antigravity list is fetched, not skipped.
 pub(crate) fn launch_models(home: &Path, agents: &Agents, agent: &str) -> BotAgentModels {

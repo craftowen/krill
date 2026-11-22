@@ -209,7 +209,7 @@ impl BotStore {
         let agent_id = if base.agent_id.trim().is_empty() {
             "claude".to_owned()
         } else {
-            base.agent_id.trim().to_owned()
+            krill_proto::agent::canonical_id(base.agent_id.trim()).to_owned()
         };
 
         let mut cfg = BotConfig::new(id, &name, &agent_id, now_ms)
@@ -519,8 +519,21 @@ impl BotStore {
         }
         params.emoji.apply(&mut bot.emoji);
         params.avatar.apply(&mut bot.avatar);
+        let mut agent_changed = false;
         if let Some(agent_id) = params.agent_id {
-            agent_id.trim().clone_into(&mut bot.agent_id);
+            let next = krill_proto::agent::canonical_id(agent_id.trim());
+            let prev = krill_proto::agent::canonical_id(&bot.agent_id);
+            agent_changed = !next.is_empty() && next != prev;
+            next.clone_into(&mut bot.agent_id);
+        }
+        if agent_changed {
+            // Clear stale provider-specific model/effort unless the caller explicitly sets new ones.
+            if matches!(params.model, FieldPatch::Unchanged) {
+                bot.model = None;
+            }
+            if matches!(params.effort, FieldPatch::Unchanged) {
+                bot.effort = None;
+            }
         }
         params.model.apply(&mut bot.model);
         params.effort.apply(&mut bot.effort);
@@ -1121,6 +1134,25 @@ impl BotStore {
         Ok(Some(updated))
     }
 
+    /// Clears live session bindings on all external links owned by `bot_id` (e.g. after switching
+    /// the bot's main agent/provider so incoming messages launch a fresh session on the new runtime).
+    pub fn unbind_bot_links(&self, bot_id: &BotId, now_ms: u64) -> io::Result<usize> {
+        let _guard = lock(&self.io_lock);
+        let mut links: Vec<ExternalConversationLink> = self.read_json_or_default(LINKS_FILE)?;
+        let mut cleared = 0_usize;
+        for link in &mut links {
+            if &link.bot_id == bot_id && link.session_id.is_some() {
+                link.session_id = None;
+                link.updated_at_ms = now_ms;
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            self.write_json(LINKS_FILE, &links)?;
+        }
+        Ok(cleared)
+    }
+
     /// Finds the most recently active link for `bot_id`.
     pub fn latest_link_for_bot(
         &self,
@@ -1615,11 +1647,11 @@ impl BotStore {
             allocate_unique_slug(&bots, &base_slug)?
         };
         let id = allocate_unique_id(&bots, slug.as_str())?;
-        let agent_id = agent_override
+        let raw_agent_id = agent_override
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(&pkg.manifest.agent_id)
-            .to_owned();
+            .unwrap_or(&pkg.manifest.agent_id);
+        let agent_id = krill_proto::agent::canonical_id(raw_agent_id.trim()).to_owned();
 
         let mut cfg = BotConfig::new(id, &final_name, &agent_id, now_ms)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
@@ -1877,20 +1909,16 @@ impl BotStore {
             .and_then(|raw| BotId::new(raw).ok())
             .filter(|bid| !bots.iter().any(|b| &b.id == bid))
             .map_or_else(|| allocate_unique_id(bots, slug.as_str()), Ok)?;
-        let agent_id = params
+        let raw_agent = params
             .as_ref()
             .map(|p| p.base.agent_id.trim())
             .filter(|a| !a.is_empty())
-            .map_or_else(
-                || {
-                    if cand.agent.trim().is_empty() {
-                        "claude".to_owned()
-                    } else {
-                        cand.agent.trim().to_owned()
-                    }
-                },
-                str::to_owned,
-            );
+            .unwrap_or_else(|| cand.agent.trim());
+        let agent_id = if raw_agent.is_empty() {
+            "claude".to_owned()
+        } else {
+            krill_proto::agent::canonical_id(raw_agent).to_owned()
+        };
 
         let mut cfg = BotConfig::new(id, &clean_name, &agent_id, now_ms)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
@@ -3002,5 +3030,76 @@ mod tests {
         crc_buf.extend_from_slice(data);
         let crc = krill_proto::bots::crc32(&crc_buf);
         out.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    #[test]
+    fn canonicalizes_antigravity_agent_alias_on_create_update_and_import() {
+        let root = std::env::temp_dir().join(format!("krilld-agy-canon-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let store = BotStore::new(root.clone());
+
+        let created = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Agy Alias".to_owned(),
+                    agent_id: "Antigravity".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: Some("xhigh".to_owned()),
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(created.agent_id, "agy");
+        assert_eq!(created.effort.as_deref(), Some("xhigh"));
+
+        let updated = store
+            .update_bot(
+                UpdateBotParams {
+                    bot_id: created.id.clone(),
+                    name: None,
+                    description: None,
+                    emoji: FieldPatch::Unchanged,
+                    avatar: FieldPatch::Unchanged,
+                    agent_id: Some("antigravity".to_owned()),
+                    model: FieldPatch::Unchanged,
+                    effort: FieldPatch::Unchanged,
+                    permission_mode: None,
+                    workspace: FieldPatch::Unchanged,
+                    paused: None,
+                    first_run_completed: None,
+                    notifications: None,
+                    schedules: None,
+                    look_around: None,
+                    memory_tidy: None,
+                    mcp_tools: None,
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(updated.agent_id, "agy");
+
+        let (_, zip) = store
+            .export_bot_zip(&created.id, BotPackageExportOptions::default())
+            .unwrap();
+        let imported = store
+            .import_bot_zip_v2(
+                &zip,
+                Some("agy-alias-copy"),
+                Some("Agy Alias Copy"),
+                Some("antigravity"),
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(imported.agent_id, "agy");
+
+        fs::remove_dir_all(&root).ok();
     }
 }

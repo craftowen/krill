@@ -1041,6 +1041,11 @@
     "No desktops paired yet.": "연결된 데스크톱이 없습니다.",
     "Switch desktop": "기기 전환",
     Desktop: "기기",
+    "Change this bot's provider, model, or effort.": "이 봇의 프로바이더, 모델 또는 사고 수준을 변경합니다.",
+    Model: "모델",
+    Default: "기본",
+    Save: "저장",
+    Saved: "저장됨",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;

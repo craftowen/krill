@@ -190,6 +190,34 @@ fn both_footer_layouts_and_standalone_orchestrator_models_parse() {
         bare("Orchestrator (Neon)"),
         "right-aligned standalone model with known catalog"
     );
+    assert_eq!(
+        footer_with(
+            &idle("? for shortcuts    auto  · Gemini 3.8 Flash · low"),
+            Some(&families)
+        ),
+        pair("Gemini 3.8 Flash", "low"),
+        "default footer without custom statusLine"
+    );
+    assert_eq!(
+        footer_with(
+            &idle("esc to cancel    auto  · Gemini 4 Argon · xhigh"),
+            Some(&families)
+        ),
+        pair("Gemini 4 Argon", "xhigh"),
+        "active generation footer without custom statusLine"
+    );
+    assert_eq!(
+        footer_with(
+            &idle("? for shortcuts    auto  · Orchestrator (Neon)"),
+            Some(&families)
+        ),
+        bare("Orchestrator (Neon)"),
+        "default footer with standalone orchestrator"
+    );
+    assert!(composer_ready(&idle(
+        "? for shortcuts    auto  · Gemini 3.8 Flash · low"
+    )));
+    assert!(!composer_ready(&screen(&["Signing in..."], (0, 13))));
     for other in [
         "  ↑/↓ Navigate · enter Select",
         "assistant text (not an effort)",

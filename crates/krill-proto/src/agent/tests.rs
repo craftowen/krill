@@ -295,12 +295,91 @@ fn launch_overrides_encode_decode_and_apply_across_providers() {
         ]
     );
 
+    // Antigravity (`agy` / `antigravity`): supports --effort (low..max) and resolves suffix conflicts.
+    let mut agy_family = agents.profiles["agy"].clone();
+    apply_launch_overrides(
+        "antigravity",
+        &mut agy_family,
+        &LaunchOverrides {
+            model: Some("gemini-4-neon".to_owned()),
+            effort: Some("xhigh".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        agy_family.argv(Permission::Yolo),
+        [
+            "agy",
+            "--model",
+            "gemini-4-neon",
+            "--effort",
+            "xhigh",
+            "--dangerously-skip-permissions",
+        ]
+    );
+
+    // Matching suffix omits redundant --effort.
+    let mut agy_same = agents.profiles["agy"].clone();
+    apply_launch_overrides(
+        "agy",
+        &mut agy_same,
+        &LaunchOverrides {
+            model: Some("gemini-3.8-flash-low".to_owned()),
+            effort: Some("low".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        agy_same.argv(Permission::Yolo),
+        [
+            "agy",
+            "--model",
+            "gemini-3.8-flash-low",
+            "--dangerously-skip-permissions",
+        ]
+    );
+
+    // Conflicting suffix strips old suffix to family + requested --effort.
+    let mut agy_conflict = agents.profiles["agy"].clone();
+    apply_launch_overrides(
+        "agy",
+        &mut agy_conflict,
+        &LaunchOverrides {
+            model: Some("gemini-3.8-flash-high".to_owned()),
+            effort: Some("low".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        agy_conflict.argv(Permission::Yolo),
+        [
+            "agy",
+            "--model",
+            "gemini-3.8-flash",
+            "--effort",
+            "low",
+            "--dangerously-skip-permissions",
+        ]
+    );
+
     // Unsupported effort or conflicting flags are rejected.
     let agy_profile = &agents.profiles["agy"];
     assert!(
         validate_launch_overrides(
             "agy",
             agy_profile,
+            &LaunchOverrides {
+                model: None,
+                effort: Some("minimal".to_owned()),
+            }
+        )
+        .is_err()
+    );
+    let cursor_profile = &agents.profiles["cursor"];
+    assert!(
+        validate_launch_overrides(
+            "cursor",
+            cursor_profile,
             &LaunchOverrides {
                 model: None,
                 effort: Some("high".to_owned()),

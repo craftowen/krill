@@ -12,7 +12,6 @@ pub struct BuiltinModel {
 
 const LMH: &[&str] = &["low", "medium", "high"];
 const LMHX: &[&str] = &["low", "medium", "high", "xhigh"];
-const LMHM: &[&str] = &["low", "medium", "high", "max"];
 const LMHXM: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 const fn model(
@@ -57,7 +56,7 @@ const CODEX: &[BuiltinModel] = &[
 pub fn builtin(agent: &str) -> (&'static [BuiltinModel], &'static [&'static str]) {
     match agent.to_ascii_lowercase().as_str() {
         "codex" => (CODEX, LMHX),
-        "gemini" | "agy" | "antigravity" => (&[], LMHM),
+        "gemini" | "agy" | "antigravity" => (&[], LMHXM),
         _ => (CLAUDE, LMHXM),
     }
 }

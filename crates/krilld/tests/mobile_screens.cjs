@@ -978,10 +978,28 @@ async function botsScreens(){
    if(req.action==='bots.memory.get')return {bot_id:'b1',content:'- Fact'};
    if(req.action==='bots.memory.update')return {content:'- Fact\n- More',restored_facts:[]};
    if(req.action==='bots.look_around')return {suggestions:[]};
+   if(req.action==='bots.models')return {models:req.agent_id==='agy'?[{id:'gemini-3.8-flash-low',label:'Gemini 3.8 Flash (Low)'}]:[{id:'opus',label:'Opus'}]};
+   if(req.action==='bots.update'){botsData[0]={...botsData[0],agent_id:req.agent_id||botsData[0].agent_id,model:req.clear_model?null:(req.model??botsData[0].model),effort:req.clear_effort?null:(req.effort??botsData[0].effort)};return {bot:botsData[0]};}
    return {};
   }
  });
  await df.flush();
+ await df.byText('Agent').action();
+ assert.equal(df.sheets.at(-1)[0],'Agent');
+ const agentBody=df.ctx.el('div');
+ df.sheets.at(-1)[3](agentBody);
+ await df.flush();
+ const selects=agentBody.querySelectorAll('select');
+ assert.equal(selects.length,3);
+ selects[0].value='agy';
+ emit(selects[0],'change');
+ await df.flush();
+ assert(df.calls.some(c=>c.action==='bots.models'&&c.agent_id==='agy'));
+ selects[1].value='gemini-3.8-flash-low';
+ const saveBtn=agentBody.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Save');
+ await saveBtn.action();
+ await df.flush();
+ assert(df.calls.some(c=>c.action==='bots.update'&&c.bot_id==='b1'&&c.agent_id==='agy'&&c.model==='gemini-3.8-flash-low'));
  await df.byText('Look Around').action();
  assert(df.calls.some(c=>c.action==='bots.look_around'&&c.bot_id==='b1'));
  const replyBox=df.find('.bot-reply-card').querySelector('textarea');

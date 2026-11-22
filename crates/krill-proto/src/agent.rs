@@ -689,6 +689,22 @@ fn has_effort_flag_in_args(args: &[String]) -> bool {
     false
 }
 
+/// Splits a trailing Antigravity effort suffix (`-low`, `-medium`, `-high`, `-xhigh`, `-max`)
+/// from a model ID (e.g., `gemini-4-neon-high` -> `("gemini-4-neon", Some("high"))`).
+#[must_use]
+pub fn strip_agy_effort_suffix(model: &str) -> (&str, Option<&str>) {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        if let Some(prefix) = model
+            .strip_suffix(effort)
+            .and_then(|rest| rest.strip_suffix('-'))
+            .filter(|prefix| !prefix.is_empty())
+        {
+            return (prefix, Some(effort));
+        }
+    }
+    (model, None)
+}
+
 /// 에이전트 ID와 프로필에 대해 `overrides`가 문법·공급자·프로필 인자와 충돌하지 않는지 검증하고
 /// 정규화된 [`LaunchOverrides`]를 돌려준다.
 pub fn validate_launch_overrides(
@@ -752,6 +768,13 @@ pub fn validate_launch_overrides(
                         ));
                     }
                 }
+                "agy" => {
+                    if !matches!(valid.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+                        return Err(format!(
+                            "agent '{agent_id}' supports effort: low, medium, high, xhigh, max (got '{valid}')"
+                        ));
+                    }
+                }
                 "pi" | "omp" => {
                     if !matches!(
                         valid.as_str(),
@@ -771,7 +794,7 @@ pub fn validate_launch_overrides(
                 }
                 _ => {
                     return Err(format!(
-                        "--effort override is not supported for agent '{agent_id}' (supported: claude, codex, grok, pi, omp)"
+                        "--effort override is not supported for agent '{agent_id}' (supported: agy, claude, codex, grok, pi, omp)"
                     ));
                 }
             }
@@ -798,13 +821,32 @@ pub fn apply_launch_overrides(
 ) -> Result<(), String> {
     let normalized = validate_launch_overrides(agent_id, profile, overrides)?;
     let canon = canonical_id(agent_id);
-    if let Some(model) = normalized.model {
+    let mut model = normalized.model;
+    let mut effort = normalized.effort;
+    if canon == "agy"
+        && let (Some(m), Some(eff)) = (&mut model, &effort)
+    {
+        let (family, existing_suffix) = strip_agy_effort_suffix(m);
+        match existing_suffix {
+            Some(existing) if existing == eff.as_str() => {
+                // Model ID already encodes the requested effort; avoid redundant --effort.
+                effort = None;
+            }
+            Some(_) => {
+                // Antigravity CLI rejects `--model <family>-<old> --effort <new>`.
+                // Strip the conflicting suffix so `--model <family> --effort <new>` succeeds.
+                *m = family.to_owned();
+            }
+            None => {}
+        }
+    }
+    if let Some(model) = model {
         profile
             .launch
             .push(if canon == "grok" { "-m" } else { "--model" }.to_owned());
         profile.launch.push(model);
     }
-    if let Some(effort) = normalized.effort {
+    if let Some(effort) = effort {
         match canon {
             "codex" => {
                 profile.launch.push("-c".to_owned());
@@ -812,7 +854,7 @@ pub fn apply_launch_overrides(
                     .launch
                     .push(format!("model_reasoning_effort=\"{effort}\""));
             }
-            "claude" | "openclaude" => {
+            "claude" | "openclaude" | "agy" => {
                 profile.launch.push("--effort".to_owned());
                 profile.launch.push(effort);
             }

@@ -293,6 +293,11 @@ impl View {
     /// Applies one change from a settings row and shows the bot as krilld returns it.
     pub(super) fn patch_bot(&mut self, params: UpdateBotParams, cx: &mut Context<Self>) {
         let rpc = self.rpc.clone();
+        let prev_agent = self
+            .bots
+            .iter()
+            .find(|b| b.id == params.bot_id)
+            .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
         self.error = None;
         self.mutation_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
@@ -304,9 +309,24 @@ impl View {
             this.update(cx, |this, cx| {
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
+                        let next_agent =
+                            krill_proto::agent::canonical_id(&updated.agent_id).to_owned();
+                        let provider_changed = prev_agent
+                            .as_deref()
+                            .is_some_and(|prev| prev != next_agent.as_str());
                         this.settings.sync_from_bot(&updated);
                         this.soul_memory.sync_config_from_bot(&updated);
+                        if provider_changed {
+                            this.settings.agent_models = None;
+                            this.settings.models_loading_for = None;
+                            this.settings.models_task = None;
+                            this.bot_sessions.retain(|s| s.bot_id != updated.id);
+                        }
                         this.upsert_bot_config(*updated);
+                        if provider_changed {
+                            this.ensure_agent_models(&next_agent, cx);
+                            this.emit_sessions_changed(cx);
+                        }
                         this.emit_badge(cx);
                     }
                     Ok(_) => {}
