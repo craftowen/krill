@@ -306,6 +306,10 @@ pub struct SidebarBot {
     pub workspace: Option<String>,
     /// `needs_you` items plus pending access requests owned by this bot.
     pub attention: usize,
+    /// Its `needs_you` items (the hover card's "items it flagged for you").
+    pub items_need_you: usize,
+    /// Who asked for access and waits (the hover card's "Asked for access" lines).
+    pub access_requesters: Vec<String>,
     /// Live chats, Home Chat (no external link) first, then newest.
     pub sessions: Vec<BotSessionSummary>,
     pub updated_at_ms: u64,
@@ -388,6 +392,23 @@ pub fn sidebar_snapshot(
                         .filter(|w| !w.is_empty())
                         .map(str::to_owned),
                     attention: needs.iter().filter(|id| **id == &bot.id).count(),
+                    items_need_you: items
+                        .iter()
+                        .filter(|i| i.status == BotItemStatus::NeedsYou && i.owner_bot_id == bot.id)
+                        .count(),
+                    access_requesters: access
+                        .iter()
+                        .filter(|r| {
+                            r.status == BotAccessRequestStatus::Pending && r.bot_id == bot.id
+                        })
+                        .map(|r| {
+                            if r.sender_name.trim().is_empty() {
+                                r.sender_id.clone()
+                            } else {
+                                r.sender_name.clone()
+                            }
+                        })
+                        .collect(),
                     sessions: live,
                     updated_at_ms: bot.updated_at_ms,
                 }

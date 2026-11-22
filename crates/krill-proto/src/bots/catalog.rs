@@ -75,6 +75,25 @@ pub struct BotTemplateEvent {
     pub prompt: &'static str,
 }
 
+/// Mascots a new bot may get (Orca `PICKABLE_BOT_MASCOT_IDS`: all but `S2`, kept for a template).
+pub const PICKABLE_MASCOTS: [&str; 19] = [
+    "A1", "B1", "D1", "E1", "F1", "G1", "H1", "H2", "I1", "J1", "K2", "L2", "M1", "N1", "O1", "P3",
+    "Q1", "R3", "T1",
+];
+
+/// Orca `randomMascotAvatar`: a bot made without a picture gets a mascot. `seed` picks it, so
+/// the same bot keeps the same one.
+#[must_use]
+pub fn default_mascot(seed: &str) -> &'static str {
+    // FNV-1a: stable across runs and platforms, unlike `DefaultHasher`.
+    let hash = seed.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let len = u64::try_from(PICKABLE_MASCOTS.len()).unwrap_or(1);
+    let at = usize::try_from(hash.checked_rem(len).unwrap_or(0)).unwrap_or(0);
+    PICKABLE_MASCOTS.get(at).copied().unwrap_or("A1")
+}
+
 /// A built-in Krill Bot template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BotTemplate {

@@ -12,8 +12,7 @@ use gpui::{
     SharedString, Subscription, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{IconName, Sizable as _};
 use krill_app::bots::{SidebarBot, avatar, new_bot, templates};
 use krill_app::hosts::HostId;
@@ -22,6 +21,13 @@ use krill_app::ui;
 use krill_proto::bots::{BotId, BotRpcRequest, BotRpcResponse, BotTemplate};
 
 use super::Shell;
+
+mod chats;
+mod header;
+mod rows;
+#[cfg(test)]
+#[cfg(unix)]
+mod tests;
 
 /// A right-click menu action on the Shell.
 type ShellAction = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
@@ -44,6 +50,14 @@ pub(super) struct BotUi {
     pub search: Option<(Entity<InputState>, Subscription)>,
     pub query: String,
     pub folded: HashSet<BotId>,
+    /// "Bot options" (sort and hide); read from settings on first use.
+    pub view: Option<krill_app::bots::sidebar_view::BotSidebarView>,
+    /// Chats whose workers are unfolded (Orca: a chat starts folded).
+    pub open_chats: HashSet<krill_proto::SessionId>,
+    /// "Show more" steps taken per chat.
+    pub chat_steps: HashMap<krill_proto::SessionId, usize>,
+    /// The bot row being renamed in place.
+    pub renaming: Option<(BotId, Entity<InputState>, Subscription)>,
     /// Decoded `avatar.png` per bot and the config time it belongs to (`None`: unreadable,
     /// so the poll doesn't fetch it again until the bot changes).
     pub avatars: HashMap<BotId, (u64, Option<Arc<Image>>)>,
@@ -510,7 +524,7 @@ impl Shell {
     }
 
     /// Orca's "Delete bot": removes the bot and keeps its folder (soul and memory stay).
-    fn delete_bot_keep_folder(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+    pub(super) fn delete_bot_keep_folder(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
         let Some(rpc) = self.bot_rpc() else {
             return;
         };
@@ -541,7 +555,7 @@ impl Shell {
         .detach();
     }
 
-    fn toggle_bot_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn toggle_bot_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.bot_ui.search.take().is_some() {
             self.bot_ui.query.clear();
         } else {
@@ -616,475 +630,10 @@ impl Shell {
         (bot.description.clone(), false)
     }
 
-    fn render_bots_header(
-        &self,
+    pub(super) fn render_bots_empty(
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let collapsed = self.bot_ui.collapsed;
-        let has_bots = !self.sidebar_bots.is_empty();
-        let groups_ok = self.sidebar_bots.len() >= 2;
-        let this = cx.weak_entity();
-        let new_menu = Button::new("bots-section-new")
-            .ghost()
-            .xsmall()
-            .icon(IconName::Plus)
-            .accessibility_label(text::SB_NEW_MENU.get())
-            .tooltip(text::SB_NEW_MENU.get())
-            .debug_selector(|| "bots-section-new".into())
-            .dropdown_menu(move |menu, _, _| {
-                let act = |f: fn(&mut Shell, &mut Window, &mut Context<Shell>)| {
-                    let this = this.clone();
-                    move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut gpui::App| {
-                        this.update(cx, |s, cx| f(s, window, cx)).ok();
-                    }
-                };
-                menu.item(
-                    PopupMenuItem::new(text::SB_NEW_BOT.get())
-                        .icon(IconName::Plus)
-                        .on_click(act(|s, _, cx| s.request_new_bot(None, None, cx))),
-                )
-                .item(
-                    PopupMenuItem::new(text::SB_BROWSE_TEMPLATES.get())
-                        .icon(gpui_component::Icon::default().data(ui::icons::LAYOUT_TEMPLATE_SVG))
-                        .on_click(act(|s, _, cx| s.request_bot_templates(cx))),
-                )
-                .item(
-                    PopupMenuItem::new(text::SB_IMPORT.get())
-                        .icon(gpui_component::Icon::default().data(ui::icons::DOWNLOAD_SVG))
-                        .on_click(act(|s, window, cx| {
-                            s.open_bots_screen(BotsScreen::Import, window, cx);
-                        })),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(text::SB_NEW_GROUP.get())
-                        .disabled(!groups_ok)
-                        .on_click(act(|s, window, cx| {
-                            s.open_bots_screen(BotsScreen::Groups, window, cx);
-                        })),
-                )
-            });
-
-        let mut header = div()
-            .id("bots-section-header")
-            .debug_selector(|| "bots-section-header".into())
-            // Orca SidebarSectionHeader: `h-8 px-2`, a fold chevron before the title.
-            .h(ui::SIDEBAR_HEADER_HEIGHT)
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .child(
-                div()
-                    .id("bots-section-title")
-                    .debug_selector(|| "bots-section-title".into())
-                    .role(gpui::Role::Button)
-                    .aria_label(if collapsed {
-                        text::SB_EXPAND.get()
-                    } else {
-                        text::SB_COLLAPSE.get()
-                    })
-                    .aria_expanded(!collapsed)
-                    .group("bots-section-title")
-                    .cursor_pointer()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.bot_ui.collapsed = !this.bot_ui.collapsed;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .ml_0p5()
-                            .size_5()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(ui::RADIUS_SM)
-                            .text_color(p.muted_foreground)
-                            .group_hover("bots-section-title", |d| {
-                                d.bg(p.accent.opacity(0.7)).text_color(p.foreground)
-                            })
-                            .child(
-                                gpui_component::Icon::new(if collapsed {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size(px(14.)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .pr_0p5()
-                            .text_size(ui::TEXT_XS)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(p.muted_foreground.opacity(0.8))
-                            .child(krill_app::i18n::catalog::sidebar::NAV_BOTS.get()),
-                    ),
-            );
-        if collapsed {
-            header = header.child(self.render_collapsed_faces(p, cx));
-        }
-        header
-            .child(div().flex_1())
-            .when(!collapsed && has_bots, |d| {
-                d.child(
-                    Button::new("bots-section-search")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Search)
-                        .accessibility_label(text::SB_SEARCH.get())
-                        .tooltip(text::SB_SEARCH.get())
-                        .debug_selector(|| "bots-section-search".into())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.toggle_bot_search(window, cx)),
-                        ),
-                )
-            })
-            .when(!collapsed, |d| d.child(new_menu))
-    }
-
-    /// Collapsed section: up to five round avatars, then `+N` (attention first, like Orca).
-    fn render_collapsed_faces(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let mut bots: Vec<&SidebarBot> = self.sidebar_bots.iter().collect();
-        bots.sort_by_key(|b| (b.attention == 0, b.working() == 0));
-        let shown = bots.len().min(5);
-        let mut row = div().flex().items_center();
-        for (i, bot) in bots.iter().take(shown).enumerate() {
-            let id = bot.id.clone();
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "bots-collapsed-{}",
-                        bot.id.as_str()
-                    )))
-                    .debug_selector({
-                        let sel = format!("bots-collapsed-{}", bot.id.as_str());
-                        move || sel.clone()
-                    })
-                    .when(i > 0, |d| d.ml(px(-4.)))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(p.sidebar)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.bot_ui.collapsed = false;
-                        this.open_bot_home(id.clone(), None, cx);
-                    }))
-                    .child(self.bot_avatar(bot, 20., px(10.), p)),
-            );
-        }
-        if bots.len() > shown {
-            row = row.child(
-                div()
-                    .ml_1()
-                    .text_size(ui::TEXT_2XS)
-                    .text_color(p.muted_foreground)
-                    .child(format!("+{}", bots.len() - shown)),
-            );
-        }
-        row
-    }
-
-    fn render_bot_children(
-        &self,
-        bot: &SidebarBot,
-        focused: Option<krill_proto::SessionId>,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let now = now_secs();
-        let mut col = div().pl(px(21.)).pr_1().pb_1().flex().flex_col().gap_1();
-        for s in &bot.sessions {
-            let active = focused == Some(s.session_id);
-            let home = s.link_id.is_none();
-            let title = super::bot_panel::chat_title(bot, s);
-            let bot_id = bot.id.clone();
-            let session = s.session_id;
-            let id = SharedString::from(format!("bot-chat-{}", s.session_id.0));
-            col = col.child(
-                div()
-                    .id(id.clone())
-                    .debug_selector(move || id.to_string())
-                    .role(gpui::Role::Button)
-                    .tab_index(0)
-                    .focus_visible(|d| d.border_1().border_color(p.ring))
-                    .aria_label(title.clone())
-                    .h(px(24.))
-                    .pl_1()
-                    .pr_0p5()
-                    .rounded(ui::RADIUS_SM)
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(p.sidebar_accent))
-                    .when(!active, |d| d.hover(|d| d.bg(p.sidebar_accent)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_bot_session(&bot_id, session, cx);
-                    }))
-                    .child(ui::icons::svg_icon(
-                        if home {
-                            ui::icons::BOT_HOME_SVG
-                        } else {
-                            ui::icons::MESSAGE_SQUARE_SVG
-                        },
-                        ui::ICON_XS,
-                        p.muted_foreground,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(p.foreground)
-                            .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
-                            .child(title),
-                    )
-                    .when(s.working, |d| {
-                        d.child(ui::status::status_glyph_slot(
-                            krill_proto::control::AgentState::Working,
-                            false,
-                            ui::status::Size::Sm,
-                            Some(&self.bot_ui.spinners),
-                            cx,
-                        ))
-                    })
-                    .child(div().flex_none().text_size(ui::TEXT_2XS).child(
-                        krill_app::jump::format_age_secs(s.created_at_ms / 1000, now),
-                    )),
-            );
-        }
-        col
-    }
-
-    fn render_bot_row(
-        &self,
-        bot: &SidebarBot,
-        focused: Option<krill_proto::SessionId>,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let has_children = !bot.sessions.is_empty();
-        let folded = self.bot_ui.folded.contains(&bot.id);
-        let active = focused.is_some_and(|f| bot.sessions.iter().any(|s| s.session_id == f));
-        let (activity, attention) = Self::bot_activity(bot);
-        let age = bot
-            .sessions
-            .iter()
-            .map(|s| s.created_at_ms)
-            .max()
-            .unwrap_or(bot.updated_at_ms);
-        let row_id = format!("bot-row-{}", bot.id.as_str());
-        let row_sel = row_id.clone();
-        let group = SharedString::from(format!("bot-row-group-{}", bot.id.as_str()));
-        let open_id = bot.id.clone();
-        let fold_id = bot.id.clone();
-        let menu_bot = bot.clone();
-        let folder = self.bot_folder(bot);
-        let this = cx.weak_entity();
-
-        let row =
-            div()
-                .id(SharedString::from(row_id))
-                .debug_selector(move || row_sel.clone())
-                .group(group.clone())
-                .role(gpui::Role::Button)
-                .tab_index(0)
-                .focus_visible(|d| d.border_1().border_color(p.ring))
-                .aria_label(bot.name.clone())
-                // Orca BotSidebarRow sits on the workspace card surface: `ml-1 pr-1.5`, a
-                // transparent border that the active row fills like an active workspace card.
-                .ml_1()
-                .pl(px(5.))
-                .pr_1p5()
-                .py(px(5.))
-                .rounded(ui::RADIUS_MD)
-                .border_1()
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .when(bot.paused, |d| d.opacity(0.6))
-                .when(active, |d| {
-                    d.bg(p.worktree_sidebar)
-                        .border_color(p.worktree_sidebar_border)
-                })
-                .when(!active, |d| {
-                    d.border_color(ui::TRANSPARENT)
-                        .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)))
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_bot_home(open_id.clone(), None, cx);
-                }))
-                .child(
-                    div()
-                        .mr_2()
-                        .child(self.bot_avatar(bot, 32., ui::RADIUS_SM, p)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(ui::TEXT_MD)
-                                        .text_color(p.sidebar_foreground)
-                                        .child(bot.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(ui::TEXT_SM)
-                                        .text_color(p.muted_foreground)
-                                        .child(krill_app::jump::format_age_secs(
-                                            age / 1000,
-                                            now_secs(),
-                                        )),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(ui::TEXT_SM)
-                                .text_color(if attention {
-                                    p.sidebar_foreground
-                                } else {
-                                    p.muted_foreground
-                                })
-                                .child(activity),
-                        ),
-                )
-                .child(div().flex_none().w(px(28.)).flex().justify_center().when(
-                    has_children,
-                    |d| {
-                        let name = bot.name.clone();
-                        d.child(
-                            div()
-                                .when(!folded, |d| {
-                                    d.invisible()
-                                        .group_hover(group.clone(), gpui::Styled::visible)
-                                })
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "bot-fold-{}",
-                                        bot.id.as_str()
-                                    )))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(if folded {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .accessibility_label(if folded {
-                                        text::SB_UNFOLD.format(&[("name", &name)])
-                                    } else {
-                                        text::SB_FOLD.format(&[("name", &name)])
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        if !this.bot_ui.folded.remove(&fold_id) {
-                                            this.bot_ui.folded.insert(fold_id.clone());
-                                        }
-                                        cx.notify();
-                                    })),
-                                ),
-                        )
-                    },
-                ))
-                .context_menu(move |menu, _, _| {
-                    let bot = menu_bot.clone();
-                    let act = |f: ShellAction| {
-                        let this = this.clone();
-                        move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut gpui::App| {
-                            this.update(cx, |s, cx| f(s, window, cx)).ok();
-                        }
-                    };
-                    let id = bot.id.clone();
-                    let settings = act(Box::new(move |s, window, cx| {
-                        if !s.open_bot_settings_in_panel(&id, cx) {
-                            s.open_bot(Some(id.clone()), Some(window), cx);
-                        }
-                    }));
-                    let id = bot.id.clone();
-                    let paused = bot.paused;
-                    let pause = act(Box::new(move |s, _, cx| {
-                        s.set_bot_paused(id.clone(), !paused, cx);
-                    }));
-                    let deleting = bot.clone();
-                    let delete = act(Box::new(move |s, _, cx| {
-                        s.bot_ui.delete = Some(deleting.clone());
-                        cx.notify();
-                    }));
-                    let mut menu = menu
-                        .item(
-                            PopupMenuItem::new(text::SB_BOT_SETTINGS.get())
-                                .icon(IconName::Settings)
-                                .on_click(settings),
-                        )
-                        .item(
-                            PopupMenuItem::new(if paused {
-                                text::SB_RESUME.get()
-                            } else {
-                                text::SB_PAUSE.get()
-                            })
-                            .icon(if paused {
-                                IconName::Play
-                            } else {
-                                IconName::Pause
-                            })
-                            .on_click(pause),
-                        );
-                    if let Some(path) = folder.clone() {
-                        menu = menu.separator().item(
-                            PopupMenuItem::new(text::SB_COPY_PATH.get())
-                                .icon(IconName::Copy)
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        path.to_string_lossy().into_owned(),
-                                    ));
-                                }),
-                        );
-                    }
-                    menu.separator().item(
-                        PopupMenuItem::new(text::SB_DELETE.get())
-                            .icon(IconName::Delete)
-                            .on_click(delete),
-                    )
-                });
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(row)
-            .when(has_children && !folded, |d| {
-                d.child(
-                    div()
-                        .when(bot.paused, |d| d.opacity(0.6))
-                        .child(self.render_bot_children(bot, focused, p, cx)),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_bots_empty(p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let mut faces = div().flex().items_center();
         for (i, id) in ["A1", "E1", "M1"].into_iter().enumerate() {
             let face = avatar::Avatar::from_fields(Some(id), None, None, id);
@@ -1154,91 +703,6 @@ impl Shell {
                         ),
                     ),
             )
-    }
-
-    /// The whole section, placed between the top navigation and Projects.
-    pub(super) fn render_bots_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let p = ui::palette(cx);
-        self.bot_ui.spinners.clear();
-        let mut section = div()
-            .id("bots-section")
-            .debug_selector(|| "bots-section".into())
-            .role(gpui::Role::Group)
-            .aria_label(krill_app::i18n::catalog::sidebar::NAV_BOTS.get())
-            .flex_none()
-            // Orca caps the section at 40% of the sidebar; the bot list scrolls inside it.
-            .max_h(gpui::relative(0.4))
-            // Orca SidebarBotsSplit: `border-b pb-2`, the Bots / Projects divider.
-            .border_b_1()
-            .border_color(p.worktree_sidebar_border)
-            .pb_2()
-            .min_h_0()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(self.render_bots_header(p, cx));
-        if self.bot_ui.collapsed {
-            return section.into_any_element();
-        }
-        if self.sidebar_bots.is_empty() {
-            // Until the list arrives, show nothing rather than an invitation to make a first bot.
-            if self.bot_ui.loaded {
-                section = section.child(Self::render_bots_empty(p, cx));
-            }
-            return section.into_any_element();
-        }
-        if let Some((input, _)) = &self.bot_ui.search {
-            section = section.child(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .child(Input::new(input).small().cleanable(true)),
-            );
-        }
-        let q = self.bot_ui.query.trim().to_lowercase();
-        let focused = self
-            .focused_session()
-            .filter(|(host, _)| *host == self.launch_host)
-            .map(|(_, s)| s);
-        let mut list = div()
-            .id("bots-section-list")
-            .debug_selector(|| "bots-section-list".into())
-            .role(gpui::Role::List)
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pb_1()
-            .pl_1()
-            .pr_1()
-            .flex()
-            .flex_col();
-        let mut shown = 0;
-        for bot in &self.sidebar_bots {
-            if !q.is_empty()
-                && !bot.name.to_lowercase().contains(&q)
-                && !bot.description.to_lowercase().contains(&q)
-            {
-                continue;
-            }
-            shown += 1;
-            list = list.child(self.render_bot_row(bot, focused, p, cx));
-        }
-        if shown == 0 {
-            list = list.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.muted_foreground)
-                    .child(text::SB_NO_MATCHES.get()),
-            );
-        }
-        section.child(list).into_any_element()
-    }
-
-    /// Spinners for working bot chats (drawn above the section so it isn't re-laid out per tick).
-    pub(super) fn bots_spinner_overlay(&self) -> impl IntoElement {
-        ui::status::spinner_overlay(&self.bot_ui.spinners)
     }
 
     /// Open New bot / Bot templates dialogs, and the delete confirmation.

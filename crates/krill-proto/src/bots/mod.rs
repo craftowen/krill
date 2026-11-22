@@ -12,8 +12,8 @@ pub use catalog::{
     BOT_MCP_APPS, BUILTIN_BOT_SKILLS, BUILTIN_BOT_TEMPLATES, BotMcpAppCatalogEntry,
     BotMcpAppCategory, BotTemplate, BotTemplateCategory, BotTemplateEvent, BotTemplateSchedule,
     COMPOSIO_CURATED_APPS, ComposioAppCatalogEntry, bot_templates_by_category, builtin_bot_skills,
-    builtin_bot_templates, find_bot_mcp_app, find_bot_skill, find_bot_template, find_composio_app,
-    generate_slack_socket_mode_manifest,
+    builtin_bot_templates, default_mascot, find_bot_mcp_app, find_bot_skill, find_bot_template,
+    find_composio_app, generate_slack_socket_mode_manifest,
 };
 pub use external::{
     discover_external_bots, discover_external_bots_filtered, discover_external_bots_in,

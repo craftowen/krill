@@ -177,6 +177,22 @@ impl Shell {
             .map(|a| a.account_id.clone())
     }
 
+    /// A chat stopped on its usage limit, for the sidebar's gauge (Orca `UsageLimitStop`):
+    /// whether Krill continues it at the reset, and the reset's local clock. Only chats whose
+    /// log has been read know.
+    pub(in crate::shell) fn chat_usage_stop(
+        &self,
+        key: &ChatKey,
+        cx: &gpui::App,
+    ) -> Option<(bool, Option<String>)> {
+        if !self.chat.logs.get(key)?.meta.rate_limited {
+            return None;
+        }
+        let auto = self.chat.auto_continue.get(key).map(|e| e.reset_at);
+        let reset = auto.or_else(|| self.chat_limit_info(key, cx).map(|i| i.reset_at));
+        Some((auto.is_some(), reset.and_then(reset_clock)))
+    }
+
     /// The limit blocking this chat's current account, from the host's account snapshot.
     pub(super) fn chat_limit_info(&self, key: &ChatKey, cx: &gpui::App) -> Option<LimitInfo> {
         let account = self.chat_account_id(key, cx)?;

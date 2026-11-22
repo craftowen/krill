@@ -1009,6 +1009,10 @@ pub struct Sidebar {
     worktree_hosts: BTreeMap<PathBuf, String>,
     automation_worktrees: BTreeSet<PathBuf>,
     cli_worktrees: BTreeSet<PathBuf>,
+    /// Orca "Hide bot workspaces" (`hideBotCreatedWorkspaces`, on by default, mirrored from
+    /// settings): `Some` while on, holding the worktrees bot workers made (refreshed by
+    /// `rebuild`).
+    bot_worktrees: Option<BTreeSet<PathBuf>>,
     comments: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
     collapsed_lineage: BTreeSet<PathBuf>,
@@ -1419,6 +1423,7 @@ impl Sidebar {
             worktree_hosts: BTreeMap::new(),
             automation_worktrees: BTreeSet::new(),
             cli_worktrees: BTreeSet::new(),
+            bot_worktrees: Some(BTreeSet::new()),
             comments: BTreeMap::new(),
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
@@ -2686,6 +2691,54 @@ impl Sidebar {
         changed
     }
 
+    /// Whether this app knows any bot session (the Projects "Hide bot workspaces" row shows then).
+    pub(crate) fn hides_bot_workspaces(&self) -> bool {
+        self.bot_worktrees.is_some()
+    }
+
+    pub(crate) fn set_hide_bot_workspaces(&mut self, hide: bool, cx: &mut Context<Self>) {
+        if self.hides_bot_workspaces() != hide {
+            self.bot_worktrees = hide.then(BTreeSet::new);
+            self.rebuild(cx);
+        }
+    }
+
+    pub(crate) fn has_bot_sessions(&self) -> bool {
+        self.bot_sessions.values().any(|m| !m.is_empty())
+    }
+
+    /// Worktrees a local bot chat's workers made: dispatches of runs whose coordinator is a bot
+    /// session. A project's own root never counts, so hiding it can't drop the project.
+    fn bot_worker_worktrees(&self) -> BTreeSet<PathBuf> {
+        let Some(bots) = self.bot_sessions.get(&HostId::Local) else {
+            return BTreeSet::new();
+        };
+        let orch = &self.disk.orchestration;
+        orch.runs
+            .iter()
+            .filter(|r| {
+                r.coordinator_session_id
+                    .is_some_and(|sid| bots.contains_key(&SessionId(sid)))
+            })
+            .flat_map(|r| orch.dispatches.iter().filter(move |d| d.run_id == r.id))
+            .filter_map(|d| {
+                d.session_id
+                    .and_then(|sid| self.session(SessionId(sid)))
+                    .and_then(|s| s.worktree.clone())
+                    .or_else(|| (!d.cwd.is_empty()).then(|| PathBuf::from(&d.cwd)))
+            })
+            .filter(|path| !self.snapshot.trees.contains_key(path))
+            .collect()
+    }
+
+    /// Orca "Mark Unread" on a bot row: shows the session as unread again (local sessions only,
+    /// like the unread set itself).
+    pub fn mark_session_unread(&mut self, host: &HostId, id: SessionId, cx: &mut Context<Self>) {
+        if host.is_local() && self.unread.insert(id) {
+            cx.notify();
+        }
+    }
+
     pub(super) fn write_read_done(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = self.state_dir().map(Path::to_path_buf) else {
             return;
@@ -3437,6 +3490,9 @@ impl Sidebar {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.reconcile_path_identity();
+        if self.bot_worktrees.is_some() {
+            self.bot_worktrees = Some(self.bot_worker_worktrees());
+        }
         if self.reconcile_pending_added_projects() {
             self.write_state(cx);
         }

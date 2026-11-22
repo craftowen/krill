@@ -1250,6 +1250,8 @@ mod tests {
             permission: krill_proto::agent::Permission::Manual,
             workspace: None,
             attention: 0,
+            items_need_you: 0,
+            access_requesters: Vec::new(),
             sessions: vec![BotSessionSummary {
                 session_id: home_sid,
                 bot_id,

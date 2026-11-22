@@ -24,6 +24,7 @@ mod panel;
 pub mod rpc;
 mod settings;
 mod settings_root;
+pub mod sidebar_view;
 mod soul_memory;
 pub mod templates;
 mod tools_sharing;

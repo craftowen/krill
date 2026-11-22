@@ -198,6 +198,14 @@ pub struct Settings {
     /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 끔).
     #[serde(default)]
     pub chat_auto_continue_after_rate_limit: bool,
+    /// 사이드바 봇 섹션 "봇 옵션"의 정렬(Orca `botSidebarView.sortBy`).
+    pub bot_sidebar_sort: crate::bots::sidebar_view::BotSidebarSort,
+    /// 일시정지한 봇 숨기기(Orca `hidePausedBots`).
+    pub bot_sidebar_hide_paused: bool,
+    /// 하는 일이 없는 봇 워커 줄 숨기기(Orca `hideSleepingWorkers`).
+    pub bot_sidebar_hide_sleeping_workers: bool,
+    /// 봇 워커가 만든 워크스페이스를 프로젝트에서 숨기고 봇 아래에만 둔다(Orca `hideBotCreatedWorkspaces`, 기본 켬).
+    pub hide_bot_workspaces: bool,
     /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
     /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -318,6 +326,10 @@ impl Default for Settings {
             show_automations_button: true,
             running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
             chat_auto_continue_after_rate_limit: false,
+            bot_sidebar_sort: crate::bots::sidebar_view::BotSidebarSort::Manual,
+            bot_sidebar_hide_paused: false,
+            bot_sidebar_hide_sleeping_workers: false,
+            hide_bot_workspaces: true,
             terminal_custom_themes: Vec::new(),
         }
     }
@@ -1508,6 +1520,41 @@ pub fn copy_on_select(cx: &App) -> bool {
 pub fn chat_auto_continue_after_rate_limit(cx: &App) -> bool {
     cx.try_global::<Config>()
         .is_some_and(|c| c.settings.chat_auto_continue_after_rate_limit)
+}
+
+/// 사이드바 봇 섹션의 "봇 옵션". `init` 전이면 기본값.
+pub fn bot_sidebar_view(cx: &App) -> crate::bots::sidebar_view::BotSidebarView {
+    cx.try_global::<Config>()
+        .map_or_else(Default::default, |c| {
+            crate::bots::sidebar_view::BotSidebarView {
+                sort: c.settings.bot_sidebar_sort,
+                hide_paused: c.settings.bot_sidebar_hide_paused,
+                hide_sleeping_workers: c.settings.bot_sidebar_hide_sleeping_workers,
+            }
+        })
+}
+
+/// "봇 옵션"을 바꾸고 `settings.toml`에 저장한다.
+pub fn set_bot_sidebar_view(view: crate::bots::sidebar_view::BotSidebarView, cx: &mut App) {
+    if cx.has_global::<Config>() && bot_sidebar_view(cx) != view {
+        edit(cx, move |s| {
+            s.bot_sidebar_sort = view.sort;
+            s.bot_sidebar_hide_paused = view.hide_paused;
+            s.bot_sidebar_hide_sleeping_workers = view.hide_sleeping_workers;
+        });
+    }
+}
+
+/// 봇 워크스페이스를 프로젝트에서 숨길지. `init` 전이면 기본값 true.
+pub fn hide_bot_workspaces(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_none_or(|c| c.settings.hide_bot_workspaces)
+}
+
+pub fn set_hide_bot_workspaces(hide: bool, cx: &mut App) {
+    if cx.has_global::<Config>() && current(cx).hide_bot_workspaces != hide {
+        edit(cx, move |s| s.hide_bot_workspaces = hide);
+    }
 }
 
 /// 실행 중인 탭·칸을 닫기 전에 확인할지(OWE-872). `init` 전이면 기본값 true.
