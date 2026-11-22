@@ -111,8 +111,10 @@ impl MenuState {
                             if shell
                                 .update(cx, |s, cx| s.open_terminal_url(pane, &uri, cx))
                                 .is_err()
+                                && let Some(clean) =
+                                    krill_app::terminal::path_link::sanitize_external_url(&uri)
                             {
-                                cx.open_url(&uri);
+                                cx.open_url(&clean);
                             }
                         } else {
                             cx.write_to_clipboard(ClipboardItem::new_string(uri.clone()));

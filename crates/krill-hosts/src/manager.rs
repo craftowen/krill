@@ -25,7 +25,7 @@ const OFFLINE_AFTER_FAILURES: u32 = 10;
 /// 꺼진 기기 재시도 간격. 사이드바 '다시 연결'([`HostManager::reconnect_now`])은 이 대기를 바로 푼다.
 const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
 
-type AttemptToken = Option<(Arc<()>, u64)>;
+type AttemptToken = (Arc<()>, u64);
 
 /// 같은 접속 대상을 가리키는 관리자끼리 나누는 '꺼진 기기' 판정의 키.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -437,15 +437,21 @@ impl HostManager {
                 };
                 let manager = self.clone();
                 let host_id = id.clone();
-                let attempt: Arc<Mutex<AttemptToken>> = Arc::new(Mutex::new(None));
-                let ensure_attempt = Arc::clone(&attempt);
-                let outcome_attempt = Arc::clone(&attempt);
+                let attempts: Arc<
+                    Mutex<std::collections::HashMap<std::thread::ThreadId, AttemptToken>>,
+                > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+                let ensure_attempts = Arc::clone(&attempts);
+                let outcome_attempts = Arc::clone(&attempts);
                 let connector = RemoteConnector::new(
                     move || {
+                        let tid = std::thread::current().id();
+                        if let Ok(mut guard) = ensure_attempts.lock() {
+                            guard.remove(&tid);
+                        }
                         let (sock, reg, gen_) =
                             manager.ensure_tunnel_socket_for_attempt(&host_id)?;
-                        if let Ok(mut guard) = ensure_attempt.lock() {
-                            *guard = Some((reg, gen_));
+                        if let Ok(mut guard) = ensure_attempts.lock() {
+                            guard.insert(tid, (reg, gen_));
                         }
                         Ok(sock)
                     },
@@ -453,7 +459,11 @@ impl HostManager {
                         let manager = self.clone();
                         let host_id = id.clone();
                         move |ok, err| {
-                            let token = outcome_attempt.lock().ok().and_then(|mut g| g.take());
+                            let tid = std::thread::current().id();
+                            let token = outcome_attempts
+                                .lock()
+                                .ok()
+                                .and_then(|mut g| g.remove(&tid));
                             manager.record_ipc_outcome_for_attempt(&host_id, token, ok, err);
                         }
                     },

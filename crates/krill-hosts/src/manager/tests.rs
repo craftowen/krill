@@ -410,3 +410,117 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $A
     drop(manager);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn concurrent_connects_on_cloned_target_never_steal_attempt_tokens() {
+    let dir = std::env::temp_dir().join(format!("krill-token-race-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let hello_bytes = krill_proto::ipc::ServerHello {
+        proto_min: 1,
+        proto_max: 1,
+        features: 0,
+        build: "test".into(),
+        instance_id: 2,
+    }
+    .encode()
+    .unwrap();
+    fs::write(dir.join("hello.bin"), &hello_bytes).unwrap();
+
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+base=$(dirname "$0")
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+sock="${fwd%%:*}"
+if [ ! -f "$base/second" ]; then
+  : > "$base/second"
+  /usr/bin/perl -MIO::Socket::UNIX -e '
+    my ($sock, $base) = @ARGV;
+    my $s = IO::Socket::UNIX->new(Local => $sock, Listen => 5) or exit 3;
+    if (my $c = $s->accept) {
+      open my $fh, ">", "$base/accepted1" or die;
+      close $fh;
+      while (!-f "$base/release1") { select(undef, undef, undef, 0.01); }
+      close $c;
+    }
+  ' "$sock" "$base" </dev/null >/dev/null 2>&1 &
+  while [ ! -f "$base/release1" ]; do sleep 0.02; done
+  exit 0
+fi
+exec /usr/bin/perl -MIO::Socket::UNIX -e '
+  my ($sock, $base) = @ARGV;
+  my $s = IO::Socket::UNIX->new(Local => $sock, Listen => 5) or exit 3;
+  while (my $c = $s->accept) {
+    open my $fh, ">", "$base/accepted2" or die;
+    close $fh;
+    while (!-f "$base/release2") { select(undef, undef, undef, 0.01); }
+    open my $in, "<", "$base/hello.bin" or die;
+    binmode $in;
+    local $/;
+    my $hello = <$in>;
+    close $in;
+    print $c $hello;
+    $c->flush;
+    while (-e $sock) { select(undef, undef, undef, 0.05); }
+    close $c;
+  }
+' "$sock" "$base"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    let host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec]);
+
+    let target_a = manager.target_for(&host, None).unwrap();
+    let target_b = target_a.clone();
+    let client_hello =
+        krill_proto::daemon::client_hello(krill_proto::ipc::ClientRole::App, "token-race");
+
+    let hello_a = client_hello.clone();
+    let thread_a = thread::spawn(move || target_a.connect(&hello_a));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dir.join("accepted1").exists() {
+        assert!(Instant::now() < deadline, "first attempt did not connect");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Start a newer tunnel generation on Thread B while Thread A is still stalled inside connect().
+    manager.reconnect_now("studio");
+    let hello_b = client_hello;
+    let thread_b = thread::spawn(move || target_b.connect(&hello_b));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dir.join("accepted2").exists() {
+        assert!(Instant::now() < deadline, "second attempt did not connect");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pid2 = manager.tunnel_pid("studio").unwrap();
+
+    // Thread A fails first; it must report only its own stale gen1 token without killing gen2.
+    fs::write(dir.join("release1"), "").unwrap();
+    assert!(thread_a.join().unwrap().is_err());
+
+    fs::write(dir.join("release2"), "").unwrap();
+    let stream_b = thread_b.join().unwrap();
+    assert!(
+        stream_b.is_ok(),
+        "stale Thread A failure must not kill Thread B's newer tunnel: {stream_b:?}"
+    );
+    drop(stream_b);
+
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+    assert_eq!(manager.tunnel_pid("studio"), Some(pid2));
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}

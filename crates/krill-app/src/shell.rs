@@ -214,6 +214,8 @@ struct Live {
     selecting: bool,
     /// 끄는 중인 선택 단위(OWE-866).
     selecting_kind: SelectKind,
+    /// 더블·트리플 클릭 시작 시점의 정규화된 원점 범위(역방향·줄바꿈 드래그용).
+    selecting_origin: Option<((i64, u16), (i64, u16))>,
     /// 프로그램 마우스 보고로 누른 버튼 비트마스크(bit b = button b).
     mouse_down: u8,
     task: Task<()>,
@@ -245,6 +247,7 @@ impl Live {
             selection_text: None,
             selecting: false,
             selecting_kind: SelectKind::Char,
+            selecting_origin: None,
             mouse_down: 0,
             task,
             creation: Arc::default(),
@@ -264,6 +267,7 @@ impl Live {
         self.selection = None;
         self.selection_text = None;
         self.selecting_kind = SelectKind::Char;
+        self.selecting_origin = None;
     }
 
     /// 보이는 화면 칸을 버퍼 기준 끝점으로.
@@ -2521,6 +2525,14 @@ impl Shell {
 
     /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 파일 탭이 포커스면
     /// 에디터 내장 검색을 열며(OWE-874), 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
+    fn terminal_search_visible(&self, cx: &App) -> bool {
+        !self.diff.read(cx).has_center_diff()
+            && !self.is_active_chat_view_in(cx)
+            && self.layout.focused().is_some_and(|pane| {
+                self.live.contains_key(&pane) && self.layout.file(pane).is_none()
+            })
+    }
+
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard.is_some() {
             return;
@@ -2529,8 +2541,7 @@ impl Shell {
             settings.update(cx, |v, cx| v.focus_search(window, cx));
             return;
         }
-        if let Some((bar, _)) = &self.search {
-            bar.clone().update(cx, |bar, cx| bar.focus(window, cx));
+        if self.diff.read(cx).has_center_diff() {
             return;
         }
         if let Some(pane) = self.layout.focused()
@@ -2545,6 +2556,10 @@ impl Shell {
         // OWE-868: 빈 탭에서는 터미널 검색 바를 열지 않는다(열어도 동작하지 않는다).
         // 파일 탭은 위에서 에디터 내장 검색으로 처리된다(OWE-874).
         if self.focused_live().is_none() {
+            return;
+        }
+        if let Some((bar, _)) = &self.search {
+            bar.clone().update(cx, |bar, cx| bar.focus(window, cx));
             return;
         }
         if let Some(pane) = self.layout.focused() {
@@ -3167,7 +3182,10 @@ impl Shell {
     /// 원격 호스트 패인의 루프백 URL(`localhost`, `127.0.0.1`, `0.0.0.0`, `[::1]`)이면
     /// 로컬 포워딩 리스너(유휴 10분 뒤 자동 해제)를 먼저 준비하고 포워딩된 로컬 URL로 연다.
     pub(super) fn open_terminal_url(&mut self, pane: PaneId, uri: &str, cx: &mut Context<Self>) {
-        if let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(uri)
+        let Some(uri) = krill_app::terminal::path_link::sanitize_external_url(uri) else {
+            return;
+        };
+        if let Some(remote_port) = krill_app::remote_fs::parse_loopback_http_url(&uri)
             && self.layout.host(pane).is_remote()
         {
             let Some((host, target)) = self.remote_target_for_pane(pane) else {
@@ -3179,7 +3197,6 @@ impl Shell {
                 cx.notify();
                 return;
             };
-            let uri = uri.to_owned();
             cx.spawn(async move |this, cx| {
                 let forwarded = cx
                     .background_executor()
@@ -3203,7 +3220,7 @@ impl Shell {
             .detach();
             return;
         }
-        cx.open_url(uri);
+        cx.open_url(&uri);
     }
 
     fn sync_history_host(&self, cx: &mut Context<Self>) -> Option<String> {
@@ -6038,6 +6055,7 @@ impl Shell {
             l.selection_text = None;
             l.selecting = true;
             l.selecting_kind = SelectKind::Char;
+            l.selecting_origin = None;
             cx.notify();
             return;
         }
@@ -6050,7 +6068,15 @@ impl Shell {
         } else {
             (Selection::new(at), SelectKind::Char)
         };
-        l.selection = Some(Anchored::from_view(selection, l.pane.scroll_offset()));
+        let anchored = Anchored::from_view(selection, l.pane.scroll_offset());
+        l.selecting_origin = (kind != SelectKind::Char).then(|| {
+            if anchored.anchor <= anchored.head {
+                (anchored.anchor, anchored.head)
+            } else {
+                (anchored.head, anchored.anchor)
+            }
+        });
+        l.selection = Some(anchored);
         l.selection_text = None;
         l.selecting = true;
         l.selecting_kind = kind;
@@ -6074,25 +6100,45 @@ impl Shell {
             return;
         }
         let point = l.anchor_point(at);
-        sel.head = match kind {
-            SelectKind::Char => point,
+        match kind {
+            SelectKind::Char => {
+                sel.head = point;
+            }
             SelectKind::Word => {
                 let word = Selection::word_at(&screen, at);
-                l.anchor_point(if point >= sel.anchor {
-                    word.head
+                let ws = l.anchor_point(word.anchor);
+                let we = l.anchor_point(word.head);
+                let (ws, we) = if ws <= we { (ws, we) } else { (we, ws) };
+                if let Some((os, oe)) = l.selecting_origin {
+                    if point >= os {
+                        sel.anchor = os;
+                        sel.head = we.max(oe);
+                    } else {
+                        sel.anchor = oe;
+                        sel.head = ws.min(os);
+                    }
                 } else {
-                    word.anchor
-                })
+                    sel.head = if point >= sel.anchor { we } else { ws };
+                }
             }
             SelectKind::Line => {
-                let column = if point.0 >= sel.anchor.0 {
-                    screen.cols.saturating_sub(1)
+                let line = Selection::line_at(&screen, at);
+                let ls = l.anchor_point(line.anchor);
+                let le = l.anchor_point(line.head);
+                let (ls, le) = if ls <= le { (ls, le) } else { (le, ls) };
+                if let Some((os, oe)) = l.selecting_origin {
+                    if ls >= os {
+                        sel.anchor = os;
+                        sel.head = le.max(oe);
+                    } else {
+                        sel.anchor = oe;
+                        sel.head = ls.min(os);
+                    }
                 } else {
-                    0
-                };
-                (point.0, column)
+                    sel.head = if point.0 >= sel.anchor.0 { le } else { ls };
+                }
             }
-        };
+        }
         l.selection = Some(sel);
         cx.notify();
     }
@@ -6106,6 +6152,7 @@ impl Shell {
         l.selecting = false;
         let keep_single = l.selecting_kind != SelectKind::Char;
         l.selecting_kind = SelectKind::Char;
+        l.selecting_origin = None;
         if l.selection.is_some_and(|s| s.anchor == s.head) && !keep_single {
             l.clear_selection();
         } else {
@@ -8925,7 +8972,13 @@ impl Render for Shell {
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
                                     // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
                                     // 너비·접힘과 무관하게 항상 터미널 우측에 붙는다.
-                                    .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
+                                    .children(
+                                        self.terminal_search_visible(cx)
+                                            .then(|| {
+                                                self.search.as_ref().map(|(bar, _)| bar.clone())
+                                            })
+                                            .flatten(),
+                                    ),
                             ),
                     )
                     .when(show_panel, |d| {

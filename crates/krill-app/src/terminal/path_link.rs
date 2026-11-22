@@ -211,6 +211,7 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
         }
         let mut in_path = false;
         let mut seg_ascii = false;
+        let mut seg_delim = false;
         let raw_end = rest
             .iter()
             .enumerate()
@@ -222,16 +223,19 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
                     if matches!(c, '/' | '?' | '#' | '=' | '&') {
                         in_path = true;
                         seg_ascii = false;
+                        seg_delim = false;
                         return false;
                     }
                     if !in_path && !c.is_ascii() {
                         return true;
                     }
-                    if in_path && seg_ascii && is_cjk_or_hangul(c) {
+                    if in_path && (seg_ascii || seg_delim) && is_cjk_or_hangul(c) {
                         return true;
                     }
                     if c.is_ascii_alphanumeric() {
                         seg_ascii = true;
+                    } else if matches!(c, ')' | ']' | '}' | '>' | '"' | '\'' | ',' | ';' | ':') {
+                        seg_delim = true;
                     }
                 }
                 false
@@ -286,6 +290,112 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
         }
     }
     None
+}
+
+fn trim_str_url_end(mut s: &str, trim_punct: bool) -> &str {
+    while let Some(c) = s.chars().next_back() {
+        let strip = match c {
+            '.' | ',' | ':' | ';' | '!' | '?' | '~' => trim_punct,
+            ')' => {
+                s.chars().filter(|&ch| ch == ')').count()
+                    > s.chars().filter(|&ch| ch == '(').count()
+            }
+            ']' => {
+                s.chars().filter(|&ch| ch == ']').count()
+                    > s.chars().filter(|&ch| ch == '[').count()
+            }
+            _ => false,
+        };
+        let Some(rest) = strip.then(|| s.strip_suffix(c)).flatten() else {
+            break;
+        };
+        s = rest;
+    }
+    s
+}
+
+/// 외부 브라우저로 넘길 URL을 정규화한다.
+///
+/// Markdown GFM 자동 링크나 터미널 링크 뒤에 닫힘 괄호·한국어 조사(`)하면`)가 붙은 경우
+/// 불균형 꼬리를 잘라내고, 비ASCII 경로·호스트를 percent-encoding/punycode ASCII URL로
+/// 변환해 macOS `NSURL::URLWithString:`이 `nil`을 돌려보내는 문제를 막는다.
+pub fn sanitize_external_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty()
+        || s.chars()
+            .any(|c| c.is_whitespace() || c.is_control() || is_bidi_control(c))
+    {
+        return None;
+    }
+    let scheme_len = if s
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        8
+    } else if s
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        7
+    } else {
+        0
+    };
+    let candidate = if scheme_len > 0 {
+        let mut in_path = false;
+        let mut seg_delim = false;
+        let mut host_ascii_or_delim = false;
+        let mut cut = None;
+        for (offset, c) in s.char_indices().skip_while(|&(i, _)| i < scheme_len) {
+            if matches!(c, '/' | '?' | '#') {
+                in_path = true;
+                seg_delim = false;
+                continue;
+            }
+            if !in_path {
+                if is_cjk_or_hangul(c) && host_ascii_or_delim {
+                    cut = Some(offset);
+                    break;
+                }
+                if c.is_ascii_alphanumeric()
+                    || matches!(c, ')' | ']' | '}' | '>' | '"' | '\'' | ',' | ';')
+                {
+                    host_ascii_or_delim = true;
+                }
+            } else if matches!(c, '=' | '&') {
+                seg_delim = false;
+            } else if is_cjk_or_hangul(c) && seg_delim {
+                cut = Some(offset);
+                break;
+            } else if matches!(c, ')' | ']' | '}' | '>' | '"' | '\'' | ',' | ';' | ':') {
+                seg_delim = true;
+            }
+        }
+        if let Some(offset) = cut {
+            s.get(..offset)
+                .map_or(s, |prefix| trim_str_url_end(prefix, true))
+        } else {
+            // CJK 접미사가 없더라도 `(https://example.com)` 끝의 불균형 `)`/`]`는 정리한다.
+            trim_str_url_end(s, false)
+        }
+    } else {
+        s
+    };
+    let parsed = gpui::http_client::Url::parse(candidate).ok()?;
+    let allowed = match parsed.scheme() {
+        "http" | "https" => parsed
+            .host_str()
+            .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.')),
+        "mailto" => !parsed.path().is_empty(),
+        _ => false,
+    };
+    if !allowed {
+        return None;
+    }
+    if candidate.is_ascii() {
+        Some(candidate.to_owned())
+    } else {
+        Some(parsed.into())
+    }
 }
 
 /// 포인터 칸을 덮는 후보 글자열(디스크를 보지 않는다). 글자마다 시작 칸, 마지막 글자 다음 칸을 함께 둔다.

@@ -1779,6 +1779,17 @@ function testTabSwitchKeepsScreen() {
   assert(!b.unmounted, "a ready terminal is parked, not closed");
   assert.equal(b.root.hidden, true);
   assert.equal(b.inputActive, false);
+  const pane0Mounts = () =>
+    f.root
+      .descendants()
+      .find((n) => n.className === "terminal-pane primary-pane")
+      .descendants()
+      .filter((n) => n.className === "terminal-mount");
+  assert.deepEqual(
+    pane0Mounts(),
+    [a.root],
+    "parked terminal element is detached from primary pane DOM",
+  );
   a.options.onStatus({ phase: "ready", message: "80 × 24" });
   const count = f.mounts.length;
   tabsNow()[1].action();
@@ -1788,6 +1799,11 @@ function testTabSwitchKeepsScreen() {
     "returning to a parked tab mounts nothing",
   );
   assert.equal(b.root.hidden, false);
+  assert.deepEqual(
+    pane0Mounts(),
+    [b.root],
+    "unparking re-attaches the parked terminal to primary pane DOM",
+  );
   assert.equal(b.inputActive, true);
   assert.equal(a.root.hidden, true);
   f.advance(119000);
@@ -1836,6 +1852,46 @@ function testTabSwitchKeepsScreen() {
     "switching to a chat-mode tab navigates via go()",
   );
   chatSwitch.view.cleanup();
+
+  // Split mode primary tab switch parks ready primary tab off-DOM so querySelectorAll(".terminal-mount") stays exact length 2.
+  const split = fixture([
+    { id: 7, state: "Working", branch: null },
+    { id: 8, state: "Working", branch: null },
+    { id: 9, state: "Working", branch: null },
+  ]);
+  split.mounts[0].options.onStatus({ phase: "ready", message: "80 × 24" });
+  split.buttons.find((b) => b.textContent === "Split terminal").action();
+  split.sheets.at(-1)[0].action();
+  split.mounts[1].options.onStatus({ phase: "ready", message: "80 × 24" });
+  const splitPanels = split.root
+    .descendants()
+    .find((n) => n.className === "session-panels");
+  const allMounts = () =>
+    splitPanels.descendants().filter((n) => n.className === "terminal-mount");
+  assert.equal(allMounts().length, 2);
+  splitPanels.children[0].dispatchEvent(new Event("pointerdown"));
+  const tabById = (id) =>
+    split.root
+      .descendants()
+      .filter((n) => n.className === "session-tab")
+      .find((n) => n.dataset.session === id);
+  tabById(9).action();
+  assert.equal(
+    allMounts().length,
+    2,
+    "switching primary tab in split mode must detach the parked mount instead of leaving 3 .terminal-mount nodes",
+  );
+  split.mounts.at(-1).options.onStatus({ phase: "ready", message: "80 × 24" });
+  const beforeReturnMounts = split.mounts.length;
+  tabById(7).action();
+  assert.equal(
+    split.mounts.length,
+    beforeReturnMounts,
+    "returning to primary tab 7 in split mode unparks without remounting",
+  );
+  assert.equal(allMounts().length, 2);
+  assert.equal(split.mounts[0].root.hidden, false);
+  split.view.cleanup();
   console.log(
     "PASS tab switch reattaches in place, parks ready terminals, and navigates normally for chat tabs",
   );

@@ -288,9 +288,30 @@ fn uninstall_preserves_user_taken_slot() {
 
 #[test]
 fn help_flag_returns_zero() {
-    use std::ffi::OsString;
-    assert_eq!(super::run(&[OsString::from("--help")]), ExitCode::SUCCESS);
-    assert_eq!(super::run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+    let args = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+    assert_eq!(super::run(&args(&["--help"])), ExitCode::SUCCESS);
+    assert_eq!(super::run(&args(&["-h"])), ExitCode::SUCCESS);
+    assert_eq!(super::run(&args(&["help"])), ExitCode::SUCCESS);
+    assert_eq!(
+        super::run(&args(&["install", "--dry-run", "--help"])),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        super::run(&args(&["uninstall", "--yes", "-h"])),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        super::run(&args(&["--chain", "echo", "--help"])),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        super::run(&args(&["install", "--bogus"])),
+        ExitCode::from(2)
+    );
+    // Values immediately following `--chain` belong to the chained shell command, not CLI help.
+    assert!(!super::wants_help(&args(&["--chain", "help"])));
+    assert!(!super::wants_help(&args(&["--chain", "-h"])));
+    assert!(!super::wants_help(&args(&["--chain", "--help"])));
 }
 
 #[test]

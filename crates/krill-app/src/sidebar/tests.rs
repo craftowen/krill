@@ -2494,6 +2494,56 @@ fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) 
     assert!(cx.debug_bounds("pr-badge-3").is_some());
 }
 
+#[gpui::test]
+fn open_next_unread_reveals_collapsed_host_group_and_folded_card(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let wt = PathBuf::from("/repo/a");
+            let mut s1 = session(1, AgentState::Done, Some("/repo/a"));
+            s1.status.agent = "claude".into();
+            s.snapshot = Snapshot {
+                sessions: vec![s1],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec![wt.clone()])]),
+            };
+            s.options.group_by = options::GroupBy::PrStatus;
+            s.prs.insert(wt.clone(), crate::pull_request::Status::Open);
+            s.unread.insert(SessionId(1));
+            s.collapsed_hosts.insert(HostId::Local);
+            s.collapsed_groups
+                .insert(GroupKey::PrStatus(options::PrGroup::Open));
+            s.collapsed.insert(PathBuf::from("/repo"));
+            s.manually_folded_cards.insert(wt.clone());
+            s.expanded_cards.clear();
+            s.rebuild(cx);
+
+            s.open_next_unread(cx);
+
+            assert!(!s.collapsed_hosts.contains(&HostId::Local));
+            assert!(
+                !s.collapsed_groups
+                    .contains(&GroupKey::PrStatus(options::PrGroup::Open))
+            );
+            assert!(!s.collapsed.contains(Path::new("/repo")));
+            assert!(!s.manually_folded_cards.contains(wt.as_path()));
+            assert!(s.expanded_cards.contains(wt.as_path()));
+            assert!(!s.unread.contains(&SessionId(1)));
+            assert_eq!(s.cursor_worktree(), Some(wt));
+            let idx = s.cursor.expect("unread session row must be selected");
+            assert_eq!(idx, 2);
+            assert!(
+                matches!(s.rows.get(idx), Some(Row::Session(sess, _)) if sess.id == SessionId(1))
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("sidebar-session-2").is_some(),
+        "open_next_unread must reveal the session row across collapsed host, group, and card"
+    );
+}
+
 /// AS-09: UI 반영은 백그라운드가 완성한 스냅샷만 소비해야 한다.
 #[gpui::test]
 fn apply_never_discovers_worktrees_on_ui_thread(cx: &mut TestAppContext) {

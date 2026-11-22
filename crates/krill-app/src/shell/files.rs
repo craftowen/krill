@@ -2078,6 +2078,15 @@ impl Shell {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(super) fn editor_search_active(&self, pane: PaneId, cx: &gpui::App) -> bool {
+        self.files
+            .tabs
+            .get(&pane)
+            .and_then(FileTab::focus_editor)
+            .is_some_and(|state| state.read(cx).search_session().is_active())
+    }
+
     /// OWE-874: 파일 탭이 포커스된 상태에서 ⌘F — 미리보기면 원본 보기로 돌린 뒤 에디터 내장 검색을
     /// 연다. 에디터 본문이 없으면(이미지·표·자리표시자) false를 돌려 호출자가 터미널 검색으로 이어가게 한다.
     pub(super) fn open_editor_search(

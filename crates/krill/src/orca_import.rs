@@ -2595,23 +2595,31 @@ fn valid_ssh_destination(s: &str) -> bool {
 }
 
 fn extract_remote_host(endpoint: &str) -> Option<(String, Option<u16>)> {
-    let rest = endpoint
-        .trim()
+    let trimmed = endpoint.trim();
+    let rest = trimmed
         .strip_prefix("wss://")
-        .or_else(|| endpoint.trim().strip_prefix("ws://"))
-        .or_else(|| endpoint.trim().strip_prefix("ssh://"))
-        .or_else(|| endpoint.trim().strip_prefix("https://"))
-        .or_else(|| endpoint.trim().strip_prefix("http://"))?;
-    let authority = rest.split('/').next()?;
+        .or_else(|| trimmed.strip_prefix("ws://"))
+        .or_else(|| trimmed.strip_prefix("ssh://"))
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
     if authority.is_empty() {
         return None;
     }
-    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+    let (clean, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, trailing) = inner.split_once(']')?;
+        let port = if trailing.is_empty() {
+            None
+        } else {
+            let raw_port = trailing.strip_prefix(':')?;
+            Some(raw_port.parse::<u16>().ok()?)
+        };
+        (host, port)
+    } else if let Some((h, p)) = authority.split_once(':') {
         (h, p.parse::<u16>().ok())
     } else {
         (authority, None)
     };
-    let clean = host.trim_matches(['[', ']']);
     if clean.is_empty()
         || matches!(
             clean.to_ascii_lowercase().as_str(),
@@ -9006,5 +9014,24 @@ PRAGMA wal_checkpoint(TRUNCATE);
         assert_eq!(rerun.bots.schedules_migrated, 0);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extract_remote_host_handles_ipv6_and_rejects_loopback() {
+        assert_eq!(
+            extract_remote_host("https://[2001:db8::1]/api"),
+            Some(("2001:db8::1".to_owned(), None))
+        );
+        assert_eq!(
+            extract_remote_host("wss://[2001:db8::1]:8443/ws"),
+            Some(("2001:db8::1".to_owned(), Some(8443)))
+        );
+        assert_eq!(extract_remote_host("https://[::1]/api"), None);
+        assert_eq!(extract_remote_host("wss://[::1]:8443/ws"), None);
+        assert_eq!(extract_remote_host("https://[2001:db8::1/broken"), None);
+        assert_eq!(
+            extract_remote_host("https://dev.example.com:9000?token=1"),
+            Some(("dev.example.com".to_owned(), Some(9000)))
+        );
     }
 }

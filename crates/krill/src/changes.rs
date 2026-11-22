@@ -14,23 +14,59 @@ use krill_proto::screen::Msg as _;
 
 const USAGE: &str = "usage: krill changes [--repo <path>]";
 
-pub fn run(args: &[OsString]) -> ExitCode {
-    // `--repo <path>` 값 자리의 `help`는 경로이므로 첫 두 토큰만 본다.
-    let head: Vec<_> = args.iter().take(2).collect();
-    if head
-        .iter()
-        .any(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
-    {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Help,
+    Query(Option<OsString>),
+}
+
+/// Returns whether `args` requests usage without mistaking `--repo <path>` values for help.
+fn wants_help(args: &[OsString]) -> bool {
+    if matches!(
+        args.first().and_then(|s| s.to_str()),
+        Some("-h" | "--help" | "help")
+    ) {
+        return true;
     }
-    let repo = match args {
-        [] => std::env::current_dir(),
-        [flag, repo] if flag == "--repo" => std::fs::canonicalize(repo),
-        _ => {
-            eprintln!("{USAGE}");
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--repo") => {
+                let _ = it.next();
+            }
+            Some("-h" | "--help") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn parse_args(args: &[OsString]) -> Result<Action, &'static str> {
+    if wants_help(args) {
+        return Ok(Action::Help);
+    }
+    match args {
+        [] => Ok(Action::Query(None)),
+        [flag, repo] if flag == "--repo" => Ok(Action::Query(Some(repo.clone()))),
+        _ => Err(USAGE),
+    }
+}
+
+pub fn run(args: &[OsString]) -> ExitCode {
+    let repo_arg = match parse_args(args) {
+        Ok(Action::Help) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Action::Query(repo)) => repo,
+        Err(usage) => {
+            eprintln!("{usage}");
             return ExitCode::from(2);
         }
+    };
+    let repo = match repo_arg {
+        None => std::env::current_dir(),
+        Some(path) => std::fs::canonicalize(path),
     };
     let result = repo
         .map_err(|e| e.to_string())
@@ -114,8 +150,21 @@ mod tests {
     use super::*;
     #[test]
     fn help_returns_zero() {
-        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
-        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
-        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+        let os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(run(&os(&["--help"])), ExitCode::SUCCESS);
+        assert_eq!(run(&os(&["-h"])), ExitCode::SUCCESS);
+        assert_eq!(run(&os(&["help"])), ExitCode::SUCCESS);
+        assert_eq!(run(&os(&["--repo", "/tmp", "--help"])), ExitCode::SUCCESS);
+        assert_eq!(run(&os(&["--repo", "/tmp", "-h"])), ExitCode::SUCCESS);
+        assert_eq!(run(&os(&["--bogus"])), ExitCode::from(2));
+        // `--repo help` and `--repo -h` pass paths, not help requests.
+        assert_eq!(
+            parse_args(&os(&["--repo", "help"])),
+            Ok(Action::Query(Some(OsString::from("help"))))
+        );
+        assert_eq!(
+            parse_args(&os(&["--repo", "-h"])),
+            Ok(Action::Query(Some(OsString::from("-h"))))
+        );
     }
 }

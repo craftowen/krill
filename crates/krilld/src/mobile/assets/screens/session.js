@@ -1224,6 +1224,7 @@
         return;
       }
       entry.el.hidden = true;
+      entry.el.remove();
       entry.handle.setInputActive?.(false);
       Promise.resolve(entry.handle.setVisible?.(false)).catch(ctx.error);
       parked.set(entry.id, entry);
@@ -1625,12 +1626,14 @@
       if (saved) {
         parked.delete(target.id);
         clearTimeout(saved.parkTimer);
+        if (![...parked.values()].some((e) => e.el === mount)) mount.remove();
         owner = saved;
         mount = saved.el;
         handle = saved.handle;
         terminalPhase = saved.phase;
         terminalMessage = saved.message;
         mount.hidden = viewMode === "chat";
+        primaryPane.append(mount);
         handle.setInputActive?.(activePane === 0);
         handle.setQuestionActive?.(viewMode === "chat");
         Promise.resolve(handle.setVisible?.(viewMode !== "chat")).catch(

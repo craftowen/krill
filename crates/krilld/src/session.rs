@@ -693,6 +693,11 @@ impl Tap {
         Ok((seq, bytes))
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn lock_live_for_test(&self) -> impl Drop + '_ {
+        self.0.live()
+    }
+
     /// PTY와 에뮬레이터를 함께 바꾸고 화면 구독자를 깨운다.
     /// 거대 크기는 와이어 상한으로 자른다(K-01). PTY만 키우면 엔진과 어긋나
     /// 프로그램 줄바꿈이 화면과 달라지므로 둘 다 같은 값으로 둔다.

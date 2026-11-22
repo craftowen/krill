@@ -1098,7 +1098,11 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     };
     cx.simulate_mouse_down(at, MouseButton::Left, cmd);
     cx.simulate_mouse_up(at, MouseButton::Left, cmd);
-    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/문서"));
+    // macOS NSURL 호환을 위해 비ASCII 경로는 percent-encoding 해서 연다.
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/%EB%AC%B8%EC%84%9C")
+    );
     // 우클릭은 프로그램으로, ⇧+우클릭은 Krill 메뉴 몫이라 보내지 않는다.
     cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
     assert_eq!(input(), b"\x1b[<2;1;1M");
@@ -2853,7 +2857,11 @@ fn security_link_preview_title_filter_multiline_paste_and_secure_input(cx: &mut 
     let open = cx.debug_bounds("terminal-link-open").unwrap().center();
     cx.simulate_click(open, Modifiers::default());
     assert_eq!(link_menu(cx), None);
-    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/보안"));
+    // 클립보드 복사는 사람이 읽는 UTF-8을 유지하고, 브라우저 열기는 macOS NSURL 호환을 위해 percent-encoding 한다.
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/%EB%B3%B4%EC%95%88")
+    );
 
     cx.simulate_mouse_move(empty_pt, None, Modifiers::default());
     cx.run_until_parked();
@@ -3919,6 +3927,105 @@ fn key_up_without_shell_focus_sends_nothing(cx: &mut TestAppContext) {
         theirs.read(&mut [0; 64]).is_err(),
         "포커스 없는 keyup은 PTY로 보내지 않는다"
     );
+}
+
+#[gpui::test]
+fn toggle_search_routes_to_editor_and_skips_center_diff_over_open_terminal_bar(
+    cx: &mut TestAppContext,
+) {
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let repo_dir = std::env::temp_dir().join(format!("krill-search-diff-{suffix}"));
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(repo_dir.join("hello.rs"), "pub fn hello() {}\n").unwrap();
+    let code_file = repo_dir.join("target.rs");
+    std::fs::write(&code_file, "fn search_target() {}\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("toggle-search-routing"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let term_pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(term_pane, krill_proto::SessionId(21), ours, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 1. 터미널 탭에서 검색 바를 연다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_search(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("search-bar").is_some());
+
+    // 2. center diff가 열리면 기존 터미널 검색 바는 가리고 새 ⌘F도 터미널 검색 바를 열지 않는다.
+    let diff_dir = repo_dir.clone();
+    cx.update(|_, cx| {
+        let panel = view.read(cx).diff.clone();
+        panel.update(cx, |p, cx| {
+            p.open_diff_file(diff_dir, "hello.rs", false, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("center-diff-view").is_some());
+    assert!(
+        cx.debug_bounds("search-bar").is_none(),
+        "terminal search bar must stay hidden while center diff is open"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.search = None;
+            s.toggle_search(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).search.is_none()));
+    assert!(cx.debug_bounds("search-bar").is_none());
+
+    // 3. center diff를 닫고 터미널 검색 바를 연 상태에서 에디터 탭으로 전환하면 검색 바가 숨고,
+    // ⌘F는 숨은 터미널 바가 아니라 에디터 내장 검색을 연다.
+    cx.update(|_, cx| {
+        let panel = view.read(cx).diff.clone();
+        panel.update(cx, krill_app::diff::Panel::clear_selection);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_search(window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("search-bar").is_some());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.open_file(code_file.clone(), cx));
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("search-bar").is_none(),
+        "terminal search bar must not render over an editor tab"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_search(window, cx));
+    });
+    cx.run_until_parked();
+    let editor_active = cx.update(|_, cx| {
+        let s = view.read(cx);
+        let pane = s.layout.focused().expect("editor pane");
+        s.editor_search_active(pane, cx)
+    });
+    assert!(
+        editor_active,
+        "Cmd+F on focused editor tab must open editor search even when terminal search exists"
+    );
+    assert!(cx.debug_bounds("search-bar").is_none());
+
+    std::fs::remove_dir_all(&repo_dir).ok();
 }
 
 /// AS-17: 출력으로 선택 자리 글자가 바뀌면 선택을 지우고, 그대로면 유지한다.
@@ -8439,6 +8546,101 @@ fn empty_tabs_actions_and_guide_never_panic(cx: &mut TestAppContext) {
 }
 
 /// OWE-866: 더블클릭 단어 선택·트리플클릭 줄 선택·Shift+클릭 확장이 동작하고,
+#[gpui::test]
+fn word_and_line_reverse_and_wrapped_drag_keep_origin_selected(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+
+    let (view, cx) = open(cx, state_path("mouse-word-line-reverse"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(4), ours, cx);
+            let modes = Modes {
+                kitty: 0,
+                flags: Modes::BRACKETED_PASTE,
+            };
+            let body = postcard::to_stdvec(&modes).unwrap();
+            assert!(s.on_frame(pane, TERM_MODES, &body, cx));
+            let row = |t: &str| -> Vec<Cell> {
+                t.chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect()
+            };
+            let mut wrap0 = row("wrapped012");
+            wrap0[9].flags = Flags::WRAPLINE;
+            let ops = vec![
+                Op::Reset { cols: 10, lines: 4 },
+                Op::Line {
+                    line: 0,
+                    cells: wrap0,
+                },
+                Op::Line {
+                    line: 1,
+                    cells: row("tail"),
+                },
+                Op::Line {
+                    line: 2,
+                    cells: row("alpha beta"),
+                },
+                Op::Line {
+                    line: 3,
+                    cells: row("third line"),
+                },
+            ];
+            let (k, b) =
+                ipc::read_frame(&mut &encode_update(Revision(1), Seq(0), ops).unwrap()[0][..])
+                    .unwrap()
+                    .unwrap();
+            assert!(s.on_frame(pane, k, &b, cx));
+        });
+    });
+    cx.run_until_parked();
+    let text_of = |view: &Entity<Shell>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).live[&pane].selection_text.clone())
+    };
+    let pos_on = |view: &Entity<Shell>, cx: &mut VisualTestContext, col: f32, line: f32| {
+        cx.update(|_, cx| {
+            let (bounds, cell) = view.read(cx).live[&pane].painted.get();
+            point(
+                bounds.origin.x + cell.width * (col + 0.5),
+                bounds.origin.y + cell.height * (line + 0.5),
+            )
+        })
+    };
+
+    // 더블클릭("beta") 후 앞 단어("alpha")로 역방향 드래그 → 원점 단어 끝까지 유지.
+    let start_word = pos_on(&view, cx, 7., 2.);
+    let back_word = pos_on(&view, cx, 1., 2.);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_begin(pane, start_word, 2, gpui::Modifiers::default(), cx);
+            s.select_move(pane, back_word, cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("alpha beta"));
+
+    // 트리플클릭("alpha beta", 2행) 후 줄바꿈된 논리 행(0~1행)으로 위쪽 드래그 → 0행 시작부터 2행 끝까지 포함.
+    let start_line = pos_on(&view, cx, 2., 2.);
+    let up_wrapped = pos_on(&view, cx, 1., 1.);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_begin(pane, start_line, 3, gpui::Modifiers::default(), cx);
+            s.select_move(pane, up_wrapped, cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(
+        text_of(&view, cx).as_deref(),
+        Some("wrapped012tail\nalpha beta")
+    );
+}
+
 /// 단어·줄 선택은 한 칸짜리라도 클릭 해제에 지워지지 않는다.
 #[gpui::test]
 fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {

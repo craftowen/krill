@@ -271,7 +271,18 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
     }
 }
 
-fn dispatch_handoff(args: &[String]) -> io::Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+struct HandoffArgs {
+    from_id: u64,
+    to_agent: String,
+    to_session: Option<u64>,
+    prompt: String,
+    lines: usize,
+    cwd: Option<PathBuf>,
+    json: bool,
+}
+
+fn parse_handoff_args(args: &[String]) -> io::Result<HandoffArgs> {
     let mut from_session = None;
     let mut to_agent = "codex".to_owned();
     let mut to_session = None;
@@ -284,20 +295,14 @@ fn dispatch_handoff(args: &[String]) -> io::Result<()> {
         match arg.as_str() {
             "--from" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --from"))?;
-                from_session = Some(
-                    raw.parse::<u64>()
-                        .map_err(|_| bad_arg("invalid --from session id"))?,
-                );
+                from_session = Some(parse_session_id(raw, "--from session")?);
             }
             "--to-agent" | "--agent" => {
                 to_agent.clone_from(it.next().ok_or_else(|| bad_arg("missing --to-agent"))?);
             }
             "--to-session" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --to-session"))?;
-                to_session = Some(
-                    raw.parse::<u64>()
-                        .map_err(|_| bad_arg("invalid --to-session id"))?,
-                );
+                to_session = Some(parse_session_id(raw, "--to-session")?);
             }
             "--prompt" => {
                 prompt.clone_from(it.next().ok_or_else(|| bad_arg("missing --prompt"))?);
@@ -320,6 +325,27 @@ fn dispatch_handoff(args: &[String]) -> io::Result<()> {
     let from_id = from_session.ok_or_else(|| {
         bad_arg("usage: krill handoff --from <session-id> [--to-agent <agent>] [--to-session <id>] [--prompt <text>] [--lines <N>] [--json]")
     })?;
+    Ok(HandoffArgs {
+        from_id,
+        to_agent,
+        to_session,
+        prompt,
+        lines,
+        cwd,
+        json,
+    })
+}
+
+fn dispatch_handoff(args: &[String]) -> io::Result<()> {
+    let HandoffArgs {
+        from_id,
+        to_agent,
+        to_session,
+        prompt,
+        lines,
+        cwd,
+        json,
+    } = parse_handoff_args(args)?;
 
     // 원본 세션을 못 읽으면 빈 맥락으로 새 에이전트를 띄우지 않는다.
     let captured = crate::session::capture_session_text(from_id)
@@ -590,10 +616,7 @@ fn collect_ports_with(
         match arg.as_str() {
             "--session" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --session"))?;
-                session_filter = Some(
-                    raw.parse::<u64>()
-                        .map_err(|_| bad_arg("invalid --session id"))?,
-                );
+                session_filter = Some(parse_session_id(raw, "--session")?);
             }
             "--no-probe" => probe = false,
             "--text" => {
@@ -652,14 +675,7 @@ fn parse_reference_args(args: &[String]) -> io::Result<(Option<PathBuf>, bool, V
             "--json" => json = true,
             "--session" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --session"))?;
-                let sid = raw
-                    .strip_prefix('s')
-                    .unwrap_or(raw)
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| bad_arg("invalid --session id"))?;
-                session = Some(sid);
+                session = Some(parse_session_id(raw, "--session")?);
             }
             _ if arg.starts_with('-') => {
                 return Err(bad_arg(format!("unexpected argument {arg}")));
@@ -673,6 +689,15 @@ fn parse_reference_args(args: &[String]) -> io::Result<(Option<PathBuf>, bool, V
         wt = Some(crate::session::resolve_session_cwd(sid)?);
     }
     Ok((wt, json, urls))
+}
+
+fn parse_session_id(raw: &str, label: &str) -> io::Result<u64> {
+    raw.strip_prefix('s')
+        .unwrap_or(raw)
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| bad_arg(format!("invalid {label} id")))
 }
 
 fn resolve_wt_key(wt_opt: Option<PathBuf>) -> io::Result<String> {
@@ -985,5 +1010,28 @@ mod tests {
         )
         .unwrap();
         assert!(ok_emitted);
+    }
+
+    #[test]
+    fn handoff_and_ports_accept_s_prefixed_session_ids_and_reject_zero() -> io::Result<()> {
+        let parsed = parse_handoff_args(&args(&["--from", "s12", "--to-session", "s34"]))?;
+        assert_eq!(parsed.from_id, 12);
+        assert_eq!(parsed.to_session, Some(34));
+        assert!(parse_handoff_args(&args(&["--from", "0"])).is_err());
+        assert!(parse_handoff_args(&args(&["--from", "s0"])).is_err());
+        assert!(parse_handoff_args(&args(&["--from", "1", "--to-session", "0"])).is_err());
+
+        let entries = collect_ports(&args(&[
+            "--text",
+            "http://127.0.0.1:4173",
+            "--session",
+            "s42",
+            "--no-probe",
+        ]))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, 42);
+        assert!(collect_ports(&args(&["--session", "0", "--no-probe"])).is_err());
+        assert!(collect_ports(&args(&["--session", "s0", "--no-probe"])).is_err());
+        Ok(())
     }
 }

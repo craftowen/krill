@@ -318,7 +318,6 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
     let reconnect = Arc::new(Notify::new());
     let supervisor = {
         let endpoint = endpoint.clone();
-        let connection_tx = connection_tx.clone();
         let paused = Arc::clone(&dial_paused);
         let reconnect = Arc::clone(&reconnect);
         let rejected = Arc::clone(&rejected);
@@ -439,7 +438,20 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
                     let Ok(id)=crate::resume::StreamId::random() else { continue };
                     let grace=Duration::from_millis(cfg.resume_grace_ms);
                     let Ok((logical,actor))=crate::resume::Logical::spawn(unix,id,grace,cfg.replay_buffer_bytes) else { continue };
-                    if let Ok(mut map)=stream_map.lock() { map.insert(id,Arc::clone(&logical)); }
+                    let inserted = if let Ok(mut map) = stream_map.lock() {
+                        if rejected.load(std::sync::atomic::Ordering::Acquire) {
+                            false
+                        } else {
+                            map.insert(id, Arc::clone(&logical));
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    if !inserted {
+                        logical.close("device authorization revoked");
+                        continue;
+                    }
                     let driver_logical=Arc::clone(&logical); let conn_rx=connection_rx.clone();
                     let driver=tokio::spawn(async move { drive_client_stream(driver_logical,conn_rx,grace).await; });
                     let map=Arc::clone(&stream_map);
@@ -450,11 +462,11 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
                 }
             }
         }
-        supervisor.abort();
-        supervisor.await.ok();
-        if let Some(conn) = connection_tx.borrow().connection.as_ref() {
+        if let Some(conn) = connection_rx.borrow().connection.as_ref() {
             conn.close(0u32.into(), b"tunnel shutdown");
         }
+        supervisor.abort();
+        supervisor.await.ok();
         if let Ok(map) = stream_map.lock() {
             for logical in map.values() {
                 logical.close("tunnel shutdown");
@@ -588,8 +600,14 @@ fn record_failure(
         }
     });
     if unauthorized {
-        rejected.store(true, std::sync::atomic::Ordering::Release);
-        close_streams(streams, "device authorization revoked");
+        if let Ok(map) = streams.lock() {
+            rejected.store(true, std::sync::atomic::Ordering::Release);
+            for logical in map.values() {
+                logical.close("device authorization revoked");
+            }
+        } else {
+            rejected.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     unauthorized
 }
@@ -615,7 +633,10 @@ async fn drive_client_stream(
     let mut previous = None;
     let mut generation = 0u64;
     loop {
-        if logical.is_closed() {
+        if logical.is_closed() || connections.has_changed().is_err() {
+            if !logical.is_closed() {
+                logical.close("tunnel closed");
+            }
             return;
         }
         let current = connections.borrow().clone();
@@ -674,7 +695,13 @@ async fn drive_client_stream(
                 previous = None;
             }
         }
-        tokio::select! { result=connections.changed()=>if result.is_err() { return; }, ()=tokio::time::sleep(Duration::from_millis(20))=>{} }
+        tokio::select! {
+            result = connections.changed() => if result.is_err() {
+                logical.close("tunnel closed");
+                return;
+            },
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
     }
 }
 
@@ -798,6 +825,127 @@ mod tests {
         assert!(self_tmp.exists());
         assert!(other_host_tmp.exists());
         assert!(live_status.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drive_client_stream_closes_immediately_when_supervisor_drops_sender() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (local, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (tx, rx) = watch::channel(ConnectionState {
+            epoch: 0,
+            connection: None,
+        });
+        let grace = Duration::from_secs(60);
+        let id = crate::resume::StreamId::random().unwrap();
+        let (logical, actor) = crate::resume::Logical::spawn(local, id, grace, 64 * 1024).unwrap();
+        let driver = tokio::spawn(drive_client_stream(logical, rx, grace));
+
+        drop(tx);
+
+        let mut buf = [0u8; 16];
+        let res = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut buf))
+            .await
+            .expect("client stream must not hang for 60s grace after supervisor exit");
+        assert!(matches!(res, Ok(0) | Err(_)));
+        driver.await.unwrap();
+        actor.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unauthorized_403_closes_waiting_and_late_client_streams_before_grace() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = PathBuf::from(format!("/tmp/klu-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let server_ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_address_lookup()
+            .alpns(vec![ALPN_LINK.to_vec()])
+            .bind_addr(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                0,
+            ))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let server_addr = server_ep.addr();
+        let connected = Arc::new(tokio::sync::Notify::new());
+        let reject_now = Arc::new(tokio::sync::Notify::new());
+        let server_connected = Arc::clone(&connected);
+        let server_reject = Arc::clone(&reject_now);
+        let server_task = tokio::spawn(async move {
+            if let Some(incoming) = server_ep.accept().await
+                && let Ok(conn) = incoming.await
+            {
+                server_connected.notify_one();
+                server_reject.notified().await;
+                conn.close(403u32.into(), b"unauthorized");
+                // Drain until endpoint closes cleanly.
+                conn.closed().await;
+            }
+            server_ep.close().await;
+        });
+
+        LinkConfig {
+            relay: crate::config::RelaySetting::Off,
+            lan_discovery: false,
+            resume_grace_ms: 60_000,
+            ..LinkConfig::default()
+        }
+        .save(&dir)
+        .unwrap();
+        crate::store::upsert_host(
+            &dir,
+            crate::store::RemoteHost::from_endpoint_addr("srv".to_owned(), "srv", &server_addr, 1),
+        )
+        .unwrap();
+
+        let handle = start_tunnel(ConnectOptions::new(dir.clone(), "srv".to_owned()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), connected.notified())
+            .await
+            .expect("tunnel should dial server");
+
+        let mut client = tokio::net::UnixStream::connect(handle.socket_path())
+            .await
+            .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        // Give accept+driver a moment to register and stall before triggering 403.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        reject_now.notify_one();
+
+        let mut buf = [0u8; 16];
+        let read_res = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("waiting client stream must close immediately on 403 Unauthorized");
+        assert!(matches!(read_res, Ok(0) | Err(_)));
+
+        // Wait until status reflects Unauthorized, then verify late connections also reject fast.
+        let mut status_rx = handle.status_rx.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while status_rx.borrow().last_error_kind != Some(TunnelErrorKind::Unauthorized) {
+            assert!(tokio::time::Instant::now() < deadline);
+            status_rx.changed().await.unwrap();
+        }
+
+        let mut late_client = tokio::net::UnixStream::connect(handle.socket_path())
+            .await
+            .unwrap();
+        let late_res = tokio::time::timeout(Duration::from_secs(2), late_client.read(&mut buf))
+            .await
+            .expect("late client stream must close immediately after 403 rejection");
+        assert!(matches!(late_res, Ok(0) | Err(_)));
+
+        handle.shutdown().await;
+        server_task.await.unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 }
