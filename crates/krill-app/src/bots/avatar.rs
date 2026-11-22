@@ -315,8 +315,9 @@ pub fn render(
         .items_center()
         .justify_center()
         .text_size(text)
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(p.muted_foreground)
+        // Orca BotAvatarTile: `font-semibold text-foreground` on the muted tile.
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(p.foreground)
         .child(glyph)
         .into_any_element()
 }

@@ -559,9 +559,9 @@ impl Shell {
         let mut header = div()
             .id("bots-section-header")
             .debug_selector(|| "bots-section-header".into())
+            // Orca SidebarSectionHeader: `h-8 px-2`, a fold chevron before the title.
             .h(ui::SIDEBAR_HEADER_HEIGHT)
-            .pl_3()
-            .pr_1p5()
+            .px_2()
             .flex()
             .items_center()
             .gap_1p5()
@@ -575,16 +575,46 @@ impl Shell {
                     } else {
                         text::SB_COLLAPSE.get()
                     })
+                    .aria_expanded(!collapsed)
+                    .group("bots-section-title")
                     .cursor_pointer()
                     .flex_none()
-                    .text_size(ui::TEXT_XS)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.bot_ui.collapsed = !this.bot_ui.collapsed;
                         cx.notify();
                     }))
-                    .child(krill_app::i18n::catalog::sidebar::NAV_BOTS.get()),
+                    .child(
+                        div()
+                            .ml_0p5()
+                            .size_5()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(ui::RADIUS_SM)
+                            .text_color(p.muted_foreground)
+                            .group_hover("bots-section-title", |d| {
+                                d.bg(p.accent.opacity(0.7)).text_color(p.foreground)
+                            })
+                            .child(
+                                gpui_component::Icon::new(if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(px(14.)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pr_0p5()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.muted_foreground.opacity(0.8))
+                            .child(krill_app::i18n::catalog::sidebar::NAV_BOTS.get()),
+                    ),
             );
         if collapsed {
             header = header.child(self.render_collapsed_faces(p, cx));
@@ -759,17 +789,25 @@ impl Shell {
                 .tab_index(0)
                 .focus_visible(|d| d.border_1().border_color(p.ring))
                 .aria_label(bot.name.clone())
-                .w_full()
+                // Orca BotSidebarRow sits on the workspace card surface: `ml-1 pr-1.5`, a
+                // transparent border that the active row fills like an active workspace card.
+                .ml_1()
                 .pl(px(5.))
+                .pr_1p5()
                 .py(px(5.))
                 .rounded(ui::RADIUS_MD)
+                .border_1()
                 .flex()
                 .items_center()
                 .cursor_pointer()
                 .when(bot.paused, |d| d.opacity(0.6))
-                .when(active, |d| d.bg(p.sidebar_accent))
+                .when(active, |d| {
+                    d.bg(p.worktree_sidebar)
+                        .border_color(p.worktree_sidebar_border)
+                })
                 .when(!active, |d| {
-                    d.hover(|d| d.bg(p.sidebar_accent.opacity(0.6)))
+                    d.border_color(ui::TRANSPARENT)
+                        .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)))
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.open_bot_home(open_id.clone(), None, cx);
@@ -777,7 +815,7 @@ impl Shell {
                 .child(
                     div()
                         .mr_2()
-                        .child(self.bot_avatar(bot, 36., ui::RADIUS_SM, p)),
+                        .child(self.bot_avatar(bot, 32., ui::RADIUS_SM, p)),
                 )
                 .child(
                     div()
@@ -1020,6 +1058,10 @@ impl Shell {
             .flex_none()
             // Orca caps the section at 40% of the sidebar; the bot list scrolls inside it.
             .max_h(gpui::relative(0.4))
+            // Orca SidebarBotsSplit: `border-b pb-2`, the Bots / Projects divider.
+            .border_b_1()
+            .border_color(p.worktree_sidebar_border)
+            .pb_2()
             .min_h_0()
             .w_full()
             .flex()
