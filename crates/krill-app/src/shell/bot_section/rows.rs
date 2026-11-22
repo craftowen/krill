@@ -447,13 +447,14 @@ impl Shell {
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let has_children = !facts.chats.is_empty() || !facts.stray.is_empty();
         let folded = self.bot_ui.folded.contains(&bot.id);
         div()
             .w_full()
             .flex()
             .flex_col()
-            .child(self.render_bot_row(bot, facts, folded, p, cx))
-            .when(!folded, |d| {
+            .child(self.render_bot_row(bot, facts, has_children, folded, p, cx))
+            .when(has_children && !folded, |d| {
                 d.child(
                     div()
                         .when(bot.paused, |d| d.opacity(0.6))
@@ -467,6 +468,7 @@ impl Shell {
         &self,
         bot: &SidebarBot,
         facts: &BotFacts,
+        has_children: bool,
         folded: bool,
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
@@ -511,7 +513,22 @@ impl Shell {
                 .into_any_element(),
         };
         let line = self.render_bot_line(bot, facts, p);
-        let trailing = self.render_fold_strip(bot, facts, folded, &group, p, cx);
+        // Orca #46717: working shows once at the row's end — on the fold strip when the bot has
+        // one, else in its own trailing slot lined up with fold rows' marks.
+        let bot_working = !bot.paused && facts.status == RowStatus::Working;
+        let trailing: Option<AnyElement> = if has_children {
+            Some(
+                self.render_fold_strip(bot, facts, folded, &group, p, cx)
+                    .into_any_element(),
+            )
+        } else if bot_working {
+            Some(
+                self.render_row_working_mark(bot.id.as_str(), cx)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         let hover = self.bot_hover_card(bot, facts, cx.weak_entity(), cx);
 
         div()
@@ -522,7 +539,7 @@ impl Shell {
             .tab_index(0)
             .focus_visible(|d| d.border_color(p.ring))
             .aria_label(bot.name.clone())
-            .aria_expanded(!folded)
+            .when(has_children, |d| d.aria_expanded(!folded))
             // Orca workspace card surface: `ml-1 pr-1.5 rounded-lg border`, `pt/pb/pl-1.25`.
             .ml_1()
             .pl(px(5.))
@@ -599,7 +616,7 @@ impl Shell {
                             )
                             .children(line),
                     )
-                    .child(trailing),
+                    .children(trailing),
             )
             .context_menu(self.bot_row_menu(bot, facts, cx.weak_entity()))
     }
@@ -654,8 +671,43 @@ impl Shell {
         )
     }
 
-    /// Orca `BotRowFoldToggle`: the row's whole right edge, its chevron hidden until hover while
-    /// unfolded, with the one live mark (a folded worker's ask, else the bot's own work).
+    /// Orca `BotRowWorkingMark` (#46717): trailing working spinner on a row without a fold strip,
+    /// followed by a chevron-wide spacer so every working spinner in the sidebar sits in one column.
+    pub(super) fn render_row_working_mark(
+        &self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let sel = format!("bot-row-working-{id}");
+        let mark_sel = format!("bot-row-working-mark-{id}");
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel.clone())
+            .role(gpui::Role::Image)
+            .aria_label(text::STATUS_WORKING.get())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .child(
+                div()
+                    .debug_selector(move || mark_sel.clone())
+                    .flex()
+                    .items_center()
+                    .child(ui::status::status_glyph_slot(
+                        AgentState::Working,
+                        false,
+                        ui::status::Size::Md,
+                        Some(&self.bot_ui.spinners),
+                        cx,
+                    )),
+            )
+            .child(div().size_4())
+    }
+
+    /// Orca `BotRowFoldToggle` (#46717): the row's whole right edge, its chevron hidden until hover
+    /// while unfolded, with one live mark (a folded worker's ask outranks the bot's own work, which
+    /// outranks folded working workers).
     fn render_fold_strip(
         &self,
         bot: &SidebarBot,
@@ -667,18 +719,43 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         let fold_id = bot.id.clone();
         let name = bot.name.clone();
-        let any_waiting = facts
+        let mut workers = facts
             .chats
             .iter()
             .flat_map(|c| &c.workers)
-            .any(WorkerFacts::waiting);
-        let mark = if folded && any_waiting {
+            .chain(&facts.stray);
+        let mut any_waiting = false;
+        let mut any_working_worker = false;
+        for w in &mut workers {
+            if w.waiting() {
+                any_waiting = true;
+            } else if w.live && w.state == AgentState::Working {
+                any_working_worker = true;
+            }
+        }
+        let live_worker = if any_waiting {
             Some(AgentState::Waiting)
-        } else if facts.status == RowStatus::Working && !bot.paused {
+        } else if any_working_worker {
             Some(AgentState::Working)
         } else {
             None
         };
+        let mark = bot_fold_mark(
+            folded,
+            !bot.paused && facts.status == RowStatus::Working,
+            live_worker,
+        );
+        let base_label = if folded {
+            text::SB_UNFOLD.format(&[("name", &name)])
+        } else {
+            text::SB_FOLD.format(&[("name", &name)])
+        };
+        let aria_label = if mark == Some(AgentState::Working) {
+            format!("{base_label} · {}", text::STATUS_WORKING.get())
+        } else {
+            base_label
+        };
+        let mark_sel = format!("bot-fold-mark-{}", bot.id.as_str());
         div()
             .id(SharedString::from(format!("bot-fold-{}", bot.id.as_str())))
             .debug_selector({
@@ -686,11 +763,7 @@ impl Shell {
                 move || sel.clone()
             })
             .role(gpui::Role::Button)
-            .aria_label(if folded {
-                text::SB_UNFOLD.format(&[("name", &name)])
-            } else {
-                text::SB_FOLD.format(&[("name", &name)])
-            })
+            .aria_label(aria_label)
             .aria_expanded(!folded)
             // `-mt/-mb-1.25 -mr-1.5 min-w-10 px-1.5 gap-0.5`: full height, flush right.
             .my(px(-5.))
@@ -713,13 +786,19 @@ impl Shell {
                 cx.notify();
             }))
             .when_some(mark, |d, state| {
-                d.child(ui::status::status_glyph_slot(
-                    state,
-                    false,
-                    ui::status::Size::Md,
-                    Some(&self.bot_ui.spinners),
-                    cx,
-                ))
+                d.child(
+                    div()
+                        .debug_selector(move || mark_sel.clone())
+                        .flex()
+                        .items_center()
+                        .child(ui::status::status_glyph_slot(
+                            state,
+                            false,
+                            ui::status::Size::Md,
+                            Some(&self.bot_ui.spinners),
+                            cx,
+                        )),
+                )
             })
             .child(
                 div()
@@ -1297,6 +1376,23 @@ fn avatar_tile(bot: &SidebarBot, cx: &gpui::App) -> AnyElement {
         ui::RADIUS_LG,
         ui::palette(cx),
     )
+}
+
+/// Orca `BotRowFoldToggle` mark priority (#46717): one mark at most — a folded worker's ask
+/// outranks the bot's own work, which outranks folded working workers.
+pub(super) const fn bot_fold_mark(
+    folded: bool,
+    bot_working: bool,
+    live_worker: Option<AgentState>,
+) -> Option<AgentState> {
+    let live = if folded { live_worker } else { None };
+    if matches!(live, Some(AgentState::Waiting)) {
+        live
+    } else if bot_working {
+        Some(AgentState::Working)
+    } else {
+        live
+    }
 }
 
 /// Orca `BotAvatarStatusBadge`: needs-you, paused or a usage-limit stop on the picture's

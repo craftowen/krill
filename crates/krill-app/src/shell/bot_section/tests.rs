@@ -643,3 +643,194 @@ fn group_page_turns_peer_handoff_reply_picker_and_panel_filters(cx: &mut TestApp
     assert!(log.iter().any(|e| e.starts_with("send:grp-release:")));
     assert!(log.iter().any(|e| e == "delete:grp-release"));
 }
+
+#[test]
+fn bot_fold_mark_priority_matches_orca() {
+    use super::rows::bot_fold_mark;
+    // Unfolded: only the bot's own work shows a spinner on the fold strip.
+    assert_eq!(bot_fold_mark(false, false, None), None);
+    assert_eq!(bot_fold_mark(false, false, Some(AgentState::Waiting)), None);
+    assert_eq!(bot_fold_mark(false, false, Some(AgentState::Working)), None);
+    assert_eq!(bot_fold_mark(false, true, None), Some(AgentState::Working));
+    assert_eq!(
+        bot_fold_mark(false, true, Some(AgentState::Waiting)),
+        Some(AgentState::Working)
+    );
+    // Folded: waiting worker outranks bot working, which outranks folded working worker.
+    assert_eq!(
+        bot_fold_mark(true, true, Some(AgentState::Waiting)),
+        Some(AgentState::Waiting)
+    );
+    assert_eq!(
+        bot_fold_mark(true, true, Some(AgentState::Working)),
+        Some(AgentState::Working)
+    );
+    assert_eq!(
+        bot_fold_mark(true, false, Some(AgentState::Working)),
+        Some(AgentState::Working)
+    );
+    assert_eq!(bot_fold_mark(true, false, None), None);
+}
+
+#[gpui::test]
+fn working_bot_row_shows_one_spinner_at_row_end_and_aligns_with_group_row(cx: &mut TestAppContext) {
+    use krill_proto::bots::{
+        BotGroupChat, BotGroupReplyAudience, BotGroupSummary, BotGroupTurnInfo,
+    };
+
+    let (view, cx) = open(cx, state_path("bot-sidebar-one-spinner"));
+    cx.simulate_resize(gpui::size(px(1400.), px(1000.)));
+    let wt = "/repo/krill/.worktrees/release";
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![
+            session(21, AgentState::Working, None, None),
+            session(31, AgentState::Working, None, Some(wt)),
+            session(41, AgentState::Done, None, None),
+            session(51, AgentState::Working, None, Some(wt)),
+        ],
+        trees: std::collections::BTreeMap::from([(
+            std::path::PathBuf::from("/repo/krill"),
+            vec![std::path::PathBuf::from(wt)],
+        )]),
+    };
+    let group = BotGroupChat {
+        id: "grp-work".to_owned(),
+        name: "Release Crew".to_owned(),
+        bot_ids: vec![BotId::new("scout").unwrap(), BotId::new("idle").unwrap()],
+        description: String::new(),
+        created_at_ms: 1_700_000_000_010,
+        updated_at_ms: 1_700_000_000_010,
+    };
+    let group_summary = BotGroupSummary {
+        group,
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        latest_message: None,
+        active_turns: vec![BotGroupTurnInfo {
+            group_id: "grp-work".to_owned(),
+            thread_id: "thr-main".to_owned(),
+            bot_id: BotId::new("scout").unwrap(),
+            session_id: SessionId(21),
+            message_id: "m1".to_owned(),
+            started_at_ms: 1_700_000_000_020,
+        }],
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut store = worker_store(21, 31, wt);
+            // Idle bot's folded worker (session 51) is working.
+            store.runs.push(krill_proto::orchestration::Run {
+                id: "r2".into(),
+                title: "check".into(),
+                coordinator_session_id: Some(41),
+                status: krill_proto::orchestration::RunStatus::Active,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+            store.dispatches.push(krill_proto::orchestration::Dispatch {
+                id: "d2".into(),
+                run_id: "r2".into(),
+                task_id: None,
+                worker_name: "check".into(),
+                agent: "claude".into(),
+                session_id: Some(51),
+                depth: 1,
+                cwd: wt.into(),
+                prompt: String::new(),
+                status: krill_proto::orchestration::DispatchStatus::Active,
+                summary: None,
+                archived_output: None,
+                started_at_ms: 0,
+                ended_at_ms: None,
+                release_state: krill_proto::orchestration::DispatchReleaseState::default(),
+                session_origin: krill_proto::orchestration::DispatchSessionOrigin::default(),
+                model: None,
+                effort: None,
+                retry_of: None,
+                request_id: None,
+            });
+            s.orch_snapshot = Arc::new(store);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+            let mut scout_chat = chat("scout", 21, "");
+            scout_chat.working = true;
+            let scout = bot("scout", "Scout", "Checks nightly", vec![scout_chat]);
+            let idle = bot(
+                "idle",
+                "Idle",
+                "Has working worker",
+                vec![chat("idle", 41, "")],
+            );
+            let bare = bot("bare", "Bare", "No chats yet", vec![]);
+            s.apply_sidebar_state(0, vec![scout, idle, bare], vec![group_summary], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Unfolded working bot: mark sits on its fold strip after the row's left/avatar side.
+    let scout_row = cx.debug_bounds("bot-row-scout").expect("scout row");
+    let scout_mark = cx
+        .debug_bounds("bot-fold-mark-scout")
+        .expect("scout fold mark");
+    assert!(scout_mark.left() > scout_row.center().x);
+    // Idle bot unfolded: no working mark on its fold strip; folded: worker's spinner shows once.
+    assert!(cx.debug_bounds("bot-fold-mark-idle").is_none());
+    click(cx, "bot-fold-idle");
+    assert!(cx.debug_bounds("bot-fold-mark-idle").is_some());
+    // Bare bot with no chats has no fold toggle at all.
+    assert!(cx.debug_bounds("bot-fold-bare").is_none());
+    // Folded working bot with working workers still shows exactly one fold mark (no duplicate).
+    click(cx, "bot-fold-scout");
+    let scout_folded_mark = cx
+        .debug_bounds("bot-fold-mark-scout")
+        .expect("folded scout mark");
+    // Working group row (no fold control) shows trailing working mark aligned in the same column.
+    let group_mark = cx
+        .debug_bounds("bot-row-working-mark-group-grp-work")
+        .expect("group working mark");
+    let delta = (f32::from(scout_folded_mark.left()) - f32::from(group_mark.left())).abs();
+    assert!(
+        delta <= 2.0,
+        "trailing working mark should align with fold row mark: fold={} group={}",
+        scout_folded_mark.left(),
+        group_mark.left()
+    );
+}
+
+#[gpui::test]
+fn collapsed_bot_preview_stays_next_to_bots_label(cx: &mut TestAppContext) {
+    let (view, cx) = setup(cx, "bot-sidebar-collapsed-left");
+    // Leave only one bot so centering vs left-alignment is unmistakable.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let one = s.sidebar_bots[0].clone();
+            s.apply_sidebar_bots(0, vec![one], cx);
+            s.bot_ui.collapsed = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    let title = cx.debug_bounds("bots-section-title").expect("Bots label");
+    let preview = cx
+        .debug_bounds("bots-collapsed-preview")
+        .expect("collapsed preview container");
+    let face = cx
+        .debug_bounds("bots-collapsed-krill")
+        .expect("collapsed bot face");
+    assert!(
+        preview.size.width > px(80.),
+        "preview fills remaining header width"
+    );
+    assert!(
+        face.left() >= title.right(),
+        "collapsed bot sits to the right of the Bots label"
+    );
+    assert!(
+        face.left() - title.right() <= px(16.),
+        "collapsed bot stays flush next to the Bots label, not centered: title_right={} face_left={} preview_width={}",
+        title.right(),
+        face.left(),
+        preview.size.width
+    );
+}
