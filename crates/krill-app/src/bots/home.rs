@@ -13,10 +13,10 @@ use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::SessionId;
-use krill_proto::bots::{BotConfig, BotItem, BotItemLink, BotItemStatus};
+use krill_proto::bots::{BotConfig, BotItem, BotItemActor, BotItemLink, BotItemStatus};
 
 use super::{View, now_unix_ms};
-use crate::i18n::catalog::bots as text;
+use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
 /// Rows a group shows before "Show N more" (Orca `BOT_ITEM_GROUP_ROWS`).
@@ -98,6 +98,17 @@ pub(super) fn activity_at(item: &BotItem, now: u64) -> u64 {
         Some(until) if until <= now => item.last_activity_at_ms.max(until),
         _ => item.last_activity_at_ms,
     }
+}
+
+/// The newest event someone other than the owner wrote (Orca `othersLastEventId`): what makes a
+/// row unseen.
+pub(super) fn others_last_event(item: &BotItem) -> u64 {
+    item.events
+        .iter()
+        .filter(|e| !matches!(e.actor, BotItemActor::Owner { .. }))
+        .map(|e| e.id)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Orca's derived Stale: Needs you, or In progress with no live worker, untouched for the stale
@@ -400,7 +411,7 @@ impl View {
         p: &ui::Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> AnyElement {
         if let Some(item) = self
             .items
             .open_uid
@@ -408,7 +419,9 @@ impl View {
             .and_then(|uid| self.items.items.iter().find(|i| &i.uid == uid))
             .cloned()
         {
-            return self.render_home_item(bot, &item, p, window, cx);
+            return self
+                .render_home_item(bot, &item, p, window, cx)
+                .into_any_element();
         }
         let now = now_unix_ms();
         let filter_on = self.items.needs_you_only;
@@ -417,6 +430,15 @@ impl View {
             .iter()
             .filter(|i| !filter_on || i.status == BotItemStatus::NeedsYou);
         let groups = grouped(shown, |i| self.item_live(i), now);
+        self.items.shown_order = Group::ALL
+            .iter()
+            .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
+            .flat_map(|g| groups[*g as usize].iter().map(|i| i.uid.clone()))
+            .collect();
+        self.items
+            .selected
+            .retain(|uid| all.iter().any(|i| &i.uid == uid));
+        self.note_items_seen(bot, &all, cx);
         // Every row's number column fits the widest number, so titles start in one column.
         let number_chars = all
             .iter()
@@ -447,9 +469,10 @@ impl View {
             .flex()
             .flex_col()
             .gap_2();
+        let needs = self.home_needs(bot);
         for group in Group::ALL {
             let rows = &groups[group as usize];
-            if rows.is_empty() {
+            if rows.is_empty() && (group != Group::NeedsYou || needs.is_empty()) {
                 continue;
             }
             list = list.child(self.render_home_group(bot, group, rows, number_chars, now, p, cx));
@@ -457,8 +480,59 @@ impl View {
         body = body
             .child(list)
             .children(Self::render_home_note(bot, &all, &groups, filter_on, p, cx));
-        body.child(self.render_automations(bot, p, cx))
-            .children(self.render_suggestions(bot, p, cx))
+        let pill = self.render_selection_pill(&bot.id, p, cx);
+        let snooze = self.render_snooze_pick(p, window, cx);
+        let cancel = self.render_cancel_ask(p, window, cx);
+        let body = body
+            .child(self.render_automations(bot, p, cx))
+            .children(self.render_suggestions(bot, p, cx));
+        div()
+            .id("bots-tab-items")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && !this.items.selected.is_empty() {
+                    this.items.selected.clear();
+                    cx.notify();
+                }
+            }))
+            .child(body)
+            .children(pill)
+            .children(snooze)
+            .children(cancel)
+            .into_any_element()
+    }
+
+    /// Keeps the item seen mark Home opened with, and moves the bot's mark past what it shows.
+    fn note_items_seen(&mut self, bot: &BotConfig, all: &[BotItem], cx: &mut Context<Self>) {
+        let Some(host_seen) = self.items.upcoming.as_ref().map(|u| u.items_seen_event_id) else {
+            return;
+        };
+        let seen = *self
+            .items
+            .seen_at_open
+            .entry(bot.id.clone())
+            .or_insert(host_seen);
+        let newest = all.iter().map(others_last_event).max().unwrap_or(0);
+        if newest > host_seen.max(seen) {
+            if let Some(up) = self.items.upcoming.as_mut() {
+                up.items_seen_event_id = newest;
+            }
+            self.mark_bot_items_opened(bot.id.clone(), cx);
+        }
+    }
+
+    /// The seen mark Home opened with for this bot.
+    fn seen_mark(&self, bot: &BotConfig) -> u64 {
+        self.items
+            .seen_at_open
+            .get(&bot.id)
+            .copied()
+            .unwrap_or(u64::MAX)
     }
 
     /// Orca's filter chip under the header while "Needs you only" is on.
@@ -588,11 +662,30 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let open = group.folded_by_default() == self.items.folds.contains(group.id());
+        let seen = self.seen_mark(bot);
+        let fresh = if group == Group::Closed {
+            rows.iter().filter(|i| others_last_event(i) > seen).count()
+        } else {
+            0
+        };
+        let summary = (!open).then(|| {
+            if fresh > 0 {
+                format!(
+                    "{} · {}",
+                    rows.len(),
+                    hm::NEW_COUNT.format(&[("n", &fresh.to_string())])
+                )
+            } else if group == Group::NeedsYou {
+                (rows.len() + self.home_needs(bot).len()).to_string()
+            } else {
+                rows.len().to_string()
+            }
+        });
         let header = section_header(
             &format!("bot-home-group-{}", group.id()),
             group.title(),
             open,
-            (!open).then(|| rows.len().to_string()),
+            summary,
             p,
         )
         .on_click(cx.listener(move |this, _, _, cx| {
@@ -601,9 +694,35 @@ impl View {
             }
             cx.notify();
         }));
+        let header = div()
+            .flex()
+            .items_center()
+            .child(div().flex_1().min_w_0().child(header))
+            .when(group == Group::Stale, |d| {
+                d.child(
+                    ui::ghost("bot-home-stale-cancel", hm::CANCEL_ALL.get())
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.items.stale_confirm = Some(());
+                            cx.notify();
+                        })),
+                )
+            });
+        let needs = if group == Group::NeedsYou {
+            self.home_needs(bot)
+        } else {
+            Vec::new()
+        };
         let mut section = div().flex().flex_col().gap_0p5().child(header);
+        if group == Group::Stale && self.items.stale_confirm.is_some() {
+            section = section.child(Self::render_stale_confirm(&bot.id, rows, STALE_DAYS, p, cx));
+        }
         if !open {
             return section;
+        }
+        // Orca's own asks come first; then the items the bot set to Needs you.
+        for need in &needs {
+            section = section.child(self.render_need_row(bot, need, p, cx));
         }
         let shown = self
             .items
@@ -669,10 +788,19 @@ impl View {
         let debug = sel.clone();
         let age = match (group, item.snoozed_until_ms) {
             (Group::Snoozed, Some(until)) => {
-                text::HM_ROW_UNTIL.format(&[("when", &clock_label(until, now))])
+                text::HM_ROW_UNTIL.format(&[("when", &super::home_time::snooze_time(until, now))])
             }
             _ => short_age(activity_at(item, now), now),
         };
+        let selected = self.items.selected.contains(&uid);
+        let checkbox = selected || !self.items.selected.is_empty();
+        let unseen = others_last_event(item) > self.seen_mark(bot);
+        let check_group: SharedString = format!("bot-home-check-{uid}").into();
+        // Needs you's question shows in the row's hover card.
+        let question = (group == Group::NeedsYou)
+            .then(|| super::home_item::waiting_question(item))
+            .flatten()
+            .cloned();
         let open_uid = uid.clone();
         let hover_uid = uid.clone();
         let mut row = div()
@@ -695,6 +823,7 @@ impl View {
             .py_1()
             .cursor_pointer()
             .hover(|d| d.bg(p.sidebar_accent))
+            .when(selected, |d| d.bg(p.sidebar_accent))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 let now_on = this.items.hover_uid.as_deref() == Some(hover_uid.as_str());
                 if *hovered != now_on {
@@ -705,15 +834,45 @@ impl View {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_home_item(open_uid.clone(), cx);
             }))
+            .when_some(question, |d, q| {
+                let title = item.title.clone();
+                d.tooltip(move |window, cx| question_card(&title, &q, window, cx))
+            })
             .child(
                 div()
+                    .group(check_group.clone())
+                    .relative()
                     .h(px(20.))
                     .w(px(16.))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(status_icon(item.status, self.item_live(item), quiet, p, cx)),
+                    .child(
+                        div()
+                            .when(checkbox, gpui::Styled::invisible)
+                            .group_hover(check_group.clone(), gpui::Styled::invisible)
+                            .child(status_icon(item.status, self.item_live(item), quiet, p, cx)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!checkbox, |d| {
+                                d.invisible()
+                                    .group_hover(check_group, gpui::Styled::visible)
+                            })
+                            .child(Self::render_row_checkbox(
+                                &uid,
+                                &item.title,
+                                selected,
+                                p,
+                                cx,
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -748,10 +907,20 @@ impl View {
                     .h(px(20.))
                     .flex()
                     .items_center()
-                    .text_size(ui::TEXT_SM)
+                    .gap_2()
+                    .text_size(ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     // Only open rows have hover actions, so only they give the age up to them.
                     .when(hovered && !closed, gpui::Styled::invisible)
+                    .when(unseen, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(|| "bot-home-item-unseen".into())
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(p.foreground),
+                        )
+                    })
                     .child(age),
             );
         if hovered && !closed {
@@ -775,50 +944,55 @@ impl View {
                 this.update_item_status(bot_id.clone(), uid.clone(), BotItemStatus::Done, cx);
             })
         };
+        let snoozed = is_snoozed(item, now_unix_ms());
+        let title = item.title.clone();
         let snooze_menu = {
             let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
             move |menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
-                Self::snooze_menu_items(menu, &this, &bot_id, &uid)
+                Self::snooze_menu_for(menu, &this, &bot_id, std::slice::from_ref(&uid), snoozed)
             }
         };
-        let more_menu =
-            move |menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
-                let done = {
-                    let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
-                    PopupMenuItem::new(text::HM_DONE.get())
-                        .icon(IconName::CircleCheck)
-                        .on_click(move |_, _, cx| {
-                            this.update(cx, |v, cx| {
-                                v.update_item_status(
-                                    bot_id.clone(),
-                                    uid.clone(),
-                                    BotItemStatus::Done,
-                                    cx,
-                                );
-                            })
-                            .ok();
+        let more_menu = move |menu: gpui_component::menu::PopupMenu,
+                              _: &mut Window,
+                              _: &mut Context<_>| {
+            let done = {
+                let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
+                PopupMenuItem::new(text::HM_DONE.get())
+                    .icon(IconName::CircleCheck)
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |v, cx| {
+                            v.update_item_status(
+                                bot_id.clone(),
+                                uid.clone(),
+                                BotItemStatus::Done,
+                                cx,
+                            );
                         })
-                };
-                let cancel = {
-                    let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
-                    PopupMenuItem::new(text::HM_CANCEL_ITEM.get())
-                        .icon(IconName::CircleSlash)
-                        .on_click(move |_, _, cx| {
-                            this.update(cx, |v, cx| {
-                                v.update_item_status(
-                                    bot_id.clone(),
-                                    uid.clone(),
-                                    BotItemStatus::Canceled,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                        })
-                };
-                Self::snooze_menu_items(menu.item(done).separator(), &this, &bot_id, &uid)
-                    .separator()
-                    .item(cancel)
+                        .ok();
+                    })
             };
+            let cancel = {
+                let (this, bot_id, uid, title) =
+                    (this.clone(), bot_id.clone(), uid.clone(), title.clone());
+                PopupMenuItem::new(text::HM_CANCEL_ITEM.get())
+                    .icon(IconName::CircleSlash)
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |v, cx| {
+                            v.ask_cancel(bot_id.clone(), vec![(uid.clone(), title.clone())], cx);
+                        })
+                        .ok();
+                    })
+            };
+            Self::snooze_menu_for(
+                menu.item(done).separator(),
+                &this,
+                &bot_id,
+                std::slice::from_ref(&uid),
+                snoozed,
+            )
+            .separator()
+            .item(cancel)
+        };
         div()
             .absolute()
             .right(px(4.))
@@ -859,30 +1033,78 @@ impl View {
                     .dropdown_menu(more_menu),
             )
     }
+}
 
-    /// Orca's three snooze presets, each with its wake time.
-    pub(super) fn snooze_menu_items(
-        mut menu: gpui_component::menu::PopupMenu,
-        this: &gpui::WeakEntity<Self>,
-        bot_id: &krill_proto::bots::BotId,
-        uid: &str,
-    ) -> gpui_component::menu::PopupMenu {
-        let now = now_unix_ms();
-        for (label, at) in snooze_presets(now, local_offset_secs(now)) {
-            let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.to_owned());
-            menu = menu.item(
-                PopupMenuItem::new(format!("{label}  {}", clock_label(at, now))).on_click(
-                    move |_, _, cx| {
-                        this.update(cx, |v, cx| {
-                            v.snooze_item(bot_id.clone(), uid.clone(), Some(at), cx);
-                        })
-                        .ok();
-                    },
-                ),
-            );
-        }
-        menu
-    }
+/// The row's hover card while it needs you: the title, then each question line with its quick
+/// replies (read-only here; they answer on the item). Orca `BotItemQuestionCard`.
+fn question_card(
+    title: &str,
+    q: &krill_proto::bots::BotItemEvent,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> gpui::AnyView {
+    let title = title.to_owned();
+    let gist = q
+        .text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(str::to_owned);
+    let decisions = q.decisions.clone();
+    gpui_component::tooltip::Tooltip::element(move |_, cx| {
+        let p = ui::palette(cx);
+        div()
+            .debug_selector(|| "bot-home-question-card".into())
+            .max_w(px(300.))
+            .flex()
+            .flex_col()
+            .text_size(ui::TEXT_XS)
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.popover_foreground)
+                    .child(title.clone()),
+            )
+            .children(gist.clone().map(|g| {
+                div()
+                    .mt_1()
+                    .truncate()
+                    .text_color(p.muted_foreground)
+                    .child(g)
+            }))
+            .children(decisions.iter().map(|d| {
+                div()
+                    .mt_2()
+                    .child(
+                        div()
+                            .text_color(p.popover_foreground)
+                            .child(d.question.clone()),
+                    )
+                    .when(!d.options.is_empty(), |el| {
+                        el.child(div().mt_1p5().flex().flex_wrap().gap_1().children(
+                            d.options.iter().enumerate().map(|(i, o)| {
+                                div()
+                                    .rounded(px(10.))
+                                    .border_1()
+                                    .border_color(p.border)
+                                    .px_2()
+                                    .py_0p5()
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(p.popover_foreground)
+                                    .child(o.clone())
+                                    .when(d.recommended == Some(i), |el| {
+                                        el.child(
+                                            div()
+                                                .ml(px(5.))
+                                                .text_color(p.muted_foreground)
+                                                .child(text::HM_RECOMMENDED.get()),
+                                        )
+                                    })
+                            }),
+                        ))
+                    })
+            }))
+    })
+    .build(window, cx)
 }
 
 /// What the header's filter icon needs.

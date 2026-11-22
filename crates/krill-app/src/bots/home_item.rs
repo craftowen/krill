@@ -11,16 +11,16 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Icon, Sizable as _};
+use gpui_component::{Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::bots::{
-    BotConfig, BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind, BotItemLink,
+    BotConfig, BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind,
     BotItemStatus,
 };
 
 use super::home::{clock_label, is_snoozed, status_icon, status_name};
 use super::{OpenSession, View, avatar, now_unix_ms};
-use crate::i18n::catalog::bots as text;
+use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
 const STATUSES: [BotItemStatus; 5] = [
@@ -60,16 +60,41 @@ impl View {
         input: Option<gpui::Entity<gpui_component::input::InputState>>,
         cx: &mut Context<Self>,
     ) {
-        let waiting = self
+        // Attached files go in as their paths, which the bot reads on this computer.
+        let files = self.items.attachments.remove(&uid).unwrap_or_default();
+        let mut body = body.trim().to_owned();
+        if !files.is_empty() {
+            let list = files
+                .iter()
+                .map(|f| format!("- {}", f.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{body}\n\n{}\n{list}", hm::ATTACHED.get())
+                .trim()
+                .clone_into(&mut body);
+        }
+        if body.is_empty() {
+            return;
+        }
+        let ask = self
             .items
             .items
             .iter()
             .find(|i| i.uid == uid)
-            .is_some_and(|i| waiting_question(i).is_some());
-        if waiting {
-            self.answer_item_decision(uid, Some(body.to_owned()), None, input, cx);
-        } else {
-            self.submit_item_comment(uid, body, input, cx);
+            .and_then(|i| waiting_question(i).cloned());
+        match ask {
+            // Several questions: the box answers the line it is on, with the picks held so far.
+            Some(ask) if ask.decisions.len() > 1 => {
+                let key = (uid.clone(), ask.id);
+                let line = self.items.ask_steps.get(&key).map_or(0, |s| s.current);
+                self.send_held_answers(uid, &key, &ask.decisions, Some((line, body)), cx);
+                if let Some(input) = input {
+                    let mut slot = Some(input);
+                    super::clear_input_on_window(&mut slot, self.window_handle, cx);
+                }
+            }
+            Some(_) => self.answer_item_decision(uid, Some(body), None, input, cx),
+            None => self.submit_item_comment(uid, &body, input, cx),
         }
     }
 
@@ -82,6 +107,7 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_per_item_inputs(&item.uid, window, cx);
+        self.ensure_pr_reads(item, cx);
         let now = now_unix_ms();
         let back = div()
             .flex_none()
@@ -126,31 +152,7 @@ impl View {
                     .child(div().text_color(p.foreground).child(note.clone())),
             );
         }
-        if let Some(done) = item.done_means.as_ref().filter(|d| !d.trim().is_empty()) {
-            content = content.child(
-                div()
-                    .debug_selector(|| "bot-item-done-means".into())
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .text_size(ui::TEXT_SM)
-                    .line_height(px(18.))
-                    .child(
-                        div()
-                            .w(px(84.))
-                            .flex_none()
-                            .text_color(p.muted_foreground)
-                            .child(text::HM_DONE_MEANS.get()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(p.foreground)
-                            .child(done.clone()),
-                    ),
-            );
-        }
+        content = content.child(self.render_item_fields(bot, item, p, cx));
         content = content.child(self.render_activity(bot, item, now, p, cx));
         let scroller = div()
             .id("bot-item-scroll")
@@ -167,9 +169,100 @@ impl View {
             .flex()
             .flex_col()
             .pt_2()
+            .capture_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                this.item_key(ev, window, cx);
+            }))
             .child(back)
             .child(scroller)
-            .child(self.render_comment_box(item, p, cx))
+            .child(self.render_comment_box(bot, item, p, window, cx))
+    }
+
+    /// Orca's field grid: Chat (opens it), then Done means.
+    fn render_item_fields(
+        &self,
+        bot: &BotConfig,
+        item: &BotItem,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let label = |t: &'static str, h: f32| {
+            div()
+                .w(px(84.))
+                .flex_none()
+                .line_height(px(h))
+                .text_color(p.muted_foreground)
+                .child(t)
+        };
+        let chat = self.item_chat(bot, item);
+        let (open_bot, open_sid) = (bot.id.clone(), chat.session);
+        let mut grid = div()
+            .debug_selector(|| "bot-item-fields".into())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_size(ui::TEXT_XS)
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(label(hm::CHAT.get(), 24.))
+                    .child(
+                        div()
+                            .id("bot-item-chat")
+                            .debug_selector(|| "bot-item-chat".into())
+                            .h(px(24.))
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_color(p.foreground)
+                            .cursor_pointer()
+                            .hover(gpui::Styled::underline)
+                            .child(
+                                Icon::new(if chat.home {
+                                    IconName::House
+                                } else {
+                                    IconName::MessageSquare
+                                })
+                                .size(px(12.))
+                                .text_color(p.muted_foreground),
+                            )
+                            .child(div().min_w_0().truncate().child(chat.title))
+                            .child(
+                                Icon::new(IconName::ExternalLink)
+                                    .size(px(12.))
+                                    .text_color(p.muted_foreground),
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(session_id) = open_sid {
+                                    cx.emit(OpenSession {
+                                        bot_id: open_bot.clone(),
+                                        session_id,
+                                    });
+                                }
+                            })),
+                    ),
+            );
+        if let Some(done) = item.done_means.as_ref().filter(|d| !d.trim().is_empty()) {
+            grid = grid.child(
+                div()
+                    .debug_selector(|| "bot-item-done-means".into())
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(label(text::HM_DONE_MEANS.get(), 18.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .line_height(px(18.))
+                            .text_color(p.foreground)
+                            .child(done.clone()),
+                    ),
+            );
+        }
+        grid
     }
 
     /// Orca's `BotItemHeader`: `#N title`, the status menu and when it was made, the snooze line
@@ -194,6 +287,8 @@ impl View {
         )]);
         let this = cx.weak_entity();
         let (bot_id, uid, current) = (bot.id.clone(), item.uid.clone(), item.status);
+        let snoozed = is_snoozed(item, now);
+        let title_text = item.title.clone();
         let status_menu = Button::new("bot-item-status")
             .debug_selector(|| "bot-item-status".into())
             .ghost()
@@ -223,16 +318,38 @@ impl View {
                         PopupMenuItem::new(name)
                             .checked(status == current)
                             .disabled(status == current)
-                            .on_click(move |_, _, cx| {
-                                this.update(cx, |v, cx| {
-                                    v.update_item_status(bot_id.clone(), uid.clone(), status, cx);
-                                })
-                                .ok();
+                            .on_click({
+                                let title = title_text.clone();
+                                move |_, _, cx| {
+                                    this.update(cx, |v, cx| {
+                                        if status == BotItemStatus::Canceled {
+                                            v.ask_cancel(
+                                                bot_id.clone(),
+                                                vec![(uid.clone(), title.clone())],
+                                                cx,
+                                            );
+                                        } else {
+                                            v.update_item_status(
+                                                bot_id.clone(),
+                                                uid.clone(),
+                                                status,
+                                                cx,
+                                            );
+                                        }
+                                    })
+                                    .ok();
+                                }
                             }),
                     );
                 }
                 if current.is_open() {
-                    menu = Self::snooze_menu_items(menu.separator(), &this, &bot_id, &uid);
+                    menu = Self::snooze_menu_for(
+                        menu.separator(),
+                        &this,
+                        &bot_id,
+                        std::slice::from_ref(&uid),
+                        snoozed,
+                    );
                 }
                 menu
             });
@@ -272,7 +389,10 @@ impl View {
                             .text_color(p.muted_foreground)
                             .child(format!(
                                 "{} · {}",
-                                text::HM_ITEM_SUB.format(&[("n", &item.number.to_string())]),
+                                hm::SUB_WHERE.format(&[
+                                    ("n", &item.number.to_string()),
+                                    ("chat", &self.item_chat(bot, item).title),
+                                ]),
                                 clock_label(item.created_at_ms, now)
                             )),
                     ),
@@ -292,9 +412,12 @@ impl View {
                             .size(px(12.))
                             .text_color(p.muted_foreground),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(
-                        text::HM_SNOOZED_UNTIL.format(&[("when", &clock_label(until, now))]),
-                    ))
+                    .child(
+                        div().flex_1().min_w_0().truncate().child(
+                            text::HM_SNOOZED_UNTIL
+                                .format(&[("when", &super::home_time::snooze_time(until, now))]),
+                        ),
+                    )
                     .child(
                         ui::secondary("bot-item-unsnooze", text::HM_UNSNOOZE.get())
                             .xsmall()
@@ -305,78 +428,9 @@ impl View {
             );
         }
         if !item.links.is_empty() {
-            header = header.child(Self::render_link_chips(bot, item, p, cx));
+            header = header.child(self.render_link_chips(bot, item, p, cx));
         }
         header
-    }
-
-    /// Orca's `BotItemLinkChips`: one chip per link; a chip opens it.
-    fn render_link_chips(
-        bot: &BotConfig,
-        item: &BotItem,
-        p: &ui::Palette,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let mut row = div().flex().flex_wrap().gap_1();
-        for (i, link) in item.links.iter().enumerate() {
-            let (icon, target) = match link {
-                BotItemLink::Pr(v) => (IconName::GitPullRequest, v),
-                BotItemLink::Url(v) => (IconName::Link, v),
-                BotItemLink::File(v) => (IconName::File, v),
-                BotItemLink::Dispatch(v) => (IconName::Bot, v),
-            };
-            let label = match link {
-                BotItemLink::Pr(v) => v
-                    .rsplit('/')
-                    .next()
-                    .filter(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty())
-                    .map_or_else(|| v.clone(), |n| format!("#{n}")),
-                BotItemLink::File(v) => v.rsplit('/').next().unwrap_or(v).to_owned(),
-                _ => target.clone(),
-            };
-            let link = link.clone();
-            let bot_id = bot.id.clone();
-            row = row.child(
-                div()
-                    .id(("bot-item-link", i))
-                    .h(px(22.))
-                    .max_w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .rounded(ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(p.border)
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.foreground)
-                    .cursor_pointer()
-                    .hover(|d| d.bg(p.sidebar_accent))
-                    .child(Icon::new(icon).size(px(12.)).text_color(p.muted_foreground))
-                    .child(div().min_w_0().truncate().child(label))
-                    .on_click(cx.listener(move |_, _, _, cx| match &link {
-                        BotItemLink::Pr(v) | BotItemLink::Url(v)
-                            if v.starts_with("https://") || v.starts_with("http://") =>
-                        {
-                            cx.open_url(v);
-                        }
-                        BotItemLink::File(v) if !v.trim().is_empty() => {
-                            cx.reveal_path(std::path::Path::new(v.trim()));
-                        }
-                        BotItemLink::Dispatch(v) => {
-                            if let Ok(n) = v.trim().parse::<u64>() {
-                                cx.emit(OpenSession {
-                                    bot_id: bot_id.clone(),
-                                    session_id: krill_proto::SessionId(n),
-                                });
-                            }
-                        }
-                        _ => {}
-                    })),
-            );
-        }
-        row
     }
 
     fn render_description(&self, desc: &str, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
@@ -393,7 +447,10 @@ impl View {
                     .line_height(px(19.))
                     .text_color(p.foreground)
                     .when(clamped && !open, |d| d.max_h(px(57.)).overflow_hidden())
-                    .child(desc.to_owned()),
+                    .child(super::home_item_parts::markdown(
+                        "bot-item-description-md",
+                        desc,
+                    )),
             )
             .when(clamped, |d| {
                 d.child(
@@ -443,11 +500,22 @@ impl View {
                     .w(px(1.))
                     .bg(p.foreground.opacity(0.12)),
             );
-        let mut comments = 0;
-        for event in &item.events {
+        let comments = item
+            .events
+            .iter()
+            .filter(|e| e.kind == BotItemEventKind::Commented || !e.decisions.is_empty())
+            .count();
+        let all = self.items.events_all.contains(&item.uid);
+        let skip = if all {
+            0
+        } else {
+            item.events
+                .len()
+                .saturating_sub(super::home_item_parts::ACTIVITY_PAGE)
+        };
+        for event in item.events.iter().skip(skip) {
             let card = event.kind == BotItemEventKind::Commented || !event.decisions.is_empty();
             if card {
-                comments += 1;
                 list = list.child(self.render_comment_card(
                     bot,
                     item,
@@ -458,7 +526,7 @@ impl View {
                     cx,
                 ));
             } else {
-                list = list.child(Self::render_event_row(bot, item, event, now, p, cx));
+                list = list.child(self.render_event_row(bot, item, event, now, p, cx));
             }
         }
         let mut section = div()
@@ -470,6 +538,17 @@ impl View {
                     .text_color(p.muted_foreground)
                     .child(text::HM_ACTIVITY.get()),
             )
+            .when(skip > 0, |d| {
+                let uid = item.uid.clone();
+                d.child(
+                    ui::ghost("bot-item-show-earlier", hm::SHOW_EARLIER.get())
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.items.events_all.insert(uid.clone());
+                            cx.notify();
+                        })),
+                )
+            })
             .child(list);
         if comments == 0 {
             section = section.child(
@@ -494,6 +573,7 @@ impl View {
 
     /// One event on the rail: its glyph, who did what, and when.
     fn render_event_row(
+        &self,
         bot: &BotConfig,
         _item: &BotItem,
         event: &BotItemEvent,
@@ -501,6 +581,109 @@ impl View {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let bold_name = || {
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.foreground)
+                .child(Self::actor_name(bot, &event.actor))
+                .into_any_element()
+        };
+        let time = || {
+            div()
+                .flex_none()
+                .text_size(ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(clock_label(event.created_at_ms, now))
+        };
+        let rail_icon = |icon: AnyElement| {
+            div()
+                .h(px(18.))
+                .w(px(20.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(p.sidebar)
+                .child(icon)
+        };
+        let line = || {
+            div()
+                .relative()
+                .min_w_0()
+                .flex()
+                .items_start()
+                .gap_2()
+                .py(px(3.))
+                .text_size(ui::TEXT_SM)
+                .line_height(px(18.))
+                .text_color(p.muted_foreground)
+        };
+        let small = |name: IconName| {
+            Icon::new(name)
+                .size(px(12.))
+                .text_color(p.muted_foreground)
+                .into_any_element()
+        };
+        // An edit names what it changed, its before and after a click away.
+        if event.kind == BotItemEventKind::Edited
+            && let Some(changes) = self.render_field_changes(event, bold_name(), p, cx)
+        {
+            return line()
+                .child(rail_icon(small(IconName::Pencil)))
+                .child(changes)
+                .child(time());
+        }
+        // A linked worker: started here, and finished once its session stops working.
+        if event.kind == BotItemEventKind::Linked
+            && let Some((title, finished)) = self.worker_lines(event)
+        {
+            let bold = |s: String| {
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.foreground)
+                    .child(s)
+            };
+            let mut col = div().flex_1().min_w_0().flex().flex_col().child(
+                line()
+                    .child(rail_icon(small(IconName::Play)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_wrap()
+                            .gap_x_1()
+                            .child(hm::WORKER_STARTED.get())
+                            .child(bold(title)),
+                    )
+                    .child(time()),
+            );
+            if let Some((stopped, title)) = finished {
+                col = col.child(
+                    line()
+                        .child(rail_icon(if stopped {
+                            small(IconName::CircleX)
+                        } else {
+                            small(IconName::CircleCheck)
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_wrap()
+                                .gap_x_1()
+                                .child(if stopped {
+                                    hm::WORKER_STOPPED.get()
+                                } else {
+                                    hm::WORKER_FINISHED.get()
+                                })
+                                .child(bold(title)),
+                        ),
+                );
+            }
+            return col;
+        }
         let glyph = |name: IconName| {
             Icon::new(name)
                 .size(px(12.))
@@ -641,10 +824,13 @@ impl View {
                 .text_size(ui::TEXT_MD)
                 .line_height(px(19.))
                 .text_color(p.foreground)
-                .child(w)
+                .child(super::home_item_parts::markdown(
+                    format!("bot-item-comment-md-{}", event.id),
+                    &w,
+                ))
         }));
         let several = event.decisions.len() > 1;
-        let mut questions = div()
+        let mut questions: gpui::Div = div()
             .flex()
             .flex_col()
             .when(several, gpui::Styled::gap_1p5)
@@ -652,6 +838,10 @@ impl View {
         for (d, decision) in event.decisions.iter().enumerate() {
             questions =
                 questions.child(self.render_question(item, event, d, decision, waiting, p, cx));
+        }
+        if waiting && several {
+            // An ask of several questions waits one line at a time.
+            questions = self.render_question_steps(item, event, p, cx);
         }
         if !event.decisions.is_empty() {
             body = body.child(
@@ -841,54 +1031,336 @@ impl View {
         line
     }
 
-    /// Orca's comment box: the field and the send arrow, always at the bottom.
+    /// Orca's `BotItemCommentBox`: "Replying to" while a question waits, attached files, the @
+    /// mention list, then attach, the text, the item's ↑ ↓ and send in one row.
     fn render_comment_box(
-        &self,
+        &mut self,
+        bot: &BotConfig,
         item: &BotItem,
         p: &ui::Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let input = self.items.comment_inputs.get(&item.uid).cloned();
         let uid = item.uid.clone();
-        let send_input = input.clone();
-        div()
+        let waiting = waiting_question(item).cloned();
+        let quote = waiting
+            .as_ref()
+            .filter(|w| self.items.reply_hidden.get(&uid) != Some(&w.id))
+            .map(|w| {
+                let key = (uid.clone(), w.id);
+                let line = self
+                    .items
+                    .ask_steps
+                    .get(&key)
+                    .map_or(0, |s| s.current)
+                    .min(w.decisions.len().saturating_sub(1));
+                w.decisions.get(line).map_or_else(
+                    || super::home_item_parts::question_line(&w.text).to_owned(),
+                    |d| super::home_item_parts::question_line(&d.question).to_owned(),
+                )
+            })
+            .filter(|q| !q.is_empty());
+        let placeholder = match &waiting {
+            Some(w) if w.decisions.iter().any(|d| !d.options.is_empty()) => {
+                hm::REPLY_OR_PICK.get().to_owned()
+            }
+            Some(_) => hm::REPLY_TO.format(&[("name", &bot.name)]),
+            None => hm::ADD_COMMENT.get().to_owned(),
+        };
+        let value = input
+            .as_ref()
+            .map(|i| i.read(cx).value().to_string())
+            .unwrap_or_default();
+        if let Some(i) = &input
+            && i.read(cx).presentation().placeholder().as_ref() != placeholder
+        {
+            i.update(cx, |s, cx| {
+                s.set_placeholder(placeholder.clone(), window, cx);
+            });
+        }
+        let mentions = super::home_item_parts::trailing_mention(&value)
+            .map(str::to_owned)
+            .map(|q| self.mention_matches(bot, &q))
+            .unwrap_or_default();
+        let files = self
+            .items
+            .attachments
+            .get(&uid)
+            .cloned()
+            .unwrap_or_default();
+        let empty = value.trim().is_empty() && files.is_empty();
+        let replying = quote.is_some();
+        let mut boxed = div()
             .debug_selector(|| "bot-item-comment-box".into())
             .flex_none()
             .mx_3()
             .mb_3()
             .mt_2()
             .flex()
-            .items_end()
-            .gap_0p5()
+            .flex_col()
             .rounded(ui::RADIUS_XL)
             .border_1()
             .border_color(p.border)
             .bg(p.background)
             .p(px(6.))
-            .children(input.map(|i| {
+            .shadow_xs();
+        if !mentions.is_empty() {
+            let mut list = div()
+                .debug_selector(|| "bot-item-mentions".into())
+                .mb_1p5()
+                .flex()
+                .flex_col()
+                .rounded(ui::RADIUS_SM)
+                .border_1()
+                .border_color(p.border)
+                .bg(p.popover)
+                .p_1();
+            for (i, file) in mentions.into_iter().enumerate() {
+                let (input, file_name) = (input.clone(), file.clone());
+                list = list.child(
+                    div()
+                        .id(("bot-item-mention", i))
+                        .debug_selector(move || format!("bot-item-mention-{i}"))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .rounded(ui::RADIUS_XS)
+                        .cursor_pointer()
+                        .text_size(ui::TEXT_SM)
+                        .hover(|d| d.bg(p.accent))
+                        .child(
+                            Icon::new(IconName::File)
+                                .size(px(14.))
+                                .text_color(p.muted_foreground),
+                        )
+                        .child(div().min_w_0().truncate().child(file))
+                        .on_click(move |_, window, cx| {
+                            if let Some(input) = &input {
+                                input.update(cx, |s, cx| {
+                                    let text = s.value().to_string();
+                                    let at = text.rfind('@').unwrap_or(text.len());
+                                    s.set_value(
+                                        format!(
+                                            "{}@{file_name} ",
+                                            text.get(..at).unwrap_or_default()
+                                        ),
+                                        window,
+                                        cx,
+                                    );
+                                    s.focus(window, cx);
+                                });
+                            }
+                        }),
+                );
+            }
+            boxed = boxed.child(list);
+        }
+        if let (Some(q), Some(w)) = (quote, waiting.as_ref()) {
+            let (hide_uid, hide_id) = (uid.clone(), w.id);
+            let focus = input.clone();
+            boxed = boxed.child(
                 div()
-                    .flex_1()
+                    .debug_selector(|| "bot-item-replying-to".into())
+                    .mx_1()
+                    .my_0p5()
+                    .h(px(24.))
+                    .max_w_full()
                     .min_w_0()
-                    .child(Input::new(&i).appearance(false))
-            }))
-            .child(
-                Button::new("bot-item-comment-send")
-                    .debug_selector(|| "bot-item-comment-send".into())
+                    .self_start()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(ui::RADIUS_SM)
+                    .bg(p.foreground.opacity(0.06))
+                    .pr(px(3.))
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(
+                        div()
+                            .id("bot-item-replying-show")
+                            .h_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .pl(px(10.))
+                            .pr_1()
+                            .rounded(ui::RADIUS_SM)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(p.foreground.opacity(0.06)))
+                            .child(
+                                div()
+                                    .size(px(6.))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(p.agent_question),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(format!("{} ", hm::REPLYING_TO.get()))
+                                    .child(div().text_color(p.foreground).child(q))
+                                    .flex(),
+                            )
+                            .tooltip(|w, cx| {
+                                ui::tooltip_view(
+                                    "bot-item-show-question",
+                                    hm::SHOW_QUESTION.get(),
+                                    w,
+                                    cx,
+                                )
+                            })
+                            .on_click(move |_, window, cx| {
+                                if let Some(i) = &focus {
+                                    i.update(cx, |s, cx| s.focus(window, cx));
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("bot-item-replying-hide")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::X).size(px(12.)))
+                            .accessibility_label(hm::HIDE.get())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.items.reply_hidden.insert(hide_uid.clone(), hide_id);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        if !files.is_empty() {
+            let mut row = div().mb_1p5().px_1().pt_2().flex().flex_wrap().gap_2();
+            for (i, path) in files.iter().enumerate() {
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let remove_uid = uid.clone();
+                row = row.child(
+                    div()
+                        .debug_selector(move || format!("bot-item-attachment-{i}"))
+                        .h(px(24.))
+                        .max_w(px(200.))
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .pl_2()
+                        .pr(px(2.))
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(p.border)
+                        .text_size(ui::TEXT_XS)
+                        .child(
+                            Icon::new(IconName::File)
+                                .size(px(12.))
+                                .text_color(p.muted_foreground),
+                        )
+                        .child(div().min_w_0().truncate().child(name.clone()))
+                        .child(
+                            Button::new(("bot-item-attachment-remove", i))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(IconName::X).size(px(10.)))
+                                .accessibility_label(SharedString::from(
+                                    hm::REMOVE_ATTACHMENT.format(&[("name", &name)]),
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(list) = this.items.attachments.get_mut(&remove_uid)
+                                        && i < list.len()
+                                    {
+                                        list.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            boxed = boxed.child(row);
+        }
+        let attach_uid = uid.clone();
+        let field = input.map(|i| {
+            div()
+                .min_w_0()
+                .flex_1()
+                // Replying to a question, the text has its own row, four lines tall.
+                .when(replying, |d| {
+                    d.w_full().flex_basis(gpui::relative(1.)).min_h(px(80.))
+                })
+                .child(Input::new(&i).appearance(false))
+        });
+        let send_input = self.items.comment_inputs.get(&uid).cloned();
+        let mut tools = div().flex().flex_wrap().items_end().gap_0p5();
+        if replying {
+            tools = tools.children(field).child(div().w_full());
+        }
+        if self.host.is_local() {
+            tools = tools.child(
+                Button::new("bot-item-attach")
+                    .debug_selector(|| "bot-item-attach".into())
                     .ghost()
                     .small()
-                    .icon(Icon::new(IconName::ArrowUp).size(px(16.)))
-                    .tooltip(text::HM_COMMENT.get())
-                    .accessibility_label(text::HM_COMMENT.get())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(input) = send_input.clone() else {
-                            return;
-                        };
-                        let body = input.read(cx).value().to_string();
-                        if !body.trim().is_empty() {
-                            this.send_item_comment(uid.clone(), &body, Some(input), cx);
-                        }
+                    .icon(Icon::new(IconName::Paperclip).size(px(16.)))
+                    .tooltip(hm::ATTACH.get())
+                    .accessibility_label(hm::ATTACH.get())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        Self::pick_attachments(attach_uid.clone(), cx);
                     })),
-            )
+            );
+        }
+        if !replying {
+            // `field` moved into the row above only while replying.
+            tools = tools.children(self.items.comment_inputs.get(&uid).cloned().map(|i| {
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(Input::new(&i).appearance(false))
+            }));
+        }
+        tools = tools.child(self.render_stepper(p, cx)).child(
+            Button::new("bot-item-comment-send")
+                .debug_selector(|| "bot-item-comment-send".into())
+                .primary()
+                .small()
+                .rounded(ui::RADIUS_LG)
+                .disabled(empty)
+                .icon(Icon::new(IconName::ArrowUp).size(px(16.)))
+                .tooltip(text::HM_COMMENT.get())
+                .accessibility_label(text::HM_COMMENT.get())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let Some(input) = send_input.clone() else {
+                        return;
+                    };
+                    let body = input.read(cx).value().to_string();
+                    this.send_item_comment(uid.clone(), &body, Some(input), cx);
+                })),
+        );
+        boxed.child(tools)
+    }
+
+    /// Picks files to attach to the comment (paths the bot reads on this computer).
+    fn pick_attachments(uid: String, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(hm::ATTACH.get().into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = chosen.await {
+                this.update(cx, |this, cx| {
+                    this.items.attachments.entry(uid).or_default().extend(paths);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 }
 

@@ -56,6 +56,7 @@ struct MockState {
     fail_set_connector_config: Option<String>,
     /// `ListAgentModels` replies by agent; a missing agent answers like a daemon that predates it.
     agent_models: BTreeMap<String, krill_proto::bots::BotAgentModels>,
+    upcoming: Option<krill_proto::bots::BotUpcoming>,
 }
 
 fn sample_bot(id: &str, name: &str) -> BotConfig {
@@ -840,6 +841,10 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 .map_or(BotRpcResponse::Ok, |m| {
                     BotRpcResponse::AgentModels(m.clone())
                 })),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(st
+                .upcoming
+                .clone()
+                .map_or(BotRpcResponse::Ok, BotRpcResponse::Upcoming)),
             _ => Ok(BotRpcResponse::Ok),
         }
     })
@@ -1940,8 +1945,11 @@ fn home_panel_groups_filters_and_opens_an_item(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("bot-home-group-planned").is_some());
     assert!(vcx.debug_bounds("bot-home-item-plan").is_none());
     assert!(vcx.debug_bounds("bot-home-item-shipped").is_none());
-    assert!(vcx.debug_bounds("bot-home-automation-tidy").is_some());
-    assert!(vcx.debug_bounds("bot-home-automation-look").is_some());
+    assert!(vcx.debug_bounds("bot-home-automation-tidy-up").is_some());
+    assert!(
+        vcx.debug_bounds("bot-home-automation-look-around")
+            .is_some()
+    );
     assert!(vcx.debug_bounds("bot-home-automations-empty").is_some());
     // No always-open add form, no status chips.
     assert!(vcx.debug_bounds("bots-item-add-btn").is_none());
@@ -2182,4 +2190,237 @@ fn new_bot_moves_off_a_default_computer_that_cannot_run_bots(cx: &mut TestAppCon
         cx.add_window_view(|window, cx| NewBot::new(hosts, Vec::new(), None, window, cx));
     vcx.run_until_parked();
     vcx.update(|_, cx| assert_eq!(dialog.read(cx).host(), &HostId::Local));
+}
+
+#[gpui::test]
+fn home_panel_selects_rows_steps_items_and_lists_asks(cx: &mut TestAppContext) {
+    let now = super::now_unix_ms();
+    let mut mock = MockState::default();
+    let mut bot = sample_bot("bot-1", "PR Bot");
+    bot.schedules.push(krill_proto::bots::BotScheduleConfig {
+        id: "s1".to_owned(),
+        name: "Mentions triage".to_owned(),
+        cron: "0 9 * * *".to_owned(),
+        prompt: "triage".to_owned(),
+        enabled: true,
+        timezone: None,
+    });
+    mock.bots.push(bot);
+    for (uid, n, status) in [
+        ("ask", 3, BotItemStatus::NeedsYou),
+        ("run", 7, BotItemStatus::Working),
+        ("run2", 9, BotItemStatus::Working),
+    ] {
+        let mut item = sample_item("bot-1", uid, n, status);
+        item.last_activity_at_ms = now;
+        item.links.clear();
+        mock.items.push(item);
+    }
+    // A bot's comment after the owner last looked: the row is unseen.
+    let run = mock.items.iter_mut().find(|i| i.uid == "run").unwrap();
+    run.events.push(BotItemEvent {
+        id: 9,
+        item_uid: "run".to_owned(),
+        kind: BotItemEventKind::Commented,
+        actor: BotItemActor::Bot {
+            bot_id: BotId::new("bot-1").unwrap(),
+            session_id: Some(SessionId(41)),
+        },
+        text: "Working on it".to_owned(),
+        decisions: vec![],
+        created_at_ms: now,
+    });
+    mock.sessions.push(BotSessionSummary {
+        session_id: SessionId(41),
+        bot_id: BotId::new("bot-1").unwrap(),
+        link_id: None,
+        pid: 1,
+        live: true,
+        working: false,
+        label: String::new(),
+        created_at_ms: now,
+    });
+    mock.upcoming = Some(krill_proto::bots::BotUpcoming {
+        look_around_next_ms: Some(now + 3_600_000),
+        schedules: vec![krill_proto::bots::BotScheduleUpcoming {
+            id: "s1".to_owned(),
+            running: true,
+            ..Default::default()
+        }],
+        items_seen_event_id: 5,
+        ..Default::default()
+    });
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.simulate_resize(gpui::size(px(360.), px(900.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&BotId::new("bot-1").unwrap(), DetailTab::Items, cx);
+        });
+    });
+    vcx.run_until_parked();
+    let click = |vcx: &mut VisualTestContext, sel: &'static str| {
+        let at = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        vcx.simulate_click(at.center(), Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // The header says the running automation; the row spins.
+    vcx.update(|_, cx| {
+        let (line, _, running) = view.read(cx).home_quiet_line().unwrap();
+        assert!(running);
+        assert!(line.contains("Mentions triage"), "{line}");
+    });
+    assert!(
+        vcx.debug_bounds("bot-home-automation-automation-s1")
+            .is_some()
+    );
+    assert!(vcx.debug_bounds("bot-home-automations-new").is_some());
+    // The row the bot wrote on since the owner looked keeps its dot.
+    assert!(vcx.debug_bounds("bot-home-item-unseen").is_some());
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::MarkBotItemsOpened { .. }))
+    );
+
+    // Checking two rows shows the pill; Move to Done writes both.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.items.selected.insert("run".to_owned());
+            v.items.selected.insert("run2".to_owned());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("bot-home-selection-pill").is_some());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_items_status(
+                BotId::new("bot-1").unwrap(),
+                &["run".to_owned(), "run2".to_owned()],
+                BotItemStatus::Done,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    let done = state
+        .lock()
+        .unwrap()
+        .items
+        .iter()
+        .filter(|i| i.status == BotItemStatus::Done)
+        .count();
+    assert_eq!(done, 2);
+    assert!(vcx.debug_bounds("bot-home-selection-pill").is_none());
+
+    // Pick a time: the dialog's custom grid snoozes the item.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.open_snooze_pick(BotId::new("bot-1").unwrap(), vec!["ask".to_owned()], cx);
+        });
+    });
+    vcx.run_until_parked();
+    click(vcx, "bot-snooze-custom");
+    assert!(vcx.debug_bounds("bot-snooze-time").is_some());
+    click(vcx, "bot-snooze-submit");
+    assert!(vcx.debug_bounds("bot-snooze-pick").is_none());
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .any(|i| i.uid == "ask" && i.snoozed_until_ms.is_some())
+    );
+}
+
+#[gpui::test]
+fn home_item_steps_shows_its_chat_and_steps_several_questions(cx: &mut TestAppContext) {
+    let now = super::now_unix_ms();
+    let mut mock = MockState::default();
+    mock.bots.push(sample_bot("bot-1", "PR Bot"));
+    for (uid, n) in [("a", 1), ("b", 2)] {
+        let mut item = sample_item("bot-1", uid, n, BotItemStatus::NeedsYou);
+        item.last_activity_at_ms = now - n;
+        item.links.clear();
+        mock.items.push(item);
+    }
+    let a = mock.items.iter_mut().find(|i| i.uid == "a").unwrap();
+    a.events.push(BotItemEvent {
+        id: 2,
+        item_uid: "a".to_owned(),
+        kind: BotItemEventKind::Status,
+        actor: BotItemActor::Bot {
+            bot_id: BotId::new("bot-1").unwrap(),
+            session_id: None,
+        },
+        text: "status -> needs_you".to_owned(),
+        decisions: ["Ship it?", "Tell the team?"]
+            .map(|q| BotItemDecision {
+                question: q.to_owned(),
+                options: vec!["Yes".to_owned(), "No".to_owned()],
+                recommended: Some(0),
+            })
+            .to_vec(),
+        created_at_ms: now,
+    });
+    a.events.push(BotItemEvent {
+        id: 3,
+        item_uid: "a".to_owned(),
+        kind: BotItemEventKind::Edited,
+        actor: BotItemActor::Owner { device: None },
+        text: r#"{"fields":{"title":{"from":"Old","to":"Task #1"}}}"#.to_owned(),
+        decisions: vec![],
+        created_at_ms: now,
+    });
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.simulate_resize(gpui::size(px(360.), px(900.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&BotId::new("bot-1").unwrap(), DetailTab::Items, cx);
+            v.open_home_item("a".to_owned(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    let click = |vcx: &mut VisualTestContext, sel: &'static str| {
+        let at = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+        vcx.simulate_click(at.center(), Modifiers::default());
+        vcx.run_until_parked();
+    };
+    assert!(vcx.debug_bounds("bot-item-chat").is_some());
+    assert!(vcx.debug_bounds("bot-item-stepper").is_some());
+    assert!(vcx.debug_bounds("bot-item-replying-to").is_some());
+    // The edit opens to its before and after.
+    click(vcx, "bot-item-change-3:title");
+
+    // Two questions, one line at a time: the first reply holds, the second sends both.
+    click(vcx, "bot-item-step-reply-0-0");
+    click(vcx, "bot-item-step-reply-1-1");
+    assert!(state.lock().unwrap().requests.iter().any(|r| matches!(
+        r,
+        BotRpcRequest::AnswerBotItem { answer_text: Some(t), .. }
+            if t == "Ship it? → Yes\nTell the team? → No"
+    )));
+
+    // Answered, it moved to In progress below #2: ↑ steps back to it.
+    click(vcx, "bot-item-prev");
+    vcx.update(|_, cx| assert_eq!(view.read(cx).items.open_uid.as_deref(), Some("b")));
 }

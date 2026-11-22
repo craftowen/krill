@@ -37,8 +37,8 @@ pub use package::{
 };
 pub use rpc::{
     BOT_REPLY, BOT_REQ, BotAgentModel, BotAgentModels, BotRpcRequest, BotRpcResponse,
-    CreateBotItemParams, CreateBotParams, CreateBotV2Params, FieldPatch, MAX_RPC_ZIP_BYTES,
-    UpdateBotExtrasParams, UpdateBotItemParams, UpdateBotParams,
+    BotScheduleUpcoming, BotUpcoming, CreateBotItemParams, CreateBotParams, CreateBotV2Params,
+    FieldPatch, MAX_RPC_ZIP_BYTES, UpdateBotExtrasParams, UpdateBotItemParams, UpdateBotParams,
 };
 pub use types::{
     ActsFor, BOT_DERIVED_SLUG_MAX_BYTES, BOT_DESCRIPTION_MAX_BYTES, BOT_ID_MAX_BYTES,

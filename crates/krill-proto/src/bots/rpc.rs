@@ -545,6 +545,16 @@ pub enum BotRpcRequest {
     ListAgentModels {
         agent_id: String,
     },
+    /// When the bot's automations ran last and run next, for its Home (Orca's Automations card
+    /// and the header's "Idle · next 8:00 PM · Look around").
+    GetBotUpcoming {
+        bot_id: BotId,
+    },
+    /// Runs one of the bot's schedules now, as its cron would.
+    RunScheduleNow {
+        bot_id: BotId,
+        schedule_id: String,
+    },
 }
 
 impl BotRpcRequest {
@@ -576,6 +586,7 @@ impl BotRpcRequest {
                 | Self::ListComposioConnections { .. }
                 | Self::GetDefaultTrackerBots
                 | Self::ListAgentModels { .. }
+                | Self::GetBotUpcoming { .. }
         )
     }
 }
@@ -1017,6 +1028,18 @@ impl fmt::Debug for BotRpcRequest {
                 .debug_struct("ListAgentModels")
                 .field("agent_id", agent_id)
                 .finish(),
+            Self::GetBotUpcoming { bot_id } => f
+                .debug_struct("GetBotUpcoming")
+                .field("bot_id", bot_id)
+                .finish(),
+            Self::RunScheduleNow {
+                bot_id,
+                schedule_id,
+            } => f
+                .debug_struct("RunScheduleNow")
+                .field("bot_id", bot_id)
+                .field("schedule_id", schedule_id)
+                .finish(),
         }
     }
 }
@@ -1035,6 +1058,41 @@ pub struct BotAgentModels {
     pub models: Vec<BotAgentModel>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Reply to [`BotRpcRequest::GetBotUpcoming`]: each automation's last and next run (Unix ms).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotUpcoming {
+    #[serde(default)]
+    pub look_around_last_ms: Option<u64>,
+    /// Ahead of now; `None` before its first look (it runs once the bot is used).
+    #[serde(default)]
+    pub look_around_next_ms: Option<u64>,
+    #[serde(default)]
+    pub tidy_last_ms: Option<u64>,
+    #[serde(default)]
+    pub tidy_next_ms: Option<u64>,
+    #[serde(default)]
+    pub schedules: Vec<BotScheduleUpcoming>,
+    /// Suggestions made after this were not seen yet (Suggestions' "N new").
+    #[serde(default)]
+    pub up_next_seen_ms: u64,
+    /// Item events after this were not seen yet (a row's dot, Closed's "N new").
+    #[serde(default)]
+    pub items_seen_event_id: u64,
+}
+
+/// One schedule's runs in [`BotUpcoming`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotScheduleUpcoming {
+    pub id: String,
+    #[serde(default)]
+    pub next_ms: Option<u64>,
+    #[serde(default)]
+    pub last_ms: Option<u64>,
+    /// Its conversation is on a turn right now.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// Versioned extensible RPC response enum paired with [`BotRpcRequest`].
@@ -1122,6 +1180,7 @@ pub enum BotRpcResponse {
     },
     DefaultTrackerBots(DefaultTrackerBots),
     AgentModels(BotAgentModels),
+    Upcoming(BotUpcoming),
 }
 
 impl fmt::Debug for BotRpcResponse {
@@ -1281,6 +1340,7 @@ impl fmt::Debug for BotRpcResponse {
                 f.debug_tuple("DefaultTrackerBots").field(defaults).finish()
             }
             Self::AgentModels(models) => f.debug_tuple("AgentModels").field(models).finish(),
+            Self::Upcoming(up) => f.debug_tuple("Upcoming").field(up).finish(),
         }
     }
 }

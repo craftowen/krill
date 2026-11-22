@@ -386,21 +386,40 @@ impl BotItemsStore {
             })?;
 
             let mut edited = false;
+            // What changed, before and after, for the item's Activity ("changed title ›").
+            let mut fields = serde_json::Map::new();
+            let mut change = |name: &str, from: &str, to: &str| {
+                fields.insert(
+                    name.to_owned(),
+                    serde_json::json!({ "from": from, "to": to }),
+                );
+            };
             if let Some(t) = next_title
                 && t != item.title
             {
+                change("title", &item.title, &t);
                 item.title = t;
                 edited = true;
             }
             if let Some(d) = next_desc
                 && d != item.description
             {
+                change(
+                    "description",
+                    item.description.as_deref().unwrap_or(""),
+                    d.as_deref().unwrap_or(""),
+                );
                 item.description = d;
                 edited = true;
             }
             if let Some(dm) = next_done
                 && dm != item.done_means
             {
+                change(
+                    "doneMeans",
+                    item.done_means.as_deref().unwrap_or(""),
+                    dm.as_deref().unwrap_or(""),
+                );
                 item.done_means = dm;
                 edited = true;
             }
@@ -502,12 +521,17 @@ impl BotItemsStore {
             .map_err(sql_err)?;
 
             if edited {
+                let text = if fields.is_empty() {
+                    "updated item".to_owned()
+                } else {
+                    serde_json::json!({ "fields": fields }).to_string()
+                };
                 insert_event(
                     &tx,
                     &uid,
                     BotItemEventKind::Edited,
                     actor,
-                    "updated item",
+                    &text,
                     &[],
                     now_ms,
                 )?;
@@ -904,6 +928,21 @@ impl BotItemsStore {
             )
             .map_err(sql_err)?;
             Ok(())
+        })
+    }
+
+    /// The newest item event the owner has seen for `bot_id` (0 before the first open).
+    pub fn items_seen_event_id(&self, bot_id: &BotId) -> io::Result<u64> {
+        self.with_conn(|conn| {
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT last_seen_event_id FROM items_seen WHERE bot_id = ?1",
+                    params![bot_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?;
+            Ok(id.and_then(|id| u64::try_from(id).ok()).unwrap_or(0))
         })
     }
 
@@ -1670,6 +1709,55 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_edit_records_each_field_before_and_after() {
+        let (dir, db) = temp_db("edit-fields");
+        let store = BotItemsStore::new(db);
+        let bot = BotId::new("bot-a").unwrap();
+        let owner = BotItemActor::Owner { device: None };
+        let item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot,
+                    title: "Old".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: None,
+                    links: vec![],
+                },
+                &owner,
+                1_000,
+            )
+            .unwrap();
+        let edited = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item.uid,
+                    title: Some("New".to_owned()),
+                    description: Some("Why".to_owned()),
+                    done_means: None,
+                    status: None,
+                    comment: None,
+                    decisions: vec![],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &owner,
+                2_000,
+            )
+            .unwrap();
+        let event = edited
+            .events
+            .iter()
+            .find(|e| e.kind == BotItemEventKind::Edited)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&event.text).unwrap();
+        assert_eq!(v["fields"]["title"]["from"], "Old");
+        assert_eq!(v["fields"]["title"]["to"], "New");
+        assert_eq!(v["fields"]["description"]["to"], "Why");
         fs::remove_dir_all(&dir).ok();
     }
 

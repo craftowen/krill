@@ -61,6 +61,8 @@ impl BotPanelTab {
 
 /// Below this panel width only the current tab keeps its name (Orca hides labels when narrow).
 const LABELLED_TABS_MIN_WIDTH: f32 = 360.;
+/// At or below this width the header says the short "Next 8:00 PM" (Orca `@max-[284px]`).
+const NARROW_HEADER_WIDTH: f32 = 284.;
 
 /// Right-sidebar state for bot pages.
 #[derive(Default)]
@@ -76,9 +78,20 @@ pub(super) struct BotPanel {
     pub stale: bool,
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
     pub chat_query: String,
-    /// What the header last drew from `view`: its filter and whether an item is open.
-    pub home_chrome: (Option<krill_app::bots::HomeFilter>, bool),
+    /// Chats unfolded to show their workers (every chat starts folded, as in Orca).
+    pub chat_unfolded: std::collections::BTreeSet<krill_proto::SessionId>,
+    /// What the header last drew from `view`: its filter, whether an item is open, and the
+    /// automations' line ("Idle · next 8:00 PM · Look around", with its narrow form).
+    pub home_chrome: HomeChrome,
+    /// A draft for this bot's Home Chat composer, put in once its chat is on screen.
+    pub pending_draft: Option<(BotId, String)>,
 }
+
+pub(super) type HomeChrome = (
+    Option<krill_app::bots::HomeFilter>,
+    bool,
+    Option<(String, Option<String>, bool)>,
+);
 
 /// How a bot chat is named: Home Chat for the Home Chat (krilld lists it first), else its own
 /// label (krilld's default label is just the bot's name), else its thread, else Orca's "New chat".
@@ -202,9 +215,17 @@ impl Shell {
         Self::subscribe_bots_view(&view, false, cx);
         // The header (drawn here) shows the view's filter and hides over an open item: redraw
         // when those change, not on every change inside the view.
+        cx.subscribe(
+            &view,
+            |this, _, ev: &krill_app::bots::DraftInHomeChat, cx| {
+                this.bot_ui.panel.pending_draft = Some((ev.bot_id.clone(), ev.text.clone()));
+                this.open_bot_home(ev.bot_id.clone(), None, cx);
+            },
+        )
+        .detach();
         cx.observe(&view, |this, view, cx| {
             let v = view.read(cx);
-            let chrome = (v.home_filter(), v.home_item_open());
+            let chrome = (v.home_filter(), v.home_item_open(), v.home_quiet_line());
             if this.bot_ui.panel.home_chrome != chrome {
                 this.bot_ui.panel.home_chrome = chrome;
                 cx.notify();
@@ -242,6 +263,36 @@ impl Shell {
         cx.notify();
     }
 
+    /// Puts a pending draft in the bot's Home Chat composer once that chat is the focused pane.
+    fn apply_pending_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((bot_id, _)) = &self.bot_ui.panel.pending_draft else {
+            return;
+        };
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
+        let home = self
+            .sidebar_bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .and_then(SidebarBot::home_session)
+            .map(|h| h.session_id);
+        if home.is_none() || self.layout.session(pane) != home {
+            return;
+        }
+        let Some(key) = self.chat_key(pane) else {
+            return;
+        };
+        let Some((_, draft)) = self.bot_ui.panel.pending_draft.take() else {
+            return;
+        };
+        let input = self.ensure_chat_input(key, window, cx);
+        input.update(cx, |state, cx| {
+            state.set_value(draft, window, cx);
+            state.focus(window, cx);
+        });
+    }
+
     pub(super) fn render_bot_panel(
         &mut self,
         bot: &SidebarBot,
@@ -250,6 +301,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = ui::palette(cx);
+        self.apply_pending_draft(window, cx);
         let tab = self.bot_ui.panel.tab;
         if tab == BotPanelTab::Chats {
             self.ensure_bot_chat_search(window, cx);
@@ -265,6 +317,19 @@ impl Shell {
             if std::mem::take(&mut self.bot_ui.panel.stale) {
                 view.update(cx, krill_app::bots::View::reload);
             }
+            // The bot's chats waiting on the owner are Home's asks.
+            let host = self.launch_host.clone();
+            let states: std::collections::BTreeMap<_, _> = bot
+                .sessions
+                .iter()
+                .filter_map(|s| {
+                    self.sidebar
+                        .read(cx)
+                        .session_on(&host, s.session_id)
+                        .map(|x| (s.session_id, x.status.state))
+                })
+                .collect();
+            view.update(cx, |v, cx| v.set_session_states(states, cx));
             let want = (bot.id.clone(), page);
             if self.bot_ui.panel.shown.as_ref() != Some(&want) {
                 // Held back by unsaved Soul edits: ask again next time instead of showing the
@@ -290,7 +355,13 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .when(!item_open, |d| {
-                            d.child(self.render_bot_panel_header(bot, view.as_ref(), p, cx))
+                            d.child(self.render_bot_panel_header(
+                                bot,
+                                view.as_ref(),
+                                width <= NARROW_HEADER_WIDTH,
+                                p,
+                                cx,
+                            ))
                         })
                         .child(div().flex_1().min_h_0().children(view))
                         .into_any_element()
@@ -429,20 +500,28 @@ impl Shell {
         &self,
         bot: &SidebarBot,
         view: Option<&Entity<krill_app::bots::View>>,
+        narrow: bool,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let (activity, attention) = Self::bot_activity(bot);
-        // Orca says Idle while nothing waits or runs; the bot's job is the sidebar's line only.
+        // Orca says what its automations do while nothing waits or runs ("Running …", "Idle ·
+        // next 8:00 PM · Look around"); the bot's job is the sidebar's line only.
         let quiet = !bot.paused && bot.attention == 0 && bot.working() == 0;
+        let quiet_line = self.bot_ui.panel.home_chrome.2.clone();
+        let automation_running = quiet_line.as_ref().is_some_and(|q| q.2);
         let status = if quiet || activity.trim().is_empty() {
-            text::BP_IDLE.get().to_owned()
+            match quiet_line {
+                Some((_, Some(short), _)) if narrow => short,
+                Some((line, ..)) => line,
+                None => text::BP_IDLE.get().to_owned(),
+            }
         } else {
             activity
         };
         let state = if bot.attention > 0 {
             krill_proto::control::AgentState::Waiting
-        } else if bot.working() > 0 {
+        } else if bot.working() > 0 || (quiet && automation_running) {
             krill_proto::control::AgentState::Working
         } else {
             krill_proto::control::AgentState::Exited
@@ -539,6 +618,7 @@ impl Shell {
         let pause_id = bot.id.clone();
         let folder = self.bot_folder(bot);
         let this = cx.weak_entity();
+        let share = view.cloned().map(|v| (v, bot.id.clone()));
         div()
             .id("bot-panel-header")
             .debug_selector(|| "bot-panel-header".into())
@@ -619,6 +699,18 @@ impl Shell {
                                     .ok();
                             }),
                         );
+                        // Orca's Share bot… publishes a link through its cloud; Krill shares the
+                        // bot as its package file.
+                        let menu = match share.clone() {
+                            Some((view, id)) => menu.item(
+                                PopupMenuItem::new(text::BP_SHARE_BOT.get())
+                                    .icon(Icon::new(gpui_kit_assets::IconName::Share2))
+                                    .on_click(move |_, _, cx| {
+                                        view.update(cx, |v, cx| v.export_bot_zip(id.clone(), cx));
+                                    }),
+                            ),
+                            None => menu,
+                        };
                         match folder.clone() {
                             Some(path) => menu.separator().item(
                                 PopupMenuItem::new(text::SB_COPY_PATH.get())
@@ -739,6 +831,340 @@ impl Shell {
 
     /// Orca's Chats tab: search, New chat, then the bot's live chats (newest first after the
     /// Home Chat). Right-click a chat to stop it, run it again or take over its workspace.
+    /// Orca's `BotChatTreeGroup` row: its source icon (the fold chevron on hover while it has
+    /// workers), the title, its age (⋯ in its place on hover), then a preview line ending in
+    /// what it is doing and "N running".
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a render helper over the chat's shared state"
+    )]
+    fn render_bot_chat_row(
+        &self,
+        bot: &SidebarBot,
+        s: &BotSessionSummary,
+        title: &SharedString,
+        state: Option<krill_proto::control::AgentState>,
+        running: usize,
+        foldable: bool,
+        open: bool,
+        now: u64,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use krill_proto::control::AgentState;
+        let focused = self
+            .layout
+            .focused()
+            .and_then(|pane| self.layout.session(pane));
+        let active = focused == Some(s.session_id);
+        let session = s.session_id;
+        let live = s.live;
+        let home = s.link_id.is_none();
+        let id = SharedString::from(format!("bot-panel-chat-{}", s.session_id.0));
+        let group: SharedString = format!("bot-chat-{}", s.session_id.0).into();
+        let open_id = bot.id.clone();
+        let menu = {
+            let this = cx.weak_entity();
+            let menu_bot = bot.id.clone();
+            move |menu: gpui_component::menu::PopupMenu| {
+                let action = |req: fn(BotId, krill_proto::SessionId) -> BotRpcRequest| {
+                    let this = this.clone();
+                    let bot = menu_bot.clone();
+                    move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+                        this.update(cx, |s, cx| {
+                            s.run_bot_chat_action(req(bot.clone(), session), cx);
+                        })
+                        .ok();
+                    }
+                };
+                let menu = if live {
+                    menu.item(
+                        PopupMenuItem::new(text::CHAT_STOP_BTN.get())
+                            .icon(IconName::CircleX)
+                            .on_click(action(|bot_id, session_id| BotRpcRequest::StopBotSession {
+                                bot_id,
+                                session_id,
+                            })),
+                    )
+                } else {
+                    menu
+                };
+                menu.item(
+                    PopupMenuItem::new(text::CHAT_RUN_AGAIN_BTN.get())
+                        .icon(IconName::Redo)
+                        .on_click(action(|bot_id, session_id| {
+                            BotRpcRequest::SendBotRunAgain { bot_id, session_id }
+                        })),
+                )
+                .item(
+                    PopupMenuItem::new(text::CHAT_TAKEOVER_BTN.get())
+                        .icon(IconName::ArrowRight)
+                        .on_click(action(|bot_id, session_id| {
+                            BotRpcRequest::TakeOverWorkspace { bot_id, session_id }
+                        })),
+                )
+            }
+        };
+        let menu2 = menu.clone();
+        let (live_text, live_strong) = match state {
+            _ if s.working => (Some(text::BP_REPLYING.get()), false),
+            Some(AgentState::Waiting | AgentState::Blocked) => (Some(text::BP_WAITING.get()), true),
+            _ => (None, false),
+        };
+        let preview: SharedString = if home {
+            text::BP_SAY_HI.format(&[("name", &bot.name)]).into()
+        } else {
+            s.link_id.clone().unwrap_or_default().into()
+        };
+        let age = krill_app::jump::format_age_secs(s.created_at_ms / 1000, now);
+        div()
+            .id(id.clone())
+            .debug_selector(move || id.to_string())
+            .group(group.clone())
+            .role(gpui::Role::Button)
+            .tab_index(0)
+            .focus_visible(|d| d.border_1().border_color(p.ring))
+            .aria_label(title.clone())
+            .aria_expanded(open)
+            .relative()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_start()
+            .gap_1()
+            .rounded(ui::RADIUS_SM)
+            .py_1p5()
+            .px_2()
+            .cursor_pointer()
+            .when(active, |d| d.bg(p.sidebar_accent))
+            .hover(|d| d.bg(p.sidebar_accent))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_bot_session(&open_id, session, cx);
+            }))
+            .context_menu(move |m, _, _| menu(m))
+            .child(
+                div()
+                    .relative()
+                    .h(px(20.))
+                    .w(px(16.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .when(open, gpui::Styled::invisible)
+                            .when(foldable, |d| {
+                                d.group_hover(group.clone(), gpui::Styled::invisible)
+                            })
+                            .child(ui::icons::svg_icon(
+                                if home {
+                                    ui::icons::BOT_HOME_SVG
+                                } else {
+                                    ui::icons::MESSAGE_SQUARE_SVG
+                                },
+                                ui::ICON_XS,
+                                p.muted_foreground,
+                            )),
+                    )
+                    .when(foldable, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("bot-chat-fold-{}", session.0)))
+                                .debug_selector(move || format!("bot-chat-fold-{}", session.0))
+                                .role(gpui::Role::Button)
+                                .aria_expanded(open)
+                                .aria_label(if open {
+                                    text::BP_FOLD.format(&[("name", title)])
+                                } else {
+                                    text::BP_UNFOLD.format(&[("name", title)])
+                                })
+                                .absolute()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(ui::RADIUS_XS)
+                                .hover(|d| d.bg(p.sidebar_accent.opacity(0.7)))
+                                .when(!open, |d| {
+                                    d.invisible()
+                                        .group_hover(group.clone(), gpui::Styled::visible)
+                                })
+                                .child(
+                                    Icon::new(if open {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .size(px(14.))
+                                    .text_color(p.muted_foreground),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.bot_ui.panel.chat_unfolded.remove(&session) {
+                                        this.bot_ui.panel.chat_unfolded.insert(session);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .pl_1()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_MD)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.sidebar_foreground)
+                                    .child(title.clone()),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .relative()
+                                    .h(px(20.))
+                                    .min_w(px(24.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_2XS)
+                                            .text_color(p.muted_foreground)
+                                            .group_hover(group.clone(), gpui::Styled::invisible)
+                                            .child(age),
+                                    )
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right_0()
+                                            .invisible()
+                                            .group_hover(group.clone(), gpui::Styled::visible)
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "bot-chat-more-{}",
+                                                    session.0
+                                                )))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Ellipsis)
+                                                .accessibility_label(text::BP_MORE.get())
+                                                .dropdown_menu(move |m, _, _| menu2(m)),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(div().flex_1().min_w_0().truncate().child(preview))
+                            .children(live_text.map(|t| {
+                                div()
+                                    .flex_none()
+                                    .when(live_strong, |d| d.text_color(p.sidebar_foreground))
+                                    .child(t)
+                            }))
+                            .when(running > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(ui::status::status_glyph(
+                                            krill_proto::control::AgentState::Working,
+                                            false,
+                                            ui::status::Size::Sm,
+                                            cx,
+                                        ))
+                                        .child(
+                                            text::BP_RUNNING_COUNT
+                                                .format(&[("n", &running.to_string())]),
+                                        ),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Orca's `BotChatTreeWorkerRow`: the worker's state, its title and age; a click opens it.
+    fn render_bot_chat_worker(
+        &self,
+        bot: &SidebarBot,
+        worker: krill_proto::SessionId,
+        at_ms: u64,
+        now: u64,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let host = self.launch_host.clone();
+        let sidebar = self.sidebar.read(cx);
+        let session = sidebar.session_on(&host, worker);
+        let state = session.map_or(krill_proto::control::AgentState::Exited, |s| s.status.state);
+        let title = session
+            .and_then(|s| s.status.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| format!("#{}", worker.0));
+        let id = SharedString::from(format!("bot-chat-worker-{}", worker.0));
+        let open_id = bot.id.clone();
+        div()
+            .id(id.clone())
+            .debug_selector(move || id.to_string())
+            .role(gpui::Role::Button)
+            .tab_index(0)
+            .h(px(28.))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(ui::RADIUS_SM)
+            .px_2()
+            .cursor_pointer()
+            .hover(|d| d.bg(p.sidebar_accent))
+            .child(div().w(px(16.)).flex_none().flex().justify_center().child(
+                ui::status::status_glyph(state, false, ui::status::Size::Sm, cx),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.sidebar_foreground)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(krill_app::jump::format_age_secs(at_ms / 1000, now)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_bot_session(&open_id, worker, cx);
+            }))
+    }
+
     fn render_bot_chats(
         &self,
         bot: &SidebarBot,
@@ -746,10 +1172,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let q = self.bot_ui.panel.chat_query.trim().to_lowercase();
-        let focused = self
-            .layout
-            .focused()
-            .and_then(|pane| self.layout.session(pane));
         let new_id = bot.id.clone();
         let search = self.bot_ui.panel.chat_search.as_ref().map(|(input, _)| {
             div()
@@ -775,13 +1197,20 @@ impl Shell {
                     })),
             );
         let now = super::bot_section::now_secs();
+        let host = self.launch_host.clone();
+        let workers = self
+            .bot_ui
+            .panel
+            .view
+            .as_ref()
+            .map(|v| v.read(cx).chat_workers(&bot.id))
+            .unwrap_or_default();
         let mut list = div()
             .id("bot-chats-list")
             .debug_selector(|| "bot-chats-list".into())
             .role(gpui::Role::List)
             .flex()
-            .flex_col()
-            .gap_0p5();
+            .flex_col();
         let mut shown = 0;
         for s in &bot.sessions {
             let title = chat_title(bot, s);
@@ -789,109 +1218,48 @@ impl Shell {
                 continue;
             }
             shown += 1;
-            let active = focused == Some(s.session_id);
             let session = s.session_id;
-            let live = s.live;
-            let id = SharedString::from(format!("bot-panel-chat-{}", s.session_id.0));
-            let open_id = bot.id.clone();
-            let this = cx.weak_entity();
-            let menu_bot = bot.id.clone();
-            list = list.child(
-                div()
-                    .id(id.clone())
-                    .debug_selector(move || id.to_string())
-                    .role(gpui::Role::Button)
-                    .tab_index(0)
-                    .focus_visible(|d| d.border_1().border_color(p.ring))
-                    .aria_label(title.clone())
-                    .h(px(28.))
-                    .px_1p5()
-                    .rounded(ui::RADIUS_SM)
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(p.sidebar_accent))
-                    .when(!active, |d| {
-                        d.hover(|d| d.bg(p.sidebar_accent.opacity(0.6)))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_bot_session(&open_id, session, cx);
-                    }))
-                    .child(ui::icons::svg_icon(
-                        if s.link_id.is_none() {
-                            ui::icons::BOT_HOME_SVG
-                        } else {
-                            ui::icons::MESSAGE_SQUARE_SVG
-                        },
-                        ui::ICON_XS,
-                        p.muted_foreground,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(p.sidebar_foreground)
-                            .child(title),
-                    )
-                    .when(s.working, |d| {
-                        d.child(
-                            div()
-                                .flex_none()
-                                .text_size(ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::CHAT_SESSION_WORKING.get()),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(krill_app::jump::format_age_secs(
-                                s.created_at_ms / 1000,
-                                now,
-                            )),
-                    )
-                    .context_menu(move |menu, _, _| {
-                        let action = |req: fn(BotId, krill_proto::SessionId) -> BotRpcRequest| {
-                            let this = this.clone();
-                            let bot = menu_bot.clone();
-                            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
-                                this.update(cx, |s, cx| {
-                                    s.run_bot_chat_action(req(bot.clone(), session), cx);
-                                })
-                                .ok();
-                            }
-                        };
-                        let menu = if live {
-                            menu.item(
-                                PopupMenuItem::new(text::CHAT_STOP_BTN.get())
-                                    .icon(IconName::CircleX)
-                                    .on_click(action(|bot_id, session_id| {
-                                        BotRpcRequest::StopBotSession { bot_id, session_id }
-                                    })),
-                            )
-                        } else {
-                            menu
-                        };
-                        menu.item(
-                            PopupMenuItem::new(text::CHAT_RUN_AGAIN_BTN.get())
-                                .icon(IconName::Redo)
-                                .on_click(action(|bot_id, session_id| {
-                                    BotRpcRequest::SendBotRunAgain { bot_id, session_id }
-                                })),
-                        )
-                        .item(
-                            PopupMenuItem::new(text::CHAT_TAKEOVER_BTN.get())
-                                .icon(IconName::ArrowRight)
-                                .on_click(action(|bot_id, session_id| {
-                                    BotRpcRequest::TakeOverWorkspace { bot_id, session_id }
-                                })),
-                        )
-                    }),
-            );
+            let state = self
+                .sidebar
+                .read(cx)
+                .session_on(&host, session)
+                .map(|x| x.status.state);
+            let mine: Vec<_> = workers
+                .iter()
+                .filter(|(chat, ..)| *chat == session)
+                .map(|(_, w, at)| (*w, *at))
+                .collect();
+            let running = mine
+                .iter()
+                .filter(|(w, _)| {
+                    self.sidebar
+                        .read(cx)
+                        .session_on(&host, *w)
+                        .is_some_and(|x| {
+                            matches!(x.status.state, krill_proto::control::AgentState::Working)
+                        })
+                })
+                .count();
+            let open = self.bot_ui.panel.chat_unfolded.contains(&session);
+            list = list.child(self.render_bot_chat_row(
+                bot,
+                s,
+                &title,
+                state,
+                running,
+                !mine.is_empty(),
+                open,
+                now,
+                p,
+                cx,
+            ));
+            if open {
+                let mut tree = div().mb_1().ml_6().flex().flex_col();
+                for (worker, at) in mine {
+                    tree = tree.child(self.render_bot_chat_worker(bot, worker, at, now, p, cx));
+                }
+                list = list.child(tree);
+            }
         }
         if shown == 0 {
             list = list.child(
