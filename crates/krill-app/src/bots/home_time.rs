@@ -2,16 +2,34 @@
 //! How Home words times: Orca's `upcomingAt`, `ranText`, `lookedText`, `formatWaitTime` and the
 //! header's `botQuietLine`, in the local time zone.
 
-use crate::i18n::{Language, catalog::bot_home as text, language};
+use crate::i18n::{Language, Message, catalog::bot_home as text, language};
 use crate::local_time::{CivilTime, civil_from_epoch};
 
 use super::home::local_offset_secs;
 
 const DAY_MS: u64 = 86_400_000;
-const EN_DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const KO_DAYS: [&str; 7] = ["일", "월", "화", "수", "목", "금", "토"];
-const EN_MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+const WEEKDAYS: [Message; 7] = [
+    text::WEEKDAY_SUN,
+    text::WEEKDAY_MON,
+    text::WEEKDAY_TUE,
+    text::WEEKDAY_WED,
+    text::WEEKDAY_THU,
+    text::WEEKDAY_FRI,
+    text::WEEKDAY_SAT,
+];
+const SHORT_MONTHS: [Message; 12] = [
+    text::MONTH_SHORT_01,
+    text::MONTH_SHORT_02,
+    text::MONTH_SHORT_03,
+    text::MONTH_SHORT_04,
+    text::MONTH_SHORT_05,
+    text::MONTH_SHORT_06,
+    text::MONTH_SHORT_07,
+    text::MONTH_SHORT_08,
+    text::MONTH_SHORT_09,
+    text::MONTH_SHORT_10,
+    text::MONTH_SHORT_11,
+    text::MONTH_SHORT_12,
 ];
 
 /// `ms` in local time: its day number, its fields and its weekday (Sunday 0).
@@ -32,42 +50,39 @@ fn local(ms: u64, offset: i64) -> (i64, CivilTime, usize) {
 }
 
 /// `8:00 PM` (`8 PM` on the hour when `short`); Korean `오후 8:00` / `오후 8시`.
-fn clock(c: &CivilTime, short: bool, lang: Language) -> String {
-    let h12 = match c.hour % 12 {
+fn clock_hm(hour: u8, minute: u8, short: bool, lang: Language) -> String {
+    let h12 = match hour % 12 {
         0 => 12,
         h => h,
     };
-    let pm = c.hour >= 12;
-    let bare = short && c.minute == 0;
-    match lang {
-        Language::En => {
-            let ampm = if pm { "PM" } else { "AM" };
-            if bare {
-                format!("{h12} {ampm}")
-            } else {
-                format!("{h12}:{:02} {ampm}", c.minute)
-            }
-        }
-        Language::Ko => {
-            let ampm = if pm { "오후" } else { "오전" };
-            if bare {
-                format!("{ampm} {h12}시")
-            } else {
-                format!("{ampm} {h12}:{:02}", c.minute)
-            }
-        }
+    let ampm = if hour >= 12 { text::PM } else { text::AM }.in_language(lang);
+    let h_str = h12.to_string();
+    if short && minute == 0 {
+        text::CLOCK_HOUR.format_in(lang, &[("ampm", ampm), ("hour", &h_str)])
+    } else {
+        let m_str = format!("{minute:02}");
+        text::CLOCK_FULL.format_in(
+            lang,
+            &[("ampm", ampm), ("hour", &h_str), ("minute", &m_str)],
+        )
     }
 }
 
+fn clock(c: &CivilTime, short: bool, lang: Language) -> String {
+    clock_hm(c.hour, c.minute, short, lang)
+}
+
+/// Formats `minutes` since midnight (`9:00 AM` / `오전 9:00`) in the active language.
+pub(super) fn clock_minutes(minutes: u32) -> String {
+    let hour = u8::try_from((minutes / 60) % 24).unwrap_or(0);
+    let minute = u8::try_from(minutes % 60).unwrap_or(0);
+    clock_hm(hour, minute, false, language())
+}
+
 fn month_day(c: &CivilTime, lang: Language) -> String {
-    match lang {
-        Language::En => format!(
-            "{} {}",
-            EN_MONTHS[usize::from(c.month.clamp(1, 12)) - 1],
-            c.day
-        ),
-        Language::Ko => format!("{}월 {}일", c.month, c.day),
-    }
+    let month = SHORT_MONTHS[usize::from(c.month.clamp(1, 12)) - 1].in_language(lang);
+    let day = c.day.to_string();
+    text::MONTH_DAY.format_in(lang, &[("month", month), ("day", &day)])
 }
 
 /// Orca's `formatWaitTime`: the time today, the weekday within six days, else the date.
@@ -84,16 +99,11 @@ fn wait_time_in(at: u64, now: u64, offset: i64, lang: Language, short: bool) -> 
         return time;
     }
     if at.abs_diff(now) < 6 * DAY_MS {
-        let name = match lang {
-            Language::En => EN_DAYS[weekday],
-            Language::Ko => KO_DAYS[weekday],
-        };
+        let name = WEEKDAYS[weekday].in_language(lang);
         return format!("{name} {time}");
     }
-    match lang {
-        Language::En => format!("{}, {time}", month_day(&c, lang)),
-        Language::Ko => format!("{} {time}", month_day(&c, lang)),
-    }
+    let date = month_day(&c, lang);
+    text::DATE_TIME.format_in(lang, &[("date", &date), ("time", &time)])
 }
 
 /// Today, yesterday or earlier, as Orca's `lookedDay` says.
@@ -207,6 +217,10 @@ mod tests {
             wait_time_in(MON_8PM + DAY_MS, MON_8PM, 0, Language::Ko, true),
             "화 오후 8시"
         );
+        assert_eq!(
+            wait_time_in(MON_8PM + 10 * DAY_MS, MON_8PM, 0, Language::Ko, true),
+            "12월 3일 오후 8시"
+        );
     }
 
     #[test]
@@ -222,5 +236,7 @@ mod tests {
         assert_eq!(clock(&at(0, 5), false, Language::En), "12:05 AM");
         assert_eq!(clock(&at(12, 0), true, Language::En), "12 PM");
         assert_eq!(clock(&at(9, 30), false, Language::Ko), "오전 9:30");
+        assert_eq!(clock(&at(12, 0), true, Language::Ko), "오후 12시");
+        assert_eq!(clock(&at(20, 0), false, Language::Ko), "오후 8:00");
     }
 }

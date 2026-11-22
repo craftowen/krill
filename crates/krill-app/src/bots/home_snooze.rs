@@ -12,13 +12,12 @@ use krill_proto::bots::{
 };
 
 use super::home::{local_offset_secs, snooze_presets};
-use super::home_time::snooze_time;
+use super::home_time::{clock_minutes as clock, snooze_time};
 use super::rpc::call_checked;
 use super::{View, now_unix_ms};
 use crate::i18n::{
-    Language,
+    Message,
     catalog::{bot_home as hm, bots as text},
-    language,
 };
 use crate::local_time::civil_from_epoch;
 use crate::ui;
@@ -28,19 +27,28 @@ const DAY_SECS: i64 = 86_400;
 const MAX_MS: u64 = 366 * DAY_SECS as u64 * 1000;
 const SLOT_MINUTES: u32 = 15;
 const DEFAULT_MINUTES: u32 = 9 * 60;
-const EN_MONTHS: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
+const FULL_MONTHS: [Message; 12] = [
+    hm::MONTH_FULL_01,
+    hm::MONTH_FULL_02,
+    hm::MONTH_FULL_03,
+    hm::MONTH_FULL_04,
+    hm::MONTH_FULL_05,
+    hm::MONTH_FULL_06,
+    hm::MONTH_FULL_07,
+    hm::MONTH_FULL_08,
+    hm::MONTH_FULL_09,
+    hm::MONTH_FULL_10,
+    hm::MONTH_FULL_11,
+    hm::MONTH_FULL_12,
+];
+const CAL_DAYS: [Message; 7] = [
+    hm::CAL_SUN,
+    hm::CAL_MON,
+    hm::CAL_TUE,
+    hm::CAL_WED,
+    hm::CAL_THU,
+    hm::CAL_FRI,
+    hm::CAL_SAT,
 ];
 
 /// The Snooze until dialog's state.
@@ -122,18 +130,6 @@ fn next_month(first: i64) -> i64 {
 
 fn prev_month(first: i64) -> i64 {
     month_first(first - 1)
-}
-
-fn clock(minutes: u32) -> String {
-    let (h, m) = (minutes / 60, minutes % 60);
-    let h12 = match h % 12 {
-        0 => 12,
-        x => x,
-    };
-    match language() {
-        Language::En => format!("{h12}:{m:02} {}", if h >= 12 { "PM" } else { "AM" }),
-        Language::Ko => format!("{} {h12}:{m:02}", if h >= 12 { "오후" } else { "오전" }),
-    }
 }
 
 impl View {
@@ -380,10 +376,8 @@ impl View {
         let slot = slot_on(chosen, pick.minutes, now, offset);
         let until = slot.map(|s| at(chosen, s, offset));
         let (year, month, _) = civil(pick.month_first);
-        let caption = match language() {
-            Language::En => format!("{} {year}", EN_MONTHS[usize::from(month.clamp(1, 12)) - 1]),
-            Language::Ko => format!("{year}년 {month}월"),
-        };
+        let month_name = FULL_MONTHS[usize::from(month.clamp(1, 12)) - 1].get();
+        let caption = hm::MONTH_YEAR.format(&[("year", &year.to_string()), ("month", month_name)]);
         let today = today(now, offset);
         let can_prev = pick.month_first > month_first(first);
         let can_next = next_month(pick.month_first) <= last;
@@ -432,16 +426,12 @@ impl View {
                             })),
                     ),
             );
-        let days = match language() {
-            Language::En => ["S", "M", "T", "W", "T", "F", "S"],
-            Language::Ko => ["일", "월", "화", "수", "목", "금", "토"],
-        };
         let mut grid = div().w_full().flex().flex_col().gap_1().child(
             div()
                 .flex()
                 .w_full()
                 .justify_between()
-                .children(days.map(|d| {
+                .children(CAL_DAYS.map(|d| {
                     div()
                         .size(px(32.))
                         .flex()
@@ -449,7 +439,7 @@ impl View {
                         .justify_center()
                         .text_size(ui::TEXT_XS)
                         .text_color(p.muted_foreground)
-                        .child(d)
+                        .child(d.get())
                 })),
         );
         // 1970-01-01 was a Thursday: the grid starts on the Sunday on or before the 1st.
@@ -630,5 +620,33 @@ mod tests {
         assert_eq!(civil(first), (2026, 11, 1));
         assert_eq!(civil(next_month(first)), (2026, 12, 1));
         assert_eq!(civil(prev_month(first)), (2026, 10, 1));
+    }
+
+    #[test]
+    fn calendar_captions_and_headers_localize_via_catalog() {
+        use crate::i18n::Language;
+        let nov = FULL_MONTHS[10];
+        assert_eq!(
+            hm::MONTH_YEAR.format_in(
+                Language::En,
+                &[("year", "2026"), ("month", nov.in_language(Language::En))]
+            ),
+            "November 2026"
+        );
+        assert_eq!(
+            hm::MONTH_YEAR.format_in(
+                Language::Ko,
+                &[("year", "2026"), ("month", nov.in_language(Language::Ko))]
+            ),
+            "2026년 11월"
+        );
+        assert_eq!(
+            CAL_DAYS.map(|d| d.in_language(Language::En)),
+            ["S", "M", "T", "W", "T", "F", "S"]
+        );
+        assert_eq!(
+            CAL_DAYS.map(|d| d.in_language(Language::Ko)),
+            ["일", "월", "화", "수", "목", "금", "토"]
+        );
     }
 }

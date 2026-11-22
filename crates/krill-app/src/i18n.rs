@@ -76,7 +76,12 @@ impl Message {
     /// Named substitutions permit translators to reorder fields. Replacement values are
     /// inserted once, so braces in paths, errors, or terminal text stay literal.
     pub fn format(self, args: &[(&str, &str)]) -> String {
-        let template = self.get();
+        self.format_in(language(), args)
+    }
+
+    /// Same as [`Self::format`], in an explicit `language`.
+    pub fn format_in(self, language: Language, args: &[(&str, &str)]) -> String {
+        let template = self.in_language(language);
         let mut result = String::new();
         let mut rest = template;
         while let Some((prefix, field)) = rest.split_once('{') {
@@ -3168,6 +3173,51 @@ catalog! {
         TODAY_AT => ("오늘 {time}", "Today at {time}"),
         TOMORROW_AT => ("내일 {time}", "Tomorrow at {time}"),
         TOMORROW_LOWER => ("내일 {time}", "tomorrow {time}"),
+        AM => ("오전", "AM"),
+        PM => ("오후", "PM"),
+        CLOCK_FULL => ("{ampm} {hour}:{minute}", "{hour}:{minute} {ampm}"),
+        CLOCK_HOUR => ("{ampm} {hour}시", "{hour} {ampm}"),
+        MONTH_DAY => ("{month} {day}일", "{month} {day}"),
+        DATE_TIME => ("{date} {time}", "{date}, {time}"),
+        MONTH_YEAR => ("{year}년 {month}", "{month} {year}"),
+        WEEKDAY_SUN => ("일", "Sun"),
+        WEEKDAY_MON => ("월", "Mon"),
+        WEEKDAY_TUE => ("화", "Tue"),
+        WEEKDAY_WED => ("수", "Wed"),
+        WEEKDAY_THU => ("목", "Thu"),
+        WEEKDAY_FRI => ("금", "Fri"),
+        WEEKDAY_SAT => ("토", "Sat"),
+        CAL_SUN => ("일", "S"),
+        CAL_MON => ("월", "M"),
+        CAL_TUE => ("화", "T"),
+        CAL_WED => ("수", "W"),
+        CAL_THU => ("목", "T"),
+        CAL_FRI => ("금", "F"),
+        CAL_SAT => ("토", "S"),
+        MONTH_SHORT_01 => ("1월", "Jan"),
+        MONTH_SHORT_02 => ("2월", "Feb"),
+        MONTH_SHORT_03 => ("3월", "Mar"),
+        MONTH_SHORT_04 => ("4월", "Apr"),
+        MONTH_SHORT_05 => ("5월", "May"),
+        MONTH_SHORT_06 => ("6월", "Jun"),
+        MONTH_SHORT_07 => ("7월", "Jul"),
+        MONTH_SHORT_08 => ("8월", "Aug"),
+        MONTH_SHORT_09 => ("9월", "Sep"),
+        MONTH_SHORT_10 => ("10월", "Oct"),
+        MONTH_SHORT_11 => ("11월", "Nov"),
+        MONTH_SHORT_12 => ("12월", "Dec"),
+        MONTH_FULL_01 => ("1월", "January"),
+        MONTH_FULL_02 => ("2월", "February"),
+        MONTH_FULL_03 => ("3월", "March"),
+        MONTH_FULL_04 => ("4월", "April"),
+        MONTH_FULL_05 => ("5월", "May"),
+        MONTH_FULL_06 => ("6월", "June"),
+        MONTH_FULL_07 => ("7월", "July"),
+        MONTH_FULL_08 => ("8월", "August"),
+        MONTH_FULL_09 => ("9월", "September"),
+        MONTH_FULL_10 => ("10월", "October"),
+        MONTH_FULL_11 => ("11월", "November"),
+        MONTH_FULL_12 => ("12월", "December"),
         RAN_AT => ("{time}에 실행함", "Ran {time}"),
         RAN_YESTERDAY => ("어제 실행함", "Ran yesterday"),
         LOOKED => ("{time}에 둘러봄", "Looked {time}"),

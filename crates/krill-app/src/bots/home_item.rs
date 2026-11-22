@@ -1105,8 +1105,7 @@ impl View {
             .border_1()
             .border_color(p.border)
             .bg(p.background)
-            .p(px(6.))
-            .shadow_xs();
+            .p(px(6.));
         if !mentions.is_empty() {
             let mut list = div()
                 .debug_selector(|| "bot-item-mentions".into())
