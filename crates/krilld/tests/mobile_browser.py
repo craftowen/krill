@@ -70,7 +70,7 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 wait('KrillMobile.store.connection.phase==="ready" && recoverySockets.length>=2')
                 wait(f'KrillMobile.store.sessions.has({cfg["session"]})')
                 navigate('/')
-                wait('!!document.querySelector(".host-card")')
+                wait('!!document.querySelector(".bots-list,.workspace-list")')
                 assert evaluate('sessionStorage.getItem("interrupted")') == 'yes'
                 assert len(json.loads((Path(cfg['dir'])/'mobile-devices.json').read_text())) == 1
                 security = evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!(localStorage.getItem("krill-mobile-v2")||localStorage.getItem("krill-mobile-hosts-v1")),hash:location.hash})')
@@ -78,8 +78,11 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 # Chromium treats loopback as secure, while LAN IPs are insecure.
                 # mobile_pwa.cjs separately exercises encryption without subtle.
                 assert security['subtle'] == ('object' if security['secure'] else 'undefined'), security
-                assert evaluate('document.querySelector(".host-card").getBoundingClientRect().bottom<innerHeight')
+                assert evaluate('document.querySelector(".tab-bar [aria-current=page]")?.getAttribute("aria-label")==="Bots"')
                 shot('home')
+                navigate('/me')
+                wait('!!document.querySelector(".host-card")')
+                assert evaluate('document.querySelector(".host-card").getBoundingClientRect().bottom<innerHeight')
                 browser('click','.host-main')
                 wait('document.querySelectorAll(".workspace-row").length===4')
                 assert evaluate('KrillMobile.store.snapshot.repositories.length') == 2

@@ -230,7 +230,7 @@ def main():
                 ready_terminal()
                 browser('fill', '.command-input', 'retained draft ' + order)
                 session_route = evaluate('location.hash')
-                evaluate('KrillMobile.app.navigate("/");true')
+                evaluate('KrillMobile.app.navigate("/me");true')
                 wait('!!document.querySelector(".host-card")')
                 if order == 'blocked-relay-first':
                     evaluate('(async()=>{await fetch("/relay-deny");return true})()')
