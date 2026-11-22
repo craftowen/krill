@@ -509,6 +509,8 @@ pub(super) struct WorktreeContext<'a> {
     pub awake_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub automation_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub cli_worktrees: Option<&'a BTreeSet<PathBuf>>,
+    /// Orca "Hide bot workspaces": worktrees a bot's workers made, listed only under the bot.
+    pub bot_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub parents: Option<&'a BTreeMap<PathBuf, PathBuf>>,
     pub collapsed_lineage: Option<&'a BTreeSet<PathBuf>>,
     pub sleeping_worktrees: Option<&'a BTreeSet<PathBuf>>,
@@ -603,6 +605,9 @@ pub(super) fn is_worktree_visible(
         && (ctx.cli_worktrees.is_some_and(|s| s.contains(path))
             || external::is_claude_worktree(path))
     {
+        return false;
+    }
+    if ctx.bot_worktrees.is_some_and(|s| s.contains(path)) {
         return false;
     }
     if options.filters.hide_sleeping {
@@ -1340,6 +1345,7 @@ impl Sidebar {
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
+            bot_worktrees: self.bot_worktrees.as_ref(),
             parents: Some(&self.parents),
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
@@ -1506,6 +1512,13 @@ impl Sidebar {
     pub fn toggle_hide_automation(&mut self, cx: &mut Context<Self>) {
         self.options.filters.hide_automation = !self.options.filters.hide_automation;
         self.persist(cx);
+    }
+
+    /// Orca "Hide bot workspaces" (on by default): kept in settings, not `sidebar.bin`.
+    pub fn toggle_hide_bot_workspaces(&mut self, cx: &mut Context<Self>) {
+        let hide = !self.hides_bot_workspaces();
+        crate::settings::set_hide_bot_workspaces(hide, cx);
+        self.set_hide_bot_workspaces(hide, cx);
     }
 
     pub fn toggle_hide_cli(&mut self, cx: &mut Context<Self>) {
@@ -1935,10 +1948,17 @@ fn build_options_menu(
     let sb = this.clone();
     menu.separator().item(
         PopupMenuItem::element(move |_, cx| {
-            let options = sb
-                .upgrade()
-                .map_or_else(WorkspaceOptions::default, |s| s.read(cx).options.clone());
-            render_filter_section(&sb, &menu_weak, &options, ui::palette(cx))
+            let (options, bots) = sb.upgrade().map_or_else(
+                || (WorkspaceOptions::default(), None),
+                |s| {
+                    let s = s.read(cx);
+                    // Orca keeps the row while off, so the change stays reachable to undo.
+                    let hide = s.hides_bot_workspaces();
+                    let shown = !hide || s.has_bot_sessions();
+                    (s.options.clone(), shown.then_some(hide))
+                },
+            );
+            render_filter_section(&sb, &menu_weak, &options, bots, ui::palette(cx))
         })
         .disabled(true),
     )
@@ -2454,9 +2474,12 @@ fn render_filter_section(
     sidebar_weak: &gpui::WeakEntity<Sidebar>,
     menu_weak: &gpui::WeakEntity<PopupMenu>,
     options: &WorkspaceOptions,
+    hide_bots: Option<bool>,
     p: &'static ui::Palette,
 ) -> gpui::Div {
     let active_filters = options.filters.active_count();
+    let bot_sb = sidebar_weak.clone();
+    let bot_mn = menu_weak.clone();
     let sleep_sb = sidebar_weak.clone();
     let sleep_mn = menu_weak.clone();
     let def_sb = sidebar_weak.clone();
@@ -2525,6 +2548,20 @@ fn render_filter_section(
                 cli_mn.update(cx, |_, cx| cx.notify()).ok();
             },
         ))
+        .when_some(hide_bots, |d, hide| {
+            d.child(render_filter_toggle_row(
+                "sidebar-filter-hide-bots",
+                ui::icons::BOT_SVG,
+                crate::i18n::catalog::bots::SB_HIDE_BOT_WORKSPACES.get(),
+                hide,
+                false,
+                p,
+                move |cx| {
+                    bot_sb.update(cx, Sidebar::toggle_hide_bot_workspaces).ok();
+                    bot_mn.update(cx, |_, cx| cx.notify()).ok();
+                },
+            ))
+        })
         .when(active_filters > 0, |d| {
             d.child(menu_separator(p)).child(
                 div()
@@ -2554,7 +2591,7 @@ fn render_filter_section(
         })
 }
 
-fn render_filter_toggle_row(
+pub fn render_filter_toggle_row(
     id: &'static str,
     icon_bytes: &'static [u8],
     label: &'static str,
@@ -2665,7 +2702,7 @@ fn switch_face(checked: bool, p: &'static ui::Palette) -> gpui::Div {
         .child(div().size(ui::SWITCH_THUMB).rounded_full().bg(thumb_bg))
 }
 
-fn check_slot(checked: bool, p: &'static ui::Palette) -> gpui::Div {
+pub fn check_slot(checked: bool, p: &'static ui::Palette) -> gpui::Div {
     div()
         .size(px(13.))
         .flex_none()
@@ -2681,7 +2718,7 @@ fn check_slot(checked: bool, p: &'static ui::Palette) -> gpui::Div {
         })
 }
 
-fn submenu_panel_frame(id: &'static str, p: &'static ui::Palette) -> gpui::Stateful<gpui::Div> {
+pub fn submenu_panel_frame(id: &'static str, p: &'static ui::Palette) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .debug_selector(move || id.into())
@@ -2695,7 +2732,7 @@ fn submenu_panel_frame(id: &'static str, p: &'static ui::Palette) -> gpui::State
         .gap_0p5()
 }
 
-fn section_label(label: &'static str, p: &'static ui::Palette) -> gpui::Div {
+pub fn section_label(label: &'static str, p: &'static ui::Palette) -> gpui::Div {
     div()
         .px_2()
         .pt_1()
@@ -2706,7 +2743,7 @@ fn section_label(label: &'static str, p: &'static ui::Palette) -> gpui::Div {
         .child(label)
 }
 
-fn menu_separator(p: &'static ui::Palette) -> gpui::Div {
+pub fn menu_separator(p: &'static ui::Palette) -> gpui::Div {
     div().my_1().h(px(1.)).w_full().bg(p.border)
 }
 

@@ -27,7 +27,7 @@ use krill_proto::bots::{
     BotSuggestion, CreateBotParams, CreateBotV2Params, DefaultTrackerBots, ExternalBotCandidate,
     ExternalBotSourceApp, ExternalConversationLink, ExternalSource, FieldPatch,
     MAX_AVATAR_PNG_BYTES, MAX_RPC_ZIP_BYTES, MemoryDeletionViolation, UpdateBotExtrasParams,
-    UpdateBotParams, append_memory_fact, assert_bot_owns_home, bot_slug_from_name,
+    UpdateBotParams, append_memory_fact, assert_bot_owns_home, bot_slug_from_name, default_mascot,
     discover_external_bots as proto_discover_external_bots, export_bot_home_zip, find_bot_mcp_app,
     find_bot_template, forget_memory_fact, import_bot_zip, init_bot_home, materialize_bot_skills,
     soul_description, strip_png_metadata, validate_bot_name, validate_bot_slug,
@@ -141,7 +141,7 @@ impl BotStore {
     /// Lists all persisted bots.
     pub fn list_bots(&self) -> io::Result<Vec<BotConfig>> {
         let _guard = lock(&self.io_lock);
-        self.read_json_or_default(BOTS_INDEX_FILE)
+        self.read_bots()
     }
 
     /// Gets a bot by exact [`BotId`].
@@ -180,7 +180,7 @@ impl BotStore {
     /// Creates a new bot using v2 extended parameters (`slug`, `avatar_color`, `skills`, `events`).
     pub fn create_bot_v2(&self, params: CreateBotV2Params, now_ms: u64) -> io::Result<BotConfig> {
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let base = params.base;
         let template = base.template_id.as_deref().and_then(find_bot_template);
 
@@ -216,6 +216,10 @@ impl BotStore {
         cfg.avatar = base
             .avatar
             .or_else(|| template.map(|t| t.mascot.to_owned()));
+        // Orca gives a bot made without a picture a random mascot.
+        if cfg.avatar.is_none() && cfg.emoji.is_none() {
+            cfg.avatar = Some(default_mascot(&format!("{}{now_ms}", cfg.id.as_str())).to_owned());
+        }
         cfg.avatar_color = params
             .avatar_color
             .map(|c| c.trim().to_owned())
@@ -334,7 +338,7 @@ impl BotStore {
         now_ms: u64,
     ) -> io::Result<BotConfig> {
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter_mut()
             .find(|b| b.id == params.bot_id)
@@ -411,7 +415,7 @@ impl BotStore {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter_mut()
             .find(|b| &b.id == bot_id)
@@ -477,7 +481,7 @@ impl BotStore {
             ));
         }
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         if let Some(ref bid) = bot_id
             && !bots.iter().any(|b| &b.id == bid)
         {
@@ -496,7 +500,7 @@ impl BotStore {
     /// Applies partial updates to an existing bot and refreshes its managed home files.
     pub fn update_bot(&self, params: UpdateBotParams, now_ms: u64) -> io::Result<BotConfig> {
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter_mut()
             .find(|b| b.id == params.bot_id)
@@ -559,7 +563,7 @@ impl BotStore {
         now_ms: u64,
     ) -> io::Result<BotConfig> {
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter_mut()
             .find(|b| &b.id == bot_id)
@@ -577,7 +581,7 @@ impl BotStore {
     /// Marks `first_run_completed = true` if not already completed. Returns `true` if changed.
     pub fn mark_first_run_completed(&self, bot_id: &BotId, now_ms: u64) -> io::Result<bool> {
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let Some(bot) = bots.iter_mut().find(|b| &b.id == bot_id) else {
             return Ok(false);
         };
@@ -595,7 +599,7 @@ impl BotStore {
     /// Deletes a bot from the registry, cleans up links/access requests/groups, and optionally removes its home.
     pub fn delete_bot(&self, bot_id: &BotId, delete_home: bool) -> io::Result<BotConfig> {
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let Some(pos) = bots.iter().position(|b| &b.id == bot_id) else {
             return Err(not_found_bot(bot_id));
         };
@@ -685,7 +689,7 @@ impl BotStore {
             ));
         }
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter_mut()
             .find(|b| &b.id == bot_id)
@@ -751,7 +755,7 @@ impl BotStore {
             )));
         }
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter()
             .find(|b| &b.id == bot_id)
@@ -879,7 +883,7 @@ impl BotStore {
     /// Explicitly removes matching fact line(s) from `<home>/MEMORY.md`.
     pub fn forget_memory_fact(&self, bot_id: &BotId, fact: &str) -> io::Result<(String, usize)> {
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter()
             .find(|b| &b.id == bot_id)
@@ -919,7 +923,7 @@ impl BotStore {
         source: Option<&str>,
     ) -> io::Result<String> {
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter()
             .find(|b| &b.id == bot_id)
@@ -1090,7 +1094,7 @@ impl BotStore {
         now_ms: u64,
     ) -> io::Result<AccessDecision> {
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter()
             .find(|b| &b.id == bot_id)
@@ -1207,7 +1211,7 @@ impl BotStore {
         self.write_json(ACCESS_REQUESTS_FILE, &reqs)?;
 
         if approve {
-            let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+            let mut bots: Vec<BotConfig> = self.read_bots()?;
             if let Some(bot) = bots.iter_mut().find(|b| b.id == decided.bot_id) {
                 let already = bot
                     .members
@@ -1297,7 +1301,7 @@ impl BotStore {
         let name = validate_bot_name(name)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         let mut unique_ids = Vec::new();
         for bid in bot_ids {
             if !bots.iter().any(|b| b.id == bid) {
@@ -1354,7 +1358,7 @@ impl BotStore {
         now_ms: u64,
     ) -> io::Result<BotGroupChat> {
         let _guard = lock(&self.io_lock);
-        let bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let bots: Vec<BotConfig> = self.read_bots()?;
         let mut groups: Vec<BotGroupChat> = self.read_json_or_default(GROUPS_FILE)?;
         let group = groups
             .iter_mut()
@@ -1499,7 +1503,7 @@ impl BotStore {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
 
         let final_name = validate_bot_name(name_override.unwrap_or(&pkg.manifest.name))
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
@@ -1632,7 +1636,7 @@ impl BotStore {
         }
 
         let _guard = lock(&self.io_lock);
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        let mut bots: Vec<BotConfig> = self.read_bots()?;
         let mut imported_ledger: BTreeMap<String, String> =
             self.read_json_or_default(IMPORTED_SOURCES_FILE)?;
         let mut imported = Vec::new();
@@ -1750,6 +1754,19 @@ impl BotStore {
     }
 
     // ---------- Internal JSON Helpers ----------
+
+    /// `bots.json`, with a mascot for a bot saved without any picture (Orca never shows one
+    /// bare); the next save keeps it.
+    fn read_bots(&self) -> io::Result<Vec<BotConfig>> {
+        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
+        for bot in &mut bots {
+            let bare = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
+            if bare(&bot.avatar) && bare(&bot.emoji) {
+                bot.avatar = Some(default_mascot(bot.id.as_str()).to_owned());
+            }
+        }
+        Ok(bots)
+    }
 
     fn read_json_or_default<T: DeserializeOwned + Default>(&self, filename: &str) -> io::Result<T> {
         ensure_no_symlink_path(&self.root)?;
@@ -2205,6 +2222,41 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_bot_without_a_picture_gets_an_orca_mascot() {
+        let root = temp_dir("mascot");
+        let store = BotStore::new(root.clone());
+        let created = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Shop".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let mascot = created.avatar.clone().unwrap();
+        assert!(krill_proto::bots::catalog::PICKABLE_MASCOTS.contains(&mascot.as_str()));
+        // A bot saved bare (before this) reads with a stable mascot of its own.
+        let index = root.join(BOTS_INDEX_FILE);
+        let raw = fs::read_to_string(&index).unwrap();
+        fs::write(&index, raw.replace(&format!("\"{mascot}\""), "null")).unwrap();
+        let listed = store.list_bots().unwrap();
+        assert_eq!(
+            listed[0].avatar.as_deref(),
+            Some(default_mascot(created.id.as_str()))
+        );
     }
 
     #[test]

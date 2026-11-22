@@ -3298,6 +3298,8 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hide_bots = crate::settings::hide_bot_workspaces(cx);
+        self.set_hide_bot_workspaces(hide_bots, cx);
         if self.delete_confirm.is_some() && self.delete_focus == DeleteFocus::Pending {
             self.delete_previous_focus = window.focused(cx);
             self.delete_scope_focus
