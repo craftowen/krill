@@ -14,7 +14,7 @@ use krill_proto::bots::{
 };
 
 use super::rpc::{
-    BOT_EFFORT_OPTIONS, BOT_RUNTIMES, BotRpcCall, call_checked, effort_label,
+    BOT_RUNTIMES, BotRpcCall, call_checked, effort_label, effort_options_for_runtime,
     runtime_display_label, runtime_models,
 };
 use crate::hosts::HostId;
@@ -243,6 +243,13 @@ impl BotAgentSetup {
     }
 
     pub fn set_model<E: 'static>(&mut self, model: Option<String>, cx: &mut Context<E>) {
+        if krill_proto::agent::canonical_id(self.runtime) == "agy"
+            && model
+                .as_deref()
+                .is_some_and(|m| krill_proto::agent::strip_agy_effort_suffix(m).1.is_some())
+        {
+            self.effort = None;
+        }
         self.model = model;
         cx.notify();
     }
@@ -272,6 +279,7 @@ impl BotAgentSetup {
     pub fn load_models<E: 'static>(&mut self, lens: fn(&mut E) -> &mut Self, cx: &mut Context<E>) {
         let rpc = self.rpc.clone();
         let agent_id = self.runtime.to_owned();
+        let expected_runtime = self.runtime;
         self.discovered = None;
         self.models_task = Some(cx.spawn(async move |this, cx| {
             let reply = cx
@@ -281,7 +289,11 @@ impl BotAgentSetup {
                 )
                 .await;
             this.update(cx, |this, cx| {
-                lens(this).discovered = Some(match reply {
+                let setup = lens(this);
+                if setup.runtime != expected_runtime {
+                    return;
+                }
+                setup.discovered = Some(match reply {
                     Ok(BotRpcResponse::AgentModels(models)) => models,
                     _ => BotAgentModels::default(),
                 });
@@ -326,7 +338,10 @@ impl BotAgentSetup {
 
     #[must_use]
     pub fn supports_effort(&self) -> bool {
-        matches!(self.runtime, "claude" | "codex" | "grok" | "opencode")
+        matches!(
+            krill_proto::agent::canonical_id(self.runtime),
+            "claude" | "codex" | "agy" | "grok" | "opencode"
+        )
     }
 
     #[must_use]
@@ -797,7 +812,7 @@ fn render_agent_popover_body<E: 'static>(
 
     let effort_row = if supports_effort {
         let mut segs = Vec::new();
-        for eff in BOT_EFFORT_OPTIONS {
+        for &eff in effort_options_for_runtime(current_runtime) {
             let active = if eff.is_empty() {
                 current_effort.is_none()
             } else {

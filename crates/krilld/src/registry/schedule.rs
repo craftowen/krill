@@ -584,13 +584,26 @@ impl Registry {
                     && let Some(tap) = self.tap(&peer, session)
                 {
                     let prompt_bytes = prompt.into_bytes();
+                    let is_agy = resolved_agent
+                        .as_ref()
+                        .is_some_and(|(canon, _)| canon == "agy");
                     std::thread::Builder::new()
                         .name(format!("sched-prompt-{}", session.0))
                         .spawn(move || {
                             let deadline = Instant::now() + Duration::from_secs(15);
                             while Instant::now() < deadline {
                                 let p = tap.pulse();
-                                if p.closed || (p.end > 0 && tap.quiet_ms() >= 150) {
+                                if p.closed {
+                                    break;
+                                }
+                                if is_agy {
+                                    if p.end > 0
+                                        && tap.quiet_ms() >= 150
+                                        && crate::mobile::agy_composer_ready(&tap.capture().0)
+                                    {
+                                        break;
+                                    }
+                                } else if p.end > 0 && tap.quiet_ms() >= 150 {
                                     break;
                                 }
                                 std::thread::sleep(Duration::from_millis(50));

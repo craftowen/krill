@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use krill_proto::SessionId;
 use krill_proto::agent_history::ChatItemKind;
 use krill_proto::bots::{
-    BOT_QUIET_MARKER, BotConfig, BotId, BotSessionSummary, MemorySnapshot, build_launch_preamble,
-    find_bot_template, init_bot_home,
+    BOT_QUIET_MARKER, BotConfig, BotId, BotSessionSummary, MemorySnapshot,
+    build_launch_preamble_in, find_bot_template, init_bot_home,
 };
 use krill_proto::hook::HookEvent;
 use krill_proto::orchestration::{MessageType, OrchestrationStore, SendParams};
@@ -316,9 +316,14 @@ impl BotRuntime {
         let home = init_bot_home(store.root(), &bot, None).map_err(|err| err.to_string())?;
         let soul = store.get_soul(bot_id).unwrap_or_default();
         let memory = store.get_memory(bot_id).unwrap_or_default();
-        let preamble = build_launch_preamble(&bot, Some(&soul), Some(&memory));
-
         let launch_cwd = resolve_launch_cwd(&bot, &home, cwd_override);
+        let preamble = build_launch_preamble_in(
+            &bot,
+            Some(&soul),
+            Some(&memory),
+            Some(&home),
+            Some(&launch_cwd),
+        );
 
         // Register Composio MCP route lazily if enabled on this bot.
         if bot.connectors.composio.enabled {
@@ -427,6 +432,7 @@ impl BotRuntime {
         if let Some(tap) = registry.session_tap(session_id) {
             let bytes = initial_input.map(String::into_bytes);
             let ctrl_thread = Arc::clone(&ctrl);
+            let is_agy = krill_proto::agent::canonical_id(&bot.agent_id) == "agy";
             let spawn_res = std::thread::Builder::new()
                 .name(format!("bot-preamble-{}", session_id.0))
                 .stack_size(STACK_SIZE)
@@ -436,7 +442,19 @@ impl BotRuntime {
                     let deadline = Instant::now() + PREAMBLE_READY_WAIT;
                     while Instant::now() < deadline {
                         let p = tap.pulse();
-                        if p.closed || (p.end > 0 && tap.quiet_ms() >= 150) {
+                        if p.closed {
+                            break;
+                        }
+                        if is_agy {
+                            // Antigravity CLI pauses >150ms during "Signing in..." before rendering
+                            // its interactive `> ` composer; wait for the composer to appear.
+                            if p.end > 0
+                                && tap.quiet_ms() >= 150
+                                && crate::mobile::agy_composer_ready(&tap.capture().0)
+                            {
+                                break;
+                            }
+                        } else if p.end > 0 && tap.quiet_ms() >= 150 {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(50));

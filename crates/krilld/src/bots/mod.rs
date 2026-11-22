@@ -601,16 +601,42 @@ impl BotsManager {
                 }
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
-            BotRpcRequest::UpdateBot(params) => match self.store.update_bot(*params, ts) {
-                Ok(bot) => {
-                    if bot.memory_tidy.enabled {
-                        self.scheduler_state.reset_tidy_auto_disabled(&bot.id).ok();
+            BotRpcRequest::UpdateBot(params) => {
+                let prev_agent = self
+                    .store
+                    .get_bot(&params.bot_id)
+                    .ok()
+                    .flatten()
+                    .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
+                match self.store.update_bot(*params, ts) {
+                    Ok(bot) => {
+                        let next_agent = krill_proto::agent::canonical_id(&bot.agent_id);
+                        if prev_agent.as_deref().is_some_and(|prev| prev != next_agent) {
+                            // Main provider changed: retire old-provider live sessions, cron
+                            // sessions, and external link session bindings so the next turn
+                            // launches cleanly on the new runtime instead of reusing the old one.
+                            self.runtime
+                                .reset_chat(
+                                    registry,
+                                    &self.store,
+                                    &self.tool_relay,
+                                    &bot.id,
+                                    None,
+                                    ts,
+                                )
+                                .ok();
+                            lock(&self.active_cron_sessions).retain(|(bid, _), _| bid != &bot.id);
+                            self.store.unbind_bot_links(&bot.id, ts).ok();
+                        }
+                        if bot.memory_tidy.enabled {
+                            self.scheduler_state.reset_tidy_auto_disabled(&bot.id).ok();
+                        }
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
                     }
-                    self.reconcile_for_bot(&bot);
-                    BotRpcResponse::Bot(Box::new(bot))
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            }
             BotRpcRequest::UpdateBotExtras(params) => {
                 match self.store.update_bot_extras(*params, ts) {
                     Ok(bot) => BotRpcResponse::Bot(Box::new(bot)),
@@ -4253,6 +4279,131 @@ mod tests {
         ));
 
         srv.join().ok();
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn switching_bot_provider_clears_stale_model_sessions_cron_and_links() {
+        let state =
+            std::env::temp_dir().join(format!("krilld-bot-provider-switch-{}", std::process::id()));
+        fs::remove_dir_all(&state).ok();
+        fs::create_dir_all(&state).unwrap();
+
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        let BotRpcResponse::Bot(created) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Switch Bot".to_owned(),
+                agent_id: "claude".to_owned(),
+                description: "provider switch test".to_owned(),
+                emoji: None,
+                avatar: None,
+                model: Some("opus".to_owned()),
+                effort: Some("high".to_owned()),
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) else {
+            panic!("expected Bot");
+        };
+        assert_eq!(created.agent_id, "claude");
+        assert_eq!(created.model.as_deref(), Some("opus"));
+        assert_eq!(created.effort.as_deref(), Some("high"));
+
+        // Seed an old-provider session binding, active cron session, and external link session.
+        let old_sid = SessionId(701);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            old_sid,
+            crate::bots::runtime::BotSessionBinding {
+                bot_id: created.id.clone(),
+                link_id: None,
+                memory_snapshot: krill_proto::bots::MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 0,
+                label: "Switch Bot".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: false,
+                last_prompt: None,
+            },
+        );
+        lock(&mgr.active_cron_sessions).insert((created.id.clone(), "daily".to_owned()), old_sid);
+        let link = mgr
+            .store
+            .lookup_or_create_link(
+                &created.id,
+                ExternalSource::Slack,
+                None,
+                "C1",
+                None,
+                ActsFor::Owner,
+                1_000,
+            )
+            .unwrap();
+        mgr.store
+            .bind_link_session(&link.id, old_sid, 1_100)
+            .unwrap();
+
+        // Switch provider from claude -> antigravity (canonicalized to agy) without setting model/effort.
+        let BotRpcResponse::Bot(updated) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::UpdateBot(Box::new(UpdateBotParams {
+                bot_id: created.id.clone(),
+                name: None,
+                description: None,
+                emoji: FieldPatch::Unchanged,
+                avatar: FieldPatch::Unchanged,
+                agent_id: Some("antigravity".to_owned()),
+                model: FieldPatch::Unchanged,
+                effort: FieldPatch::Unchanged,
+                permission_mode: None,
+                workspace: FieldPatch::Unchanged,
+                paused: None,
+                first_run_completed: None,
+                notifications: None,
+                schedules: None,
+                look_around: None,
+                memory_tidy: None,
+                mcp_tools: None,
+            })),
+        ) else {
+            panic!("expected updated Bot");
+        };
+        assert_eq!(updated.agent_id, "agy");
+        assert_eq!(updated.model, None, "stale claude model must be cleared");
+        assert_eq!(updated.effort, None, "stale claude effort must be cleared");
+        assert!(
+            !mgr.runtime.is_bot_session(old_sid),
+            "old provider session binding must be cleared on provider switch"
+        );
+        assert!(
+            lock(&mgr.active_cron_sessions).is_empty(),
+            "old provider cron session binding must be cleared on provider switch"
+        );
+        assert_eq!(
+            mgr.store
+                .get_link(&link.id)
+                .unwrap()
+                .and_then(|l| l.session_id),
+            None,
+            "external link session binding must be cleared on provider switch"
+        );
+
+        // Verify persistence across a fresh BotsManager (simulated daemon restart) and bot.json.
+        let mgr2 = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+        let reloaded = mgr2.store.get_bot(&created.id).unwrap().unwrap();
+        assert_eq!(reloaded.agent_id, "agy");
+        assert_eq!(reloaded.model, None);
+        let bot_json = fs::read_to_string(mgr2.store.bot_home(&reloaded).join("bot.json")).unwrap();
+        assert!(bot_json.contains("\"agent_id\": \"agy\""), "{bot_json}");
+
+        mgr2.shutdown();
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();
     }

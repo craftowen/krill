@@ -142,7 +142,20 @@ pub fn parse_avatar_color(raw: Option<&str>) -> Option<TabColor> {
 }
 
 /// Supported reasoning effort choices (empty string = runtime default).
-pub const BOT_EFFORT_OPTIONS: [&str; 4] = ["", "low", "medium", "high"];
+pub const BOT_EFFORT_OPTIONS: [&str; 6] = ["", "low", "medium", "high", "xhigh", "max"];
+
+const CLAUDE_EFFORT_OPTIONS: [&str; 5] = ["", "low", "medium", "high", "max"];
+const CODEX_EFFORT_OPTIONS: [&str; 5] = ["", "low", "medium", "high", "xhigh"];
+
+/// Reasoning effort choices accepted by `runtime_id` (empty string = runtime default).
+#[must_use]
+pub fn effort_options_for_runtime(runtime_id: &str) -> &'static [&'static str] {
+    match krill_proto::agent::canonical_id(runtime_id) {
+        "claude" | "openclaude" => &CLAUDE_EFFORT_OPTIONS,
+        "codex" | "grok" | "pi" | "omp" => &CODEX_EFFORT_OPTIONS,
+        _ => &BOT_EFFORT_OPTIONS,
+    }
+}
 
 /// Localized display label for a reasoning effort string.
 #[must_use]
@@ -151,6 +164,8 @@ pub fn effort_label(effort: &str) -> &'static str {
         "low" => text::EFFORT_LOW.get(),
         "medium" => text::EFFORT_MEDIUM.get(),
         "high" => text::EFFORT_HIGH.get(),
+        "xhigh" => text::EFFORT_XHIGH.get(),
+        "max" => text::EFFORT_MAX.get(),
         _ => text::EFFORT_DEFAULT.get(),
     }
 }
@@ -271,10 +286,11 @@ pub fn expect_variant<T>(
 /// ([`BotRpcRequest::ListAgentModels`]). Same list as the chat composer's; "Default" is `None` here.
 #[must_use]
 pub fn runtime_models(runtime_id: &str) -> Vec<BotAgentModel> {
-    if !matches!(runtime_id, "claude" | "codex" | "agy") {
+    let canon = krill_proto::agent::canonical_id(runtime_id);
+    if !matches!(canon, "claude" | "codex" | "agy") {
         return Vec::new();
     }
-    crate::agent_models::builtin(runtime_id)
+    crate::agent_models::builtin(canon)
         .0
         .iter()
         .filter(|m| m.id != "default")

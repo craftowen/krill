@@ -428,6 +428,11 @@ impl NewBot {
     }
 
     #[cfg(test)]
+    pub(super) fn setup(&self) -> &BotAgentSetup {
+        &self.setup
+    }
+
+    #[cfg(test)]
     pub(super) fn set_runtime(&mut self, runtime: &'static str, cx: &mut Context<Self>) {
         self.setup.set_runtime(runtime, Self::setup_mut, cx);
     }

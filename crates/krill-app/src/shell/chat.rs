@@ -2199,19 +2199,31 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn chat_agent_id<'a>(&'a self, key: &ChatKey) -> &'a str {
+        if let Some(agent) = self
+            .chat
+            .logs
+            .get(key)
+            .map(|l| l.agent.as_str())
+            .filter(|a| !a.is_empty())
+        {
+            return agent;
+        }
+        if let Some(bot) = self.chat_bot(key) {
+            let canon = krill_proto::agent::canonical_id(&bot.agent_id);
+            if !canon.is_empty() {
+                return canon;
+            }
+        }
+        "claude"
+    }
+
     pub(super) fn step_chat_model_picker(&mut self, key: &ChatKey, delta: isize) -> bool {
         if !self.chat.model_picker.contains(key) {
             return false;
         }
-        let log = self.chat.logs.get(key);
-        let meta = log.map(|l| &l.meta);
-        let agent = log.map_or("claude", |l| {
-            if l.agent.is_empty() {
-                "claude"
-            } else {
-                l.agent.as_str()
-            }
-        });
+        let agent = self.chat_agent_id(key);
+        let meta = self.chat.logs.get(key).map(|l| &l.meta);
         let (models, _) = composer::resolved_composer_choices(agent, meta);
         let len = models.len();
         if len == 0 {
@@ -2243,18 +2255,11 @@ impl Shell {
         if !self.chat.model_picker.contains(key) {
             return false;
         }
-        let log = self.chat.logs.get(key);
-        let meta = log.map(|l| &l.meta);
+        let meta = self.chat.logs.get(key).map(|l| &l.meta);
         if !meta.is_some_and(|m| m.supported && !m.pending) {
             return false;
         }
-        let agent = log.map_or("claude", |l| {
-            if l.agent.is_empty() {
-                "claude"
-            } else {
-                l.agent.as_str()
-            }
-        });
+        let agent = self.chat_agent_id(key);
         let (models, _) = composer::resolved_composer_choices(agent, meta);
         if models.is_empty() {
             return false;

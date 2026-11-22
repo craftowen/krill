@@ -295,6 +295,11 @@ fn verified(screen: &Screen) -> bool {
     native::banner_meets(screen, "Antigravity CLI ", FLOOR)
 }
 
+/// Returns true when the Antigravity TUI has rendered an empty interactive composer (`> `).
+pub(super) fn composer_ready(screen: &Screen) -> bool {
+    composer(screen, None)
+}
+
 fn composer(screen: &Screen, draft: Option<&str>) -> bool {
     let y = usize::from(screen.cursor.line);
     let Some(cells) = screen.rows.get(y) else {
@@ -394,6 +399,14 @@ fn footer(screen: &Screen) -> Option<(String, Option<String>)> {
     footer_with(screen, None)
 }
 
+fn ends_with_agy_mode_tag(segment: &str) -> bool {
+    let last = segment.split_whitespace().last().unwrap_or("");
+    matches!(
+        last.to_ascii_lowercase().as_str(),
+        "auto" | "manual" | "yolo" | "plan" | "safe" | "ask"
+    )
+}
+
 fn footer_with(screen: &Screen, families: Option<&[Family]>) -> Option<(String, Option<String>)> {
     let row = (0..screen.rows.len())
         .rev()
@@ -410,6 +423,38 @@ fn footer_with(screen: &Screen, families: Option<&[Family]>) -> Option<(String, 
         let effort = effort.to_ascii_lowercase();
         if plain_label(label) && valid_effort(&effort) {
             return Some((label.to_owned(), Some(effort)));
+        }
+    }
+    // Default Antigravity CLI footer without a custom `statusLine`:
+    //   "? for shortcuts    auto  · Gemini 3.8 Flash · low"
+    //   "esc to cancel    auto  · Gemini 3.8 Flash · low"
+    //   "? for shortcuts    auto  · Orchestrator (Neon)"
+    if !row.contains('│') && status.contains('·') {
+        let parts: Vec<&str> = status
+            .split('·')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if let [.., mode, model, effort_raw] = parts.as_slice()
+            && ends_with_agy_mode_tag(mode)
+            && plain_label(model)
+        {
+            let effort = effort_raw.to_ascii_lowercase();
+            if valid_effort(&effort) {
+                return Some(((*model).to_owned(), Some(effort)));
+            }
+        }
+        if let [.., mode, tail] = parts.as_slice()
+            && ends_with_agy_mode_tag(mode)
+        {
+            let candidate = strip_context_window(tail).trim();
+            let known_standalone = families.is_some_and(|fams| {
+                fams.iter()
+                    .any(|f| f.label == candidate && f.levels.iter().all(|l| l.effort.is_none()))
+            });
+            if known_standalone || plain_model_label(candidate) {
+                return Some((candidate.to_owned(), None));
+            }
         }
     }
     let candidate = strip_context_window(status).trim();

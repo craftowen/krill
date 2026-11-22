@@ -506,6 +506,17 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
     }
 
     let mut profile = std::borrow::Cow::Borrowed(profile);
+    if is(&profile, "agy")
+        && let Some(home) = bot_mcp.and_then(|m| m.bot_home.as_deref())
+        && cwd.is_none_or(|c| !same_workspace_dir(c, home))
+        && let Some(home_str) = home.to_str()
+        && !profile.launch.is_empty()
+    {
+        profile
+            .to_mut()
+            .launch
+            .splice(1..1, ["--add-dir".to_owned(), home_str.to_owned()]);
+    }
     if let Some(text) = instructions {
         let state = state.ok_or(io::ErrorKind::NotFound)?;
         let args = instruction_args(&profile, &mut login.env, state, session, text)?;
@@ -2439,11 +2450,11 @@ fn pane_env_with_socket(
     env
 }
 
-/// 프로그램 파일명이 `name`인가(`/opt/bin/codex`도 `codex`).
+/// 프로그램 실행 파일 식별자가 `name`인가(`/opt/bin/codex`, `agy.exe`, `antigravity` 등 정규화 포함).
 fn is(profile: &Profile, name: &str) -> bool {
     profile
         .program()
-        .is_some_and(|p| Path::new(p).file_name().is_some_and(|n| n == name))
+        .is_some_and(|p| krill_proto::agent::executable_id(p) == name)
 }
 
 /// Codex 프로필이면 프로그램 바로 뒤에 `-c` hook을 넣은 사본. 명령은 설치가 끝난(`complete`, trust 등록 포함)
@@ -2748,5 +2759,90 @@ mod independent_state_verifier {
         assert_eq!(actual.id, "claude-active");
         assert_eq!(actual.dir, active);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agy_bot_launch_adds_separate_bot_home_and_normalizes_aliases() {
+        let root = std::env::temp_dir().join(format!("krilld-agy-bot-home-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let bot_home = root.join("bot-home");
+        let workspace = root.join("project-ws");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&bot_home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let alias_profile = Profile {
+            name: "Antigravity".to_owned(),
+            launch: vec!["/usr/local/bin/antigravity".to_owned()],
+            yolo_args: vec!["--dangerously-skip-permissions".to_owned()],
+            install: String::new(),
+            install_windows: String::new(),
+            env: std::collections::BTreeMap::new(),
+        };
+        assert!(is(&alias_profile, "agy"));
+        assert!(takes_bot_instructions(&alias_profile));
+
+        let win_profile = Profile {
+            launch: vec![r"C:\Tools\agy.exe".to_owned()],
+            ..alias_profile.clone()
+        };
+        assert!(is(&win_profile, "agy"));
+        assert!(takes_bot_instructions(&win_profile));
+
+        let mcp = BotMcpLaunchConfig {
+            bot_home: Some(bot_home.clone()),
+            http_servers: Vec::new(),
+            stdio_servers: Vec::new(),
+            instructions: Some("# Bot Instructions\n".to_owned()),
+        };
+        let (launch, _, _) = launch_selected_in_with_bot_mcp(
+            &alias_profile,
+            Permission::Yolo,
+            krill_proto::SessionId(42),
+            Some(&state),
+            None,
+            Some(&workspace),
+            Some(&mcp),
+        )
+        .unwrap();
+        let argv: Vec<String> = launch
+            .argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains(&format!("--add-dir {}", bot_home.display())),
+            "expected separate bot_home --add-dir in agy launch argv: {joined}"
+        );
+        assert!(
+            joined.contains("42-instructions-"),
+            "expected instructions dir --add-dir in agy launch argv: {joined}"
+        );
+
+        // When cwd == bot_home, do not emit duplicate --add-dir for bot_home.
+        let (same_launch, _, _) = launch_selected_in_with_bot_mcp(
+            &alias_profile,
+            Permission::Yolo,
+            krill_proto::SessionId(43),
+            Some(&state),
+            None,
+            Some(&bot_home),
+            Some(&mcp),
+        )
+        .unwrap();
+        let same_joined = same_launch
+            .argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !same_joined.contains(&format!("--add-dir {}", bot_home.display())),
+            "same cwd should not duplicate bot_home --add-dir: {same_joined}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

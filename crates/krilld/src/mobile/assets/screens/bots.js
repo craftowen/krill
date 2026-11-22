@@ -509,6 +509,28 @@
     ctx.sheet(t("New Bot"), [], t("Create an autonomous bot with its own workspace and soul."), (body) => {
       const hostSelect = el("select");
       hostSelect.setAttribute("aria-label", t("Desktop"));
+      const agentSelect = el("select");
+      agentSelect.setAttribute("aria-label", t("Agent"));
+      const fillAgents = (hid) => {
+        const rawAgents = agentsFor(hid);
+        const agentChoices = rawAgents.length
+          ? rawAgents
+          : [
+              { id: "claude", name: "Claude Code" },
+              { id: "codex", name: "Codex" },
+              { id: "agy", name: "Antigravity" },
+            ];
+        const prev = agentSelect.value;
+        agentSelect.replaceChildren();
+        for (const a of agentChoices) {
+          const opt = el("option", a.name || a.id);
+          opt.value = a.id;
+          agentSelect.append(opt);
+        }
+        agentSelect.value = agentChoices.some((a) => a.id === prev) ? prev : agentChoices[0].id;
+      };
+      fillAgents(pickedHostId);
+
       if (targetHosts.length > 1) {
         for (const h of targetHosts) {
           const opt = el("option", h.name);
@@ -518,6 +540,7 @@
         hostSelect.value = pickedHostId;
         hostSelect.addEventListener("change", () => {
           pickedHostId = hostSelect.value || null;
+          fillAgents(pickedHostId);
         });
       }
 
@@ -525,17 +548,6 @@
       nameInput.type = "text";
       nameInput.placeholder = t("Bot name");
       nameInput.setAttribute("aria-label", t("Bot name"));
-
-      const agentSelect = el("select");
-      agentSelect.setAttribute("aria-label", t("Agent"));
-      const rawAgents = agentsFor(pickedHostId);
-      const agentChoices = rawAgents.length ? rawAgents : [{ id: "claude", name: "Claude Code" }];
-      for (const a of agentChoices) {
-        const opt = el("option", a.name || a.id);
-        opt.value = a.id;
-        agentSelect.append(opt);
-      }
-      agentSelect.value = agentChoices[0].id;
 
       const tplSelect = el("select");
       tplSelect.setAttribute("aria-label", t("Template"));
@@ -1311,6 +1323,150 @@
       });
     }
 
+    function openEditAgentSheet() {
+      if (!bot) return;
+      ctx.sheet(t("Agent"), [], t("Change this bot's provider, model, or effort."), (body) => {
+        const snapshotAgents = ctx.state.snapshot?.agents || [];
+        const baseChoices = [
+          { id: "claude", name: "Claude Code" },
+          { id: "codex", name: "Codex" },
+          { id: "agy", name: "Antigravity" },
+          { id: "opencode", name: "OpenCode" },
+          { id: "cursor", name: "Cursor CLI" },
+          { id: "pi", name: "Pi" },
+          { id: "grok", name: "Grok" },
+          { id: "omp", name: "OMP" },
+        ];
+        const choices = [];
+        const seen = new Set();
+        for (const a of [...snapshotAgents, ...baseChoices]) {
+          if (a?.id && !seen.has(a.id)) {
+            seen.add(a.id);
+            choices.push({ id: a.id, name: a.name || M.agentName?.(a.id) || a.id });
+          }
+        }
+        const curAgent = bot.agent_id === "antigravity" ? "agy" : bot.agent_id || "claude";
+        if (!seen.has(curAgent)) choices.unshift({ id: curAgent, name: M.agentName?.(curAgent) || curAgent });
+
+        const agentSelect = el("select");
+        agentSelect.setAttribute("aria-label", t("Agent"));
+        for (const a of choices) {
+          const opt = el("option", a.name);
+          opt.value = a.id;
+          agentSelect.append(opt);
+        }
+        agentSelect.value = curAgent;
+
+        const modelSelect = el("select");
+        modelSelect.setAttribute("aria-label", t("Model"));
+        const effortSelect = el("select");
+        effortSelect.setAttribute("aria-label", t("Effort"));
+
+        const EFFORT_LABEL = {
+          "": "Default",
+          low: "Low",
+          medium: "Medium",
+          high: "High",
+          xhigh: "Extra high",
+          max: "Max",
+        };
+        const fillEfforts = (agentId, selected) => {
+          const levels =
+            agentId === "claude"
+              ? ["", "low", "medium", "high", "max"]
+              : ["codex", "grok", "pi", "omp"].includes(agentId)
+                ? ["", "low", "medium", "high", "xhigh"]
+                : ["", "low", "medium", "high", "xhigh", "max"];
+          effortSelect.replaceChildren();
+          for (const lvl of levels) {
+            const opt = el("option", t(EFFORT_LABEL[lvl] || lvl));
+            opt.value = lvl;
+            effortSelect.append(opt);
+          }
+          effortSelect.value = levels.includes(selected) ? selected : "";
+        };
+
+        let modelSeq = 0;
+        const fillModels = (agentId, selectedModel) => {
+          const seq = ++modelSeq;
+          modelSelect.replaceChildren();
+          const defOpt = el("option", t("Default"));
+          defOpt.value = "";
+          modelSelect.append(defOpt);
+          if (selectedModel) {
+            const curOpt = el("option", selectedModel);
+            curOpt.value = selectedModel;
+            modelSelect.append(curOpt);
+            modelSelect.value = selectedModel;
+          } else {
+            modelSelect.value = "";
+          }
+          ctx
+            .rpc({ action: "bots.models", agent_id: agentId })
+            .then((res) => {
+              if (ctx.signal.aborted || seq !== modelSeq) return;
+              const items = Array.isArray(res?.models) ? res.models : [];
+              modelSelect.replaceChildren();
+              const d = el("option", t("Default"));
+              d.value = "";
+              modelSelect.append(d);
+              const ids = new Set([""]);
+              for (const m of items) {
+                if (!m?.id || ids.has(m.id)) continue;
+                ids.add(m.id);
+                const opt = el("option", m.label || m.id);
+                opt.value = m.id;
+                modelSelect.append(opt);
+              }
+              if (selectedModel && !ids.has(selectedModel)) {
+                const curOpt = el("option", selectedModel);
+                curOpt.value = selectedModel;
+                modelSelect.append(curOpt);
+              }
+              modelSelect.value = selectedModel || "";
+            })
+            .catch(() => {});
+        };
+
+        fillModels(curAgent, bot.model || "");
+        fillEfforts(curAgent, bot.effort || "");
+
+        agentSelect.addEventListener("change", () => {
+          const next = agentSelect.value || "claude";
+          fillModels(next, "");
+          fillEfforts(next, "");
+        });
+
+        const save = async () => {
+          const nextAgent = agentSelect.value || "claude";
+          const nextModel = modelSelect.value || "";
+          const nextEffort = effortSelect.value || "";
+          const res = await ctx.rpc({
+            action: "bots.update",
+            bot_id: botId,
+            agent_id: nextAgent,
+            ...(nextModel ? { model: nextModel } : { clear_model: true }),
+            ...(nextEffort ? { effort: nextEffort } : { clear_effort: true }),
+          });
+          if (res?.bot) bot = res.bot;
+          ctx.closeSheet?.();
+          ctx.toast?.(t("Saved"));
+          await refreshHost(ctx, null)?.catch?.(() => {});
+          await load();
+        };
+
+        body.append(
+          el("label", t("Agent"), "sheet-field-label"),
+          agentSelect,
+          el("label", t("Model"), "sheet-field-label"),
+          modelSelect,
+          el("label", t("Effort"), "sheet-field-label"),
+          effortSelect,
+          button(t("Save"), save, "primary"),
+        );
+      });
+    }
+
     function draw() {
       if (ctx.signal.aborted) return;
       chatBtn.disabled = !ready() || !!bot?.paused;
@@ -1326,10 +1482,13 @@
         const meta = el("div", undefined, "bots-row-main");
         meta.append(
           el("strong", bot.name),
-          el("small", [bot.agent_id, bot.model, bot.paused ? t("Paused") : t("Active")].filter(Boolean).join(" · "), "muted"),
+          el("small", [M.agentName?.(bot.agent_id) || bot.agent_id, bot.model, bot.paused ? t("Paused") : t("Active")].filter(Boolean).join(" · "), "muted"),
         );
         if (bot.description) meta.append(el("small", bot.description, "muted"));
         left.append(renderAvatar(el, bot, avatarInfo), meta);
+        const actions = el("div", undefined, "bots-row-actions");
+        const agentBtn = button(t("Agent"), openEditAgentSheet, "secondary small");
+        agentBtn.disabled = !ready();
         const lookBtn = button(
           t("Look Around"),
           async () => {
@@ -1340,7 +1499,8 @@
           "secondary small",
         );
         lookBtn.disabled = !ready() || !!bot.paused;
-        top.append(left, lookBtn);
+        actions.append(agentBtn, lookBtn);
+        top.append(left, actions);
         hero.append(top);
         nodes.push(hero);
       }

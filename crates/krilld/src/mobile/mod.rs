@@ -11,6 +11,10 @@ pub(crate) fn prewarm_agy_launch(home: &std::path::Path, config: Option<std::pat
     pwa_rpc::composer::prewarm_agy_launch(home, config);
 }
 
+pub(crate) fn agy_composer_ready(screen: &krill_proto::screen::Screen) -> bool {
+    pwa_rpc::composer::agy_composer_ready(screen)
+}
+
 pub(crate) fn bot_launch_models(
     home: &std::path::Path,
     agents: &krill_proto::agent::Agents,

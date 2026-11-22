@@ -25,7 +25,7 @@ use crate::ui;
 
 use super::View;
 use super::rpc::{
-    BOT_EFFORT_OPTIONS, BOT_RUNTIMES, call_checked, effort_label, runtime_display_label,
+    BOT_RUNTIMES, call_checked, effort_label, effort_options_for_runtime, runtime_display_label,
     runtime_models,
 };
 use super::settings_root::{
@@ -244,15 +244,17 @@ impl View {
                     .child(div().truncate().child(runtime_display_label(&runtime))),
             )
             .dropdown_menu(move |mut menu, _, _| {
+                let current_canon = krill_proto::agent::canonical_id(&switch_bot.agent_id);
                 for rt in BOT_RUNTIMES {
                     let this = this.clone();
                     let bot = switch_bot.clone();
+                    let is_current = current_canon == rt.id;
                     menu = menu.item(
                         PopupMenuItem::new(rt.label())
                             .icon(ui::icons::agent_menu_icon(rt.id))
-                            .checked(bot.agent_id == rt.id)
+                            .checked(is_current)
                             .on_click(move |_, _, cx| {
-                                if bot.agent_id == rt.id {
+                                if is_current {
                                     return;
                                 }
                                 // A new agent starts on its own default model and effort.
@@ -269,15 +271,16 @@ impl View {
                 menu
             });
 
+        let runtime_canon = krill_proto::agent::canonical_id(&runtime);
         let choices = match &self.settings.agent_models {
             Some((agent, found))
-                if agent == &runtime
+                if krill_proto::agent::canonical_id(agent) == runtime_canon
                     && !found.models.is_empty()
-                    && crate::agent_models::prefers_discovered(&runtime) =>
+                    && crate::agent_models::prefers_discovered(runtime_canon) =>
             {
                 found.models.clone()
             }
-            _ => runtime_models(&runtime),
+            _ => runtime_models(runtime_canon),
         };
         let current = bot.model.clone().filter(|m| !m.trim().is_empty());
         let model_label = current.as_deref().map_or_else(
@@ -303,12 +306,23 @@ impl View {
                     let this = this.clone();
                     let bot = model_bot.clone();
                     move |_: &ClickEvent, _: &mut Window, cx: &mut gpui::App| {
+                        // Antigravity launch model IDs encode effort (e.g. `gemini-4-neon-high`);
+                        // clear any separate effort override so they stay consistent.
+                        let clear_effort = krill_proto::agent::canonical_id(&bot.agent_id) == "agy"
+                            && choice.as_deref().is_some_and(|m| {
+                                krill_proto::agent::strip_agy_effort_suffix(m).1.is_some()
+                            });
                         let params = UpdateBotParams {
                             model: choice
                                 .clone()
                                 .map_or(krill_proto::bots::FieldPatch::Clear, |m| {
                                     krill_proto::bots::FieldPatch::Set(m)
                                 }),
+                            effort: if clear_effort {
+                                krill_proto::bots::FieldPatch::Clear
+                            } else {
+                                krill_proto::bots::FieldPatch::Unchanged
+                            },
                             ..patch(&bot)
                         };
                         this.update(cx, |v, cx| v.patch_bot(params, cx)).ok();
@@ -328,24 +342,25 @@ impl View {
                 }
                 menu
             });
+        let effort_options = effort_options_for_runtime(runtime_canon);
         let effort = bot.effort.clone().unwrap_or_default();
         let effort_bot = bot.clone();
         let ent = cx.entity();
         let effort_select = row_select(
             "bot-settings-agent-effort",
             text::FIELD_EFFORT.get(),
-            BOT_EFFORT_OPTIONS
+            effort_options
                 .iter()
                 .position(|e| *e == effort)
                 .unwrap_or(0),
-            BOT_EFFORT_OPTIONS
+            effort_options
                 .iter()
                 .enumerate()
                 .map(|(i, e)| (i, effort_label(e).into()))
                 .collect(),
             |b| b.small().w_full(),
             move |i, _, cx| {
-                let Some(eff) = BOT_EFFORT_OPTIONS.get(i) else {
+                let Some(eff) = effort_options.get(i) else {
                     return;
                 };
                 let params = UpdateBotParams {
@@ -401,18 +416,20 @@ impl View {
     }
 
     /// The agent's own model list, as the chat composer and New bot show it.
-    fn ensure_agent_models(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn ensure_agent_models(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        let canon = krill_proto::agent::canonical_id(agent_id);
         if self
             .settings
             .agent_models
             .as_ref()
-            .is_some_and(|(a, _)| a == agent_id)
-            || self.settings.models_task.is_some()
+            .is_some_and(|(a, _)| krill_proto::agent::canonical_id(a) == canon)
+            || self.settings.models_loading_for.as_deref() == Some(canon)
         {
             return;
         }
         let rpc = self.rpc.clone();
-        let agent = agent_id.to_owned();
+        let agent = canon.to_owned();
+        self.settings.models_loading_for = Some(agent.clone());
         self.settings.models_task = Some(cx.spawn(async move |this, cx| {
             let query = agent.clone();
             let reply = cx
@@ -422,6 +439,10 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.settings.models_loading_for.as_deref() != Some(agent.as_str()) {
+                    return;
+                }
+                this.settings.models_loading_for = None;
                 this.settings.models_task = None;
                 let found = match reply {
                     Ok(BotRpcResponse::AgentModels(models)) => models,

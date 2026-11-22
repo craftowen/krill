@@ -232,13 +232,7 @@ impl Shell {
         let muted_fg = palette.muted_foreground;
         let log = self.chat.logs.get(&key);
         let meta = log.map(|l| &l.meta);
-        let agent_id = log.map_or("claude", |l| {
-            if l.agent.is_empty() {
-                "claude"
-            } else {
-                l.agent.as_str()
-            }
-        });
+        let agent_id = self.chat_agent_id(&key);
         let (model_choices, effort_choices) = resolved_composer_choices(agent_id, meta);
         let current_model = meta.and_then(|m| m.current_model_id.as_deref().or(m.model.as_deref()));
         let current_effort = meta.and_then(|m| m.effort.as_deref());
@@ -255,7 +249,15 @@ impl Shell {
                 .iter()
                 .find(|item| item.id == m)
                 .map_or_else(|| short_model_name(m), |item| item.label.clone())
-        } else if let Some(agent) = log.map(|l| &l.agent).filter(|a| !a.is_empty()) {
+        } else if let Some(agent) = log
+            .map(|l| l.agent.as_str())
+            .filter(|a| !a.is_empty())
+            .or_else(|| {
+                self.chat_bot(&key)
+                    .map(|b| krill_proto::agent::canonical_id(&b.agent_id))
+                    .filter(|a| !a.is_empty())
+            })
+        {
             agent_display_name(agent)
         } else {
             "Agent".to_string()
