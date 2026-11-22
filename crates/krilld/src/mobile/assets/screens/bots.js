@@ -25,6 +25,21 @@
     }
   };
 
+  function captureAnchor(port, selector) {
+    if (!(port.clientHeight > 0)) return null;
+    const nodes = Array.from(port.querySelectorAll(selector));
+    const focused = nodes.filter((n) => n.contains(document.activeElement)).at(-1);
+    if (!focused && !(port.scrollTop > 0)) return null;
+    const top = port.getBoundingClientRect().top;
+    const node = focused || nodes.find((n) => n.getBoundingClientRect().bottom > top);
+    return node ? { node, top: node.getBoundingClientRect().top } : null;
+  }
+  function restoreAnchor(port, anchor) {
+    if (anchor && anchor.node.isConnected !== false && port.contains(anchor.node)) {
+      port.scrollTop += anchor.node.getBoundingClientRect().top - anchor.top;
+    }
+  }
+
   const formatText = (ctx) => (s, ...v) =>
     v.reduce((out, val, i) => out.replaceAll(`{${i}}`, String(val)), ctx.t?.(s, ...v) ?? s);
 
@@ -95,16 +110,24 @@
     return badge;
   }
 
-  async function openBotSession(ctx, t, botId, prompt) {
-    const res = await ctx.rpc({
+  const rpcHost = (ctx, hostId, req) => (hostId && ctx.rpcForHost ? ctx.rpcForHost(hostId, req) : ctx.rpc(req));
+  const refreshHost = (ctx, hostId) => (hostId && ctx.refreshHost ? ctx.refreshHost(hostId) : ctx.refresh?.());
+  const openBotDetail = (ctx, botId, hostId) => {
+    if (hostId && ctx.activateHost) ctx.activateHost(hostId);
+    ctx.go(`/bots/${encodeURIComponent(botId)}`);
+  };
+
+  async function openBotSession(ctx, t, botId, prompt, hostId) {
+    const res = await rpcHost(ctx, hostId, {
       action: "bots.chat.open",
       bot_id: botId,
       ...(prompt ? { prompt } : {}),
     });
     const sid = Number(res?.session_id);
     if (!Number.isSafeInteger(sid) || sid <= 0) throw Error(t("Could not open bot chat"));
+    if (hostId && ctx.activateHost) ctx.activateHost(hostId);
     try {
-      await ctx.refresh?.();
+      await refreshHost(ctx, hostId);
     } catch {
       /* ignore background refresh hiccup; fallback routing handles missing card */
     }
@@ -122,11 +145,11 @@
       }
       ctx.go(ctx.groupRoute(group, sid));
     } else {
-      ctx.go("/host/local");
+      ctx.go("/projects");
     }
   }
 
-  function accessSection(ctx, t, requests, bots, ready, reload) {
+  function accessSection(ctx, t, requests, bots, ready, reload, multiHost) {
     const { el, button } = ctx;
     const section = el("section", undefined, "bots-section");
     const head = el("div", undefined, "home-section-heading");
@@ -138,14 +161,17 @@
     for (const req of pending) {
       const row = el("div", undefined, "bots-row");
       const copy = el("div", undefined, "bots-row-main");
+      const meta = [req.source, botDisplayName(bots, req.bot_id), multiHost && req._hostName ? req._hostName : null]
+        .filter(Boolean)
+        .join(" · ");
       copy.append(
         el("strong", req.sender_name || req.sender_id || t("Sender")),
-        el("small", `${req.source} · ${botDisplayName(bots, req.bot_id)}`, "muted"),
+        el("small", meta, "muted"),
       );
       const actions = el("div", undefined, "bots-row-actions");
       const decide = async (approve) => {
         if (!ready()) return;
-        await ctx.rpc({ action: "bots.access.decide", token: req.token, approve });
+        await rpcHost(ctx, req._hostId, { action: "bots.access.decide", token: req.token, approve });
         ctx.toast?.(approve ? t("Access approved") : t("Access declined"));
         await reload();
       };
@@ -186,28 +212,32 @@
 
   function renderItemsList(ctx, t, opts) {
     const { el, button } = ctx;
-    const { items, bots, showBot, ready, onReload, cardMap } = opts;
+    const { items, bots, showBot, ready, onReload, cardMap, multiHost, hideEmpty } = opts;
     const wrap = el("div", undefined, "bots-items-list");
     if (!items.length) {
-      wrap.append(el("p", t("No items match this filter."), "empty"));
+      if (!hideEmpty) wrap.append(el("p", t("No items match this filter."), "empty"));
       return wrap;
     }
 
     const nodes = [];
     for (const item of items) {
-      let entry = cardMap.get(item.uid);
-      const draftKey = `bot-item:${item.uid}`;
+      const cardKey = item._hostId ? `${item._hostId}:${item.uid}` : item.uid;
+      let entry = cardMap.get(cardKey);
+      const draftKey = `bot-item:${cardKey}`;
       if (!entry) {
         const card = el("article", undefined, "bot-item-card");
         card.dataset.item = item.uid;
         const header = el("div", undefined, "bot-item-head");
+        const headLeft = el("div", undefined, "bot-title-line");
         const badge = el("span", undefined, "bot-status-pill");
+        const hostBadge = el("span", undefined, "device-badge");
+        headLeft.append(badge, hostBadge);
         const botBtn = button(
           "",
-          () => ctx.go(`/bots/${encodeURIComponent(item.owner_bot_id)}`),
+          () => openBotDetail(ctx, entry.current.owner_bot_id, entry.current._hostId),
           "text-button bot-owner-chip",
         );
-        header.append(badge, botBtn);
+        header.append(headLeft, botBtn);
         const title = el("strong", undefined, "bot-item-title");
         const desc = el("p", undefined, "bot-item-desc muted");
         const doneMeans = el("p", undefined, "bot-item-done muted");
@@ -232,6 +262,7 @@
         entry = {
           card,
           badge,
+          hostBadge,
           botBtn,
           title,
           desc,
@@ -248,14 +279,18 @@
           busy: false,
           current: item,
         };
-        cardMap.set(item.uid, entry);
+        cardMap.set(cardKey, entry);
 
         const mutate = async (patch) => {
           if (entry.busy || !ready()) return;
           entry.busy = true;
           syncItem();
           try {
-            await ctx.rpc({ action: "bots.item.update", item_id: entry.current.uid, ...patch });
+            await rpcHost(ctx, entry.current._hostId, {
+              action: "bots.item.update",
+              item_id: entry.current.uid,
+              ...patch,
+            });
             if (ctx.signal.aborted) return;
             if (patch.comment) {
               input.value = "";
@@ -295,7 +330,11 @@
               const raw = urlInput.value.trim();
               if (!raw) throw Error(t("Enter a link"));
               const link = /^https?:\/\//i.test(raw) ? { url: raw } : { file: raw };
-              await ctx.rpc({ action: "bots.item.link", item_id: entry.current.uid, link });
+              await rpcHost(ctx, entry.current._hostId, {
+                action: "bots.item.link",
+                item_id: entry.current.uid,
+                link,
+              });
               ctx.closeSheet?.();
               ctx.toast?.(t("Link added"));
               await onReload();
@@ -317,6 +356,8 @@
         const disabled = entry.busy || !ready();
         entry.badge.textContent = statusLabel(cur.status, t);
         entry.badge.className = `bot-status-pill ${statusTone(cur.status)}`;
+        entry.hostBadge.hidden = !multiHost || !cur._hostName;
+        if (!entry.hostBadge.hidden) entry.hostBadge.textContent = cur._hostName;
         entry.botBtn.hidden = !showBot;
         if (showBot) entry.botBtn.textContent = botDisplayName(bots, cur.owner_bot_id);
         entry.title.textContent = cur.title || "";
@@ -357,7 +398,7 @@
                 entry.busy = true;
                 syncItem();
                 try {
-                  await ctx.rpc({
+                  await rpcHost(ctx, cur._hostId, {
                     action: "bots.item.answer",
                     item_id: cur.uid,
                     option_index: idx,
@@ -400,7 +441,7 @@
     return wrap;
   }
 
-  function renderSuggestionsSection(ctx, t, suggestions, bots, ready, reload, showBot) {
+  function renderSuggestionsSection(ctx, t, suggestions, bots, ready, reload, showBot, multiHost) {
     const { el, button } = ctx;
     if (!suggestions.length) return null;
     const sec = el("section", undefined, "bots-section");
@@ -412,21 +453,22 @@
       const main = el("div", undefined, "bots-row-main");
       main.append(
         el("strong", s.title),
-        el("small", [showBot ? botDisplayName(bots, s.bot_id) : null, s.why].filter(Boolean).join(" · "), "muted"),
+        el("small", [showBot ? botDisplayName(bots, s.bot_id) : null, multiHost && s._hostName ? s._hostName : null, s.why].filter(Boolean).join(" · "), "muted"),
       );
       if (s.ask) main.append(el("small", s.ask, "muted"));
       const actions = el("div", undefined, "bots-row-actions");
       const startBtn = button(
         t("Start"),
         async () => {
-          const res = await ctx.rpc({
+          const res = await rpcHost(ctx, s._hostId, {
             action: "bots.suggestions.start",
             bot_id: s.bot_id,
             suggestion_id: s.id,
           });
           if (ctx.signal.aborted) return;
           if (Number.isSafeInteger(Number(res?.session_id)) && Number(res.session_id) > 0) {
-            await ctx.refresh?.().catch(() => {});
+            if (s._hostId && ctx.activateHost) ctx.activateHost(s._hostId);
+            await refreshHost(ctx, s._hostId).catch(() => {});
             const sess = ctx.state.sessions?.get?.(Number(res.session_id));
             const grp = sess && ctx.state.groups?.get?.(sess.groupKey);
             if (grp) {
@@ -442,7 +484,7 @@
       const dismissBtn = button(
         t("Dismiss"),
         async () => {
-          await ctx.rpc({
+          await rpcHost(ctx, s._hostId, {
             action: "bots.suggestions.dismiss",
             bot_id: s.bot_id,
             suggestion_id: s.id,
@@ -460,10 +502,25 @@
     return sec;
   }
 
-  function openCreateBotSheet(ctx, t, reload) {
+  function openCreateBotSheet(ctx, t, reload, targetHosts = []) {
     const { el, button } = ctx;
-    const agents = ctx.state.snapshot?.agents || [];
+    let pickedHostId = targetHosts[0]?.id || null;
+    const agentsFor = (hid) => (targetHosts.find((h) => h.id === hid)?.snapshot?.agents || ctx.state.snapshot?.agents || []);
     ctx.sheet(t("New Bot"), [], t("Create an autonomous bot with its own workspace and soul."), (body) => {
+      const hostSelect = el("select");
+      hostSelect.setAttribute("aria-label", t("Desktop"));
+      if (targetHosts.length > 1) {
+        for (const h of targetHosts) {
+          const opt = el("option", h.name);
+          opt.value = h.id;
+          hostSelect.append(opt);
+        }
+        hostSelect.value = pickedHostId;
+        hostSelect.addEventListener("change", () => {
+          pickedHostId = hostSelect.value || null;
+        });
+      }
+
       const nameInput = el("input");
       nameInput.type = "text";
       nameInput.placeholder = t("Bot name");
@@ -471,7 +528,8 @@
 
       const agentSelect = el("select");
       agentSelect.setAttribute("aria-label", t("Agent"));
-      const agentChoices = agents.length ? agents : [{ id: "claude", name: "Claude Code" }];
+      const rawAgents = agentsFor(pickedHostId);
+      const agentChoices = rawAgents.length ? rawAgents : [{ id: "claude", name: "Claude Code" }];
       for (const a of agentChoices) {
         const opt = el("option", a.name || a.id);
         opt.value = a.id;
@@ -497,7 +555,7 @@
       emojiInput.setAttribute("aria-label", t("Emoji"));
 
       let templates = [];
-      ctx.rpc({ action: "bots.templates" })
+      rpcHost(ctx, pickedHostId, { action: "bots.templates" })
         .then((res) => {
           if (ctx.signal.aborted) return;
           templates = res?.templates || [];
@@ -520,7 +578,7 @@
       const create = async () => {
         const name = nameInput.value.trim();
         if (!name) throw Error(t("Bot name is required"));
-        await ctx.rpc({
+        await rpcHost(ctx, pickedHostId, {
           action: "bots.create",
           name,
           agent_id: agentSelect.value || "claude",
@@ -531,11 +589,14 @@
         ctx.closeSheet?.();
         ctx.toast?.(t("Bot created"));
         try {
-          await ctx.refresh?.();
+          await refreshHost(ctx, pickedHostId);
         } catch {}
         await reload();
       };
 
+      if (targetHosts.length > 1) {
+        body.append(el("label", t("Desktop"), "sheet-field-label"), hostSelect);
+      }
       body.append(
         el("label", t("Template"), "sheet-field-label"),
         tplSelect,
@@ -607,40 +668,65 @@
     const { el, button } = ctx;
     const t = formatText(ctx);
     const botId = ctx.route?.botId || null;
-    const ready = () => ctx.state.connection?.phase === "ready" && !ctx.state.cached;
+    const allHosts = () => ctx.getConnections?.() || [];
+    const filteredHosts = () => (ctx.filteredConnections ? ctx.filteredConnections() : allHosts());
+    const botHosts = () => {
+      const f = filteredHosts();
+      if (!f.length) {
+        return ctx.state.connection?.phase === "ready" && !ctx.state.cached
+          ? [{ id: null, name: ctx.state.snapshot?.host?.display_name || "", active: true, connection: ctx.state.connection, snapshot: ctx.state.snapshot, cached: false }]
+          : [];
+      }
+      return f.filter((h) => h.connection?.phase === "ready" && !h.cached && h.snapshot?.capabilities?.bots);
+    };
+    const ready = () => botHosts().length > 0;
+    const multiHost = () => allHosts().length > 1;
 
     if (botId) {
-      return mountBotDetail(root, ctx, t, botId, ready);
+      return mountBotDetail(root, ctx, t, botId, () => ctx.state.connection?.phase === "ready" && !ctx.state.cached);
     }
 
     const screen = el("section", undefined, "details bots screen");
     const header = ctx.header("Bots", "/");
-    const upNextBtn = button(t("Up Next"), () => ctx.go("/up-next"), "filter-chip");
-    const newBtn = button(`+ ${t("New Bot")}`, () => openCreateBotSheet(ctx, t, () => load(true)), "primary small");
+    header.classList.add("title-header");
+    const filterPill = ctx.deviceFilterPill ? ctx.deviceFilterPill() : null;
+    const newBtn = button(t("New Bot"), () => openCreateBotSheet(ctx, t, () => load(true), botHosts()), "icon-button new-bot-btn", "plus");
     const refreshBtn = button(t("Refresh"), () => load(true), "icon-button refresh-button", "activity");
-    header.append(upNextBtn, newBtn, refreshBtn);
+    if (filterPill) header.append(filterPill);
+    header.append(newBtn, refreshBtn);
     const list = el("div", undefined, "detail-list bots-list");
     screen.append(header, list);
     root.append(screen);
 
     let bots = [];
     let botsCursor = null;
+    let botsCursorHost = null;
     let items = [];
     let requests = [];
     let statuses = [];
     let groups = [];
     let activeGroupId = null;
+    let activeGroupHost = null;
     let activeThreadId = null;
     let groupView = null;
     const avatars = new Map();
+    const recentRows = new Map();
+    const recentSec = el("section", undefined, "bots-section bots-recent-section");
+    const recentHead = el("div", undefined, "home-section-heading");
+    recentHead.append(el("h2", t("Recent sessions"), "section-title"), button(t("View all"), () => ctx.go("/projects", true), "text-button bots-section-action"));
+    const recentBox = el("div", undefined, "recent-session-list inset-group");
+    recentSec.append(recentHead, recentBox);
     let loading = false;
+    let loaded = false;
     let failure = null;
     let loadSeq = 0;
-    let lastPhase = ctx.state.connection?.phase;
+    let lastHostSig = "";
 
-    async function loadGroup(groupId, threadId) {
+    const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
+
+    async function loadGroup(groupId, threadId, hostId = activeGroupHost) {
       if (!ready() || !groupId) return;
-      const res = await ctx.rpc({
+      const res = await rpcHost(ctx, hostId, {
         action: "bots.groups.read",
         group_id: groupId,
         ...(threadId ? { thread_id: threadId } : {}),
@@ -649,6 +735,7 @@
       if (ctx.signal.aborted) return;
       groupView = res?.group || null;
       activeGroupId = groupView?.group?.id || groupId;
+      activeGroupHost = hostId || null;
       activeThreadId =
         threadId ||
         groupView?.threads?.[0]?.thread_id ||
@@ -658,7 +745,17 @@
     }
 
     async function load(reset = false) {
-      if (!ready()) {
+      const targets = botHosts();
+      lastHostSig = hostSig();
+      if (!targets.length) {
+        bots = [];
+        items = [];
+        requests = [];
+        statuses = [];
+        groups = [];
+        botsCursor = null;
+        botsCursorHost = null;
+        loaded = true;
         draw();
         return;
       }
@@ -667,31 +764,48 @@
       failure = null;
       draw();
       try {
-        const [botsRes, itemsRes, accessRes, statusRes, groupRes] = await Promise.all([
-          ctx.rpc({ action: "bots.list", limit: 50 }),
-          ctx.rpc({ action: "bots.items", include_closed: false, limit: 100 }),
-          ctx.rpc({ action: "bots.access.list", limit: 50 }),
-          ctx.rpc({ action: "bots.connectors.status" }),
-          ctx.rpc({ action: "bots.groups.list", limit: 50 }),
-        ]);
+        const perHost = await Promise.all(
+          targets.map(async (h) => {
+            const [botsRes, itemsRes, accessRes, statusRes, groupRes] = await Promise.all([
+              rpcHost(ctx, h.id, { action: "bots.list", limit: 50 }),
+              rpcHost(ctx, h.id, { action: "bots.items", include_closed: false, limit: 100 }),
+              rpcHost(ctx, h.id, { action: "bots.access.list", limit: 50 }),
+              rpcHost(ctx, h.id, { action: "bots.connectors.status" }),
+              rpcHost(ctx, h.id, { action: "bots.groups.list", limit: 50 }),
+            ]);
+            const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+            return {
+              host: h,
+              bots: tag(botsRes?.bots),
+              cursor: botsRes?.next_cursor || null,
+              items: tag(itemsRes?.items),
+              requests: tag(accessRes?.requests),
+              statuses: tag(statusRes?.statuses),
+              groups: tag(groupRes?.groups),
+            };
+          }),
+        );
         if (ctx.signal.aborted || seq !== loadSeq) return;
-        bots = botsRes?.bots || [];
-        botsCursor = botsRes?.next_cursor || null;
-        items = itemsRes?.items || [];
-        requests = accessRes?.requests || [];
-        statuses = statusRes?.statuses || [];
-        groups = groupRes?.groups || [];
-        if (activeGroupId && groups.some((g) => g.id === activeGroupId)) {
-          await loadGroup(activeGroupId, activeThreadId).catch(() => {});
+        bots = perHost.flatMap((r) => r.bots);
+        const firstCursor = perHost.find((r) => r.cursor);
+        botsCursor = firstCursor?.cursor || null;
+        botsCursorHost = firstCursor?.host?.id || null;
+        items = perHost.flatMap((r) => r.items);
+        requests = perHost.flatMap((r) => r.requests);
+        statuses = perHost.flatMap((r) => r.statuses);
+        groups = perHost.flatMap((r) => r.groups);
+        loaded = true;
+        if (activeGroupId && groups.some((g) => g.id === activeGroupId && g._hostId === activeGroupHost)) {
+          await loadGroup(activeGroupId, activeThreadId, activeGroupHost).catch(() => {});
         }
-        // Best-effort lazy avatar fetch for bots that have one
         for (const b of bots) {
-          if (b.avatar && !avatars.has(b.id)) {
-            avatars.set(b.id, null);
-            ctx.rpc({ action: "bots.avatar.read", bot_id: b.id })
+          const avKey = b._hostId ? `${b._hostId}:${b.id}` : b.id;
+          if (b.avatar && !avatars.has(avKey)) {
+            avatars.set(avKey, null);
+            rpcHost(ctx, b._hostId, { action: "bots.avatar.read", bot_id: b.id })
               .then((av) => {
                 if (!ctx.signal.aborted && av) {
-                  avatars.set(b.id, av);
+                  avatars.set(avKey, av);
                   draw();
                 }
               })
@@ -711,10 +825,14 @@
 
     async function loadMoreBots() {
       if (!botsCursor || !ready()) return;
-      const res = await ctx.rpc({ action: "bots.list", limit: 50, cursor: botsCursor });
+      const res = await rpcHost(ctx, botsCursorHost, { action: "bots.list", limit: 50, cursor: botsCursor });
       if (ctx.signal.aborted) return;
-      const seen = new Set(bots.map((b) => b.id));
-      for (const b of res?.bots || []) if (!seen.has(b.id)) bots.push(b);
+      const hostName = botHosts().find((h) => h.id === botsCursorHost)?.name || "";
+      const seen = new Set(bots.map((b) => `${b._hostId || ""}:${b.id}`));
+      for (const b of res?.bots || []) {
+        const k = `${botsCursorHost || ""}:${b.id}`;
+        if (!seen.has(k)) bots.push({ ...b, _hostId: botsCursorHost, _hostName: hostName });
+      }
       botsCursor = res?.next_cursor || null;
       draw();
     }
@@ -733,25 +851,25 @@
         box.append(el("p", t("No group chats yet."), "muted empty"));
       } else {
         for (const g of groups) {
+          const isActive = activeGroupId === g.id && activeGroupHost === g._hostId;
           const row = button(
             "",
             () => {
-              if (activeGroupId === g.id) {
+              if (isActive) {
                 activeGroupId = null;
+                activeGroupHost = null;
                 groupView = null;
                 draw();
               } else {
-                return loadGroup(g.id, null);
+                return loadGroup(g.id, null, g._hostId);
               }
             },
-            `bots-group-row${activeGroupId === g.id ? " active" : ""}`,
+            `bots-group-row${isActive ? " active" : ""}`,
           );
           const main = el("span", undefined, "bots-row-main");
-          main.append(
-            el("strong", g.name),
-            el("small", (g.bot_ids || []).map((id) => botDisplayName(bots, id)).join(", "), "muted"),
-          );
-          row.append(main, ctx.icon(activeGroupId === g.id ? "chevronDown" : "chevronRight"));
+          const sub = [(g.bot_ids || []).map((id) => botDisplayName(bots, id)).join(", "), multiHost() && g._hostName ? g._hostName : null].filter(Boolean).join(" · ");
+          main.append(el("strong", g.name), el("small", sub, "muted"));
+          row.append(main, ctx.icon(isActive ? "chevronDown" : "chevronRight"));
           box.append(row);
         }
       }
@@ -764,7 +882,7 @@
         for (const th of groupView.threads || []) {
           const tb = button(
             th.title || t("Thread"),
-            () => loadGroup(activeGroupId, th.thread_id),
+            () => loadGroup(activeGroupId, th.thread_id, activeGroupHost),
             th.thread_id === activeThreadId ? "filter-chip active" : "filter-chip",
           );
           tb.disabled = !ready();
@@ -774,14 +892,14 @@
           `+ ${t("Thread")}`,
           async () => {
             const prevIds = new Set((groupView?.threads || []).map((th) => th.thread_id));
-            const res = await ctx.rpc({ action: "bots.groups.new_thread", group_id: activeGroupId });
+            const res = await rpcHost(ctx, activeGroupHost, { action: "bots.groups.new_thread", group_id: activeGroupId });
             if (res?.group) {
               groupView = res.group;
               const created = (groupView.threads || []).find((th) => !prevIds.has(th.thread_id));
               activeThreadId = created?.thread_id || groupView.threads?.[0]?.thread_id || null;
               draw();
             } else {
-              await loadGroup(activeGroupId, null);
+              await loadGroup(activeGroupId, null, activeGroupHost);
             }
           },
           "filter-chip",
@@ -794,12 +912,12 @@
           const stopBtn = button(
             t("Stop"),
             async () => {
-              await ctx.rpc({
+              await rpcHost(ctx, activeGroupHost, {
                 action: "bots.groups.stop",
                 group_id: activeGroupId,
                 ...(activeThreadId ? { thread_id: activeThreadId } : {}),
               });
-              await loadGroup(activeGroupId, activeThreadId);
+              await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
             },
             "ghost small",
           );
@@ -824,7 +942,7 @@
         }
         panel.append(msgBox);
 
-        const draftKey = `bot-group:${activeGroupId}`;
+        const draftKey = `bot-group:${activeGroupHost || ""}:${activeGroupId}`;
         const sendForm = el("form", undefined, "bot-item-form");
         const mentions = el("div", undefined, "bot-decision-options");
         const textarea = el("textarea");
@@ -860,7 +978,7 @@
           if (!ready()) return;
           const text = textarea.value.trim();
           if (!text) throw Error(t("Enter a message"));
-          await ctx.rpc({
+          await rpcHost(ctx, activeGroupHost, {
             action: "bots.groups.send",
             group_id: activeGroupId,
             ...(activeThreadId ? { thread_id: activeThreadId } : {}),
@@ -870,7 +988,7 @@
           if (ctx.signal.aborted) return;
           textarea.value = "";
           ctx.state.drafts?.delete?.(draftKey);
-          await loadGroup(activeGroupId, activeThreadId);
+          await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
         };
         const sendBtn = button(t("Send"), submitGroup, "primary small");
         const controls = el("div", undefined, "bot-item-controls");
@@ -887,116 +1005,178 @@
       return sec;
     }
 
+    function renderRecentSessionsSection(hosts) {
+      if (!M.homeRecents || !hosts.length) return null;
+      const values = M.homeRecents(hosts).slice(0, 3);
+      if (!values.length) return null;
+      const multi = multiHost();
+      const nodes = values.map((v) => {
+        const key = JSON.stringify([v.host.id, v.locator.groupKey, v.session.id]);
+        let e = recentRows.get(key);
+        if (!e) {
+          const row = button(
+            "",
+            () => {
+              const current = M.homeRecents(filteredHosts()).find(
+                (r) => JSON.stringify([r.host.id, r.locator.groupKey, r.session.id]) === key,
+              );
+              if (current) ctx.openRecent(current.host.id, current.locator);
+            },
+            "recent-session-row",
+          );
+          const copy = el("span", undefined, "needs-copy");
+          const title = el("strong");
+          const meta = el("small");
+          const dot = ctx.dot("Unknown");
+          row.dataset.host = v.host.id;
+          row.dataset.session = String(v.session.id);
+          copy.append(title, meta);
+          row.append(dot, copy, ctx.icon("chevronRight"));
+          e = { row, title, meta, dot };
+          recentRows.set(key, e);
+        }
+        const s = v.session;
+        const agent = M.sessionAgent?.(s) ?? s.agent;
+        const label =
+          (M.cleanTitle?.(s.title) ?? s.title) ||
+          M.sessionPathLabel?.(s, v.host.snapshot?.host?.platform || v.host.platform) ||
+          `${t("Terminal")} #${s.id}`;
+        e.title.textContent = label;
+        e.meta.textContent = [multi ? v.host.name : null, s.group_label, agent ? M.agentName?.(agent) || agent : null]
+          .filter(Boolean)
+          .join(" · ");
+        e.meta.querySelector(".agent-icon")?.remove();
+        if (agent) e.meta.prepend(M.agentIcon?.(agent, ctx) || ctx.icon("terminal"));
+        e.dot.className = `status-dot ${String(s.state || "Unknown").toLowerCase()}`;
+        e.row.disabled = v.host.connection.phase !== "ready";
+        e.row.setAttribute("aria-label", `${t("Resume session")}: ${label} · ${v.host.name}`);
+        return e.row;
+      });
+      sync(recentBox, nodes);
+      return recentSec;
+    }
+
     function draw() {
       if (ctx.signal.aborted) return;
-      const needsCount = items.filter((i) => i.status === "needs_you").length;
-      const pendingAccessCount = requests.filter((r) => r.status === "pending").length;
-      const totalUpNext = needsCount + pendingAccessCount;
-      upNextBtn.textContent = totalUpNext > 0 ? `${t("Up Next")} (${totalUpNext})` : t("Up Next");
+      const anchor = captureAnchor(list, ".recent-session-row,.bots-section");
+      const hosts = filteredHosts();
+      const counts = M.todoCounts ? M.todoCounts(hosts) : { botNeeds: 0, botAccess: 0, gates: 0, questions: 0, sessions: 0, total: 0 };
+      const liveBotNeeds = loaded ? items.filter((i) => i.status === "needs_you").length : counts.botNeeds;
+      const liveBotAccess = loaded ? requests.filter((r) => r.status === "pending").length : counts.botAccess;
+      const totalAttention = liveBotNeeds + liveBotAccess + counts.gates + counts.questions + counts.sessions;
+      const isLegacyOnly = hosts.length > 0 && !!M.legacyNoBots?.(hosts);
       newBtn.disabled = !ready();
       refreshBtn.disabled = loading || !ready();
 
       const nodes = [];
-      if (!ready()) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
+      if (!ready() && !isLegacyOnly) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
       if (failure) nodes.push(el("p", failure, "account-error"));
 
-      if (loading && !bots.length) {
+      // Top 1-line conditional banner (shown only when >=1 attention item)
+      if (totalAttention > 0) {
+        const bannerBtn = button("", () => ctx.go("/up-next", true), "todo-summary-banner");
+        const label = t(
+          totalAttention === 1 ? "{0} request needs your attention" : "{0} requests need your attention",
+          totalAttention,
+        );
+        bannerBtn.setAttribute("aria-label", label);
+        const dot = ctx.dot("waiting");
+        const title = el("strong", label, "todo-banner-title");
+        const tag = el("span", t("Review"), "bot-status-pill waiting");
+        bannerBtn.append(dot, title, tag, ctx.icon("chevronRight"));
+        nodes.push(bannerBtn);
+      }
+
+      if (loading && !bots.length && !isLegacyOnly) {
         const loadingBox = el("div", undefined, "account-placeholder");
         loadingBox.append(el("span", undefined, "spinner"), el("p", t("Loading bots…")));
         nodes.push(loadingBox);
-        sync(list, nodes);
-        return;
-      }
-
-      if (totalUpNext > 0) {
-        const upNextRow = ctx.linkRow(
-          "Up Next",
-          t("{0} items or requests waiting for you", totalUpNext),
-          "/up-next",
-          "tasks",
-        );
-        const cardWrap = el("div", undefined, "inset-group");
-        cardWrap.append(upNextRow);
-        nodes.push(cardWrap);
-      }
-
-      const botsSec = el("section", undefined, "bots-section");
-      const botsHead = el("div", undefined, "home-section-heading");
-      botsHead.append(el("h2", t("Your bots"), "section-title"), el("small", String(bots.length), "muted"));
-      botsSec.append(botsHead);
-
-      if (!bots.length) {
-        const emptyBox = el("div", undefined, "bots-empty-card inset-group");
-        emptyBox.append(
-          el("p", t("No bots configured yet."), "empty"),
-          button(t("Create Bot"), () => openCreateBotSheet(ctx, t, () => load(true)), "primary"),
-        );
-        botsSec.append(emptyBox);
       } else {
-        const group = el("div", undefined, "inset-group");
-        for (const bot of bots) {
-          const openItems = items.filter((i) => i.owner_bot_id === bot.id && i.status === "needs_you").length;
-          const botErrors = statuses.filter((s) => s.bot_id === bot.id && s.enabled && s.state === "error").length;
-          const row = el("div", undefined, "bot-card-row");
-          const tap = button(
-            "",
-            () => ctx.go(`/bots/${encodeURIComponent(bot.id)}`),
-            "bot-card-main",
-          );
-          tap.setAttribute("aria-label", bot.name);
-          const avatar = renderAvatar(el, bot, avatars.get(bot.id));
-          const copy = el("span", undefined, "bots-row-main");
-          const titleLine = el("span", undefined, "bot-title-line");
-          titleLine.append(
-            el("strong", bot.name),
-            el(
-              "span",
-              t(bot.paused ? "Paused" : "Active"),
-              `bot-status-pill ${bot.paused ? "unknown" : "connected"}`,
-            ),
-          );
-          if (openItems > 0) {
-            titleLine.append(el("span", t("{0} needs you", openItems), "bot-status-pill waiting"));
-          }
-          if (botErrors > 0) {
-            titleLine.append(el("span", t("Connector error"), "bot-status-pill blocked"));
-          }
-          copy.append(titleLine);
-          if (bot.description) copy.append(el("small", bot.description, "muted"));
-          tap.append(avatar, copy, ctx.icon("chevronRight"));
+        const botsSec = el("section", undefined, "bots-section");
+        const botsHead = el("div", undefined, "home-section-heading");
+        botsHead.append(el("h2", t("Your bots"), "section-title"), el("small", String(bots.length), "muted"));
+        botsSec.append(botsHead);
 
-          const chatBtn = button(
-            t("Open Chat"),
-            () => openBotSession(ctx, t, bot.id),
-            "secondary small bot-chat-btn",
+        if (isLegacyOnly) {
+          const legacyBox = el("div", undefined, "bots-empty-card inset-group");
+          legacyBox.append(el("p", t("Update Krill desktop to use Bots."), "empty"));
+          botsSec.append(legacyBox);
+        } else if (!bots.length) {
+          const emptyBox = el("div", undefined, "bots-empty-card inset-group");
+          emptyBox.append(
+            el("p", t("No bots configured yet."), "empty"),
+            button(t("Create Bot"), () => openCreateBotSheet(ctx, t, () => load(true), botHosts()), "primary"),
           );
-          chatBtn.disabled = !ready() || !!bot.paused;
-          if (bot.paused) chatBtn.title = t("Paused bots cannot start chat");
-          row.append(tap, chatBtn);
-          group.append(row);
+          botsSec.append(emptyBox);
+        } else {
+          const sortedBots = bots.slice().sort((a, b) => {
+            const aNeeds = items.some((i) => i.owner_bot_id === a.id && i._hostId === a._hostId && i.status === "needs_you") ? 0 : 1;
+            const bNeeds = items.some((i) => i.owner_bot_id === b.id && i._hostId === b._hostId && i.status === "needs_you") ? 0 : 1;
+            if (aNeeds !== bNeeds) return aNeeds - bNeeds;
+            return Number(!!a.paused) - Number(!!b.paused);
+          });
+          const group = el("div", undefined, "inset-group");
+          const showDev = multiHost();
+          for (const bot of sortedBots) {
+            const openItems = items.filter((i) => i.owner_bot_id === bot.id && i._hostId === bot._hostId && i.status === "needs_you").length;
+            const botErrors = statuses.filter((s) => s.bot_id === bot.id && s._hostId === bot._hostId && s.enabled && s.state === "error").length;
+            const avKey = bot._hostId ? `${bot._hostId}:${bot.id}` : bot.id;
+            const row = el("div", undefined, "bot-card-row");
+            const tap = button("", () => openBotDetail(ctx, bot.id, bot._hostId), "bot-card-main");
+            tap.setAttribute("aria-label", bot.name);
+            const avatar = renderAvatar(el, bot, avatars.get(avKey));
+            const copy = el("span", undefined, "bots-row-main");
+            const titleLine = el("span", undefined, "bot-title-line");
+            titleLine.append(
+              el("strong", bot.name),
+              el("span", t(bot.paused ? "Paused" : "Active"), `bot-status-pill ${bot.paused ? "unknown" : "connected"}`),
+            );
+            if (openItems > 0) titleLine.append(el("span", t("{0} needs you", openItems), "bot-status-pill waiting"));
+            if (botErrors > 0) titleLine.append(el("span", t("Connector error"), "bot-status-pill blocked"));
+            if (showDev && bot._hostName) titleLine.append(el("span", bot._hostName, "device-badge"));
+            copy.append(titleLine);
+            if (bot.description) copy.append(el("small", bot.description, "muted"));
+            tap.append(avatar, copy, ctx.icon("chevronRight"));
+
+            const chatBtn = button(
+              t("Open Chat"),
+              () => openBotSession(ctx, t, bot.id, undefined, bot._hostId),
+              "secondary small bot-chat-btn",
+            );
+            chatBtn.disabled = !ready() || !!bot.paused;
+            if (bot.paused) chatBtn.title = t("Paused bots cannot start chat");
+            row.append(tap, chatBtn);
+            group.append(row);
+          }
+          botsSec.append(group);
+          if (botsCursor) {
+            const more = button(t("Load more"), loadMoreBots, "secondary");
+            more.disabled = !ready();
+            botsSec.append(more);
+          }
         }
-        botsSec.append(group);
-        if (botsCursor) {
-          const more = button(t("Load more"), loadMoreBots, "secondary");
-          more.disabled = !ready();
-          botsSec.append(more);
-        }
+        nodes.push(botsSec);
       }
-      nodes.push(botsSec);
-      nodes.push(accessSection(ctx, t, requests, bots, ready, () => load(false)));
-      nodes.push(renderGroupPanel());
+
+      // Bottom section: Recent project sessions (max 3 + "View all" -> Projects)
+      const recentNode = renderRecentSessionsSection(hosts);
+      if (recentNode) nodes.push(recentNode);
+
+      if (!isLegacyOnly && ready()) {
+        nodes.push(accessSection(ctx, t, requests, bots, ready, () => load(false), multiHost()));
+        nodes.push(renderGroupPanel());
+      }
 
       sync(list, nodes);
+      restoreAnchor(list, anchor);
     }
 
     load();
     return {
       update() {
-        const curPhase = ctx.state.connection?.phase;
-        if (curPhase !== lastPhase) {
-          lastPhase = curPhase;
-          if (ready()) load(false);
-          else draw();
+        const nextSig = hostSig();
+        if (nextSig !== lastHostSig) {
+          load(false);
         } else {
           draw();
         }
@@ -1352,13 +1532,28 @@
   M.screens["up-next"] = (root, ctx) => {
     const { el, button } = ctx;
     const t = formatText(ctx);
-    const ready = () => ctx.state.connection?.phase === "ready" && !ctx.state.cached;
+    const allHosts = () => ctx.getConnections?.() || [];
+    const filteredHosts = () => {
+      const f = ctx.filteredConnections ? ctx.filteredConnections() : allHosts();
+      if (f.length) return f;
+      return ctx.state.snapshot
+        ? [{ id: null, name: ctx.state.snapshot?.host?.display_name || "", active: true, connection: ctx.state.connection, snapshot: ctx.state.snapshot, cached: !!ctx.state.cached }]
+        : [];
+    };
+    const botHosts = () =>
+      filteredHosts().filter(
+        (h) => h.connection?.phase === "ready" && !h.cached && (h.snapshot?.capabilities?.bots || h.id === null),
+      );
+    const ready = () => botHosts().length > 0;
+    const multiHost = () => allHosts().length > 1;
 
     const screen = el("section", undefined, "details bots up-next screen");
-    const header = ctx.header("Up Next", "/");
-    const botsBtn = button(t("All Bots"), () => ctx.go("/bots"), "filter-chip");
+    const header = ctx.header("To Do", "/");
+    header.classList.add("title-header");
+    const filterPill = ctx.deviceFilterPill ? ctx.deviceFilterPill() : null;
     const refreshBtn = button(t("Refresh"), () => load(true), "icon-button refresh-button", "activity");
-    header.append(botsBtn, refreshBtn);
+    if (filterPill) header.append(filterPill);
+    header.append(refreshBtn);
     const list = el("div", undefined, "detail-list bots-list");
     screen.append(header, list);
     root.append(screen);
@@ -1367,15 +1562,28 @@
     let bots = [];
     let items = [];
     let itemsCursor = null;
+    let itemsCursorHost = null;
     let requests = [];
     let suggestions = [];
     let loading = false;
     let failure = null;
     let loadSeq = 0;
+    let lastHostSig = "";
     const cardMap = new Map();
+    const orchEntries = new Map();
+
+    const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
 
     async function load(reset = true) {
-      if (!ready()) {
+      const targets = botHosts();
+      lastHostSig = hostSig();
+      if (!targets.length) {
+        bots = [];
+        items = [];
+        itemsCursor = null;
+        itemsCursorHost = null;
+        requests = [];
+        suggestions = [];
         draw();
         return;
       }
@@ -1386,23 +1594,38 @@
       try {
         const includeClosed = filter === "closed";
         const includeSnoozed = filter === "snoozed";
-        const [botsRes, itemsRes, accessRes, sugRes] = await Promise.all([
-          ctx.rpc({ action: "bots.list", limit: 100 }),
-          ctx.rpc({
-            action: "bots.items",
-            include_closed: includeClosed,
-            include_snoozed: includeSnoozed,
-            limit: 25,
+        const perHost = await Promise.all(
+          targets.map(async (h) => {
+            const [botsRes, itemsRes, accessRes, sugRes] = await Promise.all([
+              rpcHost(ctx, h.id, { action: "bots.list", limit: 100 }),
+              rpcHost(ctx, h.id, {
+                action: "bots.items",
+                include_closed: includeClosed,
+                include_snoozed: includeSnoozed,
+                limit: 25,
+              }),
+              rpcHost(ctx, h.id, { action: "bots.access.list", limit: 50 }),
+              rpcHost(ctx, h.id, { action: "bots.suggestions.list", include_dismissed: false }),
+            ]);
+            const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+            return {
+              host: h,
+              bots: tag(botsRes?.bots),
+              items: tag(itemsRes?.items),
+              cursor: itemsRes?.next_cursor || null,
+              requests: tag(accessRes?.requests),
+              suggestions: tag(sugRes?.suggestions),
+            };
           }),
-          ctx.rpc({ action: "bots.access.list", limit: 50 }),
-          ctx.rpc({ action: "bots.suggestions.list", include_dismissed: false }),
-        ]);
+        );
         if (ctx.signal.aborted || seq !== loadSeq) return;
-        bots = botsRes?.bots || [];
-        items = itemsRes?.items || [];
-        itemsCursor = itemsRes?.next_cursor || null;
-        requests = accessRes?.requests || [];
-        suggestions = sugRes?.suggestions || [];
+        bots = perHost.flatMap((r) => r.bots);
+        items = perHost.flatMap((r) => r.items);
+        const firstCursor = perHost.find((r) => r.cursor);
+        itemsCursor = firstCursor?.cursor || null;
+        itemsCursorHost = firstCursor?.host?.id || null;
+        requests = perHost.flatMap((r) => r.requests);
+        suggestions = perHost.flatMap((r) => r.suggestions);
       } catch (e) {
         if (ctx.signal.aborted || seq !== loadSeq) return;
         failure = safeMsg(e, t);
@@ -1416,7 +1639,7 @@
 
     async function loadMore() {
       if (!itemsCursor || !ready()) return;
-      const res = await ctx.rpc({
+      const res = await rpcHost(ctx, itemsCursorHost, {
         action: "bots.items",
         include_closed: filter === "closed",
         include_snoozed: filter === "snoozed",
@@ -1424,65 +1647,286 @@
         cursor: itemsCursor,
       });
       if (ctx.signal.aborted) return;
-      const seen = new Set(items.map((x) => x.uid));
-      for (const item of res?.items || []) if (!seen.has(item.uid)) items.push(item);
+      const hostName = botHosts().find((h) => h.id === itemsCursorHost)?.name || "";
+      const seen = new Set(items.map((x) => `${x._hostId || ""}:${x.uid}`));
+      for (const item of res?.items || []) {
+        const k = `${itemsCursorHost || ""}:${item.uid}`;
+        if (!seen.has(k)) items.push({ ...item, _hostId: itemsCursorHost, _hostName: hostName });
+      }
       itemsCursor = res?.next_cursor || null;
       draw();
     }
 
+    function renderWaitingSessionsSection(hosts) {
+      const waiting = [];
+      for (const h of hosts) {
+        for (const s of h.snapshot?.sessions || []) {
+          if (!s.exited && (s.state === "Waiting" || s.state === "Blocked")) {
+            waiting.push({ host: h, session: s, key: s.worktree_key || (s.cwd ? `cwd:${s.cwd}` : `unknown:${s.id}`) });
+          }
+        }
+      }
+      waiting.sort((a, b) => (a.session.state === "Waiting" ? 0 : 1) - (b.session.state === "Waiting" ? 0 : 1));
+      if (!waiting.length) return { count: 0, node: null };
+      const sec = el("section", undefined, "bots-section todo-sessions-section");
+      const head = el("div", undefined, "home-section-heading");
+      head.append(el("h2", t("Waiting sessions"), "section-title"), el("small", String(waiting.length), "muted"));
+      const box = el("div", undefined, "inset-group recent-session-list");
+      const showDev = multiHost();
+      for (const w of waiting) {
+        const s = w.session;
+        const agent = M.sessionAgent?.(s) ?? s.agent;
+        const label =
+          (M.cleanTitle?.(s.title) ?? s.title) ||
+          M.sessionPathLabel?.(s, w.host.snapshot?.host?.platform || w.host.platform) ||
+          `${t("Terminal")} #${s.id}`;
+        const row = button(
+          "",
+          () => {
+            if (w.host.id && ctx.openRecent) ctx.openRecent(w.host.id, { id: s.id, groupKey: w.key });
+            else {
+              const grp = ctx.state.groups?.get?.(w.key) || { key: w.key, sessions: [s] };
+              ctx.go(ctx.groupRoute(grp, s.id));
+            }
+          },
+          "recent-session-row",
+        );
+        row.dataset.session = String(s.id);
+        if (w.host.id) row.dataset.host = w.host.id;
+        row.disabled = w.host.connection?.phase !== "ready" || !!w.host.cached;
+        row.setAttribute("aria-label", `${t("Open")}: ${label}`);
+        const copy = el("span", undefined, "needs-copy");
+        copy.append(
+          el("strong", label),
+          el("small", [showDev ? w.host.name : null, s.group_label, agent ? M.agentName?.(agent) || agent : null].filter(Boolean).join(" · ")),
+        );
+        const statePill = el("span", t(s.state === "Waiting" ? "Waiting for you" : "Blocked"), `bot-status-pill ${s.state === "Waiting" ? "waiting" : "blocked"}`);
+        row.append(ctx.dot(s.state), copy, statePill, ctx.icon("chevronRight"));
+        box.append(row);
+      }
+      sec.append(head, box);
+      return { count: waiting.length, node: sec };
+    }
+
+    function renderOrchestrationSection(hosts) {
+      const pending = [];
+      for (const h of hosts) {
+        const o = M.confirmationRequests ? M.confirmationRequests(h.snapshot?.orchestration) : { gates: [], questions: [], runs: [], tasks: [] };
+        const runMap = new Map((o.runs || []).map((r) => [r.id, r]));
+        const taskMap = new Map((o.tasks || []).map((tk) => [tk.id, tk]));
+        for (const g of o.gates || []) pending.push({ kind: "gate", host: h, item: g, runMap, taskMap });
+        for (const q of o.questions || []) pending.push({ kind: "question", host: h, item: q, runMap, taskMap });
+      }
+      if (!pending.length) {
+        for (const [k, e] of orchEntries) if (!e.pending) orchEntries.delete(k);
+        return { count: 0, node: null };
+      }
+      const sec = el("section", undefined, "bots-section todo-orch-section");
+      const head = el("div", undefined, "home-section-heading");
+      head.append(el("h2", t("Confirmation requests"), "section-title"), el("small", String(pending.length), "muted"));
+      const wrap = el("div", undefined, "bots-items-list");
+      const showDev = multiHost();
+      const liveKeys = new Set();
+
+      for (const p of pending) {
+        const key = `${p.host.id || "local"}:${p.kind}:${p.item.id}`;
+        liveKeys.add(key);
+        const hostReady = () => p.host.connection?.phase === "ready" && !p.host.cached;
+        let e = orchEntries.get(key);
+        if (!e) {
+          const card = el("article", undefined, "gate-card");
+          card.dataset.orchestrationId = p.item.id;
+          const top = el("div", undefined, "bot-item-head");
+          const eyebrow = el("small", t(p.kind === "gate" ? "Approval requested" : "Reply requested"), "eyebrow");
+          const hostBadge = el("span", undefined, "device-badge");
+          top.append(eyebrow, hostBadge);
+          const scope = el("p", undefined, "muted");
+          const heading = el("h2");
+          const body = el("p");
+          const status = el("p", undefined, "muted action-status");
+          status.setAttribute("role", "status");
+          card.append(top, scope, heading, body);
+          e = { key, kind: p.kind, id: p.item.id, host: p.host, card, hostBadge, scope, heading, body, status, pending: false, sent: false, message: "", options: new Map() };
+          if (p.kind === "gate") {
+            e.actions = el("div", undefined, "gate-options");
+            card.append(e.actions, status);
+          } else {
+            const form = el("form");
+            const input = el("textarea");
+            const submit = el("button", t("Send reply"), "primary");
+            input.placeholder = t("Your reply");
+            input.setAttribute("aria-label", t("Your reply"));
+            input.required = true;
+            const dKey = `orch:${key}`;
+            input.value = ctx.state.drafts?.get?.(dKey) || "";
+            input.addEventListener("input", () => (input.value ? ctx.state.drafts?.set?.(dKey, input.value) : ctx.state.drafts?.delete?.(dKey)), { signal: ctx.signal });
+            submit.type = "submit";
+            form.append(input, submit);
+            card.append(form, status);
+            Object.assign(e, { input, submit, dKey });
+            form.addEventListener("submit", (ev) => {
+              ev.preventDefault();
+              respondOrch(e);
+            }, { signal: ctx.signal });
+          }
+          orchEntries.set(key, e);
+        }
+        e.host = p.host;
+        e.hostBadge.hidden = !showDev || !p.host.name;
+        if (!e.hostBadge.hidden) e.hostBadge.textContent = p.host.name;
+        const task = p.taskMap.get(p.item.task_id);
+        const run = p.runMap.get(p.item.run_id || task?.run_id);
+        e.scope.textContent = [run?.title, task?.title].filter(Boolean).join(" · ");
+        e.scope.hidden = !e.scope.textContent;
+        e.heading.textContent = p.kind === "gate" ? p.item.question : p.item.summary;
+        e.body.textContent = p.kind === "question" ? p.item.body || "" : "";
+        e.body.hidden = !e.body.textContent;
+        e.status.textContent = e.message || (!hostReady() ? t("Reconnect to reply.") : "");
+        e.status.hidden = !e.status.textContent;
+        if (p.kind === "gate") {
+          const btns = [];
+          for (const opt of p.item.options || []) {
+            let b = e.options.get(opt);
+            if (!b) {
+              b = button(t(opt), () => respondOrch(e, opt), "secondary");
+              e.options.set(opt, b);
+            }
+            b.disabled = e.pending || e.sent || !hostReady();
+            btns.push(b);
+          }
+          sync(e.actions, btns);
+        } else {
+          e.submit.disabled = e.pending || e.sent || !hostReady();
+          e.input.readOnly = e.sent;
+        }
+        wrap.append(e.card);
+      }
+
+      async function respondOrch(e, decision) {
+        if (e.pending || e.sent) return;
+        if (e.host.connection?.phase !== "ready" || e.host.cached) {
+          e.message = t("Reconnect to reply.");
+          draw();
+          return;
+        }
+        const submitted = e.input?.value;
+        if (e.kind === "question" && !submitted?.trim()) return;
+        e.pending = true;
+        e.message = t("Sending…");
+        draw();
+        try {
+          await rpcHost(ctx, e.host.id, e.kind === "gate" ? { action: "gate_reply", id: e.id, decision } : { action: "question_reply", id: e.id, body: submitted });
+          if (ctx.signal.aborted) return;
+          e.sent = true;
+          e.message = t(e.kind === "gate" ? "Decision sent." : "Reply sent.");
+          if (e.input && e.input.value === submitted) {
+            ctx.state.drafts?.delete?.(e.dKey);
+            e.input.value = "";
+          }
+          draw();
+          await refreshHost(ctx, e.host.id)?.catch?.(() => {});
+        } catch (err) {
+          e.message = `${t("Could not send reply")}: ${safeMsg(err, t)}`;
+        } finally {
+          e.pending = false;
+          if (!ctx.signal.aborted) draw();
+        }
+      }
+
+      for (const [k, e] of orchEntries) if (!liveKeys.has(k) && !e.pending) orchEntries.delete(k);
+      sec.append(head, wrap);
+      return { count: pending.length, node: sec };
+    }
+
     function draw() {
       if (ctx.signal.aborted) return;
-      refreshBtn.disabled = loading || !ready();
+      const hosts = filteredHosts();
+      const hasBotsCap = botHosts().length > 0;
+      refreshBtn.disabled = loading || !hosts.some((h) => h.connection?.phase === "ready");
       const nodes = [];
-      if (!ready()) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
       if (failure) nodes.push(el("p", failure, "account-error"));
 
-      if (requests.some((r) => r.status === "pending")) {
-        nodes.push(accessSection(ctx, t, requests, bots, ready, () => load(true)));
+      const waitingSec = renderWaitingSessionsSection(hosts);
+      const orchSec = renderOrchestrationSection(hosts);
+      const pendingAccess = requests.filter((r) => r.status === "pending");
+      const visibleItems = filter === "needs_you" ? items.filter((i) => i.status === "needs_you") : items;
+
+      if (waitingSec.node) nodes.push(waitingSec.node);
+      if (orchSec.node) nodes.push(orchSec.node);
+      if (pendingAccess.length) {
+        nodes.push(accessSection(ctx, t, requests, bots, ready, () => load(true), multiHost()));
       }
-      const sugNode = renderSuggestionsSection(ctx, t, suggestions, bots, ready, () => load(true), true);
+      const sugNode = renderSuggestionsSection(ctx, t, suggestions, bots, ready, () => load(true), true, multiHost());
       if (sugNode) nodes.push(sugNode);
 
-      const itemSec = el("section", undefined, "bots-section");
-      itemSec.append(el("h2", t("Needs You & Active Items"), "section-title"));
-      const filterBar = el("div", undefined, "bot-decision-options");
-      for (const [id, lbl] of [
-        ["needs_you", t("Needs You")],
-        ["open", t("All Open")],
-        ["snoozed", t("Snoozed")],
-        ["closed", t("Closed")],
-      ]) {
-        const btn = button(lbl, () => {
-          filter = id;
-          return load(true);
-        }, filter === id ? "filter-chip active" : "filter-chip");
-        btn.disabled = !ready();
-        filterBar.append(btn);
-      }
-      itemSec.append(filterBar);
+      const totalEverything = waitingSec.count + orchSec.count + pendingAccess.length + suggestions.length + visibleItems.length;
 
-      const visibleItems =
-        filter === "needs_you" ? items.filter((i) => i.status === "needs_you") : items;
-      itemSec.append(
-        renderItemsList(ctx, t, {
-          items: visibleItems,
-          bots,
-          showBot: true,
-          ready,
-          onReload: () => load(true),
-          cardMap,
-        }),
-      );
-      if (itemsCursor) {
-        const more = button(t("Load more"), loadMore, "secondary");
-        more.disabled = !ready();
-        itemSec.append(more);
+      if (hasBotsCap) {
+        const itemSec = el("section", undefined, "bots-section");
+        itemSec.append(el("h2", t("Needs You & Active Items"), "section-title"));
+        const filterBar = el("div", undefined, "bot-decision-options");
+        for (const [id, lbl] of [
+          ["needs_you", t("Needs You")],
+          ["open", t("All Open")],
+          ["snoozed", t("Snoozed")],
+          ["closed", t("Closed")],
+        ]) {
+          const btn = button(lbl, () => {
+            filter = id;
+            return load(true);
+          }, filter === id ? "filter-chip active" : "filter-chip");
+          btn.disabled = !ready();
+          filterBar.append(btn);
+        }
+        itemSec.append(filterBar);
+
+        if (filter === "needs_you" && totalEverything === 0 && !loading) {
+          const clearCard = el("div", undefined, "todo-clear-card inset-group");
+          const clearTitle = el("div", undefined, "todo-clear-title");
+          clearTitle.append(ctx.icon("check"), el("strong", t("All caught up")));
+          clearCard.append(clearTitle, el("p", t("Your agents are working autonomously."), "muted"));
+          itemSec.append(clearCard);
+        } else {
+          itemSec.append(
+            renderItemsList(ctx, t, {
+              items: visibleItems,
+              bots,
+              showBot: true,
+              ready,
+              onReload: () => load(true),
+              cardMap,
+              multiHost: multiHost(),
+              hideEmpty: filter === "needs_you" && totalEverything > 0,
+            }),
+          );
+        }
+        if (itemsCursor) {
+          const more = button(t("Load more"), loadMore, "secondary");
+          more.disabled = !ready();
+          itemSec.append(more);
+        }
+        nodes.push(itemSec);
+      } else if (totalEverything === 0) {
+        const clearCard = el("div", undefined, "todo-clear-card inset-group");
+        const clearTitle = el("div", undefined, "todo-clear-title");
+        clearTitle.append(ctx.icon("check"), el("strong", t("All caught up")));
+        clearCard.append(clearTitle, el("p", t("Your agents are working autonomously."), "muted"));
+        nodes.push(clearCard);
       }
-      nodes.push(itemSec);
+
       sync(list, nodes);
     }
 
     load(true);
-    return { update: draw };
+    return {
+      update() {
+        const nextSig = hostSig();
+        if (nextSig !== lastHostSig) {
+          load(true);
+        } else {
+          draw();
+        }
+      },
+    };
   };
 })();

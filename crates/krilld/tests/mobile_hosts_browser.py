@@ -97,10 +97,15 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
 
             def home():
                 evaluate("KrillMobile.app.navigate('/');true")
-                wait('!!document.querySelector(".home-list,.home-empty")')
+                wait('!!document.querySelector(".bots-list,.home-list,.home-empty,.workspace-list")')
+
+            def me():
+                evaluate("KrillMobile.app.navigate('/me');true")
+                wait('!!document.querySelector(".settings-list")')
 
             def pair(index):
                 if index:
+                    me()
                     click('Pair a desktop')
                     click('Paste link instead')
                 else:
@@ -138,6 +143,7 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             pair(1)
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).hosts.length') == 2
             assert evaluate('KrillMobile.store.drafts.size') == 0
+            me()
             assert evaluate('document.querySelectorAll(".host-card").length') == 2
             wait('KrillMobile.app.getConnections().length===2 && KrillMobile.app.getConnections().every(h=>h.connection.phase==="ready")')
             assert evaluate('KrillMobile.app.getConnections().every(h=>h.snapshot.sessions.length>0)')
@@ -146,7 +152,7 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             assert hosts[0]['cwd'] != hosts[1]['cwd']
             evaluate("document.querySelector('.host-main').click();true")
             wait('KrillMobile.store.connection.phase==="ready" && !!document.querySelector(".workspace-list")')
-            home()
+            me()
             assert evaluate('KrillMobile.app.getConnections().every(h=>h.connection.phase==="ready")')
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).active') == 'relay:' + 'a' * 32
             assert evaluate("KrillMobile.store.drafts.get('1')") == 'first desktop draft'
@@ -155,6 +161,7 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             wait('!!document.querySelector(".workspace-list")')
             assert evaluate('KrillMobile.app.getConnections().every(h=>h.connection.phase==="ready")')
             assert evaluate('KrillMobile.store.drafts.size') == 0
+            evaluate("KrillMobile.app.setDeviceFilter('all');true")
             home()
             browser('reload')
             wait('KrillMobile.app.getConnections().length===2 && KrillMobile.app.getConnections().every(h=>h.connection.phase==="ready")')
@@ -170,15 +177,17 @@ server.listen(0,'127.0.0.1',()=>fs.writeFileSync(ready,String(server.address().p
             assert evaluate('JSON.parse(localStorage.getItem("krill-mobile-hosts-v1")).active') == hosts[1]['id']
             assert evaluate('KrillMobile.store.sessions.get('+str(hosts[1]['session'])+').cwd') == hosts[1]['cwd']
             home()
-            assert evaluate('document.querySelector(".tab-bar [aria-current=page]")?.getAttribute("aria-label")==="Feed"')
+            assert evaluate('document.querySelector(".tab-bar [aria-current=page]")?.getAttribute("aria-label")==="Bots"')
             browser('screenshot', str(shots / 'home.png'))
-            click('Usage')
+            click('Me')
             wait('!!document.querySelector(".account-row")')
             assert evaluate('document.querySelectorAll(".usage-bar").length>=2')
             assert evaluate('[...document.querySelectorAll(".usage-column")].every(n=>n.getBoundingClientRect().height<32)')
             assert evaluate('[...document.querySelectorAll(".usage-label")].every(n=>["5h","7d"].includes(n.textContent))')
-            assert evaluate('!document.querySelector(".account-list").innerText.includes("until reset")')
+            assert evaluate('!document.querySelector(".account-list,.me-usage-body").innerText.includes("until reset")')
             browser('screenshot', str(shots / 'accounts.png'))
+            evaluate("KrillMobile.app.navigate('/accounts');true")
+            wait('!!document.querySelector(".account-row")')
             click('Choose desktop')
             wait('document.querySelector("#action-sheet").open')
             evaluate("document.querySelector('.sheet-action').click();true")

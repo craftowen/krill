@@ -59,9 +59,9 @@ async function confirmationInbox(){
  const q={id:'human',from:'coordinator',to:'user',run_id:'current',task_id:'review',summary:'Choose the release scope',body:'Include the documentation fix?'},gate={id:'decision',status:'pending',run_id:'current',question:'Publish this release?',options:['Approve','Deny']};
  const store={runs:[active,finished,archived],tasks:[task,done],questions:[q,{...q,id:'internal',to:'coordinator',summary:'Internal worker exchange'},{...q,id:'answered',acked:true},{...q,id:'finished',run_id:'old',task_id:null},{...q,id:'orphan',run_id:'missing',task_id:null},{...q,id:'done',task_id:'done'}],gates:[gate,{...gate,id:'old-gate',run_id:'old'},{...gate,id:'archive-gate',run_id:'archived'},{...gate,id:'resolved',status:'resolved'}]};
  const f=fixture('orchestration',{state:{snapshot:{orchestration:store}}});assert.equal(f.headers[0].title,'Confirmation requests');assert.equal(f.all().filter(n=>n.classList.contains('gate-card')).length,2);assert(!f.root.textContent.includes('Internal worker exchange'));assert(!f.root.textContent.includes('Old project'));assert(!f.root.textContent.includes('Archived project'));const details=f.find('.gate-card').querySelector('details');assert(!details.open,'technical context starts collapsed');const input=f.find('textarea'),form=input.parentElement;input.value='Include the fix';emit(input,'input');active.status='completed';f.view.update();assert.equal(f.find('textarea'),null);assert.equal(f.find('.gate-card'),null);assert(f.root.textContent.includes('No requests waiting for you.'));emit(form,'submit');await f.flush();assert.equal(f.calls.length,0,'a stale detached form cannot submit to a finished run');assert.equal(store.questions.find(q=>q.id==='internal').acked,undefined,'projection never acknowledges worker mail');f.abort.abort();active.status='active';
- const h=fixture('home'),one={id:'one',name:'First PC',connection:{phase:'ready'},snapshot:{orchestration:store}},two={id:'two',name:'Second PC',connection:{phase:'ready'},snapshot:{orchestration:{gates:[{id:'decision',status:'pending'}]}}};h.ctx.connections=[one,two];h.view.update();const rows=()=>h.all().filter(n=>n.dataset.requestHost);assert.equal(rows().length,2);assert(rows()[0].textContent.includes('2 requests to review'));assert(rows()[1].textContent.includes('1 request to review'));await rows()[1].action();assert.equal(h.ctx.selected,'two');assert.equal(h.routes.at(-1),'/orchestration','request entry selects its owning PC before routing');const first=rows()[0];first.focus();one.snapshot.orchestration.questions=[];h.view.update();assert.equal(rows()[0],first);assert.equal(h.doc.activeElement,first);one.cached=true;h.view.update();assert(first.disabled,'cached confirmation requests cannot be answered');one.cached=false;one.connection.phase='idle';h.view.update();assert(first.disabled);one.snapshot.orchestration.gates=[];two.snapshot.orchestration.gates=[];h.view.update();assert.equal(rows().length,0);assert(!h.find('#confirmation-requests'),'Home removes the section when no requests remain');h.abort.abort();
- const w=fixture('workspaces');assert.equal(w.byText('Orchestration'),undefined);assert(w.find('#workspace-confirmation-requests').hidden);w.state.snapshot.orchestration={gates:[{id:'decision',status:'pending'}]};w.view.update();const entry=w.find('#workspace-confirmation-requests');assert(!entry.hidden);await entry.action();assert.equal(w.routes.at(-1),'/orchestration');w.abort.abort();
- console.log('PASS confirmation inbox: human-only current requests, retired work, stale form rejection, collapsed context, per-PC Home entry/counts, cached/offline disabling and contextual workspace entry');
+ const h=fixture('bots'),one={id:'one',name:'First PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},orchestration:store,sessions:[]}},two={id:'two',name:'Second PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},orchestration:{gates:[{id:'decision',status:'pending'}]},sessions:[]}};h.ctx.connections=[one,two];h.view.update();const banner=()=>h.find('.todo-summary-banner');assert(banner(),'Bots home shows 1-line summary banner when requests exist');assert(banner().textContent.includes('3 requests need your attention'));await banner().action();assert.equal(h.routes.at(-1),'/up-next','banner routes straight to To Do tab');one.snapshot.orchestration.questions=[];one.snapshot.orchestration.gates=[];two.snapshot.orchestration.gates=[];h.view.update();assert(!banner(),'Bots home hides summary banner when 0 requests remain');h.abort.abort();
+ const w=fixture('workspaces');assert.equal(w.byText('Orchestration'),undefined);assert(w.find('#workspace-confirmation-requests').hidden);w.state.snapshot.orchestration={gates:[{id:'decision',status:'pending'}]};w.view.update();const entry=w.find('#workspace-confirmation-requests');assert(!entry.hidden);await entry.action();assert.equal(w.routes.at(-1),'/up-next');w.abort.abort();
+ console.log('PASS confirmation inbox: human-only current requests, retired work, stale form rejection, collapsed context, Bots home banner, cached/offline disabling and contextual workspace entry');
 }
 
 function groups(f){const a={id:1,state:'Waiting',agent:'codex',branch:'main',groupKey:'g-a',lines:['확인 필요']},b={id:2,state:'Working',branch:'dev',groupKey:'g-b',lines:[]};const ga={key:'g-a',label:'한글 워크스페이스',path:'/tmp/a',repoKey:'repo',sessions:[a]},gb={key:'g-b',label:'Other',path:'/tmp/b',repoKey:'repo',sessions:[b]};f.state.groups=new Map([[ga.key,ga],[gb.key,gb]]);f.state.sessions=new Map([[a.id,a],[b.id,b]]);f.state.snapshot.repositories=[{key:'repo',label:'프로젝트'}];f.state.preferences.workspaceTree={'repo:repo':true,...f.state.preferences.workspaceTree};return {a,b,ga,gb};}
@@ -140,11 +140,11 @@ async function desktopVisibility(){
   assert.deepEqual(warmOut,liveOut,`warm-cache Workspaces parity for group_by=${groupBy}`);
   assert(!warmOut.groups.includes('a-ext-hidden'));assert(!warmOut.groups.includes('c-main'));
  }
- const homeLive=fixture('home'),homeWarm=fixture('home');
+ const homeLive=fixture('settings'),homeWarm=fixture('settings');
  homeLive.ctx.connections=[{id:'pc',name:'Studio',connection:{phase:'ready'},snapshot:warmInput,workspaceView:{hide_sleeping:true}}];
  homeWarm.ctx.connections=[{id:'pc',name:'Studio',connection:{phase:'connecting'},cached:true,snapshot:cachedData,workspaceView:{hide_sleeping:true}}];
  homeLive.view.update();homeWarm.view.update();
- assert.equal(homeWarm.find('.session-summary').textContent,homeLive.find('.session-summary').textContent,'Home workspace count matches warm-cached snapshot');
+ assert.equal(homeWarm.find('.session-summary').textContent,homeLive.find('.session-summary').textContent,'Me desktops workspace count matches warm-cached snapshot');
  homeLive.abort.abort();homeWarm.abort.abort();
  // Missing/mixed orders never yield NaN in Array.prototype.sort across Project, Status, and None modes.
  const origSort=Array.prototype.sort;let sawNaN=false;
@@ -322,15 +322,48 @@ async function createWorktreeSheet(){
  }
  console.log('PASS Orca Create worktree sheet: FAB, project/remote picker, Run on target, branch source suggestions, agent picker, auto-name and setup review');
 }
-async function home(){const f=fixture('home');assert.equal(f.find('.krill-logo').src,'icon.svg');assert(!f.root.textContent.includes('Welcome back'));assert(f.root.textContent.includes('Connect your desktop'));
- const first={id:'one',active:true,name:'First PC',endpoint:'Relay · aaaa',connection:{phase:'ready'},snapshot:{sessions:[{id:7,title:'First task',worktree_key:'same',state:'Working'}]}},second={id:'two',name:'Second PC',endpoint:'Relay · bbbb',connection:{phase:'ready'},snapshot:{sessions:[{id:7,title:'Second task',worktree_key:'same',state:'Waiting'}]}};f.ctx.connections=[first,second];f.view.update();assert.equal(f.find('.home-desktops').children.length,2);assert(f.root.textContent.includes('2/2'));assert(f.root.textContent.includes('Recent sessions'));assert.equal(f.calls.length,0,'Home does not poll every provider account');
- const sections=f.find('.home-list').children;assert.equal(f.find('.page-title').textContent,'Feed');assert.equal(sections[0],f.find('.recent-session'));assert.equal(sections.at(-1),f.find('.home-desktop-group'));assert(f.find('.home-desktop-group').contains(f.byText('Pair a desktop')),'Pair a desktop closes the Desktops group');assert.equal(f.find('.home-fab'),f.byText('New Workspace'));assert(!f.find('.home-list').contains(f.byText('New Workspace')),'New workspace floats over the feed');assert.equal(f.byText('New Workspace').disabled,true,'unsupported worktree creation stays disabled');first.snapshot.capabilities={worktree_create:true};f.view.update();assert.equal(f.byText('New Workspace').disabled,false);assert(!f.root.textContent.includes('Quick actions'));
- const cards=f.find('.home-desktops').children,firstButton=cards[0].querySelector('.host-main'),other=cards[1].querySelector('.host-main');await other.action();assert.equal(f.ctx.selected,'two');firstButton.focus();f.find('.home-list').scrollTop=201;const moves=firstButton.moves;first.name='Renamed PC';f.view.update();assert.equal(cards[0].querySelector('.host-main'),firstButton);assert.equal(f.doc.activeElement,firstButton);assert.equal(firstButton.moves,moves);assert.equal(f.find('.home-list').scrollTop,201);assert(firstButton.textContent.includes('Renamed PC'));
- const rows=f.find('.recent-session-list').children;assert.equal(rows[0].dataset.host,'two','Waiting session sorts ahead of Working');assert.equal(rows[1].dataset.host,'one');await rows[0].action();assert.equal(f.ctx.opened.id,'two');assert.equal(f.ctx.opened.locator.id,7);assert.equal(f.ctx.opened.locator.groupKey,'same');second.connection.phase='disconnected';f.view.update();assert(f.root.textContent.includes('1/2'));assert.equal(rows[0].disabled,true);assert.equal(rows[1].disabled,false);assert(other.textContent.includes('Not connected'));assert.equal(cards[1].querySelector('.status-dot').className,'status-dot unknown');second.connection.phase='connecting';f.view.update();assert.equal(cards[1].querySelector('.status-dot').className,'status-dot working');second.connection.phase='denied';f.view.update();assert.equal(cards[1].querySelector('.status-dot').className,'status-dot blocked');
- other._longPress();assert.deepEqual(Array.from(f.sheets.at(-1)[1],a=>a.label),['Rename desktop','Reconnect','Remove from this phone']);assert.equal(f.sheets.at(-1)[1].at(-1).danger,true);
- firstButton._longPress();assert.deepEqual(Array.from(f.sheets.at(-1)[1],a=>a.label),['Rename desktop','Remove from this phone']);assert.equal(f.sheets.at(-1)[1].at(-1).danger,true);
- cards[1].querySelectorAll('button')[1].action();await f.sheets.at(-1)[1].find(a=>a.label==='Reconnect').action();assert.equal(f.ctx.reconnected,'two');await f.sheets.at(-1)[1].find(a=>a.label==='Rename desktop').action();assert.equal(f.ctx.renamed,'two');await f.byText('Pair a desktop').action();assert.equal(f.ctx.scans,1);assert(!f.byText('Accounts'),'accounts and settings live in the tab bar');second.snapshot.sessions[0].exited=true;f.view.update();assert.equal(f.find('.recent-session-list').children.length,1);f.abort.abort();
- console.log('PASS Home simultaneous PC states, scoped equal session IDs, direct PC entry, stable focus/scroll, no greeting/account clutter');}
+async function home(){
+ // 1) Unpaired Home shows pairing hero (icon.svg + Scan QR + Paste link)
+ const f=fixture('home');assert.equal(f.find('.krill-logo').src,'icon.svg');assert(!f.root.textContent.includes('Welcome back'));assert(f.root.textContent.includes('Connect your desktop'));
+ // 2) Paired + bots capable Home opens Bots home directly (no desktop gateway) + recent sessions (max 3) + View all -> /projects
+ const first={id:'one',active:true,name:'First PC',endpoint:'Relay · aaaa',connection:{phase:'ready'},snapshot:{capabilities:{bots:true,worktree_create:true},repositories:[{key:'r1',label:'krill'}],workspaces:[{key:'same',repo_key:'r1',label:'main'}],sessions:[{id:7,title:'First task',worktree_key:'same',state:'Working'}],orchestration:{}}},second={id:'two',name:'Second PC',endpoint:'Relay · bbbb',connection:{phase:'ready'},snapshot:{capabilities:{bots:true,worktree_create:true},repositories:[{key:'r2',label:'docs'}],workspaces:[{key:'same',repo_key:'r2',label:'main'}],sessions:[{id:7,title:'Second task',worktree_key:'same',state:'Waiting'}],orchestration:{}}};
+ f.ctx.connections=[first,second];f.view.update();await f.flush();
+ assert(f.find('.bots-list'),'paired bots-capable home mounts Bots home directly');
+ assert(!f.find('.home-desktops'),'no desktop gateway on Bots home');
+ const banner=f.find('.todo-summary-banner');assert(banner,'Waiting session shows 1-line summary banner');
+ const rows=f.find('.recent-session-list').children;assert.equal(rows[0].dataset.host,'two','Waiting session sorts ahead of Working');assert.equal(rows[1].dataset.host,'one');
+ await rows[0].action();assert.equal(f.ctx.opened.id,'two');assert.equal(f.ctx.opened.locator.id,7);assert.equal(f.ctx.opened.locator.groupKey,'same');
+ await f.byText('View all').action();assert.equal(f.routes.at(-1),'/projects');
+ f.abort.abort();
+ // 3) Paired + legacy daemons (all lack capabilities.bots) safely fall back to Projects (workspaces)
+ const legacy=fixture('home');
+ legacy.ctx.connections=[{id:'old',active:true,name:'Old Mac',connection:{phase:'ready'},snapshot:{capabilities:{},repositories:[{key:'r1',label:'legacy-repo'}],workspaces:[{key:'w1',repo_key:'r1',label:'main'}],sessions:[]}}];
+ legacy.view.update();
+ assert(legacy.find('.workspace-list'),'legacy daemons without bots capability fall back to Projects');
+ legacy.abort.abort();
+ // 4) Multi-host Projects view aggregates both desktops with quiet device badges and zero reconnect
+ const proj=fixture('workspaces');proj.ctx.connections=[first,second];proj.view.update();
+ const repoLabels=proj.all().filter(n=>n.classList.contains('repo-label')).map(n=>n.textContent);
+ assert.deepEqual(repoLabels,['krill','docs']);
+ const devBadges=proj.all().filter(n=>n.classList.contains('device-badge')&&!n.hidden).map(n=>n.textContent);
+ assert.deepEqual(devBadges,['First PC','Second PC'],'multi-host projects display quiet device badges');
+ proj.abort.abort();
+ // 5) Unified Me hub (settings) hosts Connected Desktops (rename/reconnect/remove/pair/paste) + Usage + Settings
+ const me=fixture('settings');me.ctx.connections=[first,second];me.view.update();await me.flush();
+ assert.equal(me.find('.home-desktops').children.length,2);assert(me.root.textContent.includes('2/2'));
+ assert(me.find('.home-desktop-group').contains(me.byText('Pair a desktop')));
+ assert(me.find('.home-desktop-group').contains(me.byText('Paste pairing link')));
+ const cards=me.find('.home-desktops').children,firstButton=cards[0].querySelector('.host-main'),other=cards[1].querySelector('.host-main');
+ first.name='Renamed PC';me.view.update();assert(firstButton.textContent.includes('Renamed PC'));
+ second.connection.phase='disconnected';me.view.update();assert(me.root.textContent.includes('1/2'));assert(other.textContent.includes('Not connected'));assert.equal(cards[1].querySelector('.status-dot').className,'status-dot unknown');
+ second.connection.phase='connecting';me.view.update();assert.equal(cards[1].querySelector('.status-dot').className,'status-dot working');
+ second.connection.phase='denied';me.view.update();assert.equal(cards[1].querySelector('.status-dot').className,'status-dot blocked');
+ other._longPress();assert.deepEqual(Array.from(me.sheets.at(-1)[1],a=>a.label),['Rename desktop','Reconnect','Remove from this phone']);assert.equal(me.sheets.at(-1)[1].at(-1).danger,true);
+ firstButton._longPress();assert.deepEqual(Array.from(me.sheets.at(-1)[1],a=>a.label),['Rename desktop','Remove from this phone']);assert.equal(me.sheets.at(-1)[1].at(-1).danger,true);
+ cards[1].querySelectorAll('button')[1].action();await me.sheets.at(-1)[1].find(a=>a.label==='Reconnect').action();assert.equal(me.ctx.reconnected,'two');await me.sheets.at(-1)[1].find(a=>a.label==='Rename desktop').action();assert.equal(me.ctx.renamed,'two');await me.byText('Pair a desktop').action();assert.equal(me.ctx.scans,1);
+ me.abort.abort();
+ console.log('PASS Variant B Home/Projects/Me: pairing hero, Bots home with banner+recents, legacy fallback to Projects, multi-host Projects badges, Me hub desktops/usage/settings');
+}
 async function homeResumeAndLogins(){
  const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/home.js'),'utf8'),storage=new Map(),context=vm.createContext({localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)}});vm.runInContext(source,context);const R=context.KrillMobile.recentSession;
  assert.equal(R.read('phone-a'),null);R.write('phone-a',{id:7,title:'do not persist terminal text'},{key:'cwd:/work'});R.write('phone-b',{id:7},{key:'second-host'});R.write('phone-a',{id:8},{key:'another'});assert.equal(R.read('phone-a').id,8);assert.equal(R.list('phone-a').length,2);assert.equal(R.read('phone-b').groupKey,'second-host');assert(![...storage.values()][0].includes('terminal text'));R.write('phone-a',{id:9,exited:true},{key:'g'});assert.equal(R.read('phone-a').id,8);R.clear();assert.equal(R.read('phone-a'),null);
@@ -481,7 +514,7 @@ async function mobileAuditIdentity(){
   [{agent:'claude',foreground:'pi',title:'Renamed task'},'claude'],
   [{agent:'zsh',foreground:'node',title:'Codex task'},'codex']])assert.equal(M.sessionAgent(session),expected,JSON.stringify(session));
  const pi=M.agentIcon('pi',ctx);assert.equal(pi.getAttribute('class'),'agent-icon pi');assert.equal(pi.getAttribute('viewBox'),'0 0 800 800');assert.equal(pi.children.length,2);assert.equal(pi.children[0].getAttribute('fill-rule'),'evenodd');assert.equal(M.agentName('π'),'Pi');
- f.ctx.connections=[{id:'pc',name:'PC',connection:{phase:'ready'},snapshot:{sessions:[{id:1,agent:'zsh',foreground:'pi',title:'Renamed task',worktree_key:'w'}]}}];f.view.update();let row=f.find('.recent-session-row');assert(row.textContent.includes('Pi'));assert(row.descendants().some(n=>n.getAttribute('class')==='agent-icon pi'));f.ctx.connections[0].snapshot.sessions[0].foreground='codex';f.view.update();assert.equal(f.find('.recent-session-row'),row);assert(row.textContent.includes('Codex'));assert(!row.descendants().some(n=>n.getAttribute('class')==='agent-icon pi'));f.abort.abort();
+ f.ctx.connections=[{id:'pc',name:'PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},sessions:[{id:1,agent:'zsh',foreground:'pi',title:'Renamed task',worktree_key:'w'}]}}];f.view.update();let row=f.find('.recent-session-row');assert(row.textContent.includes('Pi'));assert(row.descendants().some(n=>n.getAttribute('class')==='agent-icon pi'));f.ctx.connections[0].snapshot.sessions[0].foreground='codex';f.view.update();assert.equal(f.find('.recent-session-row'),row);assert(row.textContent.includes('Codex'));assert(!row.descendants().some(n=>n.getAttribute('class')==='agent-icon pi'));f.abort.abort();
  const w=fixture('workspaces'),{a:workspaceSession}=groups(w);workspaceSession.agent='zsh';workspaceSession.foreground='pi';w.state.preferences.workspaceTree['w:g-a']=false;w.view.update();const summary=w.all().find(n=>n.dataset.group==='g-a');assert(summary.textContent.includes('Pi'));assert(summary.descendants().some(n=>n.getAttribute('class')==='agent-icon pi'));w.abort.abort();
  const a=fixture('accounts',{rpc:()=>({accounts:[{id:'a',provider:'Antigravity',label:'Default',active:true,host_default:true,usage:{}},{id:'o',provider:'OpenCode',label:'Default',active:true,host_default:true,usage:{}}]})});await a.flush();for(const id of ['agy','opencode']){const mark=a.all().find(n=>n.getAttribute('class')===`agent-icon ${id}`);assert(mark);assert.equal(mark.children.at(-1).getAttribute('class'),'layer','accounts reuse the session multicolor mark');}a.abort.abort();
  const g=fixture('orchestration',{state:{snapshot:{orchestration:{gates:[{id:'empty',status:'pending',question:'No options supplied'}]}}}});assert.equal(g.find('.gate-options').children.length,0,'missing options cannot invent Approve/Deny defaults');assert.equal(g.calls.length,0);g.state.snapshot.orchestration.gates[0].options=['Delete everything','Wait'];g.view.update();assert(g.find('.gate-options').children.every(n=>n.className==='secondary'),'opaque server choices have equal priority and no inferred danger/default');g.abort.abort();
@@ -613,7 +646,7 @@ function exitedSessionProjection(){
 async function layoutAnchors(){
  // Supply geometry explicitly: the shared fixture otherwise has clientHeight=0 semantics.
  const geometry=(f,port,predicate)=>{port.clientHeight=100;port.getBoundingClientRect=()=>({top:0,bottom:100});port.querySelectorAll=()=>f.all().filter(n=>port.contains(n)&&predicate(n));};
- const h=fixture('home');const host={id:'one',name:'PC',connection:{phase:'ready'},snapshot:{sessions:[],orchestration:{}}};h.ctx.connections=[host];h.view.update();const home=h.find('.home-list'),card=h.find('.host-card');home.scrollTop=88;geometry(h,home,n=>n.classList.contains('host-card'));card.getBoundingClientRect=()=>({top:200+(h.find('#confirmation-requests')?120:0)-home.scrollTop,bottom:300+(h.find('#confirmation-requests')?120:0)-home.scrollTop});h.find('.host-main').focus();const y=card.getBoundingClientRect().top;host.snapshot.orchestration.gates=[{id:'gate',status:'pending'}];h.view.update();assert.equal(card.getBoundingClientRect().top,y);assert.equal(home.scrollTop,208);host.snapshot.orchestration.gates=[];h.view.update();assert.equal(home.scrollTop,88);assert(!h.find('#confirmation-requests'));h.abort.abort();
+ const h=fixture('home');const host={id:'one',name:'PC',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},sessions:[{id:1,state:'Working',title:'Build',worktree_key:'w1'}],orchestration:{}}};h.ctx.connections=[host];h.view.update();const home=h.find('.bots-list'),card=h.find('.recent-session-row');home.scrollTop=88;geometry(h,home,n=>n.classList.contains('recent-session-row'));card.getBoundingClientRect=()=>({top:200+(h.find('.todo-summary-banner')?120:0)-home.scrollTop,bottom:300+(h.find('.todo-summary-banner')?120:0)-home.scrollTop});card.focus();const y=card.getBoundingClientRect().top;host.snapshot.orchestration.gates=[{id:'gate',status:'pending'}];h.view.update();assert.equal(card.getBoundingClientRect().top,y);assert.equal(home.scrollTop,208);host.snapshot.orchestration.gates=[];h.view.update();assert.equal(home.scrollTop,88);assert(!h.find('.todo-summary-banner'));h.abort.abort();
  const w=fixture('workspaces');const {ga}=groups(w);w.view.update();const port=w.find('.workspace-list'),row=w.all().find(n=>n.dataset.group===ga.key),node=row.parentElement.parentElement;assert.equal(node.style.containIntrinsicBlockSize,'auto 78px','phone workspace terminals start folded (Orca lists workspaces only)');port.scrollTop=88;geometry(w,port,n=>n.dataset.group);const rowTop=()=>{const rows=port.querySelectorAll();return rows.indexOf(row)*100-port.scrollTop;};for(const r of port.querySelectorAll())r.getBoundingClientRect=()=>({top:port.querySelectorAll().indexOf(r)*100-port.scrollTop,bottom:port.querySelectorAll().indexOf(r)*100+100-port.scrollTop});row.focus();const before=rowTop();const first={key:'new',label:'New first',repoKey:'repo',pinned:true,sessions:[]};w.state.groups=new Map([[first.key,first],...w.state.groups]);w.view.update();assert.equal(rowTop(),before);w.abort.abort();
  const o=fixture('orchestration',{state:{snapshot:{orchestration:{questions:[{id:'q',to:'user',summary:'Question'}]}}}}),op=o.find('#orchestration'),question=o.find('.gate-card'),input=o.find('textarea');geometry(o,op,n=>n.classList.contains('gate-card'));op.scrollTop=177;question.getBoundingClientRect=()=>({top:op.children.indexOf(question)*300-op.scrollTop,bottom:op.children.indexOf(question)*300+300-op.scrollTop});input.focus();assert(o.find('.action-status').hidden);const qY=question.getBoundingClientRect().top;o.state.snapshot.orchestration.gates=[{id:'g',question:'New gate',status:'pending',options:['Proceed']}];o.view.update();assert.equal(question.getBoundingClientRect().top,qY);assert.equal(op.scrollTop,477);assert.equal(o.find('textarea'),input);o.abort.abort();
  const settings=fixture('settings',{route:{subpage:'terminal'}}),settingsPort=settings.find('.settings-list');settingsPort.scrollTop=900;const keyGroup=settings.all().find(n=>n.dataset.key==='esc').parentElement.parentElement;keyGroup.querySelector=selector=>keyGroup.descendants().find(n=>n.dataset.key==='esc'&&(!selector.includes('data-step')||n.dataset.step==='1')&&!n.disabled);const oldFocus=settings.root.constructor.prototype.focus;settings.root.constructor.prototype.focus=function(options){this.focusOptions=options;settings.doc.activeElement=this;};settings.all().find(n=>n.dataset.key==='esc'&&n.dataset.step==='1').action();assert.equal(settingsPort.scrollTop,900);assert.equal(settings.doc.activeElement.focusOptions.preventScroll,true);settings.root.constructor.prototype.focus=oldFocus;settings.abort.abort();
@@ -627,7 +660,7 @@ async function layoutAnchors(){
 async function tabletRoutePreservation(){
  const f=fixture('home'),E=f.root.constructor,source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8'),lines=source.split('\n'),sidebar=lines.filter(l=>l.startsWith(' let pendingRecent=')||l.startsWith(' function syncTablet()')).join('\n'),render=source.slice(source.indexOf(' function render(){'),source.indexOf(' // IME'));
  let mounted=0,cleaned=0,updates=0,sidebarCtx,sessionCtx;const rpc=[],transport={ready:true,rpc:request=>{rpc.push(request);return Promise.resolve({});}},sandbox={root:f.root,document:f.doc,location:{hash:'#/s/7'},activeRouteScreen:'home',routeKey:'',state:f.state,hostGeneration:1,transport,screen:null,abort:null,banner:new E('div'),endpoint:{profiles:()=>[{id:'pc',active:true}]},routeAssets:{},M:{screens:{workspaces(root,ctx){mounted++;sidebarCtx=ctx;root.append(new E('div','','workspace-list'));return {cleanup(){cleaned++;},update(){updates++;}};},session(root,ctx){sessionCtx=ctx;root.append(ctx.header('Session','/'));return {};}}},AbortController,matchMedia:()=>({matches:true}),parseRoute:()=>({screen:'session'}),el:(...v)=>new E(...v),header:()=>{const h=new E('header');h.append(new E('button'),new E('h1','Session'));return h;}};
- for(const key of ['button','icon','go','setRoute','back','backTo','t','install','dot','rollup','groupRoute','linkRow','sheet','closeSheet','longPress','savePreferences','rememberSession','resumeLastSession','scanQr','pasteLink','newWorkspace','sessionKey','selectHost','forgetHost','renameHost','hostRoute','getConnections','openRecent','reconnectHost','photo','toast','error','act','createSession'])sandbox[key]=f.ctx[key]||(()=>{});vm.createContext(sandbox);vm.runInContext(sidebar+'\n'+render+'\nglobalThis.render=render;',sandbox);sandbox.render();const list=f.find('.workspace-list'),signal=sidebarCtx.signal,oldSession=sessionCtx.signal;list.scrollTop=321;sandbox.location.hash='#/s/8';sandbox.render();assert.equal(mounted,1);assert.equal(cleaned,0);assert.equal(f.find('.workspace-list'),list);assert.equal(list.scrollTop,321);assert(oldSession.aborted);assert(!signal.aborted);await sidebarCtx.rpc({action:'git'});assert.equal(rpc.length,1,'sidebar RPC survives the previous session screen abort');assert(updates>=2);sandbox.state.cached=true;assert.throws(()=>sidebarCtx.rpc({action:'git'}),/Reconnect/);f.abort.abort();
+ for(const key of ['button','icon','go','setRoute','back','backTo','t','install','dot','rollup','groupRoute','linkRow','sheet','closeSheet','longPress','savePreferences','rememberSession','resumeLastSession','scanQr','pasteLink','newWorkspace','sessionKey','selectHost','forgetHost','renameHost','hostRoute','getConnections','filteredConnections','openRecent','reconnectHost','photo','toast','error','act','createSession','setDeviceFilter','deviceFilterPill','syncDevicePills','syncTabBar','homeMode','rpcForHost','refreshHost','activateHost'])sandbox[key]=f.ctx[key]||(()=>{});sandbox.filteredConnections=()=>f.ctx.connections||[];sandbox.homeMode=()=>'bots';sandbox.deviceFilterPill=()=>new E('button');vm.createContext(sandbox);vm.runInContext(sidebar+'\n'+render+'\nglobalThis.render=render;',sandbox);sandbox.render();const list=f.find('.workspace-list'),signal=sidebarCtx.signal,oldSession=sessionCtx.signal;list.scrollTop=321;sandbox.location.hash='#/s/8';sandbox.render();assert.equal(mounted,1);assert.equal(cleaned,0);assert.equal(f.find('.workspace-list'),list);assert.equal(list.scrollTop,321);assert(oldSession.aborted);assert(!signal.aborted);await sidebarCtx.rpc({action:'git'});assert.equal(rpc.length,1,'sidebar RPC survives the previous session screen abort');assert(updates>=2);sandbox.state.cached=true;assert.throws(()=>sidebarCtx.rpc({action:'git'}),/Reconnect/);f.abort.abort();
  // Render the actual account screen through the app gate with an unavailable active host.
  sandbox.parseRoute=()=>({screen:'accounts'});sandbox.location.hash='#/accounts';sandbox.header=f.ctx.header;sandbox.M.screens.accounts=f.M.screens.accounts;f.ctx.connections=[{id:'pc',active:true,connection:{phase:'disconnected'}},{id:'other',name:'Online desktop',connection:{phase:'ready'}}];
  for(const cached of [false,true]){sandbox.state.snapshot=cached?{host:{display_name:'Cached PC'}}:null;sandbox.state.cached=cached;sandbox.state.connection={phase:'disconnected',message:'Reconnecting…'};transport.ready=false;sandbox.render();const choose=f.byText('Choose desktop');assert(choose&&!choose.hidden,'account host recovery survives missing/cached snapshots');choose.action();await f.sheets.at(-1)[1][0].action();assert.equal(f.ctx.selected,'other');assert.equal(f.routes.at(-1),'/accounts');}sandbox.abort.abort();
@@ -652,7 +685,7 @@ function pathLabelSnapshots(){
   ["", null, ""]
  ];
  for(const [cwd,platform,basename] of cases){
-  const f=fixture('home'),session={id:1,state:'Working',cwd},data={host:{platform},sessions:[session]},sandbox={state:f.state,M:f.M};
+  const f=fixture('home'),session={id:1,state:'Working',cwd},data={capabilities:{bots:true},host:{platform},sessions:[session]},sandbox={state:f.state,M:f.M};
   vm.createContext(sandbox);vm.runInContext(source.split('\n').find(l=>l.includes('function group(data)'))+'globalThis.groupSnapshot=group;',sandbox);
   for(const provided of [undefined,'Provided workspace label']){
    session.group_label=provided;sandbox.groupSnapshot(data);const label=provided||basename;
@@ -711,8 +744,10 @@ async function tabBarAndLayoutContracts(){
    t:s=>s,go(){},setRoute(){},back(){},backTo(){},icon:()=>new E('svg'),dot:()=>new E('span'),rollup:()=>'Unknown',
    groupRoute:()=>'/',linkRow:()=>new E('button'),sheet(){},closeSheet(){},longPress(){},savePreferences(){},
    rememberSession(){},resumeLastSession(){},scanQr(){},pasteLink(){},newWorkspace(){},sessionKey:()=>'k',
-   selectHost(){},forgetHost(){},renameHost(){},hostRoute:()=>'/host/local',getConnections:()=>[],openRecent(){},
+   selectHost(){},forgetHost(){},renameHost(){},hostRoute:()=>'/host/local',getConnections:()=>[],filteredConnections:()=>[],openRecent(){},
    reconnectHost(){},photo(){},toast(){},error(){},act:fn=>fn(),createSession(){},creating:()=>null,syncTablet(){},
+   setDeviceFilter(){},deviceFilterPill:()=>new E('button'),syncDevicePills(){},syncTabBar(){},homeMode:()=>'bots',
+   rpcForHost:()=>Promise.resolve({}),refreshHost:()=>Promise.resolve(),activateHost(){},
    tabletList:null,tabletAbort:null,tabletContext:null,tabletShell:null,tabletBody:null,tabletSidebar:null,
    tabletHost:null,tabletCollapsed:false,tabletCtxRef:null
   };
@@ -726,16 +761,19 @@ async function tabBarAndLayoutContracts(){
  assert(loading.root.querySelector('.screen'),'.screen exists while loading accounts');
  assert(loading.root.querySelector('.detail-list'),'.detail-list guards snapshot() from clobbering loading screen');
  assert(loading.root.querySelector('.tab-bar'),'.tab-bar stays visible while loading accounts');
- assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.textContent,'Usage');
+ assert.deepEqual(loading.root.querySelectorAll('.tab-bar-item').map(b=>b.getAttribute('aria-label')),['Bots','Projects','To Do','Me'],'Variant B 4-tab bottom bar order');
+ assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.getAttribute('aria-label'),'Me','/accounts compat highlights Me tab');
  loadDeferred.reject(Error('Network failed'));
  await loading.f.flush();
  assert(loading.root.querySelector('.tab-bar'),'.tab-bar remains visible on load error with Retry');
  assert(loading.root.querySelectorAll('button').some(b=>b.textContent==='Retry'));
  currentRoute={screen:'settings'};loading.box.location.hash='#/settings';loading.box.render();
  assert(loading.root.querySelector('.tab-bar'),'.tab-bar stays visible while loading settings');
- assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.textContent,'Settings');
+ assert.equal(loading.root.querySelectorAll('.tab-bar-item').find(b=>b.getAttribute('aria-current')==='page')?.getAttribute('aria-label'),'Me');
  currentRoute={screen:'settings',subpage:'terminal'};loading.box.location.hash='#/settings/terminal';loading.box.render();
  assert.equal(loading.root.querySelector('.tab-bar'),null,'settings subpages omit .tab-bar even while loading');
+ currentRoute={screen:'bots',botId:'b1',subpage:'b1'};loading.box.location.hash='#/bots/b1';loading.box.render();
+ assert.equal(loading.root.querySelector('.tab-bar'),null,'bot detail omits .tab-bar');
  loading.cleanup();
  // 2) Rapid tab switching while loadScreen is pending suppresses stale double-render.
  const loads=[];let accountMounts=0;
@@ -773,25 +811,32 @@ async function botsScreens(){
  assert.deepEqual({...routeBox.parseRoute()},{screen:'bots',botId:'bot 1',subpage:'bot 1'});
  routeBox.location.hash='#/up-next';
  assert.deepEqual({...routeBox.parseRoute()},{screen:'up-next',subpage:undefined});
+ routeBox.location.hash='#/projects';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'workspaces'});
+ routeBox.location.hash='#/me';
+ assert.deepEqual({...routeBox.parseRoute()},{screen:'settings',subpage:undefined});
  routeBox.location.hash='#/bots/%E0%A4%A';
  assert.throws(()=>routeBox.parseRoute(),/Invalid bot link/);
 
- // 2. Home entry card gated on capabilities.bots && ((needs_you + pending_access) > 0)
+ // 2. Variant B Home: Bots default with conditional 1-line To Do banner + legacy fallback to Projects
  const hf=fixture('home');
  hf.ctx.connections=[{id:'one',active:true,name:'Desktop',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},bots:{count:0,needs_you:0,pending_access:0},sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}}}];
  hf.view.update();
- assert(!hf.find('#bots-home-card'),'empty bots summary hides Bots card on Home');
+ assert(!hf.find('.todo-summary-banner'),'0 pending items hide To Do summary banner on Bots home');
  hf.ctx.connections[0].snapshot.bots={count:2,needs_you:0,pending_access:0};
  hf.view.update();
- assert(!hf.find('#bots-home-card'),'bots without pending Up Next items hide Bots card on Home');
+ assert(!hf.find('.todo-summary-banner'),'bots without pending items hide To Do summary banner');
  hf.ctx.connections[0].snapshot.bots={count:2,needs_you:1,pending_access:1};
  hf.view.update();
- assert(hf.find('#bots-home-card'),'pending Up Next items render Bots card on Home');
- const botButtons=hf.find('#bots-home-card').querySelectorAll('button');
- assert.equal(botButtons.length,1,'Home Bots card only renders Up Next row');
- assert(!hf.byText('Manage bots'),'Home Bots card omits Manage bots row');
- await botButtons[0].action();
+ assert(hf.find('.todo-summary-banner'),'pending items show 1-line To Do summary banner on Bots home');
+ assert(hf.find('.todo-summary-banner').textContent.includes('2 requests need your attention'));
+ await hf.find('.todo-summary-banner').action();
  assert.equal(hf.routes.at(-1),'/up-next');
+ // Legacy fallback: all ready hosts without capabilities.bots fall back to Projects (workspaces)
+ hf.ctx.connections=[{id:'old',active:true,name:'Legacy PC',connection:{phase:'ready'},snapshot:{capabilities:{},sessions:[],orchestration:{}}}];
+ assert.equal(hf.M.legacyNoBots(hf.ctx.connections),true);
+ hf.view.update();
+ assert(hf.find('.workspace-list'),'legacy hosts without bots capability fall back to Projects');
  hf.abort.abort();
 
  // 3. #/bots screen: list, paused badge, Open Chat, Create Bot sheet, Access approve + redeem, Group Chat
@@ -853,7 +898,7 @@ async function botsScreens(){
  await bf.find('.bot-group-panel').querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Send').action();
  assert(bf.calls.some(c=>c.action==='bots.groups.send'&&c.group_id==='grp-1'&&c.thread_id==='t3'&&c.text==='@triage in new thread'));
 
- await bf.byText('+ New Bot').action();
+ await bf.byText('New Bot').action();
  const sheet=bf.sheets.at(-1);
  assert.equal(sheet[0],'New Bot');
  bf.ctx.closeSheet=()=>{};
@@ -891,6 +936,34 @@ async function botsScreens(){
  await uf.byText('Dismiss').action();
  assert(uf.calls.some(c=>c.action==='bots.suggestions.dismiss'&&c.suggestion_id==='sug-1'));
  uf.abort.abort();
+
+ // 4b. Unified To Do hub aggregates waiting sessions + orchestration gates/questions + bot items across hosts, and shows All caught up when empty
+ const uni=fixture('up-next',{
+  state:{snapshot:{capabilities:{bots:true}}},
+  rpc:req=>{
+   if(req.action==='bots.list')return {bots:botsData};
+   if(req.action==='bots.items')return {items:[]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   return {};
+  }
+ });
+ uni.ctx.connections=[
+  {id:'h1',active:true,name:'Mac Mini',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},sessions:[{id:5,state:'Waiting',title:'Deploy check',worktree_key:'w1'}],orchestration:{gates:[{id:'g1',status:'pending',question:'Ship v2?',options:['Approve','Deny']}],questions:[],runs:[],tasks:[]}}},
+  {id:'h2',name:'MacBook',connection:{phase:'ready'},snapshot:{capabilities:{bots:true},sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}}}
+ ];
+ uni.view.update();await uni.flush();
+ assert(uni.root.textContent.includes('Waiting sessions'));
+ assert(uni.root.textContent.includes('Deploy check'));
+ assert(uni.root.textContent.includes('Ship v2?'));
+ assert.equal(uni.M.todoCounts(uni.ctx.connections).total,2);
+ await uni.byText('Approve').action();
+ assert(uni.calls.some(c=>c.action==='gate_reply'&&c.id==='g1'&&c.decision==='Approve'));
+ uni.ctx.connections[0].snapshot.sessions=[];
+ uni.ctx.connections[0].snapshot.orchestration.gates=[];
+ uni.view.update();await uni.flush();
+ assert(uni.root.textContent.includes('All caught up'));
+ uni.abort.abort();
 
  const df=fixture('bots',{
   route:{botId:'b1'},
