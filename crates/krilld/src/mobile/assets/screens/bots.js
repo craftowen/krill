@@ -154,6 +154,16 @@
     return t(String(status || "Unknown"));
   };
 
+  const errorCategoryLabel = (category, t) => {
+    if (!category) return null;
+    if (category === "signed_out") return t("Signed out");
+    if (category === "usage_limit") return t("Usage limit reached");
+    if (category === "not_set_up") return t("Not set up");
+    if (category === "folder_missing") return t("Folder missing");
+    if (category === "agent_error") return t("Agent error");
+    return t(String(category));
+  };
+
   const latestDecisions = (item) => {
     const events = Array.isArray(item?.events) ? item.events : [];
     for (let i = events.length - 1; i >= 0; i--) {
@@ -180,8 +190,20 @@
     return badge;
   }
 
-  const rpcHost = (ctx, hostId, req) => (hostId && ctx.rpcForHost ? ctx.rpcForHost(hostId, req) : ctx.rpc(req));
-  const refreshHost = (ctx, hostId) => (hostId && ctx.refreshHost ? ctx.refreshHost(hostId) : ctx.refresh?.());
+  const rpcHost = (ctx, hostId, req) => {
+    try {
+      return Promise.resolve(hostId && ctx.rpcForHost ? ctx.rpcForHost(hostId, req) : ctx.rpc(req));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+  const refreshHost = (ctx, hostId) => {
+    try {
+      return Promise.resolve(hostId && ctx.refreshHost ? ctx.refreshHost(hostId) : ctx.refresh?.());
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
   const openBotDetail = (ctx, botId, hostId) => {
     if (hostId && ctx.activateHost) ctx.activateHost(hostId);
     ctx.go(`/bots/${encodeURIComponent(botId)}`);
@@ -240,73 +262,121 @@
     }
   }
 
-  function accessSection(ctx, t, requests, bots, ready, reload, multiHost) {
+  function createAccessSection(ctx, t) {
     const { el, button } = ctx;
     const section = el("section", undefined, "bots-section");
     const head = el("div", undefined, "home-section-heading");
-    head.append(el("h2", t("Access & pairing"), "section-title"));
-    if (requests.length) head.append(el("small", String(requests.length), "muted"));
+    const titleEl = el("h2", t("Access & pairing"), "section-title");
+    const countEl = el("small", "", "muted");
+    head.append(titleEl, countEl);
     const box = el("div", undefined, "inset-group bots-access-card");
-    const pending = requests.filter((r) => r.status === "pending");
-
-    for (const req of pending) {
-      const row = el("div", undefined, "bots-row");
-      const copy = el("div", undefined, "bots-row-main");
-      const meta = [req.source, botDisplayName(bots, req.bot_id), multiHost && req._hostName ? req._hostName : null]
-        .filter(Boolean)
-        .join(" · ");
-      copy.append(
-        el("strong", req.sender_name || req.sender_id || t("Sender")),
-        el("small", meta, "muted"),
-      );
-      const actions = el("div", undefined, "bots-row-actions");
-      const decide = async (approve) => {
-        if (!ready()) return;
-        await rpcHost(ctx, req._hostId, { action: "bots.access.decide", token: req.token, approve });
-        ctx.toast?.(approve ? t("Access approved") : t("Access declined"));
-        await reload();
-      };
-      const allow = button(t("Approve"), () => decide(true), "primary small");
-      const deny = button(t("Deny"), () => decide(false), "ghost small");
-      allow.disabled = deny.disabled = !ready();
-      actions.append(allow, deny);
-      row.append(copy, actions);
-      box.append(row);
-    }
-
     const redeemForm = el("form", undefined, "bots-redeem-form");
+    const hostSelect = el("select");
+    hostSelect.setAttribute("aria-label", t("Desktop"));
     const codeInput = el("input");
     codeInput.type = "text";
     codeInput.placeholder = t("Enter pairing code");
     codeInput.setAttribute("aria-label", t("Enter pairing code"));
+
+    let curReady = () => false;
+    let curReload = async () => {};
+    let curHosts = [];
+    let selectedHostId = null;
+
+    hostSelect.addEventListener("change", () => {
+      selectedHostId = hostSelect.value || null;
+    });
+
     const submitRedeem = async () => {
-      if (!ready()) return;
+      if (!curReady()) return;
       const code = codeInput.value.trim();
       if (!code) throw Error(t("Enter pairing code"));
-      await ctx.rpc({ action: "bots.access.redeem", code });
+      const targetId = curHosts.length > 1 ? selectedHostId : (curHosts[0]?.id ?? null);
+      await rpcHost(ctx, targetId, { action: "bots.access.redeem", code });
       if (ctx.signal.aborted) return;
       codeInput.value = "";
       ctx.toast?.(t("Pairing code redeemed"));
-      await reload();
+      await curReload();
     };
     const redeemBtn = button(t("Redeem"), submitRedeem, "secondary small");
     redeemForm.addEventListener("submit", (e) => {
       e.preventDefault();
       ctx.act(submitRedeem);
     });
-    codeInput.disabled = redeemBtn.disabled = !ready();
     redeemForm.append(codeInput, redeemBtn);
-    box.append(redeemForm);
     section.append(head, box);
-    return section;
+
+    return {
+      update({ requests, bots, ready, reload, multiHost, targetHosts = [] }) {
+        curReady = ready;
+        curReload = reload;
+        curHosts = targetHosts;
+        countEl.hidden = !requests.length;
+        countEl.textContent = requests.length ? String(requests.length) : "";
+
+        const pending = requests.filter((r) => r.status === "pending");
+        const boxNodes = [];
+        for (const req of pending) {
+          const row = el("div", undefined, "bots-row");
+          const copy = el("div", undefined, "bots-row-main");
+          const meta = [req.source, botDisplayName(bots, req.bot_id), multiHost && req._hostName ? req._hostName : null]
+            .filter(Boolean)
+            .join(" · ");
+          copy.append(
+            el("strong", req.sender_name || req.sender_id || t("Sender")),
+            el("small", meta, "muted"),
+          );
+          const actions = el("div", undefined, "bots-row-actions");
+          const decide = async (approve) => {
+            if (!ready()) return;
+            await rpcHost(ctx, req._hostId, { action: "bots.access.decide", token: req.token, approve });
+            ctx.toast?.(approve ? t("Access approved") : t("Access declined"));
+            await reload();
+          };
+          const allow = button(t("Approve"), () => decide(true), "primary small");
+          const deny = button(t("Deny"), () => decide(false), "ghost small");
+          allow.disabled = deny.disabled = !ready();
+          actions.append(allow, deny);
+          row.append(copy, actions);
+          boxNodes.push(row);
+        }
+
+        if (targetHosts.length > 1) {
+          if (!targetHosts.some((h) => (h.id ?? null) === selectedHostId)) {
+            selectedHostId = targetHosts[0]?.id ?? null;
+          }
+          const sig = targetHosts.map((h) => `${h.id ?? ""}:${h.name || ""}`).join("\0");
+          if (hostSelect.dataset.hostSig !== sig) {
+            hostSelect.dataset.hostSig = sig;
+            hostSelect.replaceChildren();
+            for (const h of targetHosts) {
+              const opt = el("option", h.name || t("Desktop"));
+              opt.value = h.id ?? "";
+              hostSelect.append(opt);
+            }
+          }
+          if (hostSelect.value !== (selectedHostId ?? "")) hostSelect.value = selectedHostId ?? "";
+          sync(redeemForm, [hostSelect, codeInput, redeemBtn]);
+        } else {
+          selectedHostId = targetHosts[0]?.id ?? null;
+          sync(redeemForm, [codeInput, redeemBtn]);
+        }
+
+        const off = !ready();
+        hostSelect.disabled = codeInput.disabled = redeemBtn.disabled = off;
+        boxNodes.push(redeemForm);
+        sync(box, boxNodes);
+        return section;
+      },
+    };
   }
 
   function renderItemsList(ctx, t, opts) {
     const { el, button } = ctx;
-    const { items, bots, showBot, ready, onReload, cardMap, multiHost, hideEmpty } = opts;
-    const wrap = el("div", undefined, "bots-items-list");
+    const { items, bots, showBot, ready, onReload, cardMap, multiHost, hideEmpty, container } = opts;
+    const wrap = container || el("div", undefined, "bots-items-list");
     if (!items.length) {
-      if (!hideEmpty) wrap.append(el("p", t("No items match this filter."), "empty"));
+      sync(wrap, hideEmpty ? [] : [el("p", t("No items match this filter."), "empty")]);
       return wrap;
     }
 
@@ -716,10 +786,24 @@
     });
   }
 
-  function openCreateGroupSheet(ctx, t, bots, reload) {
+  function openCreateGroupSheet(ctx, t, bots, reload, targetHosts = []) {
     const { el, button } = ctx;
-    const selected = new Set(bots.slice(0, 2).map((b) => b.id));
+    const hostIdsWithBots = new Set(bots.map((b) => b._hostId ?? null));
+    let pickedHostId =
+      targetHosts.find((h) => hostIdsWithBots.has(h.id ?? null))?.id ??
+      targetHosts[0]?.id ??
+      null;
+    const botsFor = (hid) => bots.filter((b) => (b._hostId ?? null) === (hid ?? null));
+    const selected = new Set();
+    const resetSelection = () => {
+      selected.clear();
+      for (const b of botsFor(pickedHostId).slice(0, 2)) selected.add(b.id);
+    };
+    resetSelection();
     ctx.sheet(t("New Group Chat"), [], t("Coordinate multiple bots in shared threads."), (body) => {
+      const hostSelect = el("select");
+      hostSelect.setAttribute("aria-label", t("Desktop"));
+
       const nameInput = el("input");
       nameInput.type = "text";
       nameInput.placeholder = t("Group name");
@@ -731,22 +815,45 @@
       descInput.setAttribute("aria-label", t("Description"));
 
       const picks = el("div", undefined, "bot-decision-options");
-      for (const b of bots) {
-        const chip = button(b.name, () => {
-          if (selected.has(b.id)) selected.delete(b.id);
-          else selected.add(b.id);
+      const renderPicks = () => {
+        const hostBots = botsFor(pickedHostId);
+        picks.replaceChildren();
+        if (!hostBots.length) {
+          picks.append(el("p", t("No bots configured yet."), "muted"));
+          return;
+        }
+        for (const b of hostBots) {
+          const chip = button(b.name, () => {
+            if (selected.has(b.id)) selected.delete(b.id);
+            else selected.add(b.id);
+            chip.setAttribute("aria-pressed", String(selected.has(b.id)));
+            chip.className = selected.has(b.id) ? "filter-chip active" : "filter-chip";
+          }, selected.has(b.id) ? "filter-chip active" : "filter-chip");
           chip.setAttribute("aria-pressed", String(selected.has(b.id)));
-          chip.className = selected.has(b.id) ? "filter-chip active" : "filter-chip";
-        }, selected.has(b.id) ? "filter-chip active" : "filter-chip");
-        chip.setAttribute("aria-pressed", String(selected.has(b.id)));
-        picks.append(chip);
+          picks.append(chip);
+        }
+      };
+
+      if (targetHosts.length > 1) {
+        for (const h of targetHosts) {
+          const opt = el("option", h.name || t("Desktop"));
+          opt.value = h.id ?? "";
+          hostSelect.append(opt);
+        }
+        hostSelect.value = pickedHostId ?? "";
+        hostSelect.addEventListener("change", () => {
+          pickedHostId = hostSelect.value || null;
+          resetSelection();
+          renderPicks();
+        });
       }
+      renderPicks();
 
       const submit = async () => {
         const name = nameInput.value.trim();
         if (!name) throw Error(t("Group name is required"));
         if (!selected.size) throw Error(t("Select at least one bot"));
-        await ctx.rpc({
+        await rpcHost(ctx, pickedHostId, {
           action: "bots.groups.create",
           name,
           bot_ids: [...selected],
@@ -757,6 +864,9 @@
         await reload();
       };
 
+      if (targetHosts.length > 1) {
+        body.append(el("label", t("Desktop"), "sheet-field-label"), hostSelect);
+      }
       body.append(
         nameInput,
         descInput,
@@ -802,8 +912,7 @@
     root.append(screen);
 
     let bots = [];
-    let botsCursor = null;
-    let botsCursorHost = null;
+    const botsCursors = new Map();
     let items = [];
     let requests = [];
     let statuses = [];
@@ -819,6 +928,74 @@
     recentHead.append(el("h2", t("Recent sessions"), "section-title"), button(t("View all"), () => ctx.go("/projects", true), "text-button bots-section-action"));
     const recentBox = el("div", undefined, "recent-session-list inset-group");
     recentSec.append(recentHead, recentBox);
+    const accessCtrl = createAccessSection(ctx, t);
+
+    // Persistent group chat section & composer so background draw() preserves focus, draft, and reply mode.
+    const groupSec = el("section", undefined, "bots-section");
+    const groupHead = el("div", undefined, "home-section-heading");
+    const groupTitleEl = el("h2", t("Group chats"), "section-title");
+    const createGrpBtn = button(`+ ${t("New group")}`, () => openCreateGroupSheet(ctx, t, bots, () => load(true), botHosts()), "filter-chip");
+    groupHead.append(groupTitleEl, createGrpBtn);
+    const groupListBox = el("div", undefined, "inset-group");
+    const groupPanel = el("div", undefined, "bot-group-panel");
+    const groupTop = el("div", undefined, "bot-group-toolbar");
+    const threadBar = el("div", undefined, "bot-decision-options");
+    const groupMsgBox = el("div", undefined, "bot-group-messages");
+    const groupSendForm = el("form", undefined, "bot-item-form");
+    const groupMentions = el("div", undefined, "bot-decision-options");
+    const groupTextarea = el("textarea");
+    groupTextarea.rows = 2;
+    groupTextarea.placeholder = t("Message group (@mention bots)…");
+    groupTextarea.setAttribute("aria-label", t("Group message"));
+    let groupReplyMode = "mentions";
+    let lastGroupDraftKey = null;
+    const currentGroupDraftKey = () => (activeGroupId ? `bot-group:${activeGroupHost || ""}:${activeGroupId}` : null);
+    groupTextarea.addEventListener("input", () => {
+      const k = currentGroupDraftKey();
+      if (k) ctx.state.drafts?.set?.(k, groupTextarea.value);
+    });
+    const groupModeSelect = el("select");
+    groupModeSelect.setAttribute("aria-label", t("Reply mode"));
+    for (const [val, lbl] of [
+      ["mentions", t("Mentioned bots")],
+      ["all", t("All bots")],
+    ]) {
+      const opt = el("option", lbl);
+      opt.value = val;
+      groupModeSelect.append(opt);
+    }
+    groupModeSelect.value = groupReplyMode;
+    groupModeSelect.addEventListener("change", () => {
+      groupReplyMode = groupModeSelect.value || "mentions";
+    });
+    const submitGroup = async () => {
+      if (!ready() || !activeGroupId) return;
+      const text = groupTextarea.value.trim();
+      if (!text) throw Error(t("Enter a message"));
+      const dk = currentGroupDraftKey();
+      await rpcHost(ctx, activeGroupHost, {
+        action: "bots.groups.send",
+        group_id: activeGroupId,
+        ...(activeThreadId ? { thread_id: activeThreadId } : {}),
+        text,
+        reply_mode: groupModeSelect.value || groupReplyMode,
+      });
+      if (ctx.signal.aborted) return;
+      groupTextarea.value = "";
+      if (dk) ctx.state.drafts?.delete?.(dk);
+      await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
+    };
+    const groupSendBtn = button(t("Send"), submitGroup, "primary small");
+    const groupControls = el("div", undefined, "bot-item-controls");
+    groupControls.append(groupModeSelect, groupSendBtn);
+    groupSendForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      ctx.act(submitGroup);
+    });
+    groupSendForm.append(groupMentions, groupTextarea, groupControls);
+    groupPanel.append(groupTop, groupMsgBox, groupSendForm);
+    groupSec.append(groupHead, groupListBox);
+
     let loading = false;
     let loaded = false;
     let failure = null;
@@ -826,6 +1003,23 @@
     let lastHostSig = "";
 
     const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
+
+    const fetchAvatars = (list) => {
+      for (const b of list) {
+        const avKey = b._hostId ? `${b._hostId}:${b.id}` : b.id;
+        if (b.avatar && !avatars.has(avKey)) {
+          avatars.set(avKey, null);
+          rpcHost(ctx, b._hostId, { action: "bots.avatar.read", bot_id: b.id })
+            .then((av) => {
+              if (!ctx.signal.aborted && av) {
+                avatars.set(avKey, av);
+                draw();
+              }
+            })
+            .catch(() => {});
+        }
+      }
+    };
 
     async function loadGroup(groupId, threadId, hostId = activeGroupHost) {
       if (!ready() || !groupId) return;
@@ -838,7 +1032,7 @@
       if (ctx.signal.aborted) return;
       groupView = res?.group || null;
       activeGroupId = groupView?.group?.id || groupId;
-      activeGroupHost = hostId || null;
+      activeGroupHost = hostId ?? null;
       activeThreadId =
         threadId ||
         groupView?.threads?.[0]?.thread_id ||
@@ -856,8 +1050,7 @@
         requests = [];
         statuses = [];
         groups = [];
-        botsCursor = null;
-        botsCursorHost = null;
+        botsCursors.clear();
         loaded = true;
         draw();
         return;
@@ -890,31 +1083,25 @@
         );
         if (ctx.signal.aborted || seq !== loadSeq) return;
         bots = perHost.flatMap((r) => r.bots);
-        const firstCursor = perHost.find((r) => r.cursor);
-        botsCursor = firstCursor?.cursor || null;
-        botsCursorHost = firstCursor?.host?.id || null;
+        botsCursors.clear();
+        for (const r of perHost) {
+          if (r.cursor) {
+            botsCursors.set(r.host.id ?? null, {
+              hostId: r.host.id ?? null,
+              hostName: r.host.name || "",
+              cursor: r.cursor,
+            });
+          }
+        }
         items = perHost.flatMap((r) => r.items);
         requests = perHost.flatMap((r) => r.requests);
         statuses = perHost.flatMap((r) => r.statuses);
         groups = perHost.flatMap((r) => r.groups);
         loaded = true;
-        if (activeGroupId && groups.some((g) => g.id === activeGroupId && g._hostId === activeGroupHost)) {
+        if (activeGroupId && groups.some((g) => g.id === activeGroupId && (g._hostId ?? null) === (activeGroupHost ?? null))) {
           await loadGroup(activeGroupId, activeThreadId, activeGroupHost).catch(() => {});
         }
-        for (const b of bots) {
-          const avKey = b._hostId ? `${b._hostId}:${b.id}` : b.id;
-          if (b.avatar && !avatars.has(avKey)) {
-            avatars.set(avKey, null);
-            rpcHost(ctx, b._hostId, { action: "bots.avatar.read", bot_id: b.id })
-              .then((av) => {
-                if (!ctx.signal.aborted && av) {
-                  avatars.set(avKey, av);
-                  draw();
-                }
-              })
-              .catch(() => {});
-          }
-        }
+        fetchAvatars(bots);
       } catch (e) {
         if (ctx.signal.aborted || seq !== loadSeq) return;
         failure = safeMsg(e, t);
@@ -927,34 +1114,41 @@
     }
 
     async function loadMoreBots() {
-      if (!botsCursor || !ready()) return;
-      const res = await rpcHost(ctx, botsCursorHost, { action: "bots.list", limit: 50, cursor: botsCursor });
-      if (ctx.signal.aborted) return;
-      const hostName = botHosts().find((h) => h.id === botsCursorHost)?.name || "";
-      const seen = new Set(bots.map((b) => `${b._hostId || ""}:${b.id}`));
+      const nextEntry = botsCursors.values().next().value;
+      if (!nextEntry || !ready()) return;
+      const seq = loadSeq;
+      const { hostId, hostName, cursor } = nextEntry;
+      const res = await rpcHost(ctx, hostId, { action: "bots.list", limit: 50, cursor });
+      if (ctx.signal.aborted || seq !== loadSeq) return;
+      const resolvedName = botHosts().find((h) => (h.id ?? null) === hostId)?.name || hostName;
+      const seen = new Set(bots.map((b) => `${b._hostId ?? ""}:${b.id}`));
+      const added = [];
       for (const b of res?.bots || []) {
-        const k = `${botsCursorHost || ""}:${b.id}`;
-        if (!seen.has(k)) bots.push({ ...b, _hostId: botsCursorHost, _hostName: hostName });
+        const k = `${hostId ?? ""}:${b.id}`;
+        if (!seen.has(k)) {
+          const entry = hostId ? { ...b, _hostId: hostId, _hostName: resolvedName } : { ...b };
+          bots.push(entry);
+          added.push(entry);
+        }
       }
-      botsCursor = res?.next_cursor || null;
+      if (res?.next_cursor) {
+        botsCursors.set(hostId, { hostId, hostName: resolvedName, cursor: res.next_cursor });
+      } else {
+        botsCursors.delete(hostId);
+      }
+      fetchAvatars(added);
       draw();
     }
 
     function renderGroupPanel() {
-      const sec = el("section", undefined, "bots-section");
-      const head = el("div", undefined, "home-section-heading");
-      head.append(el("h2", t("Group chats"), "section-title"));
-      const createGrp = button(`+ ${t("New group")}`, () => openCreateGroupSheet(ctx, t, bots, () => load(true)), "filter-chip");
-      createGrp.disabled = !ready() || !bots.length;
-      head.append(createGrp);
-      sec.append(head);
+      createGrpBtn.disabled = !ready() || !bots.length;
 
-      const box = el("div", undefined, "inset-group");
+      const listNodes = [];
       if (!groups.length) {
-        box.append(el("p", t("No group chats yet."), "muted empty"));
+        listNodes.push(el("p", t("No group chats yet."), "muted empty"));
       } else {
         for (const g of groups) {
-          const isActive = activeGroupId === g.id && activeGroupHost === g._hostId;
+          const isActive = activeGroupId === g.id && (activeGroupHost ?? null) === (g._hostId ?? null);
           const row = button(
             "",
             () => {
@@ -962,9 +1156,10 @@
                 activeGroupId = null;
                 activeGroupHost = null;
                 groupView = null;
+                lastGroupDraftKey = null;
                 draw();
               } else {
-                return loadGroup(g.id, null, g._hostId);
+                return loadGroup(g.id, null, g._hostId ?? null);
               }
             },
             `bots-group-row${isActive ? " active" : ""}`,
@@ -973,15 +1168,13 @@
           const sub = [(g.bot_ids || []).map((id) => botDisplayName(bots, id)).join(", "), multiHost() && g._hostName ? g._hostName : null].filter(Boolean).join(" · ");
           main.append(el("strong", g.name), el("small", sub, "muted"));
           row.append(main, ctx.icon(isActive ? "chevronDown" : "chevronRight"));
-          box.append(row);
+          listNodes.push(row);
         }
       }
-      sec.append(box);
+      sync(groupListBox, listNodes);
 
       if (activeGroupId && groupView) {
-        const panel = el("div", undefined, "bot-group-panel");
-        const top = el("div", undefined, "bot-group-toolbar");
-        const threadBar = el("div", undefined, "bot-decision-options");
+        const threadNodes = [];
         for (const th of groupView.threads || []) {
           const tb = button(
             th.title || t("Thread"),
@@ -989,7 +1182,7 @@
             th.thread_id === activeThreadId ? "filter-chip active" : "filter-chip",
           );
           tb.disabled = !ready();
-          threadBar.append(tb);
+          threadNodes.push(tb);
         }
         const newThread = button(
           `+ ${t("Thread")}`,
@@ -1008,9 +1201,10 @@
           "filter-chip",
         );
         newThread.disabled = !ready();
-        threadBar.append(newThread);
-        top.append(threadBar);
+        threadNodes.push(newThread);
+        sync(threadBar, threadNodes);
 
+        const topNodes = [threadBar];
         if (groupView.active_run) {
           const stopBtn = button(
             t("Stop"),
@@ -1025,14 +1219,14 @@
             "ghost small",
           );
           stopBtn.disabled = !ready();
-          top.append(stopBtn);
+          topNodes.push(stopBtn);
         }
-        panel.append(top);
+        sync(groupTop, topNodes);
 
-        const msgBox = el("div", undefined, "bot-group-messages");
+        const msgNodes = [];
         const msgs = groupView.messages || [];
         if (!msgs.length) {
-          msgBox.append(el("p", t("No messages yet."), "muted"));
+          msgNodes.push(el("p", t("No messages yet."), "muted"));
         } else {
           for (const msg of msgs) {
             const item = el("div", undefined, "bot-group-msg");
@@ -1040,72 +1234,38 @@
               el("strong", `${msg.sender_name || msg.sender_id}${msg.in_progress ? ` · ${t("Working")}` : ""}`),
               el("p", msg.body || ""),
             );
-            msgBox.append(item);
+            msgNodes.push(item);
           }
         }
-        panel.append(msgBox);
+        sync(groupMsgBox, msgNodes);
 
-        const draftKey = `bot-group:${activeGroupHost || ""}:${activeGroupId}`;
-        const sendForm = el("form", undefined, "bot-item-form");
-        const mentions = el("div", undefined, "bot-decision-options");
-        const textarea = el("textarea");
-        textarea.rows = 2;
-        textarea.placeholder = t("Message group (@mention bots)…");
-        textarea.setAttribute("aria-label", t("Group message"));
-        textarea.value = ctx.state.drafts?.get?.(draftKey) || "";
-        textarea.addEventListener("input", () => ctx.state.drafts?.set?.(draftKey, textarea.value));
+        const draftKey = currentGroupDraftKey();
+        if (draftKey !== lastGroupDraftKey) {
+          lastGroupDraftKey = draftKey;
+          groupTextarea.value = ctx.state.drafts?.get?.(draftKey) || "";
+        }
 
+        const mentionNodes = [];
         for (const bid of groupView.group?.bot_ids || []) {
-          const b = bots.find((x) => x.id === bid);
+          const b = bots.find((x) => x.id === bid && (x._hostId ?? null) === (activeGroupHost ?? null)) || bots.find((x) => x.id === bid);
           const slug = b?.slug || bid;
           const chip = button(`@${slug}`, () => {
-            textarea.value = `${textarea.value ? `${textarea.value.trimEnd()} ` : ""}@${slug} `;
-            ctx.state.drafts?.set?.(draftKey, textarea.value);
-            textarea.focus();
+            groupTextarea.value = `${groupTextarea.value ? `${groupTextarea.value.trimEnd()} ` : ""}@${slug} `;
+            const dk = currentGroupDraftKey();
+            if (dk) ctx.state.drafts?.set?.(dk, groupTextarea.value);
+            groupTextarea.focus();
           }, "filter-chip");
-          mentions.append(chip);
+          mentionNodes.push(chip);
         }
+        sync(groupMentions, mentionNodes);
 
-        const modeSelect = el("select");
-        modeSelect.setAttribute("aria-label", t("Reply mode"));
-        for (const [val, lbl] of [
-          ["mentions", t("Mentioned bots")],
-          ["all", t("All bots")],
-        ]) {
-          const opt = el("option", lbl);
-          opt.value = val;
-          modeSelect.append(opt);
-        }
-        modeSelect.value = "mentions";
-        const submitGroup = async () => {
-          if (!ready()) return;
-          const text = textarea.value.trim();
-          if (!text) throw Error(t("Enter a message"));
-          await rpcHost(ctx, activeGroupHost, {
-            action: "bots.groups.send",
-            group_id: activeGroupId,
-            ...(activeThreadId ? { thread_id: activeThreadId } : {}),
-            text,
-            reply_mode: modeSelect.value,
-          });
-          if (ctx.signal.aborted) return;
-          textarea.value = "";
-          ctx.state.drafts?.delete?.(draftKey);
-          await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
-        };
-        const sendBtn = button(t("Send"), submitGroup, "primary small");
-        const controls = el("div", undefined, "bot-item-controls");
-        controls.append(modeSelect, sendBtn);
-        sendForm.addEventListener("submit", (e) => {
-          e.preventDefault();
-          ctx.act(submitGroup);
-        });
-        textarea.disabled = sendBtn.disabled = modeSelect.disabled = !ready();
-        sendForm.append(mentions, textarea, controls);
-        panel.append(sendForm);
-        sec.append(panel);
+        if (groupModeSelect.value !== groupReplyMode) groupModeSelect.value = groupReplyMode;
+        groupTextarea.disabled = groupSendBtn.disabled = groupModeSelect.disabled = !ready();
+        sync(groupSec, [groupHead, groupListBox, groupPanel]);
+      } else {
+        sync(groupSec, [groupHead, groupListBox]);
       }
-      return sec;
+      return groupSec;
     }
 
     function renderRecentSessionsSection(hosts) {
@@ -1213,16 +1373,16 @@
           botsSec.append(emptyBox);
         } else {
           const sortedBots = bots.slice().sort((a, b) => {
-            const aNeeds = items.some((i) => i.owner_bot_id === a.id && i._hostId === a._hostId && i.status === "needs_you") ? 0 : 1;
-            const bNeeds = items.some((i) => i.owner_bot_id === b.id && i._hostId === b._hostId && i.status === "needs_you") ? 0 : 1;
+            const aNeeds = items.some((i) => i.owner_bot_id === a.id && (i._hostId ?? null) === (a._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
+            const bNeeds = items.some((i) => i.owner_bot_id === b.id && (i._hostId ?? null) === (b._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
             if (aNeeds !== bNeeds) return aNeeds - bNeeds;
             return Number(!!a.paused) - Number(!!b.paused);
           });
           const group = el("div", undefined, "inset-group");
           const showDev = multiHost();
           for (const bot of sortedBots) {
-            const openItems = items.filter((i) => i.owner_bot_id === bot.id && i._hostId === bot._hostId && i.status === "needs_you").length;
-            const botErrors = statuses.filter((s) => s.bot_id === bot.id && s._hostId === bot._hostId && s.enabled && s.state === "error").length;
+            const openItems = items.filter((i) => i.owner_bot_id === bot.id && (i._hostId ?? null) === (bot._hostId ?? null) && i.status === "needs_you").length;
+            const botErrors = statuses.filter((s) => s.bot_id === bot.id && (s._hostId ?? null) === (bot._hostId ?? null) && s.enabled && s.state === "error").length;
             const avKey = bot._hostId ? `${bot._hostId}:${bot.id}` : bot.id;
             const row = el("div", undefined, "bot-card-row");
             const tap = button("", () => openBotDetail(ctx, bot.id, bot._hostId), "bot-card-main");
@@ -1252,7 +1412,7 @@
             group.append(row);
           }
           botsSec.append(group);
-          if (botsCursor) {
+          if (botsCursors.size > 0) {
             const more = button(t("Load more"), loadMoreBots, "secondary");
             more.disabled = !ready();
             botsSec.append(more);
@@ -1266,7 +1426,7 @@
       if (recentNode) nodes.push(recentNode);
 
       if (!isLegacyOnly && ready()) {
-        nodes.push(accessSection(ctx, t, requests, bots, ready, () => load(false), multiHost()));
+        nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(false), multiHost: multiHost(), targetHosts: botHosts() }));
         nodes.push(renderGroupPanel());
       }
 
@@ -1318,6 +1478,132 @@
     const cardMap = new Map();
     const h1 = header.querySelector("h1");
 
+    // Persistent sections/inputs in Bot Detail so background draw() preserves focus, cursor, scroll, and drafts.
+    const accessCtrl = createAccessSection(ctx, t);
+    const itemSec = el("section", undefined, "bots-section");
+    const itemHead = el("div", undefined, "home-section-heading");
+    itemHead.append(el("h2", t("Items"), "section-title"));
+    const addItemBtn = button(`+ ${t("New Item")}`, openCreateItemSheet, "filter-chip");
+    itemHead.append(addItemBtn);
+    const itemFilters = el("div", undefined, "bot-decision-options");
+    const closedBtn = button(t("Include closed"), () => {
+      includeClosed = !includeClosed;
+      return load();
+    }, "filter-chip");
+    const snoozeBtn = button(t("Include snoozed"), () => {
+      includeSnoozed = !includeSnoozed;
+      return load();
+    }, "filter-chip");
+    itemFilters.append(closedBtn, snoozeBtn);
+    const itemsWrap = el("div", undefined, "bots-items-list");
+    const moreItemsBtn = button(t("Load more"), loadMoreItems, "secondary");
+    itemSec.append(itemHead, itemFilters, itemsWrap);
+
+    const replySec = el("section", undefined, "bots-section");
+    replySec.append(el("h2", t("External reply"), "section-title"));
+    const replyBox = el("div", undefined, "inset-group bot-reply-card");
+    const replyDraftKey = `bot-reply:${botId}`;
+    const replyForm = el("form", undefined, "bot-item-form");
+    const replyInput = el("textarea");
+    replyInput.rows = 2;
+    replyInput.placeholder = t("Send reply to latest linked external thread…");
+    replyInput.setAttribute("aria-label", t("External reply"));
+    replyInput.value = ctx.state.drafts?.get?.(replyDraftKey) || "";
+    replyInput.addEventListener("input", () => ctx.state.drafts?.set?.(replyDraftKey, replyInput.value));
+    const submitReply = async () => {
+      if (!ready()) return;
+      const text = replyInput.value.trim();
+      if (!text) throw Error(t("Enter a reply"));
+      await ctx.rpc({ action: "bots.reply", bot_id: botId, text });
+      if (ctx.signal.aborted) return;
+      replyInput.value = "";
+      ctx.state.drafts?.delete?.(replyDraftKey);
+      ctx.toast?.(t("Reply posted"));
+    };
+    const replyBtn = button(t("Send reply"), submitReply, "secondary small");
+    replyForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      ctx.act(submitReply);
+    });
+    replyForm.append(replyInput, replyBtn);
+    replyBox.append(replyForm);
+    replySec.append(replyBox);
+
+    const docSec = el("section", undefined, "bots-section");
+    const docHead = el("div", undefined, "home-section-heading");
+    docHead.append(el("h2", t("Soul & Memory"), "section-title"));
+    const docCard = el("div", undefined, "inset-group bot-docs-card");
+    const soulArea = el("textarea");
+    soulArea.rows = 4;
+    soulArea.setAttribute("aria-label", t("Soul"));
+    soulArea.addEventListener("input", () => (soulText = soulArea.value));
+    const saveSoul = button(
+      t("Save Soul"),
+      async () => {
+        await ctx.rpc({ action: "bots.soul.set", bot_id: botId, content: soulArea.value });
+        ctx.toast?.(t("Soul saved"));
+      },
+      "secondary small",
+    );
+    const memArea = el("textarea");
+    memArea.rows = 4;
+    memArea.setAttribute("aria-label", t("Memory"));
+    memArea.addEventListener("input", () => (memoryText = memArea.value));
+    const delToggle = button(
+      t("Protect facts"),
+      () => {
+        allowMemoryDelete = !allowMemoryDelete;
+        draw();
+      },
+      "filter-chip",
+    );
+    const saveMem = button(
+      t("Save Memory"),
+      async () => {
+        const res = await ctx.rpc({
+          action: "bots.memory.update",
+          bot_id: botId,
+          content: memArea.value,
+          allow_deletions: allowMemoryDelete,
+        });
+        if (ctx.signal.aborted) return;
+        memoryText = res?.content ?? memoryText;
+        if (memArea.value !== memoryText) memArea.value = memoryText;
+        const restored = (res?.restored_facts || []).length;
+        ctx.toast?.(restored ? t("Memory saved ({0} facts protected)", restored) : t("Memory saved"));
+        draw();
+      },
+      "secondary small",
+    );
+    const loadDocsBtn = button(
+      t("Load"),
+      async () => {
+        const [sRes, mRes] = await Promise.all([
+          ctx.rpc({ action: "bots.soul.get", bot_id: botId }),
+          ctx.rpc({ action: "bots.memory.get", bot_id: botId }),
+        ]);
+        if (ctx.signal.aborted) return;
+        soulText = sRes?.content || "";
+        memoryText = mRes?.content || "";
+        soulArea.value = soulText;
+        memArea.value = memoryText;
+        soulLoaded = true;
+        draw();
+      },
+      "filter-chip",
+    );
+    docHead.append(loadDocsBtn);
+    docCard.append(
+      el("label", "SOUL.md", "sheet-field-label"),
+      soulArea,
+      saveSoul,
+      el("label", "MEMORY.md", "sheet-field-label"),
+      memArea,
+      delToggle,
+      saveMem,
+    );
+    docSec.append(docHead);
+
     async function load() {
       if (!ready()) {
         draw();
@@ -1352,7 +1638,7 @@
         requests = accRes?.requests || [];
         upcoming = upRes && typeof upRes === "object" ? upRes : null;
         if (bot?.avatar && !avatarInfo) {
-          ctx.rpc({ action: "bots.avatar.read", bot_id: botId })
+          rpcHost(ctx, null, { action: "bots.avatar.read", bot_id: botId })
             .then((av) => {
               if (!ctx.signal.aborted && av?.data_base64) {
                 avatarInfo = av;
@@ -1495,8 +1781,7 @@
           } else {
             modelSelect.value = "";
           }
-          ctx
-            .rpc({ action: "bots.models", agent_id: agentId })
+          rpcHost(ctx, null, { action: "bots.models", agent_id: agentId })
             .then((res) => {
               if (ctx.signal.aborted || seq !== modelSeq) return;
               const items = Array.isArray(res?.models) ? res.models : [];
@@ -1641,7 +1926,7 @@
             el("strong", st.source),
             el(
               "small",
-              [statusLabel(st.state, t), st.account_label, st.error_category].filter(Boolean).join(" · "),
+              [statusLabel(st.state, t), st.account_label, errorCategoryLabel(st.error_category, t)].filter(Boolean).join(" · "),
               "muted",
             ),
           );
@@ -1656,153 +1941,46 @@
       const sugNode = renderSuggestionsSection(ctx, t, suggestions, bot ? [bot] : [], ready, load, false);
       if (sugNode) nodes.push(sugNode);
 
-      // Items inbox
-      const itemSec = el("section", undefined, "bots-section");
-      const itemHead = el("div", undefined, "home-section-heading");
-      itemHead.append(el("h2", t("Items"), "section-title"));
-      const addBtn = button(`+ ${t("New Item")}`, openCreateItemSheet, "filter-chip");
-      addBtn.disabled = !ready();
-      itemHead.append(addBtn);
-      itemSec.append(itemHead);
-
-      const filters = el("div", undefined, "bot-decision-options");
-      const closedBtn = button(t("Include closed"), () => {
-        includeClosed = !includeClosed;
-        return load();
-      }, includeClosed ? "filter-chip active" : "filter-chip");
-      const snoozeBtn = button(t("Include snoozed"), () => {
-        includeSnoozed = !includeSnoozed;
-        return load();
-      }, includeSnoozed ? "filter-chip active" : "filter-chip");
+      // Items inbox (persistent section & wrap to keep textarea focus)
+      addItemBtn.disabled = !ready();
+      closedBtn.className = includeClosed ? "filter-chip active" : "filter-chip";
+      snoozeBtn.className = includeSnoozed ? "filter-chip active" : "filter-chip";
       closedBtn.disabled = snoozeBtn.disabled = !ready();
-      filters.append(closedBtn, snoozeBtn);
-      itemSec.append(filters);
-      itemSec.append(renderItemsList(ctx, t, { items, bots: bot ? [bot] : [], showBot: false, ready, onReload: load, cardMap }));
-      if (itemsCursor) {
-        const more = button(t("Load more"), loadMoreItems, "secondary");
-        more.disabled = !ready();
-        itemSec.append(more);
-      }
+      renderItemsList(ctx, t, {
+        items,
+        bots: bot ? [bot] : [],
+        showBot: false,
+        ready,
+        onReload: load,
+        cardMap,
+        container: itemsWrap,
+      });
+      moreItemsBtn.disabled = !ready();
+      sync(itemSec, itemsCursor ? [itemHead, itemFilters, itemsWrap, moreItemsBtn] : [itemHead, itemFilters, itemsWrap]);
       nodes.push(itemSec);
 
       if (requests.some((r) => r.status === "pending")) {
-        nodes.push(accessSection(ctx, t, requests, bot ? [bot] : [], ready, load));
+        nodes.push(accessCtrl.update({ requests, bots: bot ? [bot] : [], ready, reload: load, multiHost: false }));
       }
 
-      // Quick Reply (fail-closed if no external conversation link)
-      const replySec = el("section", undefined, "bots-section");
-      replySec.append(el("h2", t("External reply"), "section-title"));
-      const replyBox = el("div", undefined, "inset-group bot-reply-card");
-      const replyDraftKey = `bot-reply:${botId}`;
-      const replyForm = el("form", undefined, "bot-item-form");
-      const replyInput = el("textarea");
-      replyInput.rows = 2;
-      replyInput.placeholder = t("Send reply to latest linked external thread…");
-      replyInput.setAttribute("aria-label", t("External reply"));
-      replyInput.value = ctx.state.drafts?.get?.(replyDraftKey) || "";
-      replyInput.addEventListener("input", () => ctx.state.drafts?.set?.(replyDraftKey, replyInput.value));
-      const submitReply = async () => {
-        if (!ready()) return;
-        const text = replyInput.value.trim();
-        if (!text) throw Error(t("Enter a reply"));
-        await ctx.rpc({ action: "bots.reply", bot_id: botId, text });
-        if (ctx.signal.aborted) return;
-        replyInput.value = "";
-        ctx.state.drafts?.delete?.(replyDraftKey);
-        ctx.toast?.(t("Reply posted"));
-      };
-      const replyBtn = button(t("Send reply"), submitReply, "secondary small");
-      replyForm.addEventListener("submit", (e) => {
-        e.preventDefault();
-        ctx.act(submitReply);
-      });
+      // Quick Reply (persistent form to keep focus & draft)
       replyInput.disabled = replyBtn.disabled = !ready();
-      replyForm.append(replyInput, replyBtn);
-      replyBox.append(replyForm);
-      replySec.append(replyBox);
       nodes.push(replySec);
 
-      // Soul & Memory
-      const docSec = el("section", undefined, "bots-section");
-      const docHead = el("div", undefined, "home-section-heading");
-      docHead.append(el("h2", t("Soul & Memory"), "section-title"));
-      const loadDocsBtn = button(
-        t(soulLoaded ? "Reload" : "Load"),
-        async () => {
-          const [sRes, mRes] = await Promise.all([
-            ctx.rpc({ action: "bots.soul.get", bot_id: botId }),
-            ctx.rpc({ action: "bots.memory.get", bot_id: botId }),
-          ]);
-          if (ctx.signal.aborted) return;
-          soulText = sRes?.content || "";
-          memoryText = mRes?.content || "";
-          soulLoaded = true;
-          draw();
-        },
-        "filter-chip",
-      );
+      // Soul & Memory (persistent form to keep focus, cursor, and scroll)
+      const docsBtnLabel = t(soulLoaded ? "Reload" : "Load");
+      if (loadDocsBtn.textContent !== docsBtnLabel) loadDocsBtn.textContent = docsBtnLabel;
+      loadDocsBtn.setAttribute("aria-label", docsBtnLabel);
       loadDocsBtn.disabled = !ready();
-      docHead.append(loadDocsBtn);
-      docSec.append(docHead);
-
       if (soulLoaded) {
-        const docCard = el("div", undefined, "inset-group bot-docs-card");
-        const soulArea = el("textarea");
-        soulArea.rows = 4;
-        soulArea.value = soulText;
-        soulArea.setAttribute("aria-label", t("Soul"));
-        soulArea.addEventListener("input", () => (soulText = soulArea.value));
-        const saveSoul = button(
-          t("Save Soul"),
-          async () => {
-            await ctx.rpc({ action: "bots.soul.set", bot_id: botId, content: soulText });
-            ctx.toast?.(t("Soul saved"));
-          },
-          "secondary small",
-        );
-
-        const memArea = el("textarea");
-        memArea.rows = 4;
-        memArea.value = memoryText;
-        memArea.setAttribute("aria-label", t("Memory"));
-        memArea.addEventListener("input", () => (memoryText = memArea.value));
-        const delToggle = button(
-          t(allowMemoryDelete ? "Deletions allowed" : "Protect facts"),
-          () => {
-            allowMemoryDelete = !allowMemoryDelete;
-            draw();
-          },
-          allowMemoryDelete ? "filter-chip active" : "filter-chip",
-        );
-        const saveMem = button(
-          t("Save Memory"),
-          async () => {
-            const res = await ctx.rpc({
-              action: "bots.memory.update",
-              bot_id: botId,
-              content: memTextOrCurrent(),
-              allow_deletions: allowMemoryDelete,
-            });
-            if (ctx.signal.aborted) return;
-            memoryText = res?.content ?? memoryText;
-            const restored = (res?.restored_facts || []).length;
-            ctx.toast?.(restored ? t("Memory saved ({0} facts protected)", restored) : t("Memory saved"));
-            draw();
-          },
-          "secondary small",
-        );
-        const memTextOrCurrent = () => memArea.value;
+        const delLabel = t(allowMemoryDelete ? "Deletions allowed" : "Protect facts");
+        if (delToggle.textContent !== delLabel) delToggle.textContent = delLabel;
+        delToggle.setAttribute("aria-label", delLabel);
+        delToggle.className = allowMemoryDelete ? "filter-chip active" : "filter-chip";
         soulArea.disabled = saveSoul.disabled = memArea.disabled = saveMem.disabled = !ready();
-        docCard.append(
-          el("label", "SOUL.md", "sheet-field-label"),
-          soulArea,
-          saveSoul,
-          el("label", "MEMORY.md", "sheet-field-label"),
-          memArea,
-          delToggle,
-          saveMem,
-        );
-        docSec.append(docCard);
+        sync(docSec, [docHead, docCard]);
+      } else {
+        sync(docSec, [docHead]);
       }
       nodes.push(docSec);
 
@@ -1845,8 +2023,8 @@
     let filter = "needs_you";
     let bots = [];
     let items = [];
-    let itemsCursor = null;
-    let itemsCursorHost = null;
+    const itemsCursors = new Map();
+    const noStatusFilterHosts = new Set();
     let requests = [];
     let suggestions = [];
     let loading = false;
@@ -1856,7 +2034,67 @@
     const cardMap = new Map();
     const orchEntries = new Map();
 
+    // Persistent containers so background draw() preserves focus inside items, access, and orchestration forms.
+    const accessCtrl = createAccessSection(ctx, t);
+    const orchSec = el("section", undefined, "bots-section todo-orch-section");
+    const orchHead = el("div", undefined, "home-section-heading");
+    const orchCountEl = el("small", "", "muted");
+    orchHead.append(el("h2", t("Confirmation requests"), "section-title"), orchCountEl);
+    const orchWrap = el("div", undefined, "bots-items-list");
+    orchSec.append(orchHead, orchWrap);
+
+    const itemSec = el("section", undefined, "bots-section");
+    const itemSecTitle = el("h2", t("Needs You & Active Items"), "section-title");
+    const filterBar = el("div", undefined, "bot-decision-options");
+    const filterButtons = [
+      ["needs_you", t("Needs You")],
+      ["open", t("All Open")],
+      ["snoozed", t("Snoozed")],
+      ["closed", t("Closed")],
+    ].map(([id, lbl]) => {
+      const btn = button(lbl, () => {
+        filter = id;
+        return load(true);
+      }, "filter-chip");
+      btn.dataset.filter = id;
+      filterBar.append(btn);
+      return btn;
+    });
+    const itemsWrap = el("div", undefined, "bots-items-list");
+    const clearCard = el("div", undefined, "todo-clear-card inset-group");
+    const clearTitle = el("div", undefined, "todo-clear-title");
+    clearTitle.append(ctx.icon("check"), el("strong", t("All caught up")));
+    clearCard.append(clearTitle, el("p", t("Your agents are working autonomously."), "muted"));
+    const moreBtn = button(t("Load more"), loadMore, "secondary");
+    itemSec.append(itemSecTitle, filterBar, itemsWrap);
+
     const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
+
+    const itemRequestParams = (reqFilter, cursor) => ({
+      action: "bots.items",
+      include_closed: reqFilter === "closed",
+      include_snoozed: reqFilter === "snoozed",
+      ...(reqFilter === "needs_you" ? { status: "needs_you" } : {}),
+      limit: 25,
+      ...(cursor ? { cursor } : {}),
+    });
+
+    async function fetchBotItems(hostId, reqFilter, cursor) {
+      const hKey = hostId ?? "local";
+      const req = itemRequestParams(reqFilter, cursor);
+      if (req.status && noStatusFilterHosts.has(hKey)) delete req.status;
+      try {
+        return await rpcHost(ctx, hostId, req);
+      } catch (err) {
+        if (req.status && err?.definitive) {
+          noStatusFilterHosts.add(hKey);
+          const fallbackReq = { ...req };
+          delete fallbackReq.status;
+          return await rpcHost(ctx, hostId, fallbackReq);
+        }
+        throw err;
+      }
+    }
 
     async function load(reset = true) {
       const targets = botHosts();
@@ -1864,30 +2102,23 @@
       if (!targets.length) {
         bots = [];
         items = [];
-        itemsCursor = null;
-        itemsCursorHost = null;
+        itemsCursors.clear();
         requests = [];
         suggestions = [];
         draw();
         return;
       }
       const seq = ++loadSeq;
+      const reqFilter = filter;
       loading = true;
       failure = null;
       draw();
       try {
-        const includeClosed = filter === "closed";
-        const includeSnoozed = filter === "snoozed";
         const perHost = await Promise.all(
           targets.map(async (h) => {
             const [botsRes, itemsRes, accessRes, sugRes] = await Promise.all([
               rpcHost(ctx, h.id, { action: "bots.list", limit: 100 }),
-              rpcHost(ctx, h.id, {
-                action: "bots.items",
-                include_closed: includeClosed,
-                include_snoozed: includeSnoozed,
-                limit: 25,
-              }),
+              fetchBotItems(h.id, reqFilter, null),
               rpcHost(ctx, h.id, { action: "bots.access.list", limit: 50 }),
               rpcHost(ctx, h.id, { action: "bots.suggestions.list", include_dismissed: false }),
             ]);
@@ -1905,9 +2136,16 @@
         if (ctx.signal.aborted || seq !== loadSeq) return;
         bots = perHost.flatMap((r) => r.bots);
         items = perHost.flatMap((r) => r.items);
-        const firstCursor = perHost.find((r) => r.cursor);
-        itemsCursor = firstCursor?.cursor || null;
-        itemsCursorHost = firstCursor?.host?.id || null;
+        itemsCursors.clear();
+        for (const r of perHost) {
+          if (r.cursor) {
+            itemsCursors.set(r.host.id ?? null, {
+              hostId: r.host.id ?? null,
+              hostName: r.host.name || "",
+              cursor: r.cursor,
+            });
+          }
+        }
         requests = perHost.flatMap((r) => r.requests);
         suggestions = perHost.flatMap((r) => r.suggestions);
       } catch (e) {
@@ -1922,22 +2160,26 @@
     }
 
     async function loadMore() {
-      if (!itemsCursor || !ready()) return;
-      const res = await rpcHost(ctx, itemsCursorHost, {
-        action: "bots.items",
-        include_closed: filter === "closed",
-        include_snoozed: filter === "snoozed",
-        limit: 25,
-        cursor: itemsCursor,
-      });
-      if (ctx.signal.aborted) return;
-      const hostName = botHosts().find((h) => h.id === itemsCursorHost)?.name || "";
-      const seen = new Set(items.map((x) => `${x._hostId || ""}:${x.uid}`));
+      const nextEntry = itemsCursors.values().next().value;
+      if (!nextEntry || !ready()) return;
+      const seq = loadSeq;
+      const reqFilter = filter;
+      const { hostId, hostName, cursor } = nextEntry;
+      const res = await fetchBotItems(hostId, reqFilter, cursor);
+      if (ctx.signal.aborted || seq !== loadSeq || filter !== reqFilter) return;
+      const resolvedName = botHosts().find((h) => (h.id ?? null) === hostId)?.name || hostName;
+      const seen = new Set(items.map((x) => `${x._hostId ?? ""}:${x.uid}`));
       for (const item of res?.items || []) {
-        const k = `${itemsCursorHost || ""}:${item.uid}`;
-        if (!seen.has(k)) items.push({ ...item, _hostId: itemsCursorHost, _hostName: hostName });
+        const k = `${hostId ?? ""}:${item.uid}`;
+        if (!seen.has(k)) {
+          items.push(hostId ? { ...item, _hostId: hostId, _hostName: resolvedName } : { ...item });
+        }
       }
-      itemsCursor = res?.next_cursor || null;
+      if (res?.next_cursor) {
+        itemsCursors.set(hostId, { hostId, hostName: resolvedName, cursor: res.next_cursor });
+      } else {
+        itemsCursors.delete(hostId);
+      }
       draw();
     }
 
@@ -2005,12 +2247,10 @@
         for (const [k, e] of orchEntries) if (!e.pending) orchEntries.delete(k);
         return { count: 0, node: null };
       }
-      const sec = el("section", undefined, "bots-section todo-orch-section");
-      const head = el("div", undefined, "home-section-heading");
-      head.append(el("h2", t("Confirmation requests"), "section-title"), el("small", String(pending.length), "muted"));
-      const wrap = el("div", undefined, "bots-items-list");
+      orchCountEl.textContent = String(pending.length);
       const showDev = multiHost();
       const liveKeys = new Set();
+      const cardNodes = [];
 
       for (const p of pending) {
         const key = `${p.host.id || "local"}:${p.kind}:${p.item.id}`;
@@ -2083,7 +2323,7 @@
           e.submit.disabled = e.pending || e.sent || !hostReady();
           e.input.readOnly = e.sent;
         }
-        wrap.append(e.card);
+        cardNodes.push(e.card);
       }
 
       async function respondOrch(e, decision) {
@@ -2108,7 +2348,7 @@
             e.input.value = "";
           }
           draw();
-          await refreshHost(ctx, e.host.id)?.catch?.(() => {});
+          await refreshHost(ctx, e.host.id).catch(() => {});
         } catch (err) {
           e.message = `${t("Could not send reply")}: ${safeMsg(err, t)}`;
         } finally {
@@ -2118,8 +2358,8 @@
       }
 
       for (const [k, e] of orchEntries) if (!liveKeys.has(k) && !e.pending) orchEntries.delete(k);
-      sec.append(head, wrap);
-      return { count: pending.length, node: sec };
+      sync(orchWrap, cardNodes);
+      return { count: pending.length, node: orchSec };
     }
 
     function draw() {
@@ -2131,70 +2371,57 @@
       if (failure) nodes.push(el("p", failure, "account-error"));
 
       const waitingSec = renderWaitingSessionsSection(hosts);
-      const orchSec = renderOrchestrationSection(hosts);
+      const orchSecRes = renderOrchestrationSection(hosts);
       const pendingAccess = requests.filter((r) => r.status === "pending");
-      const visibleItems = filter === "needs_you" ? items.filter((i) => i.status === "needs_you") : items;
+      const now = Date.now();
+      const visibleItems =
+        filter === "needs_you"
+          ? items.filter((i) => i.status === "needs_you")
+          : filter === "closed"
+            ? items.filter((i) => i.status === "done" || i.status === "canceled")
+            : filter === "snoozed"
+              ? items.filter((i) => Number(i.snoozed_until_ms || 0) > now)
+              : items;
 
       if (waitingSec.node) nodes.push(waitingSec.node);
-      if (orchSec.node) nodes.push(orchSec.node);
+      if (orchSecRes.node) nodes.push(orchSecRes.node);
       if (pendingAccess.length) {
-        nodes.push(accessSection(ctx, t, requests, bots, ready, () => load(true), multiHost()));
+        nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(true), multiHost: multiHost(), targetHosts: botHosts() }));
       }
       const sugNode = renderSuggestionsSection(ctx, t, suggestions, bots, ready, () => load(true), true, multiHost());
       if (sugNode) nodes.push(sugNode);
 
-      const totalEverything = waitingSec.count + orchSec.count + pendingAccess.length + suggestions.length + visibleItems.length;
+      const totalEverything = waitingSec.count + orchSecRes.count + pendingAccess.length + suggestions.length + visibleItems.length;
 
       if (hasBotsCap) {
-        const itemSec = el("section", undefined, "bots-section");
-        itemSec.append(el("h2", t("Needs You & Active Items"), "section-title"));
-        const filterBar = el("div", undefined, "bot-decision-options");
-        for (const [id, lbl] of [
-          ["needs_you", t("Needs You")],
-          ["open", t("All Open")],
-          ["snoozed", t("Snoozed")],
-          ["closed", t("Closed")],
-        ]) {
-          const btn = button(lbl, () => {
-            filter = id;
-            return load(true);
-          }, filter === id ? "filter-chip active" : "filter-chip");
+        for (const btn of filterButtons) {
+          btn.className = filter === btn.dataset.filter ? "filter-chip active" : "filter-chip";
           btn.disabled = !ready();
-          filterBar.append(btn);
         }
-        itemSec.append(filterBar);
-
+        const secNodes = [itemSecTitle, filterBar];
         if (filter === "needs_you" && totalEverything === 0 && !loading) {
-          const clearCard = el("div", undefined, "todo-clear-card inset-group");
-          const clearTitle = el("div", undefined, "todo-clear-title");
-          clearTitle.append(ctx.icon("check"), el("strong", t("All caught up")));
-          clearCard.append(clearTitle, el("p", t("Your agents are working autonomously."), "muted"));
-          itemSec.append(clearCard);
+          secNodes.push(clearCard);
         } else {
-          itemSec.append(
-            renderItemsList(ctx, t, {
-              items: visibleItems,
-              bots,
-              showBot: true,
-              ready,
-              onReload: () => load(true),
-              cardMap,
-              multiHost: multiHost(),
-              hideEmpty: filter === "needs_you" && totalEverything > 0,
-            }),
-          );
+          renderItemsList(ctx, t, {
+            items: visibleItems,
+            bots,
+            showBot: true,
+            ready,
+            onReload: () => load(true),
+            cardMap,
+            multiHost: multiHost(),
+            hideEmpty: filter === "needs_you" && totalEverything > 0,
+            container: itemsWrap,
+          });
+          secNodes.push(itemsWrap);
         }
-        if (itemsCursor) {
-          const more = button(t("Load more"), loadMore, "secondary");
-          more.disabled = !ready();
-          itemSec.append(more);
+        if (itemsCursors.size > 0) {
+          moreBtn.disabled = !ready();
+          secNodes.push(moreBtn);
         }
+        sync(itemSec, secNodes);
         nodes.push(itemSec);
       } else if (totalEverything === 0) {
-        const clearCard = el("div", undefined, "todo-clear-card inset-group");
-        const clearTitle = el("div", undefined, "todo-clear-title");
-        clearTitle.append(ctx.icon("check"), el("strong", t("All caught up")));
-        clearCard.append(clearTitle, el("p", t("Your agents are working autonomously."), "muted"));
         nodes.push(clearCard);
       }
 

@@ -1062,6 +1062,11 @@
     "Sign in to {0} on desktop to start a chat.": "채팅을 시작하려면 데스크톱에서 {0}에 로그인하세요.",
     "{0} quota reached: {1}": "{0} 사용량 한도에 도달했습니다: {1}",
     "{0} usage quota has been reached.": "{0} 사용량 한도에 도달했습니다.",
+    "Signed out": "로그아웃됨",
+    "Usage limit reached": "사용량 한도 도달",
+    "Not set up": "미설정",
+    "Folder missing": "폴더를 찾을 수 없음",
+    "Agent error": "에이전트 오류",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;

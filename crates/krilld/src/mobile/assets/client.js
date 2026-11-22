@@ -1071,7 +1071,7 @@
   }
   M.transport = {
     bootstrap,
-    pool({ endpoint, onChange = () => {}, create } = {}) {
+    pool({ endpoint, onChange = () => {}, onChatPush, create } = {}) {
       const entries = new Map(),
         cache = M.storage?.create();
       let closed = !1;
@@ -1147,6 +1147,11 @@
                       peer.describeHost(data.host),
                       notify(entry));
                   },
+                  onChatPush: (payload) => {
+                    !closed &&
+                      entries.get(entry.id) === entry &&
+                      onChatPush?.(entry, payload);
+                  },
                   onStatus: (status) => {
                     ((entry.connection = status),
                       status.blocked &&
@@ -1204,6 +1209,7 @@
           [
             "snapshot",
             "chat_poll",
+            "chat_composer",
             "git",
             "accounts",
             "drop_list",
@@ -1212,6 +1218,19 @@
             "command_catalog",
             "mention_files",
             "composer_models",
+            "bots.list",
+            "bots.templates",
+            "bots.models",
+            "bots.upcoming",
+            "bots.items",
+            "bots.access.list",
+            "bots.connectors.status",
+            "bots.groups.list",
+            "bots.groups.read",
+            "bots.suggestions.list",
+            "bots.avatar.read",
+            "bots.soul.get",
+            "bots.memory.get",
           ].includes(request?.action);
       let credentials = options.credentials,
         pair = options.pair,
