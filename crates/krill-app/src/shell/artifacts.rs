@@ -174,11 +174,7 @@ impl Shell {
             )];
             for (hid, tgt) in &self.host_targets {
                 if !hid.is_local() {
-                    let label = self
-                        .ssh_hosts
-                        .iter()
-                        .find(|h| krill_app::hosts::HostId::Remote(h.id.clone()) == *hid)
-                        .map_or_else(|| format!("{hid:?}"), |h| h.label.clone());
+                    let label = self.remote_host_name(hid.remote_id().unwrap_or_default(), cx);
                     host_choices.push((hid.clone(), label, Some(tgt.clone())));
                 }
             }
@@ -284,6 +280,13 @@ impl Shell {
         cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
             this.request_new_bot(None, None, cx);
         })
+        .detach();
+        cx.subscribe(
+            view,
+            |this, _, _: &krill_app::bots::OpenRemoteSettings, cx| {
+                this.open_settings(krill_app::settings::AdminTab::Machines, None, cx);
+            },
+        )
         .detach();
         cx.subscribe(view, |this, view, ev: &krill_app::bots::OpenSession, cx| {
             let host = view.read(cx).host().clone();

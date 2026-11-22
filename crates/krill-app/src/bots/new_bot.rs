@@ -5,6 +5,7 @@
 //! The host `Shell` draws it over the workspace and opens the new bot's Home Chat on
 //! [`Event::Created`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
@@ -23,6 +24,7 @@ use krill_proto::bots::{
 
 use super::avatar::{self, PICKER_MASCOTS, PICTURE_MAX_BYTES, PictureError, prepare_picture};
 use super::rpc::{BOT_RUNTIMES, BotRpcCall, call_checked, runtime_display_label, runtime_models};
+use crate::hosts::HostId;
 use crate::i18n::catalog::bots as text;
 use crate::ui;
 
@@ -44,10 +46,49 @@ pub enum Event {
     Created {
         bot: Box<BotConfig>,
         warning: Option<String>,
+        /// The computer it was made on (and runs on).
+        host: HostId,
     },
     Close,
+    /// A picked computer's Krill predates bots: the host opens where it updates.
+    UpdateHost,
     /// "Start from a template": the host swaps this dialog for the templates gallery.
     BrowseTemplates,
+}
+
+/// A computer the bot can be made on (Orca's "Computer" choices).
+#[derive(Clone)]
+pub struct HostChoice {
+    pub id: HostId,
+    pub label: SharedString,
+    pub rpc: BotRpcCall,
+}
+
+impl std::fmt::Debug for HostChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostChoice")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a computer can't take a new bot; Orca greys these out in its Computer list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Blocked {
+    /// Its Krill predates bots (its version, `""` when it didn't say).
+    NoBots(String),
+    Unreachable,
+}
+
+/// Whether `rpc`'s computer can run bots: `None` when it can.
+fn probe(rpc: &BotRpcCall) -> Option<Blocked> {
+    let err = rpc(&BotRpcRequest::ListBots).err()?;
+    Some(
+        super::rpc::unsupported_version(&err).map_or(Blocked::Unreachable, |version| {
+            Blocked::NoBots(version.to_owned())
+        }),
+    )
 }
 
 /// One face in the carousel.
@@ -78,6 +119,11 @@ pub struct NewBot {
     rpc: BotRpcCall,
     host_label: SharedString,
     host_is_local: bool,
+    host_id: HostId,
+    /// Every computer offered, the default first.
+    hosts: Vec<HostChoice>,
+    blocked: HashMap<HostId, Blocked>,
+    probe_tasks: Vec<Task<()>>,
     taken_names: Vec<String>,
     faces: Vec<Face>,
     current: usize,
@@ -117,11 +163,10 @@ impl std::fmt::Debug for NewBot {
 }
 
 impl NewBot {
-    /// `template` pre-fills the dialog the way Orca's "Use template…" does.
+    /// `template` pre-fills the dialog the way Orca's "Use template…" does. The bot is made
+    /// on the first of `hosts` unless another is picked.
     pub fn new(
-        rpc: BotRpcCall,
-        host_label: SharedString,
-        host_is_local: bool,
+        hosts: Vec<HostChoice>,
         taken_names: Vec<String>,
         template: Option<&'static BotTemplate>,
         window: &mut Window,
@@ -157,12 +202,22 @@ impl NewBot {
             cx.subscribe_in(&name, window, Self::on_input),
             cx.subscribe_in(&purpose, window, Self::on_input),
         ];
-        let mut this = Self {
+        let first = hosts.first().cloned().unwrap_or_else(|| HostChoice {
+            id: HostId::Local,
+            label: text::HOST_LOCAL.get().into(),
+            rpc: Arc::new(|_| Err(text::DAEMON_UNAVAILABLE.get().to_owned())),
+        });
+        let host_is_local = first.id.is_local();
+        let mut view = Self {
             focus: cx.focus_handle(),
             carousel_focus: cx.focus_handle().tab_stop(true),
-            rpc,
-            host_label,
+            rpc: first.rpc,
+            host_label: first.label,
             host_is_local,
+            host_id: first.id,
+            hosts,
+            blocked: HashMap::new(),
+            probe_tasks: Vec::new(),
             taken_names,
             faces,
             current,
@@ -187,8 +242,83 @@ impl NewBot {
             picture_task: None,
             _subs: subs,
         };
-        this.load_models(cx);
-        this
+        view.load_models(cx);
+        view.probe_hosts(cx);
+        view
+    }
+
+    /// The computer the bot will be made on.
+    #[must_use]
+    pub fn host(&self) -> &HostId {
+        &self.host_id
+    }
+
+    /// Asks each remote computer whether it can run bots, greying out the ones that can't.
+    fn probe_hosts(&mut self, cx: &mut Context<Self>) {
+        self.probe_tasks = self
+            .hosts
+            .iter()
+            .filter(|h| h.id.is_remote())
+            .map(|h| {
+                let id = h.id.clone();
+                let rpc = h.rpc.clone();
+                cx.spawn(async move |this, cx| {
+                    let blocked = cx
+                        .background_executor()
+                        .spawn(async move { probe(&rpc) })
+                        .await;
+                    this.update(cx, |this, cx| this.set_blocked(&id, blocked, cx))
+                        .ok();
+                })
+            })
+            .collect();
+    }
+
+    fn set_blocked(&mut self, id: &HostId, blocked: Option<Blocked>, cx: &mut Context<Self>) {
+        let Some(blocked) = blocked else {
+            self.blocked.remove(id);
+            cx.notify();
+            return;
+        };
+        self.blocked.insert(id.clone(), blocked);
+        // The computer it was going on can't take it: fall back to one that can.
+        if &self.host_id == id
+            && let Some(next) = self
+                .hosts
+                .iter()
+                .find(|h| !self.blocked.contains_key(&h.id))
+                .map(|h| h.id.clone())
+        {
+            self.select_host(&next, cx);
+        }
+        cx.notify();
+    }
+
+    /// Makes the bot on `id` instead. A computer that can't run bots isn't picked.
+    pub fn select_host(&mut self, id: &HostId, cx: &mut Context<Self>) {
+        if self.blocked.contains_key(id) {
+            return;
+        }
+        let Some(choice) = self.hosts.iter().find(|h| &h.id == id).cloned() else {
+            return;
+        };
+        self.rpc = choice.rpc;
+        self.host_label = choice.label;
+        self.host_is_local = choice.id.is_local();
+        self.host_id = choice.id;
+        self.error = None;
+        // This computer may not have the agent picked for the last one.
+        let runtimes = available_runtimes(self.host_is_local, cx);
+        if !runtimes.contains(&self.runtime)
+            && let Some(first) = runtimes.first()
+        {
+            self.set_runtime(first, cx);
+        } else {
+            // Each computer lists its own models.
+            self.model = None;
+            self.load_models(cx);
+        }
+        cx.notify();
     }
 
     #[must_use]
@@ -498,6 +628,7 @@ impl NewBot {
         let clear_skills =
             self.template.is_some_and(|t| !t.skills.is_empty()) && self.skills.is_empty();
         let rpc = self.rpc.clone();
+        let host = self.host_id.clone();
         self.submitting = true;
         self.error = None;
         cx.notify();
@@ -550,7 +681,7 @@ impl NewBot {
             this.update(cx, |this, cx| {
                 this.submitting = false;
                 match created {
-                    Ok((bot, warning)) => cx.emit(Event::Created { bot, warning }),
+                    Ok((bot, warning)) => cx.emit(Event::Created { bot, warning, host }),
                     Err(err) => this.error = Some(SharedString::from(err)),
                 }
                 cx.notify();
@@ -589,6 +720,54 @@ impl NewBot {
             _ => {}
         }
     }
+}
+
+/// A computer that can't take the bot, greyed out with why (and Orca's "Update" when that helps).
+fn blocked_host_row(label: &SharedString, blocked: &Blocked, cx: &App) -> gpui::Div {
+    let p = ui::palette(cx);
+    let (hint, action) = match blocked {
+        Blocked::NoBots(version) if version.is_empty() => (
+            text::NB_HOST_NO_BOTS.format(&[("host", label)]),
+            Some(text::NB_HOST_UPDATE_ACTION.get()),
+        ),
+        Blocked::NoBots(version) => (
+            text::NB_HOST_NO_BOTS_VERSION.format(&[("host", label), ("version", version)]),
+            Some(text::NB_HOST_UPDATE_ACTION.get()),
+        ),
+        Blocked::Unreachable => (text::NB_HOST_UNREACHABLE.format(&[("host", label)]), None),
+    };
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(p.muted_foreground)
+                        .child(label.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(hint),
+                ),
+        )
+        .children(action.map(|action| {
+            div()
+                .flex_none()
+                .text_size(ui::TEXT_XS)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.foreground)
+                .child(action)
+        }))
 }
 
 /// The longest prefix of `s` within `max` bytes that ends on a character boundary.
@@ -1010,23 +1189,7 @@ impl NewBot {
                     .flex_col()
                     .gap_1()
                     .child(field(text::NB_COMPUTER.get()))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .text_size(ui::TEXT_LG)
-                            .child(ui::icons::svg_icon(
-                                if self.host_is_local {
-                                    ui::icons::MONITOR_SVG
-                                } else {
-                                    ui::icons::CLOUD_SVG
-                                },
-                                ui::ICON_SM,
-                                p.muted_foreground,
-                            ))
-                            .child(self.host_label.clone()),
-                    )
+                    .child(self.render_host_picker(p, cx))
                     .child(
                         div()
                             .text_size(ui::TEXT_XS)
@@ -1048,6 +1211,77 @@ impl NewBot {
                             .child(div().flex_1().min_w_0().child(model_button)),
                     ),
             )
+    }
+
+    /// Orca's Computer field: this computer and each connected one. Computers whose Krill
+    /// predates bots are greyed out and open the update; unreachable ones can't be picked.
+    fn render_host_picker(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let current = div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .child(ui::icons::svg_icon(
+                if self.host_is_local {
+                    ui::icons::MONITOR_SVG
+                } else {
+                    ui::icons::CLOUD_SVG
+                },
+                ui::ICON_SM,
+                p.muted_foreground,
+            ))
+            .child(div().truncate().child(self.host_label.clone()));
+        if self.hosts.len() < 2 {
+            return current.text_size(ui::TEXT_LG).into_any_element();
+        }
+        let this = cx.weak_entity();
+        Button::new("new-bot-host")
+            .outline()
+            .small()
+            .w_full()
+            .dropdown_caret(true)
+            .accessibility_label(self.host_label.clone())
+            .debug_selector(|| "new-bot-host".into())
+            .child(current)
+            .dropdown_menu(move |mut menu, _, cx| {
+                let Some(view) = this.upgrade() else {
+                    return menu;
+                };
+                let view = view.read(cx);
+                // Orca lists the computers that can take the bot first.
+                let mut rows: Vec<(HostChoice, Option<Blocked>)> = view
+                    .hosts
+                    .iter()
+                    .map(|h| (h.clone(), view.blocked.get(&h.id).cloned()))
+                    .collect();
+                rows.sort_by_key(|(_, blocked)| blocked.is_some());
+                let current = view.host_id.clone();
+                for (host, blocked) in rows {
+                    let this = this.clone();
+                    let id = host.id.clone();
+                    let item = match blocked {
+                        None => PopupMenuItem::new(host.label)
+                            .checked(id == current)
+                            .on_click(move |_, _, cx| {
+                                this.update(cx, |v, cx| v.select_host(&id, cx)).ok();
+                            }),
+                        Some(blocked) => {
+                            let update = matches!(blocked, Blocked::NoBots(_));
+                            let label = host.label;
+                            PopupMenuItem::element(move |_, cx| {
+                                blocked_host_row(&label, &blocked, cx)
+                            })
+                            .disabled(!update)
+                            .on_click(move |_, _, cx| {
+                                this.update(cx, |_, cx| cx.emit(Event::UpdateHost)).ok();
+                            })
+                        }
+                    };
+                    menu = menu.item(item);
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     fn render_comes_with(

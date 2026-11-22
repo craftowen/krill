@@ -195,7 +195,7 @@ fn call_daemon_bot(target: Option<&HostTarget>, req: &BotRpcRequest) -> io::Resu
     if conn.negotiated.features & need != need {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "krilld does not support FEAT_BOTS",
+            unsupported_error(&conn.server.build),
         ));
     }
     let mut sock = conn.stream;
@@ -209,6 +209,38 @@ fn call_daemon_bot(target: Option<&HostTarget>, req: &BotRpcRequest) -> io::Resu
         Reply::Failed(failure) => Err(io::Error::other(failure.to_string())),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
+}
+
+/// Start of the error a daemon without bots answers with; [`unsupported_version`] reads it back.
+// ponytail: the RPC error is a plain String, so the "no bots here" case rides in its text.
+const UNSUPPORTED: &str = "krilld does not support FEAT_BOTS";
+
+pub(super) fn unsupported_error(build: &str) -> String {
+    format!("{UNSUPPORTED} (krilld {build})")
+}
+
+/// The daemon's version when `err` says that daemon has no bots (`""` if it didn't say).
+#[must_use]
+pub fn unsupported_version(err: &str) -> Option<&str> {
+    let rest = err.strip_prefix(UNSUPPORTED)?;
+    let build = rest
+        .trim()
+        .strip_prefix("(krilld ")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or("");
+    Some(build.split_once('+').map_or(build, |(version, _)| version))
+}
+
+/// One banner line for several failed loads: each distinct message once, in first-seen order.
+#[must_use]
+pub fn join_errors(errors: &[String]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for err in errors {
+        if !seen.contains(&err.as_str()) {
+            seen.push(err);
+        }
+    }
+    seen.join(" | ")
 }
 
 /// Invokes a bot RPC call and promotes [`BotRpcResponse::Error`] into `Err(msg)`.

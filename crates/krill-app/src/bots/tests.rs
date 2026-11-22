@@ -1642,9 +1642,11 @@ fn new_bot_dialog_saves_the_mascot_and_clears_unchecked_template_skills(cx: &mut
     assert!(!tpl.skills.is_empty());
     let (dialog, vcx) = cx.add_window_view(|window, cx| {
         super::new_bot::NewBot::new(
-            rpc,
-            "My Mac".into(),
-            true,
+            vec![super::new_bot::HostChoice {
+                id: crate::hosts::HostId::Local,
+                label: "My Mac".into(),
+                rpc,
+            }],
             Vec::new(),
             Some(tpl),
             window,
@@ -1715,7 +1717,18 @@ fn new_bot_dialog_lists_the_agents_own_models_and_launches_the_pick(cx: &mut Tes
     });
     let rpc = make_mock_rpc(state.clone());
     let (dialog, vcx) = cx.add_window_view(|window, cx| {
-        super::new_bot::NewBot::new(rpc, "My Mac".into(), false, Vec::new(), None, window, cx)
+        // A remote host offers every runtime, installed here or not.
+        super::new_bot::NewBot::new(
+            vec![super::new_bot::HostChoice {
+                id: crate::hosts::HostId::Remote("iroh:studio".into()),
+                label: "Studio".into(),
+                rpc,
+            }],
+            Vec::new(),
+            None,
+            window,
+            cx,
+        )
     });
     let ids = |vcx: &mut gpui::VisualTestContext| {
         vcx.update(|_, cx| {
@@ -1975,4 +1988,198 @@ fn home_panel_groups_filters_and_opens_an_item(cx: &mut TestAppContext) {
     show(vcx, "bot-2");
     assert!(vcx.debug_bounds("bot-home-empty").is_some());
     vcx.update(|_, cx| assert!(view.read(cx).home_filter().is_none()));
+}
+
+#[test]
+fn unsupported_daemon_errors_read_back_and_load_errors_show_once() {
+    use super::rpc::{join_errors, unsupported_error, unsupported_version};
+    assert_eq!(
+        unsupported_version(&unsupported_error("0.2.10+dev.00ab")),
+        Some("0.2.10")
+    );
+    // Builds before the version rode along said only this.
+    assert_eq!(
+        unsupported_version("krilld does not support FEAT_BOTS"),
+        Some("")
+    );
+    assert_eq!(unsupported_version("connection refused"), None);
+    let errors = ["a", "b", "a", "a", "b"].map(str::to_owned);
+    assert_eq!(join_errors(&errors), "a | b");
+}
+
+/// A daemon too old for bots: every request fails the way `call_daemon_bot` does.
+fn old_daemon_rpc(calls: Arc<Mutex<usize>>) -> BotRpcCall {
+    Arc::new(move |_| {
+        *calls.lock().unwrap() += 1;
+        Err(super::rpc::unsupported_error("0.2.10+dev.00ab"))
+    })
+}
+
+#[gpui::test]
+fn a_host_without_bots_is_explained_instead_of_erroring(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let calls = Arc::new(Mutex::new(0));
+    let rpc = old_daemon_rpc(calls.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+    vcx.simulate_resize(gpui::size(px(1040.), px(720.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.error, None, "an old daemon is not an error");
+        assert_eq!(v.unsupported.as_deref(), Some("0.2.10"));
+    });
+    assert!(vcx.debug_bounds("bots-unsupported").is_some());
+    assert!(vcx.debug_bounds("bots-empty").is_none());
+    assert!(vcx.debug_bounds("bots-error-retry").is_none());
+
+    // Opening a bot from the sidebar must not fire a dozen doomed detail calls.
+    let before = *calls.lock().unwrap();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.select_bot(BotId::new("bot-1").unwrap(), cx));
+    });
+    vcx.run_until_parked();
+    assert_eq!(*calls.lock().unwrap(), before);
+    vcx.update(|_, cx| assert_eq!(view.read(cx).error, None));
+}
+
+#[gpui::test]
+fn a_failed_bot_detail_shows_each_error_once_with_the_host_name(cx: &mut TestAppContext) {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    state
+        .lock()
+        .unwrap()
+        .bots
+        .push(sample_bot("bot-1", "Helper"));
+    let (view, vcx) = open_view(cx, state.clone());
+    {
+        let mut st = state.lock().unwrap();
+        st.fail_get_soul = Some("connection reset".to_owned());
+        st.fail_get_memory = Some("connection reset".to_owned());
+    }
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_host_target(
+                crate::hosts::HostId::Local,
+                None,
+                vec![
+                    (crate::hosts::HostId::Local, "My Mac".to_owned(), None),
+                    (
+                        crate::hosts::HostId::Remote("iroh:studio".into()),
+                        "Studio".to_owned(),
+                        None,
+                    ),
+                ],
+                cx,
+            );
+            v.select_bot(BotId::new("bot-1").unwrap(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).error.as_deref(),
+            Some("My Mac: connection reset")
+        );
+    });
+}
+
+#[gpui::test]
+fn new_bot_makes_the_bot_on_the_picked_computer_and_greys_out_old_ones(cx: &mut TestAppContext) {
+    use super::new_bot::{Event, HostChoice, NewBot};
+    use crate::hosts::HostId;
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let here = Arc::new(Mutex::new(MockState::default()));
+    let studio = Arc::new(Mutex::new(MockState::default()));
+    let old_calls = Arc::new(Mutex::new(0));
+    let studio_id = HostId::Remote("iroh:studio".into());
+    let old_id = HostId::Remote("iroh:old".into());
+    let hosts = vec![
+        HostChoice {
+            id: HostId::Local,
+            label: "My Mac".into(),
+            rpc: make_mock_rpc(here.clone()),
+        },
+        HostChoice {
+            id: old_id.clone(),
+            label: "Old".into(),
+            rpc: old_daemon_rpc(old_calls),
+        },
+        HostChoice {
+            id: studio_id.clone(),
+            label: "Studio".into(),
+            rpc: make_mock_rpc(studio.clone()),
+        },
+    ];
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| NewBot::new(hosts, Vec::new(), None, window, cx));
+    let created: Arc<Mutex<Vec<HostId>>> = Arc::default();
+    let seen = created.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&dialog, move |_, ev: &Event, _| {
+            if let Event::Created { host, .. } = ev {
+                seen.lock().unwrap().push(host.clone());
+            }
+        })
+        .detach();
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        dialog.update(cx, |d, cx| {
+            // Krill on "Old" predates bots: it can't be picked.
+            d.select_host(&old_id, cx);
+            assert_eq!(d.host(), &HostId::Local);
+            d.select_host(&studio_id, cx);
+            assert_eq!(d.host(), &studio_id);
+            d.submit(cx);
+        });
+    });
+    vcx.run_until_parked();
+    let made_on_studio = studio
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .any(|r| matches!(r, BotRpcRequest::CreateBotV2(_)));
+    let made_here = here
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .any(|r| matches!(r, BotRpcRequest::CreateBotV2(_)));
+    assert!(made_on_studio, "the bot is made on the picked computer");
+    assert!(!made_here);
+    assert_eq!(*created.lock().unwrap(), vec![studio_id]);
+}
+
+#[gpui::test]
+fn new_bot_moves_off_a_default_computer_that_cannot_run_bots(cx: &mut TestAppContext) {
+    use super::new_bot::{HostChoice, NewBot};
+    use crate::hosts::HostId;
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let old_id = HostId::Remote("iroh:old".into());
+    let hosts = vec![
+        HostChoice {
+            id: old_id.clone(),
+            label: "Old".into(),
+            rpc: old_daemon_rpc(Arc::default()),
+        },
+        HostChoice {
+            id: HostId::Local,
+            label: "My Mac".into(),
+            rpc: make_mock_rpc(Arc::default()),
+        },
+    ];
+    let (dialog, vcx) =
+        cx.add_window_view(|window, cx| NewBot::new(hosts, Vec::new(), None, window, cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(dialog.read(cx).host(), &HostId::Local));
 }

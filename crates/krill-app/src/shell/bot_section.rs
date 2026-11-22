@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, FontWeight, Image, KeyDownEvent, MouseButton,
+    AnyElement, App, Context, Entity, FocusHandle, FontWeight, Image, KeyDownEvent, MouseButton,
     SharedString, Subscription, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -16,6 +16,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{IconName, Sizable as _};
 use krill_app::bots::{SidebarBot, avatar, new_bot, templates};
+use krill_app::hosts::HostId;
 use krill_app::i18n::catalog::bots as text;
 use krill_app::ui;
 use krill_proto::bots::{BotId, BotRpcRequest, BotRpcResponse, BotTemplate};
@@ -65,6 +66,10 @@ pub(super) struct BotUi {
 
 impl Shell {
     /// Bot RPC to the host bots run on (the launch host).
+    pub(super) fn bot_rpc(&self) -> Option<krill_app::bots::BotRpcCall> {
+        self.bot_rpc_on(&self.launch_host)
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -72,34 +77,58 @@ impl Shell {
             reason = "tests have no daemon without an override"
         )
     )]
-    pub(super) fn bot_rpc(&self) -> Option<krill_app::bots::BotRpcCall> {
+    fn bot_rpc_on(&self, host: &HostId) -> Option<krill_app::bots::BotRpcCall> {
         #[cfg(test)]
         {
-            self.bot_rpc_override.clone()
+            self.bot_rpc_overrides
+                .get(host)
+                .or(self.bot_rpc_override.as_ref())
+                .cloned()
         }
         #[cfg(not(test))]
         {
-            Some(krill_app::bots::daemon_bot_rpc(
-                self.target_for_host(&self.launch_host),
-            ))
+            Some(krill_app::bots::daemon_bot_rpc(self.target_for_host(host)))
         }
     }
 
-    pub(super) fn bot_host_label(&self) -> SharedString {
-        if self.launch_host.is_local() {
-            return text::HOST_LOCAL
+    pub(super) fn bot_host_label(&self, cx: &App) -> SharedString {
+        match &self.launch_host {
+            HostId::Local => text::HOST_LOCAL
                 .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
                 .get()
-                .into();
+                .into(),
+            HostId::Remote(id) => self.remote_host_name(id, cx).into(),
         }
-        self.execution_locations_for_bots()
     }
 
-    fn execution_locations_for_bots(&self) -> SharedString {
-        self.ssh_hosts
-            .iter()
-            .find(|h| krill_app::hosts::HostId::Remote(h.id.clone()) == self.launch_host)
-            .map_or_else(|| SharedString::from("?"), |h| h.label.clone().into())
+    /// Computers New bot offers: this one and every connected remote host, launch host first.
+    fn new_bot_hosts(&self, cx: &App) -> Vec<new_bot::HostChoice> {
+        let mut hosts: Vec<new_bot::HostChoice> = self
+            .execution_locations(cx)
+            .into_iter()
+            .filter_map(|(id, label)| {
+                Some(new_bot::HostChoice {
+                    rpc: self.bot_rpc_on(&id)?,
+                    id,
+                    label: label.into(),
+                })
+            })
+            .collect();
+        if let Some(at) = hosts.iter().position(|h| h.id == self.launch_host) {
+            let current = hosts.remove(at);
+            hosts.insert(0, current);
+        } else if let Some(rpc) = self.bot_rpc() {
+            // The launch host isn't connected right now; it stays the default all the same.
+            hosts.insert(
+                0,
+                new_bot::HostChoice {
+                    id: self.launch_host.clone(),
+                    label: self.bot_host_label(cx),
+                    rpc,
+                },
+            );
+        }
+        hosts
     }
 
     /// `<state>/bots/<slug>` for bots on this Mac.
@@ -135,19 +164,17 @@ impl Shell {
         let Some(request) = self.bot_ui.pending.take() else {
             return;
         };
-        let Some(rpc) = self.bot_rpc() else {
+        if self.bot_rpc().is_none() {
             return;
-        };
+        }
         // Dialogs open over the workspace like Orca's; the Bots modal makes room.
         self.close_settings(Some(window), cx);
         match request {
             BotDialogRequest::NewBot { template, purpose } => {
                 let taken: Vec<String> = self.sidebar_bots.iter().map(|b| b.name.clone()).collect();
-                let host_label = self.bot_host_label();
-                let local = self.launch_host.is_local();
+                let hosts = self.new_bot_hosts(cx);
                 let dialog = cx.new(|cx| {
-                    let mut d =
-                        new_bot::NewBot::new(rpc, host_label, local, taken, template, window, cx);
+                    let mut d = new_bot::NewBot::new(hosts, taken, template, window, cx);
                     if let Some(purpose) = purpose {
                         d.set_purpose(purpose, window, cx);
                     }
@@ -181,7 +208,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn on_new_bot_event(
+    pub(super) fn on_new_bot_event(
         &mut self,
         ev: &new_bot::Event,
         _window: &mut Window,
@@ -196,9 +223,20 @@ impl Shell {
                 cx.notify();
             }
             new_bot::Event::BrowseTemplates => self.request_bot_templates(cx),
-            new_bot::Event::Created { bot, warning } => {
+            new_bot::Event::UpdateHost => {
                 self.bot_ui.new_bot = None;
                 self.bot_ui.back_to_templates = false;
+                self.open_settings(krill_app::settings::AdminTab::Machines, None, cx);
+            }
+            new_bot::Event::Created { bot, warning, host } => {
+                self.bot_ui.new_bot = None;
+                self.bot_ui.back_to_templates = false;
+                // The bot lives on the computer picked for it: bots, its chat and the sidebar's
+                // Bots section follow that host from here.
+                if *host != self.launch_host {
+                    self.set_launch_host(host.clone(), cx);
+                    self.sidebar_bots.clear();
+                }
                 if let Some(err) = warning {
                     self.notice = Some(err.clone());
                 }

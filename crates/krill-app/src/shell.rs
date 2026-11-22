@@ -830,6 +830,10 @@ pub struct Shell {
     bots_poll: Option<Task<()>>,
     #[cfg(test)]
     pub(super) bot_rpc_override: Option<krill_app::bots::BotRpcCall>,
+    /// Per-host bot RPC for tests that tell hosts apart (falls back to `bot_rpc_override`).
+    #[cfg(test)]
+    pub(super) bot_rpc_overrides:
+        std::collections::HashMap<krill_app::hosts::HostId, krill_app::bots::BotRpcCall>,
     modal: Option<Modal>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
     pub(super) role: WindowRole,
@@ -1490,6 +1494,8 @@ impl Shell {
             bots_poll: None,
             #[cfg(test)]
             bot_rpc_override: None,
+            #[cfg(test)]
+            bot_rpc_overrides: std::collections::HashMap::new(),
             modal: None,
             role: WindowRole::Main,
             pending_focus: PendingFocus::None,
@@ -7061,35 +7067,40 @@ impl Shell {
         let krill_app::hosts::HostId::Remote(id) = self.layout.host(pane) else {
             return None;
         };
+        Some(self.remote_host_name(id, cx))
+    }
+
+    /// A remote host's name as the sidebar shows it (its id when nothing names it).
+    pub(super) fn remote_host_name(&self, id: &str, cx: &App) -> String {
         if let Some(h) = self
             .sidebar
             .read(cx)
             .remote_hosts()
             .iter()
-            .find(|h| h.id == *id)
+            .find(|h| h.id == id)
         {
-            return Some(h.label.clone());
+            return h.label.clone();
         }
         if let Some((spec, _)) = self
             .host_statuses
             .iter()
-            .find(|(s, _)| s.id == *id || s.address == *id)
+            .find(|(s, _)| s.id == id || s.address == id)
         {
-            return Some(spec.display_name().to_owned());
+            return spec.display_name().to_owned();
         }
         if let Some(h) = self
             .ssh_hosts
             .iter()
-            .find(|h| h.id == *id || h.destination == *id)
+            .find(|h| h.id == id || h.destination == id)
         {
             let label = h.label.trim();
-            return Some(if label.is_empty() {
+            return if label.is_empty() {
                 h.destination.clone()
             } else {
                 label.to_owned()
-            });
+            };
         }
-        Some(id.clone())
+        id.to_owned()
     }
 
     /// MK-131: 원격 호스트 세션 패인 헤더에 표시하는 호스트 이름 배지(상단 탭 바에는 공간 절약을 위해 표시하지 않는다).
