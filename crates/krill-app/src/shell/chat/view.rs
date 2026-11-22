@@ -386,9 +386,29 @@ impl Shell {
             work_run::DisplayRow::WorkRun(run) => {
                 self.render_work_run(pane, session, run, is_last_row, agent_state, cx)
             }
-            work_run::DisplayRow::ItemNote { note, .. } => {
-                Self::render_item_note(pane, row_ix, note, cx)
-            }
+            work_run::DisplayRow::ItemNote { note, .. } => match &note.action {
+                work_run::NoteAction::Memory(receipt) => {
+                    self.render_memory_note(pane, row_ix, note.at_ms, receipt, cx)
+                }
+                work_run::NoteAction::CreateOffer(offer) => {
+                    self.render_create_offer(pane, session, offer, cx)
+                }
+                _ => Self::render_item_note(pane, row_ix, note, cx),
+            },
+            work_run::DisplayRow::TurnBar {
+                user_abs_idx,
+                worked_secs,
+                folds,
+                expanded,
+            } => self.render_turn_bar(
+                pane,
+                session,
+                *user_abs_idx,
+                *worked_secs,
+                *folds,
+                *expanded,
+                cx,
+            ),
             work_run::DisplayRow::Notice { notice, .. } => {
                 Self::render_inbound_notice(pane, row_ix, notice, cx)
             }
@@ -1033,6 +1053,7 @@ impl Shell {
             });
 
         let is_reasoning = matches!(item.kind, ChatItemKind::Reasoning);
+        let message_row = matches!(item.kind, ChatItemKind::User | ChatItemKind::Assistant);
         let copy_button = (!item.text.trim().is_empty()).then(|| {
             let copy_text = krill_term::select::clean_text(&item.text);
             let copy_key = key.clone();
@@ -1051,18 +1072,31 @@ impl Shell {
             } else {
                 IconName::Copy
             })
-            .label(if is_copied {
-                ctext::COPIED.get()
-            } else {
-                ctext::COPY.get()
-            })
             .tooltip(if is_copied {
                 ctext::COPIED.get()
             } else {
                 ctext::COPY_MESSAGE.get()
             })
+            .accessibility_label(if is_copied {
+                ctext::COPIED.get()
+            } else {
+                ctext::COPY_MESSAGE.get()
+            })
             .ghost()
-            .xsmall()
+            // Orca's message rows: a 24px icon button; a thought keeps its labelled one.
+            .map(|b| {
+                if message_row {
+                    b.small()
+                        .text_color(if is_copied { palette.success } else { muted_fg })
+                } else {
+                    b.label(if is_copied {
+                        ctext::COPIED.get()
+                    } else {
+                        ctext::COPY.get()
+                    })
+                    .xsmall()
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
                 this.mark_chat_item_copied(copy_key.clone(), abs_idx, cx);
@@ -1080,10 +1114,12 @@ impl Shell {
                 pane.get()
             )))
             .debug_selector(|| "chat-quote-item".into())
-            .label(ctext::QUOTE_MESSAGE.get())
+            .icon(IconName::Quote)
             .tooltip(ctext::QUOTE_MESSAGE.get())
+            .accessibility_label(ctext::QUOTE_MESSAGE.get())
             .ghost()
-            .xsmall()
+            .small()
+            .text_color(muted_fg)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.quote_text_into_chat_composer(&quote_key, &quote_text, window, cx);
             }))
@@ -1094,6 +1130,13 @@ impl Shell {
 
         match item.kind {
             ChatItemKind::User => {
+                // A turn one of the bot's schedules started reads as Orca's automation run row.
+                if let Some(name) = self.chat_bot(&key).and_then(|bot| {
+                    super::bot_rows::scheduled_run(&item.text, &bot.schedules).map(str::to_owned)
+                }) {
+                    return self.render_scheduled_run(pane, session, abs_idx, &name, item, cx);
+                }
+                let item_text = item.text.as_str();
                 let image_paths = super::images::item_image_paths(item);
                 let image_numbers = super::images::image_numbers(&item.text, image_paths.len());
                 let readable = !self.layout.host(pane).is_remote();
@@ -1106,8 +1149,8 @@ impl Shell {
                         cx,
                     )
                     .map(gpui::Styled::mb_0p5);
-                let has_text = !item.text.trim().is_empty();
-                let foldable = is_user_prompt_foldable(&item.text);
+                let has_text = !item_text.trim().is_empty();
+                let foldable = is_user_prompt_foldable(item_text);
                 let prompt_expanded = self
                     .chat
                     .logs
@@ -1124,7 +1167,7 @@ impl Shell {
                             pane.get()
                         )))
                         .debug_selector(|| "chat-message-body".into()),
-                    &item.text,
+                    item_text,
                     &SegmentStyle {
                         pane,
                         session,
@@ -1195,17 +1238,7 @@ impl Shell {
                         )
                     }));
 
-                let time_badge = super::format_chat_timestamp(&item.at).map(|ts| {
-                    div()
-                        .id(SharedString::from(format!(
-                            "chat-time-{}-{abs_idx}",
-                            pane.get()
-                        )))
-                        .debug_selector(|| "chat-message-time".into())
-                        .text_size(ui::TEXT_2XS)
-                        .text_color(muted_fg)
-                        .child(ts)
-                });
+                let time_badge = Self::chat_message_time(pane, abs_idx, &item.at, muted_fg);
                 let reuse_button = (!item.text.trim().is_empty()).then(|| {
                     let reuse_text = krill_term::select::clean_text(&item.text);
                     let reuse_key = key.clone();
@@ -1214,54 +1247,51 @@ impl Shell {
                         pane.get()
                     )))
                     .debug_selector(|| "chat-reuse-item".into())
-                    .label(ctext::REUSE_PROMPT.get())
+                    .icon(IconName::Pencil)
                     .tooltip(ctext::REUSE_PROMPT.get())
+                    .accessibility_label(ctext::REUSE_PROMPT.get())
                     .ghost()
-                    .xsmall()
+                    .small()
+                    .text_color(muted_fg)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.reuse_chat_prompt(&reuse_key, &reuse_text, window, cx);
-                    }))
-                });
-                let fork_button = self.can_fork_pane(pane, cx).then(|| {
-                    Button::new(SharedString::from(format!(
-                        "chat-fork-{}-{abs_idx}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-fork-item".into())
-                    .label(ctext::FORK_SESSION.get())
-                    .tooltip(ctext::FORK_SESSION.get())
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.fork_pane_session(pane, cx);
                     }))
                 });
                 let has_meta = time_badge.is_some()
                     || open_file_button.is_some()
                     || copy_button.is_some()
                     || quote_button.is_some()
-                    || reuse_button.is_some()
-                    || fork_button.is_some();
+                    || reuse_button.is_some();
+                let meta_group =
+                    SharedString::from(format!("chat-user-row-{}-{abs_idx}", pane.get()));
+                // Orca's `UserMessageMeta`: Copy, the time, then its own action, shown on hover.
                 let user_col = div()
+                    .group(meta_group.clone())
                     .w_full()
                     .min_w_0()
                     .flex()
                     .flex_col()
                     .items_end()
-                    .gap_1()
+                    .gap_0p5()
                     .child(bubble)
                     .children(has_meta.then(|| {
                         div()
+                            .id(SharedString::from(format!(
+                                "chat-user-meta-{}-{abs_idx}",
+                                pane.get()
+                            )))
+                            .debug_selector(|| "chat-user-meta".into())
                             .flex()
                             .items_center()
                             .justify_end()
                             .gap_1()
-                            .children(time_badge)
-                            .children(open_file_button)
+                            .opacity(0.)
+                            .group_hover(meta_group.clone(), |s| s.opacity(1.))
                             .children(copy_button)
                             .children(quote_button)
+                            .children(time_badge)
+                            .children(open_file_button)
                             .children(reuse_button)
-                            .children(fork_button)
                     }));
 
                 return div()
@@ -1311,17 +1341,24 @@ impl Shell {
                     },
                     cx,
                 );
-                let time_badge = super::format_chat_timestamp(&item.at).map(|ts| {
-                    div()
-                        .id(SharedString::from(format!(
-                            "chat-time-{}-{abs_idx}",
-                            pane.get()
-                        )))
-                        .debug_selector(|| "chat-message-time".into())
-                        .text_size(ui::TEXT_2XS)
-                        .text_color(muted_fg)
-                        .child(ts)
-                });
+                let time_badge = Self::chat_message_time(pane, abs_idx, &item.at, muted_fg);
+                // Orca's `latestResponse`: the newest reply keeps its actions in view.
+                let latest_response = self
+                    .chat
+                    .logs
+                    .get(&key)
+                    .and_then(|log| log.cached_feed.as_ref())
+                    .and_then(|feed| {
+                        feed.rows().iter().rev().find_map(|row| match row {
+                            work_run::DisplayRow::Item { abs_idx, item }
+                                if item.kind == ChatItemKind::Assistant =>
+                            {
+                                Some(*abs_idx)
+                            }
+                            _ => None,
+                        })
+                    })
+                    == Some(abs_idx);
                 let show_footer = (!is_last_row
                     || agent_state != krill_proto::control::AgentState::Working)
                     && (time_badge.is_some()
@@ -1334,10 +1371,11 @@ impl Shell {
                 )))
                 .debug_selector(|| "chat-scroll-top".into())
                 .icon(IconName::ArrowUp)
-                .tooltip(ctext::SCROLL_TO_TOP.get())
-                .accessibility_label(ctext::SCROLL_TO_TOP.get())
+                .tooltip(ctext::SCROLL_MESSAGE_TO_TOP.get())
+                .accessibility_label(ctext::SCROLL_MESSAGE_TO_TOP.get())
                 .ghost()
-                .xsmall()
+                .small()
+                .text_color(muted_fg)
                 .on_click(cx.listener(move |_, _, _, cx| {
                     scroll_list.scroll_to(gpui::ListOffset {
                         item_ix: row_ix,
@@ -1345,10 +1383,33 @@ impl Shell {
                     });
                     cx.notify();
                 }));
+                // Orca forks "from this response" through its turn's end. Krill forks the whole
+                // session, which is that only on the latest response.
+                let fork_button = (latest_response && self.can_fork_pane(pane, cx)).then(|| {
+                    Button::new(SharedString::from(format!(
+                        "chat-fork-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-fork-item".into())
+                    .icon(IconName::GitFork)
+                    .tooltip(ctext::FORK_FROM_RESPONSE_TIP.get())
+                    .accessibility_label(ctext::FORK_FROM_RESPONSE.get())
+                    .ghost()
+                    .small()
+                    .text_color(muted_fg)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fork_pane_session(pane, cx);
+                    }))
+                });
+                let meta_group =
+                    SharedString::from(format!("chat-assistant-row-{}-{abs_idx}", pane.get()));
 
+                // Orca's `NativeChatAgentControls`: Copy, Fork, scroll to top, the time. Shown on
+                // the latest response, on hover elsewhere.
                 let assistant_el = div()
                     .id(SharedString::from(item_selector))
                     .debug_selector(move || debug_selector.clone())
+                    .group(meta_group.clone())
                     .w_full()
                     .min_w_0()
                     .flex()
@@ -1356,15 +1417,20 @@ impl Shell {
                     .child(body)
                     .children(show_footer.then(|| {
                         div()
-                            .mt_3()
+                            .mt_1()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .children(time_badge)
+                            .when(!latest_response, |d| {
+                                d.opacity(0.)
+                                    .group_hover(meta_group.clone(), |s| s.opacity(1.))
+                            })
                             .children(copy_button)
                             .children(quote_button)
+                            .children(fork_button)
                             .children(open_file_button)
                             .child(scroll_top_btn)
+                            .children(time_badge)
                     }));
 
                 return div()
@@ -2099,6 +2165,9 @@ impl Shell {
             (NoteAction::Linked(link), _) => ctext::NOTE_LINKED.get().replace("{link}", link),
             (NoteAction::Updated, false) => ctext::NOTE_UPDATED.get().to_owned(),
             (NoteAction::Updated, true) => ctext::NOTE_YOU_CHANGED.get().to_owned(),
+            // Drawn by `render_memory_note` and `render_create_offer`.
+            (NoteAction::Memory(receipt), _) => receipt.summary(),
+            (NoteAction::CreateOffer(offer), _) => offer.name.clone(),
             (NoteAction::Status(BotItemStatus::Working), false) => {
                 ctext::NOTE_STARTED.get().to_owned()
             }
@@ -2227,6 +2296,862 @@ impl Shell {
                                 )
                             }),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// Orca's `BotServerOutageCard` (the remote terminal's recovery card) for a bot on a remote host
+    /// that is down: retrying first, then Reconnect once retries stop. The chat stays as last read.
+    fn render_bot_outage_card(
+        &mut self,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let krill_app::hosts::HostId::Remote(host_id) = &key.0 else {
+            return None;
+        };
+        self.chat_bot(key)?;
+        let host_id = host_id.clone();
+        let (label, status) = self
+            .sidebar
+            .read(cx)
+            .remote_hosts()
+            .iter()
+            .find(|h| h.id == host_id)
+            .map(|h| (h.label.clone(), h.status))?;
+        if status == krill_app::hosts::HostStatus::Connected {
+            self.chat.outage_since.remove(&host_id);
+            return None;
+        }
+        let since = *self
+            .chat
+            .outage_since
+            .entry(host_id.clone())
+            .or_insert_with(std::time::Instant::now);
+        let stopped = status == krill_app::hosts::HostStatus::Disconnected;
+        let palette = ui::palette(cx);
+        let host = [("host", label.as_str())];
+        let (title, body) = if stopped {
+            (
+                ctext::SERVER_DOWN_TITLE.format(&host),
+                ctext::SERVER_DOWN_BODY.format(&host),
+            )
+        } else {
+            (
+                ctext::SERVER_RECONNECTING_TITLE.format(&host),
+                ctext::SERVER_RECONNECTING_BODY.get().to_owned(),
+            )
+        };
+        let secs = since.elapsed().as_secs();
+        let down_for = if secs < 60 {
+            ctext::SERVER_DOWN_SECS.format(&[("n", &secs.to_string())])
+        } else {
+            ctext::SERVER_DOWN_MINS.format(&[("n", &(secs / 60).to_string())])
+        };
+        let reconnect_host = key.0.clone();
+        Some(
+            div()
+                .flex_none()
+                .w_full()
+                .min_h(gpui::px(80.))
+                .px_3()
+                .pb_3()
+                .flex()
+                .items_end()
+                .justify_center()
+                .child(
+                    div()
+                        .id("chat-bot-server-outage")
+                        .debug_selector(|| "chat-bot-server-outage".into())
+                        .w_full()
+                        .max_w(gpui::px(576.))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .rounded(ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.card.opacity(0.95))
+                        .px_3()
+                        .py_3()
+                        .child(
+                            div()
+                                .size_8()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(ui::RADIUS_MD)
+                                .border_1()
+                                .border_color(palette.border)
+                                .bg(palette.muted)
+                                .text_color(palette.muted_foreground)
+                                .child(
+                                    gpui_component::Icon::new(if stopped {
+                                        IconName::ServerOff
+                                    } else {
+                                        IconName::LoaderCircle
+                                    })
+                                    .with_size(ui::ICON_LG),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_baseline()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(ui::TEXT_LG)
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(palette.card_foreground)
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .ml_auto()
+                                                .flex_none()
+                                                .text_size(ui::TEXT_SM)
+                                                .text_color(palette.muted_foreground)
+                                                .child(down_for),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .mt_0p5()
+                                        .text_size(ui::TEXT_SM)
+                                        .text_color(palette.muted_foreground)
+                                        .child(body),
+                                ),
+                        )
+                        .when(stopped, |card| {
+                            card.child(
+                                Button::new("chat-bot-server-reconnect")
+                                    .debug_selector(|| "chat-bot-server-reconnect".into())
+                                    .label(ctext::SERVER_RECONNECT.get())
+                                    .primary()
+                                    .small()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let host = reconnect_host.clone();
+                                        this.sidebar.update(cx, |sidebar, cx| {
+                                            sidebar.reconnect_host(host, cx);
+                                        });
+                                    })),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Orca's `BotPausedBanner`: across the top of a paused bot's page until it is resumed.
+    fn render_bot_paused_banner(
+        &self,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let bot = self.chat_bot(key).filter(|bot| bot.paused)?;
+        let bot_id = bot.id.clone();
+        let palette = ui::palette(cx);
+        Some(
+            div()
+                .id("chat-bot-paused-banner")
+                .debug_selector(|| "chat-bot-paused-banner".into())
+                .role(gpui::Role::Status)
+                .flex_none()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2p5()
+                .border_b_1()
+                .border_color(palette.warning.opacity(0.3))
+                .bg(palette.warning.opacity(0.1))
+                .py_1p5()
+                .pr_2()
+                .pl_3()
+                .text_size(ui::TEXT_SM)
+                .child(
+                    gpui_component::Icon::new(IconName::Pause)
+                        .with_size(ui::ICON_LG)
+                        .text_color(palette.warning),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(palette.foreground)
+                        .child(ctext::PAUSED_BANNER.get()),
+                )
+                .child(
+                    Button::new("chat-bot-paused-resume")
+                        .debug_selector(|| "chat-bot-paused-resume".into())
+                        .label(ctext::PAUSED_RESUME.get())
+                        .outline()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_bot_paused(bot_id.clone(), false, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Orca's `BotHomeBanner`: the bot's face and name in a pill over its Home chat; it opens the
+    /// bot's page in the right panel.
+    fn render_bot_home_banner(
+        &self,
+        pane: super::super::PaneId,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let bot = self
+            .chat_bot(key)
+            .filter(|bot| bot.home_session().is_some_and(|h| h.session_id == key.1))?;
+        let palette = ui::palette(cx);
+        let label = ctext::HOME_BANNER_LABEL.format(&[("name", bot.name.as_str())]);
+        Some(
+            div()
+                .absolute()
+                .top_2()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-bot-home-banner-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-bot-home-banner".into())
+                        .role(gpui::Role::Button)
+                        .aria_label(label)
+                        .tab_index(0)
+                        .cursor_pointer()
+                        .h_8()
+                        .max_w(gpui::relative(0.6))
+                        .pl_1()
+                        .pr_3()
+                        .rounded_full()
+                        .bg(palette.popover)
+                        .shadow_lg()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(ui::TEXT_LG)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(palette.popover_foreground)
+                        .child(self.bot_avatar(bot, 24., gpui::px(12.), palette))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .max_w(gpui::px(200.))
+                                .truncate()
+                                .child(bot.name.clone()),
+                        )
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // The chat is on its bot's page, so this opens that bot's panel.
+                            if this.panel_collapsed {
+                                this.toggle_panel(cx);
+                            }
+                            this.bot_ui.panel.tab = super::super::bot_panel::BotPanelTab::Home;
+                            this.bot_ui.panel.settings = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Orca's `NativeChatAutomationRunRow` for a turn a schedule started: "🕒 Scheduled · name",
+    /// the time on hover, and pressed, its instructions with Copy instructions.
+    fn render_scheduled_run(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        abs_idx: usize,
+        name: &str,
+        item: &ChatItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        let key = (self.layout.host(pane).clone(), session);
+        let open = self
+            .chat
+            .logs
+            .get(&key)
+            .is_some_and(|log| log.is_user_message_expanded(abs_idx));
+        let group = SharedString::from(format!("chat-scheduled-{}-{abs_idx}", pane.get()));
+        let time = Self::chat_message_time(pane, abs_idx, &item.at, muted);
+        let header = div()
+            .id(SharedString::from(format!(
+                "chat-scheduled-run-{}-{abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-scheduled-run".into())
+            .group(group.clone())
+            .role(gpui::Role::Button)
+            .aria_expanded(open)
+            .tab_index(0)
+            .cursor_pointer()
+            .w_full()
+            .min_w_0()
+            .min_h(gpui::px(24.))
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_size(ui::TEXT_LG)
+            .child(
+                gpui_component::Icon::new(IconName::Clock)
+                    .with_size(ui::ICON_LG)
+                    .text_color(muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .child(format!("{} · ", ctext::SCHEDULED_RUN.get())),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(palette.foreground)
+                            .child(name.to_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(!open, |d| {
+                        d.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.))
+                    })
+                    .child(
+                        gpui_component::Icon::new(if open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .with_size(ui::ICON_MD)
+                        .text_color(muted),
+                    )
+                    .children(time),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(log) = this
+                    .chat
+                    .logs
+                    .get_mut(&(this.layout.host(pane).clone(), session))
+                {
+                    log.toggle_user_message(abs_idx);
+                }
+                cx.notify();
+            }));
+        let prompt = item.text.trim().to_owned();
+        let card = open.then(|| {
+            let copy = prompt.clone();
+            div()
+                .ml_6()
+                .mt_1()
+                .rounded(ui::RADIUS_LG)
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.card)
+                .px_2()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .child(ctext::RUN_INSTRUCTIONS.get()),
+                )
+                .child(
+                    div()
+                        .text_size(ui::TEXT_LG)
+                        .text_color(palette.foreground)
+                        .child(prompt),
+                )
+                .child(
+                    div().mt_2().flex().child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "chat-scheduled-copy-{}-{abs_idx}",
+                                pane.get()
+                            )))
+                            .debug_selector(|| "chat-scheduled-copy".into())
+                            .cursor_pointer()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(muted)
+                            .underline()
+                            .hover(|s| s.text_color(palette.foreground))
+                            .child(ctext::COPY_INSTRUCTIONS.get())
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    copy.clone(),
+                                ));
+                            }),
+                    ),
+                )
+        });
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .children(card),
+            )
+            .into_any_element()
+    }
+
+    /// Orca's `NativeChatMessageTimestamp`: `오후 5:07` (yesterday, this year and older carry their
+    /// date), the full date and time on hover.
+    fn chat_message_time(
+        pane: super::super::PaneId,
+        abs_idx: usize,
+        at: &str,
+        color: gpui::Hsla,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let epoch = krill_proto::time::parse_reset_epoch(at.trim())?;
+        let epoch = if epoch > 10_000_000_000 {
+            epoch / 1_000
+        } else {
+            epoch
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())?;
+        let (short, full) = krill_app::chat_message_time(epoch, now)?;
+        let tip_id = format!("chat-time-{}-{abs_idx}", pane.get());
+        Some(
+            div()
+                .id(SharedString::from(tip_id.clone()))
+                .debug_selector(|| "chat-message-time".into())
+                .flex_none()
+                .whitespace_nowrap()
+                .text_size(ui::TEXT_SM)
+                .text_color(color)
+                .tooltip(move |window, cx| {
+                    ui::tooltip_view(tip_id.clone(), full.clone(), window, cx)
+                })
+                .child(short),
+        )
+    }
+
+    /// Orca's `NativeChatWorkingStatus` once a turn settles: the bot's face, "16s 작업 완료" and a
+    /// chevron that opens the work folded behind the answer, over a rule.
+    #[expect(clippy::too_many_arguments, reason = "turn bar row coordinates")]
+    fn render_turn_bar(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        user_abs_idx: usize,
+        worked_secs: u64,
+        folds: bool,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let key = (self.layout.host(pane).clone(), session);
+        let face = self
+            .chat_bot(&key)
+            .map(|bot| self.bot_avatar(bot, 24., ui::RADIUS_SM, palette));
+        let label =
+            ctext::WORKED_FOR.format(&[("time", &work_run::format_turn_duration(worked_secs))]);
+        let muted = palette.muted_foreground;
+        let line = div()
+            .id(SharedString::from(format!(
+                "chat-turn-bar-{}-{user_abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(move || format!("chat-turn-bar-{user_abs_idx}"))
+            .w_full()
+            .min_w_0()
+            .min_h(gpui::px(32.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .border_b_1()
+            .border_color(palette.border)
+            .text_size(ui::TEXT_LG)
+            .text_color(muted)
+            .children(face.map(|face| div().flex_none().mr_1().child(face)))
+            .child(div().min_w_0().truncate().child(label))
+            .when(folds, |line| {
+                line.role(gpui::Role::Button)
+                    .aria_label(ctext::TOGGLE_TURN_DETAILS.get())
+                    .aria_expanded(expanded)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(palette.foreground))
+                    .child(
+                        gpui_component::Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .with_size(ui::ICON_MD),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(log) = this
+                            .chat
+                            .logs
+                            .get_mut(&(this.layout.host(pane).clone(), session))
+                        {
+                            log.toggle_turn(user_abs_idx);
+                        }
+                        cx.notify();
+                    }))
+            });
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
+                    .child(line),
+            )
+            .into_any_element()
+    }
+
+    /// Orca's `NativeChatBotCreateOfferCard`: "New bot", the name and its purpose, then Not now and
+    /// Create bot. Created, it says so and opens the new bot.
+    fn render_create_offer(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        offer: &krill_proto::bots::BotOffer,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        let key = (self.layout.host(pane).clone(), session);
+        let created = offer
+            .created
+            .as_ref()
+            .and_then(|id| self.sidebar_bots.iter().find(|b| &b.id == id));
+        let face = match created {
+            Some(bot) => self.bot_avatar(bot, 32., ui::RADIUS_LG, palette),
+            None => krill_app::bots::avatar::render(
+                &offer_avatar(offer),
+                None,
+                &offer.name,
+                gpui::px(32.),
+                ui::RADIUS_LG,
+                palette,
+            ),
+        };
+        let status = if offer.created.is_some() {
+            Some((ctext::OFFER_CREATED.get(), palette.success))
+        } else if offer.dismissed {
+            Some((ctext::OFFER_DISMISSED.get(), muted))
+        } else {
+            None
+        };
+        let offer_id = offer.offer_id.clone();
+        let footer = if let Some(bot_id) = offer.created.clone() {
+            Some(
+                div().flex().justify_end().child(
+                    Button::new("chat-offer-open")
+                        .debug_selector(|| "chat-offer-open".into())
+                        .label(ctext::OFFER_OPEN.get())
+                        .outline()
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_bot_home(bot_id.clone(), None, cx);
+                        })),
+                ),
+            )
+        } else if offer.dismissed {
+            None
+        } else {
+            let (create_offer, dismiss_id, create_key) =
+                (offer.clone(), offer_id.clone(), key.clone());
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!("chat-offer-not-now-{offer_id}")))
+                            .debug_selector(|| "chat-offer-not-now".into())
+                            .label(ctext::OFFER_NOT_NOW.get())
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resolve_bot_offer(&dismiss_id, None, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("chat-offer-create-{offer_id}")))
+                            .debug_selector(|| "chat-offer-create".into())
+                            .label(ctext::OFFER_CREATE.get())
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.create_offered_bot(&create_key, &create_offer, cx);
+                            })),
+                    ),
+            )
+        };
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("chat-offer-{}", offer.offer_id)))
+                            .debug_selector(|| "chat-create-offer".into())
+                            .w_full()
+                            .min_w_0()
+                            .rounded(ui::RADIUS_XL)
+                            .border_1()
+                            .border_color(palette.border)
+                            .bg(palette.card)
+                            .text_size(ui::TEXT_LG)
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .p_3()
+                                    .child(div().flex_none().mt_0p5().child(face))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_baseline()
+                                                    .gap_x_2()
+                                                    .text_size(ui::TEXT_SM)
+                                                    .text_color(muted)
+                                                    .child(ctext::OFFER_HEADING.get())
+                                                    .children(status.map(|(text, color)| {
+                                                        div()
+                                                            .ml_auto()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_1p5()
+                                                            .text_color(color)
+                                                            .child(
+                                                                div()
+                                                                    .size_1p5()
+                                                                    .rounded_full()
+                                                                    .bg(color),
+                                                            )
+                                                            .child(text)
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(palette.foreground)
+                                                    .child(offer.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(ui::TEXT_SM)
+                                                    .text_color(muted)
+                                                    .child(offer.purpose.clone()),
+                                            ),
+                                    ),
+                            )
+                            .children(footer.map(|footer| {
+                                div()
+                                    .border_t_1()
+                                    .border_color(palette.border)
+                                    .px_3()
+                                    .py_2()
+                                    .child(footer)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Orca's `NativeChatMemoryUpdatedRow`: "Memory updated · 1 added >" and, opened, each change
+    /// with an Open memory link to the bot's Soul and memory settings.
+    fn render_memory_note(
+        &mut self,
+        pane: super::super::PaneId,
+        row_ix: usize,
+        at_ms: u64,
+        receipt: &work_run::MemoryReceipt,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        let open = self.chat.open_memory_notes.contains(&at_ms);
+        let label = |text: &'static str| {
+            div()
+                .flex_none()
+                .mr_2()
+                .text_size(ui::TEXT_SM)
+                .text_color(muted)
+                .child(text)
+        };
+        let fact_row = |lead: &'static str, text: &str, struck: bool| {
+            div()
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_baseline()
+                .child(label(lead))
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_color(palette.foreground)
+                        .when(struck, gpui::Styled::line_through)
+                        .child(text.to_owned()),
+                )
+        };
+        let trigger = div()
+            .id(SharedString::from(format!(
+                "chat-memory-note-{}-{row_ix}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-memory-note".into())
+            .role(gpui::Role::Button)
+            .aria_expanded(open)
+            .tab_index(0)
+            .cursor_pointer()
+            .max_w_full()
+            .py_0p5()
+            .flex()
+            .items_start()
+            .gap_1()
+            .text_size(ui::TEXT_LG)
+            .text_color(muted)
+            .hover(|s| s.text_color(palette.foreground))
+            .child(div().min_w_0().child(receipt.summary()))
+            .child(
+                div().flex_none().mt_1().child(
+                    gpui_component::Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .with_size(ui::ICON_MD),
+                ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.chat.open_memory_notes.remove(&at_ms) {
+                    this.chat.open_memory_notes.insert(at_ms);
+                }
+                cx.notify();
+            }));
+        let receipt_body = open.then(|| {
+            div()
+                .mt_1()
+                .py_1()
+                .pl_3()
+                .border_l_2()
+                .border_color(palette.border)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_size(ui::TEXT_LG)
+                .children(
+                    receipt
+                        .added
+                        .iter()
+                        .map(|fact| fact_row(ctext::MEMORY_ROW_ADDED.get(), fact, false)),
+                )
+                .children(
+                    receipt
+                        .removed
+                        .iter()
+                        .map(|fact| fact_row(ctext::MEMORY_ROW_REMOVED.get(), fact, true)),
+                )
+                .when(receipt.other_changes, |d| {
+                    d.child(
+                        div()
+                            .text_color(palette.foreground)
+                            .child(ctext::MEMORY_INDEX_CHANGED.get()),
+                    )
+                })
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-memory-open-{}-{row_ix}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-memory-open".into())
+                        .cursor_pointer()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .underline()
+                        .hover(|s| s.text_color(palette.foreground))
+                        .child(ctext::MEMORY_OPEN.get())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // The chat is on its bot's page, so its panel shows this bot.
+                            if this.panel_collapsed {
+                                this.toggle_panel(cx);
+                            }
+                            this.open_bot_settings_page(krill_app::bots::DetailTab::SoulMemory, cx);
+                        })),
+                )
+        });
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_2()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .child(trigger)
+                    .children(receipt_body),
             )
             .into_any_element()
     }
@@ -2452,6 +3377,14 @@ impl Shell {
 
         let host = self.layout.host(pane).clone();
         let agent_state = self.session_agent_state(&host, session, cx);
+        // A bot chat folds each settled turn behind its answer, as Orca's do.
+        let fold = self
+            .chat_bot(&key)
+            .is_some()
+            .then_some(agent_state == krill_proto::control::AgentState::Working);
+        if let Some(log) = self.chat.logs.get_mut(&key) {
+            log.set_turn_fold(fold);
+        }
         let unread = host.is_local() && self.sidebar.read(cx).is_unread(session);
         let poll_failed = self.chat.poll_failed.contains(&key);
 
@@ -2467,7 +3400,8 @@ impl Shell {
                             work_run::DisplayRow::Item { .. }
                             | work_run::DisplayRow::UnreadDivider { .. }
                             | work_run::DisplayRow::ItemNote { .. }
-                            | work_run::DisplayRow::Notice { .. } => None,
+                            | work_run::DisplayRow::Notice { .. }
+                            | work_run::DisplayRow::TurnBar { .. } => None,
                         })
                     } else {
                         None
@@ -2493,6 +3427,9 @@ impl Shell {
             self.ensure_question_other_input(&answer_key, window, cx);
         }
 
+        let home_pill = self
+            .chat_bot(&key)
+            .is_some_and(|bot| bot.home_session().is_some_and(|h| h.session_id == key.1));
         let mut feed = div()
             .id(SharedString::from(format!(
                 "desktop-chat-feed-{}",
@@ -2506,6 +3443,8 @@ impl Shell {
             .min_h_0()
             .overflow_hidden()
             .p_3()
+            // Orca: the transcript opens below the Home pill (8px + 32px), 48px down.
+            .when(home_pill, |d| d.pt(gpui::px(48.)))
             .flex()
             .flex_col()
             .gap_2();
@@ -2539,11 +3478,13 @@ impl Shell {
             .map(|bot| {
                 let avatar = self.bot_avatar(bot, 56., ui::RADIUS_XL, palette);
                 let name = [("name", bot.name.as_str())];
-                let subtitle = if bot.description.is_empty() {
-                    ctext::BOT_EMPTY_SUBTITLE.format(&name)
-                } else {
-                    bot.description.clone()
-                };
+                // Orca: the first paragraph of its SOUL.md, until then its own greeting.
+                let subtitle = self
+                    .chat
+                    .bot_souls
+                    .get(&bot.id)
+                    .cloned()
+                    .unwrap_or_else(|| ctext::BOT_EMPTY_SUBTITLE.format(&name));
                 (avatar, ctext::BOT_EMPTY_TITLE.format(&name), subtitle)
             });
         if display_feed.is_empty() && pending_len == 0 {
@@ -2588,7 +3529,7 @@ impl Shell {
                     .justify_center()
                     .items_center()
                     .gap_3()
-                    .p_4()
+                    .p_6()
                     .map(|empty| match persona {
                         // Orca: a chat in a bot's home greets as the bot (picture, name, SOUL.md line).
                         Some((avatar, title, subtitle)) => empty
@@ -2862,7 +3803,14 @@ impl Shell {
             }
         }
 
-        let composer = self.render_chat_composer(pane, key.clone(), &input_state, cx);
+        // Orca's `BotServerOutageCard` stands where the composer was while its server is down.
+        self.sync_chat_image_tokens(&key, &input_state, window, cx);
+        let composer = match self.render_bot_outage_card(&key, cx) {
+            Some(card) => card,
+            None => self.render_chat_composer(pane, key.clone(), &input_state, cx),
+        };
+        let paused_banner = self.render_bot_paused_banner(&key, cx);
+        let home_banner = self.render_bot_home_banner(pane, &key, cx);
 
         let live_line = (agent_state == krill_proto::control::AgentState::Working)
             .then(|| self.pane_live_status_line(pane))
@@ -3215,12 +4163,24 @@ impl Shell {
             .context_menu(move |menu, _, cx| {
                 super::super::terminal_menu::build_chat_overlay(menu, &overlay_weak, pane, cx)
             })
-            .child(feed)
-            .children(self.render_chat_prompt_notices(&key, cx))
-            .children(turn_status_line)
-            .child(composer)
-            .child(top_controls)
-            .children(find_bar);
+            // Orca: the paused banner spans the bot's page above the chat and its header controls.
+            .children(paused_banner)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(feed)
+                    .children(self.render_chat_prompt_notices(&key, cx))
+                    .children(turn_status_line)
+                    .child(composer)
+                    .children(home_banner)
+                    .child(top_controls)
+                    .children(find_bar),
+            );
 
         Some(
             div()
@@ -3256,5 +4216,28 @@ impl Shell {
                 .child(inner)
                 .into_any_element(),
         )
+    }
+}
+
+/// A proposed bot's picture: one of the mascots, the same for the same proposal (Orca draws a
+/// random mascot for it), which the bot keeps if it is created.
+fn offer_avatar(offer: &krill_proto::bots::BotOffer) -> krill_app::bots::avatar::Avatar {
+    use krill_app::bots::avatar::{Avatar, MASCOT_IDS};
+    let seed = offer.offer_id.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(usize::from(b))
+    });
+    Avatar::from_fields(
+        MASCOT_IDS.get(seed % MASCOT_IDS.len()).copied(),
+        None,
+        None,
+        &offer.name,
+    )
+}
+
+/// The mascot `offer_avatar` draws, as the avatar field a created bot stores.
+pub(super) fn offer_mascot(offer: &krill_proto::bots::BotOffer) -> Option<String> {
+    match offer_avatar(offer) {
+        krill_app::bots::avatar::Avatar::Mascot { id, .. } => Some(id.to_owned()),
+        _ => None,
     }
 }

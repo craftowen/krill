@@ -61,7 +61,7 @@ impl DisplayFeed {
         items: &[Arc<ChatItem>],
         unread_from: Option<usize>,
     ) -> Self {
-        Self::project_with_notes(base_index, items, unread_from, &[], &[])
+        Self::project_with_notes(base_index, items, unread_from, &[], &[], None)
     }
 
     /// Projects the transcript with a bot's item changes as lines between its turns (Orca's bot
@@ -74,6 +74,7 @@ impl DisplayFeed {
         unread_from: Option<usize>,
         notes: &[Arc<ItemNote>],
         turn_times: &[u64],
+        fold: Option<&TurnFold>,
     ) -> Self {
         let foldable = compute_foldable_notes(items);
         let mut rows = Vec::new();
@@ -142,6 +143,9 @@ impl DisplayFeed {
         if !notes.is_empty() {
             rows = interleave_notes(rows, notes, turn_times, base_index + items.len());
         }
+        if let Some(fold) = fold {
+            rows = fold_turns(rows, base_index, items, fold);
+        }
         if let Some(cutoff) = unread_from
             && cutoff > base_index
             && let Some(pos) = rows.iter().position(|r| r.span().end() > cutoff)
@@ -194,6 +198,15 @@ pub(super) enum DisplayRow {
         anchor_abs_idx: usize,
         note: Arc<ItemNote>,
     },
+    /// A settled turn's "16s 작업 완료 >" line under its prompt (Orca's `NativeChatWorkingStatus`):
+    /// pressing it shows the work folded behind the turn's answer.
+    TurnBar {
+        user_abs_idx: usize,
+        worked_secs: u64,
+        /// Whether anything is folded behind it (no chevron otherwise).
+        folds: bool,
+        expanded: bool,
+    },
 }
 
 impl DisplayRow {
@@ -203,6 +216,7 @@ impl DisplayRow {
             Self::WorkRun(run) => run.span,
             Self::UnreadDivider { first_abs_idx } => RawSpan::single(*first_abs_idx),
             Self::ItemNote { anchor_abs_idx, .. } => RawSpan::single(*anchor_abs_idx),
+            Self::TurnBar { user_abs_idx, .. } => RawSpan::single(*user_abs_idx),
         }
     }
 }
@@ -222,6 +236,169 @@ pub(crate) enum NoteAction {
     Linked(String),
     Status(krill_proto::bots::BotItemStatus),
     Updated,
+    /// The bot's `MEMORY.md` changed (Orca's `NativeChatMemoryUpdatedRow`).
+    Memory(MemoryReceipt),
+    /// The bot proposed a new bot (Orca's `NativeChatBotCreateOfferCard`).
+    CreateOffer(Box<krill_proto::bots::BotOffer>),
+}
+
+/// What a memory change added and removed, as its chat line's receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MemoryReceipt {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Lines other than facts changed too (Orca's "MEMORY.md changed").
+    pub other_changes: bool,
+}
+
+impl MemoryReceipt {
+    /// Orca's `botMemoryUpdatedSummary`: "· 1 added, 2 removed", or "· N changes" past two kinds.
+    pub(crate) fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(ctext::MEMORY_ADDED_COUNT.format(&[("n", &self.added.len().to_string())]));
+        }
+        if !self.removed.is_empty() {
+            parts.push(
+                ctext::MEMORY_REMOVED_COUNT.format(&[("n", &self.removed.len().to_string())]),
+            );
+        }
+        let count = self.added.len() + self.removed.len() + usize::from(self.other_changes);
+        let tail = if self.other_changes || parts.len() > 2 {
+            ctext::MEMORY_CHANGE_COUNT.format(&[("n", &count.to_string())])
+        } else {
+            parts.join(", ")
+        };
+        if tail.is_empty() {
+            ctext::MEMORY_UPDATED.get().to_owned()
+        } else {
+            format!("{} · {tail}", ctext::MEMORY_UPDATED.get())
+        }
+    }
+}
+
+/// Which settled turns fold their work behind a "Worked for" line (bot chats, as Orca's do).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct TurnFold {
+    /// The last turn is still running: it keeps its work in view.
+    pub live: bool,
+    /// Prompts (absolute indices) whose turns the reader opened.
+    pub expanded: BTreeSet<usize>,
+}
+
+fn item_epoch_secs(item: &ChatItem) -> Option<u64> {
+    let raw = item.at.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed = u64::try_from(krill_proto::time::parse_reset_epoch(raw)?).ok()?;
+    Some(if parsed > 10_000_000_000 {
+        parsed / 1_000
+    } else {
+        parsed
+    })
+}
+
+/// Orca's turn fold: under each settled prompt a "Worked for" line, and unless opened, the turn's
+/// work runs and its earlier replies hidden behind its last reply (the answer).
+fn fold_turns(
+    rows: Vec<DisplayRow>,
+    base_index: usize,
+    items: &[Arc<ChatItem>],
+    fold: &TurnFold,
+) -> Vec<DisplayRow> {
+    let users: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, row)| match row {
+            DisplayRow::Item { item, .. } if item.kind == ChatItemKind::User => Some(pos),
+            _ => None,
+        })
+        .collect();
+    if users.is_empty() {
+        return rows;
+    }
+    let mut out = Vec::with_capacity(rows.len() + users.len());
+    let mut rows = rows.into_iter().enumerate().peekable();
+    // Rows before the first prompt stay as they are.
+    while let Some((_, row)) = rows.next_if(|(pos, _)| *pos < users[0]) {
+        out.push(row);
+    }
+    for turn in 0..users.len() {
+        let next_user = users.get(turn + 1).copied().unwrap_or(usize::MAX);
+        let Some((_, user_row)) = rows.next() else {
+            break;
+        };
+        let user_abs = user_row.span().start();
+        let mut body: Vec<DisplayRow> = Vec::new();
+        while let Some((_, row)) = rows.next_if(|(pos, _)| *pos < next_user) {
+            body.push(row);
+        }
+        let last_turn = turn + 1 == users.len();
+        let raw_end = body
+            .iter()
+            .map(|r| r.span().end())
+            .max()
+            .unwrap_or(user_abs + 1);
+        let worked = (!(last_turn && fold.live))
+            .then(|| {
+                let at = |abs: usize| {
+                    abs.checked_sub(base_index)
+                        .and_then(|rel| items.get(rel))
+                        .and_then(|item| item_epoch_secs(item))
+                };
+                let start = at(user_abs)?;
+                let end = (user_abs + 1..raw_end).rev().find_map(at)?;
+                Some(end.saturating_sub(start))
+            })
+            .flatten();
+        out.push(user_row);
+        let Some(worked_secs) = worked else {
+            out.extend(body);
+            continue;
+        };
+        let answer = body.iter().rposition(
+            |r| matches!(r, DisplayRow::Item { item, .. } if item.kind == ChatItemKind::Assistant),
+        );
+        let folded = |pos: usize, row: &DisplayRow| match row {
+            DisplayRow::WorkRun(_) => true,
+            DisplayRow::Item { item, .. } => {
+                item.kind == ChatItemKind::Assistant && Some(pos) != answer
+            }
+            DisplayRow::UnreadDivider { .. }
+            | DisplayRow::ItemNote { .. }
+            | DisplayRow::Notice { .. }
+            | DisplayRow::TurnBar { .. } => false,
+        };
+        let folds = body.iter().enumerate().any(|(pos, row)| folded(pos, row));
+        let expanded = fold.expanded.contains(&user_abs);
+        out.push(DisplayRow::TurnBar {
+            user_abs_idx: user_abs,
+            worked_secs,
+            folds,
+            expanded,
+        });
+        out.extend(
+            body.into_iter()
+                .enumerate()
+                .filter(|(pos, row)| expanded || !folded(*pos, row))
+                .map(|(_, row)| row),
+        );
+    }
+    out.extend(rows.map(|(_, row)| row));
+    out
+}
+
+/// Orca's `formatNativeChatDuration`: `16s`, `2m 5s`, `1h 3m 0s`.
+pub(super) fn format_turn_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        return format!("{minutes}m {}s", secs % 60);
+    }
+    format!("{}h {}m {}s", minutes / 60, minutes % 60, secs % 60)
 }
 
 /// One change to a bot's item shown in its chat.

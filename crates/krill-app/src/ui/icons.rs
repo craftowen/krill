@@ -63,6 +63,8 @@ pub const BOT_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="curr
 
 /// Lucide `image` 아이콘 SVG(ISC License). 채팅 첨부 이미지(Orca 이미지 알약·타일) 전용.
 pub const IMAGE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>"#;
+/// Lucide `image-off`: a composer image chip whose image was removed (Orca `ImageOff`).
+pub const IMAGE_OFF_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><line x1="2" x2="22" y1="2" y2="22"/><path d="M10.41 10.41a2 2 0 1 1-2.83-2.83"/><line x1="13.5" x2="6" y1="13.5" y2="21"/><line x1="18" x2="21" y1="12" y2="15"/><path d="M3.59 3.59A1.99 1.99 0 0 0 3 5v14a2 2 0 0 0 2 2h14c.55 0 1.052-.22 1.41-.59"/><path d="M21 15V5a2 2 0 0 0-2-2H9"/></svg>"#;
 
 /// Lucide `folder` 아이콘 SVG(ISC License). 봇 채팅·설정(Orca 봇 화면) 전용.
 pub const FOLDER_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>"#;
@@ -839,6 +841,14 @@ mod tests {
             IconName::House,
             IconName::LayoutGrid,
             IconName::Files,
+            // Bot chat: message row actions, paused banner, image viewer zoom.
+            IconName::Copy,
+            IconName::GitFork,
+            IconName::Quote,
+            IconName::ZoomIn,
+            IconName::ZoomOut,
+            IconName::ServerOff,
+            IconName::ArrowLeftRight,
         ] {
             let path = icon.path();
             assert!(
@@ -858,6 +868,7 @@ gpui_kit_assets::icon_assets!(
     [
         AlarmClock,
         AlarmClockOff,
+        ArrowLeftRight,
         ArrowUpRight,
         AtSign,
         Bell,
@@ -892,6 +903,7 @@ gpui_kit_assets::icon_assets!(
         Folder,
         FolderOpen,
         Gauge,
+        GitFork,
         GitPullRequest,
         Globe,
         House,
@@ -923,10 +935,12 @@ gpui_kit_assets::icon_assets!(
         Play,
         Plug,
         Plus,
+        Quote,
         RefreshCw,
         Rocket,
         Search,
         Server,
+        ServerOff,
         Settings,
         Shapes,
         Share2,
@@ -944,6 +958,8 @@ gpui_kit_assets::icon_assets!(
         UserPlus,
         Wrench,
         X,
+        ZoomIn,
+        ZoomOut,
     ]
 );
 

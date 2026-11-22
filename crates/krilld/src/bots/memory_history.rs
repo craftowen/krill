@@ -44,6 +44,59 @@ pub(crate) fn record_change(
     timestamp_ms: u64,
     undoable: bool,
 ) -> io::Result<Option<BotMemoryHistoryEntry>> {
+    record_entry(
+        bot_home,
+        bot_id,
+        (actor, action),
+        before,
+        after,
+        timestamp_ms,
+        undoable,
+        None,
+    )
+}
+
+/// Records the net `MEMORY.md` edit a bot's turn made in chat `session` (Orca's turn memory
+/// receipt), unless an RPC edit already recorded the same result.
+pub(crate) fn record_turn_change(
+    bot_home: &Path,
+    bot_id: &BotId,
+    session: u64,
+    before: &str,
+    after: &str,
+    timestamp_ms: u64,
+) -> io::Result<Option<BotMemoryHistoryEntry>> {
+    let latest = list_history(bot_home, Some(1))?;
+    if latest.first().is_some_and(|e| e.after_content == after) {
+        return Ok(None);
+    }
+    let actor = format!("bot:{}", bot_id.as_str());
+    record_entry(
+        bot_home,
+        bot_id,
+        (&actor, "turn"),
+        before,
+        after,
+        timestamp_ms,
+        true,
+        Some(session),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "memory change audit diff parameters"
+)]
+fn record_entry(
+    bot_home: &Path,
+    bot_id: &BotId,
+    (actor, action): (&str, &str),
+    before: &str,
+    after: &str,
+    timestamp_ms: u64,
+    undoable: bool,
+    session_id: Option<u64>,
+) -> io::Result<Option<BotMemoryHistoryEntry>> {
     if before == after {
         return Ok(None);
     }
@@ -54,7 +107,11 @@ pub(crate) fn record_change(
 
     let (added, removed) = compute_fact_diff(before, after);
     let seq = ENTRY_SEQ.fetch_add(1, Ordering::Relaxed);
-    let prefix = if action == "tidy" { "tidy" } else { "mem" };
+    let prefix = match (session_id, action) {
+        (Some(session), _) => format!("turn-s{session}"),
+        (None, "tidy") => "tidy".to_owned(),
+        (None, _) => "mem".to_owned(),
+    };
     let entry = BotMemoryHistoryEntry {
         entry_id: format!("{prefix}-{timestamp_ms}-{seq}"),
         bot_id: bot_id.clone(),
@@ -473,6 +530,30 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_turns_own_edit_is_recorded_once_with_its_chat() {
+        let home = temp_home("turn");
+        let bot = BotId::new("turn-bot").unwrap();
+        let before = "# Memory\n\n- 2026-11-10 Fact A\n";
+        let after = "# Memory\n\n- 2026-11-10 Fact A\n- 2026-11-22 Fact B\n";
+        let entry = record_turn_change(&home, &bot, 42, before, after, 5_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.turn_session(), Some(42));
+        assert_eq!(entry.action, "turn");
+        assert_eq!(entry.actor, "bot:turn-bot");
+        assert_eq!(entry.added, vec!["Fact B".to_owned()]);
+        // The same result already in history (an RPC append, or the same turn twice) is not said again.
+        assert!(
+            record_turn_change(&home, &bot, 42, before, after, 6_000)
+                .unwrap()
+                .is_none()
+        );
+        let listed = list_history(&home, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].turn_session(), Some(42));
     }
 
     #[test]

@@ -923,6 +923,17 @@ where
             };
             format::format_item_detail(&item, json)
         }
+        BotCommand::Offer { bot, name, purpose } => {
+            let bot_id = resolve_bot_id(client, &bot)?;
+            match client.call(BotRpcRequest::OfferBot {
+                bot_id,
+                name,
+                purpose,
+            })? {
+                BotRpcResponse::Text(message) => Ok(format!("{message}\n")),
+                _ => Err(CliError::fail("unexpected reply for OfferBot")),
+            }
+        }
         BotCommand::Reply {
             bot,
             text,

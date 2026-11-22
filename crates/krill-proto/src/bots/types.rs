@@ -1268,6 +1268,25 @@ pub struct BotItemsPage {
     pub unseen_count: usize,
 }
 
+/// A new bot one bot proposed in its chat (Orca's create offer card).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotOffer {
+    pub offer_id: String,
+    /// The bot that proposed it.
+    pub bot_id: BotId,
+    /// The chat it was proposed in.
+    #[serde(default)]
+    pub session_id: Option<u64>,
+    pub name: String,
+    pub purpose: String,
+    pub offered_at_ms: u64,
+    /// Set once the owner answered: the bot made from it, or dismissed.
+    #[serde(default)]
+    pub created: Option<BotId>,
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
 /// Single audit diff entry in a bot's `MEMORY.md` change history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotMemoryHistoryEntry {
@@ -1288,6 +1307,16 @@ pub struct BotMemoryHistoryEntry {
     pub undoable: bool,
     #[serde(default)]
     pub undone: bool,
+}
+
+impl BotMemoryHistoryEntry {
+    /// The chat whose turn made this edit itself (krilld writes its id into the entry id as
+    /// `turn-s<session>-…`, which keeps the wire struct unchanged); `None` for other edits.
+    #[must_use]
+    pub fn turn_session(&self) -> Option<u64> {
+        let rest = self.entry_id.strip_prefix("turn-s")?;
+        rest.split('-').next()?.parse().ok()
+    }
 }
 
 /// Runtime status of automatic and manual `MEMORY.md` tidy-up.

@@ -27,6 +27,7 @@ pub mod layout;
 pub mod link;
 pub mod link_ui;
 pub(crate) mod local_time;
+pub use local_time::chat_message_time;
 pub mod machines;
 pub mod menu_bar;
 pub mod onboarding;

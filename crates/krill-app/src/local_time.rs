@@ -108,6 +108,82 @@ pub(crate) fn format_clock(epoch: i64) -> Option<String> {
     Some(format!("{:02}:{:02}", local.hour, local.minute))
 }
 
+/// Orca's chat message time (`getNativeChatMessageTimeFormatter`): today `오후 5:07`, yesterday
+/// `어제 오후 5:07`, this year `1월 15일 오후 5:07`, older with the year. The second string is the
+/// full label its tooltip shows.
+pub fn chat_message_time(epoch: i64, now: i64) -> Option<(String, String)> {
+    if !(MIN_YEAR_EPOCH..=MAX_YEAR_EPOCH).contains(&epoch) {
+        return None;
+    }
+    let offset = crate::platform::local_utc_offset_secs(epoch, civil_from_epoch(epoch)?)?;
+    let now_offset = crate::platform::local_utc_offset_secs(now, civil_from_epoch(now)?)?;
+    chat_message_time_at(epoch, offset, now, now_offset)
+}
+
+fn chat_message_time_at(
+    epoch: i64,
+    offset: i32,
+    now: i64,
+    now_offset: i32,
+) -> Option<(String, String)> {
+    use crate::i18n::catalog::chat as text;
+    let at = local_civil(epoch, offset)?;
+    let today = local_civil(now, now_offset)?;
+    let yesterday = local_civil(now.checked_sub(SECONDS_PER_DAY)?, now_offset)?;
+    let hour12 = match at.hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    let clock = if at.hour < 12 {
+        &text::MESSAGE_CLOCK_AM
+    } else {
+        &text::MESSAGE_CLOCK_PM
+    }
+    .format(&[
+        ("h", &hour12.to_string()),
+        ("m", &format!("{:02}", at.minute)),
+    ]);
+    let month = text::MESSAGE_MONTHS
+        .get()
+        .split(',')
+        .nth(usize::from(at.month).checked_sub(1)?)?;
+    let (year, day) = (at.year.to_string(), at.day.to_string());
+    let same_day =
+        |a: CivilTime, b: CivilTime| (a.year, a.month, a.day) == (b.year, b.month, b.day);
+    let short = if same_day(at, today) {
+        clock.clone()
+    } else if same_day(at, yesterday) {
+        text::MESSAGE_TIME_YESTERDAY.format(&[("time", &clock)])
+    } else if at.year == today.year {
+        text::MESSAGE_DATE.format(&[("month", month), ("day", &day), ("time", &clock)])
+    } else {
+        text::MESSAGE_DATE_YEAR.format(&[
+            ("year", &year),
+            ("month", month),
+            ("day", &day),
+            ("time", &clock),
+        ])
+    };
+    // 1970-01-01 was a Thursday.
+    let weekday = usize::try_from(
+        (epoch
+            .checked_add(i64::from(offset))?
+            .div_euclid(SECONDS_PER_DAY)
+            + 4)
+        .rem_euclid(7),
+    )
+    .ok()?;
+    let weekday = text::MESSAGE_WEEKDAYS.get().split(',').nth(weekday)?;
+    let full = text::MESSAGE_FULL.format(&[
+        ("year", &year),
+        ("month", month),
+        ("day", &day),
+        ("weekday", weekday),
+        ("time", &clock),
+    ]);
+    Some((short, full))
+}
+
 fn local_civil(epoch: i64, offset_secs: i32) -> Option<CivilTime> {
     if !(-86_400..=86_400).contains(&offset_secs) {
         return None;
@@ -139,6 +215,47 @@ fn format_with_offset(epoch: i64, offset_secs: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_message_time_reads_like_orca() {
+        // 2027-01-15 17:07 KST.
+        let at = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 1,
+            day: 15,
+            hour: 8,
+            minute: 7,
+            second: 0,
+        })
+        .unwrap();
+        let kst = 9 * 3_600;
+        let same_day = chat_message_time_at(at, kst, at + 600, kst).unwrap();
+        assert_eq!(same_day.0, "오후 5:07");
+        assert_eq!(same_day.1, "2027년 1월 15일 금요일 오후 5:07");
+        assert_eq!(
+            chat_message_time_at(at, kst, at + 86_400, kst).unwrap().0,
+            "어제 오후 5:07"
+        );
+        assert_eq!(
+            chat_message_time_at(at, kst, at + 30 * 86_400, kst)
+                .unwrap()
+                .0,
+            "1월 15일 오후 5:07"
+        );
+        assert_eq!(
+            chat_message_time_at(at, kst, at + 400 * 86_400, kst)
+                .unwrap()
+                .0,
+            "2027년 1월 15일 오후 5:07"
+        );
+        // Midnight and noon on a 12-hour clock.
+        assert_eq!(
+            chat_message_time_at(at - 8 * 3_600 - 420 - i64::from(kst), kst, at, kst)
+                .unwrap()
+                .0,
+            "오전 12:00"
+        );
+    }
 
     #[test]
     fn local_dates_cross_midnight_and_support_fractional_offsets() {
