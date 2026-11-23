@@ -89,6 +89,20 @@ pub trait ConnectorBridge: Send + Sync {
     fn dispatch_external_message(&self, msg: InboundExternalMessage)
     -> io::Result<DispatchOutcome>;
 
+    /// Routes an authorized inbound external message with pre-delivery registration and rollback
+    /// hooks so the caller can register its active turn BEFORE async `bot-preamble` delivery runs
+    /// and cleanly roll back BEFORE queued turns are drained on synchronous delivery failure.
+    fn dispatch_external_message_with_hooks(
+        &self,
+        msg: InboundExternalMessage,
+        on_bound: &mut dyn FnMut(SessionId),
+        _on_rollback: &mut dyn FnMut(SessionId),
+    ) -> io::Result<DispatchOutcome> {
+        let outcome = self.dispatch_external_message(msg)?;
+        on_bound(outcome.session_id);
+        Ok(outcome)
+    }
+
     /// Verifies sender allow-lists / approved members, or creates a pending [`BotAccessRequest`].
     fn check_or_request_access(
         &self,

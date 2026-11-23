@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,6 +139,7 @@ impl GateCallbackOutcome {
 
 #[derive(Debug, Clone)]
 struct ActiveTurnState {
+    turn_id: u64,
     source: ExternalSource,
     target: DeliveryTarget,
     last_inbound_message_id: Option<String>,
@@ -163,6 +165,7 @@ pub struct ConversationRouter {
     bridge: Arc<dyn ConnectorBridge>,
     senders: Arc<Mutex<SenderMap>>,
     active_turns: Mutex<BTreeMap<(BotId, SessionId), VecDeque<ActiveTurnState>>>,
+    next_turn_id: AtomicU64,
     link_last_inbound: Mutex<BTreeMap<String, String>>,
     pending_notice_throttle: Mutex<BTreeMap<ThrottleKey, u64>>,
     held_messages: Mutex<BTreeMap<String, HeldInboundMessage>>,
@@ -186,6 +189,7 @@ impl ConversationRouter {
             bridge,
             senders: Arc::new(Mutex::new(BTreeMap::new())),
             active_turns: Mutex::new(BTreeMap::new()),
+            next_turn_id: AtomicU64::new(1),
             link_last_inbound: Mutex::new(BTreeMap::new()),
             pending_notice_throttle: Mutex::new(BTreeMap::new()),
             held_messages: Mutex::new(BTreeMap::new()),
@@ -262,6 +266,10 @@ impl ConversationRouter {
             .unwrap_or(InboundRouteOutcome::Denied)
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "forwards owned DeliveryTarget from public handle_inbound_message* APIs"
+    )]
     fn handle_inbound_message_at_with_loader<F>(
         &self,
         mut msg: InboundExternalMessage,
@@ -372,7 +380,7 @@ impl ConversationRouter {
 
         Some(self.dispatch_allowed_message(
             msg,
-            target,
+            &target,
             Some(sender),
             &bot.name,
             bot.notifications.could_not_finish,
@@ -468,7 +476,7 @@ impl ConversationRouter {
             if should_dispatch {
                 self.dispatch_allowed_message(
                     held.msg,
-                    held.target,
+                    &held.target,
                     sender_opt.as_deref(),
                     &bot.name,
                     bot.notifications.could_not_finish,
@@ -485,7 +493,7 @@ impl ConversationRouter {
     fn dispatch_allowed_message(
         &self,
         msg: InboundExternalMessage,
-        target: DeliveryTarget,
+        target: &DeliveryTarget,
         sender: Option<&dyn PlatformSender>,
         bot_name: &str,
         notify_could_not_finish: bool,
@@ -502,7 +510,7 @@ impl ConversationRouter {
             let category = classify_error(&err.to_string());
             if notify_could_not_finish && let Some(s) = sender {
                 let safe = user_safe_error_message(category, bot_name);
-                send_chunked(s, &target, &safe).ok();
+                send_chunked(s, target, &safe).ok();
             }
             return InboundRouteOutcome::Error(category);
         }
@@ -510,7 +518,45 @@ impl ConversationRouter {
         let bot_id = msg.bot_id.clone();
         let source = msg.source;
         let inbound_msg_id = msg.external_message_id.clone();
-        match self.bridge.dispatch_external_message(msg) {
+        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+        let registered_sid = std::cell::Cell::new(None::<SessionId>);
+        let mut on_bound = |sid: SessionId| {
+            if registered_sid.get().is_some() {
+                return;
+            }
+            let mut turns = lock(&self.active_turns);
+            let queue = turns.entry((bot_id.clone(), sid)).or_default();
+            if queue.len() >= 64 {
+                queue.pop_front();
+            }
+            queue.push_back(ActiveTurnState {
+                turn_id,
+                source,
+                target: target.clone(),
+                last_inbound_message_id: inbound_msg_id.clone(),
+                status_message_id: None,
+                last_activity_at_ms: None,
+                last_activity_text: None,
+            });
+            registered_sid.set(Some(sid));
+        };
+        let mut on_rollback = |sid: SessionId| {
+            if registered_sid.get() == Some(sid) {
+                registered_sid.set(None);
+                let mut turns = lock(&self.active_turns);
+                let key = (bot_id.clone(), sid);
+                if let Some(queue) = turns.get_mut(&key) {
+                    queue.retain(|t| t.turn_id != turn_id);
+                    if queue.is_empty() {
+                        turns.remove(&key);
+                    }
+                }
+            }
+        };
+        match self
+            .bridge
+            .dispatch_external_message_with_hooks(msg, &mut on_bound, &mut on_rollback)
+        {
             Ok(outcome) => {
                 if let Some(ref ext_id) = inbound_msg_id {
                     let mut links = lock(&self.link_last_inbound);
@@ -522,26 +568,19 @@ impl ConversationRouter {
                     }
                     links.insert(outcome.link.id.clone(), ext_id.clone());
                 }
-                let mut turns = lock(&self.active_turns);
-                let queue = turns.entry((bot_id, outcome.session_id)).or_default();
-                if queue.len() >= 64 {
-                    queue.pop_front();
+                if registered_sid.get().is_none() {
+                    on_bound(outcome.session_id);
                 }
-                queue.push_back(ActiveTurnState {
-                    source,
-                    target,
-                    last_inbound_message_id: inbound_msg_id,
-                    status_message_id: None,
-                    last_activity_at_ms: None,
-                    last_activity_text: None,
-                });
                 InboundRouteOutcome::Dispatched(outcome)
             }
             Err(err) => {
+                if let Some(sid) = registered_sid.get() {
+                    on_rollback(sid);
+                }
                 let category = classify_error(&err.to_string());
                 if notify_could_not_finish && let Some(s) = sender {
                     let safe = user_safe_error_message(category, bot_name);
-                    send_chunked(s, &target, &safe).ok();
+                    send_chunked(s, target, &safe).ok();
                 }
                 InboundRouteOutcome::Error(category)
             }
@@ -679,13 +718,14 @@ impl ConversationRouter {
             state.last_activity_at_ms = Some(ts_ms);
             state.last_activity_text = Some(status_text.clone());
             (
+                state.turn_id,
                 state.source,
                 state.target.clone(),
                 state.status_message_id.clone(),
             )
         };
 
-        let (source, target, existing_msg_id) = plan;
+        let (captured_turn_id, source, target, existing_msg_id) = plan;
         let Some(sender) = self.sender_for(bot_id, source) else {
             return;
         };
@@ -701,6 +741,7 @@ impl ConversationRouter {
         } else if let Ok(new_msg_id) = sender.send_message(&target, &status_text) {
             let mut turns = lock(&self.active_turns);
             if let Some(state) = turns.get_mut(&key).and_then(VecDeque::front_mut)
+                && state.turn_id == captured_turn_id
                 && state.status_message_id.is_none()
             {
                 state.status_message_id = Some(new_msg_id);
@@ -2177,6 +2218,118 @@ mod tests {
         assert_eq!(
             dispatched_after.last().unwrap().attachments,
             vec!["/tmp/inbox/doc.pdf".to_owned()]
+        );
+    }
+
+    #[test]
+    fn r2m16_turn_activity_toctou_never_contaminates_next_turn_status_message_id() {
+        struct RacingSender {
+            router: Mutex<Option<Arc<ConversationRouter>>>,
+            bot_id: BotId,
+            session_id: SessionId,
+            edited: Mutex<Vec<(String, String)>>,
+        }
+        impl PlatformSender for RacingSender {
+            fn source(&self) -> ExternalSource {
+                ExternalSource::Telegram
+            }
+            fn max_chunk_chars(&self) -> usize {
+                4000
+            }
+            fn send_message(&self, _target: &DeliveryTarget, text: &str) -> io::Result<String> {
+                if text == "Turn 1 working"
+                    && let Some(r) = lock(&self.router).as_ref().cloned()
+                {
+                    // Simulate Turn 1 completing while Turn 1's send_message HTTP call is in flight!
+                    r.on_turn_complete(&self.bot_id, self.session_id, None);
+                }
+                Ok(format!("msg-for-{text}"))
+            }
+            fn edit_message(
+                &self,
+                _target: &DeliveryTarget,
+                message_id: &str,
+                text: &str,
+            ) -> io::Result<()> {
+                lock(&self.edited).push((message_id.to_owned(), text.to_owned()));
+                Ok(())
+            }
+        }
+
+        let bot_id = BotId::new("bot-r2m16").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "RaceBot", "claude", 1_000).unwrap();
+        bot.connectors.telegram.enabled = true;
+        bot.connectors.telegram.acts_for = ActsFor::Anyone;
+
+        let bridge = Arc::new(MockBridge {
+            bot: Mutex::new(bot),
+            decision: Mutex::new(AccessDecision::Allowed),
+            dispatched: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+        });
+        let router = Arc::new(ConversationRouter::new(bridge));
+        let sender = Arc::new(RacingSender {
+            router: Mutex::new(Some(Arc::clone(&router))),
+            bot_id: bot_id.clone(),
+            session_id: SessionId(9),
+            edited: Mutex::new(Vec::new()),
+        });
+        router.register_sender(bot_id.clone(), ExternalSource::Telegram, sender.clone());
+
+        let mk = |mid: &str| {
+            (
+                InboundExternalMessage {
+                    bot_id: bot_id.clone(),
+                    source: ExternalSource::Telegram,
+                    workspace_id: None,
+                    channel_id: "c1".to_owned(),
+                    thread_id: None,
+                    sender_id: "u1".to_owned(),
+                    sender_name: "Alice".to_owned(),
+                    text: mid.to_owned(),
+                    attachments: Vec::new(),
+                    external_message_id: Some(mid.to_owned()),
+                    acts_for: ActsFor::Owner,
+                },
+                DeliveryTarget {
+                    source: ExternalSource::Telegram,
+                    workspace_id: None,
+                    channel_id: "c1".to_owned(),
+                    thread_id: None,
+                    reply_to_message_id: Some(mid.to_owned()),
+                },
+            )
+        };
+        let (m1, t1) = mk("m1");
+        let (m2, t2) = mk("m2");
+        assert!(matches!(
+            router.handle_inbound_message(m1, t1, sender.as_ref()),
+            InboundRouteOutcome::Dispatched(_)
+        ));
+        assert!(matches!(
+            router.handle_inbound_message(m2, t2, sender.as_ref()),
+            InboundRouteOutcome::Dispatched(_)
+        ));
+
+        // Turn 1's send_message triggers Turn 1 completion mid-flight -> Turn 2 moves to front.
+        router.on_turn_activity_at(&bot_id, SessionId(9), "Turn 1 working", 10_000);
+
+        // Turn 2's status_message_id MUST still be None (never polluted with Turn 1's msg id).
+        {
+            let turns = lock(&router.active_turns);
+            let q = turns.get(&(bot_id.clone(), SessionId(9))).unwrap();
+            assert_eq!(q.len(), 1);
+            assert_eq!(
+                q.front().unwrap().status_message_id,
+                None,
+                "Turn 1's late status_message_id must not overwrite Turn 2"
+            );
+        }
+        // Next activity for Turn 2 must send a fresh message instead of editing Turn 1's message.
+        router.on_turn_activity_at(&bot_id, SessionId(9), "Turn 2 working", 20_000);
+        assert!(
+            lock(&sender.edited).is_empty(),
+            "Turn 2 must not edit Turn 1's status message"
         );
     }
 }

@@ -1478,7 +1478,33 @@ if (!files.length) return;
 const room = Math.max(0, MAX_PHOTOS - currentAttachments().length);
 if (files.length > room)
 ctx.error?.(Error(t("Maximum 4 photos per message.")));
-for (const f of files.slice(0, room)) preparePhoto(f);
+const picked = files.slice(0, room);
+if (!picked.length) return;
+entry.attachments ||= [];
+const added = picked.map((f) => {
+const att = {
+file: f,
+name: f.name || t("Photo"),
+status: "pending",
+version: ++entry.photoVersion,
+};
+entry.attachments.push(att);
+return att;
+});
+const count = Math.max(1, entry.attachments.length);
+const perPhotoMax = Math.floor(MAX_PROMPT_PHOTO_RAW_BYTES / count);
+if (count > 1) {
+for (const other of entry.attachments) {
+if (added.includes(other) || !other.file) continue;
+const overBudget =
+(other.status === "ready" &&
+estimatedPhotoBytes(other.prepared) > perPhotoMax) ||
+(other.status === "pending" &&
+(other.budgetBytes ?? MAX_PROMPT_PHOTO_RAW_BYTES) > perPhotoMax);
+if (overBudget) void preparePhoto(other.file, other);
+}
+}
+for (const att of added) void preparePhoto(att.file, att);
 });
 const attachBtn = button(
 t("Photo"),
@@ -2500,7 +2526,10 @@ const text = liveQuestion ? t("Answer the current question above") : agent
 if (input.placeholder !== text) input.placeholder = text;
 rateLimitBanner.hidden = !Boolean(status?.rate_limited);
 syncComposerHeight();
-for (const card of cards.values()) card._syncPermission?.();
+for (const card of cards.values()) {
+card._syncPermission?.();
+card._syncQuestion?.();
+}
 }
 const copyTimers = new WeakMap();
 function copyText(text, node) {
@@ -3179,14 +3208,16 @@ delete att.error;
 if (!targetAtt) entry.attachments.push(att);
 const count = Math.max(1, entry.attachments.length);
 const perPhotoMax = Math.floor(MAX_PROMPT_PHOTO_RAW_BYTES / count);
+att.budgetBytes = count > 1 ? perPhotoMax : MAX_PROMPT_PHOTO_RAW_BYTES;
 if (!targetAtt && count > 1) {
 for (const other of entry.attachments) {
-if (
-other !== att &&
-other.status === "ready" &&
-other.file &&
-estimatedPhotoBytes(other.prepared) > perPhotoMax
-) {
+if (other === att || !other.file) continue;
+const overBudget =
+(other.status === "ready" &&
+estimatedPhotoBytes(other.prepared) > perPhotoMax) ||
+(other.status === "pending" &&
+(other.budgetBytes ?? MAX_PROMPT_PHOTO_RAW_BYTES) > perPhotoMax);
+if (overBudget) {
 void preparePhoto(other.file, other);
 }
 }
@@ -3200,6 +3231,16 @@ const prepared = await ctx.photo?.(sessionId, file, photoOpts);
 if (att.version !== version || !entry.attachments.includes(att)) return;
 if (!prepared?.mime || !prepared?.data)
 throw new Error(t("Photo preparation unavailable"));
+const finalCount = Math.max(1, entry.attachments.length);
+const finalCap = Math.floor(MAX_PROMPT_PHOTO_RAW_BYTES / finalCount);
+if (
+finalCount > 1 &&
+estimatedPhotoBytes(prepared) > finalCap &&
+(att.budgetBytes ?? MAX_PROMPT_PHOTO_RAW_BYTES) > finalCap
+) {
+void preparePhoto(file, att);
+return;
+}
 att.status = "ready";
 att.prepared = prepared;
 } catch (error) {
@@ -4555,7 +4596,9 @@ const otherSendBtn = button(
 t("Send other"),
 () => {
 const question = currentLive(),
-lp = capability("live_prompt_reply")
+lp =
+capability("live_prompt_reply") &&
+entry.composerStatus?.agent === chatAgent()
 ? entry.composerStatus?.live_prompt
 : null,
 text = String(custom.value || "").trim(),
@@ -4672,7 +4715,9 @@ b.className = `${active ? "primary" : "ghost"} small chat-opt`;
 b.setAttribute("aria-pressed", String(active));
 b.disabled = !enabled;
 });
-const lp = capability("live_prompt_reply")
+const lp =
+capability("live_prompt_reply") &&
+entry.composerStatus?.agent === chatAgent()
 ? entry.composerStatus?.live_prompt
 : null,
 otherLiveIndex =
@@ -5260,7 +5305,7 @@ refreshStatus(
 incoming.some(
 (item) => item.kind === "permission" || item.kind === "question",
 ),
-);
+).catch(() => {});
 syncChatSubscription();
 }
 function handlePush(p) {

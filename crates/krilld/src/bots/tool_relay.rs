@@ -44,12 +44,22 @@ const MAX_RELAY_WORKERS: usize = 32;
 pub const BUILTIN_KRILL_CRED_ID: &str = "krill";
 pub const BUILTIN_MCP_TOOL_COUNT: u32 = 13;
 
+/// Origin category of a registered [`ToolRoute`] so custom MCP tools can never collide with
+/// or inherit the lifecycle of built-in Composio Tool Router routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteKind {
+    #[default]
+    McpTool,
+    Composio,
+}
+
 /// A single registered upstream MCP endpoint served through `/bot-tools/<cred_id>/mcp`.
 #[derive(Clone)]
 pub struct ToolRoute {
     pub cred_id: String,
     pub bot_id: BotId,
     pub tool_id: String,
+    pub kind: RouteKind,
     pub name: String,
     pub upstream_url: String,
     pub auth_kind: BotMcpAuthKind,
@@ -64,6 +74,7 @@ impl fmt::Debug for ToolRoute {
             .field("cred_id", &self.cred_id)
             .field("bot_id", &self.bot_id)
             .field("tool_id", &self.tool_id)
+            .field("kind", &self.kind)
             .field("auth_kind", &self.auth_kind)
             .finish_non_exhaustive()
     }
@@ -311,9 +322,11 @@ impl BotToolRelay {
         let mut cred_ids = Vec::new();
         let has_builtin = {
             let mut st = lock(&self.state);
-            // Replace non-composio MCP routes for this bot.
-            st.routes
-                .retain(|_, r| r.bot_id != bot.id || r.tool_id.starts_with("composio"));
+            // Replace all MCP tool routes for this bot, retaining only an enabled Composio route.
+            st.routes.retain(|_, r| {
+                r.bot_id != bot.id
+                    || (r.kind == RouteKind::Composio && bot.connectors.composio.enabled)
+            });
             for tool in &bot.mcp_tools {
                 if !tool.enabled {
                     continue;
@@ -333,6 +346,7 @@ impl BotToolRelay {
                         cred_id,
                         bot_id: bot.id.clone(),
                         tool_id: tool.id.clone(),
+                        kind: RouteKind::McpTool,
                         name: tool.name.clone(),
                         upstream_url: url.to_owned(),
                         auth_kind: tool.auth_kind,
@@ -568,6 +582,29 @@ pub fn make_cred_id(bot_id: &BotId, tool_id: &str) -> String {
     ctx.update(tool_id.as_bytes());
     let digest = ctx.finish();
     out.push('-');
+    for &b in digest.as_ref().get(..6).unwrap_or_default() {
+        write!(out, "{b:02x}").ok();
+    }
+    out
+}
+
+/// Builds a distinct, collision-proof credential route ID reserved for Composio Tool Router
+/// so a custom MCP tool with `id == "composio"` can never collide with or overwrite Composio.
+#[must_use]
+pub fn make_composio_cred_id(bot_id: &BotId) -> String {
+    let mut out = String::with_capacity(bot_id.as_str().len() + 24);
+    for ch in bot_id.as_str().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out.push_str("-composio-");
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(b"composio\x01");
+    ctx.update(bot_id.as_str().as_bytes());
+    let digest = ctx.finish();
     for &b in digest.as_ref().get(..6).unwrap_or_default() {
         write!(out, "{b:02x}").ok();
     }
@@ -1260,9 +1297,10 @@ fn inject_auth_header(
 ) {
     let header_name = route
         .header_names
-        .first()
+        .iter()
         .map(String::as_str)
-        .filter(|h| !h.trim().is_empty())
+        .map(str::trim)
+        .find(|h| !h.is_empty())
         .unwrap_or("Authorization");
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
 
@@ -2182,5 +2220,105 @@ mod tests {
         assert_ne!(make_cred_id(&b1, "b-c"), make_cred_id(&b2, "c"));
         let b3 = BotId::new("bot-1").unwrap();
         assert_ne!(make_cred_id(&b3, "foo:bar"), make_cred_id(&b3, "foo_bar"));
+    }
+
+    #[test]
+    fn r2m05_r2m15_composio_route_isolation_and_header_trimming() {
+        let dir = temp_dir("r2m05-15");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x55; 32]));
+        let relay = BotToolRelay::new(secrets);
+        let bot_id = BotId::new("bot-comp").unwrap();
+
+        // R2M-05: Custom MCP tool named "composio" has a distinct cred_id from Composio Tool Router.
+        assert_ne!(
+            make_composio_cred_id(&bot_id),
+            make_cred_id(&bot_id, "composio")
+        );
+
+        let mut bot = BotConfig::new(bot_id.clone(), "CompBot", "claude", 1_000).unwrap();
+        bot.connectors.composio.enabled = true;
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "composio".to_owned(),
+            name: "Custom Composio".to_owned(),
+            endpoint_url: Some("https://custom.example.com/mcp".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["x-api-key".to_owned()],
+            secret_ref: None,
+            enabled: true,
+        });
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "composio-docs".to_owned(),
+            name: "Composio Docs".to_owned(),
+            endpoint_url: Some("https://docs.example.com/mcp".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["x-api-key".to_owned()],
+            secret_ref: None,
+            enabled: true,
+        });
+
+        let comp_cred = make_composio_cred_id(&bot_id);
+        relay.register_route(ToolRoute {
+            cred_id: comp_cred.clone(),
+            bot_id: bot_id.clone(),
+            tool_id: "composio".to_owned(),
+            kind: RouteKind::Composio,
+            name: "Composio MCP".to_owned(),
+            upstream_url: "https://backend.composio.dev/mcp".to_owned(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["x-api-key".to_owned()],
+            secret_ref: None,
+            fallback_secret_key: "composio_api_key".to_owned(),
+        });
+
+        let grant1 = relay.prepare_launch_for_bot(&bot).unwrap().unwrap();
+        assert!(grant1.cred_ids.contains(&comp_cred));
+        assert!(grant1.cred_ids.contains(&make_cred_id(&bot_id, "composio")));
+        assert!(
+            grant1
+                .cred_ids
+                .contains(&make_cred_id(&bot_id, "composio-docs"))
+        );
+
+        // Disable both custom composio* MCP tools -> their routes MUST be removed while real Composio remains.
+        for tool in &mut bot.mcp_tools {
+            tool.enabled = false;
+        }
+        let grant2 = relay.prepare_launch_for_bot(&bot).unwrap().unwrap();
+        assert_eq!(grant2.cred_ids, vec![comp_cred.clone()]);
+
+        // Disable Composio connector -> Composio route is pruned too and relay stops when unused.
+        bot.connectors.composio.enabled = false;
+        let grant3 = relay.prepare_launch_for_bot(&bot).unwrap();
+        assert!(grant3.is_none());
+        assert!(lock(&relay.state).routes.is_empty());
+
+        // R2M-15: inject_auth_header trims whitespace and skips blank leading entries.
+        let route = ToolRoute {
+            cred_id: "c1".to_owned(),
+            bot_id,
+            tool_id: "t1".to_owned(),
+            kind: RouteKind::McpTool,
+            name: "T1".to_owned(),
+            upstream_url: "https://example.com/mcp".to_owned(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["   ".to_owned(), "  x-api-key  ".to_owned()],
+            secret_ref: None,
+            fallback_secret_key: "mcp:t1".to_owned(),
+        };
+        let mut headers = vec![("X-API-KEY".to_owned(), "spoofed".to_owned())];
+        inject_auth_header(
+            &mut headers,
+            &route,
+            &Zeroizing::new(" real-key ".to_owned()),
+        );
+        assert_eq!(
+            headers,
+            vec![("x-api-key".to_owned(), "real-key".to_owned())]
+        );
+
+        relay.shutdown();
+        fs::remove_dir_all(&dir).ok();
     }
 }

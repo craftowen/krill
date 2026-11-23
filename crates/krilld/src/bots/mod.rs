@@ -778,6 +778,10 @@ impl BotsManager {
         if let Some(mgr) = self.connectors.get() {
             mgr.shutdown();
         }
+        if let Some(oauth) = self.mcp_oauth.get() {
+            oauth.cancel_all();
+        }
+        google::cancel_all_google_oauth();
         if let Some(g) = self.google_poller.get() {
             g.stop();
         }
@@ -910,7 +914,14 @@ impl BotsManager {
                         krill_proto::bots::FieldPatch::Set(e) => Some(e.as_str()),
                         krill_proto::bots::FieldPatch::Clear => None,
                         krill_proto::bots::FieldPatch::Unchanged => {
-                            prev_bot.as_ref().and_then(|b| b.effort.as_deref())
+                            if krill_proto::agent::strip_agy_effort_suffix(model)
+                                .1
+                                .is_some()
+                            {
+                                None
+                            } else {
+                                prev_bot.as_ref().and_then(|b| b.effort.as_deref())
+                            }
                         }
                     };
                     if let Some((family, eff)) =
@@ -969,8 +980,12 @@ impl BotsManager {
                     }
                     Err(err) => return BotRpcResponse::Error(err.to_string()),
                 }
-                // Stop all live PTY sessions & clear active cron bindings BEFORE removing the bot
-                // from `BotStore`, so `DeleteBot` never leaks running agent processes.
+                // Cancel any pending OAuth sign-in listeners and stop all live PTY sessions
+                // BEFORE removing the bot and deleting its secrets so nothing races back in.
+                if let Some(oauth) = self.mcp_oauth.get() {
+                    oauth.cancel_bot(&bot_id);
+                }
+                google::cancel_google_oauth(&bot_id);
                 self.runtime
                     .stop_all_for_bot(registry, &self.tool_relay, &bot_id);
                 lock(&self.active_cron_sessions).retain(|(bid, _), _| bid != &bot_id);
@@ -1066,7 +1081,15 @@ impl BotsManager {
                     &bot_id,
                     session_id,
                 ) {
-                    Ok(()) => BotRpcResponse::Ok,
+                    Ok(()) => {
+                        self.store.unbind_session_links(session_id, ts).ok();
+                        lock(&self.active_cron_sessions).retain(|_, &mut sid| sid != session_id);
+                        self.groups.on_session_removed(session_id);
+                        if let Some(connectors) = self.connectors.get() {
+                            connectors.on_session_removed(session_id);
+                        }
+                        BotRpcResponse::Ok
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -2232,7 +2255,32 @@ impl BotsManager {
         let mut dispatched_bots = Vec::new();
         let mut failures = Vec::new();
         for target in &plan.target_bots {
-            match self.runtime.deliver_group_turn(
+            let registered = std::cell::Cell::new(None::<(SessionId, u64)>);
+            let mut on_bound = |sid: SessionId, turn_seq: u64| {
+                if registered.get().is_some() {
+                    return;
+                }
+                self.groups
+                    .record_turn_started_seq(
+                        &plan.group.id,
+                        &plan.thread.thread_id,
+                        target,
+                        sid,
+                        Some(turn_seq),
+                        ts,
+                    )
+                    .ok();
+                registered.set(Some((sid, turn_seq)));
+            };
+            let mut on_rollback = |sid: SessionId, turn_seq: u64| {
+                if registered.get() == Some((sid, turn_seq)) {
+                    registered.set(None);
+                    self.groups
+                        .on_bot_turn_finished_seq(&target.id, sid, Some(turn_seq), "", ts)
+                        .ok();
+                }
+            };
+            match self.runtime.deliver_group_turn_with_hooks(
                 registry,
                 &self.store,
                 &self.secrets,
@@ -2243,21 +2291,19 @@ impl BotsManager {
                 &plan.thread.thread_id,
                 &plan.prompt_for_bot,
                 ts,
+                Some(&mut on_bound),
+                Some(&mut on_rollback),
             ) {
                 Ok((sid, turn_seq, _)) => {
-                    self.groups
-                        .record_turn_started_seq(
-                            &plan.group.id,
-                            &plan.thread.thread_id,
-                            target,
-                            sid,
-                            Some(turn_seq),
-                            ts,
-                        )
-                        .ok();
+                    if registered.get().is_none() {
+                        on_bound(sid, turn_seq);
+                    }
                     dispatched_bots.push(target.id.clone());
                 }
                 Err(err) => {
+                    if let Some((sid, turn_seq)) = registered.get() {
+                        on_rollback(sid, turn_seq);
+                    }
                     tracing::warn!(
                         group = %plan.group.id,
                         bot = %target.id.as_str(),
@@ -2811,6 +2857,39 @@ impl ConnectorBridge for DaemonConnectorBridge {
         })
     }
 
+    fn dispatch_external_message_with_hooks(
+        &self,
+        msg: InboundExternalMessage,
+        on_bound: &mut dyn FnMut(SessionId),
+        on_rollback: &mut dyn FnMut(SessionId),
+    ) -> io::Result<DispatchOutcome> {
+        let mgr = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| io::Error::other("bots manager shut down"))?;
+        let reg = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| io::Error::other("daemon registry unavailable"))?;
+        let (link, session_id, started_new_session) =
+            mgr.runtime.dispatch_external_message_with_hooks(
+                &reg,
+                &mgr.store,
+                &mgr.secrets,
+                &mgr.tool_relay,
+                &mgr.composio_base_url,
+                &msg,
+                now_ms(),
+                Some(on_bound),
+                Some(on_rollback),
+            )?;
+        Ok(DispatchOutcome {
+            link,
+            session_id,
+            started_new_session,
+        })
+    }
+
     fn check_or_request_access(
         &self,
         bot_id: &BotId,
@@ -3216,7 +3295,32 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                 let mut dispatched = Vec::new();
                 let mut failed = Vec::new();
                 for target in &plan.target_bots {
-                    match mgr.runtime.deliver_group_turn(
+                    let registered = std::cell::Cell::new(None::<(SessionId, u64)>);
+                    let mut on_bound = |sid: SessionId, turn_seq: u64| {
+                        if registered.get().is_some() {
+                            return;
+                        }
+                        mgr.groups
+                            .record_turn_started_seq(
+                                &plan.group.id,
+                                &plan.thread.thread_id,
+                                target,
+                                sid,
+                                Some(turn_seq),
+                                ts,
+                            )
+                            .ok();
+                        registered.set(Some((sid, turn_seq)));
+                    };
+                    let mut on_rollback = |sid: SessionId, turn_seq: u64| {
+                        if registered.get() == Some((sid, turn_seq)) {
+                            registered.set(None);
+                            mgr.groups
+                                .on_bot_turn_finished_seq(&target.id, sid, Some(turn_seq), "", ts)
+                                .ok();
+                        }
+                    };
+                    match mgr.runtime.deliver_group_turn_with_hooks(
                         &reg,
                         &mgr.store,
                         &mgr.secrets,
@@ -3227,21 +3331,19 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                         &plan.thread.thread_id,
                         &plan.prompt_for_bot,
                         ts,
+                        Some(&mut on_bound),
+                        Some(&mut on_rollback),
                     ) {
                         Ok((sid, turn_seq, _)) => {
-                            mgr.groups
-                                .record_turn_started_seq(
-                                    &plan.group.id,
-                                    &plan.thread.thread_id,
-                                    target,
-                                    sid,
-                                    Some(turn_seq),
-                                    ts,
-                                )
-                                .ok();
+                            if registered.get().is_none() {
+                                on_bound(sid, turn_seq);
+                            }
                             dispatched.push(target.id.clone());
                         }
                         Err(err) => {
+                            if let Some((sid, turn_seq)) = registered.get() {
+                                on_rollback(sid, turn_seq);
+                            }
                             mgr.groups
                                 .record_dispatch_failure(
                                     &plan.group.id,
@@ -5800,6 +5902,40 @@ mod tests {
                 "stale claude effort must not carry into agy fold"
             );
         }
+
+        // R2M-23: Verify UpdateBot on existing `agy` bot with effort="high" and model=Set("gemini-4-argon-low")
+        // + effort=Unchanged passes None (not stale prev_bot.effort) to `antigravity_listed_family_selection`.
+        let listed = vec![krill_proto::agent::AgyListedModel {
+            id: "gemini-4-argon".to_owned(),
+            efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+        }];
+        let model_patch = "gemini-4-argon-low";
+        let req_effort = if krill_proto::agent::strip_agy_effort_suffix(model_patch)
+            .1
+            .is_some()
+        {
+            None
+        } else {
+            Some("high")
+        };
+        assert_eq!(
+            krill_proto::agent::antigravity_listed_family_selection(
+                model_patch,
+                req_effort,
+                &listed
+            ),
+            Some(("gemini-4-argon".to_owned(), "low".to_owned()))
+        );
+
+        // R2M-11: DeleteBot cancels pending MCP/Google OAuth listeners cleanly and shutdown cancels all.
+        let del_resp = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::DeleteBot {
+                bot_id: bot_b.id.clone(),
+                delete_home: true,
+            },
+        );
+        assert!(matches!(del_resp, BotRpcResponse::Deleted { .. }));
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();

@@ -2402,5 +2402,194 @@ async function sweepW2MobileRegressions(){
  }
  console.log('PASS sweep W2 mobile regressions: MB-02, MB-24..27, MB-29..30, MB-48..56, MB-63, MB-65');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function sweepR2MobileRegressions(){
+ // R2M-01: Markdown & duplicate-question-line matching in answeredDecisionLines / multi-decision sheet.
+ {
+  const mdItem={
+   uid:'item-r2m01-md',number:1,owner_bot_id:'b1',title:'MD Ask',status:'needs_you',
+   events:[
+    {id:10,kind:'status',actor:{bot:{bot_id:'b1'}},text:'status -> needs_you',decisions:[
+     {question:'**Deploy target?**',options:['Staging','Prod'],recommended:0,multi:false},
+     {question:'# `Region?`',options:['US','EU'],recommended:0,multi:false},
+    ],created_at_ms:1000},
+    // Historical raw-Markdown answer for Q0 must still match on read (back-compat).
+    {id:11,kind:'commented',actor:{owner:{device:'desktop'}},text:'**Deploy target?** → Staging',decisions:[],created_at_ms:1100},
+   ],
+  };
+  const dupItem={
+   uid:'item-r2m01-dup',number:2,owner_bot_id:'b1',title:'Dup Ask',status:'needs_you',
+   events:[
+    {id:20,kind:'status',actor:{bot:{bot_id:'b1'}},text:'status -> needs_you',decisions:[
+     {question:'**Pick option?**',options:['A','B'],recommended:0,multi:false},
+     {question:'**Pick option?**',options:['C','D'],recommended:0,multi:false},
+    ],created_at_ms:2000},
+    {id:21,kind:'commented',actor:{owner:{device:'mobile'}},text:'Pick option? → A',decisions:[],created_at_ms:2100},
+    {id:22,kind:'commented',actor:{owner:{device:'mobile'}},text:'Pick option? → C',decisions:[],created_at_ms:2200},
+   ],
+  };
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1',agent_id:'claude'}]};
+    if(req.action==='bots.items')return {items:[mdItem,dupItem]};
+    return {requests:[],suggestions:[]};
+   },
+  });
+  await uf.flush();
+  // On mdItem: Q0 is answered via historical raw Markdown, so card surfaces Q1 ("Region?") options US/EU.
+  assert(uf.root.textContent.includes('US')&&uf.root.textContent.includes('EU'),'R2M-01: raw Markdown historical answer marks Q0 answered so Q1 is active');
+  // On dupItem: BOTH identical-question decisions are answered -> no C/D buttons left open.
+  assert(!uf.all().some(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='C'),'R2M-01: duplicate question line slot 1 recognized as answered');
+  uf.abort.abort();
+ }
+
+ // R2M-25: Detail sheet refreshes snooze button label & click payload/toast after partial answer unsnoozes item.
+ {
+  const toasts=[];
+  const snoozedMulti={
+   uid:'item-r2m25',number:3,owner_bot_id:'b1',title:'Snoozed Multi',status:'needs_you',
+   snoozed_until_ms:Date.now()+3600*1000,
+   events:[
+    {id:30,kind:'status',actor:{bot:{bot_id:'b1'}},text:'status -> needs_you',decisions:[
+     {question:'Q1?',options:['A1','A2'],recommended:0,multi:false},
+     {question:'Q2?',options:['B1','B2'],recommended:0,multi:false},
+    ],created_at_ms:1000},
+   ],
+  };
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1',agent_id:'claude'}]};
+    if(req.action==='bots.items')return {items:[snoozedMulti]};
+    if(req.action==='bots.item.answer'){
+     return {
+      item:{
+       ...snoozedMulti,
+       snoozed_until_ms:null,
+       events:[...snoozedMulti.events,{id:31,kind:'commented',actor:{owner:{device:'mobile'}},text:'Q1? → A1',decisions:[],created_at_ms:2000}],
+      },
+     };
+    }
+    return {requests:[],suggestions:[]};
+   },
+  });
+  uf.ctx.toast=m=>toasts.push(m);
+  let closeCount=0;
+  uf.ctx.closeSheet=()=>{closeCount++;};
+  await uf.flush();
+  // Open detail sheet via Details button.
+  const detailsBtn=uf.all().find(b=>b.tagName==='BUTTON'&&String(b.textContent||'').includes('Details'));
+  assert(detailsBtn,'R2M-25: Details button present');
+  detailsBtn.action();
+  const sheet=uf.sheets.at(-1);
+  const body=uf.ctx.el('div');
+  sheet[3](body);
+  const findBtn=lbl=>body.querySelectorAll('button').find(b=>b.textContent===lbl||b.getAttribute('aria-label')===lbl);
+  assert(findBtn('Unsnooze'),'R2M-25: starts with Unsnooze label when item is snoozed');
+  await findBtn('A1').action();
+  assert.equal(closeCount,0,'R2M-25: sheet stays open after partial answer');
+  const snoozeNow=findBtn('Snooze 4h');
+  assert(snoozeNow,'R2M-25: snooze button refreshes to Snooze 4h after partial answer clears snoozed_until_ms');
+  assert.equal(snoozeNow.getAttribute('aria-label'),'Snooze 4h');
+  await snoozeNow.action();
+  const upd=uf.calls.find(c=>c.action==='bots.item.update'&&c.item_id==='item-r2m25');
+  assert(upd&&typeof upd.snoozed_until_ms?.set==='number','R2M-25: clicking refreshed Snooze 4h sends set payload');
+  assert(toasts.at(-1)==='Snooze 4h','R2M-25: toast matches live action label Snooze 4h');
+  uf.abort.abort();
+ }
+
+ // R2M-26: Switching To Do filter or Bots Hub host when all target hosts fail clears stale arrays & cursors, and All Open filters client-side.
+ {
+  let failItems=false;
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1',agent_id:'claude'}]};
+    if(req.action==='bots.items'){
+     if(failItems)return Promise.reject(Error('host down'));
+     if(req.status==='closed')return {items:[{uid:'c1',number:9,owner_bot_id:'b1',title:'Closed Relic',status:'done',events:[]}],next_cursor:'cur-closed-1'};
+     return {items:[]};
+    }
+    return {requests:[],suggestions:[]};
+   },
+  });
+  await uf.flush();
+  const closedBtn=uf.all().find(b=>b.tagName==='BUTTON'&&b.dataset.filter==='closed');
+  await closedBtn.action();
+  await uf.flush();
+  assert(uf.root.textContent.includes('Closed Relic'),'R2M-26: closed item shown under Closed filter');
+  assert(uf.all().some(b=>b.tagName==='BUTTON'&&b.textContent==='Load more'),'R2M-26: Load more present with cursor');
+  // Switch to All Open while host fails -> closed relic & cursor MUST disappear.
+  failItems=true;
+  const openBtn=uf.all().find(b=>b.tagName==='BUTTON'&&b.dataset.filter==='open');
+  await openBtn.action();
+  await uf.flush();
+  assert(!uf.root.textContent.includes('Closed Relic'),'R2M-26: closed item cleared when switching to All Open and host fails');
+  assert(!uf.all().some(b=>b.tagName==='BUTTON'&&b.textContent==='Load more'),'R2M-26: stale cursor cleared on filter switch failure');
+  uf.abort.abort();
+
+  // Bots Hub deviceFilter switch to failing host clears previous host's bots.
+  let activeHost='h1';
+  const bf=fixture('bots',{state:{snapshot:{capabilities:{bots:true}}}});
+  const conns=[
+   {id:'h1',name:'Good PC',active:true,connection:{phase:'ready'},snapshot:{capabilities:{bots:true}}},
+   {id:'h2',name:'Dead PC',active:false,connection:{phase:'ready'},snapshot:{capabilities:{bots:true}}},
+  ];
+  bf.ctx.connections=conns;
+  bf.ctx.filteredConnections=()=>conns.filter(c=>c.id===activeHost);
+  bf.ctx.rpcForHost=(hid,req)=>{
+   if(hid==='h2')return Promise.reject(Error('offline'));
+   if(req.action==='bots.list')return Promise.resolve({bots:[{id:'b1',name:'Good Bot',agent_id:'claude'}]});
+   if(req.action==='bots.items')return Promise.resolve({items:[]});
+   return Promise.resolve({requests:[],statuses:[],groups:[],sessions:[]});
+  };
+  bf.view.update();
+  await bf.flush();
+  assert(bf.root.textContent.includes('Good Bot'),'R2M-26: initial host bot rendered');
+  activeHost='h2';
+  bf.view.update();
+  await bf.flush();
+  assert(!bf.root.textContent.includes('Good Bot'),'R2M-26: stale host bots cleared when switching deviceFilter to failing host');
+  bf.abort.abort();
+ }
+
+ // R2M-27: Bot Detail with 0 active global needs_you items and Include snoozed ON does not leak snoozed items into Bot Rail badge/sort.
+ {
+  const future=Date.now()+3600*1000;
+  let failGlobal=false;
+  const df=fixture('bots',{
+   route:{botId:'b1'},
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[
+     {id:'b1',name:'Snooze Bot',agent_id:'claude'},
+     {id:'b2',name:'Other Bot',agent_id:'claude'},
+    ]};
+    if(req.action==='bots.items'&&req.bot_id==='b1'){
+     return {items:[{uid:'s1',number:1,owner_bot_id:'b1',title:'Snoozed Ask',status:'needs_you',snoozed_until_ms:future,events:[]}]};
+    }
+    if(req.action==='bots.items'&&!req.bot_id){
+     if(failGlobal)return Promise.reject(Error('global fail'));
+     return {items:[]};
+    }
+    if(req.action==='bots.connectors.status')return {statuses:[]};
+    if(req.action==='bots.suggestions.list')return {suggestions:[]};
+    if(req.action==='bots.access.list')return {requests:[]};
+    if(req.action==='bots.sessions.list')return {sessions:[]};
+    if(req.action==='bots.groups.list')return {groups:[]};
+    return {};
+   },
+  });
+  await df.flush();
+  assert.equal(df.all().filter(n=>String(n.className||'').includes('bot-rail-badge')).length,0,'R2M-27: Bot Rail omits badge when global needs_you is empty even if bot items contain snoozed needs_you');
+  // Even when global needs_you RPC fails and falls back to per-bot items, renderBotRail/sortBotsForDisplay exclude actively snoozed items.
+  failGlobal=true;
+  await df.byText('Refresh').action();
+  await df.flush();
+  assert.equal(df.all().filter(n=>String(n.className||'').includes('bot-rail-badge')).length,0,'R2M-27: Bot Rail excludes actively snoozed needs_you even on global fallback');
+  df.abort.abort();
+ }
+ console.log('PASS sweep R2 mobile screen regressions: R2M-01, R2M-25, R2M-26, R2M-27');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

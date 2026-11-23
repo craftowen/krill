@@ -678,16 +678,20 @@ fn create_dedup_item(
         .is_ok()
 }
 
-fn is_valid_github_repo(repo: &str) -> bool {
+pub(crate) fn is_valid_github_repo(repo: &str) -> bool {
     let Some((owner, name)) = repo.split_once('/') else {
         return false;
     };
     !owner.is_empty()
         && !name.is_empty()
         && !name.contains('/')
+        && owner != "."
+        && owner != ".."
+        && name != "."
+        && name != ".."
         && owner
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -967,6 +971,7 @@ pub struct TrackerPoller {
     statuses: Arc<Mutex<BTreeMap<(BotId, ExternalSource), BotConnectorStatus>>>,
     on_new_items: Arc<Mutex<Option<TrackerNewItemsCallback>>>,
     running: AtomicBool,
+    reconcile_lock: Mutex<()>,
     lifecycle: Mutex<Option<RunningTrackerPoller>>,
 }
 
@@ -1001,6 +1006,7 @@ impl TrackerPoller {
             statuses: Arc::new(Mutex::new(BTreeMap::new())),
             on_new_items: Arc::new(Mutex::new(None)),
             running: AtomicBool::new(false),
+            reconcile_lock: Mutex::new(()),
             lifecycle: Mutex::new(None),
         }
     }
@@ -1012,6 +1018,7 @@ impl TrackerPoller {
 
     /// Starts the poller thread if ≥1 bot enables GitHub or Linear and wakes immediately; stops it otherwise.
     pub fn reconcile(&self) {
+        let _reconcile = lock(&self.reconcile_lock);
         let bots = self.store.list_bots().unwrap_or_default();
         let active_keys: std::collections::BTreeSet<(BotId, ExternalSource)> = bots
             .iter()
@@ -1027,11 +1034,12 @@ impl TrackerPoller {
                 keys
             })
             .collect();
-        // Prune disabled, paused, or deleted tracker status entries (MB-41).
-        lock(&self.statuses).retain(|k, _| active_keys.contains(k));
         if active_keys.is_empty() {
-            self.stop();
+            self.stop_locked();
+            // Prune AFTER joining the poller thread so an in-flight poll cannot resurrect stale entries.
+            lock(&self.statuses).retain(|k, _| active_keys.contains(k));
         } else {
+            lock(&self.statuses).retain(|k, _| active_keys.contains(k));
             let mut guard = lock(&self.lifecycle);
             if let Some(ref running) = *guard {
                 let mut st = lock(&running.stop.0);
@@ -1203,6 +1211,9 @@ impl TrackerPoller {
                         let ts = now_ms();
                         let bots = store.list_bots().unwrap_or_default();
                         for bot in bots {
+                            if lock(&stop_bg.0).stop {
+                                break;
+                            }
                             if bot.paused {
                                 continue;
                             }
@@ -1232,27 +1243,40 @@ impl TrackerPoller {
                                                 )
                                             })
                                         });
-                                    let st = match poll_github_bot(
-                                        &bot, &secrets, &items, &endpoints, ts,
-                                    ) {
-                                        Ok(new_count) => {
-                                            if new_count > 0
-                                                && let Some(cb) =
-                                                    lock(&on_new_items).as_ref().cloned()
-                                            {
-                                                cb(&bot, ExternalSource::GitHub, new_count);
+                                    let res =
+                                        poll_github_bot(&bot, &secrets, &items, &endpoints, ts);
+                                    let still_active = !lock(&stop_bg.0).stop
+                                        && store.get_bot(&bot.id).ok().flatten().is_some_and(
+                                            |live| !live.paused && live.connectors.github.enabled,
+                                        );
+                                    if still_active {
+                                        let st = match res {
+                                            Ok(new_count) => {
+                                                if new_count > 0
+                                                    && let Some(cb) =
+                                                        lock(&on_new_items).as_ref().cloned()
+                                                {
+                                                    cb(&bot, ExternalSource::GitHub, new_count);
+                                                }
+                                                ok_status(
+                                                    &bot.id,
+                                                    ExternalSource::GitHub,
+                                                    prev_label,
+                                                    ts,
+                                                )
                                             }
-                                            ok_status(
-                                                &bot.id,
-                                                ExternalSource::GitHub,
-                                                prev_label,
-                                                ts,
-                                            )
-                                        }
-                                        Err(d) => err_status(&bot.id, ExternalSource::GitHub, d),
-                                    };
-                                    lock(&statuses).insert(key, st);
+                                            Err(d) => {
+                                                err_status(&bot.id, ExternalSource::GitHub, d)
+                                            }
+                                        };
+                                        lock(&statuses).insert(key, st);
+                                    } else {
+                                        lock(&statuses).remove(&key);
+                                    }
                                 }
+                            }
+                            if lock(&stop_bg.0).stop {
+                                break;
                             }
                             if bot.connectors.linear.enabled {
                                 let interval_ms = bot
@@ -1271,26 +1295,36 @@ impl TrackerPoller {
                                         .get(&key)
                                         .and_then(|s| s.account_label.clone())
                                         .or_else(|| Some("Linear GraphQL".to_owned()));
-                                    let st = match poll_linear_bot(
-                                        &bot, &secrets, &items, &endpoints, ts,
-                                    ) {
-                                        Ok(new_count) => {
-                                            if new_count > 0
-                                                && let Some(cb) =
-                                                    lock(&on_new_items).as_ref().cloned()
-                                            {
-                                                cb(&bot, ExternalSource::Linear, new_count);
+                                    let res =
+                                        poll_linear_bot(&bot, &secrets, &items, &endpoints, ts);
+                                    let still_active = !lock(&stop_bg.0).stop
+                                        && store.get_bot(&bot.id).ok().flatten().is_some_and(
+                                            |live| !live.paused && live.connectors.linear.enabled,
+                                        );
+                                    if still_active {
+                                        let st = match res {
+                                            Ok(new_count) => {
+                                                if new_count > 0
+                                                    && let Some(cb) =
+                                                        lock(&on_new_items).as_ref().cloned()
+                                                {
+                                                    cb(&bot, ExternalSource::Linear, new_count);
+                                                }
+                                                ok_status(
+                                                    &bot.id,
+                                                    ExternalSource::Linear,
+                                                    prev_label,
+                                                    ts,
+                                                )
                                             }
-                                            ok_status(
-                                                &bot.id,
-                                                ExternalSource::Linear,
-                                                prev_label,
-                                                ts,
-                                            )
-                                        }
-                                        Err(d) => err_status(&bot.id, ExternalSource::Linear, d),
-                                    };
-                                    lock(&statuses).insert(key, st);
+                                            Err(d) => {
+                                                err_status(&bot.id, ExternalSource::Linear, d)
+                                            }
+                                        };
+                                        lock(&statuses).insert(key, st);
+                                    } else {
+                                        lock(&statuses).remove(&key);
+                                    }
                                 }
                             }
                         }
@@ -1306,6 +1340,11 @@ impl TrackerPoller {
 
     /// Stops the background tracker poller thread cleanly.
     pub fn stop(&self) {
+        let _reconcile = lock(&self.reconcile_lock);
+        self.stop_locked();
+    }
+
+    fn stop_locked(&self) {
         let running = {
             let mut guard = lock(&self.lifecycle);
             let taken = guard.take();
@@ -1733,6 +1772,119 @@ mod tests {
         poller.stop();
         assert!(!poller.is_running());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r2m07_r2m10_rejects_traversal_github_repos_and_prevents_disabled_poller_resurrection() {
+        // R2M-07: Path traversal and dotted owners rejected.
+        assert!(is_valid_github_repo("craftowen/krill"));
+        assert!(is_valid_github_repo("org_1/repo.rs"));
+        assert!(!is_valid_github_repo("../users"));
+        assert!(!is_valid_github_repo("owner/.."));
+        assert!(!is_valid_github_repo("./repo"));
+        assert!(!is_valid_github_repo("owner/."));
+        assert!(!is_valid_github_repo("owner.dot/repo"));
+        assert!(!is_valid_github_repo("a/b/c"));
+
+        let dir = temp_dir("r2m07-10");
+        let store = Arc::new(BotStore::new(dir.clone()));
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x45; 32]));
+        let items = Arc::new(BotItemsStore::new(dir.join("items.db")));
+        let bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Tracker R2".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let mut bad_conn = bot.connectors.clone();
+        bad_conn.github.repos = vec!["../users".to_owned()];
+        assert_eq!(
+            store
+                .set_connector_config(&bot.id, bad_conn, 1_100)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // R2M-10: Disabling a bot while its HTTP poll is in flight must NOT resurrect status or emit on_new_items.
+        let poll_started = Arc::new(AtomicBool::new(false));
+        let poll_started_bg = Arc::clone(&poll_started);
+        let release_poll = Arc::new(AtomicBool::new(false));
+        let release_poll_bg = Arc::clone(&release_poll);
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = mock.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(sock.read(&mut buf).unwrap_or(0) > 0);
+            poll_started_bg.store(true, Ordering::Release);
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while !release_poll_bg.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let body = r#"[{"id":"n1","subject":{"title":"PR #1","type":"PullRequest","url":"https://api.github.com/repos/o/r/pulls/1"}}]"#;
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(wire.as_bytes()).ok();
+        });
+
+        secrets
+            .set_secret(&bot.id, "github_token", Zeroizing::new("ghp_ok".to_owned()))
+            .unwrap();
+        let mut conn = bot.connectors.clone();
+        conn.github.enabled = true;
+        store
+            .set_connector_config(&bot.id, conn.clone(), 1_200)
+            .unwrap();
+
+        let ep = TrackerEndpoints {
+            github_api_base: format!("http://{addr}"),
+            linear_graphql_url: format!("http://{addr}/graphql"),
+        };
+        let poller = TrackerPoller::new(Arc::clone(&store), secrets, items, ep);
+        let cb_fired = Arc::new(AtomicBool::new(false));
+        let cb_fired_bg = Arc::clone(&cb_fired);
+        poller.set_on_new_items(Arc::new(move |_, _, _| {
+            cb_fired_bg.store(true, Ordering::Release);
+        }));
+        poller.reconcile();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !poll_started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(poll_started.load(Ordering::Acquire));
+
+        // Disable bot while HTTP poll is in flight, then release HTTP response and reconcile.
+        conn.github.enabled = false;
+        store.set_connector_config(&bot.id, conn, 1_300).unwrap();
+        release_poll.store(true, Ordering::Release);
+        poller.reconcile();
+
+        assert!(
+            !cb_fired.load(Ordering::Acquire),
+            "on_new_items must NOT fire for a bot disabled during in-flight poll"
+        );
+        assert!(
+            poller.statuses(None).is_empty(),
+            "disabled bot status must NOT resurrect after in-flight poll finishes"
+        );
+        srv.join().ok();
         fs::remove_dir_all(&dir).ok();
     }
 }

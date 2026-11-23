@@ -1795,10 +1795,7 @@ impl Backend {
                     return Err(invalid());
                 }
                 let cwd = self.cwd(session)?;
-                let binary = std::env::current_exe()?
-                    .parent()
-                    .ok_or_else(invalid)?
-                    .join("krill");
+                let binary = krill_proto::daemon::sibling_exe("krill")?;
                 let mut command = krill_proto::os::background_command(binary);
                 command
                     .args([

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::bots::http_client::{self, HttpMethod, HttpRequest, SsrfPolicy};
 use crate::bots::items::BotItemsStore;
 use crate::bots::secrets::SecretVault;
-use crate::bots::tool_relay::{BotToolRelay, ToolRoute, make_cred_id};
+use crate::bots::tool_relay::{BotToolRelay, RouteKind, ToolRoute, make_composio_cred_id};
 use crate::session::lock;
 
 /// Default Composio v3.1 API base URL.
@@ -199,7 +199,7 @@ pub fn cleanup_composio_bot(bot_id: &BotId, state_root: Option<&Path>, relay: &B
             krill_proto::os::write_atomic_0600(&path, &bytes).ok();
         }
     }
-    let cred = make_cred_id(bot_id, "composio");
+    let cred = make_composio_cred_id(bot_id);
     relay.unregister_route(&cred);
 }
 
@@ -252,11 +252,12 @@ pub fn resolve_and_register_composio_with_root(
     };
 
     save_persisted_session(state_root, &bot.id, session_rec.clone());
-    let cred_id = make_cred_id(&bot.id, "composio");
+    let cred_id = make_composio_cred_id(&bot.id);
     relay.register_route(ToolRoute {
         cred_id: cred_id.clone(),
         bot_id: bot.id.clone(),
         tool_id: "composio".to_owned(),
+        kind: RouteKind::Composio,
         name: "Composio MCP".to_owned(),
         upstream_url: session_rec.mcp_url.clone(),
         auth_kind: BotMcpAuthKind::BearerHeader,

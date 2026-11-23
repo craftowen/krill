@@ -4,7 +4,7 @@
 //! bounded JSONL flush retries, `MEMORY.md` post-turn silent-deletion recovery, group relays, and
 //! inter-bot mail routing.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -235,6 +235,7 @@ struct RuntimeInner {
     sessions: Mutex<HashMap<SessionId, BotSessionBinding>>,
     turn_controls: Mutex<HashMap<SessionId, Arc<SessionTurnControl>>>,
     turn_meta: Mutex<HashMap<SessionId, SessionTurnMeta>>,
+    taken_over_sessions: Mutex<HashSet<SessionId>>,
     callbacks: Mutex<Option<RuntimeCallbacks>>,
 }
 
@@ -246,6 +247,7 @@ impl Default for RuntimeInner {
             sessions: Mutex::new(HashMap::new()),
             turn_controls: Mutex::new(HashMap::new()),
             turn_meta: Mutex::new(HashMap::new()),
+            taken_over_sessions: Mutex::new(HashSet::new()),
             callbacks: Mutex::new(None),
         }
     }
@@ -584,6 +586,36 @@ impl BotRuntime {
         link_id: Option<String>,
         group_key: Option<(String, String)>,
     ) -> Result<(SessionId, u32), BotStartError> {
+        self.start_bot_session_inner(
+            registry,
+            store,
+            secrets,
+            relay,
+            composio_base_url,
+            bot_id,
+            cwd_override,
+            prompt,
+            link_id,
+            group_key,
+            None,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "bot launch orchestration inputs")]
+    fn start_bot_session_inner(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        secrets: &SecretVault,
+        relay: &BotToolRelay,
+        composio_base_url: &str,
+        bot_id: &BotId,
+        cwd_override: Option<&str>,
+        prompt: Option<&str>,
+        link_id: Option<String>,
+        group_key: Option<(String, String)>,
+        on_bound: Option<&mut dyn FnMut(SessionId, u64)>,
+    ) -> Result<(SessionId, u32), BotStartError> {
         let bot = store
             .get_bot(bot_id)
             .map_err(|err| BotStartError::Other(err.to_string()))?
@@ -735,7 +767,23 @@ impl BotRuntime {
             (false, Some(user_prompt)) => Some(format!("{preamble}\n\n---\n\n{user_prompt}")),
             (false, None) => Some(preamble),
         };
-        if let Some(tap) = registry.session_tap(session_id) {
+        let tap_opt = registry.session_tap(session_id);
+        if has_prompt && tap_opt.is_none() {
+            ctrl.mark_ready();
+            registry.kill_bot_session(session_id).ok();
+            self.on_session_removed(relay, session_id);
+            return Err(BotStartError::Other(
+                "session PTY tap unavailable for initial prompt delivery".to_owned(),
+            ));
+        }
+
+        // Notify caller (group coordinator / connector router) BEFORE spawning `bot-preamble`
+        // so an early asynchronous `fail_initial_prompt_delivery` can never beat registration.
+        if let Some(cb) = on_bound {
+            cb(session_id, initial_seq);
+        }
+
+        if let Some(tap) = tap_opt {
             let bytes = initial_input.map(String::into_bytes);
             let ctrl_thread = Arc::clone(&ctrl);
             let inner_thread = Arc::clone(&self.inner);
@@ -805,25 +853,18 @@ impl BotRuntime {
                         }
                     }
                 });
-            if spawn_res.is_err() {
+            if let Err(err) = spawn_res {
                 ctrl.mark_ready();
                 if has_prompt {
-                    self.inner.fail_initial_prompt_delivery(
-                        &bot.id,
-                        session_id,
-                        "failed to spawn initial prompt delivery thread",
-                    );
+                    registry.kill_bot_session(session_id).ok();
+                    self.on_session_removed(relay, session_id);
+                    return Err(BotStartError::Other(format!(
+                        "failed to spawn initial prompt delivery thread: {err}"
+                    )));
                 }
             }
         } else {
             ctrl.mark_ready();
-            if has_prompt {
-                self.inner.fail_initial_prompt_delivery(
-                    &bot.id,
-                    session_id,
-                    "session PTY tap unavailable for initial prompt delivery",
-                );
-            }
         }
 
         Ok((session_id, pid))
@@ -844,6 +885,36 @@ impl BotRuntime {
         msg: &InboundExternalMessage,
         now_ms: u64,
     ) -> io::Result<(krill_proto::bots::ExternalConversationLink, SessionId, bool)> {
+        self.dispatch_external_message_with_hooks(
+            registry,
+            store,
+            secrets,
+            relay,
+            composio_base_url,
+            msg,
+            now_ms,
+            None,
+            None,
+        )
+    }
+
+    /// Dispatches an inbound external message with optional pre-delivery registration and rollback hooks.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "external message dispatch context"
+    )]
+    pub fn dispatch_external_message_with_hooks(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        secrets: &SecretVault,
+        relay: &BotToolRelay,
+        composio_base_url: &str,
+        msg: &InboundExternalMessage,
+        now_ms: u64,
+        on_bound: Option<&mut dyn FnMut(SessionId)>,
+        on_rollback: Option<&mut dyn FnMut(SessionId)>,
+    ) -> io::Result<(krill_proto::bots::ExternalConversationLink, SessionId, bool)> {
         let mut link = store.lookup_or_create_link(
             &msg.bot_id,
             msg.source,
@@ -856,10 +927,11 @@ impl BotRuntime {
 
         let formatted = format_external_prompt(msg);
 
-        // Reuse bound session if still alive (reconstructing missing in-memory binding if needed),
-        // queueing behind any in-flight turn so active turn state is never clobbered (MB-10).
+        // Reuse bound session if still alive and NOT taken over by the human owner, queueing
+        // behind any in-flight turn so active turn state is never clobbered (MB-10 / R2M-04).
         if let Some(sid) = link.session_id
             && registry.is_session_live(sid)
+            && !self.is_taken_over(sid)
         {
             self.ensure_binding_for_live_session(
                 registry,
@@ -870,20 +942,29 @@ impl BotRuntime {
                 now_ms,
             );
             relay.update_session_link(&msg.bot_id, sid, &link.id);
-            self.deliver_or_queue_turn_with_link(
+            let mut bound_bridge = on_bound.map(|cb| move |s: SessionId, _seq: u64| cb(s));
+            let mut rollback_bridge = on_rollback.map(|cb| move |s: SessionId, _seq: u64| cb(s));
+            self.deliver_or_queue_turn_with_link_hooks(
                 registry,
                 store,
                 sid,
                 &msg.bot_id,
                 &formatted,
                 Some(link.id.clone()),
+                bound_bridge
+                    .as_mut()
+                    .map(|f| f as &mut dyn FnMut(SessionId, u64)),
+                rollback_bridge
+                    .as_mut()
+                    .map(|f| f as &mut dyn FnMut(SessionId, u64)),
             )
             .map_err(io::Error::other)?;
             return Ok((link, sid, false));
         }
 
+        let mut bound_bridge = on_bound.map(|cb| move |s: SessionId, _seq: u64| cb(s));
         let (sid, _pid) = self
-            .start_bot_session(
+            .start_bot_session_inner(
                 registry,
                 store,
                 secrets,
@@ -893,6 +974,10 @@ impl BotRuntime {
                 None,
                 Some(&formatted),
                 Some(link.id.clone()),
+                None,
+                bound_bridge
+                    .as_mut()
+                    .map(|f| f as &mut dyn FnMut(SessionId, u64)),
             )
             .map_err(|err| io::Error::other(err.message()))?;
         if let Some(updated) = store.bind_link_session(&link.id, sid, now_ms)? {
@@ -958,13 +1043,62 @@ impl BotRuntime {
         prompt: &str,
         now_ms: u64,
     ) -> Result<(SessionId, u64, bool), String> {
+        self.deliver_group_turn_with_hooks(
+            registry,
+            store,
+            secrets,
+            relay,
+            composio_base_url,
+            bot_id,
+            group_id,
+            thread_id,
+            prompt,
+            now_ms,
+            None,
+            None,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "group bot turn dispatch context")]
+    pub(crate) fn deliver_group_turn_with_hooks(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        secrets: &SecretVault,
+        relay: &BotToolRelay,
+        composio_base_url: &str,
+        bot_id: &BotId,
+        group_id: &str,
+        thread_id: &str,
+        prompt: &str,
+        now_ms: u64,
+        on_bound: Option<&mut dyn FnMut(SessionId, u64)>,
+        on_rollback: Option<&mut dyn FnMut(SessionId, u64)>,
+    ) -> Result<(SessionId, u64, bool), String> {
         let _ = now_ms;
         if let Some(sid) = self.live_group_session_for_bot(registry, bot_id, group_id, thread_id) {
-            let seq = self.deliver_or_queue_turn(registry, store, sid, bot_id, prompt)?;
+            let seq = self.deliver_or_queue_turn_with_link_hooks(
+                registry,
+                store,
+                sid,
+                bot_id,
+                prompt,
+                None,
+                on_bound,
+                on_rollback,
+            )?;
             return Ok((sid, seq, false));
         }
+        let mut recorded_seq: Option<u64> = None;
+        let mut on_bound = on_bound;
+        let mut bound_wrapper = |sid: SessionId, seq: u64| {
+            recorded_seq = Some(seq);
+            if let Some(cb) = on_bound.as_deref_mut() {
+                cb(sid, seq);
+            }
+        };
         let (sid, _pid) = self
-            .start_bot_session_with_group(
+            .start_bot_session_inner(
                 registry,
                 store,
                 secrets,
@@ -975,12 +1109,15 @@ impl BotRuntime {
                 Some(prompt),
                 None,
                 Some((group_id.to_owned(), thread_id.to_owned())),
+                Some(&mut bound_wrapper),
             )
             .map_err(|err| err.message())?;
-        let seq = lock(&self.inner.turn_meta)
-            .get(&sid)
-            .and_then(|m| m.active_turn_seq)
-            .unwrap_or(1);
+        let seq = recorded_seq.unwrap_or_else(|| {
+            lock(&self.inner.turn_meta)
+                .get(&sid)
+                .and_then(|m| m.active_turn_seq)
+                .unwrap_or(1)
+        });
         Ok((sid, seq, true))
     }
 
@@ -1020,88 +1157,136 @@ impl BotRuntime {
         prompt: &str,
         link_id: Option<String>,
     ) -> Result<u64, String> {
+        self.deliver_or_queue_turn_with_link_hooks(
+            registry, store, sid, bot_id, prompt, link_id, None, None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "turn delivery with lifecycle hooks"
+    )]
+    fn deliver_or_queue_turn_with_link_hooks(
+        &self,
+        registry: &Registry,
+        store: &BotStore,
+        sid: SessionId,
+        bot_id: &BotId,
+        prompt: &str,
+        link_id: Option<String>,
+        on_bound: Option<&mut dyn FnMut(SessionId, u64)>,
+        on_rollback: Option<&mut dyn FnMut(SessionId, u64)>,
+    ) -> Result<u64, String> {
         type PrevTurnState = (bool, bool, Option<String>, Option<String>, Option<u64>);
         enum Action {
             Queued(u64),
-            Deliver {
-                seq: u64,
-                prev: Option<PrevTurnState>,
-            },
+            Deliver { seq: u64, prev: PrevTurnState },
         }
         // Pre-read MEMORY.md outside all runtime locks (MB-01).
         let fresh_memory = store.get_memory(bot_id).ok();
         let action = {
             // Canonical lock order: sessions -> turn_meta (MB-01).
             let mut sessions = lock(&self.inner.sessions);
+            let Some(binding) = sessions.get_mut(&sid) else {
+                return Err(format!(
+                    "session {} is not bound to bot {}",
+                    sid.0,
+                    bot_id.as_str()
+                ));
+            };
+            if &binding.bot_id != bot_id {
+                return Err(format!("session {} belongs to another bot", sid.0));
+            }
             let mut meta_map = lock(&self.inner.turn_meta);
             let meta = meta_map.entry(sid).or_default();
             meta.turn_seq = meta.turn_seq.saturating_add(1);
             let seq = meta.turn_seq;
-            if let Some(binding) = sessions.get_mut(&sid) {
-                if binding.owner_turn_pending {
-                    meta.pending_turns.push_back(QueuedBotTurn {
-                        prompt: prompt.to_owned(),
-                        turn_seq: seq,
-                        link_id,
-                    });
-                    Action::Queued(seq)
-                } else {
-                    let prev = (
-                        binding.explicit_reply_posted,
-                        binding.owner_turn_pending,
-                        binding.link_id.clone(),
-                        binding.last_prompt.clone(),
-                        meta.active_turn_seq,
-                    );
-                    binding.explicit_reply_posted = false;
-                    binding.owner_turn_pending = true;
-                    if let Some(ref lid) = link_id {
-                        binding.link_id = Some(lid.clone());
-                    }
-                    binding.last_prompt = Some(prompt.to_owned());
-                    if let Some(ref mem) = fresh_memory {
-                        binding.memory_snapshot = MemorySnapshot::capture(mem);
-                    }
-                    meta.active_turn_seq = Some(seq);
-                    Action::Deliver {
-                        seq,
-                        prev: Some(prev),
-                    }
-                }
+            if binding.owner_turn_pending {
+                meta.pending_turns.push_back(QueuedBotTurn {
+                    prompt: prompt.to_owned(),
+                    turn_seq: seq,
+                    link_id,
+                });
+                Action::Queued(seq)
             } else {
+                let prev = (
+                    binding.explicit_reply_posted,
+                    binding.owner_turn_pending,
+                    binding.link_id.clone(),
+                    binding.last_prompt.clone(),
+                    meta.active_turn_seq,
+                );
+                binding.explicit_reply_posted = false;
+                binding.owner_turn_pending = true;
+                if let Some(ref lid) = link_id {
+                    binding.link_id = Some(lid.clone());
+                }
+                binding.last_prompt = Some(prompt.to_owned());
+                if let Some(ref mem) = fresh_memory {
+                    binding.memory_snapshot = MemorySnapshot::capture(mem);
+                }
                 meta.active_turn_seq = Some(seq);
-                Action::Deliver { seq, prev: None }
+                Action::Deliver { seq, prev }
             }
         };
 
         match action {
             Action::Queued(seq) => {
+                if let Some(cb) = on_bound {
+                    cb(sid, seq);
+                }
                 self.inner.persist_bindings();
                 Ok(seq)
             }
             Action::Deliver { seq, prev } => {
+                if let Some(cb) = on_bound {
+                    cb(sid, seq);
+                }
                 self.inner.persist_bindings();
                 if let Err(err) =
                     self.inner
                         .deliver_serialized_input(registry, sid, prompt.as_bytes(), true)
                 {
-                    if let Some((prev_explicit, prev_pending, prev_link, prev_prompt, prev_seq)) =
-                        prev
-                    {
-                        {
-                            let mut sessions = lock(&self.inner.sessions);
-                            let mut meta_map = lock(&self.inner.turn_meta);
-                            if let Some(binding) = sessions.get_mut(&sid) {
-                                binding.explicit_reply_posted = prev_explicit;
-                                binding.owner_turn_pending = prev_pending;
-                                binding.link_id = prev_link;
-                                binding.last_prompt = prev_prompt;
-                            }
-                            if let Some(meta) = meta_map.get_mut(&sid) {
+                    let (prev_explicit, prev_pending, prev_link, prev_prompt, prev_seq) = prev;
+                    let has_queued = {
+                        let mut sessions = lock(&self.inner.sessions);
+                        let mut meta_map = lock(&self.inner.turn_meta);
+                        if let Some(binding) = sessions.get_mut(&sid) {
+                            binding.explicit_reply_posted = prev_explicit;
+                            binding.owner_turn_pending = prev_pending;
+                            binding.link_id = prev_link;
+                            binding.last_prompt = prev_prompt;
+                        }
+                        if let Some(meta) = meta_map.get_mut(&sid) {
+                            if meta.active_turn_seq == Some(seq) {
                                 meta.active_turn_seq = prev_seq;
                             }
+                            !meta.pending_turns.is_empty()
+                        } else {
+                            false
                         }
-                        self.inner.persist_bindings();
+                    };
+                    self.inner.persist_bindings();
+                    if let Some(rb) = on_rollback {
+                        rb(sid, seq);
+                    }
+                    if has_queued {
+                        let (groups, connectors) = {
+                            let cb = lock(&self.inner.callbacks);
+                            match cb.as_ref() {
+                                Some(c) => (c.groups.upgrade(), lock(&c.connectors).upgrade()),
+                                None => (None, None),
+                            }
+                        };
+                        self.inner.drain_next_queued_turn(
+                            registry,
+                            store,
+                            groups.as_deref(),
+                            connectors.as_deref(),
+                            bot_id,
+                            sid,
+                            now_ms(),
+                        );
                     }
                     return Err(err.to_string());
                 }
@@ -1366,6 +1551,7 @@ impl BotRuntime {
                     "session is no longer live",
                 ));
             }
+            lock(&self.inner.taken_over_sessions).insert(session_id);
             sessions.remove(&session_id)
         };
         lock(&self.inner.turn_controls).remove(&session_id);
@@ -1379,7 +1565,13 @@ impl BotRuntime {
         Ok(())
     }
 
+    fn is_taken_over(&self, session_id: SessionId) -> bool {
+        lock(&self.inner.taken_over_sessions).contains(&session_id)
+    }
+
     /// Re-sends the most recent prompt on a live bot session (`SendBotRunAgain`).
+    /// Routes through [`Self::deliver_or_queue_turn_with_link_hooks`] so an in-flight turn is
+    /// never interleaved or clobbered.
     pub fn send_run_again(
         &self,
         registry: &Registry,
@@ -1393,11 +1585,9 @@ impl BotRuntime {
                 "bot session is not live",
             ));
         }
-        // Pre-read MEMORY.md outside all runtime mutexes (MB-01).
-        let fresh_memory = store.get_memory(bot_id).ok();
-        let (prompt, prev_explicit, prev_pending, prev_seq) = {
-            let mut sessions = lock(&self.inner.sessions);
-            let Some(binding) = sessions.get_mut(&session_id) else {
+        let prompt = {
+            let sessions = lock(&self.inner.sessions);
+            let Some(binding) = sessions.get(&session_id) else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "bot session binding not found",
@@ -1421,40 +1611,13 @@ impl BotRuntime {
                     "no previous prompt recorded for this session",
                 ));
             };
-            let prev_explicit = binding.explicit_reply_posted;
-            let prev_pending = binding.owner_turn_pending;
-            binding.explicit_reply_posted = false;
-            binding.owner_turn_pending = true;
-            if let Some(ref mem) = fresh_memory {
-                binding.memory_snapshot = MemorySnapshot::capture(mem);
-            }
-            let mut meta_map = lock(&self.inner.turn_meta);
-            let meta = meta_map.entry(session_id).or_default();
-            let prev_seq = meta.active_turn_seq;
-            meta.turn_seq = meta.turn_seq.saturating_add(1);
-            meta.active_turn_seq = Some(meta.turn_seq);
-            (last, prev_explicit, prev_pending, prev_seq)
+            last
         };
-        self.inner.persist_bindings();
-        if let Err(err) =
-            self.inner
-                .deliver_serialized_input(registry, session_id, prompt.as_bytes(), true)
-        {
-            {
-                let mut sessions = lock(&self.inner.sessions);
-                let mut meta_map = lock(&self.inner.turn_meta);
-                if let Some(binding) = sessions.get_mut(&session_id) {
-                    binding.explicit_reply_posted = prev_explicit;
-                    binding.owner_turn_pending = prev_pending;
-                }
-                if let Some(meta) = meta_map.get_mut(&session_id) {
-                    meta.active_turn_seq = prev_seq;
-                }
-            }
-            self.inner.persist_bindings();
-            return Err(err);
-        }
-        Ok(())
+        self.deliver_or_queue_turn_with_link_hooks(
+            registry, store, session_id, bot_id, &prompt, None, None, None,
+        )
+        .map(|_| ())
+        .map_err(io::Error::other)
     }
 
     /// Marks that `bot_id` explicitly called `PostBotReply` during its current turn.
@@ -1671,24 +1834,19 @@ impl BotRuntime {
         let final_reply = {
             let mut sessions = lock(&self.inner.sessions);
             let mut meta_map = lock(&self.inner.turn_meta);
-            let reply = if binding.explicit_reply_posted {
-                if let Some(entry) = sessions.get_mut(&session_id) {
-                    entry.explicit_reply_posted = false;
-                    entry.owner_turn_pending = false;
-                    entry.chat_offset = next_offset;
-                }
-                None
+            let explicit_posted = if let Some(entry) = sessions.get_mut(&session_id) {
+                let posted = entry.explicit_reply_posted;
+                entry.explicit_reply_posted = false;
+                entry.owner_turn_pending = false;
+                entry.chat_offset = next_offset;
+                posted
             } else {
-                if let Some(entry) = sessions.get_mut(&session_id) {
-                    entry.owner_turn_pending = false;
-                    entry.chat_offset = next_offset;
-                }
-                cleaned_reply
+                binding.explicit_reply_posted
             };
             if let Some(meta) = meta_map.get_mut(&session_id) {
                 meta.active_turn_seq = None;
             }
-            reply
+            if explicit_posted { None } else { cleaned_reply }
         };
         self.inner.persist_bindings();
 
@@ -1853,6 +2011,7 @@ impl BotRuntime {
             let mut meta = lock(&self.inner.turn_meta);
             controls.remove(&session_id);
             meta.remove(&session_id);
+            lock(&self.inner.taken_over_sessions).remove(&session_id);
             sessions.remove(&session_id)
         };
         if let Some(binding) = removed {
@@ -2002,6 +2161,9 @@ impl BotRuntime {
         link_id: Option<String>,
         now_ms: u64,
     ) {
+        if self.is_taken_over(sid) {
+            return;
+        }
         let missing = !lock(&self.inner.sessions).contains_key(&sid);
         if !missing {
             return;
@@ -3066,6 +3228,111 @@ mod tests {
             )
             .unwrap_err();
         assert!(cross_err.contains("does not belong to bot"), "{cross_err}");
+
+        // R2M-04: deliver_or_queue_turn rejects unbound/taken-over session IDs instead of writing to PTY.
+        let unbound_err = rt
+            .deliver_or_queue_turn(&reg, &store, SessionId(999_999), &bot.id, "orphan")
+            .unwrap_err();
+        assert!(unbound_err.contains("not bound"), "{unbound_err}");
+        lock(&rt.inner.taken_over_sessions).insert(SessionId(888_888));
+        rt.ensure_binding_for_live_session(
+            &reg,
+            &store,
+            &bot.id,
+            SessionId(888_888),
+            Some("link-stale".to_owned()),
+            1_200,
+        );
+        assert!(
+            !lock(&rt.inner.sessions).contains_key(&SessionId(888_888)),
+            "taken-over session must never be re-bound by ensure_binding_for_live_session"
+        );
+
+        // R2M-09: Rollback on failed deliver_serialized_input drains queued pending_turns instead of stranding them.
+        let sid_q = SessionId(707_707);
+        lock(&rt.inner.sessions).insert(
+            sid_q,
+            BotSessionBinding {
+                bot_id: bot.id.clone(),
+                link_id: None,
+                memory_snapshot: MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 4243,
+                label: "queue-test".to_owned(),
+                created_at_ms: 1_200,
+                owner_turn_pending: false,
+                last_prompt: Some("prev".to_owned()),
+            },
+        );
+        lock(&rt.inner.turn_meta).insert(
+            sid_q,
+            SessionTurnMeta {
+                group_key: None,
+                turn_seq: 1,
+                active_turn_seq: None,
+                pending_turns: VecDeque::from([QueuedBotTurn {
+                    prompt: "Turn 2".to_owned(),
+                    turn_seq: 2,
+                    link_id: None,
+                }]),
+            },
+        );
+        // Delivery of Turn 1 fails (session not in registry) -> rollback MUST drain Turn 2 from pending_turns!
+        assert!(
+            rt.deliver_or_queue_turn(&reg, &store, sid_q, &bot.id, "Turn 1")
+                .is_err()
+        );
+        assert!(
+            lock(&rt.inner.turn_meta)
+                .get(&sid_q)
+                .unwrap()
+                .pending_turns
+                .is_empty(),
+            "R2M-09: rollback must drain pending_turns instead of stranding Turn 2"
+        );
+
+        // R2M-21: on_hook_event_with_groups reads & resets live `entry.explicit_reply_posted` under lock.
+        let sid_exp = SessionId(708_708);
+        lock(&rt.inner.sessions).insert(
+            sid_exp,
+            BotSessionBinding {
+                bot_id: bot.id.clone(),
+                link_id: None,
+                memory_snapshot: MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: true,
+                launch_token: None,
+                pid: 4244,
+                label: "exp-test".to_owned(),
+                created_at_ms: 1_300,
+                owner_turn_pending: true,
+                last_prompt: Some("hi".to_owned()),
+            },
+        );
+        let stop_ev = HookEvent {
+            id: krill_proto::hook::EventId {
+                pid: 4244,
+                unix_ns: 1_400_000_000,
+            },
+            agent: "claude".to_owned(),
+            ppid: 4244,
+            input: krill_proto::hook::Input::Complete,
+            payload: serde_json::json!({"hook_event_name": "Stop"})
+                .to_string()
+                .into_bytes(),
+        };
+        rt.on_hook_event_with_groups(&reg, &store, None, None, sid_exp, &stop_ev);
+        {
+            let sessions = lock(&rt.inner.sessions);
+            let b = sessions.get(&sid_exp).unwrap();
+            assert!(
+                !b.explicit_reply_posted,
+                "R2M-21: explicit_reply_posted reset"
+            );
+            assert!(!b.owner_turn_pending, "R2M-21: owner_turn_pending cleared");
+        }
 
         fs::remove_dir_all(&dir).ok();
     }

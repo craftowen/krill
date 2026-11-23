@@ -44,6 +44,7 @@ pub const DISCORD_GATEWAY_INTENTS: u32 = (1 << 0) | (1 << 9) | (1 << 12) | (1 <<
 const WORKER_STACK_SIZE: usize = 128 * 1024;
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WS_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_POLL_SLICE: Duration = Duration::from_millis(100);
 const MAX_DISCORD_RATE_RETRIES: usize = 2;
 const MAX_OUTBOUND_DISCORD_FILE_BYTES: usize = 25 * 1024 * 1024;
@@ -517,10 +518,31 @@ fn run_discord_loop(
     router: &Arc<ConversationRouter>,
     stop: &Arc<StopFlag>,
 ) {
+    run_discord_loop_with_timeouts(
+        bot,
+        bot_token,
+        sender,
+        bridge,
+        router,
+        stop,
+        WS_HELLO_TIMEOUT,
+    );
+}
+
+fn run_discord_loop_with_timeouts(
+    bot: &BotConfig,
+    bot_token: &Zeroizing<String>,
+    sender: &Arc<DiscordSender>,
+    bridge: &Arc<dyn ConnectorBridge>,
+    router: &Arc<ConversationRouter>,
+    stop: &Arc<StopFlag>,
+    hello_timeout: Duration,
+) {
     let mut session = GatewaySession::default();
     let mut participated_threads: BTreeSet<String> = BTreeSet::new();
     let mut backoff_ms: u64 = 1_000;
     let mut consecutive_resume_failures: u32 = 0;
+    let mut consecutive_reconnects: u32 = 0;
 
     while !stop.is_stopped() {
         report_status(
@@ -607,6 +629,7 @@ fn run_discord_loop(
 
         let mut heartbeat_interval: Option<Duration> = None;
         let mut next_heartbeat: Option<Instant> = None;
+        let hello_deadline = Instant::now() + hello_timeout;
         let mut awaiting_ack = false;
         let mut immediate_reconnect = false;
         let mut custom_reconnect_wait: Option<Duration> = None;
@@ -614,6 +637,19 @@ fn run_discord_loop(
         let mut resumed_or_ready = false;
 
         while !stop.is_stopped() {
+            if heartbeat_interval.is_none() && Instant::now() >= hello_deadline {
+                report_status(
+                    bridge,
+                    &bot.id,
+                    false,
+                    ConnectorHealthState::Error,
+                    session.account_label.clone(),
+                    None,
+                    Some("Discord gateway HELLO timed out".to_owned()),
+                    Some(classify_error("Discord gateway HELLO timed out")),
+                );
+                break;
+            }
             // Send scheduled heartbeat if due.
             if let (Some(interval), Some(due)) = (heartbeat_interval, next_heartbeat)
                 && Instant::now() >= due
@@ -630,10 +666,14 @@ fn run_discord_loop(
                 next_heartbeat = Some(Instant::now() + interval);
             }
 
-            let poll_wait = next_heartbeat.map_or(WS_POLL_SLICE, |due| {
-                due.saturating_duration_since(Instant::now())
-                    .min(WS_POLL_SLICE)
-            });
+            let poll_wait = match next_heartbeat {
+                Some(due) => due
+                    .saturating_duration_since(Instant::now())
+                    .min(WS_POLL_SLICE),
+                None => hello_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(WS_POLL_SLICE),
+            };
             match ws.poll_event(poll_wait) {
                 Ok(WsEvent::Timeout | WsEvent::Pong(_) | WsEvent::Binary(_)) => {}
                 Ok(WsEvent::Text(raw)) => {
@@ -739,6 +779,7 @@ fn run_discord_loop(
                             if event_name == "READY" || event_name == "RESUMED" {
                                 backoff_ms = 1_000;
                                 consecutive_resume_failures = 0;
+                                consecutive_reconnects = 0;
                                 resumed_or_ready = true;
                             }
                         }
@@ -797,11 +838,17 @@ fn run_discord_loop(
                 consecutive_resume_failures = 0;
             }
         }
+        if immediate_reconnect {
+            consecutive_reconnects = consecutive_reconnects.saturating_add(1);
+        } else {
+            consecutive_reconnects = 0;
+        }
+        let skip_backoff = immediate_reconnect && consecutive_reconnects < 2;
         if let Some(wait_dur) = custom_reconnect_wait {
             if stop.wait(wait_dur) {
                 break;
             }
-        } else if !immediate_reconnect {
+        } else if !skip_backoff {
             if stop.wait(Duration::from_millis(backoff_ms)) {
                 break;
             }
@@ -2133,5 +2180,267 @@ mod tests {
             &mut participated,
         );
         assert_eq!(lock(&bridge.dispatched).len(), 1);
+    }
+
+    #[test]
+    fn r2m17_hello_timeout_disconnects_and_repeated_op_reconnect_applies_backoff() {
+        struct StatusBridge {
+            bot: BotConfig,
+            statuses: Mutex<Vec<BotConnectorStatus>>,
+        }
+        impl ConnectorBridge for StatusBridge {
+            fn dispatch_external_message(
+                &self,
+                _: InboundExternalMessage,
+            ) -> io::Result<crate::bots::connectors::DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> io::Result<crate::bots::connectors::AccessDecision> {
+                Ok(crate::bots::connectors::AccessDecision::Allowed)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+                _: krill_proto::bots::ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+                _: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, st: BotConnectorStatus) {
+                lock(&self.statuses).push(st);
+            }
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.bot.id == bot_id).then(|| self.bot.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.bot.clone()]
+            }
+            fn resolve_secret(
+                &self,
+                _: &BotId,
+                _: Option<&str>,
+                _: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+        }
+
+        // 1. Pre-OP_HELLO stall must disconnect after hello_timeout instead of hanging forever.
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let rest_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let rest_addr = rest_listener.local_addr().unwrap();
+        let stop_servers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_rest = Arc::clone(&stop_servers);
+        let stop_ws = Arc::clone(&stop_servers);
+
+        let rest_srv = thread::spawn(move || {
+            rest_listener.set_nonblocking(true).ok();
+            while !stop_rest.load(std::sync::atomic::Ordering::Acquire) {
+                let Ok((mut sock, _)) = rest_listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                sock.set_nonblocking(false).ok();
+                let mut buf = [0u8; 2048];
+                if sock.read(&mut buf).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let body = format!(r#"{{"url":"ws://{ws_addr}"}}"#);
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).ok();
+            }
+        });
+
+        let ws_accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ws_accepts_bg = Arc::clone(&ws_accepts);
+        let ws_srv = thread::spawn(move || {
+            ws_listener.set_nonblocking(true).ok();
+            let mut held_sockets = Vec::new();
+            while !stop_ws.load(std::sync::atomic::Ordering::Acquire) {
+                let Ok((mut sock, _)) = ws_listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                sock.set_nonblocking(false).ok();
+                if accept_ws_test_handshake(&mut sock).is_ok() {
+                    ws_accepts_bg.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    // Hold socket open without EVER sending OP_HELLO!
+                    held_sockets.push(sock);
+                }
+            }
+        });
+
+        let bot_id = BotId::new("dc-hello-to").unwrap();
+        let mut bot = BotConfig::new(bot_id, "DcHello", "claude", 1_000).unwrap();
+        bot.connectors.discord.enabled = true;
+        let bridge = Arc::new(StatusBridge {
+            bot: bot.clone(),
+            statuses: Mutex::new(Vec::new()),
+        });
+        let bridge_dyn: Arc<dyn ConnectorBridge> = bridge.clone();
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge_dyn)));
+        let sender = Arc::new(DiscordSender::new(
+            &format!("http://{rest_addr}"),
+            Zeroizing::new("tok".to_owned()),
+        ));
+        let stop = Arc::new(StopFlag::default());
+        let stop_bg = Arc::clone(&stop);
+        let tok = Zeroizing::new("tok".to_owned());
+        let worker = thread::spawn(move || {
+            run_discord_loop_with_timeouts(
+                &bot,
+                &tok,
+                &sender,
+                &bridge_dyn,
+                &router,
+                &stop_bg,
+                Duration::from_millis(120),
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if lock(&bridge.statuses).iter().any(|s| {
+                s.last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("HELLO timed out"))
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+        stop.signal();
+        stop_servers.store(true, std::sync::atomic::Ordering::Release);
+        worker.join().unwrap();
+        rest_srv.join().ok();
+        ws_srv.join().ok();
+
+        assert!(
+            lock(&bridge.statuses).iter().any(|s| s
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("HELLO timed out"))),
+            "pre-OP_HELLO stall must hit hello_deadline and report timeout"
+        );
+
+        // 2. Repeated OP_RECONNECT without READY/RESUMED must back off on >=2nd consecutive reconnect.
+        let ws2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws2_addr = ws2.local_addr().unwrap();
+        let rest2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let rest2_addr = rest2.local_addr().unwrap();
+        let stop2_srv = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2_r = Arc::clone(&stop2_srv);
+        let stop2_w = Arc::clone(&stop2_srv);
+        let r2_thread = thread::spawn(move || {
+            rest2.set_nonblocking(true).ok();
+            while !stop2_r.load(std::sync::atomic::Ordering::Acquire) {
+                let Ok((mut sock, _)) = rest2.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                sock.set_nonblocking(false).ok();
+                let mut buf = [0u8; 2048];
+                if sock.read(&mut buf).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let body = format!(r#"{{"url":"ws://{ws2_addr}"}}"#);
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).ok();
+            }
+        });
+        let reconnect_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let reconnect_times_bg = Arc::clone(&reconnect_times);
+        let w2_thread = thread::spawn(move || {
+            ws2.set_nonblocking(true).ok();
+            while !stop2_w.load(std::sync::atomic::Ordering::Acquire) {
+                let Ok((mut sock, _)) = ws2.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                sock.set_nonblocking(false).ok();
+                if accept_ws_test_handshake(&mut sock).is_ok() {
+                    lock(&reconnect_times_bg).push(Instant::now());
+                    write_server_frame(
+                        &mut sock,
+                        true,
+                        1,
+                        br#"{"op":10,"d":{"heartbeat_interval":5000}}"#,
+                    )
+                    .ok();
+                    // Immediately send OP_RECONNECT without READY/RESUMED.
+                    write_server_frame(&mut sock, true, 1, br#"{"op":7,"d":null}"#).ok();
+                }
+            }
+        });
+
+        let bot2 = BotConfig::new(
+            BotId::new("dc-reconn").unwrap(),
+            "DcReconn",
+            "claude",
+            1_000,
+        )
+        .unwrap();
+        let b2 = Arc::new(StatusBridge {
+            bot: bot2.clone(),
+            statuses: Mutex::new(Vec::new()),
+        });
+        let b2_dyn: Arc<dyn ConnectorBridge> = b2;
+        let router2 = Arc::new(ConversationRouter::new(Arc::clone(&b2_dyn)));
+        let sender2 = Arc::new(DiscordSender::new(
+            &format!("http://{rest2_addr}"),
+            Zeroizing::new("tok".to_owned()),
+        ));
+        let stop2 = Arc::new(StopFlag::default());
+        let stop2_bg = Arc::clone(&stop2);
+        let tok2 = Zeroizing::new("tok".to_owned());
+        let worker2 = thread::spawn(move || {
+            run_discord_loop_with_timeouts(
+                &bot2,
+                &tok2,
+                &sender2,
+                &b2_dyn,
+                &router2,
+                &stop2_bg,
+                Duration::from_secs(5),
+            );
+        });
+        thread::sleep(Duration::from_millis(450));
+        stop2.signal();
+        stop2_srv.store(true, std::sync::atomic::Ordering::Release);
+        worker2.join().unwrap();
+        r2_thread.join().ok();
+        w2_thread.join().ok();
+
+        let count = lock(&reconnect_times).len();
+        assert!(
+            (2..=3).contains(&count),
+            "2nd consecutive OP_RECONNECT must apply backoff (expected 2..=3 connections in 450ms, got {count})"
+        );
     }
 }

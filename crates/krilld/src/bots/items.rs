@@ -847,10 +847,25 @@ impl BotItemsStore {
             let mut collected_multi = multi_ask
                 .map(|ask_ev| collect_decision_answers(&ask_ev.decisions, &item.events, ask_ev.id));
 
+            let decision_id_trimmed = decision_id.map(str::trim).filter(|s| !s.is_empty());
             let target_on_multi = multi_ask.and_then(|ask_ev| {
                 let existing = collected_multi.as_deref().unwrap_or(&[]);
-                resolve_target_decision_on_event(ask_ev, decision_id, option_index, existing)
+                resolve_target_decision_on_event(
+                    ask_ev,
+                    decision_id_trimmed,
+                    option_index,
+                    existing,
+                )
             });
+            if multi_ask.is_some()
+                && let Some(raw_dec_id) = decision_id_trimmed
+                && target_on_multi.is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("decision_id '{raw_dec_id}' does not match an active decision"),
+                ));
+            }
 
             let resolved_option = if let Some(idx) = option_index {
                 let idx_usize = usize::try_from(idx).unwrap_or(usize::MAX);
@@ -1434,12 +1449,25 @@ fn parse_items_cursor(raw: &str) -> io::Result<(i64, String)> {
     Ok((ts, uid_part.to_owned()))
 }
 
-fn decision_question_line(question: &str) -> &str {
+fn raw_decision_question_line(question: &str) -> &str {
     question
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_else(|| question.trim())
+}
+
+fn decision_question_line(question: &str) -> String {
+    let first = raw_decision_question_line(question);
+    let stripped = first.trim_start_matches(|c: char| {
+        matches!(c, '#' | '>' | '-' | '*' | '+') || c.is_whitespace()
+    });
+    stripped
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_owned()
 }
 
 fn active_decision_event(events: &[BotItemEvent]) -> Option<&BotItemEvent> {
@@ -1485,43 +1513,52 @@ fn apply_decision_answer_lines(
             continue;
         }
         let mut best_len = 0_usize;
-        let mut best_indices: Vec<usize> = Vec::new();
+        let mut best_matches: Vec<(usize, String)> = Vec::new();
         for (idx, dec) in decisions.iter().enumerate() {
-            let ql = decision_question_line(&dec.question);
-            if ql.is_empty() {
-                continue;
+            let norm = decision_question_line(&dec.question);
+            let raw = raw_decision_question_line(&dec.question);
+            let mut best_for_dec: Option<String> = None;
+            for cand in [norm.as_str(), raw] {
+                if cand.is_empty() {
+                    continue;
+                }
+                let prefix = format!("{cand} →");
+                if line.starts_with(&prefix)
+                    && best_for_dec
+                        .as_ref()
+                        .is_none_or(|prev| prefix.len() > prev.len())
+                {
+                    best_for_dec = Some(prefix);
+                }
             }
-            let prefix = format!("{ql} →");
-            if line.starts_with(&prefix) {
-                match ql.len().cmp(&best_len) {
+            if let Some(prefix) = best_for_dec {
+                match prefix.len().cmp(&best_len) {
                     std::cmp::Ordering::Greater => {
-                        best_len = ql.len();
-                        best_indices.clear();
-                        best_indices.push(idx);
+                        best_len = prefix.len();
+                        best_matches.clear();
+                        best_matches.push((idx, prefix));
                     }
                     std::cmp::Ordering::Equal => {
-                        best_indices.push(idx);
+                        best_matches.push((idx, prefix));
                     }
                     std::cmp::Ordering::Less => {}
                 }
             }
         }
-        if best_indices.is_empty() {
-            continue;
-        }
-        let target_idx = best_indices
+        let Some((target_idx, matched_prefix)) = best_matches
             .iter()
-            .copied()
-            .find(|&idx| answers.get(idx).is_some_and(Option::is_none))
-            .unwrap_or_else(|| best_indices.first().copied().unwrap_or(0));
-        if let Some(dec) = decisions.get(target_idx) {
-            let ql = decision_question_line(&dec.question);
-            let prefix = format!("{ql} →");
-            let val = line.strip_prefix(&prefix).unwrap_or("").trim();
-            if let Some(slot) = answers.get_mut(target_idx) {
-                *slot = Some(val.to_owned());
-                matched += 1;
-            }
+            .find(|(idx, _)| answers.get(*idx).is_some_and(Option::is_none))
+            .or_else(|| best_matches.first())
+        else {
+            continue;
+        };
+        let val = line
+            .strip_prefix(matched_prefix.as_str())
+            .unwrap_or("")
+            .trim();
+        if let Some(slot) = answers.get_mut(*target_idx) {
+            *slot = Some(val.to_owned());
+            matched += 1;
         }
     }
     matched
@@ -1581,7 +1618,9 @@ fn resolve_target_decision_on_event<'a>(
         }
         let mut matches = ask_ev.decisions.iter().enumerate().filter(|(_, d)| {
             let q = d.question.trim();
-            q == raw || decision_question_line(&d.question) == raw
+            q == raw
+                || raw_decision_question_line(&d.question) == raw
+                || decision_question_line(&d.question) == raw
         });
         let first = matches.next()?;
         if existing_answers.get(first.0).is_some_and(Option::is_some) {
@@ -1630,7 +1669,9 @@ fn resolve_target_decision<'a>(
         }
         return latest.iter().find(|d| {
             let q = d.question.trim();
-            q == raw || decision_question_line(&d.question) == raw
+            q == raw
+                || raw_decision_question_line(&d.question) == raw
+                || decision_question_line(&d.question) == raw
         });
     }
     events
@@ -2736,6 +2777,225 @@ mod tests {
         let clamped_ask = clamp_utf8_bytes_and_chars(&cjk, 120, BOT_ITEM_TITLE_MAX_BYTES);
         assert!(clamped_ask.len() <= BOT_ITEM_TITLE_MAX_BYTES);
         assert!(clamped_ask.chars().count() <= 120);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r2m01_r2m02_markdown_decisions_backcompat_and_stale_decision_id_rejected() {
+        let (dir, db_path) = temp_db("r2m01-02");
+        let store = BotItemsStore::new(db_path);
+        let bot_id = BotId::new("bot-md").unwrap();
+        let bot_actor = BotItemActor::Bot {
+            bot_id: bot_id.clone(),
+            session_id: None,
+        };
+        let owner = BotItemActor::Owner {
+            device: Some("mobile".to_owned()),
+        };
+
+        let item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_id.clone(),
+                    title: "Markdown multi-decision".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                1_000,
+            )
+            .unwrap();
+        let updated = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Confirm deploy settings".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "**Deploy target?**".to_owned(),
+                            options: vec!["Staging".to_owned(), "Prod".to_owned()],
+                            recommended: Some(0),
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "# `Region?`".to_owned(),
+                            options: vec!["US".to_owned(), "EU".to_owned()],
+                            recommended: Some(0),
+                            multi: false,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &bot_actor,
+                1_100,
+            )
+            .unwrap();
+        let ask_ev_id = updated
+            .events
+            .iter()
+            .rev()
+            .find(|e| !e.decisions.is_empty())
+            .unwrap()
+            .id;
+
+        // R2M-02: stale or invalid decision_id on multi-decision NeedsYou MUST return InvalidInput
+        // instead of falling through to freeform and waking the bot.
+        let stale_err = store
+            .answer_item(
+                &item.uid,
+                Some("Staging"),
+                Some(0),
+                Some("99999:0"),
+                None,
+                &owner,
+                1_150,
+            )
+            .unwrap_err();
+        assert_eq!(stale_err.kind(), io::ErrorKind::InvalidInput);
+        let invalid_err = store
+            .answer_item(
+                &item.uid,
+                Some("Staging"),
+                None,
+                Some("nonexistent-decision"),
+                None,
+                &owner,
+                1_160,
+            )
+            .unwrap_err();
+        assert_eq!(invalid_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store.get_item(&item.uid).unwrap().unwrap().status,
+            BotItemStatus::NeedsYou
+        );
+
+        // R2M-01: Mobile/Desktop normalized prefix ("Deploy target? → Staging") matches Decision 0
+        // without double-prefixing and keeps status NeedsYou until Decision 1 is answered.
+        let ans1 = store
+            .answer_item(
+                &item.uid,
+                Some("Deploy target? → Staging"),
+                Some(0),
+                Some(&format!("{ask_ev_id}:0")),
+                None,
+                &owner,
+                1_200,
+            )
+            .unwrap();
+        assert!(!ans1.should_wake_bot);
+        assert_eq!(ans1.item.status, BotItemStatus::NeedsYou);
+        assert_eq!(ans1.answer_summary, "Deploy target? → Staging");
+        assert!(
+            !ans1
+                .item
+                .events
+                .last()
+                .unwrap()
+                .text
+                .contains("**Deploy target?**"),
+            "must not double-prefix with raw Markdown"
+        );
+
+        // Answering Decision 1 via option_index uses stripped question line and completes all decisions.
+        let ans2 = store
+            .answer_item(
+                &item.uid,
+                None,
+                Some(1),
+                Some(&format!("{ask_ev_id}:1")),
+                None,
+                &owner,
+                1_300,
+            )
+            .unwrap();
+        assert!(ans2.should_wake_bot);
+        assert_eq!(ans2.item.status, BotItemStatus::Working);
+        assert_eq!(
+            ans2.answer_summary,
+            "Deploy target? → Staging\nRegion? → EU"
+        );
+
+        // R2M-01 back-compat: historical raw-Markdown prefix is still recognized on read.
+        let hist = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id,
+                    title: "Historical raw markdown".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                2_000,
+            )
+            .unwrap();
+        store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: hist.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Pick two".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "**Env?**".to_owned(),
+                            options: vec!["Dev".to_owned(), "Prod".to_owned()],
+                            recommended: None,
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "**Mode?**".to_owned(),
+                            options: vec!["Fast".to_owned(), "Safe".to_owned()],
+                            recommended: None,
+                            multi: false,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &bot_actor,
+                2_100,
+            )
+            .unwrap();
+        let raw_ans = store
+            .answer_item(
+                &hist.uid,
+                Some("**Env?** → Prod"),
+                None,
+                None,
+                None,
+                &owner,
+                2_200,
+            )
+            .unwrap();
+        assert!(!raw_ans.should_wake_bot);
+        assert_eq!(raw_ans.item.status, BotItemStatus::NeedsYou);
+
+        let norm_ans = store
+            .answer_item(
+                &hist.uid,
+                Some("Mode? → Safe"),
+                None,
+                None,
+                None,
+                &owner,
+                2_300,
+            )
+            .unwrap();
+        assert!(norm_ans.should_wake_bot);
+        assert_eq!(norm_ans.item.status, BotItemStatus::Working);
+        assert_eq!(norm_ans.answer_summary, "Env? → Prod\nMode? → Safe");
 
         fs::remove_dir_all(&dir).ok();
     }

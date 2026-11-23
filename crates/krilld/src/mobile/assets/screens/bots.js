@@ -170,11 +170,13 @@ return sameDay
 return t("Never");
 }
 };
-const questionLine = (q) => {
-const first = String(q || "")
+const rawQuestionLine = (q) =>
+String(q || "")
 .split("\n")
 .map((l) => l.trim())
 .find(Boolean) || "";
+const questionLine = (q) => {
+const first = rawQuestionLine(q);
 return first
 .replace(/^[#>\-*+\s]+/, "")
 .replace(/\*\*|__|`/g, "")
@@ -195,7 +197,14 @@ return parts.length > 1 ? parts[parts.length - 1].trim() : null;
 const answeredDecisionLines = (item, askEv) => {
 const decs = Array.isArray(askEv?.decisions) ? askEv.decisions : [];
 const answered = decs.map(() => null);
-const heads = decs.map((d) => `${questionLine(d.question)} →`);
+const headPairs = decs.map((d) => {
+const norm = questionLine(d.question);
+const raw = rawQuestionLine(d.question);
+const list = [];
+if (norm) list.push(`${norm} →`);
+if (raw && raw !== norm) list.push(`${raw} →`);
+return list;
+});
 const events = Array.isArray(item?.events) ? item.events : [];
 for (const ev of events) {
 if (Number(ev?.id || 0) <= Number(askEv?.id || 0)) continue;
@@ -207,17 +216,27 @@ if (!answered[0]) answered[0] = txt;
 continue;
 }
 for (const line of txt.split("\n").map((l) => l.trim())) {
-let best = -1;
 let bestLen = -1;
-heads.forEach((hd, i) => {
-if (hd.length > 2 && line.startsWith(hd) && hd.length > bestLen) {
-best = i;
-bestLen = hd.length;
+let bestMatches = [];
+headPairs.forEach((cands, i) => {
+let decBest = null;
+for (const hd of cands) {
+if (hd.length > 2 && line.startsWith(hd) && (!decBest || hd.length > decBest.length)) {
+decBest = hd;
+}
+}
+if (!decBest) return;
+if (decBest.length > bestLen) {
+bestLen = decBest.length;
+bestMatches = [{ i, hd: decBest }];
+} else if (decBest.length === bestLen) {
+bestMatches.push({ i, hd: decBest });
 }
 });
-if (best >= 0 && !answered[best]) {
-const val = line.slice(heads[best].length).trim();
-if (val) answered[best] = val;
+const target = bestMatches.find((m) => !answered[m.i]);
+if (target) {
+const val = line.slice(target.hd.length).trim();
+if (val) answered[target.i] = val;
 }
 }
 }
@@ -403,14 +422,15 @@ ctx.go("/projects");
 }
 }
 function sortBotsForDisplay(bots, items, botSessions) {
+const now = Date.now();
 const liveWork = new Set(
 (botSessions || [])
 .filter((s) => s.live && s.working)
 .map((s) => `${s._hostId ?? ""}:${s.bot_id}`),
 );
 return bots.slice().sort((a, b) => {
-const aNeeds = items.some((i) => i.owner_bot_id === a.id && (i._hostId ?? null) === (a._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
-const bNeeds = items.some((i) => i.owner_bot_id === b.id && (i._hostId ?? null) === (b._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
+const aNeeds = items.some((i) => i.owner_bot_id === a.id && (i._hostId ?? null) === (a._hostId ?? null) && i.status === "needs_you" && !isActivelySnoozed(i, now)) ? 0 : 1;
+const bNeeds = items.some((i) => i.owner_bot_id === b.id && (i._hostId ?? null) === (b._hostId ?? null) && i.status === "needs_you" && !isActivelySnoozed(i, now)) ? 0 : 1;
 if (aNeeds !== bNeeds) return aNeeds - bNeeds;
 const aWork = liveWork.has(`${a._hostId ?? ""}:${a.id}`) ? 0 : 1;
 const bWork = liveWork.has(`${b._hostId ?? ""}:${b.id}`) ? 0 : 1;
@@ -423,13 +443,14 @@ function renderBotRail(ctx, t, opts) {
 const { el, button } = ctx;
 const { bots, groups, items, botSessions, avatars, activeBotId, activeGroupId, activeGroupHost, ready, onPickBot, onPickGroup, onNewBot } = opts;
 if (!bots.length && !groups.length) return null;
+const now = Date.now();
 const nav = el("nav", undefined, "bot-rail");
 nav.setAttribute("aria-label", t("Quick switch"));
 const scroller = el("div", undefined, "bot-rail-scroll");
 const sorted = sortBotsForDisplay(bots, items, botSessions);
 for (const bot of sorted) {
 const needs = items.filter(
-(i) => i.owner_bot_id === bot.id && (i._hostId ?? null) === (bot._hostId ?? null) && i.status === "needs_you",
+(i) => i.owner_bot_id === bot.id && (i._hostId ?? null) === (bot._hostId ?? null) && i.status === "needs_you" && !isActivelySnoozed(i, now),
 ).length;
 const working = (botSessions || []).some(
 (s) => s.bot_id === bot.id && (s._hostId ?? null) === (bot._hostId ?? null) && s.live && s.working,
@@ -1021,20 +1042,21 @@ true,
 },
 "secondary small",
 );
-const snoozeLbl = t(isSnoozed() ? "Unsnooze" : "Snooze 4h");
 const snoozeBtn = button(
-snoozeLbl,
-() =>
-runMutation(
+t(isSnoozed() ? "Unsnooze" : "Snooze 4h"),
+() => {
+const wasSnoozed = isSnoozed();
+return runMutation(
 () =>
 rpcHost(ctx, curItem._hostId, {
 action: "bots.item.update",
 item_id: curItem.uid,
-snoozed_until_ms: isSnoozed() ? "clear" : { set: Date.now() + 4 * 3600 * 1000 },
+snoozed_until_ms: wasSnoozed ? "clear" : { set: Date.now() + 4 * 3600 * 1000 },
 }),
-snoozeLbl,
+t(wasSnoozed ? "Unsnooze" : "Snooze 4h"),
 true,
-),
+);
+},
 "secondary small",
 );
 const linkForm = el("form", undefined, "bot-item-form");
@@ -1152,6 +1174,9 @@ return !hadMore;
 decisionsBox.replaceChildren(...decNodes);
 decisionsBox.hidden = !decNodes.length;
 drawTimeline();
+const curSnoozeLbl = t(isSnoozed() ? "Unsnooze" : "Snooze 4h");
+snoozeBtn.textContent = curSnoozeLbl;
+snoozeBtn.setAttribute("aria-label", curSnoozeLbl);
 input.disabled = submitBtn.disabled = off;
 doneBtn.disabled = snoozeBtn.disabled = cancelBtn.disabled = off || isClosed();
 linkBtn.disabled = linkInput.disabled = saveLinkBtn.disabled = off;
@@ -1932,7 +1957,9 @@ draw();
 }
 async function load(reset = false) {
 const targets = botHosts();
+const prevHostSig = lastHostSig;
 lastHostSig = hostSig();
+const hostChanged = Boolean(prevHostSig && prevHostSig !== lastHostSig);
 if (!targets.length) {
 bots = [];
 items = [];
@@ -1944,6 +1971,15 @@ botsCursors.clear();
 loaded = true;
 draw();
 return;
+}
+if (hostChanged) {
+bots = [];
+items = [];
+requests = [];
+statuses = [];
+groups = [];
+botSessions = [];
+botsCursors.clear();
 }
 const seq = ++loadSeq;
 loading = true;
@@ -2014,6 +2050,14 @@ activeGroupHost = matchedGroup._hostId ?? null;
 await loadGroup(matchedGroup.id, activeThreadId, activeGroupHost).catch(() => {});
 }
 fetchAvatars(bots);
+} else if (reset || hostChanged) {
+bots = [];
+items = [];
+requests = [];
+statuses = [];
+groups = [];
+botSessions = [];
+botsCursors.clear();
 }
 if (failedHosts.length) {
 failure = failedHosts
@@ -2850,7 +2894,7 @@ ctx,
 null,
 { action: "bots.items", include_closed: false, status: "needs_you", limit: 100 },
 detailNoStatusHosts,
-).catch(() => ({ items: [] })),
+).catch(() => null),
 ctx.rpc({ action: "bots.connectors.status", bot_id: botId }),
 ctx.rpc({ action: "bots.suggestions.list", bot_id: botId, include_dismissed: false }),
 ctx.rpc({ action: "bots.access.list", bot_id: botId, limit: 50 }),
@@ -2864,7 +2908,7 @@ bot = allBots.find((b) => b.id === botId) || null;
 if (h1 && bot?.name) h1.textContent = bot.name;
 items = itemsRes?.items || [];
 itemsCursor = itemsRes?.next_cursor || null;
-allItems = (allItemsRes?.items || []).length ? allItemsRes.items : items;
+allItems = Array.isArray(allItemsRes?.items) ? allItemsRes.items : items;
 statuses = statusRes?.statuses || [];
 suggestions = sugRes?.suggestions || [];
 requests = accRes?.requests || [];
@@ -3694,9 +3738,14 @@ limit: 25,
 async function fetchBotItems(hostId, reqFilter, cursor) {
 return fetchBotItemsWithStatus(ctx, hostId, itemRequestParams(reqFilter, cursor), noStatusFilterHosts);
 }
+let lastLoadedFilter = filter;
 async function load(reset = true) {
 const targets = botHosts();
+const prevHostSig = lastHostSig;
 lastHostSig = hostSig();
+const hostChanged = Boolean(prevHostSig && prevHostSig !== lastHostSig);
+const reqFilter = filter;
+const filterChanged = reqFilter !== lastLoadedFilter;
 if (!targets.length) {
 bots = [];
 items = [];
@@ -3707,8 +3756,17 @@ failedAutomations = [];
 draw();
 return;
 }
+if (hostChanged || filterChanged) {
+items = [];
+itemsCursors.clear();
+if (hostChanged) {
+bots = [];
+requests = [];
+suggestions = [];
+failedAutomations = [];
+}
+}
 const seq = ++loadSeq;
-const reqFilter = filter;
 loading = true;
 failure = null;
 draw();
@@ -3787,6 +3845,16 @@ cursor: r.cursor,
 requests = perHost.flatMap((r) => r.requests);
 suggestions = perHost.flatMap((r) => r.suggestions);
 failedAutomations = perHost.flatMap((r) => r.autoFails);
+lastLoadedFilter = reqFilter;
+} else if (reset || hostChanged || filterChanged) {
+items = [];
+itemsCursors.clear();
+if (hostChanged) {
+bots = [];
+requests = [];
+suggestions = [];
+failedAutomations = [];
+}
 }
 if (failedHosts.length) {
 failure = failedHosts
@@ -4054,10 +4122,12 @@ const now = Date.now();
 const visibleItems =
 filter === "needs_you"
 ? items.filter((i) => i.status === "needs_you")
+: filter === "open"
+? items.filter((i) => i.status !== "done" && i.status !== "canceled" && !isActivelySnoozed(i, now))
 : filter === "closed"
 ? items.filter((i) => i.status === "done" || i.status === "canceled")
 : filter === "snoozed"
-? items.filter((i) => Number(i.snoozed_until_ms || 0) > now)
+? items.filter((i) => isActivelySnoozed(i, now))
 : items;
 if (filter === "needs_you") {
 const waitingSec = renderWaitingSessionsSection(hosts);

@@ -6558,6 +6558,175 @@ async function unboundEmptyAndVisibilityTransitions() {
     }
     fCopy.dispose();
     console.log("PASS sweep W2 chat regressions: MB-21, MB-27, MB-28, MB-57, MB-58, MB-59, MB-64");
+
+    // R2M-12: Multi-select photoPicker gives ALL selected photos the shared per-photo budget up front,
+    // AND adding a second photo while the first is still pending re-triggers the pending photo at half budget.
+    {
+      const calls = [];
+      const fMulti = fixture({
+        handler: async () => ({ bound: true, agent: "claude", items: [], next_offset: 0, reset: false }),
+      });
+      await flush();
+      fMulti.prepare = async (_s, file, opts) => {
+        calls.push({ name: file.name, maxBytes: opts?.maxBytes ?? null });
+        return { mime: "image/jpeg", data: "A".repeat(1000) };
+      };
+      const picker = fMulti.root.descendants().find((n) => n.tag === "input" && n.type === "file");
+      picker.files = [
+        { name: "m1.jpg", type: "image/jpeg", size: 100 },
+        { name: "m2.jpg", type: "image/jpeg", size: 100 },
+        { name: "m3.jpg", type: "image/jpeg", size: 100 },
+      ];
+      picker.dispatchEvent(new Event("change"));
+      await flush();
+      const expectedThird = Math.floor((480 * 1024) / 3);
+      assert.equal(calls.length, 3, "R2M-12: 3 photos prepared once each with final 3-way cap");
+      assert(calls.every((c) => c.maxBytes === expectedThird), `R2M-12: all 3 photos got maxBytes=${expectedThird}, got ${JSON.stringify(calls)}`);
+      fMulti.dispose();
+
+      // Sequential pick while Photo 1 is STILL pending: Photo 1 must be re-triggered with half budget and ignore stale oversized completion.
+      const seqCalls = [];
+      let resolveFirstStale = null;
+      const fSeq = fixture({
+        handler: async () => ({ bound: true, agent: "claude", items: [], next_offset: 0, reset: false }),
+      });
+      await flush();
+      fSeq.prepare = (_s, file, opts) => {
+        seqCalls.push({ name: file.name, maxBytes: opts?.maxBytes ?? null });
+        if (file.name === "s1.jpg" && !opts?.maxBytes) {
+          return new Promise((r) => {
+            resolveFirstStale = () => r({ mime: "image/jpeg", data: "B".repeat(600000) });
+          });
+        }
+        return Promise.resolve({ mime: "image/jpeg", data: "C".repeat(200000) });
+      };
+      const pSeq = fSeq.root.descendants().find((n) => n.tag === "input" && n.type === "file");
+      pSeq.files = [{ name: "s1.jpg", type: "image/jpeg", size: 100 }];
+      pSeq.dispatchEvent(new Event("change"));
+      // Photo 1 is still pending; pick Photo 2 immediately.
+      pSeq.files = [{ name: "s2.jpg", type: "image/jpeg", size: 100 }];
+      pSeq.dispatchEvent(new Event("change"));
+      resolveFirstStale?.();
+      await flush();
+      const half = Math.floor((480 * 1024) / 2);
+      assert(
+        seqCalls.some((c) => c.name === "s1.jpg" && c.maxBytes === half),
+        `R2M-12: pending s1.jpg re-triggered with maxBytes=${half}, calls=${JSON.stringify(seqCalls)}`,
+      );
+      assert.equal(fSeq.entry.attachments[0].prepared.data.length, 200000, "R2M-12: stale oversized pending s1.jpg resolution discarded");
+      fSeq.dispose();
+    }
+
+    // R2M-13 + R2M-24: Live question card syncs write-in inputs when chat_composer resolves after chat_poll,
+    // guards agent match, and chat_composer error on forced poll refresh never causes unhandledRejection.
+    {
+      let resolveComposer = null;
+      const fQ = fixture({
+        capabilities: { chat_composer: true, live_prompt_reply: true },
+        handler: (req) => {
+          if (req.action === "chat_poll") {
+            return Promise.resolve({
+              bound: true,
+              agent: "claude",
+              items: [
+                {
+                  id: "q-r2m13",
+                  kind: "question",
+                  title: "Target",
+                  text: "Choose target",
+                  options: [{ label: "Staging" }, { label: "Other" }],
+                },
+              ],
+              next_offset: 1,
+              reset: false,
+            });
+          }
+          if (req.action === "chat_composer") {
+            return new Promise((r) => {
+              resolveComposer = r;
+            });
+          }
+          return Promise.resolve({});
+        },
+      });
+      await flush();
+      fQ.setQuestion({
+        identity: "q-r2m13",
+        token: "tok-13",
+        title: "Choose target",
+        enabled: true,
+        multiple: false,
+        choices: [{ label: "Staging", selected: true }, { label: "Other", selected: false }],
+      });
+      await flush();
+      const otherBtn = fQ.root.descendants().find((n) => String(n.className || "").includes("chat-other-submit"));
+      assert(otherBtn, "R2M-13: Send other button exists on question card");
+      assert.equal(otherBtn.hidden, true, "R2M-13: hidden before chat_composer delivers live_prompt");
+      // Mismatched agent composerStatus must NOT unhide Send other.
+      resolveComposer?.({
+        agent: "codex",
+        supported: true,
+        model: "gpt-5",
+        live_prompt: { kind: "numbered_menu", allows_other: true, prompt: "Choose target" },
+      });
+      await flush();
+      assert.equal(otherBtn.hidden, true, "R2M-13: mismatched agent does not unhide write-in");
+      // Now resolve a fresh chat_composer with matching agent -> syncAgent calls card._syncQuestion and unhides write-in.
+      fQ.entry.composerStatusAt = 0;
+      fQ.update();
+      await flush();
+      resolveComposer?.({
+        agent: "claude",
+        supported: true,
+        model: "claude-sonnet-4",
+        live_prompt: { kind: "numbered_menu", allows_other: true, prompt: "Choose target" },
+      });
+      await flush();
+      assert.equal(otherBtn.hidden, false, "R2M-13: syncAgent calls card._syncQuestion and unhides Send other");
+      // Also verify mismatched agent directly on entry.composerStatus keeps write-in hidden after syncQuestion.
+      fQ.entry.composerStatus = {
+        agent: "codex",
+        supported: true,
+        model: "gpt-5",
+        live_prompt: { kind: "numbered_menu", allows_other: true, prompt: "Choose target" },
+      };
+      fQ.update();
+      await flush();
+      assert.equal(otherBtn.hidden, true, "R2M-13: guard entry.composerStatus.agent === chatAgent() hides write-in on mismatch");
+      fQ.dispose();
+
+      // R2M-24: Forced refreshStatus(true) triggered by incoming question/permission in applyPollPayload catches rejections.
+      let unhandled = 0;
+      const onUnhandled = () => { unhandled++; };
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const fErr = fixture({
+          capabilities: { chat_composer: true },
+          handler: (req) => {
+            if (req.action === "chat_poll") {
+              return Promise.resolve({
+                bound: true,
+                agent: "claude",
+                items: [{ id: "perm-r2m24", kind: "permission", text: "Allow tool?" }],
+                next_offset: 1,
+                reset: false,
+              });
+            }
+            if (req.action === "chat_composer") {
+              return Promise.reject(Error("composer boom"));
+            }
+            return Promise.resolve({});
+          },
+        });
+        await flush();
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(unhandled, 0, "R2M-24: failing forced refreshStatus in applyPollPayload must not trigger unhandledRejection");
+        fErr.dispose();
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+      console.log("PASS sweep R2 chat regressions: R2M-12, R2M-13, R2M-24");
+    }
   }
 }
 main().catch((error) => {
