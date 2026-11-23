@@ -402,6 +402,14 @@ fn is_valid_worktree_symlink(wt_real: &Path, raw: &str) -> bool {
     fs::symlink_metadata(wt_real.join(rel)).is_ok_and(|m| m.file_type().is_symlink())
 }
 
+fn matches_active_symlink(rel: &Path, active_symlinks: &[&str]) -> bool {
+    rel.to_str().is_some_and(|s| {
+        let normalized = s.replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/');
+        active_symlinks.contains(&trimmed)
+    })
+}
+
 fn dir_contains_only_active_symlinks(
     wt_real: &Path,
     rel_dir: &Path,
@@ -412,9 +420,7 @@ fn dir_contains_only_active_symlinks(
         return false;
     };
     if meta.file_type().is_symlink() {
-        return rel_dir
-            .to_str()
-            .is_some_and(|s| active_symlinks.contains(&s.trim_end_matches('/')));
+        return matches_active_symlink(rel_dir, active_symlinks);
     }
     if !meta.is_dir() {
         return false;
@@ -429,10 +435,7 @@ fn dir_contains_only_active_symlinks(
         };
         has_entry = true;
         let child_rel = rel_dir.join(entry.file_name());
-        let Some(child_str) = child_rel.to_str() else {
-            return false;
-        };
-        if active_symlinks.contains(&child_str) {
+        if matches_active_symlink(&child_rel, active_symlinks) {
             continue;
         }
         if !dir_contains_only_active_symlinks(wt_real, &child_rel, active_symlinks) {
@@ -451,7 +454,7 @@ fn is_dirty_ignoring_symlinks(stdout: &[u8], wt_real: &Path, symlinks: &[String]
     }
     let active_symlinks: Vec<&str> = symlinks
         .iter()
-        .map(String::as_str)
+        .map(|s| s.trim().trim_end_matches('/'))
         .filter(|s| is_valid_worktree_symlink(wt_real, s))
         .collect();
     if active_symlinks.is_empty() {
@@ -511,7 +514,7 @@ fn unlink_symlinks(
         let rel = Path::new(trimmed);
         let link = wt_real.join(rel);
         let target = fs::read_link(&link).ok();
-        if fs::remove_file(&link).is_ok()
+        if remove_symlink(&link).is_ok()
             && let Some(target) = target
         {
             removed.push((link, target));
@@ -528,6 +531,32 @@ fn unlink_symlinks(
         }
     }
     removed
+}
+
+#[cfg(windows)]
+fn remove_symlink(link: &Path) -> io::Result<()> {
+    use std::os::windows::fs::FileTypeExt as _;
+    let ft = fs::symlink_metadata(link)?.file_type();
+    if !ft.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a symlink",
+        ));
+    }
+    if ft.is_symlink_dir() {
+        fs::remove_dir(link)
+    } else {
+        match fs::remove_file(link) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => fs::remove_dir(link),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_symlink(link: &Path) -> io::Result<()> {
+    fs::remove_file(link)
 }
 
 /// 삭제가 실패해 워크트리가 남으면 끊어 둔 심링크를 되살린다.
@@ -1172,5 +1201,43 @@ exec git "$@"
             assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
         }
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn active_symlink_matching_normalizes_windows_separators() {
+        let active = ["apps/web/node_modules", ".env"];
+        assert!(matches_active_symlink(
+            Path::new(r"apps\web\node_modules"),
+            &active
+        ));
+        assert!(matches_active_symlink(
+            Path::new(r"apps\web\node_modules\"),
+            &active
+        ));
+        assert!(matches_active_symlink(
+            Path::new("apps/web/node_modules/"),
+            &active
+        ));
+        assert!(!matches_active_symlink(
+            Path::new(r"apps\web\other"),
+            &active
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_symlink_unlinks_directory_symlink_without_touching_target() {
+        let dir = std::env::temp_dir().join(format!("krill-rm-symlink-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let target = dir.join("target-dir");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = dir.join("dir-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        remove_symlink(&link).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(target.join("keep.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
     }
 }

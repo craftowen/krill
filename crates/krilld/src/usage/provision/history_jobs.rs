@@ -6,6 +6,33 @@ use std::sync::Mutex;
 
 static RUNNING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
+pub(super) fn is_running(profile: &Path) -> bool {
+    let resolved = profile.canonicalize().ok();
+    crate::session::lock(&RUNNING).iter().any(|other| {
+        other == profile
+            || resolved
+                .as_ref()
+                .is_some_and(|p| other.canonicalize().is_ok_and(|o| o == *p))
+    })
+}
+
+#[cfg(test)]
+pub(super) struct RunningGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        crate::session::lock(&RUNNING).remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn mark_running_for_tests(profile: &Path) -> RunningGuard {
+    let key = profile.to_path_buf();
+    crate::session::lock(&RUNNING).insert(key.clone());
+    RunningGuard(key)
+}
+
 pub(super) fn spawn(profile: &Path, job: impl FnOnce() + Send + 'static) {
     let profile = profile.to_path_buf();
     let mut running = crate::session::lock(&RUNNING);

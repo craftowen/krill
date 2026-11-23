@@ -625,6 +625,7 @@ fn recovery_keeps_only_remaining_unconfirmed_replacement_without_publishing_comp
                 registry: &reg,
                 original: SessionId(7),
                 session: SessionId(8),
+                spawned: true,
                 disposition: ReplacementDisposition::Unresolved,
                 bot_grant_token: None,
             };
@@ -2837,6 +2838,7 @@ fn replacement_journals_are_independent_and_legacy_record_is_preserved() {
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
+        spawned: true,
         disposition: ReplacementDisposition::Committed,
         bot_grant_token: None,
     });
@@ -3077,6 +3079,7 @@ fn unreadable_replacement_evidence_is_preserved_and_blocks_new_spawns() {
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
+        spawned: false,
         disposition: ReplacementDisposition::Unresolved,
         bot_grant_token: None,
     });
@@ -3568,6 +3571,7 @@ fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
+        spawned: true,
         disposition: ReplacementDisposition::Retained { persisted: false },
         bot_grant_token: None,
     });
@@ -3580,6 +3584,7 @@ fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_
         registry: &reg,
         original: SessionId(7),
         session: SessionId(8),
+        spawned: true,
         disposition: ReplacementDisposition::Retained { persisted: true },
         bot_grant_token: None,
     });
@@ -4669,4 +4674,246 @@ fn bot_session_account_switch_rebinds_bot_runtime_and_preserves_instructions() {
     drop(reg);
     reader_worker.join().ok();
     fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn replacement_drop_unlinks_journal_after_definitive_spawn_failure_or_early_exit() {
+    let root = std::env::temp_dir().join(format!("kas-dc16-drop-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+
+    // 1. Definitive FromHolder::Failed (NotSpawned) unlinks the replacement journal.
+    let reg_no_holder = Registry::new(None, Some(&root));
+    let j1 = replacement_journal(&root, SessionId(81));
+    accounts::write_atomic_0600(&j1, b"fixture").unwrap();
+    drop(Replacement {
+        registry: &reg_no_holder,
+        original: SessionId(71),
+        session: SessionId(81),
+        spawned: false,
+        disposition: ReplacementDisposition::NotSpawned,
+        bot_grant_token: None,
+    });
+    assert!(
+        !j1.exists(),
+        "NotSpawned replacement must unlink its journal on drop"
+    );
+    drop(reg_no_holder);
+
+    // 2. Spawned replacement that exited early is removed from state.sessions and its journal unlinked.
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (holder, reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let (master, _proc) = UnixStream::pair().unwrap();
+    let kept = vec![Kept {
+        id: SessionId(82),
+        pid: 802,
+        status: Some(1),
+        size: None,
+        master: OwnedFd::from(master),
+    }];
+    let reg = Arc::new(Registry::new(Some((holder, kept)), Some(&root)));
+    let j2 = replacement_journal(&root, SessionId(82));
+    accounts::write_atomic_0600(
+        &j2,
+        &serde_json::to_vec(&Prepared {
+            from: SessionId(72),
+            to: SessionId(82),
+            account_id: "selected".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let reg_reader = Arc::clone(&reg);
+    let reader_worker = std::thread::spawn(move || {
+        reg_reader.holder.as_ref().unwrap().run(reader, |_, _| {});
+    });
+    let holder_worker = std::thread::spawn(move || {
+        if let Ok(Some(pkt)) = holder_link.recv()
+            && let Ok(ToHolder::Release { req, id }) = ToHolder::decode(pkt.frame())
+        {
+            assert_eq!(id, SessionId(82));
+            holder_link
+                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                .unwrap();
+        }
+    });
+    lock(&reg.account_replacements).insert(SessionId(82));
+    drop(Replacement {
+        registry: &reg,
+        original: SessionId(72),
+        session: SessionId(82),
+        spawned: true,
+        disposition: ReplacementDisposition::Unresolved,
+        bot_grant_token: None,
+    });
+    assert!(
+        !j2.exists(),
+        "early-exited spawned replacement must unlink its journal on drop"
+    );
+    assert!(
+        !lock(&reg.state).sessions.contains_key(&SessionId(82)),
+        "early-exited replacement must be released from state.sessions"
+    );
+    assert!(
+        reg.ensure_no_unresolved_account_replacement(SessionId(72))
+            .is_ok()
+    );
+    drop(reg);
+    holder_worker.join().unwrap();
+    reader_worker.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recover_account_work_unlinks_committed_journal_after_retiring_original() {
+    for close_ok in [true, false] {
+        let root = std::env::temp_dir().join(format!(
+            "kas-dc17-recover-{}-{close_ok}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        holder_end
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, reader, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let mut procs = Vec::new();
+        let kept: Vec<_> = [SessionId(7), SessionId(8)]
+            .into_iter()
+            .map(|id| {
+                let (master, proc_end) = UnixStream::pair().unwrap();
+                procs.push(proc_end);
+                Kept {
+                    id,
+                    pid: 800 + u32::try_from(id.0).unwrap(),
+                    status: None,
+                    size: None,
+                    master: OwnedFd::from(master),
+                }
+            })
+            .collect();
+        let committed = SessionHandoff {
+            from: SessionId(7),
+            to: Some(SessionId(8)),
+            account_id: "selected".into(),
+            error: None,
+        };
+        accounts::write_atomic_0600(&root.join(FILE), &serde_json::to_vec(&[committed]).unwrap())
+            .unwrap();
+        let journal = replacement_journal(&root, SessionId(8));
+        accounts::write_atomic_0600(
+            &journal,
+            &serde_json::to_vec(&Prepared {
+                from: SessionId(7),
+                to: SessionId(8),
+                account_id: "selected".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let reg = Arc::new(Registry::new(Some((holder, kept)), Some(&root)));
+        let reg_reader = Arc::clone(&reg);
+        let reader_worker = std::thread::spawn(move || {
+            reg_reader.run_holder(reader);
+        });
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_holder = Arc::clone(&done);
+        let holder_worker = std::thread::spawn(move || {
+            while !done_holder.load(std::sync::atomic::Ordering::Acquire) {
+                let pkt = match holder_link.recv() {
+                    Ok(Some(pkt)) => pkt,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Ok(None) | Err(_) => break,
+                };
+                match ToHolder::decode(pkt.frame()).unwrap() {
+                    ToHolder::Terminate { req, id } if id == SessionId(7) => {
+                        if close_ok {
+                            holder_link
+                                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                                .unwrap();
+                            holder_link
+                                .send(&FromHolder::Exited { id, status: 0 }.encode().unwrap(), &[])
+                                .unwrap();
+                        } else {
+                            holder_link
+                                .send(
+                                    &FromHolder::Failed {
+                                        req,
+                                        errno: libc::EPERM,
+                                    }
+                                    .encode()
+                                    .unwrap(),
+                                    &[],
+                                )
+                                .unwrap();
+                        }
+                    }
+                    ToHolder::Terminate { req, id } if id == SessionId(8) => {
+                        holder_link
+                            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                            .unwrap();
+                        holder_link
+                            .send(&FromHolder::Exited { id, status: 0 }.encode().unwrap(), &[])
+                            .unwrap();
+                    }
+                    ToHolder::Release { req, .. } => {
+                        holder_link
+                            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+        reg.recover_account_work(&home);
+        assert!(
+            !journal.exists(),
+            "committed replacement journal must be unlinked once recovery finishes (close_ok={close_ok})"
+        );
+        assert!(
+            reg.ensure_no_unresolved_account_replacement(SessionId(7))
+                .is_ok()
+        );
+        assert!(
+            reg.ensure_no_unresolved_account_replacement(SessionId(8))
+                .is_ok()
+        );
+        done.store(true, std::sync::atomic::Ordering::Release);
+        holder_worker.join().unwrap();
+        reader_worker.join().unwrap();
+        drop(reg);
+        drop(procs);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

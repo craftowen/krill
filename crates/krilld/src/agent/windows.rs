@@ -77,14 +77,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
     };
     let args: Vec<_> = args.collect();
     // agy needs SSH mode with --gemini_dir even when no account marker is present.
-    if std::path::Path::new(&program)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| matches!(name, "agy" | "antigravity"))
-        && args
-            .iter()
-            .any(|arg| arg.to_string_lossy().starts_with("--gemini_dir="))
-    {
+    if needs_agy_ssh_mode(&program, &args) {
         command.env("SSH_CONNECTION", "krill");
         command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
     }
@@ -115,6 +108,19 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(any(windows, test))]
+fn needs_agy_ssh_mode(program: &OsStr, args: &[OsString]) -> bool {
+    std::path::Path::new(program)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("agy") || name.eq_ignore_ascii_case("antigravity")
+        })
+        && args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--gemini_dir="))
 }
 
 /// Windows 폴백 셸(`then_shell`)에 에이전트 계정 격리 변수가 누수되지 않도록 제거할 목록.
@@ -201,6 +207,12 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
         if provider == ProviderKind::OpenCode && !opencode_instructions_dir.is_empty() {
             env.push((b"OPENCODE_CONFIG_DIR".to_vec(), opencode_instructions_dir));
         }
+    }
+    if !opencode_instructions_dir.is_empty()
+        && provider.is_none_or(|kind| kind == ProviderKind::OpenCode)
+    {
+        env.retain(|(key, _)| !key.eq_ignore_ascii_case(b"OPENCODE_CONFIG_DIR"));
+        env.push((b"OPENCODE_CONFIG_DIR".to_vec(), opencode_instructions_dir));
     }
     env.retain(|(key, _)| {
         !key.eq_ignore_ascii_case(b"KRILL_ACCOUNT_PROVIDER")

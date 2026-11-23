@@ -286,7 +286,7 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                             .strip_suffix(unit)?
                             .parse::<u64>()
                             .ok()
-                            .map(|n| n * mul)
+                            .map(|n| n.saturating_mul(mul))
                     };
                     hours('h', 1).or_else(|| hours('d', 24)).unwrap_or(u64::MAX)
                 });
@@ -488,6 +488,16 @@ mod tests {
             Some("$1.23 / $20.00")
         );
         assert!(parse(ProviderKind::OpenCode, "{}").meters.is_empty());
+    }
+
+    #[test]
+    fn antigravity_huge_day_window_saturates_without_overflow_panic() {
+        let reading = parse(
+            ProviderKind::Antigravity,
+            r#"{"groups":[{"name":"Gemini","buckets":[{"id":"huge","window":"1000000000000000000d","remaining_fraction":0.5},{"id":"short","window":"5h","remaining_fraction":0.2}]}]}"#,
+        );
+        let labels: Vec<_> = reading.meters.iter().map(|m| m.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini · 5h", "Gemini · 1000000000000000000d"]);
     }
 
     #[test]

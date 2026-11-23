@@ -22,9 +22,10 @@ mod codex_reset;
 
 type Key = (PathBuf, ProviderKind, PathBuf);
 type Credentials = (Zeroizing<String>, Option<String>);
+type StoredDigest = (Option<PathBuf>, Option<[u8; 32]>);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
-static CREDENTIAL_DIGESTS: Mutex<BTreeMap<Key, Option<[u8; 32]>>> = Mutex::new(BTreeMap::new());
+static CREDENTIAL_DIGESTS: Mutex<BTreeMap<Key, StoredDigest>> = Mutex::new(BTreeMap::new());
 static AUTH_REJECTED: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 /// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
 static RETRY: Mutex<BTreeMap<Key, Retry>> = Mutex::new(BTreeMap::new());
@@ -64,7 +65,13 @@ pub(crate) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
     super::meters::evict_profile(home, provider, dir);
 }
 
-fn credential_digest(provider: ProviderKind, dir: &Path, host: bool) -> Option<[u8; 32]> {
+fn credential_digest(
+    home: &Path,
+    state: Option<&Path>,
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+) -> Option<[u8; 32]> {
     let cred = match provider {
         ProviderKind::Antigravity if host => read_file(&dir.join("antigravity-oauth-token")),
         ProviderKind::Antigravity => {
@@ -73,16 +80,21 @@ fn credential_digest(provider: ProviderKind, dir: &Path, host: bool) -> Option<[
         ProviderKind::Codex => read_file(&dir.join("auth.json")),
         ProviderKind::Claude => read_file(&dir.join(".credentials.json"))
             .or_else(|| read_file(&dir.join("credentials.json"))),
-        ProviderKind::OpenCode if host => read_file(&dir.join("auth.json")),
+        ProviderKind::OpenCode if host => read_file(&opencode_host_auth_path(home)),
         ProviderKind::OpenCode => read_file(&dir.join("data/opencode/auth.json")),
         ProviderKind::Gemini => return None,
+    };
+    let override_key = if provider == ProviderKind::OpenCode && host {
+        opencode_go_override(home, state)
+    } else {
+        None
     };
     let login_ns = std::fs::symlink_metadata(dir.join(".krill-login-completed"))
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos());
-    if cred.is_none() && login_ns.is_none() {
+    if cred.is_none() && override_key.is_none() && login_ns.is_none() {
         return None;
     }
     let mut hasher = Sha256::new();
@@ -91,6 +103,11 @@ fn credential_digest(provider: ProviderKind, dir: &Path, host: bool) -> Option<[
         hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(&bytes);
     }
+    if let Some(key) = override_key {
+        hasher.update(b"override\0");
+        hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
     if let Some(ns) = login_ns {
         hasher.update(b"login\0");
         hasher.update(ns.to_le_bytes());
@@ -98,31 +115,48 @@ fn credential_digest(provider: ProviderKind, dir: &Path, host: bool) -> Option<[
     Some(hasher.finalize().into())
 }
 
-fn evict_if_credentials_changed(home: &Path, provider: ProviderKind, dir: &Path, host: bool) {
+fn evict_if_credentials_changed(
+    home: &Path,
+    state: Option<&Path>,
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+) {
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
-    let recorded = lock(&CREDENTIAL_DIGESTS).get(&key).copied();
-    if let Some(prev) = recorded
-        && credential_digest(provider, dir, host) != prev
-    {
-        evict_profile(home, provider, dir);
-        accounts::evict_login_profile(provider, dir);
+    let recorded = lock(&CREDENTIAL_DIGESTS).get(&key).cloned();
+    if let Some((stored_state, prev)) = recorded {
+        let effective_state = state.or(stored_state.as_deref());
+        if credential_digest(home, effective_state, provider, dir, host) != prev {
+            evict_profile(home, provider, dir);
+            accounts::evict_login_profile(provider, dir);
+        }
     }
 }
 
 pub(super) fn has_auth_failure(home: &Path, provider: ProviderKind, dir: &Path) -> bool {
     let host = dir == accounts::host_default_dir(home, provider);
-    evict_if_credentials_changed(home, provider, dir, host);
+    evict_if_credentials_changed(home, None, provider, dir, host);
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
     lock(&AUTH_REJECTED).contains(&key)
         && lock(&CACHE).get(&key).is_some_and(|(at, u)| alive(*at, u))
 }
 
+#[cfg(test)]
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
+    cached_in(home, None, provider, dir)
+}
+
+pub(super) fn cached_in(
+    home: &Path,
+    state: Option<&Path>,
+    provider: ProviderKind,
+    dir: &Path,
+) -> Option<ProfileUsage> {
     if provider == ProviderKind::Antigravity {
         return agy::cached(home, dir);
     }
     let host = dir == accounts::host_default_dir(home, provider);
-    evict_if_credentials_changed(home, provider, dir, host);
+    evict_if_credentials_changed(home, state, provider, dir, host);
     lock(&CACHE)
         .get(&(home.to_path_buf(), provider, dir.to_path_buf()))
         .filter(|(at, usage)| alive(*at, usage))
@@ -183,7 +217,7 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
         {
             continue;
         }
-        evict_if_credentials_changed(home, provider, &dir, host);
+        evict_if_credentials_changed(home, state, provider, &dir, host);
         let key = (home.to_path_buf(), provider, dir);
         // 실패·429는 `RETRY` 시각만 보고, 정상 값은 주기(`interval`)만 본다.
         if !force
@@ -208,32 +242,37 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     let launched = std::thread::Builder::new()
         .name("account-usage".into())
         .spawn(move || {
-            let before = credential_digest(job.1, &job.2, host);
-            let result =
-                std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
-                    .unwrap_or(Fetched::Failed(Failure::Internal));
-            let after = credential_digest(job.1, &job.2, host);
-            if before.is_some() && after.is_some() && before != after {
-                lock(&PENDING).remove(&job);
-                return;
-            }
-            lock(&CREDENTIAL_DIGESTS).insert(job.clone(), after);
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs());
-            if let Some(usage) = apply_result(&job, result, now) {
-                let mut cache = lock(&CACHE);
-                cache.retain(|_, (at, u)| alive(*at, u));
-                cache.insert(job.clone(), (Instant::now(), usage));
-                let mut rejected = lock(&AUTH_REJECTED);
-                rejected.retain(|k| cache.contains_key(k));
-            }
-            lock(&PENDING).remove(&job);
+            run_fetch_job(&job, host, state.as_deref(), || {
+                fetch(job.1, &job.2, host, &job.0, state.as_deref())
+            });
         });
     if launched.is_err() {
         lock(&PENDING).remove(key);
     }
+}
+
+fn run_fetch_job(job: &Key, host: bool, state: Option<&Path>, run_fetch: impl FnOnce() -> Fetched) {
+    let before = credential_digest(&job.0, state, job.1, &job.2, host);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_fetch))
+        .unwrap_or(Fetched::Failed(Failure::Internal));
+    let after = credential_digest(&job.0, state, job.1, &job.2, host);
+    if before != after {
+        lock(&PENDING).remove(job);
+        return;
+    }
+    lock(&CREDENTIAL_DIGESTS).insert(job.clone(), (state.map(Path::to_path_buf), after));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    if let Some(usage) = apply_result(job, result, now) {
+        let mut cache = lock(&CACHE);
+        cache.retain(|_, (at, u)| alive(*at, u));
+        cache.insert(job.clone(), (Instant::now(), usage));
+        let mut rejected = lock(&AUTH_REJECTED);
+        rejected.retain(|k| cache.contains_key(k));
+    }
+    lock(&PENDING).remove(job);
 }
 
 fn apply_result(job: &Key, result: Fetched, now: Option<u64>) -> Option<ProfileUsage> {
@@ -449,7 +488,10 @@ fn mark_failed(
 pub(super) fn fail_for_tests(home: &Path, provider: ProviderKind, dir: &Path) {
     let host = dir == accounts::host_default_dir(home, provider);
     let key = (home.to_path_buf(), provider, dir.to_path_buf());
-    lock(&CREDENTIAL_DIGESTS).insert(key.clone(), credential_digest(provider, dir, host));
+    lock(&CREDENTIAL_DIGESTS).insert(
+        key.clone(),
+        (None, credential_digest(home, None, provider, dir, host)),
+    );
     lock(&AUTH_REJECTED).insert(key.clone());
     mark_failed(&mut lock(&CACHE), &key, None, Failure::Http(401));
 }
@@ -598,7 +640,7 @@ pub(crate) fn consume_reset_credit(
     let (token, account) = match usage_credentials(provider, dir, host, home, state) {
         Ok(creds) => creds,
         Err(reason) => {
-            record_failure(&key, reason, now);
+            record_failure(&key, state, reason, now);
             return Err(ResetConsumeError::AuthRequired);
         }
     };
@@ -606,7 +648,7 @@ pub(crate) fn consume_reset_credit(
     consume_request(provider, &token, account.as_deref(), &redeem_id, |config| {
         let res = curl_exchange(config, CODEX_CONSUME_TIMEOUT_SECS);
         if let Ok((code, retry_after, _)) = &res {
-            record_reset_http(&key, *code, *retry_after, now);
+            record_reset_http(&key, state, *code, *retry_after, now);
         }
         res
     })
@@ -906,9 +948,15 @@ fn now_epoch_u64() -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-fn record_failure(key: &Key, reason: Failure, now: Option<u64>) {
+fn record_failure(key: &Key, state: Option<&Path>, reason: Failure, now: Option<u64>) {
     let host = key.2 == accounts::host_default_dir(&key.0, key.1);
-    lock(&CREDENTIAL_DIGESTS).insert(key.clone(), credential_digest(key.1, &key.2, host));
+    lock(&CREDENTIAL_DIGESTS).insert(
+        key.clone(),
+        (
+            state.map(Path::to_path_buf),
+            credential_digest(&key.0, state, key.1, &key.2, host),
+        ),
+    );
     if key.1 == ProviderKind::Codex && reason == Failure::Http(401) {
         lock(&AUTH_REJECTED).insert(key.clone());
     } else {
@@ -923,7 +971,13 @@ fn record_failure(key: &Key, reason: Failure, now: Option<u64>) {
     mark_failed(&mut lock(&CACHE), key, now, reason);
 }
 
-fn record_reset_http(key: &Key, status: u16, retry_after: Option<Duration>, now: Option<u64>) {
+fn record_reset_http(
+    key: &Key,
+    state: Option<&Path>,
+    status: u16,
+    retry_after: Option<Duration>,
+    now: Option<u64>,
+) {
     if status == 429 {
         let mut retry = lock(&RETRY);
         let entry = retry.entry(key.clone()).or_insert_with(Retry::new);
@@ -934,7 +988,7 @@ fn record_reset_http(key: &Key, status: u16, retry_after: Option<Duration>, now:
         drop(retry);
         mark_rate_limited(&mut lock(&CACHE), key, now);
     } else if status == 401 || status == 403 {
-        record_failure(key, Failure::Http(status), now);
+        record_failure(key, state, Failure::Http(status), now);
     }
 }
 
@@ -949,14 +1003,14 @@ pub(super) fn consume_claude_reset_credit(
     let (token, _) = match usage_credentials(ProviderKind::Claude, dir, host, home, state) {
         Ok(creds) => creds,
         Err(reason) => {
-            record_failure(&key, reason, now);
+            record_failure(&key, state, reason, now);
             return Err(ResetConsumeError::AuthRequired);
         }
     };
     let send_probe = |config: &str| -> Result<Zeroizing<Vec<u8>>, ResetConsumeError> {
         let (status, retry_after, body) = curl_exchange(config, DEFAULT_HTTP_TIMEOUT_SECS)
             .map_err(CurlError::into_reset_error)?;
-        record_reset_http(&key, status, retry_after, now);
+        record_reset_http(&key, state, status, retry_after, now);
         match status {
             401 | 403 => Err(ResetConsumeError::AuthRequired),
             429 => Err(ResetConsumeError::RateLimited),
@@ -977,7 +1031,7 @@ pub(super) fn consume_claude_reset_credit(
         Some(Some(program)) => claude_claim_reset(&token, &org, program, |cfg| {
             let res = curl_exchange(cfg, CLAUDE_CONSUME_TIMEOUT_SECS);
             if let Ok((code, retry_after, _)) = &res {
-                record_reset_http(&key, *code, *retry_after, now);
+                record_reset_http(&key, state, *code, *retry_after, now);
             }
             res
         }),
@@ -1245,6 +1299,39 @@ fn opencode_go_override(home: &Path, state: Option<&Path>) -> Option<Zeroizing<S
     None
 }
 
+fn is_default_home(home: &Path) -> bool {
+    let Some(real_home) = krill_proto::os::home_dir() else {
+        return false;
+    };
+    home == real_home
+        || home
+            .canonicalize()
+            .ok()
+            .zip(real_home.canonicalize().ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+fn opencode_host_auth_path_with(
+    home: &Path,
+    use_xdg_env: bool,
+    xdg_data_home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    let base = use_xdg_env
+        .then_some(xdg_data_home)
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| home.join(".local/share"), PathBuf::from);
+    base.join("opencode/auth.json")
+}
+
+pub(super) fn opencode_host_auth_path(home: &Path) -> PathBuf {
+    let use_xdg_env = is_default_home(home);
+    let xdg = use_xdg_env
+        .then(|| std::env::var_os("XDG_DATA_HOME"))
+        .flatten();
+    opencode_host_auth_path_with(home, use_xdg_env, xdg.as_deref())
+}
+
 fn other_credentials(
     provider: ProviderKind,
     dir: &Path,
@@ -1252,15 +1339,28 @@ fn other_credentials(
     home: &Path,
     state: Option<&Path>,
 ) -> Option<Credentials> {
+    let env_key = if provider == ProviderKind::OpenCode && host {
+        std::env::var("OPENCODE_API_KEY").ok()
+    } else {
+        None
+    };
+    other_credentials_with_env(provider, dir, host, home, state, env_key.as_deref())
+}
+
+fn other_credentials_with_env(
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+    home: &Path,
+    state: Option<&Path>,
+    opencode_env_key: Option<&str>,
+) -> Option<Credentials> {
     if provider == ProviderKind::OpenCode {
-        if let Some(key) = opencode_go_override(home, state) {
+        if host && let Some(key) = opencode_go_override(home, state) {
             return Some((key, None));
         }
         let auth = if host {
-            let default_home = accounts::default_home();
-            std::env::var_os("XDG_DATA_HOME")
-                .map_or_else(|| default_home.join(".local/share"), PathBuf::from)
-                .join("opencode/auth.json")
+            opencode_host_auth_path(home)
         } else {
             dir.join("data/opencode/auth.json")
         };
@@ -1280,10 +1380,13 @@ fn other_credentials(
         if let Some(key) = from_auth {
             return Some((key, None));
         }
-        let env_key = std::env::var("OPENCODE_API_KEY")
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())?;
+        if !host {
+            return None;
+        }
+        let env_key = opencode_env_key
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?
+            .to_owned();
         return Some((Zeroizing::new(env_key), None));
     }
     parse_credentials(provider, &read_file(&dir.join("auth.json"))?)
@@ -1510,14 +1613,16 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
 // krilld가 SecItem으로 직접 읽으면 macOS가 매번 로그인 키체인 암호를 묻는다 — Orca처럼 같은 도구로 읽는다.
 #[cfg(all(not(test), not(windows)))]
 fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
-    let output = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let stdout = Zeroizing::new(output.stdout);
-    (output.status.success() && u64::try_from(stdout.len()).ok()? <= MAX_BYTES).then_some(stdout)
+    let mut cmd = Command::new("/usr/bin/security");
+    cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
+    let (status, stdout) = accounts::agy_native::run_command_with_timeout(
+        &mut cmd,
+        None,
+        true,
+        MAX_BYTES,
+        accounts::agy_native::KEYCHAIN_TIMEOUT,
+    )?;
+    status.success().then_some(stdout)
 }
 // Windows 자격 증명 관리자: go-keyring(`service:account`), keytar/Bun(`service/account`), keyring-rs(`account.service`) 순으로 찾는다.
 #[cfg(all(not(test), windows))]
@@ -1758,7 +1863,7 @@ pub(crate) mod agy {
             return None;
         }
         let host = dir == accounts::host_default_dir(home, ProviderKind::Antigravity);
-        super::evict_if_credentials_changed(home, ProviderKind::Antigravity, dir, host);
+        super::evict_if_credentials_changed(home, None, ProviderKind::Antigravity, dir, host);
         lock(&CACHE)
             .get(&(home.to_path_buf(), dir.to_path_buf()))
             .filter(|(at, _)| at.elapsed() < TTL)
@@ -1804,7 +1909,7 @@ pub(crate) mod agy {
             }
         }
         for (dir, host) in profiles {
-            super::evict_if_credentials_changed(home, ProviderKind::Antigravity, &dir, host);
+            super::evict_if_credentials_changed(home, state, ProviderKind::Antigravity, &dir, host);
             let key = (home.to_path_buf(), dir);
             if lock(&CACHE)
                 .get(&key)
@@ -1843,128 +1948,147 @@ pub(crate) mod agy {
         let launched = std::thread::Builder::new()
             .name("agy-usage".into())
             .spawn(move || {
-                // An unauthenticated profile must never run `/usage` (it can
-                // start interactive OAuth). Keep this check off request threads
-                // and serialized with `agy_native` host token mutations.
-                let started = Instant::now();
-                let authenticated = std::panic::catch_unwind(|| {
-                    let file = accounts::load_file(&job.0, state.as_deref());
-                    accounts::agy_native::reconcile_host_to_profiles_then(
-                        &job.0,
-                        &file.accounts,
-                        || should_probe(&job.1, host),
-                    )
-                })
-                .unwrap_or(false);
-                if started.elapsed() >= Duration::from_secs(2) {
-                    tracing::info!(
-                        host,
-                        elapsed_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "agy authentication check slow"
-                    );
-                }
-                let direct_key = (job.0.clone(), ProviderKind::Antigravity, job.1.clone());
-                if !authenticated {
-                    let digest = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
-                    lock(&super::CREDENTIAL_DIGESTS).insert(direct_key, digest);
-                    record_failed(&job);
-                    lock(&PENDING).remove(&job);
-                    return;
-                }
-                let before = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
-                // Orca `beginUsageRead`: snapshot the active native login before running `agy -p /usage`
-                // so mid-read account switches cannot misattribute usage.
-                let usage_read_login = if host {
-                    accounts::agy_native::AntigravityAccountService::for_host(
-                        &job.0,
-                        state.as_deref(),
-                    )
-                    .begin_usage_read()
-                    .ok()
-                    .flatten()
-                    .and_then(|start| start.login)
-                } else {
-                    None
-                };
-                let usage = std::panic::catch_unwind(|| {
-                    let exe = super::agy_exe()?;
-                    fetch(&exe, &job.1, host)
-                })
-                .ok()
-                .flatten();
-                let after = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
-                if before.is_some() && after.is_some() && before != after {
-                    lock(&PENDING).remove(&job);
-                    return;
-                }
-                lock(&super::CREDENTIAL_DIGESTS).insert(direct_key, after);
-                if let Some((usage, meters)) = usage {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs());
-                    if host && let Some(login) = usage_read_login.as_ref() {
-                        let stored = krill_proto::usage::AntigravityStoredUsage {
-                            usage: usage.to_proto(),
-                            meters: meters.meters.clone(),
-                            updated_at: now.unwrap_or(0),
-                        };
-                        match accounts::agy_native::AntigravityAccountService::for_host(
+                run_agy_job(
+                    &job,
+                    host,
+                    state.as_deref(),
+                    || {
+                        let file = accounts::load_file(&job.0, state.as_deref());
+                        accounts::agy_native::reconcile_host_to_profiles_then(
                             &job.0,
-                            state.as_deref(),
-                        )
-                        .finish_usage_read(login, Some(stored))
-                        {
-                            Ok(accounts::agy_native::AntigravityUsageReadFinish::Switched) => {
-                                // Native account changed mid-read; drop rather than misattribute.
-                                lock(&PENDING).remove(&job);
-                                return;
-                            }
-                            Ok(accounts::agy_native::AntigravityUsageReadFinish::Committed {
-                                ..
-                            })
-                            | Err(_) => {}
-                        }
-                    }
-                    lock(&FAILED).remove(&job);
-                    super::super::meters::remember(
-                        &job.0,
-                        ProviderKind::Antigravity,
-                        &job.1,
-                        meters,
-                    );
-                    // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
-                    // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
-                    if usage_max(&usage) < 100
-                        && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
-                    {
-                        accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
-                    }
-                    let mut cache = lock(&CACHE);
-                    cache.retain(|_, (at, _)| at.elapsed() < TTL);
-                    if cache.len() >= 256 {
-                        cache.pop_first();
-                    }
-                    cache.insert(
-                        job.clone(),
-                        (
-                            Instant::now(),
-                            ProfileUsage {
-                                usage,
-                                updated_at: now,
-                                ..ProfileUsage::default()
+                            &file.accounts,
+                            || {
+                                let ok = should_probe(&job.1, host);
+                                let digest = super::credential_digest(
+                                    &job.0,
+                                    state.as_deref(),
+                                    ProviderKind::Antigravity,
+                                    &job.1,
+                                    host,
+                                );
+                                (ok, digest)
                             },
-                        ),
-                    );
-                } else {
-                    record_failed(&job);
-                }
-                lock(&PENDING).remove(&job);
+                        )
+                    },
+                    || {
+                        let exe = super::agy_exe()?;
+                        fetch(&exe, &job.1, host)
+                    },
+                );
             });
         if launched.is_err() {
             lock(&PENDING).remove(key);
         }
+    }
+
+    fn run_agy_job(
+        job: &Key,
+        host: bool,
+        state: Option<&Path>,
+        check_auth: impl FnOnce() -> (bool, Option<[u8; 32]>),
+        run_fetch: impl FnOnce() -> Option<(Usage, krill_proto::usage::AccountMeters)>,
+    ) {
+        let direct_key = (job.0.clone(), ProviderKind::Antigravity, job.1.clone());
+        let before_auth =
+            super::credential_digest(&job.0, state, ProviderKind::Antigravity, &job.1, host);
+        // An unauthenticated profile must never run `/usage` (it can
+        // start interactive OAuth). Keep this check off request threads
+        // and serialized with `agy_native` host token mutations.
+        let started = Instant::now();
+        let (authenticated, before_fetch) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(check_auth))
+                .unwrap_or((false, before_auth));
+        if started.elapsed() >= Duration::from_secs(2) {
+            tracing::info!(
+                host,
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "agy authentication check slow"
+            );
+        }
+        if !authenticated {
+            let after =
+                super::credential_digest(&job.0, state, ProviderKind::Antigravity, &job.1, host);
+            if before_auth == after {
+                lock(&super::CREDENTIAL_DIGESTS)
+                    .insert(direct_key, (state.map(Path::to_path_buf), after));
+                record_failed(job);
+            }
+            lock(&PENDING).remove(job);
+            return;
+        }
+        // Orca `beginUsageRead`: snapshot the active native login before running `agy -p /usage`
+        // so mid-read account switches cannot misattribute usage.
+        let usage_read_login = if host {
+            accounts::agy_native::AntigravityAccountService::for_host(&job.0, state)
+                .begin_usage_read()
+                .ok()
+                .flatten()
+                .and_then(|start| start.login)
+        } else {
+            None
+        };
+        let usage = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_fetch))
+            .ok()
+            .flatten();
+        let after =
+            super::credential_digest(&job.0, state, ProviderKind::Antigravity, &job.1, host);
+        if before_fetch != after {
+            lock(&PENDING).remove(job);
+            return;
+        }
+        lock(&super::CREDENTIAL_DIGESTS).insert(direct_key, (state.map(Path::to_path_buf), after));
+        if let Some((usage, meters)) = usage {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+            if host && let Some(login) = usage_read_login.as_ref() {
+                let stored = krill_proto::usage::AntigravityStoredUsage {
+                    usage: usage.to_proto(),
+                    meters: meters.meters.clone(),
+                    updated_at: now.unwrap_or(0),
+                };
+                match accounts::agy_native::AntigravityAccountService::for_host(&job.0, state)
+                    .finish_usage_read(login, Some(stored))
+                {
+                    Ok(accounts::agy_native::AntigravityUsageReadFinish::Switched) => {
+                        // Native account changed mid-read; drop rather than misattribute.
+                        lock(&PENDING).remove(job);
+                        return;
+                    }
+                    Ok(accounts::agy_native::AntigravityUsageReadFinish::Committed { .. })
+                    | Err(_) => {}
+                }
+            }
+            lock(&FAILED).remove(job);
+            super::super::meters::remember(&job.0, ProviderKind::Antigravity, &job.1, meters);
+            // `/usage` 폴링에서는 런타임 훅 전용 `RATE_LIMITED`를 찍지 않는다.
+            // Gemini 기본 사용량이 100% 미만으로 회복되면 기존 한도 표기를 지운다.
+            if usage_max(&usage) < 100
+                && let Some(id) = account_id_for(&job.0, state, &job.1, host)
+            {
+                accounts::clear_rate_limited(ProviderKind::Antigravity, &id);
+            }
+            let mut cache = lock(&CACHE);
+            cache.retain(|_, (at, _)| at.elapsed() < TTL);
+            if cache.len() >= 256 {
+                cache.pop_first();
+            }
+            cache.insert(
+                job.clone(),
+                (
+                    Instant::now(),
+                    ProfileUsage {
+                        usage,
+                        updated_at: now,
+                        ..ProfileUsage::default()
+                    },
+                ),
+            );
+        } else {
+            record_failed(job);
+        }
+        lock(&PENDING).remove(job);
     }
 
     fn usage_max(usage: &Usage) -> u8 {
@@ -2788,6 +2912,84 @@ pub(crate) mod agy {
                 "the check must not read the contents"
             );
             std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn agy_job_discards_stale_failure_and_usage_on_login_and_logout_transitions() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root =
+                std::env::temp_dir().join(format!("dc45-agy-transitions-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            let home = root.join("home");
+            let profile = root.join("profile");
+            let token_path = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            std::fs::create_dir_all(token_path.parent().unwrap()).unwrap();
+            let key = (home.clone(), profile.clone());
+            let direct_key = (home.clone(), ProviderKind::Antigravity, profile.clone());
+
+            // 1. None -> Some during !authenticated must not store FAILED or CREDENTIAL_DIGESTS.
+            lock(&PENDING).insert(key.clone());
+            run_agy_job(
+                &key,
+                false,
+                None,
+                || {
+                    std::fs::write(
+                        &token_path,
+                        br#"{"auth_method":"consumer","token":{"access_token":"new-login"}}"#,
+                    )
+                    .unwrap();
+                    (false, None)
+                },
+                || panic!("unauthenticated path must not invoke fetch"),
+            );
+            assert!(!lock(&PENDING).contains(&key));
+            assert!(
+                !lock(&FAILED).contains_key(&key),
+                "stale unauthenticated failure must not be cached after concurrent login"
+            );
+            assert!(!lock(&super::super::CREDENTIAL_DIGESTS).contains_key(&direct_key));
+
+            // 2. Some -> None during fetch must not cache logged-out account's usage.
+            let before_digest = super::super::credential_digest(
+                &home,
+                None,
+                ProviderKind::Antigravity,
+                &profile,
+                false,
+            );
+            assert!(before_digest.is_some());
+            lock(&PENDING).insert(key.clone());
+            run_agy_job(
+                &key,
+                false,
+                None,
+                || (true, before_digest),
+                || {
+                    std::fs::remove_file(&token_path).unwrap();
+                    Some((
+                        Usage {
+                            five_hour: Some(Window {
+                                percent: 42,
+                                resets_at: None,
+                            }),
+                            seven_day: None,
+                        },
+                        krill_proto::usage::AccountMeters::default(),
+                    ))
+                },
+            );
+            assert!(!lock(&PENDING).contains(&key));
+            assert!(
+                !lock(&CACHE).contains_key(&key),
+                "stale usage from logged-out account must not be cached"
+            );
+            assert!(!lock(&super::super::CREDENTIAL_DIGESTS).contains_key(&direct_key));
+
+            lock(&super::super::CREDENTIAL_DIGESTS).remove(&direct_key);
+            reset_latch_for_tests();
+            std::fs::remove_dir_all(root).ok();
         }
     }
 }
@@ -3837,5 +4039,213 @@ mod tests {
             Some((429, None))
         );
         assert_eq!(parse_status_tail("\n"), None);
+    }
+
+    #[test]
+    fn opencode_isolated_profile_ignores_host_override_and_env_while_host_uses_home_param() {
+        let root = std::env::temp_dir().join(format!("dc43-opencode-iso-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let host_dir = accounts::host_default_dir(&home, ProviderKind::OpenCode);
+        let isolated = root.join("isolated-profile");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&isolated).unwrap();
+
+        std::fs::write(state.join("opencode-go-api-key"), "sk-global-override\n").unwrap();
+        let host_auth = home.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+        std::fs::write(
+            &host_auth,
+            br#"{"opencode":{"type":"api","key":"sk-host-home"}}"#,
+        )
+        .unwrap();
+
+        // Isolated logged-out profile must never inherit global override or daemon OPENCODE_API_KEY.
+        assert!(
+            other_credentials_with_env(
+                ProviderKind::OpenCode,
+                &isolated,
+                false,
+                &home,
+                Some(&state),
+                Some("sk-daemon-env"),
+            )
+            .is_none()
+        );
+
+        // Once isolated profile has its own auth.json, it reads only that key.
+        let iso_auth = isolated.join("data/opencode/auth.json");
+        std::fs::create_dir_all(iso_auth.parent().unwrap()).unwrap();
+        std::fs::write(
+            &iso_auth,
+            br#"{"opencode-go":{"type":"api","key":"sk-isolated"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            other_credentials_with_env(
+                ProviderKind::OpenCode,
+                &isolated,
+                false,
+                &home,
+                Some(&state),
+                Some("sk-daemon-env"),
+            )
+            .map(|(k, _)| k.to_string())
+            .as_deref(),
+            Some("sk-isolated")
+        );
+
+        // Host profile uses the `home` parameter (not accounts::default_home()) and applies overrides.
+        assert_eq!(
+            other_credentials_with_env(
+                ProviderKind::OpenCode,
+                &host_dir,
+                true,
+                &home,
+                None,
+                Some("sk-daemon-env"),
+            )
+            .map(|(k, _)| k.to_string())
+            .as_deref(),
+            Some("sk-host-home")
+        );
+        assert_eq!(
+            other_credentials_with_env(
+                ProviderKind::OpenCode,
+                &host_dir,
+                true,
+                &home,
+                Some(&state),
+                Some("sk-daemon-env"),
+            )
+            .map(|(k, _)| k.to_string())
+            .as_deref(),
+            Some("sk-global-override")
+        );
+        std::fs::remove_file(&host_auth).unwrap();
+        assert_eq!(
+            other_credentials_with_env(
+                ProviderKind::OpenCode,
+                &host_dir,
+                true,
+                &home,
+                None,
+                Some("sk-daemon-env"),
+            )
+            .map(|(k, _)| k.to_string())
+            .as_deref(),
+            Some("sk-daemon-env")
+        );
+
+        // XDG_DATA_HOME resolution helper respects non-empty env only when using default home.
+        assert_eq!(
+            opencode_host_auth_path_with(&home, true, Some(std::ffi::OsStr::new("/xdg-data"))),
+            PathBuf::from("/xdg-data").join("opencode/auth.json")
+        );
+        assert_eq!(
+            opencode_host_auth_path_with(&home, true, Some(std::ffi::OsStr::new(""))),
+            home.join(".local/share").join("opencode/auth.json")
+        );
+        assert_eq!(
+            opencode_host_auth_path_with(&home, false, Some(std::ffi::OsStr::new("/xdg-data"))),
+            home.join(".local/share").join("opencode/auth.json")
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn host_opencode_credential_digest_evicts_cache_and_retry_on_auth_or_override_change() {
+        let root =
+            std::env::temp_dir().join(format!("dc44-opencode-digest-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let host_dir = accounts::host_default_dir(&home, ProviderKind::OpenCode);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let key = (home.clone(), ProviderKind::OpenCode, host_dir.clone());
+
+        assert!(
+            credential_digest(&home, Some(&state), ProviderKind::OpenCode, &host_dir, true)
+                .is_none()
+        );
+        lock(&CREDENTIAL_DIGESTS).insert(key.clone(), (Some(state.clone()), None));
+        lock(&RETRY).insert(key.clone(), Retry::new());
+        mark_failed(&mut lock(&CACHE), &key, Some(100), Failure::Credentials);
+
+        // Writing host ~/.local/share/opencode/auth.json must change digest and evict CACHE + RETRY.
+        let host_auth = home.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+        std::fs::write(&host_auth, br#"{"opencode":{"type":"api","key":"sk-1"}}"#).unwrap();
+        let digest1 =
+            credential_digest(&home, Some(&state), ProviderKind::OpenCode, &host_dir, true);
+        assert!(digest1.is_some());
+        assert!(cached_in(&home, Some(&state), ProviderKind::OpenCode, &host_dir).is_none());
+        assert!(!lock(&CACHE).contains_key(&key));
+        assert!(!lock(&RETRY).contains_key(&key));
+
+        // Saving/rotating state/opencode-go-api-key must also change digest and evict even via cached().
+        lock(&CREDENTIAL_DIGESTS).insert(key.clone(), (Some(state.clone()), digest1));
+        lock(&RETRY).insert(key.clone(), Retry::new());
+        mark_failed(&mut lock(&CACHE), &key, Some(200), Failure::Http(401));
+        std::fs::write(state.join("opencode-go-api-key"), "sk-go-rotated\n").unwrap();
+        assert_ne!(
+            credential_digest(&home, Some(&state), ProviderKind::OpenCode, &host_dir, true),
+            digest1
+        );
+        assert!(cached(&home, ProviderKind::OpenCode, &host_dir).is_none());
+        assert!(!lock(&CACHE).contains_key(&key));
+        assert!(!lock(&RETRY).contains_key(&key));
+
+        evict_profile(&home, ProviderKind::OpenCode, &host_dir);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fetch_job_discards_results_across_none_some_and_some_none_transitions() {
+        let root = std::env::temp_dir().join(format!("dc45-direct-job-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let profile = root.join("codex-profile");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let key = (home.clone(), ProviderKind::Codex, profile.clone());
+        let auth_path = profile.join("auth.json");
+
+        // 1. None -> Some during failed fetch must not cache failure or record new digest.
+        lock(&PENDING).insert(key.clone());
+        run_fetch_job(&key, false, None, || {
+            std::fs::write(&auth_path, br#"{"tokens":{"access_token":"fresh"}}"#).unwrap();
+            Fetched::Failed(Failure::Credentials)
+        });
+        assert!(!lock(&PENDING).contains(&key));
+        assert!(!lock(&CACHE).contains_key(&key));
+        assert!(!lock(&RETRY).contains_key(&key));
+        assert!(!lock(&CREDENTIAL_DIGESTS).contains_key(&key));
+
+        // 2. Some -> None during fetch must not cache logged-out account's usage.
+        lock(&PENDING).insert(key.clone());
+        run_fetch_job(&key, false, None, || {
+            std::fs::remove_file(&auth_path).unwrap();
+            Fetched::Usage(
+                Usage {
+                    five_hour: Some(Window {
+                        percent: 33,
+                        resets_at: None,
+                    }),
+                    seven_day: None,
+                },
+                krill_proto::usage::AccountMeters::default(),
+            )
+        });
+        assert!(!lock(&PENDING).contains(&key));
+        assert!(!lock(&CACHE).contains_key(&key));
+        assert!(!lock(&CREDENTIAL_DIGESTS).contains_key(&key));
+
+        evict_profile(&home, ProviderKind::Codex, &profile);
+        std::fs::remove_dir_all(root).ok();
     }
 }

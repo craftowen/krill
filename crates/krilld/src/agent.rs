@@ -63,8 +63,12 @@ case "${KRILL_ACCOUNT_PROVIDER-}" in
   opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi; if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi;;
   agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1; else unset SSH_CONNECTION AGY_CLI_FORCE_FILE_TOKEN_STORAGE; fi;;
 esac
+if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
-if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@"; fi; exec "$@"
+case "$(basename "$1")" in
+  agy|antigravity) for _a in "$@"; do case "$_a" in --gemini_dir=*) SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@";; esac; done;;
+esac
+exec "$@"
 )
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
 exec "${SHELL:-/bin/zsh}" -l
@@ -682,14 +686,16 @@ fn instruction_args(
             }
         }
         env.retain(|(k, _)| {
-            k.as_slice() != b"OPENCODE_CONFIG_DIR"
-                && k.as_slice() != b"KRILL_OPENCODE_INSTRUCTIONS_DIR"
+            !k.eq_ignore_ascii_case(b"OPENCODE_CONFIG_DIR")
+                && !k.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         });
-        let dir_bytes = dir.as_os_str().as_bytes().to_vec();
-        env.push((b"OPENCODE_CONFIG_DIR".to_vec(), dir_bytes.clone()));
         // Preflight/Windows account isolation strips inherited OPENCODE_CONFIG_DIR; pass the
-        // Krill-generated bot instructions dir through an explicit marker so it is restored.
-        env.push((b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(), dir_bytes));
+        // Krill-generated bot instructions dir through an explicit marker so it is restored only
+        // for the agent subshell and never leaks into the fallback login shell (DC-24).
+        env.push((
+            b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(),
+            dir.as_os_str().as_bytes().to_vec(),
+        ));
         return Ok(Vec::new());
     }
     Ok(Vec::new())
@@ -1516,14 +1522,14 @@ fn trust_home_for_runtime() -> Option<PathBuf> {
     Some(home)
 }
 
-/// 루트(`/`)나 홈 디렉터리 자체는 신뢰 범위를 넓히지 않도록 거부한다.
+/// 루트(`/`, `C:\` 등)나 홈 디렉터리 자체는 신뢰 범위를 넓히지 않도록 거부한다.
 pub(crate) fn is_too_broad_to_pre_trust(home: &Path, cwd: &Path) -> bool {
-    if cwd.as_os_str().is_empty() || cwd == Path::new("/") || cwd == home {
+    if cwd.as_os_str().is_empty() || cwd.parent().is_none() || cwd == home {
         return true;
     }
-    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let home_canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    cwd_canon == Path::new("/") || (!home.as_os_str().is_empty() && cwd_canon == home_canon)
+    let cwd_canon = krill_proto::os::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let home_canon = krill_proto::os::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    cwd_canon.parent().is_none() || (!home.as_os_str().is_empty() && cwd_canon == home_canon)
 }
 
 fn trust_candidates(cwd: &Path) -> Vec<String> {
@@ -1531,7 +1537,7 @@ fn trust_candidates(cwd: &Path) -> Vec<String> {
     if let Some(s) = cwd.to_str().filter(|s| !s.is_empty()) {
         candidates.push(s.to_owned());
     }
-    if let Ok(canon) = std::fs::canonicalize(cwd)
+    if let Ok(canon) = krill_proto::os::canonicalize(cwd)
         && let Some(s) = canon.to_str().filter(|s| !s.is_empty())
         && !candidates.iter().any(|c| c == s)
     {
@@ -2076,11 +2082,42 @@ pub(crate) fn pre_trust_codex_in_with_hook(
     )
 }
 
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '#' => return line.get(..idx).unwrap_or(line),
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
 pub(crate) fn upsert_codex_project_trust_checked(
     existing: &str,
     project_path: &str,
 ) -> Option<(String, bool)> {
-    if !existing.trim().is_empty() {
+    let mut expected: toml::Table = if existing.trim().is_empty() {
+        toml::Table::new()
+    } else {
         let parsed: toml::Value = toml::from_str(existing).ok()?;
         let root_tbl = parsed.as_table()?;
         if let Some(projects_val) = root_tbl.get("projects") {
@@ -2091,10 +2128,29 @@ pub(crate) fn upsert_codex_project_trust_checked(
                 return None;
             }
         }
-    }
+        root_tbl.clone()
+    };
     let (next, changed) = upsert_codex_project_trust(existing, project_path);
     if changed {
-        toml::from_str::<toml::Value>(&next).ok()?;
+        let after: toml::Value = toml::from_str(&next).ok()?;
+        let projects_tbl = expected
+            .entry("projects".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()?;
+        let proj_tbl = projects_tbl
+            .entry(project_path.to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()?;
+        if proj_tbl.contains_key("trust_level") {
+            return None;
+        }
+        proj_tbl.insert(
+            "trust_level".to_owned(),
+            toml::Value::String("trusted".to_owned()),
+        );
+        if after != toml::Value::Table(expected) {
+            return None;
+        }
     }
     Some((next, changed))
 }
@@ -2113,7 +2169,7 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
     };
 
     let section_idx = lines.iter().position(|line| {
-        let trimmed = line.trim();
+        let trimmed = strip_toml_comment(line).trim();
         let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
             return false;
         };
@@ -2124,7 +2180,7 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
     if let Some(start) = section_idx {
         let mut end = lines.len();
         for (i, line) in lines.iter().enumerate().skip(start + 1) {
-            let trimmed = line.trim();
+            let trimmed = strip_toml_comment(line).trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
                 end = i;
                 break;
@@ -2132,7 +2188,7 @@ pub(crate) fn upsert_codex_project_trust(existing: &str, project_path: &str) -> 
         }
         if let Some(slice) = lines.get_mut((start + 1)..end) {
             for line in slice {
-                let without_comment = line.split('#').next().unwrap_or("").trim();
+                let without_comment = strip_toml_comment(line).trim();
                 if let Some((key, _)) = without_comment.split_once('=')
                     && key.trim() == "trust_level"
                 {
@@ -2182,7 +2238,7 @@ pub(crate) fn pre_trust_cursor_in(home: &Path, cwd: &Path) -> io::Result<bool> {
     if is_too_broad_to_pre_trust(home, cwd) {
         return Ok(false);
     }
-    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let canon = krill_proto::os::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let Some(canon_str) = canon.to_str().filter(|s| !s.is_empty()) else {
         return Ok(false);
     };
@@ -2383,6 +2439,9 @@ fn apply_account_env(
     state: Option<&Path>,
     pinned: Option<&LaunchAccount>,
 ) -> Option<LaunchAccount> {
+    login
+        .env
+        .retain(|(key, _)| !key.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR"));
     let prog = profile.program()?;
     let account = pinned.cloned().or_else(|| active_account(state, prog));
     if let Some(account) = &account {
@@ -2462,6 +2521,9 @@ fn apply_account_env(
     }
     // User environment remains customizable; credential authority belongs to the selected account.
     for (key, value) in &profile.env {
+        if key.eq_ignore_ascii_case("KRILL_OPENCODE_INSTRUCTIONS_DIR") {
+            continue;
+        }
         if let Some(provider) = account
             .as_ref()
             .and_then(|a| ProviderKind::from_env_var(&a.env_key))

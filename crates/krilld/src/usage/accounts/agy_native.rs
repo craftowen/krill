@@ -14,8 +14,16 @@ pub(crate) mod codec;
 pub(crate) mod service;
 pub(crate) mod store;
 
+#[cfg(unix)]
+use std::io::Read as _;
+#[cfg(unix)]
+use std::io::Write as _;
 use std::path::Path;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use krill_proto::usage::{AntigravityAccountOp, AntigravityAccountState, ProviderKind};
 use zeroize::Zeroizing;
@@ -31,6 +39,8 @@ use store::AntigravityAccountStore as _;
 pub(crate) use store::{StoredAntigravityAccount, vault_path};
 
 const MAX_TOKEN_BYTES: u64 = 64 * 1024;
+#[cfg(unix)]
+pub(crate) const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 
 /// Dispatch one `UsageRequest::AntigravityAccounts(op)` against the host's native Antigravity service.
@@ -514,6 +524,87 @@ fn valid_token(raw: &[u8]) -> bool {
         && u64::try_from(raw.len()).is_ok_and(|len| len <= MAX_TOKEN_BYTES)
         && serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|v| v.is_object())
 }
+
+#[cfg(unix)]
+pub(crate) fn run_command_with_timeout(
+    cmd: &mut Command,
+    stdin_bytes: Option<&[u8]>,
+    capture_stdout: bool,
+    max_stdout: u64,
+    timeout: Duration,
+) -> Option<(std::process::ExitStatus, Zeroizing<Vec<u8>>)> {
+    cmd.stdin(if stdin_bytes.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(if capture_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let reader = if capture_stdout {
+        let stdout = child.stdout.take()?;
+        let handle = std::thread::Builder::new()
+            .name("keychain-read".into())
+            .spawn(move || {
+                let mut buf = Zeroizing::new(Vec::new());
+                let limit = max_stdout.saturating_add(1);
+                stdout.take(limit).read_to_end(&mut buf).ok()?;
+                (u64::try_from(buf.len()).ok()? <= max_stdout).then_some(buf)
+            })
+            .ok();
+        let Some(handle) = handle else {
+            child.kill().ok();
+            child.wait().ok();
+            return None;
+        };
+        Some(handle)
+    } else {
+        None
+    };
+    if let Some(bytes) = stdin_bytes {
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(bytes).is_ok());
+        if !wrote {
+            child.kill().ok();
+            child.wait().ok();
+            if let Some(handle) = reader {
+                drop(handle.join());
+            }
+            return None;
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+        }
+    };
+    let stdout = match reader {
+        Some(handle) => handle.join().ok().flatten(),
+        None => Some(Zeroizing::new(Vec::new())),
+    };
+    let status = status?;
+    let stdout = stdout?;
+    Some((status, stdout))
+}
+
 
 #[cfg(test)]
 mod tests;

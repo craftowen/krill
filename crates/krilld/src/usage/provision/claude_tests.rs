@@ -597,3 +597,35 @@ fn unchanged_provisioning_conflicts_warn_once_per_change() {
         ]
     );
 }
+
+#[test]
+fn unsupported_symlink_in_non_unix_link_helper_does_not_abort_or_delete_empty_dir() {
+    let home = root("unsupported-symlink");
+    let src = home.join("host-skills");
+    let dst = home.join("profile-skills");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+
+    let mut report = Report::default();
+    link_with(&src, &dst, "skills", &mut report, |_, _| {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    })
+    .unwrap();
+    assert!(report.changed.is_empty());
+    assert!(report.conflicts.is_empty());
+    assert!(
+        dst.is_dir(),
+        "empty target dir must be preserved when symlink is unsupported"
+    );
+
+    let missing_dst = home.join("profile-commands");
+    link_with(&src, &missing_dst, "commands", &mut report, |_, _| {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    })
+    .unwrap();
+    assert!(report.changed.is_empty());
+    assert!(report.conflicts.is_empty());
+    assert!(!missing_dst.exists());
+
+    std::fs::remove_dir_all(home).ok();
+}

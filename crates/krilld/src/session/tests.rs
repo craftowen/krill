@@ -1209,3 +1209,106 @@ fn clear_viewport_invalidates_capture_cache_and_recovers_poison_and_unwind() {
     assert!(!tap.0.live.is_poisoned());
     assert!(tap.pulse().revision > rev_before_poison_clear);
 }
+
+#[test]
+fn rebuild_preserves_concurrent_resize_park_and_clear() {
+    use crate::store::{Limits, Store};
+
+    let root = std::env::temp_dir().join(format!("krill-rebuild-race-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let id = SessionId(9701);
+    let start_size = WinSize { cols: 80, rows: 24 };
+    let look = Arc::new(Appearance::load(PathBuf::new()));
+    {
+        let mut rec = store.recorder(id, start_size).unwrap();
+        let mut payload = Vec::new();
+        for i in 0..40_u32 {
+            payload.extend_from_slice(format!("rebuild-line-{i:02}\r\n").as_bytes());
+        }
+        rec.append(&payload);
+        rec.seal();
+    }
+
+    let make_shared = |size: WinSize, parked: bool, history_epoch: u64, seq: u64| {
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let shared = Shared {
+            id,
+            clients: Mutex::default(),
+            input: Mutex::default(),
+            capture: Mutex::default(),
+            history_access: Mutex::default(),
+            live: Mutex::new(Live {
+                engine: Engine::new(size),
+                revision: 0,
+                history_epoch,
+                seq,
+                last_output: Instant::now(),
+                input_since_done: true,
+                last_input_ns: 0,
+                done_ns: 0,
+                viewers: 0,
+                epoch: 0,
+                parked,
+                resized: None,
+                size,
+            }),
+            gaps: Mutex::new(Vec::new()),
+            master: pty.controller,
+            look: Arc::clone(&look),
+            out: Mutex::new(Out {
+                ring: VecDeque::new(),
+                end: seq,
+                revision: 0,
+                closed: false,
+                generation: 0,
+            }),
+            changed: Condvar::new(),
+            shown: Condvar::new(),
+            paused: AtomicBool::new(false),
+            store: Some(Arc::clone(&store)),
+            reader: Mutex::new(None),
+        };
+        (pty.user, shared)
+    };
+
+    // 1. Concurrent resize before rebuild commits: keep resized live.size and engine dimensions.
+    {
+        let rec = store.recorder(id, start_size).unwrap();
+        let resized = WinSize {
+            cols: 120,
+            rows: 40,
+        };
+        let (_slave, shared) = make_shared(resized, false, 0, rec.seq());
+        rebuild(&shared, &rec, start_size);
+        let live = shared.live();
+        assert_eq!(live.size, resized);
+        let screen = live.engine.screen();
+        assert_eq!((screen.cols, screen.lines), (120, 40));
+        assert!(live.engine.screen_text().contains("rebuild-line-39"));
+    }
+
+    // 2. Concurrent park before rebuild commits: restored engine must be demoted to 0 hot lines.
+    {
+        let rec = store.recorder(id, start_size).unwrap();
+        let (_slave, shared) = make_shared(start_size, true, 0, rec.seq());
+        rebuild(&shared, &rec, start_size);
+        let live = shared.live();
+        assert!(live.parked);
+        assert_eq!(live.engine.history_len(), 0);
+        assert!(live.engine.screen_text().contains("rebuild-line-39"));
+    }
+
+    // 3. Concurrent clear_scrollback/clear_viewport (history_epoch > 0): abort rebuild.
+    {
+        let rec = store.recorder(id, start_size).unwrap();
+        let (_slave, shared) = make_shared(start_size, false, 1, rec.seq());
+        rebuild(&shared, &rec, start_size);
+        let live = shared.live();
+        assert_eq!(live.revision, 0);
+        assert_eq!(live.engine.history_len(), 0);
+        assert!(!live.engine.screen_text().contains("rebuild-line-39"));
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}

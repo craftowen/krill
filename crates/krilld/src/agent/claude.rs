@@ -249,7 +249,10 @@ pub(crate) fn session_id(state: &Path, id: SessionId) -> Option<String> {
     for entry in dir.flatten() {
         let name = entry.file_name();
         if owner(&name) == Some(id)
-            && let Some((_, uuid)) = name.to_str()?.strip_suffix(".json")?.split_once('-')
+            && let Some((_, uuid)) = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(".json"))
+                .and_then(|s| s.split_once('-'))
             && is_uuid(uuid)
         {
             return Some(uuid.to_owned());
@@ -513,6 +516,10 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
 
 /// 실제와 같은 login/interactive 셸의 PATH·환경에서 버전을 읽는다. 5초 안에 못 읽으면 보수적 집합.
 fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
+    probe_now_with_timeout(profile, login, Duration::from_secs(5))
+}
+
+fn probe_now_with_timeout(profile: &Profile, login: &Launch, timeout: Duration) -> Option<String> {
     let mut profile = profile.clone();
     profile.launch = vec![profile.program()?.to_owned(), "--version".into()];
     #[cfg(unix)]
@@ -525,11 +532,6 @@ fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
     let mut command = super::windows::command(OsStr::new(profile.program()?), login.env.clone())?;
     #[cfg(windows)]
     command.arg("--version");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     #[cfg(unix)]
     command
         .args(args.iter().map(|a| OsStr::from_bytes(a)))
@@ -540,12 +542,11 @@ fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
                 .iter()
                 .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
         );
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    let mut child = crate::child::spawn(crate::child::own_group(&mut command)).ok()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -553,10 +554,9 @@ fn probe_now(profile: &Profile, login: &Launch) -> Option<String> {
         tx.send(stdout.take(4096).read_to_string(&mut text).map(|_| text))
             .ok();
     });
-    let out = rx.recv_timeout(Duration::from_secs(5));
+    let out = rx.recv_timeout(timeout);
     let status = child.try_wait().ok().flatten();
-    child.kill().ok();
-    child.wait().ok();
+    drop(child);
     if status.is_some_and(|s| !s.success()) {
         return None;
     }

@@ -238,16 +238,7 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
                     }))
                     .ok()
                     .flatten();
-                    {
-                        let mut state = lock(&shared);
-                        state.lookups.remove(&owned);
-                        if state.last.get(&owned) != Some(&result) {
-                            state.revision = state.revision.wrapping_add(1);
-                        }
-                        state.last.insert(owned, result.clone());
-                    }
-                    *lock(&done.result) = DiscoveryResult::Ready(result);
-                    done.ready.notify_all();
+                    complete_lookup(&shared, owned, &done, result);
                     crate::alloc::purge();
                 });
             if spawned.is_err() {
@@ -277,6 +268,30 @@ fn lookup(cache: &Arc<Mutex<Cache>>, path: &Path, deadline: Instant) -> Option<R
         DiscoveryResult::Ready(trees) => trees.clone(),
         DiscoveryResult::Pending => None,
     }
+}
+
+fn complete_lookup(
+    cache: &Mutex<Cache>,
+    owned: PathBuf,
+    done: &Arc<Discovery>,
+    result: Option<RepositoryTrees>,
+) {
+    {
+        let mut state = lock(cache);
+        if state
+            .lookups
+            .get(&owned)
+            .is_some_and(|current| Arc::ptr_eq(current, done))
+        {
+            state.lookups.remove(&owned);
+            if state.last.get(&owned) != Some(&result) {
+                state.revision = state.revision.wrapping_add(1);
+            }
+            state.last.insert(owned, result.clone());
+        }
+    }
+    *lock(&done.result) = DiscoveryResult::Ready(result);
+    done.ready.notify_all();
 }
 
 /// 차단 조회(백그라운드 스레드 전용). 같은 저장소의 여러 cwd는 한 번의 git 호출을 공유한다.
@@ -880,5 +895,40 @@ mod concurrency_tests {
             unlocked,
             "an inflight discovery must not retain the global cache lock"
         );
+    }
+
+    #[test]
+    fn stale_lookup_after_invalidation_cannot_overwrite_newer_flight_or_last() {
+        let path = PathBuf::from("/krill-sidebar-stale-lookup-after-invalidation");
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let old_flight = Arc::new(Discovery::default());
+        let new_flight = Arc::new(Discovery::default());
+        let stale = RepositoryTrees {
+            repo: b"/repo".to_vec(),
+            worktrees: vec![b"/repo".to_vec(), b"/repo-deleted".to_vec()],
+        };
+        let fresh_trees = RepositoryTrees {
+            repo: b"/repo".to_vec(),
+            worktrees: vec![b"/repo".to_vec(), b"/repo-created".to_vec()],
+        };
+        {
+            let mut state = lock(&cache);
+            state.lookups.insert(path.clone(), Arc::clone(&old_flight));
+            state.invalidate();
+            state.lookups.insert(path.clone(), Arc::clone(&new_flight));
+            state.last.insert(path.clone(), Some(fresh_trees.clone()));
+        }
+        let rev_before = revision(&cache);
+        complete_lookup(&cache, path.clone(), &old_flight, Some(stale.clone()));
+        // Waiters on old_flight still receive its result without hanging.
+        assert!(matches!(
+            &*lock(&old_flight.result),
+            DiscoveryResult::Ready(Some(got)) if got == &stale
+        ));
+        // Authoritative cache and newer in-flight slot remain untouched.
+        let state = lock(&cache);
+        assert!(Arc::ptr_eq(state.lookups.get(&path).unwrap(), &new_flight));
+        assert_eq!(state.last.get(&path), Some(&Some(fresh_trees)));
+        assert_eq!(state.revision, rev_before);
     }
 }

@@ -109,8 +109,7 @@ pub(super) fn provision(
     lock.try_lock().map_err(io::Error::from)?;
     store(&host, &local).share_using(idle, &mut report, &merge_conversations)?;
     if !local.join("conversations").is_symlink()
-        || local.join("conversations").canonicalize()?
-            != host.join("conversations").canonicalize()?
+        || !symlink_points_to(&local.join("conversations"), &host.join("conversations"))?
         || (needs_idle && !idle())
     {
         report.conflicts.push(SUMMARY);
@@ -470,6 +469,28 @@ mod unit_tests {
             provision(&home, &profile, &|| true).unwrap(),
             Report::default()
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dangling_conversations_symlink_records_conflict_instead_of_not_found_error() {
+        let root =
+            std::env::temp_dir().join(format!("krill-agy-dangling-conv-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let host = home.join(".gemini/antigravity-cli");
+        let profile = root.join("profile");
+        let local = profile.join(".gemini/antigravity-cli");
+        fs::create_dir_all(&host).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("missing-conversations-target"),
+            local.join("conversations"),
+        )
+        .unwrap();
+
+        let report = provision(&home, &profile, &|| true).unwrap();
+        assert_eq!(report.conflicts, ["conversations", SUMMARY]);
         fs::remove_dir_all(root).ok();
     }
 }

@@ -311,6 +311,39 @@ pub(super) fn read(path: &Path, keys: Option<&Keyring>) -> io::Result<Option<Seg
     )
 }
 
+/// `read`가 `Ok(None)`을 돌려준 세그먼트가 크래시로 잘린 헤더·salt 또는 깨진 헤더라
+/// 치우고 다시 열 수 있는지 판정한다. 매직과 헤더 CRC가 맞는 미래 포맷은 보존한다.
+pub(super) fn is_reclaimable_unreadable(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let len = meta.len();
+    let mut prefix = [0; HEADER_LEN];
+    match read_full(&mut file, &mut prefix) {
+        Ok(false) => true,
+        Ok(true) => {
+            if Header::decode_with_keyframe(&prefix).is_some() {
+                len < (HEADER_LEN + SALT_LEN) as u64
+            } else {
+                let valid_magic = prefix.get(..4) == Some(MAGIC.as_slice());
+                let valid_crc = prefix
+                    .get(..HEADER_LEN - 4)
+                    .zip(prefix.get(HEADER_LEN - 4..))
+                    .and_then(|(body, crc)| {
+                        let crc = u32::from_le_bytes(crc.try_into().ok()?);
+                        Some(crc == crc32fast::hash(body))
+                    })
+                    .unwrap_or(false);
+                !(valid_magic && valid_crc)
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 pub(super) fn decode(bytes: &[u8], key: Option<&Key>) -> io::Result<Option<Segment>> {

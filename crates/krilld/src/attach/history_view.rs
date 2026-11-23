@@ -197,7 +197,7 @@ impl View {
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<()> {
         if !self.indexed && requested >= u64::try_from(self.hot.len()).unwrap_or(u64::MAX) {
-            self.info.truncate(1);
+            let mut cold = Vec::with_capacity(self.info.len().saturating_sub(1));
             for (gen_idx, manifest) in self.manifests.iter().enumerate() {
                 let hot_ref: &[Box<[u8]>] = if gen_idx == 0 { &self.hot } else { &[] };
                 let (index, prior_screen) =
@@ -205,7 +205,7 @@ impl View {
                 if let Some(screen) = prior_screen
                     && !screen.rows.is_empty()
                 {
-                    self.info.push(Some(SourceInfo {
+                    cold.push(Some(SourceInfo {
                         identity: screen.entry.identity,
                         total: screen.entry.total,
                         covered: screen.entry.covered,
@@ -213,7 +213,7 @@ impl View {
                     }));
                 }
                 for (page, entry) in index.into_iter().enumerate().rev() {
-                    self.info.push(Some(SourceInfo {
+                    cold.push(Some(SourceInfo {
                         identity: entry.identity,
                         total: entry.total,
                         covered: entry.covered,
@@ -221,6 +221,8 @@ impl View {
                     }));
                 }
             }
+            self.info.truncate(1);
+            self.info.extend(cold);
             self.indexed = true;
         }
         let mut base = 0u64;
@@ -290,5 +292,123 @@ impl View {
             base = end;
         }
         Err(io::ErrorKind::InvalidData.into())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::appearance::Appearance;
+    use crate::session::Session;
+    use crate::store::{Limits, Store};
+    use krill_proto::SessionId;
+    use krill_proto::holder::WinSize;
+    use std::io::Write as _;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn failed_cold_indexing_preserves_cold_placeholders_for_hot_requests() {
+        let root = std::env::temp_dir().join(format!("krill-hv-dc02-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let store = Store::open(
+            &root,
+            Limits {
+                seal_bytes: 2048,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let id = SessionId(9702);
+        let size = WinSize { cols: 80, rows: 10 };
+        let pty = rustix_openpty::openpty(None, None).unwrap();
+        let mut mode = rustix::termios::tcgetattr(&pty.user).unwrap();
+        mode.make_raw();
+        rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &mode)
+            .unwrap();
+        let session = Session::start(
+            id,
+            pty.controller,
+            size,
+            Arc::new(Appearance::load(std::path::PathBuf::new())),
+            Some(store.recorder(id, size).unwrap()),
+        )
+        .unwrap();
+        let mut output = std::fs::File::from(pty.user);
+        let tap = session.tap();
+
+        let mut payload = Vec::new();
+        for i in 0..1050_u32 {
+            payload.extend_from_slice(format!("hv-{i:04}\r\n").as_bytes());
+        }
+        output.write_all(&payload).unwrap();
+        let pulse = tap.wait_timeout(Duration::from_secs(5), |p| p.end >= payload.len() as u64);
+        assert_eq!(pulse.end, payload.len() as u64);
+        assert!(store.history(id).unwrap().len() >= 2);
+
+        let mut service = Service::default();
+        let initial = service.load(
+            &tap,
+            &HistoryViewRequest {
+                req: 1,
+                view: 0,
+                skip: 0,
+                count: 10,
+            },
+            &|| false,
+        );
+        assert_eq!(initial.status, HistoryViewStatus::Ready);
+        assert!(!initial.complete, "initial hot page must report cold pages");
+        let view = initial.view;
+        let hot_total = initial.total;
+        assert!(hot_total > 0);
+
+        // Cancel during cold indexing: info placeholders must remain intact.
+        let cancelled = service.load(
+            &tap,
+            &HistoryViewRequest {
+                req: 2,
+                view,
+                skip: hot_total,
+                count: 10,
+            },
+            &|| true,
+        );
+        assert_eq!(cancelled.status, HistoryViewStatus::Missing);
+
+        // Follow-up hot request on the same view must still report complete == false.
+        let hot_again = service.load(
+            &tap,
+            &HistoryViewRequest {
+                req: 3,
+                view,
+                skip: 0,
+                count: 10,
+            },
+            &|| false,
+        );
+        assert_eq!(hot_again.status, HistoryViewStatus::Ready);
+        assert!(
+            !hot_again.complete,
+            "failed cold indexing must not drop cold placeholders"
+        );
+
+        // Retrying cold indexing on the same view must now succeed and return cold rows.
+        let cold = service.load(
+            &tap,
+            &HistoryViewRequest {
+                req: 4,
+                view,
+                skip: hot_total,
+                count: 10,
+            },
+            &|| false,
+        );
+        assert_eq!(cold.status, HistoryViewStatus::Ready);
+        assert!(!cold.rows.is_empty());
+
+        drop(output);
+        session.wait().unwrap();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -20,17 +20,18 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const CURSOR_CACHE_CAP: usize = 32;
 const MAX_CHECKPOINTS_PER_ENTRY: usize = 512;
 
-#[derive(Clone, PartialEq, Eq)]
-struct FileStamp {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp<const N: usize> {
     len: u64,
     modified_ns: Option<u128>,
-    header: [u8; 32],
+    header: [u8; N],
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DbStamp {
-    db: FileStamp,
-    wal: Option<FileStamp>,
+    db: FileStamp<4>,
+    wal: Option<FileStamp<32>>,
+    shm: Option<FileStamp<96>>,
 }
 
 struct CursorEntry {
@@ -56,26 +57,24 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn file_stamp(path: &Path, header_offset: u64, header_len: usize) -> Option<FileStamp> {
-    let mut file = File::open(path).ok()?;
+fn file_stamp_from<const N: usize>(mut file: File, header_offset: u64) -> Option<FileStamp<N>> {
     let meta = file.metadata().ok()?;
     let modified_ns = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos());
-    let mut header = [0u8; 32];
-    let want = header_len.min(header.len());
-    if want > 0 && file.seek(SeekFrom::Start(header_offset)).is_ok() {
-        let mut read = 0;
-        while read < want {
-            let Some(buf) = header.get_mut(read..want) else {
-                break;
-            };
-            match file.read(buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => read += n,
-            }
+    let mut header = [0u8; N];
+    file.seek(SeekFrom::Start(header_offset)).ok()?;
+    let mut read = 0;
+    while read < N {
+        let Some(buf) = header.get_mut(read..N) else {
+            break;
+        };
+        match file.read(buf) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(_) => return None,
         }
     }
     Some(FileStamp {
@@ -85,10 +84,45 @@ fn file_stamp(path: &Path, header_offset: u64, header_len: usize) -> Option<File
     })
 }
 
+fn file_stamp<const N: usize>(path: &Path, header_offset: u64) -> Option<FileStamp<N>> {
+    file_stamp_from(File::open(path).ok()?, header_offset)
+}
+
+enum SidecarStamp<const N: usize> {
+    Present(FileStamp<N>),
+    Missing,
+    Unreadable,
+}
+
+fn optional_file_stamp<const N: usize>(path: &Path, header_offset: u64) -> SidecarStamp<N> {
+    match File::open(path) {
+        Ok(file) => file_stamp_from(file, header_offset)
+            .map_or(SidecarStamp::Unreadable, SidecarStamp::Present),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => SidecarStamp::Missing,
+        Err(_) => SidecarStamp::Unreadable,
+    }
+}
+
 fn read_db_stamp(path: &Path) -> Option<DbStamp> {
-    let db = file_stamp(path, 24, 4)?;
-    let wal = file_stamp(&sidecar_path(path, "-wal"), 0, 32);
-    Some(DbStamp { db, wal })
+    let db = file_stamp::<4>(path, 24)?;
+    let wal = match optional_file_stamp::<32>(&sidecar_path(path, "-wal"), 0) {
+        SidecarStamp::Present(stamp) => Some(stamp),
+        SidecarStamp::Missing => None,
+        SidecarStamp::Unreadable => return None,
+    };
+    let shm = match optional_file_stamp::<96>(&sidecar_path(path, "-shm"), 0) {
+        SidecarStamp::Present(stamp) => Some(stamp),
+        SidecarStamp::Missing => None,
+        SidecarStamp::Unreadable => return None,
+    };
+    // Reject a torn WalIndexHdr (bytes 0..48 vs 48..96) captured mid-commit.
+    if let Some(shm_stamp) = &shm
+        && shm_stamp.len >= 96
+        && shm_stamp.header.get(..48) != shm_stamp.header.get(48..96)
+    {
+        return None;
+    }
+    Some(DbStamp { db, wal, shm })
 }
 
 struct CachedResume {
@@ -395,6 +429,19 @@ fn read_window(
     db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; BEGIN;")?;
     let schema = columns(&db, "session")?;
     needs(&schema, &["id", "directory"])?;
+    // Re-read the stamp once the first SELECT inside BEGIN; has pinned the SQLite read snapshot.
+    // Reuse cached checkpoints and update the cursor cache only when before == after.
+    let stamp_after = if stamp.is_some() {
+        read_db_stamp(path)
+    } else {
+        None
+    };
+    let stamp_stable = stamp.is_some() && stamp == stamp_after;
+    let (sql_offset, resume_hasher) = if stamp_stable {
+        (sql_offset, resume_hasher)
+    } else {
+        (0, None)
+    };
     let title = if schema.contains("title") {
         "title"
     } else {
@@ -620,6 +667,7 @@ fn read_window(
             }
             batch.truncated |= batch.bytes > MAX_BYTES || scan_now() >= deadline;
             if let (Some(sid), Some(stamp)) = (id, stamp.as_ref())
+                && stamp_stable
                 && !batch.truncated
                 && !batch.skipped
                 && page_size.is_some()
@@ -1187,6 +1235,78 @@ mod tests {
         );
         assert!(edited.bound && edited.reset);
         assert_eq!(edited.items[0].text, "edited-0");
+
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn db_stamp_tracks_shm_header_rejects_torn_header_and_revalidates_wal_reuse() {
+        let (root, path, db) = fixture("dc30-shm");
+
+        // 1. Standalone sidecar stamp test: changing -shm WalIndexHdr (bytes 0..96) must change
+        //    DbStamp even when .db and -wal are untouched, and torn headers (0..48 != 48..96)
+        //    must return None so callers fail closed to SQLite.
+        let synth_dir = root.join("synthetic");
+        std::fs::create_dir_all(&synth_dir).unwrap();
+        let synth_db = synth_dir.join("test.db");
+        let synth_wal = sidecar_path(&synth_db, "-wal");
+        let synth_shm = sidecar_path(&synth_db, "-shm");
+        std::fs::write(&synth_db, vec![0u8; 100]).unwrap();
+        std::fs::write(&synth_wal, vec![0u8; 64]).unwrap();
+        let mut shm_bytes = vec![0u8; 128];
+        shm_bytes[8] = 1;
+        shm_bytes[56] = 1;
+        std::fs::write(&synth_shm, &shm_bytes).unwrap();
+
+        let stamp1 = read_db_stamp(&synth_db).expect("consistent shm stamp");
+        assert!(stamp1.shm.is_some());
+
+        // Bump iChange in both header copies without touching .db or -wal.
+        shm_bytes[8] = 2;
+        shm_bytes[56] = 2;
+        std::fs::write(&synth_shm, &shm_bytes).unwrap();
+        let stamp2 = read_db_stamp(&synth_db).expect("updated consistent shm stamp");
+        assert_ne!(
+            stamp1, stamp2,
+            "-shm WalIndexHdr update must change DbStamp"
+        );
+
+        // Simulate a mid-commit torn WalIndexHdr (copy 1 != copy 2).
+        shm_bytes[8] = 3;
+        std::fs::write(&synth_shm, &shm_bytes).unwrap();
+        assert!(
+            read_db_stamp(&synth_db).is_none(),
+            "torn -shm WalIndexHdr must disable cursor caching"
+        );
+
+        // 2. Real SQLite WAL checkpoint + WAL frame reuse must invalidate the cursor cache
+        //    and surface the newly committed message on the very next poll.
+        let initial = chat::poll_transcript_file(VaultAgent::OpenCode, "ses_sqlite_001", &path, 0);
+        assert!(initial.bound && initial.items.len() == 2);
+        let idle = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            initial.next_offset,
+        );
+        assert!(idle.bound && !idle.reset && idle.items.is_empty());
+
+        db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap();
+        db.execute(
+            "INSERT INTO message VALUES('msg3','ses_sqlite_001',?1,3000)",
+            [r#"{"role":"user","content":"reused wal frame"}"#],
+        )
+        .unwrap();
+        let next = chat::poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_sqlite_001",
+            &path,
+            initial.next_offset,
+        );
+        assert!(next.bound && !next.reset);
+        assert_eq!(next.items.len(), 1);
+        assert_eq!(next.items[0].text, "reused wal frame");
 
         drop(db);
         std::fs::remove_dir_all(root).unwrap();

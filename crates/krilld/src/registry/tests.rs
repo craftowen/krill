@@ -4122,3 +4122,131 @@ fn bots_watcher_mask_observer_audit_oversized_and_auto_boot() {
     }
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn restricted_peer_cannot_create_sessions_or_bypass_enforced_signing_policy() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-dc15-restricted-create-sign-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(scope::SIGNING_POLICY_FILE),
+        "require_signed = true\n",
+    )
+    .unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let mut clients = HashMap::new();
+    let mut restricted = Peer {
+        pid: Some(4242),
+        scope: Scope::Restricted,
+    };
+
+    for program in [
+        Program::Login,
+        Program::Custom {
+            program: b"/bin/sh".to_vec(),
+            args: vec![b"-c".to_vec(), b"true".to_vec()],
+        },
+        Program::Agent {
+            id: "claude".into(),
+        },
+        Program::Agent {
+            id: "fork:s1".into(),
+        },
+    ] {
+        let req = Request::Create(Create {
+            program,
+            cwd: b"/tmp".to_vec(),
+            cols: 80,
+            rows: 24,
+            account: None,
+        });
+        assert_eq!(
+            reg.handle(&restricted, req, &mut clients),
+            Reply::Failed(Failure::Denied)
+        );
+    }
+
+    assert!(
+        reg.gate_connection_signing(&mut restricted, || None),
+        "Scope::Restricted must be rejected when peer-signing.toml is enforced"
+    );
+
+    let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
+    assert!(
+        audit.contains("deny op=create target=0 peer_pid=4242 scope=restricted"),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("deny op=peer-sign target=0 peer_pid=4242 scope=restricted"),
+        "{audit}"
+    );
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn discover_hook_identity_skips_exited_sessions_without_resurrecting_binding() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-dc21-hook-discovery-exited-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(701);
+    reg.agents
+        .remember_session(
+            id,
+            &control::AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            None,
+            b"/tmp".to_vec(),
+            None,
+        )
+        .unwrap();
+    let (master, _peer_end) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    {
+        let mut st = lock(&reg.state);
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: std::process::id(),
+                cwd: PathBuf::from("/tmp"),
+                wrapped: false,
+            },
+        );
+        st.exited.insert(id, 0);
+    }
+    let event = HookEvent {
+        id: hook::EventId {
+            pid: std::process::id(),
+            unix_ns: status::now_ns(),
+        },
+        agent: "claude".into(),
+        ppid: std::process::id(),
+        input: hook::Input::Complete,
+        payload: br#"{"hook_event_name":"Stop"}"#.to_vec(),
+    };
+    reg.discover_hook_identity_in(&home, id, &event);
+    let stored = reg.agents.stored(id).unwrap().unwrap();
+    assert_eq!(stored.session_id, None);
+    assert_eq!(stored.transcript_path, None);
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}

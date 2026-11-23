@@ -24,9 +24,10 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
+use std::sync::Mutex;
 
 use krill_proto::control::{Create, Failure, NewWorktree, Program, Reply, Setup, Worktree};
 use krill_proto::holder::WinSize;
@@ -572,12 +573,13 @@ pub(crate) fn trusted(file: &Path, hash: &[u8]) -> io::Result<bool> {
     }
 }
 
+static TRUST_LOCK: Mutex<()> = Mutex::new(());
+
 pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
+    let _guard = crate::session::lock(&TRUST_LOCK);
+    let _file_lock = krill_proto::config_document::lock_toml(file)?;
     if trusted(file, hash)? {
         return Ok(());
-    }
-    if let Some(d) = file.parent() {
-        fs::create_dir_all(d)?;
     }
     let mut content = match fs::read_to_string(file) {
         Ok(s) => s,
@@ -589,22 +591,7 @@ pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
     }
     content.push_str(&hex(hash));
     content.push('\n');
-    let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
-    let write_result = (|| -> io::Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        drop(f);
-        fs::rename(&tmp, file)
-    })();
-    if write_result.is_err() {
-        fs::remove_file(&tmp).ok();
-    }
-    write_result
+    krill_proto::os::write_atomic_0600(file, content.as_bytes())
 }
 
 /// `state_dir/setup-trust`에 `(top, script)` SHA-256 해시가 승인돼 있거나
@@ -1119,6 +1106,34 @@ mod trust_tests {
         remember(&file, &second).unwrap();
         assert!(trusted(&file, &first).unwrap());
         assert!(trusted(&file, &second).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remember_serializes_concurrent_writes_without_losing_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-setup-trust-conc-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let file = dir.join(TRUST_FILE);
+        let hashes: Vec<Vec<u8>> = (0..32_u32)
+            .map(|i| digest(Path::new("/tmp/repo-conc"), &format!("echo {i}")))
+            .collect();
+        std::thread::scope(|s| {
+            for chunk in hashes.chunks(4) {
+                let file = &file;
+                s.spawn(move || {
+                    for h in chunk {
+                        remember(file, h).unwrap();
+                    }
+                });
+            }
+        });
+        for h in &hashes {
+            assert!(
+                trusted(&file, h).unwrap(),
+                "missing hash after concurrent remember"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

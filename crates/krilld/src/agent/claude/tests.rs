@@ -385,6 +385,75 @@ fn fork_settings_do_not_expose_uninjected_session_id_but_clean_up_on_discard_and
     assert_eq!(sweep(&tmp.0, &[]), 1);
 }
 
+#[test]
+fn session_id_ignores_non_json_instruction_entries_for_same_session() {
+    let tmp = Temp::new();
+    let krill = tmp.script("krill", "#!/bin/sh\nexit 0\n");
+    let sid = SessionId(42);
+    let settings = Settings::create(&tmp.0, &krill, sid, Some("2.1.299")).unwrap();
+    let dir = tmp.0.join(DIR);
+    // Create instruction files and directories with UUIDs sorting both before and after settings.id
+    // so read_dir visits non-.json entries owned by the same session regardless of filesystem order.
+    for suffix in [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    ] {
+        fs::write(
+            dir.join(format!("{}-instructions-{suffix}.md", sid.0)),
+            "bot",
+        )
+        .unwrap();
+    }
+    let _instr_file = create_instructions_file(&tmp.0, sid, "bot instructions").unwrap();
+    let _instr_dir = create_instructions_dir(&tmp.0, sid).unwrap();
+
+    assert_eq!(
+        session_id(&tmp.0, sid).as_deref(),
+        Some(settings.id.as_str()),
+        "non-.json instruction files must not short-circuit session_id lookup"
+    );
+
+    let only_instr = SessionId(43);
+    assert!(
+        create_instructions_file(&tmp.0, only_instr, "only instructions")
+            .unwrap()
+            .is_file()
+    );
+    assert_eq!(session_id(&tmp.0, only_instr), None);
+}
+
+#[test]
+fn probe_timeout_terminates_grandchild_process_group() {
+    let tmp = Temp::new();
+    let pid_file = tmp.0.join("grandchild.pid");
+    let exe = tmp.script(
+        "claude",
+        &format!(
+            "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n",
+            pid_file.display()
+        ),
+    );
+    let started = Instant::now();
+    let version = probe_now_with_timeout(&profile(&exe), &tmp.login(), Duration::from_millis(600));
+    assert_eq!(version, None);
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    if let Ok(raw) = fs::read_to_string(&pid_file)
+        && let Ok(pid) = raw.trim().parse::<i32>()
+        && let Some(pid) = rustix::process::Pid::from_raw(pid)
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "grandchild process {pid:?} leaked after claude probe timeout"
+        );
+    }
+}
+
 /// OWE-701: statusLine은 버전 게이트를 탄다. 1.0.64 미만에는 주입하지 않고,
 /// 미확인 버전에는 주입한다(미확인 ≠ 구버전).
 #[test]

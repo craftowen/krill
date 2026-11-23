@@ -228,6 +228,7 @@ fn fallback_shell_strips_provider_and_opencode_account_isolation_envs() {
     for expected in [
         "KRILL_ACCOUNT_PROVIDER",
         "KRILL_ACCOUNT_DIR",
+        "KRILL_OPENCODE_INSTRUCTIONS_DIR",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
         "XDG_DATA_HOME",
@@ -239,4 +240,104 @@ fn fallback_shell_strips_provider_and_opencode_account_isolation_envs() {
             "missing env_remove for {expected}: {removed:?}"
         );
     }
+}
+
+#[test]
+fn opencode_instructions_dir_survives_windows_command_without_leaking_marker() {
+    let instr_dir = "C:\\Users\\owen\\krill\\42-instructions-abc";
+    for account_dir in ["", "selected 한글 O'wen"] {
+        let mut vars = env();
+        vars.retain(|(k, _)| {
+            !k.eq_ignore_ascii_case(b"KRILL_ACCOUNT_PROVIDER")
+                && !k.eq_ignore_ascii_case(b"KRILL_ACCOUNT_DIR")
+                && !k.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+                && !k.eq_ignore_ascii_case(b"OPENCODE_CONFIG_DIR")
+        });
+        vars.extend([
+            (b"KRILL_ACCOUNT_PROVIDER".to_vec(), b"opencode".to_vec()),
+            (
+                b"KRILL_ACCOUNT_DIR".to_vec(),
+                account_dir.as_bytes().to_vec(),
+            ),
+            (b"OPENCODE_CONFIG_DIR".to_vec(), b"/stale-override".to_vec()),
+            (b"OPENAI_API_KEY".to_vec(), b"wrong-key".to_vec()),
+            (
+                b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(),
+                instr_dir.as_bytes().to_vec(),
+            ),
+        ]);
+        let cmd = command(std::env::current_exe().unwrap().as_os_str(), vars).unwrap();
+        assert_eq!(value(&cmd, "OPENCODE_CONFIG_DIR"), Some(instr_dir.into()));
+        assert_eq!(value(&cmd, "KRILL_OPENCODE_INSTRUCTIONS_DIR"), None);
+        assert_eq!(value(&cmd, "KRILL_ACCOUNT_PROVIDER"), None);
+        assert_eq!(value(&cmd, "KRILL_ACCOUNT_DIR"), None);
+        assert_eq!(value(&cmd, "OPENAI_API_KEY"), None);
+        if !account_dir.is_empty() {
+            assert_eq!(value(&cmd, "OPENCODE_DB"), Some("opencode.db".into()));
+            assert_eq!(
+                value(&cmd, "XDG_DATA_HOME"),
+                Some(PathBuf::from(account_dir).join("data").into_os_string())
+            );
+        }
+    }
+}
+
+#[test]
+fn needs_agy_ssh_mode_matches_case_insensitively_across_args() {
+    let with_gemini = vec![
+        OsString::from("--add-dir"),
+        OsString::from("/bot/home"),
+        OsString::from("--gemini_dir=/profile/.gemini"),
+    ];
+    let without_gemini = vec![OsString::from("--add-dir"), OsString::from("/bot/home")];
+    for program in ["agy", "AGY.EXE", "Antigravity.cmd", "/tools/AGY.EXE"] {
+        assert!(
+            needs_agy_ssh_mode(OsStr::new(program), &with_gemini),
+            "{program}"
+        );
+        assert!(
+            !needs_agy_ssh_mode(OsStr::new(program), &without_gemini),
+            "{program}"
+        );
+    }
+    assert!(!needs_agy_ssh_mode(OsStr::new("CLAUDE.EXE"), &with_gemini));
+    #[cfg(windows)]
+    assert!(needs_agy_ssh_mode(
+        OsStr::new(r"C:\Tools\AGY.EXE"),
+        &with_gemini
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pre_trust_rejects_drive_roots_and_avoids_verbatim_prefix() {
+    let root = std::env::temp_dir().join(format!("krill-win-pretrust-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    for broad in [r"C:\", "C:/", r"\\?\C:\"] {
+        assert!(
+            crate::agent::is_too_broad_to_pre_trust(&home, std::path::Path::new(broad)),
+            "drive root must be rejected: {broad}"
+        );
+    }
+
+    assert!(crate::agent::pre_trust_cursor_in(&home, &workspace).unwrap());
+    let expected = krill_proto::os::canonicalize(&workspace).unwrap();
+    let expected_str = expected.to_str().unwrap();
+    assert!(!expected_str.starts_with(r"\\?\"), "{expected_str}");
+    let slug = crate::agent::cursor_project_slug(expected_str);
+    assert!(!slug.starts_with("----"), "{slug}");
+    let marker = home
+        .join(".cursor/projects")
+        .join(slug)
+        .join(".workspace-trusted");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(parsed["workspacePath"], expected_str);
+
+    std::fs::remove_dir_all(&root).ok();
 }

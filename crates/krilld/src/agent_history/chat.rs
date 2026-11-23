@@ -68,6 +68,10 @@ impl ScanBudget {
 }
 
 fn read_json_bounded(path: &Path, remaining: &mut u64) -> std::io::Result<Value> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(std::io::Error::other("chat JSON must be a regular file"));
+    }
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     if len > *remaining {
@@ -300,9 +304,10 @@ pub(crate) fn latest_page(
     let mut start = scan_start + u64::try_from(complete.max(leading)).unwrap_or(0);
     // A giant final record may occupy the entire window. Find its beginning in
     // bounded chunks so the next historical request can pass it.
-    if start == end && leading == complete && scan_start > 0 {
+    if leading >= complete && scan_start > 0 {
         let floor = end.saturating_sub(MAX_SKIP_BYTES);
         let mut cursor = scan_start;
+        let mut found = false;
         while cursor > floor {
             let chunk_start = cursor.saturating_sub(MAX_POLL_BYTES).max(floor);
             file.seek(SeekFrom::Start(chunk_start))?;
@@ -312,12 +317,13 @@ pub(crate) fn latest_page(
                 .read_to_end(&mut chunk)?;
             if let Some(index) = chunk.iter().rposition(|b| *b == b'\n') {
                 start = chunk_start + u64::try_from(index + 1).unwrap_or(0);
+                found = true;
                 break;
             }
             cursor = chunk_start;
-            if cursor == 0 {
-                start = 0;
-            }
+        }
+        if !found {
+            start = floor;
         }
     }
     let mut count = 0;
@@ -557,12 +563,22 @@ fn opencode_storage_root(path: &Path) -> Option<&Path> {
 }
 
 fn sorted_json_files(dir: &Path) -> Vec<PathBuf> {
+    if !fs::symlink_metadata(dir)
+        .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.file_type().is_dir())
+    {
+        return Vec::new();
+    }
     let mut paths: Vec<_> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| !kind.is_symlink() && kind.is_file())
+        })
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json") && path.is_file())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
     paths.sort();
     paths
@@ -924,11 +940,17 @@ fn load_opencode_session(agent: &str, sid: &str, path: &Path, path_str: &str) ->
     // The session document is bounded individually; external messages share a 64 MiB budget.
     remaining = MAX_SKIP_BYTES;
     parse_opencode_value(&embedded, storage_root, &mut page.items, &mut remaining);
-    if let Some(root) = storage_root {
+    if let Some(root) = storage_root
+        && crate::agent::control::valid_session_id(&page.session_id)
+    {
         for message in sorted_json_files(&root.join("message").join(&page.session_id)) {
             message.hash(&mut fingerprint);
             crate::agent::control::cache::stamp(&message).hash(&mut fingerprint);
-            if let Some(id) = message.file_stem() {
+            if let Some(id) = message
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|id| crate::agent::control::valid_session_id(id))
+            {
                 for part in sorted_json_files(&root.join("part").join(id)) {
                     part.hash(&mut fingerprint);
                     crate::agent::control::cache::stamp(&part).hash(&mut fingerprint);
@@ -2319,15 +2341,9 @@ fn parse_opencode_message_record(
         }
     }
     if let (Some(sr), Some(msg_id)) = (storage_root, v.get("id").and_then(Value::as_str))
-        && let Ok(entries) = fs::read_dir(sr.join("part").join(msg_id))
+        && crate::agent::control::valid_session_id(msg_id)
     {
-        let mut part_files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
-            .collect();
-        part_files.sort();
-        for pf in part_files {
+        for pf in sorted_json_files(&sr.join("part").join(msg_id)) {
             if let Ok(pv) = read_json_bounded(&pf, remaining) {
                 parse_opencode_part(default_kind, &pv, out);
             }
@@ -3120,16 +3136,28 @@ fn take_leading_image_paths(item: &mut ChatItem) {
 
 /// Adds `paths` to a user item's `file_path` (one path per line), skipping repeats.
 fn add_image_paths(item: &mut ChatItem, paths: &[String]) {
+    if item.file_path.len() > MAX_TEXT {
+        item.file_path = bounded(&item.file_path, MAX_TEXT);
+    }
     for path in paths {
         if item.file_path.lines().any(|existing| existing == path) {
             continue;
         }
-        if !item.file_path.is_empty() {
+        let sep = usize::from(!item.file_path.is_empty());
+        if item
+            .file_path
+            .len()
+            .saturating_add(sep)
+            .saturating_add(path.len())
+            > MAX_TEXT
+        {
+            break;
+        }
+        if sep > 0 {
             item.file_path.push('\n');
         }
         item.file_path.push_str(path);
     }
-    item.file_path = bounded(&item.file_path, MAX_CHAT_TEXT);
 }
 
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
@@ -3770,6 +3798,135 @@ mod tests {
         assert_eq!(claude_snap.items[1].text, "뒤쪽 리마인더 제거 전 질문");
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn add_image_paths_caps_at_max_text_and_roundtrips_wire() {
+        use krill_proto::screen::Msg as _;
+
+        let mut item = ChatItem {
+            kind: ChatItemKind::User,
+            text: "check these screenshots".into(),
+            ..ChatItem::default()
+        };
+        let paths: Vec<String> = (0..100)
+            .map(|i| format!("/tmp/krill-paste/{}/image_{i:03}.png", "nested".repeat(12)))
+            .collect();
+        add_image_paths(&mut item, &paths);
+        assert!(
+            item.file_path.len() <= MAX_TEXT,
+            "file_path len {} exceeded MAX_TEXT ({MAX_TEXT})",
+            item.file_path.len()
+        );
+        let kept: Vec<&str> = item.file_path.lines().collect();
+        assert!(!kept.is_empty());
+        for (idx, line) in kept.iter().enumerate() {
+            assert_eq!(*line, paths[idx], "stopped path must remain complete");
+        }
+        assert!(kept.len() < paths.len());
+
+        let snap = ChatPollSnapshot {
+            agent: "claude".into(),
+            session_id: "sid".into(),
+            transcript_path: "/tmp/sid.jsonl".into(),
+            bound: true,
+            items: vec![item],
+            ..ChatPollSnapshot::default()
+        };
+        let reply = krill_proto::control::Reply::AgentHistory(
+            krill_proto::agent_history::Response::ChatPolled(snap),
+        );
+        let frame = reply.encode().expect("encode ChatPolled");
+        let decoded =
+            krill_proto::control::Reply::decode(frame[4], frame.get(5..).expect("ipc body"))
+                .expect("decode ChatPolled must succeed within MAX_TEXT");
+        assert_eq!(decoded, reply);
+    }
+
+    #[test]
+    fn latest_page_handles_unflushed_giant_tail_and_giant_plus_partial_without_stalling() {
+        // Subcase A: complete record followed by an unflushed >512 KiB tail with no trailing `\n`.
+        let (dir_a, path_a) = audit_fixture("giant-unflushed");
+        let old = claude_record("before unflushed");
+        let unflushed = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}",
+            "z".repeat(650_000)
+        );
+        fs::write(&path_a, format!("{old}{unflushed}")).unwrap();
+        let file_len_a = fs::metadata(&path_a).unwrap().len();
+        let resolved_a = poll_transcript_file(VaultAgent::Claude, "sid", &path_a, 0);
+        let (_, start_a) = latest_page(resolved_a.clone(), None).unwrap();
+        assert!(
+            start_a < file_len_a,
+            "unflushed giant tail must strictly reduce start ({start_a} vs {file_len_a})"
+        );
+        assert_eq!(start_a, u64::try_from(old.len()).unwrap());
+        let (earlier_a, zero_a) = latest_page(resolved_a, Some(start_a)).unwrap();
+        assert_eq!(zero_a, 0);
+        assert_eq!(earlier_a.items.len(), 1);
+        assert_eq!(earlier_a.items[0].text, "before unflushed");
+        fs::remove_dir_all(dir_a).ok();
+
+        // Subcase B: complete >512 KiB record followed by a partial trailing line.
+        let (dir_b, path_b) = audit_fixture("giant-plus-partial");
+        let old_b = claude_record("before giant");
+        let giant_b = claude_record(&"y".repeat(650_000));
+        let partial_b = r#"{"type":"user","message":{"content":"streaming""#;
+        fs::write(&path_b, format!("{old_b}{giant_b}{partial_b}")).unwrap();
+        let resolved_b = poll_transcript_file(VaultAgent::Claude, "sid", &path_b, 0);
+        let (latest_b, start_b) = latest_page(resolved_b.clone(), None).unwrap();
+        assert_eq!(start_b, u64::try_from(old_b.len()).unwrap());
+        assert_eq!(latest_b.items.len(), 1);
+        assert_eq!(latest_b.items[0].text, "Skipped oversized entry");
+        let (earlier_b, zero_b) = latest_page(resolved_b, Some(start_b)).unwrap();
+        assert_eq!(zero_b, 0);
+        assert_eq!(earlier_b.items.len(), 1);
+        assert_eq!(earlier_b.items[0].text, "before giant");
+        fs::remove_dir_all(dir_b).ok();
+    }
+
+    #[test]
+    fn opencode_json_chat_rejects_path_traversal_and_symlinks() {
+        let (dir, _) = audit_fixture("oc-traversal");
+        let storage = dir.join("storage");
+        let session_dir = storage.join("session/global");
+        let msg_dir = storage.join("message/ses_safe");
+        let ok_part_dir = storage.join("part/msg_ok");
+        let secret_dir = dir.join("secret");
+        for d in [&session_dir, &msg_dir, &ok_part_dir, &secret_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let secret_file = secret_dir.join("pwn.json");
+        fs::write(&secret_file, r#"{"type":"text","text":"SECRET_TRAVERSAL"}"#).unwrap();
+        let session_file = session_dir.join("ses_safe.json");
+        fs::write(&session_file, "{}").unwrap();
+        fs::write(
+            msg_dir.join("msg_001.json"),
+            r#"{"id":"../../secret","role":"assistant","content":"safe body"}"#,
+        )
+        .unwrap();
+        fs::write(
+            msg_dir.join("msg_002.json"),
+            r#"{"id":"msg_ok","role":"assistant"}"#,
+        )
+        .unwrap();
+        fs::write(
+            ok_part_dir.join("part_001.json"),
+            r#"{"type":"text","text":"visible part"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&secret_file, ok_part_dir.join("part_002.json")).unwrap();
+
+        let snap = poll_transcript_file(VaultAgent::OpenCode, "ses_safe", &session_file, 0);
+        assert!(snap.bound);
+        let texts: Vec<&str> = snap.items.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"safe body"), "{texts:?}");
+        assert!(texts.contains(&"visible part"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("SECRET_TRAVERSAL")),
+            "traversal/symlink leaked into chat items: {texts:?}"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 }
 

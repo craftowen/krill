@@ -16,7 +16,7 @@ use crate::session::lock;
 
 use krill_proto::agent_history::{
     MAX_ENTRIES, MAX_TEXT, SearchQuery, SearchSnapshot, VaultAgent, VaultHit, VaultTarget,
-    is_claude_mem_cwd, is_claude_mem_project_dir,
+    is_absolute_history_path, is_claude_mem_cwd, is_claude_mem_project_dir,
 };
 use serde_json::Value;
 
@@ -867,7 +867,7 @@ fn extract_snippet(text: &str, terms: &[String]) -> String {
     // Search before applying the display cap: a hit may be beyond MAX_TEXT.
     let clean = normalized_line(text, usize::MAX);
     let chars: Vec<char> = clean.chars().collect();
-    if chars.len() <= SNIPPET_CHARS {
+    if chars.len() <= SNIPPET_CHARS && clean.len() <= MAX_TEXT {
         return clean;
     }
     let lower = clean.to_lowercase();
@@ -905,19 +905,44 @@ fn extract_snippet(text: &str, terms: &[String]) -> String {
         .saturating_sub(context)
         .min(chars.len().saturating_sub(width));
     let end = start.saturating_add(width).min(chars.len());
+    let leading_ellipsis = start > 0;
+    let trailing_ellipsis = end < chars.len();
+    let ellipsis_len = '…'.len_utf8();
+    let slice = chars.get(start..end).unwrap_or_default();
+    let slice_bytes: usize = slice.iter().copied().map(char::len_utf8).sum();
+    let ellipsis_bytes = (usize::from(leading_ellipsis) + usize::from(trailing_ellipsis))
+        .saturating_mul(ellipsis_len);
     let mut out = String::new();
-    if start > 0 {
+    if leading_ellipsis {
         out.push('…');
     }
-    if let Some(slice) = chars.get(start..end) {
+    if slice_bytes.saturating_add(ellipsis_bytes) <= MAX_TEXT {
         for &c in slice {
             out.push(c);
         }
-    }
-    if end < chars.len() {
-        out.push('…');
+        if trailing_ellipsis {
+            out.push('…');
+        }
+    } else {
+        let body_limit = MAX_TEXT.saturating_sub(ellipsis_len);
+        for &c in slice {
+            if out.len().saturating_add(c.len_utf8()) > body_limit {
+                break;
+            }
+            out.push(c);
+        }
+        if out.len().saturating_add(ellipsis_len) <= MAX_TEXT {
+            out.push('…');
+        }
     }
     out
+}
+
+struct ReadOutcome {
+    modified: u64,
+    file_partial: bool,
+    file_skipped: bool,
+    budget_capped: bool,
 }
 
 struct Indexer {
@@ -931,10 +956,12 @@ struct Indexer {
 }
 
 impl Indexer {
+    fn is_exhausted(&self) -> bool {
+        self.nodes >= MAX_NODES || self.bytes >= MAX_BYTES || self.start.elapsed() >= self.scan_time
+    }
+
     fn exhausted(&mut self) -> bool {
-        let done = self.nodes >= MAX_NODES
-            || self.bytes >= MAX_BYTES
-            || self.start.elapsed() >= self.scan_time;
+        let done = self.is_exhausted();
         self.truncated |= done;
         done
     }
@@ -963,7 +990,11 @@ impl Indexer {
         }
     }
 
-    fn read_lines(&mut self, path: &Path, mut on_line: impl FnMut(&[u8])) -> io::Result<u64> {
+    fn read_lines(
+        &mut self,
+        path: &Path,
+        mut on_line: impl FnMut(&[u8]),
+    ) -> io::Result<ReadOutcome> {
         let mut file = File::open(path)?;
         let meta = file.metadata()?;
         let modified = meta
@@ -972,14 +1003,23 @@ impl Indexer {
             .unwrap_or_default()
             .as_secs();
         let file_len = meta.len();
-        self.truncated |= file_len > u64::try_from(FILE_BYTES).unwrap_or(u64::MAX);
-        let limit =
-            u64::try_from(FILE_BYTES.min(MAX_BYTES.saturating_sub(self.bytes))).unwrap_or(u64::MAX);
+        let file_limit = u64::try_from(FILE_BYTES).unwrap_or(u64::MAX);
+        let remaining = u64::try_from(MAX_BYTES.saturating_sub(self.bytes)).unwrap_or(u64::MAX);
+        let limit = file_limit.min(remaining);
+        let file_partial = file_len > file_limit;
+        let budget_capped = file_len > limit && remaining < file_limit;
+        self.truncated |= file_partial || budget_capped;
         if limit == 0 {
             self.truncated = true;
-            return Ok(modified);
+            return Ok(ReadOutcome {
+                modified,
+                file_partial,
+                file_skipped: false,
+                budget_capped: true,
+            });
         }
 
+        let mut file_skipped = false;
         let mut line = Vec::new();
         if file_len <= limit || limit < 2 {
             let mut reader = BufReader::with_capacity(8192, file.take(limit));
@@ -989,6 +1029,7 @@ impl Indexer {
                     Ok(0) => break,
                     Ok(_) => on_line(&line),
                     Err(_) => {
+                        file_skipped = true;
                         self.skipped = true;
                         break;
                     }
@@ -998,7 +1039,12 @@ impl Indexer {
             self.bytes = self
                 .bytes
                 .saturating_add(usize::try_from(read).unwrap_or(usize::MAX));
-            return Ok(modified);
+            return Ok(ReadOutcome {
+                modified,
+                file_partial,
+                file_skipped,
+                budget_capped,
+            });
         }
 
         self.truncated = true;
@@ -1014,6 +1060,7 @@ impl Indexer {
                     Ok(0) => break,
                     Ok(_) => on_line(&line),
                     Err(_) => {
+                        file_skipped = true;
                         self.skipped = true;
                         break;
                     }
@@ -1042,6 +1089,7 @@ impl Indexer {
                     Ok(0) => break,
                     Ok(_) => on_line(&line),
                     Err(_) => {
+                        file_skipped = true;
                         self.skipped = true;
                         break;
                     }
@@ -1054,7 +1102,12 @@ impl Indexer {
         self.bytes = self
             .bytes
             .saturating_add(usize::try_from(total_read).unwrap_or(usize::MAX));
-        Ok(modified)
+        Ok(ReadOutcome {
+            modified,
+            file_partial,
+            file_skipped,
+            budget_capped,
+        })
     }
 
     fn scan_claude(&mut self, root: &Path) {
@@ -1380,7 +1433,7 @@ impl Indexer {
             }
         });
 
-        let Ok(modified) = res else {
+        let Ok(outcome) = res else {
             self.skipped = true;
             return;
         };
@@ -1403,17 +1456,20 @@ impl Indexer {
             agent: VaultAgent::Claude,
             id,
             cwd,
-            modified,
+            modified: outcome.modified,
             title,
             summary: sum,
             messages,
         };
-        if let Some((mtime_ns, size)) = stamp {
+        if let Some((mtime_ns, size)) = stamp
+            && !outcome.budget_capped
+            && !self.is_exhausted()
+        {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
-                    partial: self.truncated,
-                    skipped: self.skipped,
+                    partial: outcome.file_partial,
+                    skipped: outcome.file_skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -1652,7 +1708,7 @@ impl Indexer {
             }
         });
 
-        let Ok(modified) = res else {
+        let Ok(outcome) = res else {
             self.skipped = true;
             return;
         };
@@ -1670,17 +1726,20 @@ impl Indexer {
             agent: VaultAgent::Codex,
             id,
             cwd,
-            modified,
+            modified: outcome.modified,
             title,
             summary: sum,
             messages,
         };
-        if let Some((mtime_ns, size)) = stamp {
+        if let Some((mtime_ns, size)) = stamp
+            && !outcome.budget_capped
+            && !self.is_exhausted()
+        {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
-                    partial: self.truncated,
-                    skipped: self.skipped,
+                    partial: outcome.file_partial,
+                    skipped: outcome.file_skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -1846,7 +1905,7 @@ impl Indexer {
             }
         });
 
-        let Ok(modified) = res else {
+        let Ok(outcome) = res else {
             self.skipped = true;
             return;
         };
@@ -1874,17 +1933,20 @@ impl Indexer {
             agent: VaultAgent::Agy,
             id,
             cwd,
-            modified,
+            modified: outcome.modified,
             title: resolved_title,
             summary: resolved_summary,
             messages,
         };
-        if let Some((mtime_ns, size)) = stamp {
+        if let Some((mtime_ns, size)) = stamp
+            && !outcome.budget_capped
+            && !self.is_exhausted()
+        {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
-                    partial: self.truncated,
-                    skipped: self.skipped,
+                    partial: outcome.file_partial,
+                    skipped: outcome.file_skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -1953,17 +2015,49 @@ impl Indexer {
         }
     }
 
+    fn read_bounded_file(&mut self, path: &Path) -> Option<Vec<u8>> {
+        if self.exhausted() {
+            return None;
+        }
+        let meta = fs::symlink_metadata(path).ok()?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return None;
+        }
+        let remaining = MAX_BYTES.saturating_sub(self.bytes);
+        let limit = u64::try_from(FILE_BYTES.min(remaining)).unwrap_or(u64::MAX);
+        if limit == 0 {
+            self.truncated = true;
+            return None;
+        }
+        let file = File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > limit {
+            self.truncated = true;
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        if file.take(limit).read_to_end(&mut bytes).is_err() {
+            self.skipped = true;
+            return None;
+        }
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Some(bytes)
+    }
+
     fn parse_opencode_json(&mut self, path: &Path, storage_root: Option<&Path>) {
         let mut bytes = Vec::new();
         let Ok(modified) = File::open(path).and_then(|f| {
-            let m = f
-                .metadata()?
+            let meta = f.metadata()?;
+            let m = meta
                 .modified()?
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let limit = u64::try_from(FILE_BYTES.min(MAX_BYTES.saturating_sub(self.bytes)))
                 .unwrap_or(u64::MAX);
+            if meta.len() > limit {
+                self.truncated = true;
+            }
             f.take(limit).read_to_end(&mut bytes)?;
             Ok(m)
         }) else {
@@ -1990,7 +2084,7 @@ impl Indexer {
             .unwrap_or("")
             .trim()
             .to_owned();
-        if id.is_empty() || cwd.is_empty() {
+        if !crate::agent::control::valid_session_id(&id) || cwd.is_empty() {
             self.skipped = true;
             return;
         }
@@ -2055,6 +2149,11 @@ impl Indexer {
         summary: &mut String,
         messages: &mut Vec<(String, String)>,
     ) {
+        if !fs::symlink_metadata(msg_dir)
+            .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+        {
+            return;
+        }
         let Ok(entries) = fs::read_dir(msg_dir) else {
             return;
         };
@@ -2062,7 +2161,7 @@ impl Indexer {
             .take(128)
             .flatten()
             .filter(|e| {
-                e.file_type().is_ok_and(|k| k.is_file())
+                e.file_type().is_ok_and(|k| !k.is_symlink() && k.is_file())
                     && e.path().extension().is_some_and(|ext| ext == "json")
             })
             .map(|e| e.path())
@@ -2073,11 +2172,10 @@ impl Indexer {
                 break;
             }
             self.nodes = self.nodes.saturating_add(1);
-            let Ok(text) = fs::read_to_string(&file) else {
+            let Some(bytes) = self.read_bounded_file(&file) else {
                 continue;
             };
-            self.bytes = self.bytes.saturating_add(text.len());
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
                 continue;
             };
             let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -2094,12 +2192,32 @@ impl Indexer {
             if role != "developer"
                 && role != "system"
                 && let Some(msg_id) = v.get("id").and_then(Value::as_str)
+                && crate::agent::control::valid_session_id(msg_id)
             {
                 let part_dir = storage_root.join("part").join(msg_id);
-                if let Ok(parts) = fs::read_dir(part_dir) {
-                    for part in parts.take(32).flatten() {
-                        if let Ok(pt) = fs::read_to_string(part.path())
-                            && let Ok(pv) = serde_json::from_str::<Value>(&pt)
+                if fs::symlink_metadata(&part_dir)
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+                    && let Ok(parts) = fs::read_dir(&part_dir)
+                {
+                    let mut part_files: Vec<PathBuf> = parts
+                        .take(32)
+                        .flatten()
+                        .filter(|p| {
+                            p.file_type().is_ok_and(|k| !k.is_symlink() && k.is_file())
+                                && p.path().extension().is_some_and(|ext| ext == "json")
+                        })
+                        .map(|p| p.path())
+                        .collect();
+                    part_files.sort();
+                    for part_path in part_files {
+                        if self.exhausted() {
+                            break;
+                        }
+                        self.nodes = self.nodes.saturating_add(1);
+                        let Some(pt) = self.read_bounded_file(&part_path) else {
+                            continue;
+                        };
+                        if let Ok(pv) = serde_json::from_slice::<Value>(&pt)
                             && let Some(t) = pv
                                 .get("text")
                                 .or_else(|| pv.get("content"))
@@ -2177,7 +2295,7 @@ impl Indexer {
             extract_content_messages(role, &v, &mut messages);
         });
 
-        let Ok(modified) = res else {
+        let Ok(outcome) = res else {
             self.skipped = true;
             return;
         };
@@ -2195,17 +2313,20 @@ impl Indexer {
             agent: VaultAgent::OpenCode,
             id,
             cwd,
-            modified,
+            modified: outcome.modified,
             title: resolved_title,
             summary,
             messages,
         };
-        if let Some((mtime_ns, size)) = stamp {
+        if let Some((mtime_ns, size)) = stamp
+            && !outcome.budget_capped
+            && !self.is_exhausted()
+        {
             store_cached_doc(
                 path,
                 CachedVaultDoc {
-                    partial: self.truncated,
-                    skipped: self.skipped,
+                    partial: outcome.file_partial,
+                    skipped: outcome.file_skipped,
                     mtime_ns,
                     size,
                     doc: doc.clone(),
@@ -3147,7 +3268,7 @@ fn extract_agy_workspace_from_text(content: &str) -> Option<String> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("Command Working Directory:") {
             let p = rest.trim();
-            if p.starts_with('/') {
+            if is_absolute_history_path(p) {
                 return Some(p.to_owned());
             }
         }
@@ -3161,7 +3282,7 @@ pub(super) fn extract_agy_workspace_from_record(v: &Value) -> Option<String> {
         .or_else(|| v.get("workspace"))
         .and_then(Value::as_str)
         .map(|s| s.trim().trim_matches('"'))
-        && c.starts_with('/')
+        && is_absolute_history_path(c)
     {
         return Some(c.to_owned());
     }
@@ -3183,7 +3304,7 @@ pub(super) fn extract_agy_workspace_from_record(v: &Value) -> Option<String> {
                     .get(key)
                     .and_then(Value::as_str)
                     .map(|s| s.trim().trim_matches('"'))
-                    && val.starts_with('/')
+                    && is_absolute_history_path(val)
                 {
                     return Some(val.to_owned());
                 }
@@ -3889,5 +4010,342 @@ mod injected_transcript_filter_tests {
         );
         assert_eq!(normalize_path("/work/App"), "/work/App");
         assert_eq!(normalize_path("/work/app"), "/work/app");
+    }
+}
+
+#[cfg(test)]
+mod sweep_regressions {
+    use super::*;
+
+    #[test]
+    fn vault_excerpt_caps_long_ascii_and_multibyte_hits_at_max_text() {
+        use krill_proto::screen::Msg as _;
+
+        // 4,094-byte ASCII match surrounded by context so leading/trailing '…' would exceed MAX_TEXT.
+        let ascii_term = "a".repeat(MAX_TEXT - 2);
+        let ascii_text = format!("prefix {ascii_term} suffix");
+        let ascii_snippet = extract_snippet(&ascii_text, std::slice::from_ref(&ascii_term));
+        assert!(
+            ascii_snippet.len() <= MAX_TEXT,
+            "ascii snippet {} > {MAX_TEXT}",
+            ascii_snippet.len()
+        );
+        assert!(ascii_snippet.starts_with('…') && ascii_snippet.ends_with('…'));
+
+        // 1,365-char Korean match (4,095 bytes) surrounded by context.
+        let kr_term = "가".repeat(1365);
+        let kr_text = format!("앞부분 {kr_term} 뒷부분");
+        let kr_snippet = extract_snippet(&kr_text, std::slice::from_ref(&kr_term));
+        assert!(
+            kr_snippet.len() <= MAX_TEXT,
+            "korean snippet {} > {MAX_TEXT}",
+            kr_snippet.len()
+        );
+        assert!(kr_snippet.starts_with('…') && kr_snippet.ends_with('…'));
+
+        // Exact MAX_TEXT ASCII match with no surrounding context must not be spuriously truncated.
+        let exact = "b".repeat(MAX_TEXT);
+        let exact_snippet = extract_snippet(&exact, std::slice::from_ref(&exact));
+        assert_eq!(exact_snippet, exact);
+
+        // Wire roundtrip check via Reply::encode/decode.
+        for snippet in [ascii_snippet, kr_snippet, exact_snippet] {
+            let hit = VaultHit {
+                agent: VaultAgent::Claude,
+                id: "11111111-2222-4333-8444-555555555555".into(),
+                cwd: "/tmp/ws".into(),
+                modified: 1,
+                title: "title".into(),
+                summary: "summary".into(),
+                snippet,
+                role: "user".into(),
+                score: 10,
+            };
+            let reply = krill_proto::control::Reply::AgentHistory(
+                krill_proto::agent_history::Response::Searched(SearchSnapshot {
+                    hits: vec![hit],
+                    truncated: false,
+                    skipped: false,
+                }),
+            );
+            let frame = reply.encode().expect("encode Searched");
+            let decoded =
+                krill_proto::control::Reply::decode(frame[4], frame.get(5..).expect("ipc body"))
+                    .expect("decode Searched must succeed within MAX_TEXT");
+            assert_eq!(decoded, reply);
+        }
+    }
+
+    #[test]
+    fn extract_agy_workspace_accepts_windows_drive_and_unc_paths() {
+        assert_eq!(
+            extract_agy_workspace_from_text(
+                "Command Working Directory: C:\\Users\\owen\\repo\nother"
+            )
+            .as_deref(),
+            Some(r"C:\Users\owen\repo")
+        );
+        assert_eq!(
+            extract_agy_workspace_from_text("Command Working Directory: \\\\server\\share\\proj")
+                .as_deref(),
+            Some(r"\\server\share\proj")
+        );
+        assert_eq!(
+            extract_agy_workspace_from_text("Command Working Directory: relative/dir"),
+            None
+        );
+
+        let rec_cwd = serde_json::json!({ "cwd": r"D:\work\krill" });
+        assert_eq!(
+            extract_agy_workspace_from_record(&rec_cwd).as_deref(),
+            Some(r"D:\work\krill")
+        );
+
+        let rec_tool = serde_json::json!({
+            "tool_calls": [
+                { "name": "grep", "args": { "SearchDirectory": "C:/Projects/App" } }
+            ]
+        });
+        assert_eq!(
+            extract_agy_workspace_from_record(&rec_tool).as_deref(),
+            Some("C:/Projects/App")
+        );
+
+        let rec_unc = serde_json::json!({
+            "tool_calls": [
+                { "name": "run", "args": { "Cwd": r"\\fileserver\team\repo" } }
+            ]
+        });
+        assert_eq!(
+            extract_agy_workspace_from_record(&rec_unc).as_deref(),
+            Some(r"\\fileserver\team\repo")
+        );
+
+        let rec_rel = serde_json::json!({
+            "cwd": "relative/path",
+            "tool_calls": [{ "name": "run", "args": { "DirectoryPath": "src/lib.rs" } }]
+        });
+        assert_eq!(extract_agy_workspace_from_record(&rec_rel), None);
+    }
+
+    #[test]
+    fn vault_cache_tracks_per_file_flags_and_skips_budget_capped_partial_reads() {
+        let root = std::env::temp_dir().join(format!("krill-dc29-cache-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let ws = root.join("workspace");
+        let clean_root = root.join("clean/projects/p");
+        let capped_root = root.join("capped/projects/p");
+        for d in [&ws, &clean_root, &capped_root] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let cwd_json = serde_json::to_string(&ws.to_string_lossy().into_owned()).unwrap();
+
+        // 1. A clean file parsed after scan-wide truncated/skipped flags were already set must be
+        //    cached with its own per-file flags (false, false), never tainted by earlier files.
+        let clean_id = "11111111-1111-4111-8111-111111111111";
+        let clean_path = clean_root.join(format!("{clean_id}.jsonl"));
+        fs::write(
+            &clean_path,
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{clean_id}\",\"cwd\":{cwd_json},\"message\":{{\"role\":\"user\",\"content\":\"CleanUniqueToken29\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut tainted_indexer = Indexer {
+            docs: BTreeMap::new(),
+            nodes: 0,
+            bytes: 0,
+            start: Instant::now(),
+            scan_time: Duration::from_secs(60),
+            truncated: true,
+            skipped: true,
+        };
+        tainted_indexer.parse_claude_file(&clean_path);
+        let (clean_mtime, clean_size) = file_stamp(&clean_path).unwrap();
+        let cached = lookup_cached_doc(&clean_path, clean_mtime, clean_size)
+            .expect("clean file should be cached");
+        assert!(
+            !cached.partial,
+            "clean file must not inherit scan truncated"
+        );
+        assert!(!cached.skipped, "clean file must not inherit scan skipped");
+
+        let clean_snap = search_in_with_budget(
+            &VaultRoots {
+                claude: vec![root.join("clean")],
+                ..VaultRoots::default()
+            },
+            &SearchQuery {
+                query: "CleanUniqueToken29".into(),
+                ..SearchQuery::default()
+            },
+            Duration::from_secs(60),
+        );
+        assert_eq!(clean_snap.hits.len(), 1);
+        assert!(!clean_snap.truncated && !clean_snap.skipped);
+
+        // 2. A file whose read limit was shrunk below FILE_BYTES by remaining global MAX_BYTES
+        //    must NOT be cached partially under its full (mtime_ns, size).
+        let capped_id = "22222222-2222-4222-8222-222222222222";
+        let capped_path = capped_root.join(format!("{capped_id}.jsonl"));
+        let mut body = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{capped_id}\",\"cwd\":{cwd_json},\"message\":{{\"role\":\"user\",\"content\":\"HeaderPrompt\"}}}}\n"
+        );
+        let pad_line = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}\n",
+            "p".repeat(512)
+        );
+        for _ in 0..24 {
+            body.push_str(&pad_line);
+        }
+        body.push_str(
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"MiddleLostWhenCapped29\"}}\n",
+        );
+        for _ in 0..24 {
+            body.push_str(&pad_line);
+        }
+        fs::write(&capped_path, &body).unwrap();
+
+        let mut tight_indexer = Indexer {
+            docs: BTreeMap::new(),
+            nodes: 0,
+            bytes: MAX_BYTES - 1024,
+            start: Instant::now(),
+            scan_time: Duration::from_secs(60),
+            truncated: false,
+            skipped: false,
+        };
+        tight_indexer.parse_claude_file(&capped_path);
+        assert!(tight_indexer.truncated);
+        let (capped_mtime, capped_size) = file_stamp(&capped_path).unwrap();
+        assert!(
+            lookup_cached_doc(&capped_path, capped_mtime, capped_size).is_none(),
+            "global-budget-capped partial read must not be cached"
+        );
+
+        let full_snap = search_in_with_budget(
+            &VaultRoots {
+                claude: vec![root.join("capped")],
+                ..VaultRoots::default()
+            },
+            &SearchQuery {
+                query: "MiddleLostWhenCapped29".into(),
+                ..SearchQuery::default()
+            },
+            Duration::from_secs(60),
+        );
+        assert_eq!(full_snap.hits.len(), 1);
+        assert!(!full_snap.truncated);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn opencode_json_vault_blocks_traversal_symlinks_and_oversized_parts() {
+        let root = std::env::temp_dir().join(format!("krill-dc28-opencode-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let ws = root.join("workspace");
+        let storage = root.join("opencode/storage");
+        let sess_dir = storage.join("session/global");
+        let msg_dir = storage.join("message/ses_good_28");
+        let ok_part_dir = storage.join("part/msg_ok_28");
+        // Placed at `opencode/secret` so `storage/message/../../secret` and
+        // `storage/part/../../secret` would resolve directly here without path validation.
+        let secret_dir = root.join("opencode/secret");
+        for d in [&ws, &sess_dir, &msg_dir, &ok_part_dir, &secret_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let cwd_json = serde_json::to_string(&ws.to_string_lossy().into_owned()).unwrap();
+
+        // Secret JSON outside storage/ that traversal or symlinks attempt to read.
+        let secret_file = secret_dir.join("leak.json");
+        fs::write(
+            &secret_file,
+            r#"{"role":"user","text":"SECRET_VAULT_LEAK"}"#,
+        )
+        .unwrap();
+
+        // Traversal session id (`../../secret`) must be rejected before joining message/<id>.
+        fs::write(
+            sess_dir.join("bad.json"),
+            format!(r#"{{"id":"../../secret","directory":{cwd_json},"title":"bad"}}"#),
+        )
+        .unwrap();
+
+        // Valid session referencing:
+        // - a message whose id traverses to `../../secret`
+        // - a message whose JSON file exceeds FILE_BYTES (600 KiB)
+        // - a valid message with a normal part, an oversized (>FILE_BYTES) part, and a symlink part
+        fs::write(
+            sess_dir.join("ses_good_28.json"),
+            format!(r#"{{"id":"ses_good_28","directory":{cwd_json},"title":"Safe OpenCode"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            msg_dir.join("msg_001_trav.json"),
+            r#"{"id":"../../secret","role":"user","content":"normal msg text"}"#,
+        )
+        .unwrap();
+        fs::write(
+            msg_dir.join("msg_002_huge.json"),
+            format!(
+                r#"{{"id":"msg_huge","role":"user","content":"HUGE_MSG_TOKEN {}"}}"#,
+                "x".repeat(FILE_BYTES + 1024)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            msg_dir.join("msg_003_ok.json"),
+            r#"{"id":"msg_ok_28","role":"assistant"}"#,
+        )
+        .unwrap();
+        fs::write(
+            ok_part_dir.join("part_001_ok.json"),
+            r#"{"type":"text","text":"SAFE_PART_TOKEN_28"}"#,
+        )
+        .unwrap();
+        fs::write(
+            ok_part_dir.join("part_002_huge.json"),
+            format!(
+                r#"{{"type":"text","text":"HUGE_PART_TOKEN {}"}}"#,
+                "y".repeat(FILE_BYTES + 1024)
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret_file, ok_part_dir.join("part_003_link.json")).unwrap();
+
+        let roots = VaultRoots {
+            opencode: vec![root.join("opencode")],
+            ..VaultRoots::default()
+        };
+
+        let safe = search_in(
+            &roots,
+            &SearchQuery {
+                query: "SAFE_PART_TOKEN_28".into(),
+                ..SearchQuery::default()
+            },
+        );
+        assert_eq!(safe.hits.len(), 1);
+        assert_eq!(safe.hits[0].id, "ses_good_28");
+        assert!(safe.truncated, "oversized message/part must set truncated");
+
+        for forbidden in ["SECRET_VAULT_LEAK", "HUGE_MSG_TOKEN", "HUGE_PART_TOKEN"] {
+            let leak = search_in(
+                &roots,
+                &SearchQuery {
+                    query: forbidden.into(),
+                    ..SearchQuery::default()
+                },
+            );
+            assert!(
+                leak.hits.is_empty(),
+                "forbidden content indexed in vault: {forbidden}"
+            );
+        }
+
+        fs::remove_dir_all(&root).ok();
     }
 }
