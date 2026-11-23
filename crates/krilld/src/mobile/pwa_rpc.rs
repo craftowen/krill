@@ -804,6 +804,27 @@ enum Action {
     BotsUpcoming {
         bot_id: String,
     },
+    #[serde(rename = "bots.sessions.list")]
+    BotsSessionsList {
+        #[serde(default)]
+        bot_id: Option<String>,
+    },
+    #[serde(rename = "bots.sessions.stop")]
+    BotsSessionStop {
+        bot_id: String,
+        session_id: u64,
+    },
+    #[serde(rename = "bots.schedule.run")]
+    BotsScheduleRun {
+        bot_id: String,
+        schedule_id: String,
+    },
+    #[serde(rename = "bots.schedule.toggle")]
+    BotsScheduleToggle {
+        bot_id: String,
+        schedule_id: String,
+        enabled: bool,
+    },
     #[serde(rename = "bots.update")]
     BotsUpdate {
         bot_id: String,
@@ -1829,6 +1850,102 @@ impl Backend {
                 let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::GetBotUpcoming { bot_id })? {
                     krill_proto::bots::BotRpcResponse::Upcoming(up) => Ok(to_value(up)?),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsSessionsList { bot_id } => {
+                let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
+                if self.bots_inactive()? {
+                    return Ok(json!({"sessions": []}));
+                }
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListBotSessions { bot_id })? {
+                    krill_proto::bots::BotRpcResponse::BotSessions(sessions) => {
+                        Ok(json!({"sessions": to_value(sessions)?}))
+                    }
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsSessionStop { bot_id, session_id } => {
+                self.ensure_bots_active()?;
+                if session_id == 0 {
+                    return Err(invalid());
+                }
+                let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::StopBotSession {
+                    bot_id,
+                    session_id: SessionId(session_id),
+                })? {
+                    krill_proto::bots::BotRpcResponse::Ok => Ok(json!({"stopped": true})),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsScheduleRun {
+                bot_id,
+                schedule_id,
+            } => {
+                self.ensure_bots_active()?;
+                let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
+                let schedule_id = validate_bot_token(&schedule_id, 128)?;
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::RunScheduleNow {
+                    bot_id,
+                    schedule_id,
+                })? {
+                    krill_proto::bots::BotRpcResponse::Ok => Ok(json!({"started": true})),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::BotsScheduleToggle {
+                bot_id,
+                schedule_id,
+                enabled,
+            } => {
+                self.ensure_bots_active()?;
+                let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
+                let schedule_id = validate_bot_token(&schedule_id, 128)?;
+                let mut bot = match self.bot_rpc(krill_proto::bots::BotRpcRequest::GetBot {
+                    bot_id: bot_id.clone(),
+                })? {
+                    krill_proto::bots::BotRpcResponse::Bot(bot) => *bot,
+                    _ => return Err(invalid()),
+                };
+                let mut found = false;
+                for sched in &mut bot.schedules {
+                    if sched.id == schedule_id {
+                        sched.enabled = enabled;
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Err(io::Error::other(format!(
+                        "schedule not found: {schedule_id}"
+                    )));
+                }
+                let params = krill_proto::bots::UpdateBotParams {
+                    bot_id,
+                    name: None,
+                    description: None,
+                    emoji: krill_proto::bots::FieldPatch::Unchanged,
+                    avatar: krill_proto::bots::FieldPatch::Unchanged,
+                    agent_id: None,
+                    model: krill_proto::bots::FieldPatch::Unchanged,
+                    effort: krill_proto::bots::FieldPatch::Unchanged,
+                    permission_mode: None,
+                    workspace: krill_proto::bots::FieldPatch::Unchanged,
+                    paused: None,
+                    first_run_completed: None,
+                    notifications: None,
+                    schedules: Some(bot.schedules),
+                    look_around: None,
+                    memory_tidy: None,
+                    mcp_tools: None,
+                };
+                match self.bot_rpc(krill_proto::bots::BotRpcRequest::UpdateBot(Box::new(
+                    params,
+                )))? {
+                    krill_proto::bots::BotRpcResponse::Bot(updated) => {
+                        Ok(json!({"bot": to_value(*updated)?}))
+                    }
                     _ => Err(invalid()),
                 }
             }
@@ -6795,6 +6912,84 @@ mod revision_tests {
         .unwrap();
         assert_eq!(sugs["ok"], true, "{sugs}");
 
+        // Live bot sessions list + invalid stop rejection
+        let bot_sessions: Value = serde_json::from_str(
+            &backend.request(&json!({"action": "bots.sessions.list", "bot_id": v2_id}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(bot_sessions["ok"], true, "{bot_sessions}");
+        assert!(bot_sessions["data"]["sessions"].is_array());
+        let bad_stop: Value = serde_json::from_str(&backend.request(
+            &json!({"action": "bots.sessions.stop", "bot_id": v2_id, "session_id": 0}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(bad_stop["ok"], false, "{bad_stop}");
+
+        // Schedule toggle + paused RunScheduleNow structured refusal
+        let sched = krill_proto::bots::BotScheduleConfig {
+            id: "nightly".into(),
+            name: "Nightly check".into(),
+            cron: "0 9 * * *".into(),
+            prompt: "Check status".into(),
+            enabled: true,
+            timezone: None,
+        };
+        let add_sched = mgr.handle_rpc(
+            &registry,
+            krill_proto::bots::BotRpcRequest::UpdateBot(Box::new(
+                krill_proto::bots::UpdateBotParams {
+                    bot_id: krill_proto::bots::BotId::new(&v2_id).unwrap(),
+                    name: None,
+                    description: None,
+                    emoji: krill_proto::bots::FieldPatch::Unchanged,
+                    avatar: krill_proto::bots::FieldPatch::Unchanged,
+                    agent_id: None,
+                    model: krill_proto::bots::FieldPatch::Unchanged,
+                    effort: krill_proto::bots::FieldPatch::Unchanged,
+                    permission_mode: None,
+                    workspace: krill_proto::bots::FieldPatch::Unchanged,
+                    paused: Some(true),
+                    first_run_completed: None,
+                    notifications: None,
+                    schedules: Some(vec![sched]),
+                    look_around: None,
+                    memory_tidy: None,
+                    mcp_tools: None,
+                },
+            )),
+        );
+        assert!(matches!(
+            add_sched,
+            krill_proto::bots::BotRpcResponse::Bot(_)
+        ));
+        let toggled: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.schedule.toggle",
+                    "bot_id": v2_id,
+                    "schedule_id": "nightly",
+                    "enabled": false
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(toggled["ok"], true, "{toggled}");
+        assert_eq!(toggled["data"]["bot"]["schedules"][0]["enabled"], false);
+        let run_refused: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.schedule.run",
+                    "bot_id": v2_id,
+                    "schedule_id": "nightly"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(run_refused["ok"], false, "{run_refused}");
+        assert_eq!(run_refused["data"]["refusal"]["code"], "bot_paused");
+
         mgr.shutdown();
         drop(backend);
         drop(registry);
@@ -7284,6 +7479,10 @@ mod revision_tests {
         for payload in [
             r#"{"action":"bots.create","name":"Triage","agent_id":"claude","slug":"triage","skills":["rust"]}"#,
             r#"{"action":"bots.models","agent_id":"antigravity"}"#,
+            r#"{"action":"bots.sessions.list","bot_id":"b1"}"#,
+            r#"{"action":"bots.sessions.stop","bot_id":"b1","session_id":7}"#,
+            r#"{"action":"bots.schedule.run","bot_id":"b1","schedule_id":"nightly"}"#,
+            r#"{"action":"bots.schedule.toggle","bot_id":"b1","schedule_id":"nightly","enabled":false}"#,
             r#"{"action":"bots.update","bot_id":"b1","agent_id":"antigravity","model":"gemini-3.8-flash-low","clear_effort":true}"#,
             r#"{"action":"handoff","session":1,"agent":"antigravity"}"#,
             r#"{"action":"bots.chat.open","bot_id":"b1","prompt":"check inbox"}"#,

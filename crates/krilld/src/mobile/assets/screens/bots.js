@@ -134,15 +134,16 @@
 
   const statusTone = (status) => {
     if (status === "needs_you") return "waiting";
-    if (status === "working" || status === "connected") return "working";
-    if (status === "done") return "connected";
-    if (status === "error") return "blocked";
+    if (status === "working" || status === "running") return "working";
+    if (status === "done" || status === "connected" || status === "active") return "connected";
+    if (status === "error" || status === "blocked") return "blocked";
     return "unknown";
   };
 
   const statusLabel = (status, t) => {
     if (status === "needs_you") return t("Needs You");
     if (status === "working") return t("Working");
+    if (status === "running") return t("Running");
     if (status === "planned") return t("Planned");
     if (status === "done") return t("Done");
     if (status === "canceled") return t("Canceled");
@@ -150,6 +151,8 @@
     if (status === "connecting") return t("Connecting…");
     if (status === "disconnected") return t("Disconnected");
     if (status === "disabled") return t("Disabled");
+    if (status === "paused") return t("Paused");
+    if (status === "active") return t("Active");
     if (status === "error") return t("Error");
     return t(String(status || "Unknown"));
   };
@@ -162,6 +165,24 @@
     if (category === "folder_missing") return t("Folder missing");
     if (category === "agent_error") return t("Agent error");
     return t(String(category));
+  };
+
+  const formatTimestamp = (ms, t) => {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n <= 0) return t("Never");
+    try {
+      const d = new Date(n);
+      const now = new Date();
+      const sameDay =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+      return sameDay
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    } catch {
+      return t("Never");
+    }
   };
 
   const latestDecisions = (item) => {
@@ -177,8 +198,9 @@
   const botDisplayName = (bots, botId) => bots.find((b) => b.id === botId)?.name || botId;
 
   function renderAvatar(el, bot, avatarInfo) {
-    const badge = el("span", undefined, "bot-avatar");
-    if (isValidColor(bot?.avatar_color)) badge.style.backgroundColor = bot.avatar_color;
+    const hasColor = isValidColor(bot?.avatar_color);
+    const badge = el("span", undefined, `bot-avatar${hasColor ? " has-color" : ""}`);
+    if (hasColor) badge.style.backgroundColor = bot.avatar_color;
     if (avatarInfo && isSafeAvatarSrc(avatarInfo.mime, avatarInfo.data_base64)) {
       const img = el("img", undefined, "bot-avatar-img");
       img.alt = "";
@@ -204,8 +226,12 @@
       return Promise.reject(e);
     }
   };
-  const openBotDetail = (ctx, botId, hostId) => {
+  const openBotDetail = (ctx, botId, hostId, tab) => {
     if (hostId && ctx.activateHost) ctx.activateHost(hostId);
+    if (ctx.state?.ui) {
+      ctx.state.ui.botPendingTab = tab || "chat";
+      ctx.state.ui.activeBotGroup = null;
+    }
     ctx.go(`/bots/${encodeURIComponent(botId)}`);
   };
 
@@ -223,27 +249,13 @@
     }
   }
 
-  async function openBotSession(ctx, t, botId, prompt, hostId) {
-    let res;
-    try {
-      res = await rpcHost(ctx, hostId, {
-        action: "bots.chat.open",
-        bot_id: botId,
-        ...(prompt ? { prompt } : {}),
-      });
-    } catch (error) {
-      const refusal = readBotRefusal(error);
-      if (refusal) throw Object.assign(Error(mobileBotRefusalText(refusal, t)), { data: error?.data });
-      throw error;
-    }
-    const sid = Number(res?.session_id);
+  async function openBotTerminalSession(ctx, t, sessionId, hostId) {
+    const sid = Number(sessionId);
     if (!Number.isSafeInteger(sid) || sid <= 0) throw Error(t("Could not open bot chat"));
     if (hostId && ctx.activateHost) ctx.activateHost(hostId);
     try {
       await refreshHost(ctx, hostId);
-    } catch {
-      /* ignore background refresh hiccup; fallback routing handles missing card */
-    }
+    } catch {}
     if (ctx.signal.aborted) return;
     const session = ctx.state.sessions?.get?.(sid);
     const group =
@@ -251,15 +263,275 @@
       (session ? { key: session.groupKey, sessions: [session] } : null);
     if (group) {
       const key = ctx.sessionKey?.(sid);
-      if (key && !Object.hasOwn(ctx.state.preferences?.sessionViewModes || {}, key)) {
+      if (key) {
         ctx.savePreferences?.({
-          sessionViewModes: { ...ctx.state.preferences?.sessionViewModes, [key]: "chat" },
+          sessionViewModes: { ...ctx.state.preferences?.sessionViewModes, [key]: "term" },
         });
       }
       ctx.go(ctx.groupRoute(group, sid));
     } else {
       ctx.go("/projects");
     }
+  }
+
+  function sortBotsForDisplay(bots, items, botSessions) {
+    const liveWork = new Set(
+      (botSessions || [])
+        .filter((s) => s.live && s.working)
+        .map((s) => `${s._hostId ?? ""}:${s.bot_id}`),
+    );
+    return bots.slice().sort((a, b) => {
+      const aNeeds = items.some((i) => i.owner_bot_id === a.id && (i._hostId ?? null) === (a._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
+      const bNeeds = items.some((i) => i.owner_bot_id === b.id && (i._hostId ?? null) === (b._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
+      if (aNeeds !== bNeeds) return aNeeds - bNeeds;
+      const aWork = liveWork.has(`${a._hostId ?? ""}:${a.id}`) ? 0 : 1;
+      const bWork = liveWork.has(`${b._hostId ?? ""}:${b.id}`) ? 0 : 1;
+      if (aWork !== bWork) return aWork - bWork;
+      return Number(!!a.paused) - Number(!!b.paused);
+    });
+  }
+
+  /** C: Top horizontal avatar quick-switch rail (all bots + groups + + New Bot). */
+  function renderBotRail(ctx, t, opts) {
+    const { el, button } = ctx;
+    const { bots, groups, items, botSessions, avatars, activeBotId, activeGroupId, activeGroupHost, ready, onPickBot, onPickGroup, onNewBot } = opts;
+    if (!bots.length && !groups.length) return null;
+
+    const nav = el("nav", undefined, "bot-rail");
+    nav.setAttribute("aria-label", t("Quick switch"));
+    const scroller = el("div", undefined, "bot-rail-scroll");
+    const sorted = sortBotsForDisplay(bots, items, botSessions);
+
+    for (const bot of sorted) {
+      const needs = items.filter(
+        (i) => i.owner_bot_id === bot.id && (i._hostId ?? null) === (bot._hostId ?? null) && i.status === "needs_you",
+      ).length;
+      const working = (botSessions || []).some(
+        (s) => s.bot_id === bot.id && (s._hostId ?? null) === (bot._hostId ?? null) && s.live && s.working,
+      );
+      const tone = bot.paused ? "unknown" : needs > 0 ? "waiting" : working ? "working" : "connected";
+      const isActive = !activeGroupId && activeBotId === bot.id;
+      const avKey = bot._hostId ? `${bot._hostId}:${bot.id}` : bot.id;
+      const itemBtn = button(
+        "",
+        () => onPickBot(bot),
+        `bot-rail-item${isActive ? " active" : ""}${needs > 0 ? " needs" : ""}`,
+      );
+      itemBtn.dataset.botRailId = bot.id;
+      itemBtn.setAttribute("aria-label", needs > 0 ? `${bot.name} (${t("{0} needs you", needs)})` : bot.name);
+      if (isActive) itemBtn.setAttribute("aria-current", "true");
+      const ring = el("span", undefined, "bot-rail-ring");
+      ring.append(renderAvatar(el, bot, avatars.get(avKey)));
+      ring.append(el("span", undefined, `bot-rail-dot ${tone}`));
+      if (needs > 0) ring.append(el("span", needs > 99 ? "99+" : String(needs), "bot-rail-badge"));
+      itemBtn.append(ring, el("span", bot.name, "bot-rail-name"));
+      scroller.append(itemBtn);
+    }
+
+    for (const g of groups || []) {
+      const isActive = activeGroupId === g.id && (activeGroupHost === undefined || (activeGroupHost ?? null) === (g._hostId ?? null));
+      const gBtn = button(
+        "",
+        () => onPickGroup(g),
+        `bot-rail-item is-group${isActive ? " active" : ""}`,
+      );
+      gBtn.dataset.groupRailId = g.id;
+      gBtn.setAttribute("aria-label", g.name);
+      if (isActive) gBtn.setAttribute("aria-current", "true");
+      const ring = el("span", undefined, "bot-rail-ring");
+      const av = el("span", undefined, "bot-avatar bot-group-avatar");
+      av.append(ctx.icon("chat"));
+      ring.append(av);
+      gBtn.append(ring, el("span", g.name, "bot-rail-name"));
+      scroller.append(gBtn);
+    }
+
+    if (onNewBot) {
+      const addBtn = button("", onNewBot, "bot-rail-item is-add");
+      addBtn.setAttribute("aria-label", t("New Bot"));
+      addBtn.disabled = !ready();
+      const ring = el("span", undefined, "bot-rail-ring");
+      const av = el("span", undefined, "bot-avatar bot-add-avatar");
+      av.append(ctx.icon("plus"));
+      ring.append(av);
+      addBtn.append(ring, el("span", t("New Bot"), "bot-rail-name"));
+      scroller.append(addBtn);
+    }
+
+    nav.append(scroller);
+    return nav;
+  }
+
+  /** D: One-tap Needs You decision card deck (auto-collapses to null when 0 urgent items). */
+  function renderDecisionDeck(ctx, t, opts) {
+    const { el, button } = ctx;
+    const { cards, bots, ready, deckIndex, onNext, onReload, onOpenBot, compact } = opts;
+    if (!cards.length) return null;
+
+    const idx = ((deckIndex % cards.length) + cards.length) % cards.length;
+    const cur = cards[idx];
+    const deck = el("section", undefined, `bot-decision-deck${compact ? " compact" : ""}`);
+    const card = el(
+      "article",
+      undefined,
+      `bot-decision-card ${cur.kind === "schedule_error" ? "blocked bot-automation-run-row" : "waiting"}`,
+    );
+    card.dataset.decisionKind = cur.kind;
+
+    const head = el("div", undefined, "bot-decision-card-head");
+    const kindLabel =
+      cur.kind === "access"
+        ? t("Access request")
+        : cur.kind === "gate"
+          ? t("Approval requested")
+          : cur.kind === "schedule_error"
+            ? t("Failed automation")
+            : t("Needs attention");
+    const pill = el("span", `${kindLabel} ${idx + 1}/${cards.length}`, `bot-status-pill ${cur.kind === "schedule_error" ? "blocked" : "waiting"}`);
+    head.append(pill);
+    if (cur.botId && onOpenBot) {
+      head.append(
+        button(botDisplayName(bots, cur.botId), () => onOpenBot(cur.botId, cur.hostId), "text-button bot-owner-chip"),
+      );
+    } else if (cur.hostName) {
+      head.append(el("span", cur.hostName, "device-badge"));
+    }
+    card.append(head);
+    card.append(el("strong", cur.title, "bot-decision-card-title"));
+    if (cur.subtitle) {
+      card.append(
+        el("p", cur.subtitle, cur.kind === "schedule_error" ? "account-error bot-decision-card-sub" : "muted bot-decision-card-sub"),
+      );
+    }
+
+    const actions = el("div", undefined, "bot-decision-card-actions");
+    const finishMutation = async (hostId, toastMsg) => {
+      if (toastMsg) ctx.toast?.(toastMsg);
+      await refreshHost(ctx, hostId).catch(() => {});
+      ctx.syncTabBar?.();
+      await onReload();
+    };
+
+    if (cur.kind === "item") {
+      const latest = latestDecisions(cur.item);
+      if (latest && latest.decisions.length) {
+        const firstDec = latest.decisions[0];
+        if (firstDec.question && firstDec.question !== cur.title) {
+          card.append(el("p", firstDec.question, "bot-decision-q"));
+        }
+        (firstDec.options || []).forEach((opt, optIdx) => {
+          const btn = button(
+            opt,
+            async () => {
+              if (!ready()) return;
+              await rpcHost(ctx, cur.hostId, {
+                action: "bots.item.answer",
+                item_id: cur.item.uid,
+                option_index: optIdx,
+                answer_text: opt,
+              });
+              await finishMutation(cur.hostId, t("Answer sent"));
+            },
+            firstDec.recommended === optIdx ? "primary small" : "secondary small",
+          );
+          btn.disabled = !ready();
+          actions.append(btn);
+        });
+      } else {
+        const doneBtn = button(
+          t("Done"),
+          async () => {
+            if (!ready()) return;
+            await rpcHost(ctx, cur.hostId, {
+              action: "bots.item.update",
+              item_id: cur.item.uid,
+              status: "done",
+            });
+            await finishMutation(cur.hostId, t("Done"));
+          },
+          "primary small",
+        );
+        const snoozeBtn = button(
+          t("Snooze 4h"),
+          async () => {
+            if (!ready()) return;
+            await rpcHost(ctx, cur.hostId, {
+              action: "bots.item.update",
+              item_id: cur.item.uid,
+              snoozed_until_ms: { set: Date.now() + 4 * 3600 * 1000 },
+            });
+            await finishMutation(cur.hostId, t("Snooze 4h"));
+          },
+          "secondary small",
+        );
+        doneBtn.disabled = snoozeBtn.disabled = !ready();
+        actions.append(doneBtn, snoozeBtn);
+      }
+    } else if (cur.kind === "access") {
+      const approveBtn = button(
+        t("Approve"),
+        async () => {
+          if (!ready()) return;
+          await rpcHost(ctx, cur.hostId, { action: "bots.access.decide", token: cur.request.token, approve: true });
+          await finishMutation(cur.hostId, t("Access approved"));
+        },
+        "primary small",
+      );
+      const denyBtn = button(
+        t("Deny"),
+        async () => {
+          if (!ready()) return;
+          await rpcHost(ctx, cur.hostId, { action: "bots.access.decide", token: cur.request.token, approve: false });
+          await finishMutation(cur.hostId, t("Access declined"));
+        },
+        "secondary small",
+      );
+      approveBtn.disabled = denyBtn.disabled = !ready();
+      actions.append(approveBtn, denyBtn);
+    } else if (cur.kind === "gate") {
+      (cur.gate.options || []).forEach((opt, optIdx) => {
+        const b = button(
+          t(opt),
+          async () => {
+            if (!ready()) return;
+            await rpcHost(ctx, cur.hostId, { action: "gate_reply", id: cur.gate.id, decision: opt });
+            await finishMutation(cur.hostId, t("Decision sent."));
+          },
+          optIdx === 0 ? "primary small" : "secondary small",
+        );
+        b.disabled = !ready();
+        actions.append(b);
+      });
+    } else if (cur.kind === "schedule_error") {
+      const retryBtn = button(
+        t("Run now"),
+        async () => {
+          if (!ready()) return;
+          try {
+            await rpcHost(ctx, cur.hostId, {
+              action: "bots.schedule.run",
+              bot_id: cur.botId,
+              schedule_id: cur.scheduleId,
+            });
+            await finishMutation(cur.hostId, t("Schedule started"));
+          } catch (err) {
+            ctx.toast?.(safeMsg(err, t));
+          }
+        },
+        "primary small",
+      );
+      retryBtn.disabled = !ready();
+      actions.append(retryBtn);
+    }
+
+    if (cards.length > 1 && onNext) {
+      const nextBtn = button(t("Next"), onNext, "ghost small bot-deck-next");
+      actions.append(nextBtn);
+    }
+
+    card.append(actions);
+    deck.append(card);
+    return deck;
   }
 
   function createAccessSection(ctx, t) {
@@ -311,10 +583,10 @@
         curReady = ready;
         curReload = reload;
         curHosts = targetHosts;
-        countEl.hidden = !requests.length;
-        countEl.textContent = requests.length ? String(requests.length) : "";
-
         const pending = requests.filter((r) => r.status === "pending");
+        countEl.hidden = !pending.length;
+        countEl.textContent = pending.length ? String(pending.length) : "";
+
         const boxNodes = [];
         for (const req of pending) {
           const row = el("div", undefined, "bots-row");
@@ -331,6 +603,8 @@
             if (!ready()) return;
             await rpcHost(ctx, req._hostId, { action: "bots.access.decide", token: req.token, approve });
             ctx.toast?.(approve ? t("Access approved") : t("Access declined"));
+            await refreshHost(ctx, req._hostId).catch(() => {});
+            ctx.syncTabBar?.();
             await reload();
           };
           const allow = button(t("Approve"), () => decide(true), "primary small");
@@ -373,7 +647,7 @@
 
   function renderItemsList(ctx, t, opts) {
     const { el, button } = ctx;
-    const { items, bots, showBot, ready, onReload, cardMap, multiHost, hideEmpty, container } = opts;
+    const { items, bots, showBot, ready, onReload, cardMap, multiHost, hideEmpty, container, collapsible, expandedIds, onToggleExpand } = opts;
     const wrap = container || el("div", undefined, "bots-items-list");
     if (!items.length) {
       sync(wrap, hideEmpty ? [] : [el("p", t("No items match this filter."), "empty")]);
@@ -386,24 +660,32 @@
       let entry = cardMap.get(cardKey);
       const draftKey = `bot-item:${cardKey}`;
       if (!entry) {
-        const card = el("article", undefined, "bot-item-card");
+        const card = el("article", undefined, `bot-item-card${collapsible ? " is-collapsible" : ""}`);
         card.dataset.item = item.uid;
         const header = el("div", undefined, "bot-item-head");
         const headLeft = el("div", undefined, "bot-title-line");
         const badge = el("span", undefined, "bot-status-pill");
         const hostBadge = el("span", undefined, "device-badge");
         headLeft.append(badge, hostBadge);
+        const headRight = el("div", undefined, "bot-item-head-right");
         const botBtn = button(
           "",
-          () => openBotDetail(ctx, entry.current.owner_bot_id, entry.current._hostId),
+          () => openBotDetail(ctx, entry.current.owner_bot_id, entry.current._hostId, "work"),
           "text-button bot-owner-chip",
         );
-        header.append(headLeft, botBtn);
+        const toggleBtn = button(
+          t("Details"),
+          () => entry.onToggle?.(),
+          "ghost small bot-item-toggle",
+        );
+        headRight.append(botBtn, toggleBtn);
+        header.append(headLeft, headRight);
         const title = el("strong", undefined, "bot-item-title");
+        const decisionsBox = el("div", undefined, "bot-item-decisions");
+        const detailsWrap = el("div", undefined, "bot-item-details");
         const desc = el("p", undefined, "bot-item-desc muted");
         const doneMeans = el("p", undefined, "bot-item-done muted");
         const links = el("div", undefined, "bot-item-links");
-        const decisionsBox = el("div", undefined, "bot-item-decisions");
         const form = el("form", undefined, "bot-item-form");
         const input = el("textarea");
         input.rows = 2;
@@ -419,13 +701,16 @@
         const linkBtn = button(t("Add link"), () => entry.onLink(), "ghost small");
         controls.append(submit, doneBtn, snoozeBtn, linkBtn, cancelBtn);
         form.append(input, controls);
-        card.append(header, title, desc, doneMeans, links, decisionsBox, form);
+        detailsWrap.append(desc, doneMeans, links, form);
+        card.append(header, title, decisionsBox, detailsWrap);
         entry = {
           card,
           badge,
           hostBadge,
           botBtn,
+          toggleBtn,
           title,
+          detailsWrap,
           desc,
           doneMeans,
           links,
@@ -439,6 +724,7 @@
           linkBtn,
           busy: false,
           current: item,
+          onToggle: null,
         };
         cardMap.set(cardKey, entry);
 
@@ -457,6 +743,8 @@
               input.value = "";
               ctx.state.drafts?.delete?.(draftKey);
             }
+            await refreshHost(ctx, entry.current._hostId).catch(() => {});
+            ctx.syncTabBar?.();
             await onReload();
           } finally {
             entry.busy = false;
@@ -512,15 +800,26 @@
       }
 
       entry.current = item;
+      entry.onToggle = collapsible ? () => onToggleExpand?.(cardKey) : null;
+
       function syncItem() {
         const cur = entry.current;
         const disabled = entry.busy || !ready();
+        const isExpanded = !collapsible || !!expandedIds?.has(cardKey);
         entry.badge.textContent = statusLabel(cur.status, t);
         entry.badge.className = `bot-status-pill ${statusTone(cur.status)}`;
         entry.hostBadge.hidden = !multiHost || !cur._hostName;
         if (!entry.hostBadge.hidden) entry.hostBadge.textContent = cur._hostName;
         entry.botBtn.hidden = !showBot;
         if (showBot) entry.botBtn.textContent = botDisplayName(bots, cur.owner_bot_id);
+        entry.toggleBtn.hidden = !collapsible;
+        if (collapsible) {
+          const lbl = t(isExpanded ? "Hide" : "Details");
+          entry.toggleBtn.textContent = lbl;
+          entry.toggleBtn.setAttribute("aria-label", lbl);
+          entry.toggleBtn.setAttribute("aria-expanded", String(isExpanded));
+        }
+        entry.detailsWrap.hidden = !isExpanded;
         entry.title.textContent = cur.title || "";
         entry.desc.hidden = !cur.description;
         entry.desc.textContent = cur.description || "";
@@ -566,6 +865,8 @@
                     answer_text: opt,
                   });
                   ctx.toast?.(t("Answer sent"));
+                  await refreshHost(ctx, cur._hostId).catch(() => {});
+                  ctx.syncTabBar?.();
                   await onReload();
                 } finally {
                   entry.busy = false;
@@ -602,13 +903,18 @@
     return wrap;
   }
 
-  function renderSuggestionsSection(ctx, t, suggestions, bots, ready, reload, showBot, multiHost) {
+  function renderSuggestionsSection(ctx, t, suggestions, bots, ready, reload, showBot, multiHost, headerAction) {
     const { el, button } = ctx;
-    if (!suggestions.length) return null;
+    if (!suggestions.length && !headerAction) return null;
     const sec = el("section", undefined, "bots-section");
     const head = el("div", undefined, "home-section-heading");
-    head.append(el("h2", t("Suggestions"), "section-title"), el("small", String(suggestions.length), "muted"));
+    head.append(el("h2", t("Suggestions"), "section-title"));
+    if (suggestions.length) head.append(el("small", String(suggestions.length), "muted"));
+    if (headerAction) head.append(headerAction);
     const group = el("div", undefined, "inset-group");
+    if (!suggestions.length) {
+      group.append(el("p", t("No items match this filter."), "empty"));
+    }
     for (const s of suggestions) {
       const row = el("div", undefined, "bots-row");
       const main = el("div", undefined, "bots-row-main");
@@ -630,12 +936,8 @@
           if (Number.isSafeInteger(Number(res?.session_id)) && Number(res.session_id) > 0) {
             if (s._hostId && ctx.activateHost) ctx.activateHost(s._hostId);
             await refreshHost(ctx, s._hostId).catch(() => {});
-            const sess = ctx.state.sessions?.get?.(Number(res.session_id));
-            const grp = sess && ctx.state.groups?.get?.(sess.groupKey);
-            if (grp) {
-              ctx.go(ctx.groupRoute(grp, Number(res.session_id)));
-              return;
-            }
+            openBotDetail(ctx, s.bot_id, s._hostId, "chat");
+            return;
           }
           ctx.toast?.(t("Suggestion started"));
           await reload();
@@ -917,10 +1219,18 @@
     let requests = [];
     let statuses = [];
     let groups = [];
-    let activeGroupId = null;
-    let activeGroupHost = null;
+    let botSessions = [];
+    let hubMode = "bots";
+    let activeGroupId = ctx.state?.ui?.activeBotGroup?.id || null;
+    let activeGroupHost = ctx.state?.ui?.activeBotGroup?.hostId ?? null;
     let activeThreadId = null;
     let groupView = null;
+    let deckIndex = 0;
+    if (ctx.state?.ui?.activeBotGroup) {
+      hubMode = "groups";
+      ctx.state.ui.activeBotGroup = null;
+    }
+
     const avatars = new Map();
     const recentRows = new Map();
     const recentSec = el("section", undefined, "bots-section bots-recent-section");
@@ -930,17 +1240,36 @@
     recentSec.append(recentHead, recentBox);
     const accessCtrl = createAccessSection(ctx, t);
 
-    // Persistent group chat section & composer so background draw() preserves focus, draft, and reply mode.
+    // Persistent group chat section & promoted composer so background draw() preserves focus, draft, and reply mode.
     const groupSec = el("section", undefined, "bots-section");
     const groupHead = el("div", undefined, "home-section-heading");
     const groupTitleEl = el("h2", t("Group chats"), "section-title");
     const createGrpBtn = button(`+ ${t("New group")}`, () => openCreateGroupSheet(ctx, t, bots, () => load(true), botHosts()), "filter-chip");
     groupHead.append(groupTitleEl, createGrpBtn);
     const groupListBox = el("div", undefined, "inset-group");
-    const groupPanel = el("div", undefined, "bot-group-panel");
+    const groupPanel = el("section", undefined, "bot-group-panel bot-group-promoted");
+    const groupPromotedHead = el("div", undefined, "bot-group-promoted-head");
+    const groupBackBtn = button(
+      t("Back to bots"),
+      () => {
+        activeGroupId = null;
+        activeGroupHost = null;
+        groupView = null;
+        lastGroupDraftKey = null;
+        hubMode = "bots";
+        draw();
+      },
+      "ghost small",
+      "back",
+    );
+    const groupPromotedTitleWrap = el("div", undefined, "bots-row-main");
+    const groupPromotedTitle = el("strong", t("Group chats"));
+    const groupPromotedMembers = el("small", "", "muted");
+    groupPromotedTitleWrap.append(groupPromotedTitle, groupPromotedMembers);
+    groupPromotedHead.append(groupBackBtn, groupPromotedTitleWrap);
     const groupTop = el("div", undefined, "bot-group-toolbar");
     const threadBar = el("div", undefined, "bot-decision-options");
-    const groupMsgBox = el("div", undefined, "bot-group-messages");
+    const groupMsgBox = el("div", undefined, "bot-group-messages promoted");
     const groupSendForm = el("form", undefined, "bot-item-form");
     const groupMentions = el("div", undefined, "bot-decision-options");
     const groupTextarea = el("textarea");
@@ -993,7 +1322,7 @@
       ctx.act(submitGroup);
     });
     groupSendForm.append(groupMentions, groupTextarea, groupControls);
-    groupPanel.append(groupTop, groupMsgBox, groupSendForm);
+    groupPanel.append(groupPromotedHead, groupTop, groupMsgBox, groupSendForm);
     groupSec.append(groupHead, groupListBox);
 
     let loading = false;
@@ -1004,8 +1333,8 @@
 
     const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
 
-    const fetchAvatars = (list) => {
-      for (const b of list) {
+    const fetchAvatars = (listItems) => {
+      for (const b of listItems) {
         const avKey = b._hostId ? `${b._hostId}:${b.id}` : b.id;
         if (b.avatar && !avatars.has(avKey)) {
           avatars.set(avKey, null);
@@ -1050,6 +1379,7 @@
         requests = [];
         statuses = [];
         groups = [];
+        botSessions = [];
         botsCursors.clear();
         loaded = true;
         draw();
@@ -1062,12 +1392,13 @@
       try {
         const perHost = await Promise.all(
           targets.map(async (h) => {
-            const [botsRes, itemsRes, accessRes, statusRes, groupRes] = await Promise.all([
+            const [botsRes, itemsRes, accessRes, statusRes, groupRes, sessRes] = await Promise.all([
               rpcHost(ctx, h.id, { action: "bots.list", limit: 50 }),
               rpcHost(ctx, h.id, { action: "bots.items", include_closed: false, limit: 100 }),
               rpcHost(ctx, h.id, { action: "bots.access.list", limit: 50 }),
               rpcHost(ctx, h.id, { action: "bots.connectors.status" }),
               rpcHost(ctx, h.id, { action: "bots.groups.list", limit: 50 }),
+              rpcHost(ctx, h.id, { action: "bots.sessions.list" }).catch(() => ({ sessions: [] })),
             ]);
             const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
             return {
@@ -1078,6 +1409,7 @@
               requests: tag(accessRes?.requests),
               statuses: tag(statusRes?.statuses),
               groups: tag(groupRes?.groups),
+              sessions: tag(sessRes?.sessions),
             };
           }),
         );
@@ -1097,9 +1429,14 @@
         requests = perHost.flatMap((r) => r.requests);
         statuses = perHost.flatMap((r) => r.statuses);
         groups = perHost.flatMap((r) => r.groups);
+        botSessions = perHost.flatMap((r) => r.sessions);
         loaded = true;
-        if (activeGroupId && groups.some((g) => g.id === activeGroupId && (g._hostId ?? null) === (activeGroupHost ?? null))) {
-          await loadGroup(activeGroupId, activeThreadId, activeGroupHost).catch(() => {});
+        const matchedGroup = activeGroupId
+          ? groups.find((g) => g.id === activeGroupId && (!activeGroupHost || (g._hostId ?? null) === (activeGroupHost ?? null)))
+          : null;
+        if (matchedGroup) {
+          activeGroupHost = matchedGroup._hostId ?? null;
+          await loadGroup(matchedGroup.id, activeThreadId, activeGroupHost).catch(() => {});
         }
         fetchAvatars(bots);
       } catch (e) {
@@ -1159,6 +1496,7 @@
                 lastGroupDraftKey = null;
                 draw();
               } else {
+                hubMode = "groups";
                 return loadGroup(g.id, null, g._hostId ?? null);
               }
             },
@@ -1174,6 +1512,9 @@
       sync(groupListBox, listNodes);
 
       if (activeGroupId && groupView) {
+        groupPromotedTitle.textContent = groupView.group?.name || t("Group chats");
+        groupPromotedMembers.textContent = (groupView.group?.bot_ids || []).map((id) => botDisplayName(bots, id)).join(", ");
+
         const threadNodes = [];
         for (const th of groupView.threads || []) {
           const tb = button(
@@ -1319,6 +1660,51 @@
       return recentSec;
     }
 
+    function buildHubDecisionCards(hosts) {
+      const cards = [];
+      for (const item of items) {
+        if (item.status === "needs_you") {
+          cards.push({
+            kind: "item",
+            botId: item.owner_bot_id,
+            hostId: item._hostId,
+            hostName: multiHost() ? item._hostName : null,
+            title: item.title,
+            subtitle: item.description || "",
+            item,
+          });
+        }
+      }
+      for (const req of requests) {
+        if (req.status === "pending") {
+          cards.push({
+            kind: "access",
+            botId: req.bot_id,
+            hostId: req._hostId,
+            hostName: multiHost() ? req._hostName : null,
+            title: req.sender_name || req.sender_id || t("Sender"),
+            subtitle: [req.source, botDisplayName(bots, req.bot_id)].filter(Boolean).join(" · "),
+            request: req,
+          });
+        }
+      }
+      for (const h of hosts) {
+        const o = M.confirmationRequests ? M.confirmationRequests(h.snapshot?.orchestration) : { gates: [] };
+        for (const g of o.gates || []) {
+          cards.push({
+            kind: "gate",
+            botId: null,
+            hostId: h.id,
+            hostName: multiHost() ? h.name : null,
+            title: g.question,
+            subtitle: "",
+            gate: g,
+          });
+        }
+      }
+      return cards;
+    }
+
     function draw() {
       if (ctx.signal.aborted) return;
       const anchor = captureAnchor(list, ".recent-session-row,.bots-section");
@@ -1335,99 +1721,193 @@
       if (!ready() && !isLegacyOnly) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
       if (failure) nodes.push(el("p", failure, "account-error"));
 
-      // Top 1-line conditional banner (shown only when >=1 attention item)
-      if (totalAttention > 0) {
-        const bannerBtn = button("", () => ctx.go("/up-next", true), "todo-summary-banner");
-        const label = t(
-          totalAttention === 1 ? "{0} request needs your attention" : "{0} requests need your attention",
-          totalAttention,
-        );
-        bannerBtn.setAttribute("aria-label", label);
-        const dot = ctx.dot("waiting");
-        const title = el("strong", label, "todo-banner-title");
-        const tag = el("span", t("Review"), "bot-status-pill waiting");
-        bannerBtn.append(dot, title, tag, ctx.icon("chevronRight"));
-        nodes.push(bannerBtn);
+      // C: Top Avatar Quick-Switch Rail
+      if (!isLegacyOnly && (bots.length || groups.length)) {
+        const rail = renderBotRail(ctx, t, {
+          bots,
+          groups,
+          items,
+          botSessions,
+          avatars,
+          activeBotId: null,
+          activeGroupId,
+          activeGroupHost,
+          ready,
+          onPickBot: (b) => openBotDetail(ctx, b.id, b._hostId, "chat"),
+          onPickGroup: (g) => {
+            hubMode = "groups";
+            return loadGroup(g.id, null, g._hostId ?? null);
+          },
+          onNewBot: () => openCreateBotSheet(ctx, t, () => load(true), botHosts()),
+        });
+        if (rail) nodes.push(rail);
       }
 
-      if (loading && !bots.length && !isLegacyOnly) {
-        const loadingBox = el("div", undefined, "account-placeholder");
-        loadingBox.append(el("span", undefined, "spinner"), el("p", t("Loading bots…")));
-        nodes.push(loadingBox);
+      const groupOpen = !!(activeGroupId && groupView);
+      if (groupOpen) {
+        nodes.push(renderGroupPanel());
+        if (!isLegacyOnly && ready()) {
+          nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(false), multiHost: multiHost(), targetHosts: botHosts() }));
+        }
       } else {
-        const botsSec = el("section", undefined, "bots-section");
-        const botsHead = el("div", undefined, "home-section-heading");
-        botsHead.append(el("h2", t("Your bots"), "section-title"), el("small", String(bots.length), "muted"));
-        botsSec.append(botsHead);
+        // Top 1-line conditional banner (shown only when >=1 attention item)
+        if (totalAttention > 0) {
+          const bannerBtn = button("", () => ctx.go("/up-next", true), "todo-summary-banner");
+          const label = t(
+            totalAttention === 1 ? "{0} request needs your attention" : "{0} requests need your attention",
+            totalAttention,
+          );
+          bannerBtn.setAttribute("aria-label", label);
+          const dot = ctx.dot("waiting");
+          const title = el("strong", label, "todo-banner-title");
+          const tag = el("span", t("Review"), "bot-status-pill waiting");
+          bannerBtn.append(dot, title, tag, ctx.icon("chevronRight"));
+          nodes.push(bannerBtn);
+        }
 
-        if (isLegacyOnly) {
+        // D: One-tap Needs You Decision Card Deck (auto-collapses when 0 urgent cards)
+        if (!isLegacyOnly) {
+          const deck = renderDecisionDeck(ctx, t, {
+            cards: buildHubDecisionCards(hosts),
+            bots,
+            ready,
+            deckIndex,
+            onNext: () => {
+              deckIndex++;
+              draw();
+            },
+            onReload: () => load(false),
+            onOpenBot: (bid, hid) => openBotDetail(ctx, bid, hid, "work"),
+          });
+          if (deck) nodes.push(deck);
+        }
+
+        if (loading && !bots.length && !isLegacyOnly) {
+          const loadingBox = el("div", undefined, "account-placeholder");
+          loadingBox.append(el("span", undefined, "spinner"), el("p", t("Loading bots…")));
+          nodes.push(loadingBox);
+        } else if (isLegacyOnly) {
+          const legacySec = el("section", undefined, "bots-section");
           const legacyBox = el("div", undefined, "bots-empty-card inset-group");
           legacyBox.append(el("p", t("Update Krill desktop to use Bots."), "empty"));
-          botsSec.append(legacyBox);
-        } else if (!bots.length) {
-          const emptyBox = el("div", undefined, "bots-empty-card inset-group");
-          emptyBox.append(
-            el("p", t("No bots configured yet."), "empty"),
-            button(t("Create Bot"), () => openCreateBotSheet(ctx, t, () => load(true), botHosts()), "primary"),
-          );
-          botsSec.append(emptyBox);
+          legacySec.append(legacyBox);
+          nodes.push(legacySec);
         } else {
-          const sortedBots = bots.slice().sort((a, b) => {
-            const aNeeds = items.some((i) => i.owner_bot_id === a.id && (i._hostId ?? null) === (a._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
-            const bNeeds = items.some((i) => i.owner_bot_id === b.id && (i._hostId ?? null) === (b._hostId ?? null) && i.status === "needs_you") ? 0 : 1;
-            if (aNeeds !== bNeeds) return aNeeds - bNeeds;
-            return Number(!!a.paused) - Number(!!b.paused);
-          });
-          const group = el("div", undefined, "inset-group");
-          const showDev = multiHost();
-          for (const bot of sortedBots) {
-            const openItems = items.filter((i) => i.owner_bot_id === bot.id && (i._hostId ?? null) === (bot._hostId ?? null) && i.status === "needs_you").length;
-            const botErrors = statuses.filter((s) => s.bot_id === bot.id && (s._hostId ?? null) === (bot._hostId ?? null) && s.enabled && s.state === "error").length;
-            const avKey = bot._hostId ? `${bot._hostId}:${bot.id}` : bot.id;
-            const row = el("div", undefined, "bot-card-row");
-            const tap = button("", () => openBotDetail(ctx, bot.id, bot._hostId), "bot-card-main");
-            tap.setAttribute("aria-label", bot.name);
-            const avatar = renderAvatar(el, bot, avatars.get(avKey));
-            const copy = el("span", undefined, "bots-row-main");
-            const titleLine = el("span", undefined, "bot-title-line");
-            titleLine.append(
-              el("strong", bot.name),
-              el("span", t(bot.paused ? "Paused" : "Active"), `bot-status-pill ${bot.paused ? "unknown" : "connected"}`),
-            );
-            if (openItems > 0) titleLine.append(el("span", t("{0} needs you", openItems), "bot-status-pill waiting"));
-            if (botErrors > 0) titleLine.append(el("span", t("Connector error"), "bot-status-pill blocked"));
-            if (showDev && bot._hostName) titleLine.append(el("span", bot._hostName, "device-badge"));
-            copy.append(titleLine);
-            if (bot.description) copy.append(el("small", bot.description, "muted"));
-            tap.append(avatar, copy, ctx.icon("chevronRight"));
-
-            const chatBtn = button(
-              t("Open Chat"),
-              () => openBotSession(ctx, t, bot.id, undefined, bot._hostId),
-              "secondary small bot-chat-btn",
-            );
-            chatBtn.disabled = !ready() || !!bot.paused;
-            if (bot.paused) chatBtn.title = t("Paused bots cannot start chat");
-            row.append(tap, chatBtn);
-            group.append(row);
+          // A: Hub segment switcher (Your bots / Group chats)
+          if (bots.length || groups.length) {
+            const seg = el("div", undefined, "bot-seg-tabs");
+            seg.setAttribute("role", "tablist");
+            for (const [id, lbl] of [
+              ["bots", `${t("Your bots")} (${bots.length})`],
+              ["groups", `${t("Group chats")} (${groups.length})`],
+            ]) {
+              const tabBtn = button(
+                lbl,
+                () => {
+                  hubMode = id;
+                  draw();
+                },
+                `bot-seg-tab${hubMode === id ? " active" : ""}`,
+              );
+              tabBtn.setAttribute("role", "tab");
+              tabBtn.setAttribute("aria-selected", String(hubMode === id));
+              tabBtn.dataset.hubMode = id;
+              seg.append(tabBtn);
+            }
+            nodes.push(seg);
           }
-          botsSec.append(group);
-          if (botsCursors.size > 0) {
-            const more = button(t("Load more"), loadMoreBots, "secondary");
-            more.disabled = !ready();
-            botsSec.append(more);
+
+          if (hubMode === "groups") {
+            nodes.push(renderGroupPanel());
+          } else {
+            const botsSec = el("section", undefined, "bots-section");
+            const botsHead = el("div", undefined, "home-section-heading");
+            botsHead.append(el("h2", t("Your bots"), "section-title"), el("small", String(bots.length), "muted"));
+            botsSec.append(botsHead);
+
+            if (!bots.length) {
+              const emptyBox = el("div", undefined, "bots-empty-card inset-group");
+              emptyBox.append(
+                el("p", t("No bots configured yet."), "empty"),
+                button(t("Create Bot"), () => openCreateBotSheet(ctx, t, () => load(true), botHosts()), "primary"),
+              );
+              botsSec.append(emptyBox);
+            } else {
+              const sortedBots = sortBotsForDisplay(bots, items, botSessions);
+              const group = el("div", undefined, "inset-group");
+              const showDev = multiHost();
+              for (const bot of sortedBots) {
+                const openItems = items.filter((i) => i.owner_bot_id === bot.id && (i._hostId ?? null) === (bot._hostId ?? null) && i.status === "needs_you").length;
+                const botErrors = statuses.filter((s) => s.bot_id === bot.id && (s._hostId ?? null) === (bot._hostId ?? null) && s.enabled && s.state === "error").length;
+                const liveSessions = botSessions.filter((s) => s.bot_id === bot.id && (s._hostId ?? null) === (bot._hostId ?? null) && s.live);
+                const workingCount = liveSessions.filter((s) => s.working).length;
+                const avKey = bot._hostId ? `${bot._hostId}:${bot.id}` : bot.id;
+                const row = el("div", undefined, "bot-card-row");
+                const tap = button("", () => openBotDetail(ctx, bot.id, bot._hostId, "chat"), "bot-card-main");
+                tap.setAttribute("aria-label", bot.name);
+                const avatar = renderAvatar(el, bot, avatars.get(avKey));
+                const copy = el("span", undefined, "bots-row-main");
+                const titleLine = el("span", undefined, "bot-title-line");
+                titleLine.append(
+                  el("strong", bot.name),
+                  el(
+                    "span",
+                    t(bot.paused ? "Paused" : workingCount > 0 ? "Working" : "Active"),
+                    `bot-status-pill ${bot.paused ? "unknown" : workingCount > 0 ? "working" : "connected"}`,
+                  ),
+                );
+                if (openItems > 0) titleLine.append(el("span", t("{0} needs you", openItems), "bot-status-pill waiting"));
+                if (botErrors > 0) titleLine.append(el("span", t("Connector error"), "bot-status-pill blocked"));
+                if (showDev && bot._hostName) titleLine.append(el("span", bot._hostName, "device-badge"));
+                copy.append(titleLine);
+
+                const liveLine = [
+                  refusalAgentLabel(bot.agent_id),
+                  workingCount > 0
+                    ? workingCount === 1
+                      ? t("1 active")
+                      : t("{0} active", workingCount)
+                    : liveSessions.length > 0
+                      ? liveSessions.length === 1
+                        ? t("1 live chat")
+                        : t("{0} live chats", liveSessions.length)
+                      : null,
+                  bot.description || null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                if (liveLine) copy.append(el("small", liveLine, "muted"));
+                tap.append(avatar, copy, ctx.icon("chevronRight"));
+
+                // Open Chat keeps bot context inside Bot Workspace (#/bots/:id Chat tab)
+                const chatBtn = button(
+                  t("Open Chat"),
+                  () => openBotDetail(ctx, bot.id, bot._hostId, "chat"),
+                  "secondary small bot-chat-btn",
+                );
+                chatBtn.disabled = !ready() || !!bot.paused;
+                if (bot.paused) chatBtn.title = t("Paused bots cannot start chat");
+                row.append(tap, chatBtn);
+                group.append(row);
+              }
+              botsSec.append(group);
+              if (botsCursors.size > 0) {
+                const more = button(t("Load more"), loadMoreBots, "secondary");
+                more.disabled = !ready();
+                botsSec.append(more);
+              }
+            }
+            nodes.push(botsSec);
           }
         }
-        nodes.push(botsSec);
-      }
 
-      // Bottom section: Recent project sessions (max 3 + "View all" -> Projects)
-      const recentNode = renderRecentSessionsSection(hosts);
-      if (recentNode) nodes.push(recentNode);
+        // Bottom section: Recent project sessions (max 3 + "View all" -> Projects)
+        const recentNode = renderRecentSessionsSection(hosts);
+        if (recentNode) nodes.push(recentNode);
 
-      if (!isLegacyOnly && ready()) {
-        nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(false), multiHost: multiHost(), targetHosts: botHosts() }));
-        nodes.push(renderGroupPanel());
+        if (!isLegacyOnly && ready()) {
+          nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(false), multiHost: multiHost(), targetHosts: botHosts() }));
+        }
       }
 
       sync(list, nodes);
@@ -1449,36 +1929,66 @@
 
   function mountBotDetail(root, ctx, t, botId, ready) {
     const { el, button } = ctx;
-    const screen = el("section", undefined, "details bots bot-detail screen");
+    const screen = el("section", undefined, "details bots bot-detail bot-workspace screen");
     const header = ctx.header(botId, "/bots");
-    const chatBtn = button(t("Open Chat"), () => openBotSession(ctx, t, botId), "primary small");
+    const headerSub = el("small", "", "header-sub");
+    header.querySelector(".header-copy")?.append(headerSub);
     const refreshBtn = button(t("Refresh"), () => load(), "icon-button refresh-button", "activity");
-    header.append(chatBtn, refreshBtn);
-    const list = el("div", undefined, "detail-list bots-list");
-    screen.append(header, list);
+    header.append(refreshBtn);
+
+    const railMount = el("div", undefined, "bot-workspace-rail");
+    const tabBar = el("div", undefined, "bot-seg-tabs bot-workspace-tabs");
+    tabBar.setAttribute("role", "tablist");
+
+    // Persistent panes so embedded M.chat.mount stays mounted without losing drafts/IME/scroll
+    const chatPane = el("div", undefined, "bot-workspace-pane bot-chat-pane");
+    const chatTop = el("div", undefined, "bot-chat-top");
+    const chatStage = el("div", undefined, "bot-chat-stage");
+    chatPane.append(chatTop, chatStage);
+
+    const list = el("div", undefined, "detail-list bots-list bot-workspace-scroll");
+
+    screen.append(header, railMount, tabBar, chatPane, list);
     root.append(screen);
 
+    let activeTab = ctx.state?.ui?.botPendingTab || "chat";
+    if (!["chat", "work", "automations", "settings"].includes(activeTab)) activeTab = "chat";
+    if (ctx.state?.ui) ctx.state.ui.botPendingTab = null;
+
     let bot = null;
+    let allBots = [];
+    let allItems = [];
+    let allGroups = [];
+    let allBotSessions = [];
     let items = [];
     let itemsCursor = null;
     let statuses = [];
     let suggestions = [];
     let requests = [];
     let upcoming = null;
-    let avatarInfo = null;
+    let botSessions = [];
+    let activeSessionId = null;
+    let chatHandle = null;
+    let chatMountedSid = null;
+    let chatStarting = false;
+    let chatRefusal = null;
+    let deckIndex = 0;
     let includeClosed = false;
     let includeSnoozed = false;
     let soulLoaded = false;
+    let soulLoading = false;
     let soulText = "";
     let memoryText = "";
     let allowMemoryDelete = false;
     let loading = false;
     let failure = null;
     let loadSeq = 0;
+    const avatars = new Map();
     const cardMap = new Map();
+    const expandedItems = new Set();
     const h1 = header.querySelector("h1");
 
-    // Persistent sections/inputs in Bot Detail so background draw() preserves focus, cursor, scroll, and drafts.
+    // Persistent sections/inputs in Bot Workspace so background draw() preserves focus, cursor, scroll, and drafts.
     const accessCtrl = createAccessSection(ctx, t);
     const itemSec = el("section", undefined, "bots-section");
     const itemHead = el("div", undefined, "home-section-heading");
@@ -1499,8 +2009,8 @@
     const moreItemsBtn = button(t("Load more"), loadMoreItems, "secondary");
     itemSec.append(itemHead, itemFilters, itemsWrap);
 
-    const replySec = el("section", undefined, "bots-section");
-    replySec.append(el("h2", t("External reply"), "section-title"));
+    const replyDetails = el("details", undefined, "bot-reply-fold");
+    replyDetails.append(el("summary", t("External reply"), "bot-reply-fold-summary"));
     const replyBox = el("div", undefined, "inset-group bot-reply-card");
     const replyDraftKey = `bot-reply:${botId}`;
     const replyForm = el("form", undefined, "bot-item-form");
@@ -1527,7 +2037,7 @@
     });
     replyForm.append(replyInput, replyBtn);
     replyBox.append(replyForm);
-    replySec.append(replyBox);
+    replyDetails.append(replyBox);
 
     const docSec = el("section", undefined, "bots-section");
     const docHead = el("div", undefined, "home-section-heading");
@@ -1575,23 +2085,7 @@
       },
       "secondary small",
     );
-    const loadDocsBtn = button(
-      t("Load"),
-      async () => {
-        const [sRes, mRes] = await Promise.all([
-          ctx.rpc({ action: "bots.soul.get", bot_id: botId }),
-          ctx.rpc({ action: "bots.memory.get", bot_id: botId }),
-        ]);
-        if (ctx.signal.aborted) return;
-        soulText = sRes?.content || "";
-        memoryText = mRes?.content || "";
-        soulArea.value = soulText;
-        memArea.value = memoryText;
-        soulLoaded = true;
-        draw();
-      },
-      "filter-chip",
-    );
+    const loadDocsBtn = button(t("Load"), () => loadDocs(), "filter-chip");
     docHead.append(loadDocsBtn);
     docCard.append(
       el("label", "SOUL.md", "sheet-field-label"),
@@ -1604,6 +2098,157 @@
     );
     docSec.append(docHead);
 
+    function unmountChat() {
+      if (chatHandle) {
+        chatHandle.unmount?.();
+        chatHandle = null;
+      }
+      chatMountedSid = null;
+    }
+
+    function ensureChatMounted() {
+      const wantSid = Number(activeSessionId);
+      const canMount = Number.isSafeInteger(wantSid) && wantSid > 0 && typeof M.chat?.mount === "function";
+      if (!canMount) {
+        unmountChat();
+        renderChatEmptyState();
+        return;
+      }
+      if (chatMountedSid === wantSid && chatHandle) {
+        chatHandle.setVisible?.(activeTab === "chat");
+        chatHandle.update?.();
+        return;
+      }
+      unmountChat();
+      chatStage.replaceChildren();
+      if (!ctx.state.sessions?.has?.(wantSid)) {
+        const s = botSessions.find((x) => Number(x.session_id) === wantSid);
+        const key = `bot:${botId}`;
+        const synth = {
+          id: wantSid,
+          agent: bot?.agent_id || "",
+          title: s?.label || bot?.name || botId,
+          state: s?.working ? "Working" : "Done",
+          exited: false,
+          groupKey: key,
+        };
+        ctx.state.sessions?.set?.(wantSid, synth);
+      }
+      chatMountedSid = wantSid;
+      chatHandle = M.chat.mount(chatStage, {
+        ctx,
+        sessionId: wantSid,
+        agentIcon: M.agentIcon,
+        visible: activeTab === "chat",
+        onSwitchTerm: () => openBotTerminalSession(ctx, t, wantSid, null),
+      });
+    }
+
+    async function startOrOpenBotChat(promptText) {
+      if (chatStarting || !ready()) return;
+      chatStarting = true;
+      chatRefusal = null;
+      draw();
+      try {
+        const res = await ctx.rpc({
+          action: "bots.chat.open",
+          bot_id: botId,
+          ...(promptText ? { prompt: promptText } : {}),
+        });
+        if (ctx.signal.aborted) return;
+        const sid = Number(res?.session_id);
+        if (!Number.isSafeInteger(sid) || sid <= 0) throw Error(t("Could not open bot chat"));
+        activeSessionId = sid;
+        await refreshHost(ctx, null).catch(() => {});
+        await load();
+      } catch (error) {
+        if (ctx.signal.aborted) return;
+        const refusal = readBotRefusal(error);
+        const msg = refusal ? mobileBotRefusalText(refusal, t) : safeMsg(error, t);
+        chatRefusal = msg;
+        throw Object.assign(Error(msg), { data: error?.data });
+      } finally {
+        chatStarting = false;
+        if (!ctx.signal.aborted) draw();
+      }
+    }
+
+    function renderChatEmptyState() {
+      const box = el("div", undefined, "bot-chat-empty");
+      if (chatRefusal) {
+        box.append(el("p", chatRefusal, "account-error"));
+      }
+      if (bot?.paused) {
+        box.append(
+          el("p", t("This bot is paused. Resume it to start a chat."), "muted"),
+          button(
+            t("Resume"),
+            async () => {
+              await ctx.rpc({ action: "bots.update", bot_id: botId, paused: false });
+              ctx.toast?.(t("Bot resumed"));
+              await refreshHost(ctx, null).catch(() => {});
+              await load();
+            },
+            "primary",
+          ),
+        );
+      } else {
+        box.append(el("p", t("Send a message to start chatting with this bot."), "muted"));
+        const draftKey = `bot-first-chat:${botId}`;
+        const form = el("form", undefined, "bot-first-chat-form");
+        const input = el("textarea");
+        input.rows = 2;
+        input.placeholder = t("Message this bot…");
+        input.setAttribute("aria-label", t("Message this bot…"));
+        input.value = ctx.state.drafts?.get?.(draftKey) || "";
+        input.addEventListener("input", () => ctx.state.drafts?.set?.(draftKey, input.value));
+        const sendPrompt = async () => {
+          const text = input.value.trim();
+          await startOrOpenBotChat(text || undefined);
+          if (!ctx.signal.aborted) {
+            input.value = "";
+            ctx.state.drafts?.delete?.(draftKey);
+          }
+        };
+        form.addEventListener("submit", (e) => {
+          e.preventDefault();
+          ctx.act(sendPrompt);
+        });
+        const row = el("div", undefined, "bot-item-controls");
+        const startBtn = button(
+          t(chatStarting ? "Starting chat…" : "Start chat"),
+          sendPrompt,
+          "primary small",
+        );
+        startBtn.disabled = !ready() || chatStarting;
+        input.disabled = !ready() || chatStarting;
+        row.append(startBtn);
+        form.append(input, row);
+        box.append(form);
+      }
+      chatStage.replaceChildren(box);
+    }
+
+    async function loadDocs() {
+      if (!ready() || soulLoading) return;
+      soulLoading = true;
+      try {
+        const [sRes, mRes] = await Promise.all([
+          ctx.rpc({ action: "bots.soul.get", bot_id: botId }),
+          ctx.rpc({ action: "bots.memory.get", bot_id: botId }),
+        ]);
+        if (ctx.signal.aborted) return;
+        soulText = sRes?.content || "";
+        memoryText = mRes?.content || "";
+        soulArea.value = soulText;
+        memArea.value = memoryText;
+        soulLoaded = true;
+      } finally {
+        soulLoading = false;
+        if (!ctx.signal.aborted) draw();
+      }
+    }
+
     async function load() {
       if (!ready()) {
         draw();
@@ -1614,7 +2259,7 @@
       failure = null;
       draw();
       try {
-        const [botsRes, itemsRes, statusRes, sugRes, accRes, upRes] = await Promise.all([
+        const [botsRes, itemsRes, allItemsRes, statusRes, sugRes, accRes, upRes, sessRes, grpRes] = await Promise.all([
           ctx.rpc({ action: "bots.list", limit: 100 }),
           ctx.rpc({
             action: "bots.items",
@@ -1623,29 +2268,48 @@
             include_snoozed: includeSnoozed,
             limit: 25,
           }),
+          rpcHost(ctx, null, { action: "bots.items", include_closed: false, limit: 100 }).catch(() => ({ items: [] })),
           ctx.rpc({ action: "bots.connectors.status", bot_id: botId }),
           ctx.rpc({ action: "bots.suggestions.list", bot_id: botId, include_dismissed: false }),
           ctx.rpc({ action: "bots.access.list", bot_id: botId, limit: 50 }),
-          ctx.rpc({ action: "bots.upcoming", bot_id: botId }).catch(() => null),
+          rpcHost(ctx, null, { action: "bots.upcoming", bot_id: botId }).catch(() => null),
+          rpcHost(ctx, null, { action: "bots.sessions.list" }).catch(() => ({ sessions: [] })),
+          rpcHost(ctx, null, { action: "bots.groups.list", limit: 50 }).catch(() => ({ groups: [] })),
         ]);
         if (ctx.signal.aborted || seq !== loadSeq) return;
-        bot = (botsRes?.bots || []).find((b) => b.id === botId) || null;
+        allBots = botsRes?.bots || [];
+        bot = allBots.find((b) => b.id === botId) || null;
         if (h1 && bot?.name) h1.textContent = bot.name;
         items = itemsRes?.items || [];
         itemsCursor = itemsRes?.next_cursor || null;
+        allItems = (allItemsRes?.items || []).length ? allItemsRes.items : items;
         statuses = statusRes?.statuses || [];
         suggestions = sugRes?.suggestions || [];
         requests = accRes?.requests || [];
         upcoming = upRes && typeof upRes === "object" ? upRes : null;
-        if (bot?.avatar && !avatarInfo) {
-          rpcHost(ctx, null, { action: "bots.avatar.read", bot_id: botId })
-            .then((av) => {
-              if (!ctx.signal.aborted && av?.data_base64) {
-                avatarInfo = av;
-                draw();
-              }
-            })
-            .catch(() => {});
+        allBotSessions = sessRes?.sessions || [];
+        botSessions = allBotSessions.filter((s) => s.bot_id === botId);
+        allGroups = grpRes?.groups || [];
+
+        const liveForBot = botSessions.filter((s) => s.live);
+        if (activeSessionId && !liveForBot.some((s) => Number(s.session_id) === Number(activeSessionId))) {
+          activeSessionId = liveForBot[0]?.session_id ?? null;
+        } else if (!activeSessionId && liveForBot.length) {
+          activeSessionId = liveForBot[0].session_id;
+        }
+
+        for (const b of allBots) {
+          if (b.avatar && !avatars.has(b.id)) {
+            avatars.set(b.id, null);
+            rpcHost(ctx, null, { action: "bots.avatar.read", bot_id: b.id })
+              .then((av) => {
+                if (!ctx.signal.aborted && av?.data_base64) {
+                  avatars.set(b.id, av);
+                  draw();
+                }
+              })
+              .catch(() => {});
+          }
         }
       } catch (e) {
         if (ctx.signal.aborted || seq !== loadSeq) return;
@@ -1784,13 +2448,13 @@
           rpcHost(ctx, null, { action: "bots.models", agent_id: agentId })
             .then((res) => {
               if (ctx.signal.aborted || seq !== modelSeq) return;
-              const items = Array.isArray(res?.models) ? res.models : [];
+              const listItems = Array.isArray(res?.models) ? res.models : [];
               modelSelect.replaceChildren();
               const d = el("option", t("Default"));
               d.value = "";
               modelSelect.append(d);
               const ids = new Set([""]);
-              for (const m of items) {
+              for (const m of listItems) {
                 if (!m?.id || ids.has(m.id)) continue;
                 ids.add(m.id);
                 const opt = el("option", m.label || m.id);
@@ -1836,7 +2500,7 @@
           } else {
             ctx.toast?.(t("Saved"));
           }
-          await refreshHost(ctx, null)?.catch?.(() => {});
+          await refreshHost(ctx, null).catch(() => {});
           await load();
         };
 
@@ -1852,96 +2516,144 @@
       });
     }
 
-    function draw() {
-      if (ctx.signal.aborted) return;
-      chatBtn.disabled = !ready() || !!bot?.paused;
-      refreshBtn.disabled = loading || !ready();
+    function buildBotDecisionCards() {
+      const cards = [];
+      for (const item of items) {
+        if (item.status === "needs_you") {
+          cards.push({
+            kind: "item",
+            botId,
+            hostId: null,
+            title: item.title,
+            subtitle: item.description || "",
+            item,
+          });
+        }
+      }
+      for (const req of requests) {
+        if (req.status === "pending") {
+          cards.push({
+            kind: "access",
+            botId,
+            hostId: null,
+            title: req.sender_name || req.sender_id || t("Sender"),
+            subtitle: req.source || "",
+            request: req,
+          });
+        }
+      }
+      for (const run of upcoming?.schedules || []) {
+        if (run?.last_refusal || run?.last_error) {
+          const cfg = (bot?.schedules || []).find((s) => s.id === run.id);
+          cards.push({
+            kind: "schedule_error",
+            botId,
+            hostId: null,
+            scheduleId: run.id,
+            title: cfg?.name || run.id,
+            subtitle: run.last_refusal
+              ? mobileBotRefusalText(run.last_refusal, t)
+              : String(run.last_error || ""),
+          });
+        }
+      }
+      return cards;
+    }
+
+    function renderChatTopArea() {
+      const topNodes = [];
+      if (!ready()) topNodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
+      if (failure) topNodes.push(el("p", failure, "account-error"));
+
+      // Thread / session switcher bar + New Chat + Open in Terminal
+      const threadBar = el("div", undefined, "bot-thread-bar");
+      const liveSessions = botSessions.filter((s) => s.live);
+      liveSessions.forEach((s, idx) => {
+        const sid = Number(s.session_id);
+        const lbl = idx === 0 ? t("Home Chat") : s.label || `#${sid}`;
+        const chip = button(
+          lbl,
+          () => {
+            activeSessionId = sid;
+            draw();
+          },
+          `filter-chip bot-thread-chip${Number(activeSessionId) === sid ? " active" : ""}`,
+        );
+        if (Number(activeSessionId) === sid) chip.setAttribute("aria-current", "true");
+        threadBar.append(chip);
+      });
+      const newChatBtn = button(
+        `+ ${t("New Chat")}`,
+        () => startOrOpenBotChat(),
+        "filter-chip bot-new-chat-btn",
+      );
+      newChatBtn.disabled = !ready() || !!bot?.paused || chatStarting;
+      threadBar.append(newChatBtn);
+
+      if (Number.isSafeInteger(Number(activeSessionId)) && Number(activeSessionId) > 0) {
+        const termBtn = button(
+          t("Terminal"),
+          () => openBotTerminalSession(ctx, t, activeSessionId, null),
+          "ghost small bot-term-btn",
+          "terminal",
+        );
+        termBtn.setAttribute("aria-label", t("Open in terminal"));
+        threadBar.append(termBtn);
+      }
+      topNodes.push(threadBar);
+
+      // Worker / activity progress strip
+      const workingSessions = liveSessions.filter((s) => s.working);
+      const orch = M.confirmationRequests ? M.confirmationRequests(ctx.state.snapshot?.orchestration) : { tasks: [] };
+      const runningTasks = (orch.tasks || []).filter((tk) => tk.status === "running" || tk.status === "in_progress");
+      if (workingSessions.length || runningTasks.length) {
+        const strip = el("div", undefined, "bot-worker-strip");
+        strip.append(ctx.dot("working"));
+        const primary = workingSessions[0];
+        const summary = workingSessions.length
+          ? `${t("Active workers")} · ${workingSessions.length === 1 ? t("1 active") : t("{0} active", workingSessions.length)}`
+          : `${t("Active workers")} · ${runningTasks[0].title}`;
+        strip.append(el("span", summary, "bot-worker-copy"));
+        if (primary) {
+          const stopBtn = button(
+            t("Stop"),
+            async () => {
+              await ctx.rpc({ action: "bots.sessions.stop", bot_id: botId, session_id: Number(primary.session_id) });
+              ctx.toast?.(t("Session stopped"));
+              await load();
+            },
+            "ghost small",
+          );
+          stopBtn.disabled = !ready();
+          strip.append(stopBtn);
+        }
+        topNodes.push(strip);
+      }
+
+      // D: Bot-scoped One-Tap Decision Card Deck right above chat feed
+      const deck = renderDecisionDeck(ctx, t, {
+        cards: buildBotDecisionCards(),
+        bots: allBots.length ? allBots : bot ? [bot] : [],
+        ready,
+        deckIndex,
+        compact: true,
+        onNext: () => {
+          deckIndex++;
+          draw();
+        },
+        onReload: () => load(),
+      });
+      if (deck) topNodes.push(deck);
+
+      sync(chatTop, topNodes);
+    }
+
+    function renderWorkNodes() {
       const nodes = [];
       if (!ready()) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
       if (failure) nodes.push(el("p", failure, "account-error"));
 
-      if (bot) {
-        const hero = el("div", undefined, "inset-group bot-detail-hero");
-        const top = el("div", undefined, "bots-row");
-        const left = el("div", undefined, "bot-card-main");
-        const meta = el("div", undefined, "bots-row-main");
-        meta.append(
-          el("strong", bot.name),
-          el("small", [M.agentName?.(bot.agent_id) || bot.agent_id, bot.model, bot.paused ? t("Paused") : t("Active")].filter(Boolean).join(" · "), "muted"),
-        );
-        if (bot.description) meta.append(el("small", bot.description, "muted"));
-        left.append(renderAvatar(el, bot, avatarInfo), meta);
-        const actions = el("div", undefined, "bots-row-actions");
-        const agentBtn = button(t("Agent"), openEditAgentSheet, "secondary small");
-        agentBtn.disabled = !ready();
-        const lookBtn = button(
-          t("Look Around"),
-          async () => {
-            const res = await ctx.rpc({ action: "bots.look_around", bot_id: botId });
-            ctx.toast?.(t("{0} suggestions ready", (res?.suggestions || []).length));
-            await load();
-          },
-          "secondary small",
-        );
-        lookBtn.disabled = !ready() || !!bot.paused;
-        actions.append(agentBtn, lookBtn);
-        top.append(left, actions);
-        hero.append(top);
-        nodes.push(hero);
-      }
-
-      // Failed automation run cards (`e1779f39`): surface why a scheduled run could not start.
-      const failedRuns = (upcoming?.schedules || []).filter((s) => s?.last_refusal || s?.last_error);
-      if (failedRuns.length) {
-        const autoSec = el("section", undefined, "bots-section");
-        autoSec.append(el("h2", t("Automations"), "section-title"));
-        const group = el("div", undefined, "inset-group");
-        for (const run of failedRuns) {
-          const cfg = (bot?.schedules || []).find((s) => s.id === run.id);
-          const row = el("div", undefined, "bots-row bot-automation-run-row");
-          const main = el("div", undefined, "bots-row-main");
-          const errText = run.last_refusal
-            ? mobileBotRefusalText(run.last_refusal, t)
-            : String(run.last_error || "");
-          main.append(
-            el("strong", cfg?.name || run.id),
-            el("small", errText, "account-error"),
-          );
-          row.append(main, ctx.dot("blocked"));
-          group.append(row);
-        }
-        autoSec.append(group);
-        nodes.push(autoSec);
-      }
-
-      // Connector health summary
-      if (statuses.length) {
-        const connSec = el("section", undefined, "bots-section");
-        connSec.append(el("h2", t("Connectors"), "section-title"));
-        const group = el("div", undefined, "inset-group");
-        for (const st of statuses) {
-          const row = el("div", undefined, "bots-row");
-          const main = el("div", undefined, "bots-row-main");
-          main.append(
-            el("strong", st.source),
-            el(
-              "small",
-              [statusLabel(st.state, t), st.account_label, errorCategoryLabel(st.error_category, t)].filter(Boolean).join(" · "),
-              "muted",
-            ),
-          );
-          const dot = ctx.dot(statusTone(st.state));
-          row.append(main, dot);
-          group.append(row);
-        }
-        connSec.append(group);
-        nodes.push(connSec);
-      }
-
-      const sugNode = renderSuggestionsSection(ctx, t, suggestions, bot ? [bot] : [], ready, load, false);
-      if (sugNode) nodes.push(sugNode);
-
-      // Items inbox (persistent section & wrap to keep textarea focus)
+      // Persistent Items section with collapsible summary cards
       addItemBtn.disabled = !ready();
       closedBtn.className = includeClosed ? "filter-chip active" : "filter-chip";
       snoozeBtn.className = includeSnoozed ? "filter-chip active" : "filter-chip";
@@ -1954,24 +2666,267 @@
         onReload: load,
         cardMap,
         container: itemsWrap,
+        collapsible: true,
+        expandedIds: expandedItems,
+        onToggleExpand: (key) => {
+          if (expandedItems.has(key)) expandedItems.delete(key);
+          else expandedItems.add(key);
+          draw();
+        },
       });
       moreItemsBtn.disabled = !ready();
       sync(itemSec, itemsCursor ? [itemHead, itemFilters, itemsWrap, moreItemsBtn] : [itemHead, itemFilters, itemsWrap]);
       nodes.push(itemSec);
 
+      // Suggestions section with Look Around trigger
+      const lookBtn = button(
+        t("Look Around"),
+        async () => {
+          const res = await ctx.rpc({ action: "bots.look_around", bot_id: botId });
+          ctx.toast?.(t("{0} suggestions ready", (res?.suggestions || []).length));
+          await load();
+        },
+        "secondary small",
+      );
+      lookBtn.disabled = !ready() || !!bot?.paused;
+      const sugNode = renderSuggestionsSection(ctx, t, suggestions, bot ? [bot] : [], ready, load, false, false, lookBtn);
+      if (sugNode) nodes.push(sugNode);
+
       if (requests.some((r) => r.status === "pending")) {
         nodes.push(accessCtrl.update({ requests, bots: bot ? [bot] : [], ready, reload: load, multiHost: false }));
       }
 
-      // Quick Reply (persistent form to keep focus & draft)
+      // Persistent collapsible External Reply (keeps textarea identity, focus, and draft across draw)
       replyInput.disabled = replyBtn.disabled = !ready();
-      nodes.push(replySec);
+      nodes.push(replyDetails);
+      return nodes;
+    }
 
-      // Soul & Memory (persistent form to keep focus, cursor, and scroll)
+    function renderAutomationsNodes() {
+      const nodes = [];
+      if (!ready()) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
+      if (failure) nodes.push(el("p", failure, "account-error"));
+
+      // Proactive Look Around card
+      const laSec = el("section", undefined, "bots-section");
+      laSec.append(el("h2", t("Look Around"), "section-title"));
+      const laBox = el("div", undefined, "inset-group");
+      const laRow = el("div", undefined, "bots-row");
+      const laMain = el("div", undefined, "bots-row-main");
+      laMain.append(
+        el("strong", t("Look Around")),
+        el(
+          "small",
+          `${t("Last run")}: ${formatTimestamp(upcoming?.look_around_last_ms, t)} · ${t("Next run")}: ${formatTimestamp(upcoming?.look_around_next_ms, t)}`,
+          "muted",
+        ),
+      );
+      const laBtn = button(
+        t("Run now"),
+        async () => {
+          const res = await ctx.rpc({ action: "bots.look_around", bot_id: botId });
+          ctx.toast?.(t("{0} suggestions ready", (res?.suggestions || []).length));
+          await load();
+        },
+        "secondary small",
+      );
+      laBtn.disabled = !ready() || !!bot?.paused;
+      laRow.append(laMain, laBtn);
+      laBox.append(laRow);
+      laSec.append(laBox);
+      nodes.push(laSec);
+
+      // Full Scheduled Automations list (failed + running + active + paused)
+      const autoSec = el("section", undefined, "bots-section");
+      const cfgSchedules = Array.isArray(bot?.schedules) ? bot.schedules : [];
+      const upMap = new Map((upcoming?.schedules || []).map((u) => [u.id, u]));
+      const merged = [];
+      const seenIds = new Set();
+      for (const cfg of cfgSchedules) {
+        seenIds.add(cfg.id);
+        merged.push({ cfg, run: upMap.get(cfg.id) || null });
+      }
+      for (const run of upcoming?.schedules || []) {
+        if (!seenIds.has(run.id)) merged.push({ cfg: null, run });
+      }
+      merged.sort((a, b) => {
+        const aFail = a.run?.last_refusal || a.run?.last_error ? 0 : 1;
+        const bFail = b.run?.last_refusal || b.run?.last_error ? 0 : 1;
+        if (aFail !== bFail) return aFail - bFail;
+        const aRun = a.run?.running ? 0 : 1;
+        const bRun = b.run?.running ? 0 : 1;
+        if (aRun !== bRun) return aRun - bRun;
+        return Number(a.cfg?.enabled === false) - Number(b.cfg?.enabled === false);
+      });
+
+      const autoHead = el("div", undefined, "home-section-heading");
+      autoHead.append(el("h2", t("Automations"), "section-title"), el("small", String(merged.length), "muted"));
+      autoSec.append(autoHead);
+
+      const group = el("div", undefined, "inset-group");
+      if (!merged.length) {
+        group.append(el("p", t("No scheduled automations configured."), "empty"));
+      } else {
+        for (const entry of merged) {
+          const { cfg, run } = entry;
+          const sid = cfg?.id || run?.id || "";
+          const failed = !!(run?.last_refusal || run?.last_error);
+          const running = !!run?.running;
+          const enabled = cfg ? cfg.enabled !== false : true;
+          const row = el("div", undefined, `bots-row bot-automation-row${failed ? " bot-automation-run-row" : ""}`);
+          const main = el("div", undefined, "bots-row-main");
+          const titleLine = el("div", undefined, "bot-title-line");
+          titleLine.append(
+            el("strong", cfg?.name || sid),
+            el(
+              "span",
+              t(failed ? "Error" : running ? "Running" : enabled ? "Active" : "Paused"),
+              `bot-status-pill ${failed ? "blocked" : running ? "working" : enabled ? "connected" : "unknown"}`,
+            ),
+          );
+          main.append(titleLine);
+          const metaParts = [
+            cfg?.cron || null,
+            run?.next_ms ? `${t("Next run")}: ${formatTimestamp(run.next_ms, t)}` : null,
+            run?.last_ms ? `${t("Last run")}: ${formatTimestamp(run.last_ms, t)}` : null,
+          ].filter(Boolean);
+          if (metaParts.length) main.append(el("small", metaParts.join(" · "), "muted"));
+          if (failed) {
+            const errText = run.last_refusal
+              ? mobileBotRefusalText(run.last_refusal, t)
+              : String(run.last_error || "");
+            main.append(el("small", errText, "account-error"));
+          }
+
+          const actions = el("div", undefined, "bots-row-actions");
+          const runBtn = button(
+            t("Run now"),
+            async () => {
+              try {
+                await ctx.rpc({ action: "bots.schedule.run", bot_id: botId, schedule_id: sid });
+                ctx.toast?.(t("Schedule started"));
+                await load();
+              } catch (err) {
+                ctx.toast?.(safeMsg(err, t));
+              }
+            },
+            "primary small",
+          );
+          runBtn.disabled = !ready() || running;
+          actions.append(runBtn);
+
+          if (cfg) {
+            const toggleBtn = button(
+              t(enabled ? "Pause" : "Enable"),
+              async () => {
+                const res = await ctx.rpc({
+                  action: "bots.schedule.toggle",
+                  bot_id: botId,
+                  schedule_id: sid,
+                  enabled: !enabled,
+                });
+                if (res?.bot) bot = res.bot;
+                ctx.toast?.(t("Schedule updated"));
+                await load();
+              },
+              "secondary small",
+            );
+            toggleBtn.disabled = !ready();
+            actions.append(toggleBtn);
+          }
+
+          row.append(main, actions);
+          group.append(row);
+        }
+      }
+      autoSec.append(group);
+      nodes.push(autoSec);
+      return nodes;
+    }
+
+    function renderSettingsNodes() {
+      const nodes = [];
+      if (!ready()) nodes.push(el("p", t("Reconnect to manage bots."), "muted bots-offline-hint"));
+      if (failure) nodes.push(el("p", failure, "account-error"));
+
+      if (bot) {
+        const cfgSec = el("section", undefined, "bots-section");
+        cfgSec.append(el("h2", t("Settings"), "section-title"));
+        const cfgGroup = el("div", undefined, "inset-group");
+
+        // Bot Status + Pause / Resume
+        const statusRow = el("div", undefined, "bots-row");
+        const statusMain = el("div", undefined, "bots-row-main");
+        statusMain.append(
+          el("strong", t("Bot status")),
+          el("small", t(bot.paused ? "Paused" : "Active"), "muted"),
+        );
+        const pauseBtn = button(
+          t(bot.paused ? "Resume" : "Pause"),
+          async () => {
+            const nextPaused = !bot.paused;
+            const res = await ctx.rpc({ action: "bots.update", bot_id: botId, paused: nextPaused });
+            if (res?.bot) bot = res.bot;
+            ctx.toast?.(t(nextPaused ? "Bot paused" : "Bot resumed"));
+            await refreshHost(ctx, null).catch(() => {});
+            await load();
+          },
+          bot.paused ? "primary small" : "secondary small",
+        );
+        pauseBtn.disabled = !ready();
+        statusRow.append(statusMain, pauseBtn);
+        cfgGroup.append(statusRow);
+
+        // Provider & Model (supports agy / Antigravity, claude, codex, etc.)
+        const agentRow = el("div", undefined, "bots-row");
+        const agentMain = el("div", undefined, "bots-row-main");
+        agentMain.append(
+          el("strong", t("Provider & model")),
+          el(
+            "small",
+            [refusalAgentLabel(bot.agent_id), bot.model || t("Default"), bot.effort || null].filter(Boolean).join(" · "),
+            "muted",
+          ),
+        );
+        const agentBtn = button(t("Agent"), openEditAgentSheet, "secondary small");
+        agentBtn.disabled = !ready();
+        agentRow.append(agentMain, agentBtn);
+        cfgGroup.append(agentRow);
+
+        cfgSec.append(cfgGroup);
+        nodes.push(cfgSec);
+      }
+
+      // Connectors health summary (human-readable error category labels, M-15)
+      const connSec = el("section", undefined, "bots-section");
+      connSec.append(el("h2", t("Connectors"), "section-title"));
+      const connGroup = el("div", undefined, "inset-group");
+      if (!statuses.length) {
+        connGroup.append(el("p", t("No connectors configured."), "empty"));
+      } else {
+        for (const st of statuses) {
+          const row = el("div", undefined, "bots-row");
+          const main = el("div", undefined, "bots-row-main");
+          main.append(
+            el("strong", st.source),
+            el(
+              "small",
+              [statusLabel(st.state, t), st.account_label, errorCategoryLabel(st.error_category, t)].filter(Boolean).join(" · "),
+              "muted",
+            ),
+          );
+          row.append(main, ctx.dot(statusTone(st.state)));
+          connGroup.append(row);
+        }
+      }
+      connSec.append(connGroup);
+      nodes.push(connSec);
+
+      // Persistent Soul & Memory (keeps textarea identity, focus, cursor, and draft across draw, M-12)
       const docsBtnLabel = t(soulLoaded ? "Reload" : "Load");
       if (loadDocsBtn.textContent !== docsBtnLabel) loadDocsBtn.textContent = docsBtnLabel;
       loadDocsBtn.setAttribute("aria-label", docsBtnLabel);
-      loadDocsBtn.disabled = !ready();
+      loadDocsBtn.disabled = !ready() || soulLoading;
       if (soulLoaded) {
         const delLabel = t(allowMemoryDelete ? "Deletions allowed" : "Protect facts");
         if (delToggle.textContent !== delLabel) delToggle.textContent = delLabel;
@@ -1983,12 +2938,106 @@
         sync(docSec, [docHead]);
       }
       nodes.push(docSec);
+      return nodes;
+    }
 
-      sync(list, nodes);
+    function draw() {
+      if (ctx.signal.aborted) return;
+      refreshBtn.disabled = loading || !ready();
+
+      if (bot) {
+        const working = botSessions.some((s) => s.live && s.working);
+        headerSub.textContent = [
+          refusalAgentLabel(bot.agent_id),
+          bot.model || null,
+          t(bot.paused ? "Paused" : working ? "Working" : "Active"),
+        ]
+          .filter(Boolean)
+          .join(" · ");
+      }
+
+      // C: Compact Avatar Quick-Switch Rail inside Bot Workspace
+      const rail = renderBotRail(ctx, t, {
+        bots: allBots.length ? allBots : bot ? [bot] : [],
+        groups: allGroups,
+        items: allItems,
+        botSessions: allBotSessions,
+        avatars,
+        activeBotId: botId,
+        activeGroupId: null,
+        ready,
+        onPickBot: (b) => {
+          if (b.id !== botId) openBotDetail(ctx, b.id, b._hostId, activeTab);
+        },
+        onPickGroup: (g) => {
+          if (ctx.state?.ui) ctx.state.ui.activeBotGroup = { id: g.id, hostId: g._hostId ?? null };
+          ctx.go("/bots");
+        },
+        onNewBot: () => openCreateBotSheet(ctx, t, () => load(), []),
+      });
+      railMount.replaceChildren(...(rail ? [rail] : []));
+      railMount.hidden = !rail;
+
+      // A: 4 Segment Tabs (Chat / Work / Automations / Settings)
+      const needsCount = items.filter((i) => i.status === "needs_you").length + requests.filter((r) => r.status === "pending").length;
+      const autoErrCount = (upcoming?.schedules || []).filter((s) => s?.last_refusal || s?.last_error).length;
+      const tabDefs = [
+        ["chat", t("Chat"), 0, false],
+        ["work", t("Work"), needsCount, false],
+        ["automations", t("Automations"), autoErrCount, true],
+        ["settings", t("Settings"), 0, false],
+      ];
+      const tabNodes = tabDefs.map(([id, lbl, badgeCount, isErr]) => {
+        const b = button(
+          "",
+          () => {
+            activeTab = id;
+            if (id === "settings" && !soulLoaded && !soulLoading) loadDocs().catch(() => {});
+            draw();
+          },
+          `bot-seg-tab${activeTab === id ? " active" : ""}`,
+        );
+        b.setAttribute("role", "tab");
+        b.setAttribute("aria-selected", String(activeTab === id));
+        b.setAttribute("aria-label", lbl);
+        b.dataset.botTab = id;
+        b.append(el("span", lbl));
+        if (badgeCount > 0) {
+          b.append(el("span", badgeCount > 99 ? "99+" : String(badgeCount), `bot-seg-badge${isErr ? " blocked" : ""}`));
+        }
+        return b;
+      });
+      sync(tabBar, tabNodes);
+
+      const inChat = activeTab === "chat";
+      chatPane.hidden = !inChat;
+      list.hidden = inChat;
+
+      if (inChat) {
+        renderChatTopArea();
+        ensureChatMounted();
+      } else {
+        chatHandle?.setVisible?.(false);
+        const paneNodes =
+          activeTab === "work"
+            ? renderWorkNodes()
+            : activeTab === "automations"
+              ? renderAutomationsNodes()
+              : renderSettingsNodes();
+        sync(list, paneNodes);
+      }
     }
 
     load();
-    return { update: draw };
+    return {
+      update() {
+        draw();
+        if (activeTab === "chat") chatHandle?.update?.();
+      },
+      cleanup() {
+        unmountChat();
+      },
+    };
   }
 
   M.screens["up-next"] = (root, ctx) => {
@@ -2349,6 +3398,7 @@
           }
           draw();
           await refreshHost(ctx, e.host.id).catch(() => {});
+          ctx.syncTabBar?.();
         } catch (err) {
           e.message = `${t("Could not send reply")}: ${safeMsg(err, t)}`;
         } finally {
