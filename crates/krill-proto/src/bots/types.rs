@@ -15,6 +15,20 @@ pub const BOT_ID_MAX_BYTES: usize = 64;
 pub const BOT_SLUG_MAX_BYTES: usize = 64;
 /// Default derived slug length limit (matches Orca's folder limit).
 pub const BOT_DERIVED_SLUG_MAX_BYTES: usize = 40;
+/// Grace window for minor system clock adjustments when verifying that a bot session belongs
+/// to a specific bot instance (`session.created_at_ms + grace >= bot.created_at_ms`).
+pub const BOT_SESSION_CLOCK_SKEW_GRACE_MS: u64 = 60_000;
+
+/// Returns `true` if a session created at `session_created_at_ms` can plausibly belong to a bot
+/// instance created at `bot_created_at_ms`. Rejects stale sessions left behind by a previously
+/// deleted bot whose ID was reused before unique bot IDs were enforced.
+#[must_use]
+pub const fn session_belongs_to_bot(bot_created_at_ms: u64, session_created_at_ms: u64) -> bool {
+    if bot_created_at_ms == 0 || session_created_at_ms == 0 {
+        return true;
+    }
+    session_created_at_ms.saturating_add(BOT_SESSION_CLOCK_SKEW_GRACE_MS) >= bot_created_at_ms
+}
 /// Maximum description UTF-8 byte length.
 pub const BOT_DESCRIPTION_MAX_BYTES: usize = 1024;
 /// Maximum look-around focus UTF-8 byte length.
