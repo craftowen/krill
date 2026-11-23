@@ -1834,10 +1834,7 @@ const groupPromotedHead = el("div", undefined, "bot-group-promoted-head");
 const groupBackBtn = button(
 t("Back to bots"),
 () => {
-activeGroupId = null;
-activeGroupHost = null;
-groupView = null;
-lastGroupDraftKey = null;
+clearActiveGroup();
 hubMode = "bots";
 draw();
 },
@@ -1884,18 +1881,24 @@ if (!ready() || !activeGroupId) return;
 const text = groupTextarea.value.trim();
 if (!text) throw Error(t("Enter a message"));
 groupVoice?.onSend?.(text);
+const gSeq = groupLoadSeq;
+const lSeq = loadSeq;
+const gid = activeGroupId;
+const tid = activeThreadId;
+const hid = activeGroupHost;
 const dk = currentGroupDraftKey();
-await rpcHost(ctx, activeGroupHost, {
+await rpcHost(ctx, hid, {
 action: "bots.groups.send",
-group_id: activeGroupId,
-...(activeThreadId ? { thread_id: activeThreadId } : {}),
+group_id: gid,
+...(tid ? { thread_id: tid } : {}),
 text,
 reply_mode: groupModeSelect.value || groupReplyMode,
 });
 if (ctx.signal.aborted) return;
-groupTextarea.value = "";
 if (dk) ctx.state.drafts?.delete?.(dk);
-await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
+if (gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
+groupTextarea.value = "";
+await loadGroup(gid, tid, hid);
 };
 const groupSendBtn = button(t("Send"), submitGroup, "primary small");
 const groupControls = el("div", undefined, "bot-item-controls");
@@ -1918,7 +1921,16 @@ let loading = false;
 let loaded = false;
 let failure = null;
 let loadSeq = 0;
+let groupLoadSeq = 0;
 let lastHostSig = "";
+const clearActiveGroup = () => {
+groupLoadSeq++;
+activeGroupId = null;
+activeGroupHost = null;
+activeThreadId = null;
+groupView = null;
+lastGroupDraftKey = null;
+};
 const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
 const fetchAvatars = (listItems) => {
 for (const b of listItems) {
@@ -1938,13 +1950,15 @@ draw();
 };
 async function loadGroup(groupId, threadId, hostId = activeGroupHost) {
 if (!ready() || !groupId) return;
+const gSeq = ++groupLoadSeq;
+const lSeq = loadSeq;
 const res = await rpcHost(ctx, hostId, {
 action: "bots.groups.read",
 group_id: groupId,
 ...(threadId ? { thread_id: threadId } : {}),
 limit: 60,
 });
-if (ctx.signal.aborted) return;
+if (ctx.signal.aborted || gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
 groupView = res?.group || null;
 activeGroupId = groupView?.group?.id || groupId;
 activeGroupHost = hostId ?? null;
@@ -1961,6 +1975,8 @@ const prevHostSig = lastHostSig;
 lastHostSig = hostSig();
 const hostChanged = Boolean(prevHostSig && prevHostSig !== lastHostSig);
 if (!targets.length) {
+++loadSeq;
+loading = false;
 bots = [];
 items = [];
 requests = [];
@@ -1968,6 +1984,7 @@ statuses = [];
 groups = [];
 botSessions = [];
 botsCursors.clear();
+clearActiveGroup();
 loaded = true;
 draw();
 return;
@@ -1980,6 +1997,7 @@ statuses = [];
 groups = [];
 botSessions = [];
 botsCursors.clear();
+clearActiveGroup();
 }
 const seq = ++loadSeq;
 loading = true;
@@ -2048,6 +2066,8 @@ const matchedGroup = activeGroupId
 if (matchedGroup) {
 activeGroupHost = matchedGroup._hostId ?? null;
 await loadGroup(matchedGroup.id, activeThreadId, activeGroupHost).catch(() => {});
+} else if (activeGroupId) {
+clearActiveGroup();
 }
 fetchAvatars(bots);
 } else if (reset || hostChanged) {
@@ -2058,6 +2078,7 @@ statuses = [];
 groups = [];
 botSessions = [];
 botsCursors.clear();
+clearActiveGroup();
 }
 if (failedHosts.length) {
 failure = failedHosts
@@ -2112,10 +2133,7 @@ const row = button(
 "",
 () => {
 if (isActive) {
-activeGroupId = null;
-activeGroupHost = null;
-groupView = null;
-lastGroupDraftKey = null;
+clearActiveGroup();
 draw();
 } else {
 hubMode = "groups";
@@ -2148,15 +2166,20 @@ threadNodes.push(tb);
 const newThread = button(
 `+ ${t("Thread")}`,
 async () => {
+const gSeq = groupLoadSeq;
+const lSeq = loadSeq;
+const gid = activeGroupId;
+const hid = activeGroupHost;
 const prevIds = new Set((groupView?.threads || []).map((th) => th.thread_id));
-const res = await rpcHost(ctx, activeGroupHost, { action: "bots.groups.new_thread", group_id: activeGroupId });
+const res = await rpcHost(ctx, hid, { action: "bots.groups.new_thread", group_id: gid });
+if (ctx.signal.aborted || gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
 if (res?.group) {
 groupView = res.group;
 const created = (groupView.threads || []).find((th) => !prevIds.has(th.thread_id));
 activeThreadId = created?.thread_id || groupView.threads?.[0]?.thread_id || null;
 draw();
 } else {
-await loadGroup(activeGroupId, null, activeGroupHost);
+await loadGroup(gid, null, hid);
 }
 },
 "filter-chip",
@@ -2169,12 +2192,18 @@ if (groupView.active_run) {
 const stopBtn = button(
 t("Stop"),
 async () => {
-await rpcHost(ctx, activeGroupHost, {
+const gSeq = groupLoadSeq;
+const lSeq = loadSeq;
+const gid = activeGroupId;
+const tid = activeThreadId;
+const hid = activeGroupHost;
+await rpcHost(ctx, hid, {
 action: "bots.groups.stop",
-group_id: activeGroupId,
-...(activeThreadId ? { thread_id: activeThreadId } : {}),
+group_id: gid,
+...(tid ? { thread_id: tid } : {}),
 });
-await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
+if (ctx.signal.aborted || gSeq !== groupLoadSeq || lSeq !== loadSeq) return;
+await loadGroup(gid, tid, hid);
 },
 "ghost small",
 );

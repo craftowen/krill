@@ -2591,5 +2591,104 @@ async function sweepR2MobileRegressions(){
  }
  console.log('PASS sweep R2 mobile screen regressions: R2M-01, R2M-25, R2M-26, R2M-27');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function sweepR3MobileRegressions(){
+ // R3M-04: BotsHome clears open group state on host switch, all hosts disconnecting, or group deletion,
+ // and guards loadGroup with monotonic groupLoadSeq + loadSeq against stale completion after host switch.
+ {
+  let activeHosts=['h1'];
+  let h1Groups=[{id:'g1',name:'Host A Group',bot_ids:['b1']}];
+  let deferredRead=null;
+  const hostCalls=[];
+  const conns=[
+   {id:'h1',name:'Host A',active:true,connection:{phase:'ready'},snapshot:{capabilities:{bots:true}}},
+   {id:'h2',name:'Host B',active:false,connection:{phase:'ready'},snapshot:{capabilities:{bots:true}}},
+  ];
+  const bf=fixture('bots',{state:{snapshot:{capabilities:{bots:true}}}});
+  bf.ctx.connections=conns;
+  bf.ctx.filteredConnections=()=>conns.filter(c=>activeHosts.includes(c.id));
+  bf.ctx.rpcForHost=(hid,req)=>{
+   hostCalls.push({hid,req});
+   if(req.action==='bots.list'){
+    if(hid==='h1')return Promise.resolve({bots:[{id:'b1',slug:'alpha',name:'Alpha Bot',agent_id:'claude'}]});
+    if(hid==='h2')return Promise.resolve({bots:[{id:'b2',slug:'beta',name:'Beta Bot',agent_id:'codex'}]});
+   }
+   if(req.action==='bots.groups.list'){
+    if(hid==='h1')return Promise.resolve({groups:h1Groups});
+    if(hid==='h2')return Promise.resolve({groups:[{id:'g2',name:'Host B Group',bot_ids:['b2']}]});
+   }
+   if(req.action==='bots.groups.read'){
+    if(deferredRead)return deferredRead.promise;
+    if(hid==='h1')return Promise.resolve({group:{group:{id:'g1',name:'Host A Group',bot_ids:['b1']},threads:[{thread_id:'th-a',title:'Main'}],messages:[{sender_name:'Alpha Bot',body:'From Host A'}],active_run:false}});
+    return Promise.resolve({group:{group:{id:'g2',name:'Host B Group',bot_ids:['b2']},threads:[{thread_id:'th-b',title:'Main'}],messages:[{sender_name:'Beta Bot',body:'From Host B'}],active_run:false}});
+   }
+   if(req.action==='bots.items')return Promise.resolve({items:[]});
+   return Promise.resolve({requests:[],statuses:[],sessions:[]});
+  };
+  bf.view.update();
+  await bf.flush();
+
+  // 1. Open group g1 on Host A -> promoted group view renders Host A's chat.
+  const grpBtn=bf.all().find(n=>n.dataset?.groupRailId==='g1');
+  assert(grpBtn,'R3M-04: Host A group rail button present');
+  await grpBtn.action();
+  await bf.flush();
+  assert(bf.find('.bot-group-promoted'),'R3M-04: promoted group chat opens on Host A');
+  assert(bf.root.textContent.includes('From Host A'));
+
+  // 2. Switch header deviceFilter to Host B -> open group state MUST clear immediately so Host B's hub renders.
+  hostCalls.length=0;
+  activeHosts=['h2'];
+  bf.view.update();
+  await bf.flush();
+  assert(!bf.find('.bot-group-promoted'),'R3M-04: switching host closes Host A promoted group chat');
+  assert(bf.root.textContent.includes('Beta Bot'),'R3M-04: Host B Bots Hub renders instead of Host A group');
+  assert(!bf.root.textContent.includes('From Host A'),'R3M-04: Host A group messages cleared on host switch');
+  assert(!hostCalls.some(c=>c.hid==='h1'),'R3M-04: no RPCs sent to filtered-out Host A after switch');
+
+  // 3. Stale in-flight bots.groups.read from Host A completing AFTER switch to Host B MUST be ignored.
+  activeHosts=['h1'];
+  bf.view.update();
+  await bf.flush();
+  deferredRead=deferred();
+  const grpBtnAgain=bf.all().find(n=>n.dataset?.groupRailId==='g1');
+  const pendingOpen=grpBtnAgain.action();
+  activeHosts=['h2'];
+  bf.view.update();
+  await bf.flush();
+  deferredRead.resolve({group:{group:{id:'g1',name:'Host A Group',bot_ids:['b1']},threads:[{thread_id:'th-a',title:'Main'}],messages:[{sender_name:'Alpha Bot',body:'Late Host A'}],active_run:false}});
+  await pendingOpen;
+  await bf.flush();
+  deferredRead=null;
+  assert(!bf.find('.bot-group-promoted'),'R3M-04: late bots.groups.read from Host A must not reopen group on Host B');
+  assert(bf.root.textContent.includes('Beta Bot'));
+
+  // 4. Open group on Host A, then delete it on Refresh -> !matchedGroup clears open group state.
+  activeHosts=['h1'];
+  bf.view.update();
+  await bf.flush();
+  await bf.all().find(n=>n.dataset?.groupRailId==='g1').action();
+  await bf.flush();
+  assert(bf.find('.bot-group-promoted'));
+  h1Groups=[];
+  await bf.byText('Refresh').action();
+  await bf.flush();
+  assert(!bf.find('.bot-group-promoted'),'R3M-04: deleting open group on refresh closes promoted group view');
+
+  // 5. Open group on Host B, then all hosts disconnect (!targets.length) -> clears open group state.
+  activeHosts=['h2'];
+  bf.view.update();
+  await bf.flush();
+  await bf.all().find(n=>n.dataset?.groupRailId==='g2').action();
+  await bf.flush();
+  assert(bf.find('.bot-group-promoted'));
+  activeHosts=[];
+  bf.ctx.state.connection={phase:'closed'};
+  bf.view.update();
+  await bf.flush();
+  assert(!bf.find('.bot-group-promoted'),'R3M-04: disconnecting all hosts closes promoted group view');
+  bf.abort.abort();
+ }
+ console.log('PASS sweep R3 mobile screen regressions: R3M-04');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

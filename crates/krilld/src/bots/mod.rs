@@ -2860,8 +2860,8 @@ impl ConnectorBridge for DaemonConnectorBridge {
     fn dispatch_external_message_with_hooks(
         &self,
         msg: InboundExternalMessage,
-        on_bound: &mut dyn FnMut(SessionId),
-        on_rollback: &mut dyn FnMut(SessionId),
+        on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+        on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
     ) -> io::Result<DispatchOutcome> {
         let mgr = self
             .manager

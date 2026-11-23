@@ -912,8 +912,8 @@ impl BotRuntime {
         composio_base_url: &str,
         msg: &InboundExternalMessage,
         now_ms: u64,
-        on_bound: Option<&mut dyn FnMut(SessionId)>,
-        on_rollback: Option<&mut dyn FnMut(SessionId)>,
+        on_bound: Option<&mut dyn FnMut(SessionId, Option<u64>)>,
+        on_rollback: Option<&mut dyn FnMut(SessionId, Option<u64>)>,
     ) -> io::Result<(krill_proto::bots::ExternalConversationLink, SessionId, bool)> {
         let mut link = store.lookup_or_create_link(
             &msg.bot_id,
@@ -942,8 +942,10 @@ impl BotRuntime {
                 now_ms,
             );
             relay.update_session_link(&msg.bot_id, sid, &link.id);
-            let mut bound_bridge = on_bound.map(|cb| move |s: SessionId, _seq: u64| cb(s));
-            let mut rollback_bridge = on_rollback.map(|cb| move |s: SessionId, _seq: u64| cb(s));
+            let mut bound_bridge =
+                on_bound.map(|cb| move |s: SessionId, seq: u64| cb(s, Some(seq)));
+            let mut rollback_bridge =
+                on_rollback.map(|cb| move |s: SessionId, seq: u64| cb(s, Some(seq)));
             self.deliver_or_queue_turn_with_link_hooks(
                 registry,
                 store,
@@ -962,7 +964,7 @@ impl BotRuntime {
             return Ok((link, sid, false));
         }
 
-        let mut bound_bridge = on_bound.map(|cb| move |s: SessionId, _seq: u64| cb(s));
+        let mut bound_bridge = on_bound.map(|cb| move |s: SessionId, seq: u64| cb(s, Some(seq)));
         let (sid, _pid) = self
             .start_bot_session_inner(
                 registry,
@@ -1562,6 +1564,7 @@ impl BotRuntime {
             relay.revoke_token(&token);
         }
         self.inner.persist_bindings();
+        registry.release_bot_session(session_id);
         Ok(())
     }
 
@@ -1724,7 +1727,10 @@ impl BotRuntime {
         if let Some(activity) = extract_tool_activity(&event.payload)
             && let Some(mgr) = connectors
         {
-            mgr.on_turn_activity(&binding.bot_id, session_id, &activity);
+            let active_seq = lock(&self.inner.turn_meta)
+                .get(&session_id)
+                .and_then(|m| m.active_turn_seq);
+            mgr.on_turn_activity_seq(&binding.bot_id, session_id, active_seq, &activity);
         }
 
         // 3. On turn stop: heal silent MEMORY.md deletions, mark first_run_completed, extract reply.
@@ -1766,7 +1772,12 @@ impl BotRuntime {
                 .ok();
             }
             if let Some(mgr) = connectors {
-                mgr.on_turn_complete(&binding.bot_id, session_id, Some(err_text.as_str()));
+                mgr.on_turn_complete_seq(
+                    &binding.bot_id,
+                    session_id,
+                    completed_seq,
+                    Some(err_text.as_str()),
+                );
             }
             self.inner.drain_next_queued_turn(
                 registry,
@@ -1863,7 +1874,12 @@ impl BotRuntime {
             .ok();
         }
         if let Some(mgr) = connectors {
-            mgr.on_turn_complete(&binding.bot_id, session_id, final_reply.as_deref());
+            mgr.on_turn_complete_seq(
+                &binding.bot_id,
+                session_id,
+                completed_seq,
+                final_reply.as_deref(),
+            );
         }
         self.inner.drain_next_queued_turn(
             registry,
@@ -2252,7 +2268,7 @@ impl RuntimeInner {
                 .ok();
         }
         if let Some(ref c) = connectors {
-            c.on_turn_complete(bot_id, session_id, Some(fail_note.as_str()));
+            c.on_turn_complete_seq(bot_id, session_id, completed_seq, Some(fail_note.as_str()));
         }
         if let (Some(reg), Some(store)) = (reg, store) {
             self.drain_next_queued_turn(
@@ -2341,7 +2357,12 @@ impl RuntimeInner {
                         .ok();
                     }
                     if let Some(c) = connectors {
-                        c.on_turn_complete(bot_id, session_id, Some(fail_note.as_str()));
+                        c.on_turn_complete_seq(
+                            bot_id,
+                            session_id,
+                            Some(next.turn_seq),
+                            Some(fail_note.as_str()),
+                        );
                     }
                 }
             }
@@ -3332,6 +3353,269 @@ mod tests {
                 "R2M-21: explicit_reply_posted reset"
             );
             assert!(!b.owner_turn_pending, "R2M-21: owner_turn_pending cleared");
+        }
+
+        // R3M-03: non-connector Turn 2 activity & stop completion on a bound session must NOT
+        // leak into a queued external connector Turn 3 (seq correlation across BotRuntime -> ConnectorManager).
+        {
+            use crate::bots::connectors::router::{DeliveryTarget, PlatformSender};
+            use crate::bots::{AccessDecision, ConnectorBridge, DispatchOutcome};
+            use krill_proto::bots::ExternalSource;
+
+            struct RecordingSender {
+                sent: Mutex<Vec<String>>,
+            }
+            impl PlatformSender for RecordingSender {
+                fn source(&self) -> ExternalSource {
+                    ExternalSource::Telegram
+                }
+                fn max_chunk_chars(&self) -> usize {
+                    4000
+                }
+                fn send_message(&self, _target: &DeliveryTarget, text: &str) -> io::Result<String> {
+                    lock(&self.sent).push(text.to_owned());
+                    Ok(format!("msg-{}", lock(&self.sent).len()))
+                }
+                fn edit_message(
+                    &self,
+                    _target: &DeliveryTarget,
+                    _message_id: &str,
+                    text: &str,
+                ) -> io::Result<()> {
+                    lock(&self.sent).push(format!("edit:{text}"));
+                    Ok(())
+                }
+            }
+            struct QueuedSeqBridge {
+                bot: BotConfig,
+                rt: Arc<BotRuntime>,
+                reg: Arc<Registry>,
+                store: Arc<BotStore>,
+                sid: SessionId,
+            }
+            impl ConnectorBridge for QueuedSeqBridge {
+                fn dispatch_external_message(
+                    &self,
+                    msg: InboundExternalMessage,
+                ) -> io::Result<DispatchOutcome> {
+                    let link = self.store.lookup_or_create_link(
+                        &msg.bot_id,
+                        msg.source,
+                        msg.workspace_id.as_deref(),
+                        &msg.channel_id,
+                        msg.thread_id.as_deref(),
+                        msg.acts_for,
+                        1_500,
+                    )?;
+                    Ok(DispatchOutcome {
+                        link,
+                        session_id: self.sid,
+                        started_new_session: false,
+                    })
+                }
+                fn dispatch_external_message_with_hooks(
+                    &self,
+                    msg: InboundExternalMessage,
+                    on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+                    on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
+                ) -> io::Result<DispatchOutcome> {
+                    let mut bound = |s: SessionId, seq: u64| on_bound(s, Some(seq));
+                    let mut rb = |s: SessionId, seq: u64| on_rollback(s, Some(seq));
+                    self.rt
+                        .deliver_or_queue_turn_with_link_hooks(
+                            &self.reg,
+                            &self.store,
+                            self.sid,
+                            &msg.bot_id,
+                            &msg.text,
+                            None,
+                            Some(&mut bound),
+                            Some(&mut rb),
+                        )
+                        .map_err(io::Error::other)?;
+                    self.dispatch_external_message(msg)
+                }
+                fn check_or_request_access(
+                    &self,
+                    _bot_id: &BotId,
+                    _source: ExternalSource,
+                    _sender_id: &str,
+                    _sender_name: &str,
+                    _channel_id: &str,
+                ) -> io::Result<AccessDecision> {
+                    Ok(AccessDecision::Allowed)
+                }
+                fn resolve_secret(
+                    &self,
+                    _bot_id: &BotId,
+                    _explicit_ref: Option<&str>,
+                    _fallback_key: &str,
+                ) -> io::Result<Option<zeroize::Zeroizing<String>>> {
+                    Ok(None)
+                }
+                fn lookup_or_create_link(
+                    &self,
+                    bot_id: &BotId,
+                    source: ExternalSource,
+                    workspace_id: Option<&str>,
+                    channel_id: &str,
+                    thread_id: Option<&str>,
+                    acts_for: krill_proto::bots::ActsFor,
+                ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                    self.store.lookup_or_create_link(
+                        bot_id,
+                        source,
+                        workspace_id,
+                        channel_id,
+                        thread_id,
+                        acts_for,
+                        1_500,
+                    )
+                }
+                fn reply_orchestration_gate(
+                    &self,
+                    _gate_id: &str,
+                    _decision: &str,
+                    _rationale: Option<String>,
+                    _resolved_by: &str,
+                ) -> io::Result<()> {
+                    Ok(())
+                }
+                fn update_connector_status(&self, _status: krill_proto::bots::BotConnectorStatus) {}
+                fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                    (bot_id == &self.bot.id).then(|| self.bot.clone())
+                }
+                fn list_bots(&self) -> Vec<BotConfig> {
+                    vec![self.bot.clone()]
+                }
+            }
+
+            let mut tg_bot = bot.clone();
+            tg_bot.connectors.telegram.enabled = true;
+            tg_bot.connectors.telegram.acts_for = krill_proto::bots::ActsFor::Anyone;
+
+            let sid_seq = SessionId(709_709);
+            lock(&rt.inner.sessions).insert(
+                sid_seq,
+                BotSessionBinding {
+                    bot_id: tg_bot.id.clone(),
+                    link_id: None,
+                    memory_snapshot: MemorySnapshot::capture(""),
+                    chat_offset: 0,
+                    explicit_reply_posted: false,
+                    launch_token: None,
+                    pid: 4245,
+                    label: "seq-test".to_owned(),
+                    created_at_ms: 1_500,
+                    owner_turn_pending: true,
+                    last_prompt: Some("owner secret".to_owned()),
+                },
+            );
+            lock(&rt.inner.turn_meta).insert(
+                sid_seq,
+                SessionTurnMeta {
+                    group_key: None,
+                    turn_seq: 2,
+                    active_turn_seq: Some(2),
+                    pending_turns: VecDeque::new(),
+                },
+            );
+
+            let sender = Arc::new(RecordingSender {
+                sent: Mutex::new(Vec::new()),
+            });
+            let cm_seq = ConnectorManager::new(Arc::new(QueuedSeqBridge {
+                bot: tg_bot.clone(),
+                rt: Arc::clone(&rt),
+                reg: Arc::clone(&reg),
+                store: Arc::clone(&store),
+                sid: sid_seq,
+            }));
+            cm_seq.router().register_sender(
+                tg_bot.id.clone(),
+                ExternalSource::Telegram,
+                sender.clone(),
+            );
+
+            // Alice's message queues as Turn 3 while owner Turn 2 is active.
+            let target = DeliveryTarget {
+                source: ExternalSource::Telegram,
+                workspace_id: None,
+                channel_id: "alice-chan".to_owned(),
+                thread_id: None,
+                reply_to_message_id: Some("m-alice".to_owned()),
+            };
+            let outcome = cm_seq.router().handle_inbound_message(
+                InboundExternalMessage {
+                    bot_id: tg_bot.id.clone(),
+                    source: ExternalSource::Telegram,
+                    workspace_id: None,
+                    channel_id: "alice-chan".to_owned(),
+                    thread_id: None,
+                    sender_id: "alice".to_owned(),
+                    sender_name: "Alice".to_owned(),
+                    text: "ping".to_owned(),
+                    attachments: Vec::new(),
+                    external_message_id: Some("m-alice".to_owned()),
+                    acts_for: krill_proto::bots::ActsFor::Owner,
+                },
+                target,
+                sender.as_ref(),
+            );
+            assert!(matches!(
+                outcome,
+                crate::bots::connectors::router::InboundRouteOutcome::Dispatched(_)
+            ));
+
+            // Turn 2 tool activity must NOT be sent to Alice.
+            let act_ev = HookEvent {
+                id: krill_proto::hook::EventId {
+                    pid: 4245,
+                    unix_ns: 1_510_000_000,
+                },
+                agent: "claude".to_owned(),
+                ppid: 4245,
+                input: krill_proto::hook::Input::Complete,
+                payload: serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"})
+                    .to_string()
+                    .into_bytes(),
+            };
+            rt.on_hook_event_with_groups(&reg, &store, Some(&cm_seq), None, sid_seq, &act_ev);
+            assert!(
+                lock(&sender.sent).is_empty(),
+                "R3M-03: Turn 2 tool activity must not leak into Alice's queued Turn 3 chat"
+            );
+
+            // Turn 2 agy-failed Stop must NOT leak error text into Alice's chat (only drain Turn 3,
+            // which fails delivery because fake session is not in Registry -> delivers Turn 3 dispatch failure).
+            let stop_fail_ev = HookEvent {
+                id: krill_proto::hook::EventId {
+                    pid: 4245,
+                    unix_ns: 1_520_000_000,
+                },
+                agent: "agy".to_owned(),
+                ppid: 4245,
+                input: krill_proto::hook::Input::Complete,
+                payload: serde_json::json!({
+                    "hook_event_name": "Stop",
+                    "terminationReason": "ERROR",
+                    "error": "SECRET_OWNER_TURN2_ERROR"
+                })
+                .to_string()
+                .into_bytes(),
+            };
+            rt.on_hook_event_with_groups(&reg, &store, Some(&cm_seq), None, sid_seq, &stop_fail_ev);
+            let sent_msgs = lock(&sender.sent).clone();
+            assert!(
+                sent_msgs
+                    .iter()
+                    .all(|m| !m.contains("SECRET_OWNER_TURN2_ERROR")),
+                "R3M-03: Turn 2 error must never leak to Alice: {sent_msgs:?}"
+            );
+            assert!(
+                sent_msgs.iter().any(|m| m.contains("[dispatch failed:")),
+                "R3M-03: queued Turn 3 drain failure must still notify Alice: {sent_msgs:?}"
+            );
         }
 
         fs::remove_dir_all(&dir).ok();

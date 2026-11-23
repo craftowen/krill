@@ -140,12 +140,21 @@ impl GateCallbackOutcome {
 #[derive(Debug, Clone)]
 struct ActiveTurnState {
     turn_id: u64,
+    turn_seq: Option<u64>,
     source: ExternalSource,
     target: DeliveryTarget,
     last_inbound_message_id: Option<String>,
     status_message_id: Option<String>,
     last_activity_at_ms: Option<u64>,
     last_activity_text: Option<String>,
+}
+
+fn turn_seq_matches(expected: Option<u64>, actual: Option<u64>) -> bool {
+    match (expected, actual) {
+        (Some(exp), Some(act)) => exp == act,
+        (None, _) => true,
+        (Some(_), None) => false,
+    }
 }
 
 type DeferredInboundLoader = Box<dyn FnOnce(&mut InboundExternalMessage) -> bool + Send + 'static>;
@@ -520,7 +529,7 @@ impl ConversationRouter {
         let inbound_msg_id = msg.external_message_id.clone();
         let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
         let registered_sid = std::cell::Cell::new(None::<SessionId>);
-        let mut on_bound = |sid: SessionId| {
+        let mut on_bound = |sid: SessionId, turn_seq: Option<u64>| {
             if registered_sid.get().is_some() {
                 return;
             }
@@ -531,6 +540,7 @@ impl ConversationRouter {
             }
             queue.push_back(ActiveTurnState {
                 turn_id,
+                turn_seq,
                 source,
                 target: target.clone(),
                 last_inbound_message_id: inbound_msg_id.clone(),
@@ -540,7 +550,7 @@ impl ConversationRouter {
             });
             registered_sid.set(Some(sid));
         };
-        let mut on_rollback = |sid: SessionId| {
+        let mut on_rollback = |sid: SessionId, _turn_seq: Option<u64>| {
             if registered_sid.get() == Some(sid) {
                 registered_sid.set(None);
                 let mut turns = lock(&self.active_turns);
@@ -569,13 +579,13 @@ impl ConversationRouter {
                     links.insert(outcome.link.id.clone(), ext_id.clone());
                 }
                 if registered_sid.get().is_none() {
-                    on_bound(outcome.session_id);
+                    on_bound(outcome.session_id, None);
                 }
                 InboundRouteOutcome::Dispatched(outcome)
             }
             Err(err) => {
                 if let Some(sid) = registered_sid.get() {
-                    on_rollback(sid);
+                    on_rollback(sid, None);
                 }
                 let category = classify_error(&err.to_string());
                 if notify_could_not_finish && let Some(s) = sender {
@@ -682,7 +692,19 @@ impl ConversationRouter {
 
     /// Updates a single in-place status message for `(bot_id, session_id)` at most once every 3s.
     pub fn on_turn_activity(&self, bot_id: &BotId, session_id: SessionId, activity: &str) {
-        self.on_turn_activity_at(bot_id, session_id, activity, now_ms());
+        self.on_turn_activity_at_seq(bot_id, session_id, None, activity, now_ms());
+    }
+
+    /// Sequence-correlated variant of [`Self::on_turn_activity`] so non-connector turns never
+    /// leak status edits into queued external chats.
+    pub fn on_turn_activity_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        activity: &str,
+    ) {
+        self.on_turn_activity_at_seq(bot_id, session_id, turn_seq, activity, now_ms());
     }
 
     /// Deterministic-clock version of [`Self::on_turn_activity`] (also used by tests).
@@ -690,6 +712,18 @@ impl ConversationRouter {
         &self,
         bot_id: &BotId,
         session_id: SessionId,
+        activity: &str,
+        ts_ms: u64,
+    ) {
+        self.on_turn_activity_at_seq(bot_id, session_id, None, activity, ts_ms);
+    }
+
+    /// Deterministic-clock, sequence-correlated variant of [`Self::on_turn_activity_seq`].
+    pub fn on_turn_activity_at_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
         activity: &str,
         ts_ms: u64,
     ) {
@@ -702,7 +736,10 @@ impl ConversationRouter {
         let key = (bot_id.clone(), session_id);
         let plan = {
             let mut turns = lock(&self.active_turns);
-            let Some(state) = turns.get_mut(&key).and_then(VecDeque::front_mut) else {
+            let Some(state) = turns.get_mut(&key).and_then(|q| {
+                q.iter_mut()
+                    .find(|s| turn_seq_matches(s.turn_seq, turn_seq))
+            }) else {
                 return;
             };
             if let Some(last_ts) = state.last_activity_at_ms
@@ -740,8 +777,9 @@ impl ConversationRouter {
             }
         } else if let Ok(new_msg_id) = sender.send_message(&target, &status_text) {
             let mut turns = lock(&self.active_turns);
-            if let Some(state) = turns.get_mut(&key).and_then(VecDeque::front_mut)
-                && state.turn_id == captured_turn_id
+            if let Some(state) = turns
+                .get_mut(&key)
+                .and_then(|q| q.iter_mut().find(|s| s.turn_id == captured_turn_id))
                 && state.status_message_id.is_none()
             {
                 state.status_message_id = Some(new_msg_id);
@@ -762,10 +800,27 @@ impl ConversationRouter {
         session_id: SessionId,
         final_reply: Option<&str>,
     ) {
+        self.on_turn_complete_seq(bot_id, session_id, None, final_reply);
+    }
+
+    /// Sequence-correlated variant of [`Self::on_turn_complete`] so a non-connector turn never
+    /// pops or leaks its final reply into a queued external chat.
+    pub fn on_turn_complete_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        final_reply: Option<&str>,
+    ) {
         let key = (bot_id.clone(), session_id);
         let active = {
             let mut turns = lock(&self.active_turns);
-            let popped = turns.get_mut(&key).and_then(VecDeque::pop_front);
+            let popped = turns.get_mut(&key).and_then(|q| {
+                let idx = q
+                    .iter()
+                    .position(|s| turn_seq_matches(s.turn_seq, turn_seq))?;
+                q.remove(idx)
+            });
             if turns.get(&key).is_some_and(VecDeque::is_empty) {
                 turns.remove(&key);
             }
@@ -2330,6 +2385,185 @@ mod tests {
         assert!(
             lock(&sender.edited).is_empty(),
             "Turn 2 must not edit Turn 1's status message"
+        );
+    }
+
+    #[test]
+    fn r3m03_turn_seq_prevents_non_connector_activity_and_reply_leaking_to_queued_external_chat() {
+        struct SeqBridge {
+            bot: BotConfig,
+            next_seq: AtomicU64,
+        }
+        impl ConnectorBridge for SeqBridge {
+            fn dispatch_external_message(
+                &self,
+                msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Ok(DispatchOutcome {
+                    link: ExternalConversationLink {
+                        id: "link-seq".to_owned(),
+                        bot_id: msg.bot_id,
+                        source: msg.source,
+                        workspace_id: msg.workspace_id,
+                        channel_id: msg.channel_id,
+                        thread_id: msg.thread_id,
+                        acts_for: msg.acts_for,
+                        session_id: Some(SessionId(9)),
+                        created_at_ms: 1_000,
+                        updated_at_ms: 1_000,
+                    },
+                    session_id: SessionId(9),
+                    started_new_session: false,
+                })
+            }
+            fn dispatch_external_message_with_hooks(
+                &self,
+                msg: InboundExternalMessage,
+                on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+                _on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
+            ) -> io::Result<DispatchOutcome> {
+                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+                on_bound(SessionId(9), Some(seq));
+                self.dispatch_external_message(msg)
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Allowed)
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<zeroize::Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                bot_id: &BotId,
+                source: ExternalSource,
+                workspace_id: Option<&str>,
+                channel_id: &str,
+                thread_id: Option<&str>,
+                acts_for: ActsFor,
+            ) -> io::Result<ExternalConversationLink> {
+                Ok(ExternalConversationLink {
+                    id: "link-seq".to_owned(),
+                    bot_id: bot_id.clone(),
+                    source,
+                    workspace_id: workspace_id.map(ToOwned::to_owned),
+                    channel_id: channel_id.to_owned(),
+                    thread_id: thread_id.map(ToOwned::to_owned),
+                    acts_for,
+                    session_id: Some(SessionId(9)),
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: krill_proto::bots::BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (bot_id == &self.bot.id).then(|| self.bot.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.bot.clone()]
+            }
+        }
+
+        let bot_id = BotId::new("bot-r3m03").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "SeqBot", "claude", 1_000).unwrap();
+        bot.connectors.telegram.enabled = true;
+        bot.connectors.telegram.acts_for = ActsFor::Anyone;
+
+        // Owner is currently running Turn 2 (not in router.active_turns). Alice's inbound message
+        // gets queued as Turn 3 (`turn_seq = 3`).
+        let bridge = Arc::new(SeqBridge {
+            bot,
+            next_seq: AtomicU64::new(3),
+        });
+        let router = ConversationRouter::new(bridge);
+        let sender = Arc::new(MockSender::default());
+        router.register_sender(bot_id.clone(), ExternalSource::Telegram, sender.clone());
+
+        let msg = InboundExternalMessage {
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "alice-chat".to_owned(),
+            thread_id: None,
+            sender_id: "alice".to_owned(),
+            sender_name: "Alice".to_owned(),
+            text: "status?".to_owned(),
+            attachments: Vec::new(),
+            external_message_id: Some("m-alice".to_owned()),
+            acts_for: ActsFor::Owner,
+        };
+        let target = DeliveryTarget {
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "alice-chat".to_owned(),
+            thread_id: None,
+            reply_to_message_id: Some("m-alice".to_owned()),
+        };
+        assert!(matches!(
+            router.handle_inbound_message(msg, target, sender.as_ref()),
+            InboundRouteOutcome::Dispatched(_)
+        ));
+
+        // 1. Non-connector Turn 2 activity and completion MUST NOT touch Alice's chat.
+        router.on_turn_activity_at_seq(
+            &bot_id,
+            SessionId(9),
+            Some(2),
+            "Owner tool activity",
+            10_000,
+        );
+        router.on_turn_complete_seq(&bot_id, SessionId(9), Some(2), Some("Private owner reply"));
+        // Untracked (`None`) turn completion MUST NOT hijack a seq-tagged turn either.
+        router.on_turn_activity_at_seq(&bot_id, SessionId(9), None, "Untracked activity", 15_000);
+        router.on_turn_complete_seq(&bot_id, SessionId(9), None, Some("Untracked reply"));
+        assert!(
+            lock(&sender.sent).is_empty(),
+            "non-connector/untracked turns must never leak into Alice's queued external chat"
+        );
+        assert_eq!(
+            lock(&router.active_turns)
+                .get(&(bot_id.clone(), SessionId(9)))
+                .map(VecDeque::len),
+            Some(1),
+            "Alice's Turn 3 must remain queued"
+        );
+
+        // 2. When Turn 3 runs and completes, activity and final reply deliver cleanly to Alice.
+        router.on_turn_activity_at_seq(
+            &bot_id,
+            SessionId(9),
+            Some(3),
+            "Working for Alice...",
+            20_000,
+        );
+        router.on_turn_complete_seq(&bot_id, SessionId(9), Some(3), Some("Hello Alice!"));
+        let sent = lock(&sender.sent).clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].1, "Working for Alice...");
+        assert_eq!(sent[1].1, "Hello Alice!");
+        assert!(
+            lock(&router.active_turns).is_empty(),
+            "Alice's Turn 3 entry must be popped after matching completion"
         );
     }
 }

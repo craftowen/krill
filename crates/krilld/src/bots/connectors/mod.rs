@@ -95,11 +95,11 @@ pub trait ConnectorBridge: Send + Sync {
     fn dispatch_external_message_with_hooks(
         &self,
         msg: InboundExternalMessage,
-        on_bound: &mut dyn FnMut(SessionId),
-        _on_rollback: &mut dyn FnMut(SessionId),
+        on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+        _on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
     ) -> io::Result<DispatchOutcome> {
         let outcome = self.dispatch_external_message(msg)?;
-        on_bound(outcome.session_id);
+        on_bound(outcome.session_id, None);
         Ok(outcome)
     }
 
@@ -649,6 +649,19 @@ impl ConnectorManager {
         self.router.on_turn_activity(bot_id, session_id, activity);
     }
 
+    /// Sequence-correlated variant of [`Self::on_turn_activity`] so non-connector turns never
+    /// leak status edits into queued external chats.
+    pub fn on_turn_activity_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        activity: &str,
+    ) {
+        self.router
+            .on_turn_activity_seq(bot_id, session_id, turn_seq, activity);
+    }
+
     /// Runs an on-demand live connectivity test (`TestConnector`) for `(bot, source)`.
     pub fn test_connector(
         &self,
@@ -795,6 +808,19 @@ impl ConnectorManager {
     ) {
         self.router
             .on_turn_complete(bot_id, session_id, final_reply);
+    }
+
+    /// Sequence-correlated variant of [`Self::on_turn_complete`] so non-connector turns never
+    /// pop or leak replies into queued external chats.
+    pub fn on_turn_complete_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        final_reply: Option<&str>,
+    ) {
+        self.router
+            .on_turn_complete_seq(bot_id, session_id, turn_seq, final_reply);
     }
 
     /// Cleans up queued active turn states when a bot session exits or is killed (MB-10).
