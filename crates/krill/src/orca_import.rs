@@ -6322,10 +6322,12 @@ fn translate_orca_item_event_data(
                 .and_then(Json::as_u64)
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|&idx| idx < options.len());
+            let multi = q.get("multi").and_then(Json::as_bool).unwrap_or(false);
             decisions.push(BotItemDecision {
                 question: question.to_owned(),
                 options,
                 recommended,
+                multi,
             });
         }
     }

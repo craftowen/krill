@@ -1380,6 +1380,7 @@ fn v2_groups_settings_memory_undo_decisions_and_connectors(cx: &mut TestAppConte
             question: "Ship now?".to_owned(),
             options: vec!["Go".to_owned(), "Wait".to_owned()],
             recommended: Some(0),
+            multi: false,
         }],
         created_at_ms: 1_700_000_000_100,
     });
@@ -1923,6 +1924,7 @@ fn home_panel_groups_filters_and_opens_an_item(cx: &mut TestAppContext) {
             question: "Ship it?".to_owned(),
             options: vec!["Yes".to_owned(), "No".to_owned()],
             recommended: Some(0),
+            multi: false,
         }],
         created_at_ms: now,
     });
@@ -2388,6 +2390,7 @@ fn home_item_steps_shows_its_chat_and_steps_several_questions(cx: &mut TestAppCo
                 question: q.to_owned(),
                 options: vec!["Yes".to_owned(), "No".to_owned()],
                 recommended: Some(0),
+                multi: false,
             })
             .to_vec(),
         created_at_ms: now,
@@ -3529,6 +3532,7 @@ fn waiting_question_comment_is_shown_whole_and_settled_comment_clamps(
             question: "Proceed with option A?".into(),
             options: vec!["Yes".into(), "No".into()],
             recommended: Some(0),
+            multi: false,
         }],
         created_at_ms: 2_000,
     };

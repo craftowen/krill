@@ -1398,6 +1398,7 @@ fn parses_and_executes_v2_items_memory_schedules_tools_groups_sessions_avatar_co
             question: "Deploy?".to_owned(),
             options: vec!["Ship".to_owned(), "Hold".to_owned()],
             recommended: Some(0),
+            multi: false,
         }],
         created_at_ms: 10,
     });

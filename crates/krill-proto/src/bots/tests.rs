@@ -843,6 +843,7 @@ fn bot_rpc_feature_bit_kinds_control_wiring_and_secret_redaction() {
                 question: "Ship now?".to_owned(),
                 options: vec!["Yes".to_owned(), "Wait".to_owned()],
                 recommended: Some(0),
+                multi: false,
             }],
             close_note: None,
             snoozed_until_ms: FieldPatch::Unchanged,
@@ -988,6 +989,7 @@ fn bot_rpc_feature_bit_kinds_control_wiring_and_secret_redaction() {
                 question: "Merge now?".to_owned(),
                 options: vec!["Yes".to_owned(), "No".to_owned()],
                 recommended: Some(0),
+                multi: false,
             }],
             created_at_ms: 1_700_000_000_000,
         }],
@@ -1208,6 +1210,7 @@ fn v0317_wire_golden_bytes_unchanged() {
                 question: "Merge now?".to_owned(),
                 options: vec!["Yes".to_owned(), "No".to_owned()],
                 recommended: Some(0),
+                multi: false,
             }],
             created_at_ms: 1_700_000_000_000,
         }],
@@ -1944,6 +1947,32 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
         request_id: None,
     };
     assert!(!format!("{answer_req:?}").contains("PRIVATE_ANSWER_BODY"));
+
+    // BotItemDecision.multi backward compatibility: legacy JSON omits multi -> defaults false; multi:true round-trips on JSON.
+    let legacy_dec: BotItemDecision =
+        serde_json::from_str(r#"{"question":"Ship?","options":["Yes","No"],"recommended":0}"#)
+            .unwrap();
+    assert!(!legacy_dec.multi);
+    assert!(
+        !serde_json::to_string(&legacy_dec)
+            .unwrap()
+            .contains("multi")
+    );
+    let multi_dec = BotItemDecision {
+        question: "Channels?".to_owned(),
+        options: vec!["Slack".to_owned(), "Email".to_owned()],
+        recommended: Some(0),
+        multi: true,
+    };
+    let encoded_multi = serde_json::to_string(&multi_dec).unwrap();
+    assert!(encoded_multi.contains(r#""multi":true"#));
+    let decoded_multi: BotItemDecision = serde_json::from_str(&encoded_multi).unwrap();
+    assert_eq!(decoded_multi, multi_dec);
+    let wire_dec = postcard::to_stdvec(&legacy_dec).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<BotItemDecision>(&wire_dec).unwrap(),
+        legacy_dec
+    );
 
     // Bounded deserialization on UploadBotAvatar and ImportBotZipV2
     let oversize_avatar = BotRpcRequest::UploadBotAvatar {

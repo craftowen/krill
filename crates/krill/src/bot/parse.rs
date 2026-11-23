@@ -2030,6 +2030,7 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                         question: trimmed.to_owned(),
                         options: Vec::new(),
                         recommended: None,
+                        multi: false,
                     });
                     any_field = true;
                 } else if let Some(val) = take_opt(tail, &mut idx, "--option")? {

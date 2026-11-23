@@ -1330,6 +1330,7 @@ mod tests {
             question: q.to_owned(),
             options: vec!["Yes".to_owned(), "No".to_owned()],
             recommended: Some(0),
+            multi: false,
         }
     }
 
@@ -1511,16 +1512,19 @@ mod tests {
                         question: "Where should the switcher live?".to_owned(),
                         options: vec!["Top strip".to_owned(), "Right panel".to_owned()],
                         recommended: Some(0),
+                        multi: false,
                     },
                     BotItemDecision {
                         question: "Keep sidebar chat rows?".to_owned(),
                         options: vec!["No".to_owned(), "Yes".to_owned()],
                         recommended: Some(0),
+                        multi: false,
                     },
                     BotItemDecision {
                         question: "Shortcut to switch chats?".to_owned(),
                         options: vec!["Cmd+1-9".to_owned(), "Ctrl+1-9".to_owned()],
                         recommended: Some(0),
+                        multi: false,
                     },
                 ],
                 created_at_ms: 1_700_000_000_000,

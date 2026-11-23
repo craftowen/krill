@@ -781,7 +781,7 @@ impl BotItemsStore {
         item_id: &str,
         answer_text: Option<&str>,
         option_index: Option<u32>,
-        _decision_id: Option<&str>,
+        decision_id: Option<&str>,
         request_id: Option<&str>,
         actor: &BotItemActor,
         now_ms: u64,
@@ -842,14 +842,7 @@ impl BotItemsStore {
 
             let resolved_option = if let Some(idx) = option_index {
                 let idx_usize = usize::try_from(idx).unwrap_or(usize::MAX);
-                let latest_decisions = item
-                    .events
-                    .iter()
-                    .rev()
-                    .find(|e| !e.decisions.is_empty())
-                    .map(|e| e.decisions.as_slice());
-                let opt_label = latest_decisions
-                    .and_then(|decs| decs.first())
+                let opt_label = resolve_target_decision(&item.events, decision_id)
                     .and_then(|d| d.options.get(idx_usize))
                     .cloned();
                 match opt_label {
@@ -867,6 +860,8 @@ impl BotItemsStore {
             };
 
             let answer_summary = match (resolved_option, text_trimmed) {
+                (Some(opt), Some(txt)) if opt == txt => opt,
+                (Some(_), Some(txt)) if txt.contains(" → ") => txt,
                 (Some(opt), Some(txt)) => format!("{opt} — {txt}"),
                 (Some(opt), None) => opt,
                 (None, Some(txt)) => txt,
@@ -1382,6 +1377,44 @@ fn parse_items_cursor(raw: &str) -> io::Result<(i64, String)> {
         ));
     }
     Ok((ts, uid_part.to_owned()))
+}
+
+fn resolve_target_decision<'a>(
+    events: &'a [BotItemEvent],
+    decision_id: Option<&str>,
+) -> Option<&'a BotItemDecision> {
+    let trimmed = decision_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(raw) = trimmed {
+        if let Some((ev_part, dec_part)) = raw.split_once(':')
+            && let (Ok(ev_id), Ok(dec_idx)) = (ev_part.parse::<u64>(), dec_part.parse::<usize>())
+        {
+            return events
+                .iter()
+                .find(|e| e.id == ev_id)
+                .and_then(|e| e.decisions.get(dec_idx));
+        }
+        let latest = events
+            .iter()
+            .rev()
+            .find(|e| !e.decisions.is_empty())
+            .map(|e| e.decisions.as_slice())?;
+        if let Ok(dec_idx) = raw.parse::<usize>() {
+            return latest.get(dec_idx);
+        }
+        return latest.iter().find(|d| {
+            let q = d.question.trim();
+            q == raw
+                || q.lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .is_some_and(|line| line == raw)
+        });
+    }
+    events
+        .iter()
+        .rev()
+        .find(|e| !e.decisions.is_empty())
+        .and_then(|e| e.decisions.first())
 }
 
 fn load_item_by_uid(conn: &Connection, uid: &str) -> io::Result<Option<BotItem>> {
@@ -1913,6 +1946,7 @@ mod tests {
                         question: "Approve?".to_owned(),
                         options: vec!["Yes".to_owned(), "No".to_owned()],
                         recommended: Some(0),
+                        multi: false,
                     }],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
@@ -1942,6 +1976,7 @@ mod tests {
                         question: "Env?".to_owned(),
                         options: vec!["Staging".to_owned(), "Prod".to_owned()],
                         recommended: Some(0),
+                        multi: false,
                     }],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Set(99_000),
@@ -2123,6 +2158,210 @@ mod tests {
         assert_eq!(lazy_store.items_seen_event_id(&bot_a).unwrap(), 0);
         assert!(!untouched_db.exists());
         assert!(!lazy_store.is_open());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn answer_item_matches_decision_id_and_persists_multi_compat() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-bot-items-dec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = BotItemsStore::new(dir.join("items.db"));
+        let bot_agy = BotId::new("bot-agy").unwrap();
+        let bot_actor = BotItemActor::Bot {
+            bot_id: bot_agy.clone(),
+            session_id: None,
+        };
+        let owner = BotItemActor::Owner {
+            device: Some("phone".to_owned()),
+        };
+
+        let item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_agy.clone(),
+                    title: "Release rollout".to_owned(),
+                    description: None,
+                    done_means: Some("Rollout plan confirmed".to_owned()),
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                1_000,
+            )
+            .unwrap();
+
+        let asked = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Confirm rollout target and channels".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "Target env?".to_owned(),
+                            options: vec!["Staging".to_owned(), "Prod".to_owned()],
+                            recommended: Some(0),
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "Notify channels?".to_owned(),
+                            options: vec![
+                                "Slack".to_owned(),
+                                "Email".to_owned(),
+                                "Changelog".to_owned(),
+                            ],
+                            recommended: Some(0),
+                            multi: true,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &bot_actor,
+                1_500,
+            )
+            .unwrap();
+        let ask_event = asked
+            .events
+            .iter()
+            .rev()
+            .find(|e| !e.decisions.is_empty())
+            .unwrap();
+        assert!(!ask_event.decisions[0].multi);
+        assert!(ask_event.decisions[1].multi);
+
+        // Matching by "<event_id>:1" targets the second decision (not decs.first()).
+        let by_ev_idx = store
+            .answer_item(
+                &item.uid,
+                None,
+                Some(2),
+                Some(&format!("{}:1", ask_event.id)),
+                None,
+                &owner,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(by_ev_idx.answer_summary, "Changelog");
+        assert!(by_ev_idx.should_wake_bot);
+        assert_eq!(by_ev_idx.item.status, BotItemStatus::Working);
+
+        // Matching by numeric index "1" and deduplicating identical option_index + answer_text.
+        let by_num = store
+            .answer_item(
+                &item.uid,
+                Some("Email"),
+                Some(1),
+                Some("1"),
+                None,
+                &owner,
+                2_100,
+            )
+            .unwrap();
+        assert_eq!(by_num.answer_summary, "Email");
+
+        // Matching by question text.
+        let by_question = store
+            .answer_item(
+                &item.uid,
+                None,
+                Some(1),
+                Some("Target env?"),
+                None,
+                &owner,
+                2_200,
+            )
+            .unwrap();
+        assert_eq!(by_question.answer_summary, "Prod");
+
+        // Named multi-question answer passes through cleanly without duplicating option label.
+        let named = store
+            .answer_item(
+                &item.uid,
+                Some("Notify channels? → Slack, Email"),
+                Some(0),
+                Some("1"),
+                None,
+                &owner,
+                2_300,
+            )
+            .unwrap();
+        assert_eq!(named.answer_summary, "Notify channels? → Slack, Email");
+
+        // Legacy SQLite row without "multi" deserializes as multi: false.
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE item_events SET decisions_json = ?1 WHERE id = ?2",
+                    params![
+                        r#"[{"question":"Legacy?","options":["A","B"],"recommended":0}]"#,
+                        i64::try_from(ask_event.id).unwrap()
+                    ],
+                )
+                .map_err(sql_err)?;
+                Ok(())
+            })
+            .unwrap();
+        let reloaded = store.get_item(&item.uid).unwrap().unwrap();
+        let legacy_ev = reloaded
+            .events
+            .iter()
+            .find(|e| e.id == ask_event.id)
+            .unwrap();
+        assert_eq!(legacy_ev.decisions[0].question, "Legacy?");
+        assert!(!legacy_ev.decisions[0].multi);
+
+        // Text-only needs_you item (no decisions) answered via answer_item wakes bot and moves to Working.
+        let text_only = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_agy,
+                    title: "Refund policy wording".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                3_000,
+            )
+            .unwrap();
+        store
+            .add_comment(
+                &text_only.uid,
+                &bot_actor,
+                "Please confirm whether partial refund note is needed.",
+                &[],
+                3_100,
+            )
+            .unwrap();
+        let text_ans = store
+            .answer_item(
+                &text_only.uid,
+                Some("Keep 7-day clause and add 1 line for prorated refunds."),
+                None,
+                None,
+                None,
+                &owner,
+                3_200,
+            )
+            .unwrap();
+        assert!(text_ans.should_wake_bot);
+        assert_eq!(text_ans.item.status, BotItemStatus::Working);
+        assert_eq!(
+            text_ans.answer_summary,
+            "Keep 7-day clause and add 1 line for prorated refunds."
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
