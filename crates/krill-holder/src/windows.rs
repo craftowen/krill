@@ -275,9 +275,7 @@ impl Holder {
         for s in self.sessions.iter_mut().filter(|s| s.status.is_none()) {
             // Also drains the Job's IOCP notifications so they never pile up.
             let empty = s.job.empty().unwrap_or(false);
-            // As on Unix the session ends with its leader (shell). Apps it launched (GUI,
-            // new console) keep running, as in Windows Terminal. A teardown waits for the
-            // rest of the Job or its deadline.
+            // Session ends with its leader shell (as on Unix); teardown waits for Job or deadline.
             let status = match s.process.status() {
                 Ok(Some(status)) if s.deadline.is_none() || empty => status,
                 Err(_) if empty => STATUS_UNKNOWN,
@@ -289,7 +287,9 @@ impl Holder {
             s.console.close();
             events.push(FromHolder::Exited { id: s.id, status });
         }
-        if events.iter().any(|m| self.send(m, None).is_err()) {
+        if self.daemon.as_ref().is_some_and(|d| d.link.is_some())
+            && events.iter().any(|m| self.send(m, None).is_err())
+        {
             self.drop_link();
         }
         self.idle()
@@ -299,8 +299,7 @@ impl Holder {
     }
     fn daemon_exited(&mut self, status: i32, uptime: Duration) -> bool {
         if status == i32::from(KRILLD_DUPLICATE) {
-            // Another daemon owns the socket, so a restart only repeats this every 30 seconds
-            // (A-01). Keep each session's console until it ends.
+            // Another daemon owns the socket; park and keep each session's console until exit (A-01).
             self.daemon = None;
             self.parked = true;
             return self.idle();

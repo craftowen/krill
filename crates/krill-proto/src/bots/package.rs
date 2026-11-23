@@ -27,9 +27,10 @@ pub const MAX_ZIP_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ZIP_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum raw `.zip` archive size accepted by [`import_bot_zip`] (16 MiB).
 pub const MAX_ZIP_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum PNG avatar byte size accepted by [`strip_png_metadata`] and IPC RPCs (768 KiB,
-/// below `ipc::MAX_FRAME` = 1 MiB).
-pub const MAX_AVATAR_PNG_BYTES: usize = 768 * 1024;
+/// Maximum PNG avatar byte size accepted by [`strip_png_metadata`] and IPC RPCs (512 KiB,
+/// leaving 256 KiB headroom inside `MAX_RPC_ZIP_BYTES` for Store-mode ZIP export and keeping
+/// Mobile base64+JSON responses well below `ipc::MAX_FRAME` = 1 MiB).
+pub const MAX_AVATAR_PNG_BYTES: usize = 512 * 1024;
 
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 const ZIP_LOCAL_FILE_HEADER_SIG: u32 = 0x0403_4b50;

@@ -42,6 +42,25 @@ fn run_args_parse_chain_forms_and_ignore_unknown_flags() {
     // 모르는 플래그는 틱을 깨지 않게 무시한다.
     assert!(parse_run_args(&args(&["--json"])).chain.is_none());
     assert!(parse_run_args(&args(&["--chain"])).chain.is_none());
+
+    // Shell-agnostic `--chain-b64` decodes commands containing single quotes and spaces.
+    let ps_cmd = r#"powershell -Command "Write-Host 'hi'""#;
+    let encoded = statusline::encode_chain_b64(ps_cmd);
+    assert_eq!(
+        parse_run_args(&args(&["--chain-b64", &encoded])).chain,
+        Some(OsString::from(ps_cmd))
+    );
+    let eq_flag = format!("--chain-b64={encoded}");
+    assert_eq!(
+        parse_run_args(&args(&[&eq_flag])).chain,
+        Some(OsString::from(ps_cmd))
+    );
+    assert!(
+        parse_run_args(&args(&["--chain-b64", "not valid!!!"]))
+            .chain
+            .is_none()
+    );
+    assert!(parse_run_args(&args(&["--chain-b64"])).chain.is_none());
 }
 
 #[test]
@@ -308,10 +327,13 @@ fn help_flag_returns_zero() {
         super::run(&args(&["install", "--bogus"])),
         ExitCode::from(2)
     );
-    // Values immediately following `--chain` belong to the chained shell command, not CLI help.
+    // Values immediately following `--chain` or `--chain-b64` belong to the chained command, not CLI help.
     assert!(!super::wants_help(&args(&["--chain", "help"])));
     assert!(!super::wants_help(&args(&["--chain", "-h"])));
     assert!(!super::wants_help(&args(&["--chain", "--help"])));
+    assert!(!super::wants_help(&args(&["--chain-b64", "help"])));
+    assert!(!super::wants_help(&args(&["--chain-b64", "-h"])));
+    assert!(!super::wants_help(&args(&["--chain-b64", "--help"])));
 }
 
 #[test]

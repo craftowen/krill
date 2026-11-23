@@ -1014,17 +1014,20 @@ pub enum Failure {
 }
 
 /// [`Failure::Os`]의 와이어 표현. macOS는 자기 errno 그대로다. Linux는 두 OS 번호가 같은 1~34만 그대로 보내고,
-/// 그 밖은 `LINUX_TAG + errno`로 보낸다 — 번호가 겹쳐도(Linux ETIME 62 = macOS ELOOP 62) 같은 OS끼리는 늘 원래 값으로
-/// 돌아오고, 받는 macOS는 아는 것만 자기 번호로 옮긴다(모르는 값은 "Unknown error 100xx"로 남아 틀린 문구를 피한다).
+/// 그 밖은 `LINUX_TAG + errno`로 보낸다. Windows는 `WinSock`(10000+)이 `LINUX_TAG + linux_errno`와 겹치지 않게
+/// `>= LINUX_TAG`를 `WIN_TAG + code`로 표시해, 같은 OS끼리는 늘 원래 값으로 돌아오고 이기종은 아는 오류만 변환한다.
 mod wire_errno {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    /// Linux errno 표식. 실제 errno는 이보다 훨씬 작다.
+    /// Linux errno 표식. 실제 Linux errno는 이보다 훨씬 작다.
     const LINUX_TAG: i32 = 10_000;
-    /// 1~34는 두 OS가 같다.
-    #[cfg(target_os = "linux")]
+    /// Windows `WinSock`/확장 오류 표식(`LINUX_TAG + linux_errno` 대역과 분리).
+    const WIN_TAG: i32 = 100_000;
+    /// 1~34는 Linux·macOS가 같다.
+    #[cfg(any(target_os = "linux", test))]
     const SHARED_MAX: i32 = 34;
     /// (Linux, macOS) 번호가 다른 errno 중 spawn·IO·소켓에서 나올 만한 것.
+    #[cfg(any(not(windows), test))]
     const PAIRS: &[(i32, i32)] = &[
         (35, 11),  // EDEADLK
         (36, 63),  // ENAMETOOLONG
@@ -1037,22 +1040,72 @@ mod wire_errno {
         (110, 60), // ETIMEDOUT
         (111, 61), // ECONNREFUSED
     ];
+    /// (`WinSock`, Linux, macOS) 공통 소켓 오류 대응.
+    #[cfg(any(not(windows), test))]
+    const WINSOCK_UNIX_PAIRS: &[(i32, i32, i32)] = &[
+        (10_035, 11, 35),  // WSAEWOULDBLOCK -> EAGAIN
+        (10_036, 115, 36), // WSAEINPROGRESS -> EINPROGRESS
+        (10_038, 88, 38),  // WSAENOTSOCK -> ENOTSOCK
+        (10_040, 90, 40),  // WSAEMSGSIZE -> EMSGSIZE
+        (10_045, 95, 45),  // WSAEOPNOTSUPP -> EOPNOTSUPP
+        (10_048, 98, 48),  // WSAEADDRINUSE -> EADDRINUSE
+        (10_049, 99, 49),  // WSAEADDRNOTAVAIL -> EADDRNOTAVAIL
+        (10_050, 100, 50), // WSAENETDOWN -> ENETDOWN
+        (10_051, 101, 51), // WSAENETUNREACH -> ENETUNREACH
+        (10_053, 103, 53), // WSAECONNABORTED -> ECONNABORTED
+        (10_054, 104, 54), // WSAECONNRESET -> ECONNRESET
+        (10_057, 107, 57), // WSAENOTCONN -> ENOTCONN
+        (10_060, 110, 60), // WSAETIMEDOUT -> ETIMEDOUT
+        (10_061, 111, 61), // WSAECONNREFUSED -> ECONNREFUSED
+        (10_065, 113, 65), // WSAEHOSTUNREACH -> EHOSTUNREACH
+    ];
+    /// (Linux, Win32/`WinSock`) Windows 수신측 변환표.
+    #[cfg(any(windows, test))]
+    const LINUX_WINDOWS_PAIRS: &[(i32, i32)] = &[
+        (35, 1_131),   // EDEADLK -> ERROR_POSSIBLE_DEADLOCK
+        (36, 206),     // ENAMETOOLONG -> ERROR_FILENAME_EXCED_RANGE
+        (38, 120),     // ENOSYS -> ERROR_CALL_NOT_IMPLEMENTED
+        (39, 145),     // ENOTEMPTY -> ERROR_DIR_NOT_EMPTY
+        (40, 1_921),   // ELOOP -> ERROR_CANT_RESOLVE_FILENAME
+        (88, 10_038),  // ENOTSOCK -> WSAENOTSOCK
+        (90, 10_040),  // EMSGSIZE -> WSAEMSGSIZE
+        (95, 10_045),  // EOPNOTSUPP -> WSAEOPNOTSUPP
+        (98, 10_048),  // EADDRINUSE -> WSAEADDRINUSE
+        (99, 10_049),  // EADDRNOTAVAIL -> WSAEADDRNOTAVAIL
+        (100, 10_050), // ENETDOWN -> WSAENETDOWN
+        (101, 10_051), // ENETUNREACH -> WSAENETUNREACH
+        (103, 10_053), // ECONNABORTED -> WSAECONNABORTED
+        (104, 10_054), // ECONNRESET -> WSAECONNRESET
+        (107, 10_057), // ENOTCONN -> WSAENOTCONN
+        (110, 10_060), // ETIMEDOUT -> WSAETIMEDOUT
+        (111, 10_061), // ECONNREFUSED -> WSAECONNREFUSED
+        (113, 10_065), // EHOSTUNREACH -> WSAEHOSTUNREACH
+        (115, 10_036), // EINPROGRESS -> WSAEINPROGRESS
+    ];
     /// Linux EAGAIN(11)은 1~34 안이라 그대로 가지만 macOS EAGAIN은 35다.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     const LINUX_EAGAIN: i32 = 11;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     const MACOS_EAGAIN: i32 = 35;
 
-    #[cfg(target_os = "linux")]
-    pub(super) fn to_wire(local: i32) -> i32 {
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn to_wire_linux(local: i32) -> i32 {
         if (1..=SHARED_MAX).contains(&local) {
             local
         } else {
             LINUX_TAG.saturating_add(local)
         }
     }
-    #[cfg(target_os = "linux")]
-    pub(super) fn from_wire(wire: i32) -> i32 {
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn from_wire_linux(wire: i32) -> i32 {
+        if wire >= WIN_TAG {
+            let win = wire.saturating_sub(WIN_TAG);
+            return WINSOCK_UNIX_PAIRS
+                .iter()
+                .find(|p| p.0 == win)
+                .map_or(wire, |p| p.1);
+        }
         if wire > LINUX_TAG {
             return wire.saturating_sub(LINUX_TAG);
         }
@@ -1068,17 +1121,76 @@ mod wire_errno {
             .find(|p| p.1 == wire && p.1 > SHARED_MAX)
             .map_or(wire, |p| p.0)
     }
-    #[cfg(not(target_os = "linux"))]
-    pub(super) fn to_wire(local: i32) -> i32 {
+
+    #[cfg(any(all(not(target_os = "linux"), not(windows)), test))]
+    pub(super) fn to_wire_macos(local: i32) -> i32 {
         local
     }
-    #[cfg(not(target_os = "linux"))]
-    pub(super) fn from_wire(wire: i32) -> i32 {
+
+    #[cfg(any(all(not(target_os = "linux"), not(windows)), test))]
+    pub(super) fn from_wire_macos(wire: i32) -> i32 {
+        if wire >= WIN_TAG {
+            let win = wire.saturating_sub(WIN_TAG);
+            return WINSOCK_UNIX_PAIRS
+                .iter()
+                .find(|p| p.0 == win)
+                .map_or(wire, |p| p.2);
+        }
         let Some(linux) = wire.checked_sub(LINUX_TAG).filter(|e| *e > 0) else {
             // macOS 피어, 또는 Linux의 1~34(같은 번호). 단 Linux EAGAIN(11)은 macOS EDEADLK(11)과 겹쳐 구분할 수 없어 그대로 둔다.
             return wire;
         };
         PAIRS.iter().find(|p| p.0 == linux).map_or(wire, |p| p.1)
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn to_wire_windows(local: i32) -> i32 {
+        if local >= LINUX_TAG {
+            WIN_TAG.saturating_add(local)
+        } else {
+            local
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn from_wire_windows(wire: i32) -> i32 {
+        if wire >= WIN_TAG {
+            return wire.saturating_sub(WIN_TAG);
+        }
+        let Some(linux) = wire.checked_sub(LINUX_TAG).filter(|e| *e > 0) else {
+            return wire;
+        };
+        LINUX_WINDOWS_PAIRS
+            .iter()
+            .find(|p| p.0 == linux)
+            .map_or(wire, |p| p.1)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        to_wire_linux(local)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        from_wire_linux(wire)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        to_wire_windows(local)
+    }
+    #[cfg(windows)]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        from_wire_windows(wire)
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        to_wire_macos(local)
+    }
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        from_wire_macos(wire)
     }
 
     #[expect(
@@ -1350,9 +1462,6 @@ impl Msg for Request {
         })
     }
 }
-/// Postcard variant discriminant for [`Reply::Bot`] (0-indexed variant 33).
-const REPLY_BOT_TAG: u8 = 33;
-
 impl Msg for Reply {
     const KIND: u8 = kind::REPLY;
 
@@ -1448,22 +1557,10 @@ impl Msg for Reply {
             }
             return crate::ipc::encode_frame(Self::KIND, &body);
         }
-        if let Self::Bot(resp) = self {
-            let mut body = postcard::to_stdvec(&REPLY_BOT_TAG).map_err(crate::ipc::Error::Codec)?;
-            body.extend(resp.encode_wire_body()?);
-            return crate::ipc::encode_frame(Self::KIND, &body);
-        }
         crate::ipc::encode(Self::KIND, self)
     }
 
     fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
-        if kind == Self::KIND && body.first() == Some(&REPLY_BOT_TAG) {
-            let (_, rest) =
-                postcard::take_from_bytes::<u8>(body).map_err(crate::ipc::Error::Codec)?;
-            return Ok(Self::Bot(crate::bots::BotRpcResponse::decode_wire_body(
-                rest,
-            )?));
-        }
         if kind == Self::KIND && body.first() == Some(&4) {
             let (mut reply, rest) =
                 postcard::take_from_bytes::<Self>(body).map_err(crate::ipc::Error::Codec)?;

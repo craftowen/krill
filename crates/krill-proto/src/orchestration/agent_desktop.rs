@@ -613,8 +613,26 @@ fn stage_pair_from_dir(
         }
         atomic_copy_executable(&helper_src, &bin_dir.join(helper))?;
     }
-    atomic_copy_executable(&main_src, &bin_dir.join(asset.main_binary))?;
+    let staged_main = bin_dir.join(asset.main_binary);
+    #[cfg(any(not(unix), test))]
+    backfill_pre_sidecar_link_sha256(bin_dir, &staged_main)?;
+    atomic_copy_executable(&main_src, &staged_main)?;
     write_version_stamp(bin_dir, version)
+}
+
+#[cfg(any(not(unix), test))]
+fn backfill_pre_sidecar_link_sha256(bin_dir: &Path, staged_main: &Path) -> io::Result<()> {
+    if read_link_sha256(bin_dir).is_some() {
+        return Ok(());
+    }
+    if let Ok(meta) = fs::symlink_metadata(staged_main)
+        && meta.is_file()
+        && !meta.file_type().is_symlink()
+        && let Ok(digest) = file_sha256(staged_main)
+    {
+        write_link_sha256(bin_dir, &digest)?;
+    }
+    Ok(())
 }
 
 fn atomic_copy_executable(src: &Path, dst: &Path) -> io::Result<()> {
@@ -1277,6 +1295,62 @@ mod tests {
             AgentDesktopLinkStatus::ForeignPreserved(link_path.clone())
         );
         assert_eq!(fs::read(&link_path).unwrap(), b"user-custom-agent-desktop");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_pair_from_dir_backfills_pre_sidecar_digest_for_windows_upgrade() {
+        let root = temp_home("pre-sidecar-upgrade");
+        let home = root.join("home");
+        let bin_dir = crate::user_dirs::share_dir(&home).join("bin");
+        let local_bin = home.join(".local/bin");
+        let src_v2 = root.join("src-v2");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&local_bin).unwrap();
+        fs::create_dir_all(&src_v2).unwrap();
+
+        let win_asset = PINNED_ASSETS
+            .iter()
+            .find(|a| a.target == AgentDesktopTarget::WindowsX64)
+            .unwrap();
+        let staged_main = bin_dir.join(win_asset.main_binary);
+        let link_path = local_bin.join(win_asset.main_binary);
+
+        // Pre-PC-20 Windows install: v1 staged + copied to ~/.local/bin, no sidecar file yet.
+        fs::write(&staged_main, b"agent-desktop-v1-legacy").unwrap();
+        fs::write(&link_path, b"agent-desktop-v1-legacy").unwrap();
+        assert!(!bin_dir.join(CLI_LINK_SHA256_FILE).exists());
+
+        // Stage v2 over staged_main; backfill must record v1's SHA-256 before overwriting.
+        let src_main = src_v2.join(win_asset.main_binary);
+        fs::write(&src_main, b"agent-desktop-v2-new").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&src_main, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        stage_pair_from_dir(&src_v2, &bin_dir, win_asset, "2.0.0").unwrap();
+        assert_eq!(fs::read(&staged_main).unwrap(), b"agent-desktop-v2-new");
+        assert!(bin_dir.join(CLI_LINK_SHA256_FILE).is_file());
+
+        // Now sync_copied_cli_link recognizes v1 in link_path via backfilled sidecar and upgrades it.
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::Linked(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"agent-desktop-v2-new");
+
+        // Pre-sidecar foreign binary at link_path must still be preserved when staged upgrades.
+        fs::remove_file(bin_dir.join(CLI_LINK_SHA256_FILE)).unwrap();
+        fs::write(&link_path, b"foreign-user-binary").unwrap();
+        fs::write(&src_main, b"agent-desktop-v3-new").unwrap();
+        stage_pair_from_dir(&src_v2, &bin_dir, win_asset, "3.0.0").unwrap();
+        assert_eq!(
+            sync_copied_cli_link(&home, &staged_main, &link_path).unwrap(),
+            AgentDesktopLinkStatus::ForeignPreserved(link_path.clone())
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), b"foreign-user-binary");
 
         fs::remove_dir_all(root).unwrap();
     }

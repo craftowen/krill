@@ -1095,8 +1095,11 @@ fn is_windows_drive_path(s: &str) -> bool {
 
 fn sqlite_immutable_uri_from_raw(raw: &str, windows_separators: bool) -> String {
     let normalized: std::borrow::Cow<'_, str> = if windows_separators {
-        let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
-            format!("//{unc}")
+        let stripped = if raw
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+        {
+            format!("//{}", raw.get(8..).unwrap_or_default())
         } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
             rest.to_owned()
         } else {
@@ -1109,6 +1112,8 @@ fn sqlite_immutable_uri_from_raw(raw: &str, windows_separators: bool) -> String 
     let mut encoded = String::with_capacity(normalized.len().saturating_add(32));
     if windows_separators && is_windows_drive_path(&normalized) {
         encoded.push_str("file:///");
+    } else if normalized.starts_with("//") {
+        encoded.push_str("file://");
     } else {
         encoded.push_str("file:");
     }
@@ -3119,20 +3124,36 @@ fn import_projects_domain(
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
 
+            let host_id = setup
+                .host_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty() && *h != "local")
+                .map(str::to_owned);
+            let base_id = setup
+                .repo_id
+                .as_deref()
+                .or(setup.project_id.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let trimmed = setup.id.trim();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                })
+                .map_or_else(|| slugify(&display_name), str::to_owned);
+            let id = match &host_id {
+                Some(host) => format!("{host}:{base_id}"),
+                None => base_id,
+            };
+
             let candidate = StoredProject {
-                id: setup
-                    .repo_id
-                    .or(setup.project_id)
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| setup.id.trim().to_owned()),
+                id,
                 path: clean_path,
                 display_name,
                 badge_color,
                 repo_icon,
                 kind,
-                host_id: setup
-                    .host_id
-                    .filter(|h| !h.trim().is_empty() && h.trim() != "local"),
+                host_id,
                 worktree_base_ref: None,
                 worktree_base_path: setup.worktree_base_path.filter(|s| !s.trim().is_empty()),
                 symlink_paths: setup
@@ -3351,9 +3372,10 @@ fn upsert_project(
     summary: &mut ProjectsImportSummary,
 ) {
     if let Some(existing) = store.projects.iter_mut().find(|p| {
-        (p.host_id == candidate.host_id
-            && (p.path == candidate.path || same_import_path(&p.path, &candidate.path)))
-            || p.id == candidate.id
+        p.host_id == candidate.host_id
+            && (p.path == candidate.path
+                || same_import_path(&p.path, &candidate.path)
+                || p.id == candidate.id)
     }) {
         let mut changed = false;
         if existing.path != candidate.path && same_import_path(&existing.path, &candidate.path) {
@@ -3805,168 +3827,172 @@ fn import_settings_domain(
     warnings: &mut Vec<String>,
 ) -> io::Result<SettingsImportSummary> {
     let mut summary = SettingsImportSummary::default();
-    let Some(settings) = domains.get("settings") else {
-        return Ok(summary);
-    };
-
-    // 1. `<state_dir>/settings.toml`
-    let settings_path = opts.state_dir.join(SETTINGS_FILE);
-    let original = read_original(&settings_path)?;
-    let mut settings_table: toml::Table = match &original {
-        Some(raw) => toml::from_str(raw).map_err(invalid_data)?,
-        None => toml::Table::new(),
-    };
-    let before_settings = settings_table.clone();
-
-    if let Some(raw_agent) = settings.get("defaultTuiAgent").and_then(Json::as_str)
-        && let Some(mapped) = map_orca_agent_id(raw_agent)
-    {
-        settings_table.insert(
-            "default_agent".to_owned(),
-            toml::Value::String(mapped.to_owned()),
-        );
-        summary.default_agent = Some(mapped.to_owned());
-    }
-
-    if let Some(size) = settings.get("terminalFontSize").and_then(Json::as_u64) {
-        let clamped = u8::try_from(size).unwrap_or(13).clamp(10, 24);
-        settings_table.insert(
-            "terminal_font_size".to_owned(),
-            toml::Value::Integer(i64::from(clamped)),
-        );
-    }
-
-    if let Some(family) = settings
-        .get("terminalFontFamily")
-        .and_then(Json::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        // OWE-899: 고정폭 확인이 안 되는 이름(SF Mono 등)은 셀 계산을 깨뜨리므로
-        // 반영하지 않고 사유를 남긴다.
-        if importable_terminal_font(family) {
-            settings_table.insert(
-                "terminal_font_family".to_owned(),
-                toml::Value::String(family.to_owned()),
-            );
-        } else {
-            let reason = terminal_font_skip_reason(family);
-            summary.terminal_font_skipped = Some(reason.clone());
-            warnings.push(reason);
-        }
-    }
-
-    if let Some(cursor) = settings.get("terminalCursorStyle").and_then(Json::as_str) {
-        let shape = match cursor.trim().to_ascii_lowercase().as_str() {
-            "bar" | "beam" => Some("bar"),
-            "underline" => Some("underline"),
-            "block" => Some("block"),
-            _ => None,
+    if let Some(settings) = domains.get("settings") {
+        // 1. `<state_dir>/settings.toml`
+        let settings_path = opts.state_dir.join(SETTINGS_FILE);
+        let original = read_original(&settings_path)?;
+        let mut settings_table: toml::Table = match &original {
+            Some(raw) => toml::from_str(raw).map_err(invalid_data)?,
+            None => toml::Table::new(),
         };
-        if let Some(s) = shape {
+        let before_settings = settings_table.clone();
+
+        if let Some(raw_agent) = settings.get("defaultTuiAgent").and_then(Json::as_str)
+            && let Some(mapped) = map_orca_agent_id(raw_agent)
+        {
             settings_table.insert(
-                "terminal_cursor_shape".to_owned(),
-                toml::Value::String(s.to_owned()),
+                "default_agent".to_owned(),
+                toml::Value::String(mapped.to_owned()),
+            );
+            summary.default_agent = Some(mapped.to_owned());
+        }
+
+        if let Some(size) = settings.get("terminalFontSize").and_then(Json::as_u64) {
+            let clamped = u8::try_from(size).unwrap_or(13).clamp(10, 24);
+            settings_table.insert(
+                "terminal_font_size".to_owned(),
+                toml::Value::Integer(i64::from(clamped)),
             );
         }
-    }
 
-    if let Some(blink) = settings.get("terminalCursorBlink").and_then(Json::as_bool) {
-        settings_table.insert(
-            "terminal_cursor_blink".to_owned(),
-            toml::Value::Boolean(blink),
-        );
-    }
-
-    if let Some(theme) = settings.get("theme").and_then(Json::as_str) {
-        let mapped = match theme.trim().to_ascii_lowercase().as_str() {
-            "light" => Some("light"),
-            "dark" => Some("dark"),
-            "system" => Some("system"),
-            _ => None,
-        };
-        if let Some(t) = mapped {
-            settings_table.insert("theme".to_owned(), toml::Value::String(t.to_owned()));
-        }
-    }
-
-    if let Some(awake) = settings.get("computerAwakeMode").and_then(Json::as_str) {
-        let mapped = match awake.trim().to_ascii_lowercase().as_str() {
-            "always" | "on" => Some("on"),
-            "while-agents-run" | "auto" | "agent" => Some("agent"),
-            "never" | "off" => Some("off"),
-            _ => None,
-        };
-        if let Some(a) = mapped {
-            settings_table.insert("keep_awake".to_owned(), toml::Value::String(a.to_owned()));
-        }
-    } else if let Some(keep) = settings
-        .get("keepComputerAwakeWhileAgentsRun")
-        .and_then(Json::as_bool)
-    {
-        settings_table.insert(
-            "keep_awake".to_owned(),
-            toml::Value::String(if keep { "agent" } else { "off" }.to_owned()),
-        );
-    }
-
-    // Merge `terminalQuickCommands`
-    if let Some(arr) = settings.get("terminalQuickCommands")
-        && let Ok(orca_cmds) = serde_json::from_value::<Vec<OrcaQuickCommand>>(arr.clone())
-    {
-        let mut existing_cmds: Vec<QuickCmdEntry> = settings_table
-            .get("quick_commands")
-            .and_then(|v| v.clone().try_into().ok())
-            .unwrap_or_default();
-
-        for qc in orca_cmds {
-            let name = qc.label.trim().to_owned();
-            let text = qc
-                .command
-                .as_deref()
-                .or(qc.prompt.as_deref())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            let Some(text) = text else {
-                continue;
-            };
-            if name.is_empty() {
-                continue;
+        if let Some(family) = settings
+            .get("terminalFontFamily")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // OWE-899: 고정폭 확인이 안 되는 이름(SF Mono 등)은 셀 계산을 깨뜨리므로
+            // 반영하지 않고 사유를 남긴다.
+            if importable_terminal_font(family) {
+                settings_table.insert(
+                    "terminal_font_family".to_owned(),
+                    toml::Value::String(family.to_owned()),
+                );
+            } else {
+                let reason = terminal_font_skip_reason(family);
+                summary.terminal_font_skipped = Some(reason.clone());
+                warnings.push(reason);
             }
-            if let Some(found) = existing_cmds.iter_mut().find(|c| c.name == name) {
-                if found.text != text {
-                    found.text = text;
+        }
+
+        if let Some(cursor) = settings.get("terminalCursorStyle").and_then(Json::as_str) {
+            let shape = match cursor.trim().to_ascii_lowercase().as_str() {
+                "bar" | "beam" => Some("bar"),
+                "underline" => Some("underline"),
+                "block" => Some("block"),
+                _ => None,
+            };
+            if let Some(s) = shape {
+                settings_table.insert(
+                    "terminal_cursor_shape".to_owned(),
+                    toml::Value::String(s.to_owned()),
+                );
+            }
+        }
+
+        if let Some(blink) = settings.get("terminalCursorBlink").and_then(Json::as_bool) {
+            settings_table.insert(
+                "terminal_cursor_blink".to_owned(),
+                toml::Value::Boolean(blink),
+            );
+        }
+
+        if let Some(theme) = settings.get("theme").and_then(Json::as_str) {
+            let mapped = match theme.trim().to_ascii_lowercase().as_str() {
+                "light" => Some("light"),
+                "dark" => Some("dark"),
+                "system" => Some("system"),
+                _ => None,
+            };
+            if let Some(t) = mapped {
+                settings_table.insert("theme".to_owned(), toml::Value::String(t.to_owned()));
+            }
+        }
+
+        if let Some(awake) = settings.get("computerAwakeMode").and_then(Json::as_str) {
+            let mapped = match awake.trim().to_ascii_lowercase().as_str() {
+                "always" | "on" => Some("on"),
+                "while-agents-run" | "auto" | "agent" => Some("agent"),
+                "never" | "off" => Some("off"),
+                _ => None,
+            };
+            if let Some(a) = mapped {
+                settings_table.insert("keep_awake".to_owned(), toml::Value::String(a.to_owned()));
+            }
+        } else if let Some(keep) = settings
+            .get("keepComputerAwakeWhileAgentsRun")
+            .and_then(Json::as_bool)
+        {
+            settings_table.insert(
+                "keep_awake".to_owned(),
+                toml::Value::String(if keep { "agent" } else { "off" }.to_owned()),
+            );
+        }
+
+        // Merge `terminalQuickCommands`
+        if let Some(arr) = settings.get("terminalQuickCommands")
+            && let Ok(orca_cmds) = serde_json::from_value::<Vec<OrcaQuickCommand>>(arr.clone())
+        {
+            let mut existing_cmds: Vec<QuickCmdEntry> = settings_table
+                .get("quick_commands")
+                .and_then(|v| v.clone().try_into().ok())
+                .unwrap_or_default();
+
+            for qc in orca_cmds {
+                let name = qc.label.trim().to_owned();
+                let text = qc
+                    .command
+                    .as_deref()
+                    .or(qc.prompt.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let Some(text) = text else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(found) = existing_cmds.iter_mut().find(|c| c.name == name) {
+                    if found.text != text {
+                        found.text = text;
+                        summary.quick_commands_merged =
+                            summary.quick_commands_merged.saturating_add(1);
+                    }
+                } else {
+                    existing_cmds.push(QuickCmdEntry { name, text });
                     summary.quick_commands_merged = summary.quick_commands_merged.saturating_add(1);
                 }
-            } else {
-                existing_cmds.push(QuickCmdEntry { name, text });
-                summary.quick_commands_merged = summary.quick_commands_merged.saturating_add(1);
+            }
+
+            if !existing_cmds.is_empty()
+                && let Ok(val) = toml::Value::try_from(existing_cmds)
+            {
+                settings_table.insert("quick_commands".to_owned(), val);
             }
         }
 
-        if !existing_cmds.is_empty()
-            && let Ok(val) = toml::Value::try_from(existing_cmds)
-        {
-            settings_table.insert("quick_commands".to_owned(), val);
+        import_orca_terminal_themes(settings, &mut settings_table);
+
+        if settings_table != before_settings {
+            summary.settings_updated = true;
+            if !opts.dry_run {
+                let text = config_document::save_toml(&settings_path, &settings_table)?;
+                write_atomic_0600(&settings_path, text.as_bytes(), original.as_deref())?;
+            }
         }
+
+        // 2. `<state_dir>/agents.toml` (`agentCmdOverrides`, `agentDefaultArgs`, `agentDefaultEnv`)
+        summary.agents_updated = import_agent_profiles(opts, settings, warnings)?;
     }
-
-    import_orca_terminal_themes(settings, &mut settings_table);
-
-    if settings_table != before_settings {
-        summary.settings_updated = true;
-        if !opts.dry_run {
-            let text = config_document::save_toml(&settings_path, &settings_table)?;
-            write_atomic_0600(&settings_path, text.as_bytes(), original.as_deref())?;
-        }
-    }
-
-    // 2. `<state_dir>/agents.toml` (`agentCmdOverrides`, `agentDefaultArgs`, `agentDefaultEnv`)
-    summary.agents_updated = import_agent_profiles(opts, settings, warnings)?;
 
     // 3. `<state_dir>/schedules.toml` (`automations`)
-    summary.schedules_merged = import_automations(opts, domains, settings, warnings)?;
+    summary.schedules_merged = import_automations(
+        opts,
+        domains,
+        domains.get("settings").unwrap_or(&Json::Null),
+        warnings,
+    )?;
 
     Ok(summary)
 }
@@ -4389,16 +4415,10 @@ fn import_automations(
         if id.len() > 64 {
             id.truncate(64);
         }
-        let cron = auto
-            .rrule
-            .as_deref()
-            .and_then(|expr| schedule::parse_schedule_to_cron(expr).ok())
-            .unwrap_or_else(|| {
-                rrule_to_utc_cron(
-                    auto.rrule.as_deref(),
-                    auto.dtstart.as_ref().and_then(Json::as_str),
-                )
-            });
+        let cron = automation_rrule_to_cron(
+            auto.rrule.as_deref(),
+            auto.dtstart.as_ref().and_then(Json::as_str),
+        );
         let cwd = resolve_automation_cwd(&opts.home, &auto, &projects);
         let command = resolve_automation_command(auto.agent_id.as_deref());
         let existing_entry = schedules.schedule.iter().find(|s| s.id == id);
@@ -4598,6 +4618,22 @@ fn resolve_automation_command(agent_id: Option<&str>) -> Vec<String> {
             .unwrap_or("claude")
             .to_owned(),
     ]
+}
+
+/// Routes RRULE strings directly to [`rrule_to_utc_cron`] so `dtstart` wall-clock time is
+/// preserved instead of falling back to `schedule::parse_schedule_to_cron`'s hardcoded 09:00.
+fn automation_rrule_to_cron(rrule: Option<&str>, dtstart: Option<&str>) -> String {
+    if let Some(expr) = rrule {
+        let trimmed = expr.trim();
+        let is_rrule = trimmed.contains('=')
+            || trimmed
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RRULE:"));
+        if !is_rrule && let Ok(cron) = schedule::parse_schedule_to_cron(trimmed) {
+            return cron;
+        }
+    }
+    rrule_to_utc_cron(rrule, dtstart)
 }
 
 /// RFC 5545 RRULE(`FREQ=DAILY;BYHOUR=9;BYMINUTE=30` 등)을 Krill 5-필드 UTC cron으로 변환한다.
@@ -5822,16 +5858,10 @@ fn migrate_bot_scoped_automations(
         if sched_id.len() > 64 {
             sched_id.truncate(64);
         }
-        let cron = auto
-            .rrule
-            .as_deref()
-            .and_then(|expr| schedule::parse_schedule_to_cron(expr).ok())
-            .unwrap_or_else(|| {
-                rrule_to_utc_cron(
-                    auto.rrule.as_deref(),
-                    auto.dtstart.as_ref().and_then(Json::as_str),
-                )
-            });
+        let cron = automation_rrule_to_cron(
+            auto.rrule.as_deref(),
+            auto.dtstart.as_ref().and_then(Json::as_str),
+        );
         if let Err(err) = Cron::parse(&cron) {
             warnings.push(format!(
                 "skipping bot automation '{}': invalid cron '{cron}': {err}",
@@ -6116,6 +6146,14 @@ fn import_orca_bot_groups(
     Ok(added)
 }
 
+struct TempSqlFileGuard(PathBuf);
+
+impl Drop for TempSqlFileGuard {
+    fn drop(&mut self) {
+        fs::remove_file(&self.0).ok();
+    }
+}
+
 fn import_orca_bot_items(
     opts: &ImportOptions,
     profile_id: &str,
@@ -6164,26 +6202,21 @@ fn import_orca_bot_items(
 
     let dst_db = bots_root.join(BOT_ITEMS_DB_FILE);
     let mut existing_uids = BTreeSet::new();
-    let mut used_numbers: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
-    let mut max_number_by_bot: BTreeMap<String, u64> = BTreeMap::new();
-    if dst_db.is_file()
-        && let Ok(existing_rows) =
-            run_sqlite3_json_rows(&dst_db, "SELECT uid, owner_bot_id, number FROM items;")
-    {
-        for row in existing_rows {
-            if let Some(uid) = row.get("uid").and_then(Json::as_str) {
-                existing_uids.insert(uid.to_owned());
-            }
-            if let (Some(bot), Some(num)) = (
-                row.get("owner_bot_id").and_then(Json::as_str),
-                row.get("number").and_then(Json::as_u64),
-            ) {
-                used_numbers.entry(bot.to_owned()).or_default().insert(num);
-                let slot = max_number_by_bot.entry(bot.to_owned()).or_insert(0);
-                if num > *slot {
-                    *slot = num;
+    if dst_db.is_file() {
+        match run_sqlite3_json_rows(&dst_db, "SELECT uid, owner_bot_id, number FROM items;") {
+            Ok(existing_rows) => {
+                for row in existing_rows {
+                    if let Some(uid) = row.get("uid").and_then(Json::as_str) {
+                        existing_uids.insert(uid.to_owned());
+                    }
                 }
             }
+            Err(err)
+                if err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no such table") => {}
+            Err(err) => return Err(err),
         }
     }
 
@@ -6215,18 +6248,6 @@ fn import_orca_bot_items(
         };
         let owner_str = owner_bot_id.as_str().to_owned();
         let raw_num = row.get("number").and_then(Json::as_u64).unwrap_or(1);
-        let nums = used_numbers.entry(owner_str.clone()).or_default();
-        let max_slot = max_number_by_bot.entry(owner_str.clone()).or_insert(0);
-        let final_num = if nums.insert(raw_num) {
-            if raw_num > *max_slot {
-                *max_slot = raw_num;
-            }
-            raw_num
-        } else {
-            *max_slot = max_slot.saturating_add(1);
-            nums.insert(*max_slot);
-            *max_slot
-        };
         let title = row
             .get("title")
             .and_then(Json::as_str)
@@ -6246,19 +6267,22 @@ fn import_orca_bot_items(
         };
         pending_uids.insert(uid.to_owned());
         resolved_owner_by_uid.insert(uid.to_owned(), owner_bot_id);
-        pending_items.push((uid.to_owned(), final_num, owner_str, title, status, row));
+        pending_items.push((uid.to_owned(), raw_num, owner_str, title, status, row));
     }
 
     if pending_items.is_empty() {
         return Ok(0);
     }
 
+    let mut imported_count = pending_items.len();
+
     if !opts.dry_run {
         ensure_dir_0700(bots_root)?;
         let mut sql = String::from(
-            "PRAGMA journal_mode = WAL;\n\
-             PRAGMA busy_timeout = 5000;\n\
+            "PRAGMA busy_timeout = 5000;\n\
+             PRAGMA journal_mode = WAL;\n\
              PRAGMA foreign_keys = ON;\n\
+             BEGIN IMMEDIATE;\n\
              CREATE TABLE IF NOT EXISTS items (\n\
                  uid TEXT PRIMARY KEY,\n\
                  number INTEGER NOT NULL,\n\
@@ -6295,10 +6319,10 @@ fn import_orca_bot_items(
                  created_at_ms INTEGER NOT NULL\n\
              );\n\
              CREATE INDEX IF NOT EXISTS idx_item_events_uid ON item_events(item_uid);\n\
-             BEGIN IMMEDIATE;\n",
+             CREATE TEMP TABLE _imported_uids (uid TEXT PRIMARY KEY);\n",
         );
 
-        for (uid, num, owner, title, status, row) in &pending_items {
+        for (uid, raw_num, owner, title, status, row) in &pending_items {
             let desc = row.get("description").and_then(Json::as_str);
             let done_means = row.get("done_means").and_then(Json::as_str);
             let close_note = row.get("close_note").and_then(Json::as_str);
@@ -6314,11 +6338,18 @@ fn import_orca_bot_items(
                 .and_then(Json::as_u64)
                 .unwrap_or(updated);
             let closed = row.get("closed_at").and_then(Json::as_u64);
+            let uid_sql = sql_hex_text(uid);
+            let owner_sql = sql_hex_text(owner);
             writeln!(
                 sql,
-                "INSERT OR IGNORE INTO items (uid, number, owner_bot_id, title, description, done_means, status, close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, updated_at_ms, closed_at_ms) VALUES ({}, {num}, {}, {}, {}, {}, {}, {}, {}, {version}, {last_act}, {created}, {updated}, {});",
-                sql_hex_text(uid),
-                sql_hex_text(owner),
+                "INSERT INTO _imported_uids (uid) SELECT {uid_sql} WHERE NOT EXISTS (SELECT 1 FROM items WHERE uid = {uid_sql});\n\
+                 INSERT INTO items (uid, number, owner_bot_id, title, description, done_means, status, close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, updated_at_ms, closed_at_ms) \
+                 SELECT {uid_sql}, \
+                 CASE WHEN NOT EXISTS (SELECT 1 FROM items WHERE owner_bot_id = {owner_sql} AND number = {raw_num}) \
+                 THEN {raw_num} \
+                 ELSE COALESCE((SELECT MAX(number) FROM items WHERE owner_bot_id = {owner_sql}), 0) + 1 END, \
+                 {owner_sql}, {}, {}, {}, {}, {}, {}, {version}, {last_act}, {created}, {updated}, {} \
+                 WHERE EXISTS (SELECT 1 FROM _imported_uids WHERE uid = {uid_sql});",
                 sql_hex_text(title),
                 sql_opt_hex_text(desc),
                 sql_opt_hex_text(done_means),
@@ -6347,10 +6378,10 @@ fn import_orca_bot_items(
                 "dispatch" | "pr" | "url" | "file" => kind_raw,
                 _ => continue,
             };
+            let uid_sql = sql_hex_text(uid);
             writeln!(
                 sql,
-                "INSERT OR IGNORE INTO item_links (item_uid, kind, target) VALUES ({}, {}, {});",
-                sql_hex_text(uid),
+                "INSERT OR IGNORE INTO item_links (item_uid, kind, target) SELECT {uid_sql}, {}, {} WHERE EXISTS (SELECT 1 FROM _imported_uids WHERE uid = {uid_sql});",
                 sql_hex_text(kind),
                 sql_hex_text(target),
             )
@@ -6388,10 +6419,10 @@ fn import_orca_bot_items(
             );
             let decisions_json = serde_json::to_string(&decisions).map_err(invalid_data)?;
             let created = ev.get("created_at").and_then(Json::as_u64).unwrap_or(0);
+            let uid_sql = sql_hex_text(uid);
             writeln!(
                 sql,
-                "INSERT INTO item_events (item_uid, kind, actor_json, text, decisions_json, created_at_ms) VALUES ({}, {}, {}, {}, {}, {created});",
-                sql_hex_text(uid),
+                "INSERT INTO item_events (item_uid, kind, actor_json, text, decisions_json, created_at_ms) SELECT {uid_sql}, {}, {}, {}, {}, {created} WHERE EXISTS (SELECT 1 FROM _imported_uids WHERE uid = {uid_sql});",
                 sql_hex_text(kind),
                 sql_hex_text(&actor_json),
                 sql_hex_text(&text),
@@ -6400,17 +6431,30 @@ fn import_orca_bot_items(
             .ok();
         }
 
-        sql.push_str("COMMIT;\n");
-        let mut child = Command::new(sqlite3_binary())
+        sql.push_str("SELECT 'IMPORTED_COUNT=' || COUNT(*) FROM _imported_uids;\nCOMMIT;\n");
+
+        let sql_path = bots_root.join(format!(
+            ".orca-import-items-{}-{}.sql",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let mut open = OpenOptions::new();
+            open.create_new(true).write(true);
+            #[cfg(unix)]
+            open.mode(0o600);
+            let mut file = open.open(&sql_path)?;
+            file.write_all(sql.as_bytes())?;
+        }
+        let _sql_guard = TempSqlFileGuard(sql_path.clone());
+        let sql_stdin = File::open(&sql_path)?;
+        let out = Command::new(sqlite3_binary())
+            .arg("-bail")
             .arg(&dst_db)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(sql_stdin))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(sql.as_bytes())?;
-        }
-        let out = child.wait_with_output()?;
+            .output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(io::Error::other(format!(
@@ -6419,13 +6463,22 @@ fn import_orca_bot_items(
                 stderr.trim()
             )));
         }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(count) = stdout
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix("IMPORTED_COUNT="))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            imported_count = count;
+        }
         #[cfg(unix)]
         {
             fs::set_permissions(&dst_db, fs::Permissions::from_mode(0o600)).ok();
         }
     }
 
-    Ok(pending_items.len())
+    Ok(imported_count)
 }
 
 fn translate_orca_item_actor(
@@ -8414,15 +8467,30 @@ mod tests {
         let win_unc = sqlite_immutable_uri_from_raw(r"\\server\share\홍길동\db.sqlite", true);
         assert_eq!(
             win_unc,
-            "file://server/share/%ED%99%8D%EA%B8%B8%EB%8F%99/db.sqlite?immutable=1"
+            "file:////server/share/%ED%99%8D%EA%B8%B8%EB%8F%99/db.sqlite?immutable=1"
         );
 
         let win_verbatim_unc =
             sqlite_immutable_uri_from_raw(r"\\?\UNC\server\share\홍길동\db.sqlite", true);
         assert_eq!(
             win_verbatim_unc,
-            "file://server/share/%ED%99%8D%EA%B8%B8%EB%8F%99/db.sqlite?immutable=1"
+            "file:////server/share/%ED%99%8D%EA%B8%B8%EB%8F%99/db.sqlite?immutable=1"
         );
+
+        let win_verbatim_unc_lower =
+            sqlite_immutable_uri_from_raw(r"\\?\unc\localhost\share\db.sqlite", true);
+        assert_eq!(
+            win_verbatim_unc_lower,
+            "file:////localhost/share/db.sqlite?immutable=1"
+        );
+
+        let unix_double_slash = sqlite_immutable_uri_from_raw("//tmp/profile-state.db", false);
+        assert_eq!(
+            unix_double_slash,
+            "file:////tmp/profile-state.db?immutable=1"
+        );
+        let unix_localhost = sqlite_immutable_uri_from_raw("//localhost/db.sqlite", false);
+        assert_eq!(unix_localhost, "file:////localhost/db.sqlite?immutable=1");
     }
 
     /// PC-14: WAL-mode SQLite DBs without `-shm` under non-ASCII paths succeed via immutable URI.
@@ -9968,5 +10036,387 @@ PRAGMA wal_checkpoint(TRUNCATE);
             extract_remote_host("https://dev.example.com:9000?token=1"),
             Some(("dev.example.com".to_owned(), Some(9000)))
         );
+    }
+
+    #[test]
+    fn import_settings_domain_imports_automations_without_settings_domain_and_honors_dtstart() {
+        let root = std::env::temp_dir().join(format!("krill-r2p-09-10-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state_dir = root.join("state");
+        let orca_dir = root.join("orca");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&orca_dir).unwrap();
+
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            "automations".to_owned(),
+            serde_json::json!([
+                {
+                    "id": "daily-digest",
+                    "name": "Daily digest",
+                    "prompt": "Summarize today",
+                    "rrule": "FREQ=DAILY",
+                    "dtstart": "2026-10-01T14:30:00Z",
+                    "enabled": true
+                },
+                {
+                    "id": "weekly-sync",
+                    "name": "Weekly sync",
+                    "prompt": "Check PRs",
+                    "rrule": "FREQ=WEEKLY;BYDAY=MO,WE",
+                    "dtstart": "2026-10-01T14:30:00Z",
+                    "enabled": true
+                },
+                {
+                    "id": "hourly-ping",
+                    "name": "Hourly ping",
+                    "prompt": "Ping status",
+                    "rrule": "FREQ=HOURLY",
+                    "dtstart": "2026-10-01T14:30:00Z",
+                    "enabled": true
+                },
+                {
+                    "id": "plain-cron",
+                    "name": "Plain cron",
+                    "prompt": "Plain cron job",
+                    "rrule": "15 8 * * 1-5",
+                    "dtstart": "2026-10-01T14:30:00Z",
+                    "enabled": true
+                }
+            ]),
+        );
+
+        let opts = ImportOptions {
+            home,
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Settings],
+            dry_run: false,
+        };
+        let mut warnings = Vec::new();
+        let summary = import_settings_domain(&opts, &domains, &mut warnings).unwrap();
+        assert_eq!(summary.schedules_merged, 4, "warnings: {warnings:?}");
+
+        let loaded = Schedules::load(&state_dir).unwrap();
+        let cron_of = |id: &str| {
+            loaded
+                .schedule
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.cron.clone())
+        };
+        assert_eq!(cron_of("orca-daily-digest").as_deref(), Some("30 14 * * *"));
+        assert_eq!(
+            cron_of("orca-weekly-sync").as_deref(),
+            Some("30 14 * * 1,3")
+        );
+        assert_eq!(cron_of("orca-hourly-ping").as_deref(), Some("30 * * * *"));
+        assert_eq!(cron_of("orca-plain-cron").as_deref(), Some("15 8 * * 1-5"));
+
+        // Bot-scoped RRULE automation also preserves dtstart wall-clock time.
+        let mut bot_domains = BTreeMap::new();
+        bot_domains.insert(
+            "automations".to_owned(),
+            serde_json::json!([{
+                "id": "bot-daily",
+                "name": "Bot daily",
+                "prompt": "Check queue",
+                "rrule": "FREQ=DAILY",
+                "dtstart": "2026-10-01T14:30:00Z",
+                "bot": { "botId": "bot-1" }
+            }]),
+        );
+        let mut bot_cfg = build_krill_bot_config("helper", None, None, None, 0).unwrap();
+        bot_cfg.id = BotId::new("bot-1").unwrap();
+        let mut bots = vec![bot_cfg];
+        let mut map = BTreeMap::new();
+        map.insert("bot-1".to_owned(), BotId::new("bot-1").unwrap());
+        let mut bot_warnings = Vec::new();
+        let (migrated, _) =
+            migrate_bot_scoped_automations(&bot_domains, &mut bots, &map, &mut bot_warnings);
+        assert_eq!(migrated, 1, "warnings: {bot_warnings:?}");
+        assert_eq!(bots[0].schedules[0].cron, "30 14 * * *");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn allocate_unique_bot_slug_avoids_existing_directory_without_bot_json() {
+        let root = std::env::temp_dir().join(format!("krill-r2p-12-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let bots_root = root.join("bots");
+        let existing_dir = bots_root.join("helper");
+        fs::create_dir_all(&existing_dir).unwrap();
+        fs::write(existing_dir.join("notes.txt"), "keep me").unwrap();
+
+        let base = BotSlug::new("helper").unwrap();
+        let allocated = allocate_unique_bot_slug(&[], &bots_root, &base);
+        assert_eq!(allocated.as_str(), "helper-2");
+        assert_eq!(
+            fs::read_to_string(existing_dir.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remote_project_host_setups_do_not_overwrite_local_or_other_host_projects() {
+        let root = std::env::temp_dir().join(format!("krill-r2p-13-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state_dir = root.join("state");
+        let orca_dir = root.join("orca");
+        let local_repo = root.join("local-repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&orca_dir).unwrap();
+        fs::create_dir_all(&local_repo).unwrap();
+
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            "repos".to_owned(),
+            serde_json::json!([{
+                "id": "repo-shared",
+                "path": local_repo.to_string_lossy(),
+                "displayName": "Local App",
+                "hookSettings": { "scripts": { "setup": "local-setup.sh" } }
+            }]),
+        );
+        domains.insert(
+            "projectHostSetups".to_owned(),
+            serde_json::json!([
+                {
+                    "id": "setup-a",
+                    "repoId": "repo-shared",
+                    "hostId": "host-a",
+                    "path": "/srv/a/app",
+                    "displayName": "Host A App",
+                    "hookSettings": { "scripts": { "setup": "host-a-setup.sh" } }
+                },
+                {
+                    "id": "setup-b",
+                    "repoId": "repo-shared",
+                    "hostId": "host-b",
+                    "path": "/srv/b/app",
+                    "displayName": "Host B App",
+                    "hookSettings": { "scripts": { "setup": "host-b-setup.sh" } }
+                }
+            ]),
+        );
+
+        let opts = ImportOptions {
+            home,
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Projects],
+            dry_run: false,
+        };
+        let mut warnings = Vec::new();
+        let summary = import_projects_domain(&opts, &domains, &mut warnings).unwrap();
+        assert_eq!(summary.projects_added, 3, "warnings: {warnings:?}");
+
+        let store = ProjectsStore::load(&state_dir).unwrap();
+        assert_eq!(store.projects.len(), 3);
+        let local = store.projects.iter().find(|p| p.host_id.is_none()).unwrap();
+        assert_eq!(local.display_name, "Local App");
+        assert_eq!(local.setup_script.as_deref(), Some("local-setup.sh"));
+
+        let host_a = store
+            .projects
+            .iter()
+            .find(|p| p.host_id.as_deref() == Some("host-a"))
+            .unwrap();
+        assert_eq!(host_a.id, "host-a:repo-shared");
+        assert_eq!(host_a.setup_script.as_deref(), Some("host-a-setup.sh"));
+
+        let host_b = store
+            .projects
+            .iter()
+            .find(|p| p.host_id.as_deref() == Some("host-b"))
+            .unwrap();
+        assert_eq!(host_b.id, "host-b:repo-shared");
+        assert_eq!(host_b.setup_script.as_deref(), Some("host-b-setup.sh"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "requires sqlite3 CLI on PATH")]
+    fn import_orca_bot_items_propagates_dst_errors_and_allocates_numbers_in_tx() {
+        let root = std::env::temp_dir().join(format!("krill-r2p-08-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state_dir = root.join("state");
+        let orca_dir = root.join("orca");
+        let profile_dir = orca_dir.join("profiles").join("default");
+        let bots_root = state_dir.join(BOTS_DIR);
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::create_dir_all(&bots_root).unwrap();
+
+        // Create Orca source DB with two items both numbered 1 for bot-1.
+        let src_db = profile_dir.join("bot-items.sqlite");
+        let src_sql = "\
+CREATE TABLE items (
+    uid TEXT PRIMARY KEY,
+    number INTEGER NOT NULL,
+    owner_bot_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    done_means TEXT,
+    status TEXT NOT NULL,
+    close_note TEXT,
+    snoozed_until INTEGER,
+    version INTEGER NOT NULL,
+    last_activity_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    closed_at INTEGER
+);
+CREATE TABLE item_links (item_uid TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL);
+CREATE TABLE item_events (id INTEGER PRIMARY KEY AUTOINCREMENT, item_uid TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
+INSERT INTO items VALUES ('uid-1', 1, 'bot-1', 'First', NULL, NULL, 'planned', NULL, NULL, 1, 100, 100, 100, NULL);
+INSERT INTO items VALUES ('uid-2', 1, 'bot-1', 'Second', NULL, NULL, 'working', NULL, NULL, 1, 200, 200, 200, NULL);
+INSERT INTO item_links VALUES ('uid-1', 'url', 'https://example.com/1');
+INSERT INTO item_events (item_uid, kind, actor, data, created_at) VALUES ('uid-1', 'made', '{\"kind\":\"owner\"}', '{\"text\":\"created\"}', 100);
+";
+        assert!(
+            Command::new(sqlite3_binary())
+                .arg(&src_db)
+                .arg(src_sql)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let bot_id = BotId::new("bot-1").unwrap();
+        let mut bot_id_map = BTreeMap::new();
+        bot_id_map.insert("bot-1".to_owned(), bot_id.clone());
+        let mut bot_cfg = build_krill_bot_config("b1", None, None, None, 0).unwrap();
+        bot_cfg.id = bot_id;
+        let existing_bots = vec![bot_cfg];
+        let opts = ImportOptions {
+            home,
+            state_dir,
+            orca_dir,
+            domains: vec![ImportDomain::Bots],
+            dry_run: false,
+        };
+
+        // 1. Corrupt destination DB must propagate error rather than silently swallowing it.
+        let dst_db = bots_root.join(BOT_ITEMS_DB_FILE);
+        fs::write(&dst_db, b"not a valid sqlite database header").unwrap();
+        let mut warnings = Vec::new();
+        let err = import_orca_bot_items(
+            &opts,
+            "default",
+            &bots_root,
+            &bot_id_map,
+            &existing_bots,
+            &mut warnings,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("sqlite3"),
+            "corrupt dst_db error should propagate: {err}"
+        );
+        fs::remove_file(&dst_db).unwrap();
+
+        // 2. Pre-existing item with (bot-1, 1) in dst_db: both imported items allocate non-colliding
+        // numbers (2 and 3) inside BEGIN IMMEDIATE with intact links/events and no leftover temp SQL.
+        let pre_sql = "\
+CREATE TABLE items (
+    uid TEXT PRIMARY KEY,
+    number INTEGER NOT NULL,
+    owner_bot_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    done_means TEXT,
+    status TEXT NOT NULL,
+    close_note TEXT,
+    snoozed_until_ms INTEGER,
+    version INTEGER NOT NULL,
+    last_activity_at_ms INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    closed_at_ms INTEGER,
+    UNIQUE(owner_bot_id, number)
+);
+INSERT INTO items VALUES ('uid-existing', 1, 'bot-1', 'Existing', NULL, NULL, 'planned', NULL, NULL, 1, 50, 50, 50, NULL);
+";
+        assert!(
+            Command::new(sqlite3_binary())
+                .arg(&dst_db)
+                .arg(pre_sql)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let count = import_orca_bot_items(
+            &opts,
+            "default",
+            &bots_root,
+            &bot_id_map,
+            &existing_bots,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+
+        let rows = run_sqlite3_json_rows(
+            &dst_db,
+            "SELECT uid, number FROM items ORDER BY number ASC;",
+        )
+        .unwrap();
+        let got: Vec<(String, u64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["uid"].as_str().unwrap().to_owned(),
+                    r["number"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("uid-existing".to_owned(), 1),
+                ("uid-1".to_owned(), 2),
+                ("uid-2".to_owned(), 3),
+            ]
+        );
+        let events = run_sqlite3_json_rows(&dst_db, "SELECT item_uid FROM item_events;").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            fs::read_dir(&bots_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|e| !e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".orca-import-items-")),
+            "temp SQL script must be cleaned up"
+        );
+
+        // 3. Re-running import is idempotent and does not duplicate events.
+        let rerun = import_orca_bot_items(
+            &opts,
+            "default",
+            &bots_root,
+            &bot_id_map,
+            &existing_bots,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(rerun, 0);
+        let events_after =
+            run_sqlite3_json_rows(&dst_db, "SELECT item_uid FROM item_events;").unwrap();
+        assert_eq!(events_after.len(), 1);
+
+        fs::remove_dir_all(&root).ok();
     }
 }

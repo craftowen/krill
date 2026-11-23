@@ -1917,11 +1917,8 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             print_json(&out)?;
         }
     } else {
-        if let Some(delivery) = delivery {
-            println!(
-                "Delivery: {} (ack with check --ack {})",
-                delivery.id, delivery.id
-            );
+        if let Some(banner) = format_unacked_delivery_banner(delivery.as_ref()) {
+            println!("{banner}");
         }
         println!("ID\tFROM\tTO\tTYPE\tACK\tSUMMARY");
         for m in messages {
@@ -2472,6 +2469,17 @@ fn auto_release_targets<'a>(
                 })
         })
         .collect()
+}
+
+/// Formats the unacknowledged delivery reminder line, omitting it once the delivery is already acked.
+fn format_unacked_delivery_banner(
+    delivery: Option<&krill_proto::orchestration::OrchestrationDelivery>,
+) -> Option<String> {
+    let delivery = delivery.filter(|d| !d.acked)?;
+    Some(format!(
+        "Delivery: {} (ack with check --ack {})",
+        delivery.id, delivery.id
+    ))
 }
 
 /// Selects only messages acknowledged by this `check` call for worker auto-release.
@@ -5041,6 +5049,15 @@ mod delivery_and_launch_cli_tests {
             select_acked_for_auto_release(true, false, None, false, &done).len(),
             done.len(),
             "--ack-ids must auto-release"
+        );
+        // R2P-05: an already-acked delivery returned on bare `--ack` must not print an unacked reminder.
+        assert_eq!(format_unacked_delivery_banner(Some(&sample_delivery)), None);
+        assert_eq!(format_unacked_delivery_banner(None), None);
+        let mut unacked_delivery = sample_delivery;
+        unacked_delivery.acked = false;
+        assert_eq!(
+            format_unacked_delivery_banner(Some(&unacked_delivery)).as_deref(),
+            Some("Delivery: delivery-1 (ack with check --ack delivery-1)")
         );
         Ok(())
     }

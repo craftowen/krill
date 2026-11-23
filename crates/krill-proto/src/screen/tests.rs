@@ -977,6 +977,30 @@ fn history_view_fit_accounts_for_full_header_within_one_frame() {
 }
 
 #[test]
+fn history_view_fit_enforces_max_history_rows_even_when_bytes_fit() {
+    let mut reply = HistoryViewRows {
+        req: 7,
+        view: 3,
+        session: crate::SessionId(11),
+        epoch: [1, 2, 3],
+        status: HistoryViewStatus::Ready,
+        identity: None,
+        skip: 0,
+        total: u64::from(MAX_HISTORY_ROWS) + 25,
+        complete: false,
+        rows: vec![Vec::new(); usize::from(MAX_HISTORY_ROWS) + 25],
+        screen: None,
+    };
+    // Empty rows easily fit under ipc::MAX_FRAME in bytes, yet decode rejects > MAX_HISTORY_ROWS.
+    assert!(reply.encode().is_ok());
+    reply.fit();
+    assert_eq!(reply.rows.len(), usize::from(MAX_HISTORY_ROWS));
+    let encoded = reply.encode().unwrap();
+    let (kind, body) = frame(&encoded);
+    assert_eq!(HistoryViewRows::decode(kind, &body).unwrap(), reply);
+}
+
+#[test]
 fn cursor_explicit_postfix_is_compatible_bounded_and_applied_after_reset() {
     let mut current = update();
     let old = current.encode().unwrap();

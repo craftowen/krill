@@ -53,7 +53,7 @@ fn wants_help(args: &[OsString]) -> bool {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
-            Some("--chain") => {
+            Some("--chain" | "--chain-b64") => {
                 let _ = it.next();
             }
             Some("-h" | "--help") => return true,
@@ -123,6 +123,17 @@ fn parse_run_args(args: &[OsString]) -> RunArgs {
             }
         } else if let Some(value) = first.to_str().and_then(|s| s.strip_prefix("--chain=")) {
             chain = Some(OsString::from(value));
+        } else if first == statusline::CHAIN_B64_FLAG {
+            if let Some((value, left)) = tail.split_first() {
+                if let Some(decoded) = value.to_str().and_then(statusline::decode_chain_b64) {
+                    chain = Some(OsString::from(decoded));
+                }
+                rest = left;
+            }
+        } else if let Some(value) = first.to_str().and_then(|s| s.strip_prefix("--chain-b64="))
+            && let Some(decoded) = statusline::decode_chain_b64(value)
+        {
+            chain = Some(OsString::from(decoded));
         }
     }
     RunArgs { chain }

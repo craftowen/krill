@@ -132,7 +132,7 @@ impl HistoryViewRows {
                 .saturating_add(varint_len(next_keep))
                 .saturating_add(next_rows)
                 .saturating_add(screen_bytes);
-            if total > MAX_BODY {
+            if next_keep > usize::from(MAX_HISTORY_ROWS) || total > MAX_BODY {
                 break;
             }
             used_rows = next_rows;

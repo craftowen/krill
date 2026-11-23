@@ -34,7 +34,8 @@ pub const BOT_REPLY: u8 = 0x68;
 
 /// Maximum `.zip` payload transferred inside a single IPC frame (below `ipc::MAX_FRAME` = 1 MiB).
 pub const MAX_RPC_ZIP_BYTES: usize = 768 * 1024;
-/// Maximum PNG avatar payload transferred inside a single IPC frame (below `ipc::MAX_FRAME` = 1 MiB).
+/// Maximum PNG avatar payload transferred inside a single IPC frame (512 KiB, leaving headroom
+/// for Store-mode ZIP export within `MAX_RPC_ZIP_BYTES` and Mobile base64 within `ipc::MAX_FRAME`).
 pub const MAX_RPC_AVATAR_PNG_BYTES: usize = MAX_AVATAR_PNG_BYTES;
 
 /// Parameters for creating a new bot.

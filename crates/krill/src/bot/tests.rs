@@ -2962,3 +2962,75 @@ fn items_update_and_answer_flag_aliases_do_not_eagerly_consume_values() {
         err.message
     );
 }
+
+#[test]
+fn export_zip_rejects_traversal_and_absolute_daemon_filenames() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-export-sec-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let out_dir_slash = format!("{}/", out_dir.display());
+
+    for bad_name in [
+        "../../escape.zip",
+        "../escape.zip",
+        "..",
+        ".",
+        "",
+        "/tmp/escape.zip",
+        r"C:\Windows\escape.zip",
+        "C:escape.zip",
+        "nested/escape.zip",
+        r"nested\escape.zip",
+        "bad\0name.zip",
+    ] {
+        let mut client = MockClient::new([
+            BotRpcResponse::Bot(Box::new(sample_bot())),
+            BotRpcResponse::ExportedZip {
+                filename: bad_name.to_owned(),
+                zip_bytes: b"evil".to_vec(),
+            },
+        ]);
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        let err = execute_online(
+            parse_command(&s(&["export", "bot-pr-1", &out_dir_slash]), None).unwrap(),
+            &mut client,
+            &mut empty,
+            0,
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("unsafe filename"),
+            "expected unsafe filename rejection for {bad_name:?}, got: {}",
+            err.message
+        );
+        assert!(!dir.join("escape.zip").exists());
+        assert!(!out_dir.join("nested").exists());
+    }
+
+    // Legitimate single-component filename succeeds inside out_dir.
+    let mut client = MockClient::new([
+        BotRpcResponse::Bot(Box::new(sample_bot())),
+        BotRpcResponse::ExportedZip {
+            filename: "pr-reviewer.zip".to_owned(),
+            zip_bytes: b"PK-valid".to_vec(),
+        },
+    ]);
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let ok = execute_online(
+        parse_command(&s(&["export", "bot-pr-1", &out_dir_slash]), None).unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(ok.contains("pr-reviewer.zip"), "{ok}");
+    assert_eq!(
+        fs::read(out_dir.join("pr-reviewer.zip")).unwrap(),
+        b"PK-valid"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}

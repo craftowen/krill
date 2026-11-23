@@ -1645,10 +1645,30 @@ where
     }
 }
 
+fn validate_default_export_filename(default_filename: &str) -> Result<(), CliError> {
+    let has_drive_prefix = default_filename
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && default_filename.as_bytes().get(1) == Some(&b':');
+    let mut comps = Path::new(default_filename).components();
+    let single_normal = matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !single_normal || default_filename.contains(['/', '\\', '\0']) || has_drive_prefix {
+        return Err(CliError::fail(format!(
+            "refusing unsafe filename from daemon: {default_filename:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_output_file_path(
     out_path: &str,
     default_filename: &str,
 ) -> Result<std::path::PathBuf, CliError> {
+    validate_default_export_filename(default_filename)?;
     let p = Path::new(out_path);
     let target_path = if out_path.ends_with('/') || out_path.ends_with('\\') || p.is_dir() {
         p.join(default_filename)
