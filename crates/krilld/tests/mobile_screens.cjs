@@ -2027,5 +2027,380 @@ async function voicePipitoRegressions(){
  assert.equal(K.t('Learned words ({0})',5),'자동 학습 단어장 (5)');
  console.log('PASS Voice / Pipito mobile regressions: WAV encoding, chunked upload, composer insert & feedback, settings UI, ko i18n');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function sweepW2MobileRegressions(){
+ const botsSrc=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/bots.js'),'utf8');
+ const i18nSrc=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8');
+
+ // MB-02 + MB-53 + MB-55: Multi-decision detail sheet stays open and refreshes after Q1, closes after Q2; Done clears draft; Add link uses type=text.
+ {
+  let closeCount=0;
+  let itemState={
+   uid:'it-mb02',owner_bot_id:'b1',title:'Two decisions',status:'needs_you',
+   events:[{id:100,kind:'commented',actor:{bot:{bot_id:'b1'}},text:'Pick two',decisions:[
+    {question:'First?',options:['A1','A2'],recommended:0,multi:false},
+    {question:'Second?',options:['B1','B2'],recommended:0,multi:false},
+   ],created_at_ms:Date.now()-5000}],
+  };
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'Bot 1'}]};
+    if(req.action==='bots.items')return {items:[itemState]};
+    if(req.action==='bots.item.answer'){
+     const nextEvents=[...itemState.events,{id:itemState.events.length+101,kind:'commented',actor:{owner:{device:'mobile'}},text:req.answer_text,decisions:[],created_at_ms:Date.now()}];
+     const done=nextEvents.length>=3;
+     itemState={...itemState,status:done?'working':'needs_you',events:nextEvents};
+     return {item:itemState};
+    }
+    return {requests:[],suggestions:[]};
+   },
+  });
+  uf.ctx.closeSheet=()=>{closeCount++;};
+  await uf.flush();
+  const card=uf.all().find(n=>n.dataset?.item==='it-mb02');
+  await card.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Details').action();
+  const body=uf.ctx.el('div');
+  uf.sheets.at(-1)[3](body);
+  // MB-55: Add link input in detail sheet is type=text (allows file paths).
+  const sheetInputs=body.querySelectorAll('input');
+  assert(sheetInputs.some(inp=>inp.type==='text'&&inp.getAttribute('aria-label')==='Link URL'),'MB-55: detail sheet link input uses type=text');
+  // MB-02: Answer Q1 -> sheet stays open and refreshes Q1 to answered while keeping Q2 open.
+  await body.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='A1').action();
+  assert.equal(closeCount,0,'MB-02: detail sheet stays open when open decisions remain');
+  assert(body.textContent.includes('First? → A1'),'MB-02: answered Q1 reflected in refreshed detail sheet');
+  const b2Btn=body.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='B2');
+  assert(b2Btn,'MB-02: Q2 buttons remain rendered in detail sheet');
+  await b2Btn.action();
+  assert.equal(closeCount,1,'MB-02: detail sheet closes after final decision answered');
+  // MB-53: Done with closing comment clears input and draftKey.
+  const ta=body.querySelector('textarea');
+  ta.value='Closing note';emit(ta,'input');
+  assert.equal(uf.state.drafts.get('bot-item:it-mb02'),'Closing note');
+  await body.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Done').action();
+  assert.equal(ta.value,'','MB-53: Done clears detail sheet textarea');
+  assert.equal(uf.state.drafts.has('bot-item:it-mb02'),false,'MB-53: Done removes draftKey from state.drafts');
+  uf.abort.abort();
+ }
+
+ // MB-24: To Do Closed and Snoozed tabs pass status="closed" and status="snoozed".
+ {
+  const itemCalls=[];
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.items'){itemCalls.push(req);return {items:[]};}
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1'}]};
+    return {requests:[],suggestions:[]};
+   },
+  });
+  await uf.flush();
+  assert.equal(itemCalls.at(-1).status,'needs_you');
+  await uf.all().find(n=>n.dataset?.filter==='closed').action();
+  await uf.flush();
+  assert.equal(itemCalls.at(-1).status,'closed','MB-24: Closed tab sends status="closed"');
+  await uf.all().find(n=>n.dataset?.filter==='snoozed').action();
+  await uf.flush();
+  assert.equal(itemCalls.at(-1).status,'snoozed','MB-24: Snoozed tab sends status="snoozed"');
+  uf.abort.abort();
+ }
+
+ // MB-25: mountBotDetail mounted while offline triggers load() on reconnect.
+ {
+  let listCalls=0;
+  const df=fixture('bots',{
+   route:{botId:'b1'},
+   state:{connection:{phase:'connecting',message:'Connecting…'},snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list'){listCalls++;return {bots:[{id:'b1',name:'Reconnected Bot',agent_id:'claude'}]};}
+    return {items:[],statuses:[],suggestions:[],requests:[],sessions:[],groups:[]};
+   },
+  });
+  await df.flush();
+  assert.equal(listCalls,0,'MB-25: offline mount skips load');
+  df.state.connection={phase:'ready',message:'Connected'};
+  df.view.update();
+  await df.flush();
+  assert.equal(listCalls,1,'MB-25: reconnect update triggers load()');
+  assert(df.root.textContent.includes('Reconnected Bot'),'MB-25: bot details render after reconnect');
+  df.abort.abort();
+ }
+
+ // MB-26: Decision Deck handles multi:true and empty options[] via Answer question button opening detail sheet.
+ {
+  const deckItems=[
+   {uid:'it-multi',owner_bot_id:'b1',title:'Multi pick',status:'needs_you',events:[{id:1,kind:'commented',actor:{bot:{bot_id:'b1'}},text:'Choose many',decisions:[{question:'Channels?',options:['Slack','Email'],multi:true}],created_at_ms:100}]},
+   {uid:'it-empty',owner_bot_id:'b1',title:'Free form',status:'needs_you',events:[{id:2,kind:'commented',actor:{bot:{bot_id:'b1'}},text:'Tell me',decisions:[{question:'Why?',options:[],multi:false}],created_at_ms:200}]},
+  ];
+  const bf=fixture('bots',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1'}]};
+    if(req.action==='bots.items')return {items:deckItems};
+    return {requests:[],statuses:[],groups:[],sessions:[]};
+   },
+  });
+  await bf.flush();
+  const deck1=bf.find('.bot-decision-deck');
+  assert(deck1.descendants().some(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Answer question'),'MB-26: multi-select renders Answer question button instead of 1-tap submit');
+  assert(!deck1.descendants().some(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Slack'),'MB-26: multi-select does not render 1-tap option button');
+  await deck1.descendants().find(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Answer question').action();
+  assert.equal(bf.sheets.at(-1)[0],'Multi pick','MB-26: Answer question opens item detail sheet');
+  await deck1.descendants().find(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Next').action();
+  const deck2=bf.find('.bot-decision-deck');
+  assert(deck2.descendants().some(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Answer question'),'MB-26: empty options[] renders Answer question button');
+  bf.abort.abort();
+ }
+
+ // MB-27 (bots.js) + MB-52: Bot detail preserves synthetic session across snapshot wipe & excludes snoozed needs_you from decision deck & badge.
+ {
+  const mountedOpts=[];
+  const df=fixture('bots',{
+   route:{botId:'b1'},
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'Bot 1',agent_id:'claude'}]};
+    if(req.action==='bots.items'){
+     if(req.status==='needs_you')return {items:[]};
+     return {items:[
+      {uid:'active-ny',owner_bot_id:'b1',title:'Active Ask',status:'needs_you'},
+      {uid:'snoozed-ny',owner_bot_id:'b1',title:'Snoozed Ask',status:'needs_you',snoozed_until_ms:Date.now()+3600000},
+     ]};
+    }
+    if(req.action==='bots.sessions.list')return {sessions:[{session_id:77,bot_id:'b1',live:true,working:false,label:'Home'}]};
+    return {statuses:[],suggestions:[],requests:[],groups:[]};
+   },
+  });
+  df.M.chat={mount(_el,opts){mountedOpts.push(opts);return {setVisible(){},update(){},unmount(){}};}};
+  await df.flush();
+  assert.equal(mountedOpts[0]?.botSession,true,'MB-27: bots.js passes botSession:true to M.chat.mount');
+  assert(df.state.sessions.has(77),'MB-27: synthetic bot session inserted on mount');
+  // Simulate background snapshot wiping state.sessions:
+  df.state.sessions=new Map();
+  df.view.update();
+  assert(df.state.sessions.has(77),'MB-27: synthetic bot session re-ensured on update() after snapshot wipe');
+  // MB-52: Work badge counts only unsnoozed needs_you (1, not 2) and deck excludes Snoozed Ask.
+  const workTab=df.all().find(n=>n.dataset?.botTab==='work');
+  assert(workTab.textContent.includes('1')&&!workTab.textContent.includes('2'),'MB-52: Work tab badge excludes actively snoozed needs_you items');
+  assert(!df.find('.bot-decision-deck').textContent.includes('Snoozed Ask'),'MB-52: Bot decision deck excludes actively snoozed needs_you items');
+  df.abort.abort();
+ }
+
+ // MB-29: Accounts panel setHost() while Host A RPC is in flight fetches Host B and ignores Host A late response.
+ {
+  const pending={};
+  const af=fixture('accounts',{
+   rpc:req=>new Promise((resolve,reject)=>{pending[req._host||'h1']={resolve,reject};}),
+  });
+  let hostConns=[
+   {id:'h1',name:'Host A',active:true,connection:{phase:'ready'}},
+   {id:'h2',name:'Host B',active:false,connection:{phase:'ready'}},
+  ];
+  const rpcHosts=[];
+  const panelRoot=af.ctx.el('div');
+  const panelCtx={
+   ...af.ctx,
+   getConnections:()=>hostConns,
+   rpcForHost:(hid,req)=>{rpcHosts.push(hid);return new Promise((resolve,reject)=>{pending[hid]={resolve,reject};});},
+  };
+  const panel=af.M.mountAccountsPanel(panelRoot,panelCtx,{hostId:'h1'});
+  assert.deepEqual(rpcHosts,['h1']);
+  panel.setHost('h2');
+  assert.deepEqual(rpcHosts,['h1','h2'],'MB-29: setHost immediately starts load for Host B despite Host A in flight');
+  pending.h1.resolve({accounts:[{id:'a-old',provider:'Claude',email:'hostA@example.com',active:true,host_default:true}],statuses:[]});
+  await af.flush();
+  assert(!panelRoot.textContent.includes('hostA@example.com'),'MB-29: late Host A response ignored after setHost(h2)');
+  pending.h2.resolve({accounts:[{id:'a-new',provider:'Claude',email:'hostB@example.com',active:true,host_default:true}],statuses:[]});
+  await af.flush();
+  assert(panelRoot.textContent.includes('hostB@example.com'),'MB-29: Host B accounts render cleanly');
+  af.abort.abort();
+ }
+
+ // MB-30: workspaceComposer Run On switcher calls openWorkspaceComposer (skipping chooser/filter override).
+ {
+  let openedRepo=null,selectedTarget=null,newWsCalls=0;
+  const wf=fixture('workspaces',{
+   state:{snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1',label:'Repo1',path:'/r1'}],agents:[{id:'claude',name:'Claude'}]}},
+  });
+  const conns=[
+   {id:'h1',name:'Host A',active:true,connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1'}]}},
+   {id:'h2',name:'Host B',active:false,connection:{phase:'ready'},snapshot:{capabilities:{worktree_create:true},repositories:[{key:'r1'}]}},
+  ];
+  const compCtx={
+   ...wf.ctx,
+   getConnections:()=>conns,
+   getHosts:()=>conns,
+   selectHost:(id,cb)=>{selectedTarget=id;cb?.();},
+   newWorkspace:()=>{newWsCalls++;},
+   openWorkspaceComposer:repo=>{openedRepo=repo;},
+   closeSheet:()=>{},
+  };
+  wf.M.workspaceComposer(compCtx,'r1');
+  const sheetBody=wf.ctx.el('div');
+  wf.sheets.at(-1)[3](sheetBody);
+  const hostBBtn=sheetBody.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Host B');
+  await hostBBtn.action();
+  assert.equal(selectedTarget,'h2','MB-30: switched to Host B');
+  assert.equal(openedRepo,'r1','MB-30: invoked openWorkspaceComposer directly');
+  assert.equal(newWsCalls,0,'MB-30: did not bounce back through newWorkspace deviceFilter/chooser');
+  wf.abort.abort();
+ }
+
+ // MB-48 + MB-55: renderItemsList updates sync/onReload across re-renders; Add link sheet input uses type=text.
+ {
+  let reloadCount=0;
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'Initial Name'}]};
+    if(req.action==='bots.items')return {items:[{uid:'i-48',owner_bot_id:'b1',title:'Task',status:'needs_you'}]};
+    return {requests:[],suggestions:[]};
+   },
+  });
+  await uf.flush();
+  const card=uf.all().find(n=>n.dataset?.item==='i-48');
+  await card.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Add link').action();
+  const linkSheetBody=uf.ctx.el('div');
+  uf.sheets.at(-1)[3](linkSheetBody);
+  assert.equal(linkSheetBody.querySelector('input').type,'text','MB-55: renderItemsList Add link input uses type=text');
+  assert(botsSrc.includes('entry.sync = syncItem;')&&botsSrc.includes('entry.onReload = onReload;'),'MB-48: renderItemsList refreshes entry.sync and entry.onReload on each render');
+  uf.abort.abort();
+  assert.equal(reloadCount,0);
+ }
+
+ // MB-49 + MB-50: Bots Hub sends status="needs_you" & multi-host partial failure still shows healthy host data.
+ {
+  const hostItemReqs=[];
+  const bf=fixture('bots',{
+   state:{snapshot:{capabilities:{bots:true}}},
+  });
+  bf.ctx.connections=[
+   {id:'h1',name:'Healthy PC',active:true,connection:{phase:'ready'},snapshot:{capabilities:{bots:true}}},
+   {id:'h2',name:'Broken PC',active:false,connection:{phase:'ready'},snapshot:{capabilities:{bots:true}}},
+  ];
+  bf.ctx.rpcForHost=(hid,req)=>{
+   if(req.action==='bots.items')hostItemReqs.push({hid,req});
+   if(hid==='h2')return Promise.reject(Error('RPC timeout'));
+   if(req.action==='bots.list')return Promise.resolve({bots:[{id:'b1',name:'Healthy Bot',agent_id:'claude'}]});
+   if(req.action==='bots.items')return Promise.resolve({items:[]});
+   return Promise.resolve({requests:[],statuses:[],groups:[],sessions:[]});
+  };
+  bf.view.update();
+  await bf.flush();
+  assert(hostItemReqs.some(x=>x.hid==='h1'&&x.req.status==='needs_you'),'MB-49: Bots Hub requests bots.items with status="needs_you"');
+  assert(bf.root.textContent.includes('Healthy Bot'),'MB-50: Bots Hub preserves healthy host bots when peer host fails');
+  assert(bf.root.textContent.includes('Broken PC'),'MB-50: Bots Hub surfaces failing host error');
+  bf.abort.abort();
+ }
+
+ // MB-51: up-next failed automation Run now catches BotSessionRefusal and shows localized toast.
+ {
+  const toasts=[];
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1',schedules:[{id:'s1',name:'Nightly'}]}]};
+    if(req.action==='bots.upcoming')return {schedules:[{id:'s1',last_error:'failed'}]};
+    if(req.action==='bots.schedule.run')throw Object.assign(Error('raw desktop on this computer error'),{data:{refusal:{code:'bot_paused',detail:'B1'}}});
+    return {items:[],requests:[],suggestions:[]};
+   },
+  });
+  uf.ctx.toast=msg=>toasts.push(msg);
+  await uf.flush();
+  const runBtn=uf.all().find(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Run now');
+  await assert.doesNotReject(()=>runBtn.action(),'MB-51: Run now catches refusal error');
+  assert(toasts.some(m=>m.includes("Bot 'B1' is paused")),'MB-51: localized mobileBotRefusalText shown in toast');
+  uf.abort.abort();
+ }
+
+ // MB-54: Legacy single-host without capabilities.bots does not fire bots.* RPCs on #/bots or #/up-next.
+ {
+  const bf=fixture('bots',{state:{snapshot:{capabilities:{bots:false}}}});
+  await bf.flush();
+  assert.equal(bf.calls.filter(c=>String(c.action).startsWith('bots.')).length,0,'MB-54: #/bots skips bots.* RPCs on legacy single host');
+  bf.abort.abort();
+  const uf=fixture('up-next',{state:{snapshot:{capabilities:{bots:false}}}});
+  await uf.flush();
+  assert.equal(uf.calls.filter(c=>String(c.action).startsWith('bots.')).length,0,'MB-54: #/up-next skips bots.* RPCs on legacy single host');
+  uf.abort.abort();
+ }
+
+ // MB-56: i18n.js has zero duplicate keys and consistent translations.
+ {
+  const lines=i18nSrc.split('\n');
+  const seen=new Map();
+  lines.forEach((line,idx)=>{
+   if(idx+1<6||idx+1>1125)return;
+   const m=line.match(/^\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([A-Za-z_$][A-Za-z0-9_$]*))\s*:/);
+   if(!m)return;
+   const key=m[1]!==undefined?JSON.parse('"'+m[1]+'"'):m[2]!==undefined?m[2]:m[3];
+   assert(!seen.has(key),`MB-56: duplicate i18n key "${key}" at L${idx+1} (first L${seen.get(key)})`);
+   seen.set(key,idx+1);
+  });
+  const koBox=vm.createContext({navigator:{language:'ko'}});
+  vm.runInContext(i18nSrc,koBox);
+  assert.equal(koBox.KrillMobile.i18n.t('Desktop'),'컴퓨터','MB-56: Desktop translates consistently to 컴퓨터');
+  assert.equal(koBox.KrillMobile.i18n.t('No matches'),'검색 결과가 없습니다','MB-56: No matches standardized');
+  assert.equal(koBox.KrillMobile.i18n.t('Clear'),'지우기','MB-56: Clear standardized');
+ }
+
+ // MB-63: commandEditor removes rejected command_catalog promise from cache so switching back retries.
+ {
+  let catCalls=0;
+  const sessions=new Map([
+   [1,{id:1,agent:'claude',state:'Working',groupKey:'repo',cwd:'/repo',command_context:'ctx1'}],
+   [2,{id:2,agent:'claude',state:'Working',groupKey:'repo',cwd:'/repo2',command_context:'ctx2'}],
+  ]);
+  const groups=new Map([['repo',{label:'Project',sessions:[...sessions.values()]}]]);
+  const sf=fixture('settings',{
+   route:{subpage:'terminal'},
+   state:{sessions,groups,snapshot:{capabilities:{command_catalog:true},quick_commands:[]}},
+   rpc:req=>{
+    if(req.action==='command_catalog'){
+     catCalls++;
+     if(catCalls===1)return Promise.reject(Error('timeout'));
+     return Promise.resolve({supported:true,items:[{name:'Deploy',text:'/deploy',description:'ship'}]});
+    }
+    return {};
+   },
+  });
+  await sf.flush();
+  await sf.byText('Find installed skills').action();
+  await sf.flush();
+  const sel=sf.all().find(n=>n.getAttribute('aria-label')==='Session for installed skills');
+  sel.value='1';emit(sel,'change');await sf.flush();
+  assert.equal(catCalls,1);
+  // Switch session away and back -> must retry instead of re-awaiting rejected cache entry
+  sel.value='2';emit(sel,'change');await sf.flush();
+  sel.value='1';emit(sel,'change');await sf.flush();
+  assert.equal(catCalls,3,'MB-63: switching back retries command_catalog after earlier rejection');
+  assert(sf.root.textContent.includes('Deploy'),'MB-63: retried catalog renders installed skills');
+  sf.abort.abort();
+ }
+
+ // MB-65: Krill Drop download() aborts before saving when ctx.signal aborts before final drop_get resolves.
+ {
+  let resolveChunk,shared=0;
+  const df=fixture('drop',{
+   globals:{
+    atob:s=>Buffer.from(s,'base64').toString('binary'),
+    Blob:class{constructor(parts){this.parts=parts;}},
+    File:class{constructor(parts,name){this.parts=parts;this.name=name;}},
+    navigator:{canShare:()=>true,share:async()=>{shared++;}},
+   },
+   rpc:req=>{
+    if(req.action==='drop_list')return {inbox:'/inbox',items:[{id:'d1',name:'report.txt',size:5,modified_unix_ms:Date.now()}]};
+    if(req.action==='drop_get')return new Promise(r=>{resolveChunk=r;});
+    return {};
+   },
+  });
+  await df.flush();
+  const dlPromise=df.byText('Download').action();
+  df.abort.abort();
+  resolveChunk({data:Buffer.from('hello').toString('base64'),size:5,eof:true});
+  await dlPromise;
+  assert.equal(shared,0,'MB-65: aborted download must not invoke navigator.share or save()');
+ }
+ console.log('PASS sweep W2 mobile regressions: MB-02, MB-24..27, MB-29..30, MB-48..56, MB-63, MB-65');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

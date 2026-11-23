@@ -106,6 +106,17 @@ pub(super) struct Context {
     env: BTreeMap<String, String>,
 }
 
+const WINDOWS_UNAVAILABLE: &str =
+    "Verified model changes are unavailable on Windows. Keep chatting with the current model.";
+
+fn ensure_model_change_platform(is_windows: bool) -> io::Result<()> {
+    if is_windows {
+        Err(io::Error::other(WINDOWS_UNAVAILABLE))
+    } else {
+        Ok(())
+    }
+}
+
 impl Backend {
     pub(super) fn composer_models(&self, session: u64) -> io::Result<Value> {
         let context = self.composer_context(session)?;
@@ -118,7 +129,7 @@ impl Backend {
     fn composer_catalog(&self, context: &Context, session: u64) -> Value {
         let mut models = context.models();
         if cfg!(windows) {
-            set(&mut models, "reason", "Verified model changes are unavailable on Windows. Keep chatting with the current model.".into());
+            set(&mut models, "reason", WINDOWS_UNAVAILABLE.into());
         } else if let Some(adapter) = adapter(&context.agent) {
             adapter.control(context, &self.live(session), &mut models);
         }
@@ -131,6 +142,7 @@ impl Backend {
         model: &str,
         effort: Option<&str>,
     ) -> io::Result<Value> {
+        ensure_model_change_platform(cfg!(windows))?;
         let context = self.composer_context(session)?;
         match adapter(&context.agent) {
             Some(adapter) => adapter.set_model(&context, &self.live(session), model, effort),
@@ -167,6 +179,7 @@ impl Backend {
     }
 
     pub(super) fn set_composer_effort(&self, session: u64, effort: &str) -> io::Result<Value> {
+        ensure_model_change_platform(cfg!(windows))?;
         let context = self.composer_context(session)?;
         adapter(&context.agent).map_or_else(
             || Err(no_current_model()),

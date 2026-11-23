@@ -427,11 +427,7 @@ fn bound_bot_list_payload(
         if !page_items.is_empty() {
             page_items.clear();
             truncated = true;
-            next_cursor = if list_key == "items" {
-                None
-            } else {
-                Some(slice_start.to_string())
-            };
+            next_cursor = None;
             data = build_bot_list_value(
                 list_key,
                 &page_items,
@@ -1520,7 +1516,8 @@ impl Backend {
                             None
                         };
                         let path = PathBuf::from(std::ffi::OsStr::from_bytes(&tree.path));
-                        let path = fs::canonicalize(&path).unwrap_or(path);
+                        let path = krill_proto::os::canonicalize(&path)
+                            .unwrap_or_else(|_| krill_proto::os::shell_path(&path));
                         Ok(json!({"workspace":hex(path.as_os_str().as_bytes()),
                             "path":path.to_string_lossy(),"branch":tree.branch,"session":session,
                             "setup_session":tree.setup.map(|s| s.0),"warnings":tree.warnings}))
@@ -1589,9 +1586,22 @@ impl Backend {
                     }
                 }
                 // Prepare images before sending anything, then submit image paths and text in order.
-                let mut saved_paths = Vec::with_capacity(all_photos.len());
+                let mut decoded_photos = Vec::with_capacity(all_photos.len());
+                let mut total_photo_bytes: usize = 0;
                 for item in all_photos {
-                    match save_photo(&item.mime, &item.data) {
+                    let (ext, bytes) = decode_photo(&item.mime, &item.data)?;
+                    total_photo_bytes = total_photo_bytes.saturating_add(bytes.len());
+                    if total_photo_bytes > MAX_PROMPT_PHOTO_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Photos are too large to send together. Remove a photo or choose smaller images.",
+                        ));
+                    }
+                    decoded_photos.push((ext, bytes));
+                }
+                let mut saved_paths = Vec::with_capacity(decoded_photos.len());
+                for (ext, bytes) in decoded_photos {
+                    match write_photo(ext, &bytes) {
                         Ok(path) => saved_paths.push(path),
                         Err(err) => {
                             for saved in saved_paths {
@@ -4075,7 +4085,9 @@ fn to_value(v: impl serde::Serialize) -> io::Result<Value> {
     serde_json::to_value(v).map_err(io::Error::other)
 }
 
-fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
+const MAX_PROMPT_PHOTO_BYTES: usize = 512 * 1024;
+
+fn decode_photo(mime: &str, data: &str) -> io::Result<(&'static str, Vec<u8>)> {
     let extension = match mime {
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -4083,9 +4095,13 @@ fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
         _ => return Err(invalid()),
     };
     let bytes = decode_base64(data)?;
-    if bytes.is_empty() || bytes.len() > 512 * 1024 {
+    if bytes.is_empty() || bytes.len() > MAX_PROMPT_PHOTO_BYTES {
         return Err(invalid());
     }
+    Ok((extension, bytes))
+}
+
+fn write_photo(extension: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("krill-paste");
     fs::DirBuilder::new()
         .recursive(true)
@@ -4100,8 +4116,13 @@ fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
         OpenOptions::new().create_new(true).write(true).mode(0o600),
         &path,
     )?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     Ok(path)
+}
+
+fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
+    let (extension, bytes) = decode_photo(mime, data)?;
+    write_photo(extension, &bytes)
 }
 fn decode_base64(data: &str) -> io::Result<Vec<u8>> {
     if data.len() > 700_000 {
@@ -4398,14 +4419,19 @@ fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io
 }
 
 /// Bracketed Paste(`\x1b[200~...\x1b[201~`)로 감싸고 내부 ESC(`0x1b`)·ETX(`0x03`) 등 제어 바이트를 제거한다(OWE-944 / MK-241).
+fn sanitize_prompt_input(text: &str) -> Vec<u8> {
+    text.as_bytes()
+        .iter()
+        .copied()
+        .filter(|&b| matches!(b, b'\n' | b'\r' | b'\t') || (b >= 0x20 && b != 0x7f))
+        .collect()
+}
+
 fn format_bracketed_paste(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len().saturating_add(12));
+    let sanitized = sanitize_prompt_input(text);
+    let mut out = Vec::with_capacity(sanitized.len().saturating_add(12));
     out.extend_from_slice(b"\x1b[200~");
-    for &b in text.as_bytes() {
-        if matches!(b, b'\n' | b'\r' | b'\t') || (b >= 0x20 && b != 0x7f) {
-            out.push(b);
-        }
-    }
+    out.extend_from_slice(&sanitized);
     out.extend_from_slice(b"\x1b[201~");
     out
 }
@@ -7963,5 +7989,68 @@ value = "{}"
         assert_eq!(chunk["data"]["total"], 2);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitize_prompt_input_strips_escape_and_control_bytes() {
+        assert_eq!(
+            sanitize_prompt_input("hi\x1b[201~\nthere\x03\x7f\t\r"),
+            b"hi[201~\nthere\t\r"
+        );
+        assert_eq!(sanitize_prompt_input("\x03\x1b\x00\x7f"), b"");
+    }
+
+    #[test]
+    fn prompt_photos_enforce_combined_512kib_budget() {
+        let registry = Arc::new(Registry::new(None, None));
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        // Each photo is 260 KiB raw (354,988 B base64), individually <= 512 KiB,
+        // combined 520 KiB > 512 KiB while total JSON stays under 750,000 B.
+        let one_photo = "A".repeat(354_988);
+        let req = json!({
+            "action": "prompt",
+            "session": 1,
+            "text": "two large photos",
+            "photos": [
+                {"mime": "image/jpeg", "data": one_photo},
+                {"mime": "image/jpeg", "data": one_photo},
+            ]
+        })
+        .to_string();
+        assert!(req.len() < 750_000, "req len = {}", req.len());
+        let resp: Value = serde_json::from_str(&backend.request(&req)).unwrap();
+        assert_eq!(resp["ok"], false);
+        assert!(
+            resp["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("Photos are too large to send together")),
+            "unexpected error: {resp}"
+        );
+    }
+
+    #[test]
+    fn bound_bot_list_payload_oversized_non_items_entry_clears_next_cursor() {
+        let oversized = vec![
+            json!({"id": "b0", "name": "ok"}),
+            json!({"id": "b1", "name": "x".repeat(ipc::MAX_FRAME)}),
+            json!({"id": "b2", "name": "after"}),
+        ];
+        let bounded = bound_bot_list_payload(&oversized, "bots", 1, 25, 3, None, &[]).unwrap();
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["bots"].as_array().unwrap().len(), 0);
+        assert!(
+            bounded["next_cursor"].is_null(),
+            "next_cursor must not loop back to slice_start: {bounded}"
+        );
     }
 }

@@ -796,7 +796,7 @@ return tools >= 1 || thoughts >= 2 ? idx : 0;
 function parseItemAtMs(at) {
 if (at === undefined || at === null || at === "") return null;
 if (typeof at === "number")
-return Number.isFinite(at) && at > 0 ? at : null;
+return Number.isFinite(at) && at > 0 ? (at < 1e11 ? at * 1000 : at) : null;
 const raw = String(at).trim();
 if (!raw) return null;
 const ms = /^\d+$/.test(raw)
@@ -833,7 +833,16 @@ const cacheLimit = 8,
 cacheByteLimit = 8 * 1024 * 1024,
 pageLimit = 2048,
 itemByteLimit = 2 * 1024 * 1024,
-MAX_PHOTOS = 4;
+MAX_PHOTOS = 4,
+MAX_PROMPT_PHOTO_RAW_BYTES = 480 * 1024,
+MAX_PROMPT_PHOTO_HARD_RAW_BYTES = 512 * 1024,
+MAX_PROMPT_REQUEST_BYTES = 740000;
+function estimatedPhotoBytes(prepared) {
+const data = typeof prepared?.data === "string" ? prepared.data : "";
+if (!data) return 0;
+const pad = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+return Math.max(0, Math.floor((data.length * 3) / 4) - pad);
+}
 const isEntryPinned = (e) =>
 e.mounts > 0 ||
 e.sending ||
@@ -844,6 +853,7 @@ e.questionDraft?.changed ||
 e.questionDraft?.selected?.length ||
 e.photo ||
 (e.attachments?.length > 0) ||
+(e.queuedPrompts?.length > 0) ||
 e.live,
 pinned = (state, id, e) => isEntryPinned(e) || !!state.drafts?.get(id);
 function pruneCache(state) {
@@ -864,7 +874,7 @@ const e = state.chatCache?.get(id);
 if (e && !pinned(state, id, e)) state.chatCache.delete(id);
 }
 function mountChat(root, opts) {
-const { ctx, sessionId, onSwitchTerm, agentIcon } = opts,
+const { ctx, sessionId, onSwitchTerm, agentIcon, botSession } = opts,
 agentName = (a) => M.agentName?.(a) || a;
 const { el, button, state } = ctx,
 drafts = state.drafts || (state.drafts = new Map()),
@@ -1679,7 +1689,7 @@ return (
 state.chatCache === cacheMap &&
 state.drafts === drafts &&
 cacheMap.get(sessionId) === entry &&
-state.sessions?.has(sessionId)
+(state.sessions?.has(sessionId) || !!botSession)
 );
 }
 function active() {
@@ -1692,8 +1702,9 @@ let pollQueued = false,
 refreshPollQueued = false,
 appliedTimer = null;
 function syncReadScope() {
-const sess = state.sessions.get(sessionId),
-key = JSON.stringify([
+const sess = state.sessions?.get(sessionId);
+if (!sess) return;
+const key = JSON.stringify([
 ctx.sessionKey?.(sessionId) ?? sessionId,
 sess.agent,
 sess.cwd,
@@ -1705,8 +1716,19 @@ sess.command_context,
 ]);
 if (entry.readScope === key) return;
 const changed = entry.readScope !== undefined;
+const wasSynthetic = !!entry.readScopeSynthetic;
+const prevAgent = entry.readScopeAgent || "";
 entry.readScope = key;
+entry.readScopeSynthetic = !!sess._synthetic;
+entry.readScopeAgent = sess.agent || "";
 if (!changed) return;
+if (
+wasSynthetic &&
+!sess._synthetic &&
+(!prevAgent || !sess.agent || prevAgent === sess.agent)
+) {
+return;
+}
 earlierEpoch++;
 earlierQueued = false;
 failedEarlier = false;
@@ -2480,27 +2502,44 @@ rateLimitBanner.hidden = !Boolean(status?.rate_limited);
 syncComposerHeight();
 for (const card of cards.values()) card._syncPermission?.();
 }
+const copyTimers = new WeakMap();
 function copyText(text, node) {
 run(async () => {
 await writeClipboardText(el, t, text);
-if (!node) return;
+if (!node || disposed) return;
+const prevTimer = copyTimers.get(node);
+if (prevTimer) clearTimeout(prevTimer);
 if (ctx.icon && String(node.className || "").includes("chat-copy")) {
 node.replaceChildren(ctx.icon("check"));
 node.setAttribute("aria-label", t("Copied"));
 node.dataset.copied = "true";
+copyTimers.set(
+node,
 setTimeout(() => {
+copyTimers.delete(node);
+if (disposed) return;
 node.replaceChildren(ctx.icon("copy"));
 node.setAttribute("aria-label", t("Copy"));
 delete node.dataset.copied;
-}, CODE_COPY_FEEDBACK_MS);
+}, CODE_COPY_FEEDBACK_MS),
+);
 } else {
-const prev = node.textContent;
+if (node.dataset.copyLabel === undefined) {
+node.dataset.copyLabel = node.textContent;
+}
+const prev = node.dataset.copyLabel;
 node.textContent = t("Copied");
 node.dataset.copied = "true";
+copyTimers.set(
+node,
 setTimeout(() => {
+copyTimers.delete(node);
+if (disposed) return;
 node.textContent = prev;
 delete node.dataset.copied;
-}, CODE_COPY_FEEDBACK_MS);
+delete node.dataset.copyLabel;
+}, CODE_COPY_FEEDBACK_MS),
+);
 }
 });
 }
@@ -2596,8 +2635,9 @@ return copyBtn;
 }
 // 오늘은 시각만, 다른 날은 날짜와 시각을 보인다(Orca 메시지 아래 표기).
 function formatTime(at) {
-if (!at) return "";
-const date = new Date(/^\d+$/.test(at) ? Number(at) : at);
+const ms = parseItemAtMs(at);
+if (ms === null) return "";
+const date = new Date(ms);
 if (Number.isNaN(date.getTime())) return "";
 const lang = M.i18n?.language,
 today = new Date().toDateString() === date.toDateString();
@@ -2696,15 +2736,11 @@ t("Copy"),
 "copy",
 );
 meta.append(copy);
-const when = formatTime(item.at);
+const ms = parseItemAtMs(item.at),
+when = ms !== null ? formatTime(ms) : "";
 if (when) {
 const time = el("time", when, "chat-time");
-time.setAttribute(
-"datetime",
-new Date(
-/^\d+$/.test(item.at) ? Number(item.at) : item.at,
-).toISOString(),
-);
+time.setAttribute("datetime", new Date(ms).toISOString());
 meta.append(time);
 }
 if (capability("chat_tail") || capability("chat_composer")) {
@@ -2911,7 +2947,7 @@ return;
 if (!String(text || "").trim() && !attList.length) return;
 const hadLive = !!entry.live;
 followLatest();
-entry.progress = {
+const progress = {
 phase: "sending",
 text,
 photo: attList.length > 0,
@@ -2922,6 +2958,7 @@ lastState: state.sessions?.get(sessionId)?.state,
 stamp: state.sessions?.get(sessionId)?.state_since_unix_ns,
 ids: new Set(entry.items.map((item) => item.id)),
 };
+entry.progress = progress;
 entry.sending = true;
 closeSuggestions();
 if (hadLive) renderItems();
@@ -2936,15 +2973,37 @@ attList.length > 1
 : attList.length === 1
 ? { photo: attList[0].prepared }
 : {};
-voiceCtl?.onSend?.(text);
-await ctx.rpc({
+const rpcPayload = {
 action: "prompt",
 session: sessionId,
 text,
 ...(steer && capability("prompt_steer") ? { mode: "steer" } : {}),
 ...photoFields,
-});
-entry.progress.phase = "accepted";
+};
+if (attList.length > 0) {
+const totalRawBytes = attList.reduce(
+(sum, a) => sum + estimatedPhotoBytes(a.prepared),
+0,
+);
+const serialized = JSON.stringify(rpcPayload);
+const requestBytes =
+typeof TextEncoder === "function"
+? new TextEncoder().encode(serialized).length
+: serialized.length;
+if (
+totalRawBytes > MAX_PROMPT_PHOTO_HARD_RAW_BYTES ||
+requestBytes > MAX_PROMPT_REQUEST_BYTES
+) {
+throw Error(
+t(
+"Photos are too large to send together. Remove a photo or choose smaller images.",
+),
+);
+}
+}
+voiceCtl?.onSend?.(text);
+await ctx.rpc(rpcPayload);
+if (entry.progress === progress) entry.progress.phase = "accepted";
 entry.notifyComposer?.();
 if (fromDraft) {
 if (
@@ -2969,7 +3028,7 @@ await ctx.refresh?.();
 }
 } catch (error) {
 const message = cleanRpcError(error, t);
-if (entry.progress.phase === "sending") {
+if (entry.progress === progress && entry.progress.phase === "sending") {
 entry.progress.phase = "error";
 entry.progress.error = message;
 }
@@ -3118,10 +3177,26 @@ att.status = "pending";
 att.version = version;
 delete att.error;
 if (!targetAtt) entry.attachments.push(att);
+const count = Math.max(1, entry.attachments.length);
+const perPhotoMax = Math.floor(MAX_PROMPT_PHOTO_RAW_BYTES / count);
+if (!targetAtt && count > 1) {
+for (const other of entry.attachments) {
+if (
+other !== att &&
+other.status === "ready" &&
+other.file &&
+estimatedPhotoBytes(other.prepared) > perPhotoMax
+) {
+void preparePhoto(other.file, other);
+}
+}
+}
 syncEntryPhoto();
 updateComposer();
 try {
-const prepared = await ctx.photo?.(sessionId, file, { prepare: true });
+const photoOpts =
+count > 1 ? { prepare: true, maxBytes: perPhotoMax } : { prepare: true };
+const prepared = await ctx.photo?.(sessionId, file, photoOpts);
 if (att.version !== version || !entry.attachments.includes(att)) return;
 if (!prepared?.mime || !prepared?.data)
 throw new Error(t("Photo preparation unavailable"));

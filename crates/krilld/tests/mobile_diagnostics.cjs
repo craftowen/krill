@@ -1796,3 +1796,14 @@ test("stage-2 protocol error does not report mobile_auth_failed or block authent
   assert.equal(h.events()[0].diagnostics.reason, "protocol_error");
   t.close();
 });
+test("non-retryable HTTP 400 drops rejected batch immediately without retrying", async () => {
+  const h = harness();
+  h.diagnostics.setEnabled(true);
+  h.setCollector(async () => ({ ok: false, status: 400 }));
+  event(h, { source_file: "screens/bots.js", line: 12 });
+  await h.tick();
+  assert.equal(h.requests.length, 1);
+  await h.tick(60000);
+  assert.equal(h.requests.length, 1, "MB-33: HTTP 400 batch dropped without retries");
+  assert.equal(h.timers.size, 0);
+});

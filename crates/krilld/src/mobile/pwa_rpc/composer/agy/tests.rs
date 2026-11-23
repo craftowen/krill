@@ -778,3 +778,16 @@ fn classify_version_output_handles_leading_v_and_ignores_filenames() {
         VerifiedExe::Failed(UNVERIFIED)
     );
 }
+
+#[test]
+fn effort_supported_is_false_when_session_control_is_unsupported() {
+    let families = parse(MODELS);
+    let multi = &families[0]; // Gemini 4 Argon (low/medium/high)
+    let standalone = &families[1]; // Orchestrator (Neon) (no efforts)
+    assert!(!agy_effort_supported(false, Some(multi), Some("medium")));
+    assert!(!agy_effort_supported(false, None, Some("high")));
+    assert!(!agy_effort_supported(false, Some(standalone), Some("low")));
+    assert!(agy_effort_supported(true, Some(multi), None));
+    assert!(agy_effort_supported(true, Some(standalone), Some("medium")));
+    assert!(!agy_effort_supported(true, Some(standalone), None));
+}

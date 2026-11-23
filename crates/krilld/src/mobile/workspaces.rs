@@ -117,6 +117,7 @@ enum BinPrGroup {
 enum BinGroupKey {
     WorkspaceStatus(krill_proto::orchestration::WorkspaceStatus),
     PrStatus(BinPrGroup),
+    Pinned,
 }
 #[derive(serde::Serialize, Deserialize)]
 enum BinHostId {
@@ -174,6 +175,8 @@ fn read(path: &Path, limit: u64) -> Option<Vec<u8>> {
     (u64::try_from(bytes.len()).ok()? <= limit).then_some(bytes)
 }
 fn normalize(path: &Path) -> PathBuf {
+    let stripped = krill_proto::os::shell_path(path);
+    let path = stripped.as_path();
     let cleaned = path
         .to_str()
         .and_then(|s| {
@@ -186,7 +189,7 @@ fn normalize(path: &Path) -> PathBuf {
         .iter()
         .any(|p| path.starts_with(p))
     {
-        if let Ok(path) = fs::canonicalize(path) {
+        if let Ok(path) = krill_proto::os::canonicalize(path) {
             return path;
         }
         if cfg!(target_os = "macos") {
@@ -294,7 +297,7 @@ fn remote_slug(config: &str) -> Option<String> {
 fn main_worktree(tree: &Path) -> Option<PathBuf> {
     let dir = git_dir(tree);
     let common = String::from_utf8(read(&dir.join("commondir"), 4096)?).ok()?;
-    let common = fs::canonicalize(dir.join(common.trim())).ok()?;
+    let common = krill_proto::os::canonicalize(&dir.join(common.trim())).ok()?;
     (common.file_name()? == ".git")
         .then(|| common.parent().map(normalize))
         .flatten()
@@ -646,7 +649,6 @@ impl Catalog {
         count: usize,
         awake: &BTreeSet<PathBuf>,
     ) -> Value {
-        let lossy = tree.to_string_lossy();
         let default_branch = tree == repo
             || count <= 1
             || self.branches.get(tree).is_some_and(|b| {
@@ -660,7 +662,7 @@ impl Catalog {
                 || self.unread.contains(tree)
                 || awake.contains(tree));
         json!({"asleep":asleep,"default_branch":default_branch,
-            "automation":lossy.contains("/.orca/automations/") || lossy.contains("/automations/"),
+            "automation":is_automation_worktree(tree),
             // `.claude/worktrees` 외부 워크트리는 PC에서 펼치기 전까지 접혀 있다.
             "external":tree != repo && is_claude_worktree(tree),
             "external_shown":self.view.shown_external.contains(repo)})
@@ -811,6 +813,16 @@ impl Catalog {
             })
             .collect()
     }
+}
+/// `<repo>/.orca/automations/<run>` 또는 `.../automations/<run>` 아래 워크트리(플랫폼 구분자 무관).
+fn is_automation_worktree(path: &Path) -> bool {
+    let mut parts = path.components().peekable();
+    while let Some(part) = parts.next() {
+        if part.as_os_str() == "automations" && parts.peek().is_some() {
+            return true;
+        }
+    }
+    false
 }
 /// `<repo>/.claude/worktrees/` 아래 워크트리(데스크톱 `external::is_claude_worktree`와 동일).
 fn is_claude_worktree(path: &Path) -> bool {
@@ -1651,5 +1663,69 @@ value = "Rocket"
         assert_eq!(luc["icon"]["kind"], "lucide");
         assert_eq!(luc["icon"]["value"], "Rocket");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sidebar_tail_decodes_pinned_group_key_without_dropping_tail() {
+        let prefs = BTreeMap::from([(PathBuf::from("/a"), (true, "Alpha"))]);
+        let options = BinOptions {
+            group_by: 0,
+            sort_by: 2,
+            card_layout: 0,
+            card_properties: BinCardProperties {
+                issue: true,
+                pr: true,
+                comment: true,
+                ports: true,
+                branch: true,
+                host: true,
+            },
+            filters: BinFilters {
+                hide_sleeping: false,
+                always_show_default_branch: true,
+                hide_automation: false,
+                hide_cli: false,
+                repos: BTreeSet::new(),
+                hosts: BTreeSet::new(),
+            },
+        };
+        let lineage = BinLineage {
+            parents: BTreeMap::new(),
+            collapsed_lineage: BTreeSet::new(),
+            sleeping_worktrees: BTreeSet::new(),
+        };
+        let ui = BinUi {
+            collapsed: BTreeSet::new(),
+            collapsed_groups: vec![BinGroupKey::Pinned],
+            collapsed_hosts: Vec::new(),
+            expanded_cards: BTreeSet::new(),
+            selected_worktree: None,
+            shown_external: BTreeSet::from([PathBuf::from("/a")]),
+            removed_projects: BTreeSet::from([PathBuf::from("/removed")]),
+        };
+        let order = vec![PathBuf::from("/b"), PathBuf::from("/a")];
+        let mut body = Vec::new();
+        body.extend(postcard::to_allocvec(&prefs).unwrap());
+        body.extend(postcard::to_allocvec(&options).unwrap());
+        body.extend(postcard::to_allocvec(&lineage).unwrap());
+        body.extend(postcard::to_allocvec(&ui).unwrap());
+        body.extend(postcard::to_allocvec(&order).unwrap());
+
+        let tail = decode_sidebar_tail(&body);
+        assert!(tail.view.removed.contains(Path::new("/removed")));
+        assert!(tail.view.shown_external.contains(Path::new("/a")));
+        assert_eq!(tail.order, order);
+    }
+
+    #[test]
+    fn is_automation_worktree_checks_path_components() {
+        assert!(is_automation_worktree(Path::new(
+            "/repo/.orca/automations/nightly"
+        )));
+        assert!(is_automation_worktree(Path::new("/work/automations/run-1")));
+        assert!(!is_automation_worktree(Path::new("/work/automations")));
+        assert!(!is_automation_worktree(Path::new(
+            "/work/my-automations/run-1"
+        )));
     }
 }

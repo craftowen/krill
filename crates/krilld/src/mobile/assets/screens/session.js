@@ -480,8 +480,9 @@
           if (request === serial && same() && !result)
             status.textContent = t("Loading installed skills…");
         }, 1000);
+        let pending;
         try {
-          let pending = cache.get(key);
+          pending = cache.get(key);
           if (!pending) {
             pending = Promise.resolve(
               ctx.rpc({ action: "command_catalog", session: sessionId }),
@@ -516,6 +517,7 @@
             });
           render();
         } catch {
+          if (pending && cache.get(key) === pending) cache.delete(key);
           if (request === serial && same()) {
             result = { error: true };
             render();

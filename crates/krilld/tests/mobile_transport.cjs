@@ -2615,3 +2615,76 @@ test("unexpected text or protocol error during stage-2 authentication does not s
   assert.equal(h.transport.ready, true);
   h.transport.close();
 });
+test("MB-32: chat_subscribe, chat_unsubscribe and bots.sessions.list are reads and never poison updateBusy", async () => {
+  for (const action of ["chat_subscribe", "chat_unsubscribe", "bots.sessions.list"]) {
+    const h = harness(),
+      { pending, socket } = await h.start(4);
+    h.response(socket, { sessions: [] });
+    await pending;
+    const req = h.transport.rpc({ action, session: 1 });
+    await flush();
+    socket.emit("close", { code: 1006 });
+    await flush();
+    // Reconnect: read retries on the new socket and completes with updateBusy === false
+    await h.tick(1000);
+    const retry = h.sockets.at(-1);
+    assert.notEqual(retry, socket);
+    await h.advance(retry, 4);
+    h.response(retry, { sessions: [] });
+    await flush();
+    h.response(retry, { ok: true });
+    await req;
+    assert.equal(h.transport.updateBusy, false, `MB-32: ${action} drop must retry as read and never set uncertainMutation/updateBusy`);
+    h.transport.close();
+  }
+});
+test("MB-60: direct-origin relay URLs omit ?v=undefined", () => {
+  const h = harness(
+    {
+      device_id: "d1",
+      credential: "11".repeat(32),
+      rid: "a".repeat(32),
+      routes: { relay: { origin: "https://relay.krill.page", rid: "a".repeat(32) } },
+      preferred_route: "relay",
+    },
+    "https://phone.test/",
+    true,
+  );
+  const url = h.endpoint.socketUrl();
+  assert.equal(url, "wss://relay.krill.page/r/" + "a".repeat(32));
+  assert(!url.includes("undefined"), "MB-60: relay URL must not contain ?v=undefined");
+  h.transport.close();
+});
+test("MB-61 & MB-62: Tailscale-only host rid:null never falsely matches adopt() and pairingDirect resets after auth/switch", () => {
+  const hostA = {
+    id: "direct:https://a.tail1.ts.net:18449",
+    host_id: "1".repeat(32),
+    device_id: "dev-a",
+    credential: "aa".repeat(32),
+    rid: null,
+    fixed: true,
+    routes: { tailscale: { origin: "https://a.tail1.ts.net:18449" } },
+    preferred_route: "tailscale",
+  };
+  const h = harness(null, undefined, true);
+  h.store.set("krill-mobile-hosts-v1", JSON.stringify({ active: hostA.id, hosts: [hostA] }));
+  const e = h.context.KrillMobile.transport.bootstrap();
+  const adopted = e.adopt("https://phone.test/m/0123456789abcdef/#pair=" + "f".repeat(64) + "&key=secret&d=b.tail2.ts.net:18449");
+  assert.equal(adopted.existingId, undefined, "MB-61: rid:null must not falsely match existing Tailscale-only host");
+  // MB-62: adopt with d=, authenticate, then switch to relay fallback -> authenticated() without pairingPending must not force preferred_route back to tailscale.
+  adopted.use();
+  e.authenticated({
+    device_id: "dev-b",
+    credential: "bb".repeat(32),
+    desktop: {
+      host_id: "2".repeat(32),
+      relay: { origin: "https://phone.test", rid: "c".repeat(32) },
+      tailscale: { origin: "https://b.tail2.ts.net:18449" },
+    },
+  });
+  const relayUrl = e.socketUrls().find((u) => u.includes("/r/"));
+  assert(e.selectRoute(relayUrl));
+  const reauth = e.authenticated({});
+  assert.equal(reauth.preferred_route, "relay", "MB-62: stale pairingDirect must not overwrite preferred_route back to tailscale");
+  h.transport.close();
+});
