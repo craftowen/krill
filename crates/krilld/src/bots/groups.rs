@@ -751,8 +751,8 @@ impl GroupCoordinator {
     }
 
     /// Relays a finished bot turn's output into a matching active group chat turn, enforcing
-    /// `turn_seq` correlation when both sides supply a sequence number so an earlier non-group
-    /// turn cannot hijack or leak into a later group placeholder.
+    /// `turn_seq` correlation so an earlier non-group or untracked (`None`) completion cannot
+    /// hijack or delete a sequence-tagged (`Some(n)`) group placeholder (R4D-02).
     pub(crate) fn on_bot_turn_finished_seq(
         &self,
         bot_id: &BotId,
@@ -773,7 +773,8 @@ impl GroupCoordinator {
                 && t.session_id == session_id
                 && match (t.turn_seq, turn_seq) {
                     (Some(expected), Some(actual)) => expected == actual,
-                    _ => true,
+                    (None, _) => true,
+                    (Some(_), None) => false,
                 }
         }) else {
             return Ok(None);
@@ -1535,6 +1536,169 @@ mod tests {
         let summaries = groups.list_group_summaries(&store).unwrap();
         let summary3 = summaries.iter().find(|s| s.group.id == grp3.id).unwrap();
         assert_eq!(summary3.reply_audience, BotGroupReplyAudience::Mentions);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn r4d_02_untracked_completion_cannot_hijack_seq_tagged_group_turn() {
+        let root = temp_dir("r4d-02");
+        let store = BotStore::new(root.clone());
+        let groups = GroupCoordinator::new(root.clone());
+
+        let alice = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Alice Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let grp = store
+            .create_group("Burst Room", vec![alice.id.clone()], String::new(), 1_000)
+            .unwrap();
+        let plan = groups
+            .prepare_message_dispatch(
+                &store,
+                &grp.id,
+                None,
+                "owner",
+                "Check burst turn",
+                Some(BotGroupReplyMode::All),
+                1_010,
+            )
+            .unwrap();
+
+        // Register a queued seq-tagged group turn (`turn_seq = Some(2)`).
+        groups
+            .record_turn_started_seq(
+                &grp.id,
+                &plan.thread.thread_id,
+                &alice,
+                SessionId(401),
+                Some(2),
+                1_020,
+            )
+            .unwrap();
+
+        // An untracked (`None`) completion — non-empty OR empty — must NOT hijack or delete
+        // the `Some(2)` placeholder.
+        assert!(
+            groups
+                .on_bot_turn_finished_seq(
+                    &alice.id,
+                    SessionId(401),
+                    None,
+                    "Spurious untracked output",
+                    1_030,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            groups
+                .on_bot_turn_finished_seq(&alice.id, SessionId(401), None, "", 1_035)
+                .unwrap()
+                .is_none()
+        );
+
+        let room_mid = groups
+            .read_group_room(
+                &store,
+                &grp.id,
+                Some(&plan.thread.thread_id),
+                None,
+                Some(50),
+            )
+            .unwrap();
+        assert_eq!(room_mid.active_turns.len(), 1);
+        assert!(
+            room_mid
+                .messages
+                .iter()
+                .any(|m| m.sender_id == alice.id.as_str() && m.in_progress),
+            "R4D-02: queued Some(2) placeholder must remain in_progress after None completions"
+        );
+        assert!(
+            room_mid
+                .messages
+                .iter()
+                .all(|m| !m.body.contains("Spurious untracked output"))
+        );
+
+        // Real completion with `Some(2)` fills and completes the placeholder cleanly.
+        let real = groups
+            .on_bot_turn_finished_seq(
+                &alice.id,
+                SessionId(401),
+                Some(2),
+                "Real queued turn 2 reply",
+                1_040,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(real.body, "Real queued turn 2 reply");
+        assert!(!real.in_progress);
+        let view_done = groups
+            .read_group(&store, &grp.id, Some(&plan.thread.thread_id), Some(50))
+            .unwrap();
+        assert!(!view_done.active_run);
+
+        // Legacy untracked turns (`t.turn_seq = None`) still complete cleanly for both `None`
+        // and `Some(n)` completions.
+        groups
+            .record_turn_started(
+                &grp.id,
+                &plan.thread.thread_id,
+                &alice,
+                SessionId(402),
+                1_050,
+            )
+            .unwrap();
+        let legacy_none = groups
+            .on_bot_turn_finished_seq(
+                &alice.id,
+                SessionId(402),
+                None,
+                "Legacy untracked reply",
+                1_060,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_none.body, "Legacy untracked reply");
+        assert!(!legacy_none.in_progress);
+
+        groups
+            .record_turn_started(
+                &grp.id,
+                &plan.thread.thread_id,
+                &alice,
+                SessionId(403),
+                1_070,
+            )
+            .unwrap();
+        let legacy_some = groups
+            .on_bot_turn_finished_seq(
+                &alice.id,
+                SessionId(403),
+                Some(7),
+                "Legacy with seq reply",
+                1_080,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_some.body, "Legacy with seq reply");
+        assert!(!legacy_some.in_progress);
 
         fs::remove_dir_all(&root).ok();
     }

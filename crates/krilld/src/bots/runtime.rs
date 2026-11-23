@@ -1319,11 +1319,18 @@ impl BotRuntime {
     /// Records that the human owner directly submitted a prompt into a live bot session (via
     /// desktop `SendInput` or mobile `Action::Prompt`), setting `owner_turn_pending` and
     /// `last_prompt` so `working`, `first_run_completed`, and `SendBotRunAgain` stay accurate.
+    ///
+    /// When a turn is already in flight (`owner_turn_pending == true`), owner steering prompts
+    /// must not advance `active_turn_seq`, reset `explicit_reply_posted`, or clobber
+    /// `last_prompt` so the active connector/group turn still completes with its original
+    /// `turn_seq` (R4D-01).
     pub fn on_owner_prompt_submitted(&self, session_id: SessionId, prompt: &str) {
         let mut changed = false;
         {
             let mut sessions = lock(&self.inner.sessions);
-            if let Some(binding) = sessions.get_mut(&session_id) {
+            if let Some(binding) = sessions.get_mut(&session_id)
+                && !binding.owner_turn_pending
+            {
                 let trimmed = prompt.trim();
                 binding.owner_turn_pending = true;
                 binding.explicit_reply_posted = false;
@@ -3616,6 +3623,372 @@ mod tests {
                 sent_msgs.iter().any(|m| m.contains("[dispatch failed:")),
                 "R3M-03: queued Turn 3 drain failure must still notify Alice: {sent_msgs:?}"
             );
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r4d_01_owner_steering_prompt_preserves_in_flight_turn_seq() {
+        use crate::bots::connectors::router::{DeliveryTarget, PlatformSender};
+        use crate::bots::{AccessDecision, ConnectorBridge, DispatchOutcome};
+        use krill_proto::bots::ExternalSource;
+
+        struct RecordingSender {
+            sent: Mutex<Vec<String>>,
+        }
+        impl PlatformSender for RecordingSender {
+            fn source(&self) -> ExternalSource {
+                ExternalSource::Telegram
+            }
+            fn max_chunk_chars(&self) -> usize {
+                4000
+            }
+            fn send_message(&self, _target: &DeliveryTarget, text: &str) -> io::Result<String> {
+                lock(&self.sent).push(text.to_owned());
+                Ok(format!("msg-{}", lock(&self.sent).len()))
+            }
+            fn edit_message(
+                &self,
+                _target: &DeliveryTarget,
+                _message_id: &str,
+                text: &str,
+            ) -> io::Result<()> {
+                lock(&self.sent).push(format!("edit:{text}"));
+                Ok(())
+            }
+        }
+
+        struct ActiveSeqBridge {
+            bot: BotConfig,
+            store: Arc<BotStore>,
+            sid: SessionId,
+            seq: u64,
+        }
+        impl ConnectorBridge for ActiveSeqBridge {
+            fn dispatch_external_message(
+                &self,
+                msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                let link = self.store.lookup_or_create_link(
+                    &msg.bot_id,
+                    msg.source,
+                    msg.workspace_id.as_deref(),
+                    &msg.channel_id,
+                    msg.thread_id.as_deref(),
+                    msg.acts_for,
+                    1_000,
+                )?;
+                Ok(DispatchOutcome {
+                    link,
+                    session_id: self.sid,
+                    started_new_session: false,
+                })
+            }
+            fn dispatch_external_message_with_hooks(
+                &self,
+                msg: InboundExternalMessage,
+                on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+                _on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
+            ) -> io::Result<DispatchOutcome> {
+                on_bound(self.sid, Some(self.seq));
+                self.dispatch_external_message(msg)
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Allowed)
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                bot_id: &BotId,
+                source: ExternalSource,
+                workspace_id: Option<&str>,
+                channel_id: &str,
+                thread_id: Option<&str>,
+                acts_for: krill_proto::bots::ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                self.store.lookup_or_create_link(
+                    bot_id,
+                    source,
+                    workspace_id,
+                    channel_id,
+                    thread_id,
+                    acts_for,
+                    1_000,
+                )
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: krill_proto::bots::BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (bot_id == &self.bot.id).then(|| self.bot.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.bot.clone()]
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("krilld-rt-r4d01-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let store = Arc::new(BotStore::new(dir.clone()));
+        let groups = Arc::new(GroupCoordinator::new(dir.clone()));
+        let mut bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Steer Guard Bot".to_owned(),
+                    agent_id: "agy".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        bot.connectors.telegram.enabled = true;
+        bot.connectors.telegram.acts_for = krill_proto::bots::ActsFor::Anyone;
+
+        let grp = store
+            .create_group("Steer Ops", vec![bot.id.clone()], String::new(), 1_000)
+            .unwrap();
+        let plan = groups
+            .prepare_message_dispatch(
+                &store,
+                &grp.id,
+                None,
+                "owner",
+                "Initial group prompt",
+                Some(krill_proto::bots::BotGroupReplyMode::All),
+                1_010,
+            )
+            .unwrap();
+
+        let rt = BotRuntime::with_root(dir.clone());
+        let sid = SessionId(801_801);
+        lock(&rt.inner.sessions).insert(
+            sid,
+            BotSessionBinding {
+                bot_id: bot.id.clone(),
+                link_id: None,
+                memory_snapshot: MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 4301,
+                label: "steer-turn1".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: true,
+                last_prompt: Some("External turn 1 prompt".to_owned()),
+            },
+        );
+        lock(&rt.inner.turn_meta).insert(
+            sid,
+            SessionTurnMeta {
+                group_key: Some((grp.id.clone(), plan.thread.thread_id.clone())),
+                turn_seq: 1,
+                active_turn_seq: Some(1),
+                pending_turns: VecDeque::new(),
+            },
+        );
+        groups
+            .record_turn_started_seq(&grp.id, &plan.thread.thread_id, &bot, sid, Some(1), 1_020)
+            .unwrap();
+
+        let sender = Arc::new(RecordingSender {
+            sent: Mutex::new(Vec::new()),
+        });
+        let cm = ConnectorManager::new(Arc::new(ActiveSeqBridge {
+            bot: bot.clone(),
+            store: Arc::clone(&store),
+            sid,
+            seq: 1,
+        }));
+        cm.router()
+            .register_sender(bot.id.clone(), ExternalSource::Telegram, sender.clone());
+
+        let target = DeliveryTarget {
+            source: ExternalSource::Telegram,
+            workspace_id: None,
+            channel_id: "tg-steer".to_owned(),
+            thread_id: None,
+            reply_to_message_id: Some("m-1".to_owned()),
+        };
+        let outcome = cm.router().handle_inbound_message(
+            InboundExternalMessage {
+                bot_id: bot.id.clone(),
+                source: ExternalSource::Telegram,
+                workspace_id: None,
+                channel_id: "tg-steer".to_owned(),
+                thread_id: None,
+                sender_id: "user-1".to_owned(),
+                sender_name: "User".to_owned(),
+                text: "External turn 1 prompt".to_owned(),
+                attachments: Vec::new(),
+                external_message_id: Some("m-1".to_owned()),
+                acts_for: krill_proto::bots::ActsFor::Owner,
+            },
+            target,
+            sender.as_ref(),
+        );
+        assert!(matches!(
+            outcome,
+            crate::bots::connectors::router::InboundRouteOutcome::Dispatched(_)
+        ));
+
+        // Overlapping owner steering prompt while Turn 1 is still active must NOT overwrite
+        // `active_turn_seq`, advance `turn_seq`, reset `explicit_reply_posted`, or clobber
+        // `last_prompt`.
+        rt.on_owner_prompt_submitted(sid, "Owner steering follow-up");
+        {
+            let sessions = lock(&rt.inner.sessions);
+            let b = sessions.get(&sid).unwrap();
+            assert!(b.owner_turn_pending);
+            assert_eq!(b.last_prompt.as_deref(), Some("External turn 1 prompt"));
+            let meta = lock(&rt.inner.turn_meta);
+            let m = meta.get(&sid).unwrap();
+            assert_eq!(m.turn_seq, 1);
+            assert_eq!(m.active_turn_seq, Some(1));
+        }
+
+        // Also verify `explicit_reply_posted` stays intact during an overlapping steering prompt.
+        let sid_exp = SessionId(801_802);
+        lock(&rt.inner.sessions).insert(
+            sid_exp,
+            BotSessionBinding {
+                bot_id: bot.id.clone(),
+                link_id: None,
+                memory_snapshot: MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: true,
+                launch_token: None,
+                pid: 4302,
+                label: "steer-explicit".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: true,
+                last_prompt: Some("Explicit prompt".to_owned()),
+            },
+        );
+        lock(&rt.inner.turn_meta).insert(
+            sid_exp,
+            SessionTurnMeta {
+                group_key: None,
+                turn_seq: 3,
+                active_turn_seq: Some(3),
+                pending_turns: VecDeque::new(),
+            },
+        );
+        rt.on_owner_prompt_submitted(sid_exp, "Steering over explicit reply");
+        {
+            let sessions = lock(&rt.inner.sessions);
+            let b = sessions.get(&sid_exp).unwrap();
+            assert!(b.explicit_reply_posted);
+            assert_eq!(b.last_prompt.as_deref(), Some("Explicit prompt"));
+            let meta = lock(&rt.inner.turn_meta);
+            let m = meta.get(&sid_exp).unwrap();
+            assert_eq!(m.turn_seq, 3);
+            assert_eq!(m.active_turn_seq, Some(3));
+        }
+
+        // Turn 1 live activity still correlates with original `turn_seq = Some(1)`.
+        let act_ev = HookEvent {
+            id: krill_proto::hook::EventId {
+                pid: 4301,
+                unix_ns: 1_030_000_000,
+            },
+            agent: "agy".to_owned(),
+            ppid: 4301,
+            input: krill_proto::hook::Input::Complete,
+            payload: serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"})
+                .to_string()
+                .into_bytes(),
+        };
+        rt.on_hook_event_with_groups(&reg, &store, Some(&cm), Some(&groups), sid, &act_ev);
+        assert!(
+            !lock(&sender.sent).is_empty(),
+            "R4D-01: Turn 1 activity must still correlate with active connector turn_seq=1"
+        );
+
+        // Turn 1 Stop completes both the connector turn and the group placeholder with `Some(1)`.
+        let stop_ev = HookEvent {
+            id: krill_proto::hook::EventId {
+                pid: 4301,
+                unix_ns: 1_040_000_000,
+            },
+            agent: "agy".to_owned(),
+            ppid: 4301,
+            input: krill_proto::hook::Input::Complete,
+            payload: serde_json::json!({
+                "hook_event_name": "Stop",
+                "terminationReason": "ERROR",
+                "error": "TURN_1_RESULT"
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        rt.on_hook_event_with_groups(&reg, &store, Some(&cm), Some(&groups), sid, &stop_ev);
+
+        let sent_msgs = lock(&sender.sent).clone();
+        assert!(
+            sent_msgs.iter().any(|m| m.contains("TURN_1_RESULT")),
+            "R4D-01: Turn 1 completion must still deliver to connector turn_seq=1: {sent_msgs:?}"
+        );
+        let view = groups
+            .read_group(&store, &grp.id, Some(&plan.thread.thread_id), Some(20))
+            .unwrap();
+        assert!(
+            !view.active_run,
+            "R4D-01: group placeholder for turn_seq=1 must complete instead of sticking active"
+        );
+        assert!(
+            view.messages
+                .iter()
+                .any(|m| m.body.contains("TURN_1_RESULT") && !m.in_progress),
+            "R4D-01: group thread must receive Turn 1 completion: {:?}",
+            view.messages
+        );
+
+        // Once Turn 1 is idle (`owner_turn_pending == false`), a subsequent owner prompt starts
+        // Turn 2 cleanly with `turn_seq = 2`.
+        rt.on_owner_prompt_submitted(sid, "Fresh turn 2 prompt");
+        {
+            let sessions = lock(&rt.inner.sessions);
+            let b = sessions.get(&sid).unwrap();
+            assert!(b.owner_turn_pending);
+            assert!(!b.explicit_reply_posted);
+            assert_eq!(b.last_prompt.as_deref(), Some("Fresh turn 2 prompt"));
+            let meta = lock(&rt.inner.turn_meta);
+            let m = meta.get(&sid).unwrap();
+            assert_eq!(m.turn_seq, 2);
+            assert_eq!(m.active_turn_seq, Some(2));
         }
 
         fs::remove_dir_all(&dir).ok();
