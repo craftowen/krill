@@ -1122,6 +1122,19 @@
     "Multi-select": "복수 선택",
     Answered: "응답됨",
     File: "파일",
+    "Voice input": "음성 입력",
+    "Stop recording": "녹음 중지",
+    "Transcribing…": "변환 중…",
+    "No speech detected.": "음성이 감지되지 않았습니다.",
+    "Voice input requires HTTPS or localhost.": "음성 입력은 HTTPS 또는 localhost에서만 사용할 수 있습니다.",
+    "Microphone unavailable.": "마이크를 사용할 수 없습니다.",
+    "Microphone permission denied.": "마이크 권한이 거부되었습니다.",
+    "Voice / Pipito": "음성 / Pipito",
+    "AI Refine": "문장 다듬기",
+    "Learned words ({0})": "자동 학습 단어장 ({0})",
+    "Add word…": "단어 추가…",
+    "Pipito not running": "Pipito 미실행",
+    "Pipito not installed": "Pipito 미설치",
   };
   function t(text, ...values) {
     let out = language === "ko" ? ko[text] || text : text;

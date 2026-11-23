@@ -1521,6 +1521,13 @@ else M.app?.navigate?.("/accounts");
 );
 leading.append(attachBtn, modelBtn, searchToggleBtn, statusLine);
 statusRow.append(leading, contextMeter, queueBtn, steerBtn, sendBtn);
+const voiceCtl = M.voice?.attach?.(input, statusRow, {
+ctx,
+targetKind: "session",
+targetId: () => String(sessionId),
+beforeNode: sendBtn,
+onInsert: () => resizeInput?.(),
+});
 box.append(suggestions, queuedStrip, attachment, input, statusRow);
 composer.append(box, photoPicker);
 // Like Orca, the send tap takes focus so the IME commits the last syllable first.
@@ -2798,6 +2805,7 @@ attList.length > 1
 : attList.length === 1
 ? { photo: attList[0].prepared }
 : {};
+voiceCtl?.onSend?.(text);
 await ctx.rpc({
 action: "prompt",
 session: sessionId,

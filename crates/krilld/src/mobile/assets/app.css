@@ -1106,3 +1106,18 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-automation-row{flex-wrap:wrap;align-items:flex-start}
 #mobile-app .bot-workspace>.page-header:not(.title-header) .header-copy{padding-right:0;text-align:left}
 @media(max-width:360px){.bot-workspace-tabs{margin:4px 8px}.bot-seg-tab{padding:4px;font-size:calc(11px * var(--ui-scale,1))}.bot-rail-item{min-width:50px}}
+.voice-ctl{display:inline-flex;align-items:center;gap:4px;flex:none}
+.voice-rec{display:inline-flex;align-items:center;gap:6px;padding:2px 6px;border-radius:999px;background:color-mix(in srgb,var(--status-blocked) 14%,transparent);border:1px solid color-mix(in srgb,var(--status-blocked) 40%,transparent)}
+.voice-dot{width:8px;height:8px;border-radius:50%;background:var(--status-blocked);animation:voice-pulse 1s infinite}
+@keyframes voice-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.voice-timer,.voice-busy{font-size:var(--font-meta);font-variant-numeric:tabular-nums}
+.voice-stop{min-height:26px;padding:0 8px}
+.voice-add-row{display:flex;gap:6px;align-items:center}
+.voice-add-row input{flex:1;min-width:0}
+.voice-chips{display:flex;flex-wrap:wrap;gap:6px}
+.voice-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;background:var(--surface-raised);border:1px solid var(--border);font-size:var(--font-meta)}
+.voice-chip.pinned{border-color:var(--accent)}
+.voice-chip-x{border:0;background:none;color:var(--text-muted);cursor:pointer;padding:0 2px;font-size:13px;line-height:1}
+.voice-status-pill[data-status=ready]{color:var(--status-done)}
+.voice-status-pill[data-status=loading]{color:var(--status-working)}
+.voice-status-pill[data-status=not_running],.voice-status-pill[data-status=not_installed]{color:var(--status-blocked)}
