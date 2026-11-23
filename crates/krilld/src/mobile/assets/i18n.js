@@ -651,6 +651,8 @@
     "Enter a new message": "새 메시지를 입력하세요",
     "Start a conversation": "새 대화를 시작하세요",
     "Jump to latest": "맨 아래로 이동",
+    "Collapse all work steps": "작업 과정 모두 접기",
+    "Expand all work steps": "작업 과정 모두 펼치기",
     "Needs you": "확인 필요",
     "Everything else": "기타",
     Tabs: "탭",

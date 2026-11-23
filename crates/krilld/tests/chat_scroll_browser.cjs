@@ -127,7 +127,52 @@ async function main(){
   assert(settledSnap.gap<=2,'feed stays pinned at bottom when agent reply arrives');
   assert(settledSnap.reply.includes('바로 확인했습니다.'));
   await browser('screenshot',path.join(evidence,'chat-submit-bottom-390.png'));
-  console.log('PASS Chromium 390x844 chat prefetch, automatic pagination, stable reader anchor, trusted touch, dictation stability and immediate scroll-to-bottom on submit');
+  // Floating bulk work-process toggle button above jump-to-bottom on 390x844.
+  await evaluate(`
+   view.unmount();state.chatCache.clear();
+   state.sessions.set(7,{id:7,state:"Working"});
+   const workItems=[
+    {id:"wu1",kind:"user",text:"작업 단계 확인해줘"},
+    {id:"wr1",kind:"reasoning",text:"첫 번째 작업 과정을 검토합니다."},
+    {id:"wt1",kind:"tool_call",call_id:"wc1",tool_name:"read_file",file_path:"/work/app.rs"},
+    {id:"wtr1",kind:"tool_result",call_id:"wc1",text:"ok"},
+    {id:"wa1",kind:"assistant",text:"첫 단계 완료했습니다. ".repeat(18)},
+    {id:"wr2",kind:"reasoning",text:"두 번째 작업 중 생각 과정입니다."},
+    ...Array.from({length:12},(_,i)=>({id:"wt2_"+i,kind:"tool_call",call_id:"wc2_"+i,tool_name:"run_command",title:"Step "+(i+1)+" command check",text:"cmd "+i}))
+   ];
+   ctx.rpc=async q=>q.action==="chat_poll"?{generation:"g-work",agent:"agy",bound:true,page_start:0,next_offset:workItems.length,items:workItems}:{};
+   window.view=KrillMobile.chat.mount(document.querySelector("main"),{ctx,sessionId:7});
+   window.feed=document.querySelector(".chat-feed");
+   return true;
+  `);
+  await browser('wait','--fn','document.querySelectorAll(".chat-tool-run").length===2&&!document.querySelector(".chat-process-toggle").hidden');
+  const toggleOpenState=await evaluate(`
+   const btn=document.querySelector(".chat-process-toggle"),jump=document.querySelector(".chat-jump-bottom"),comp=document.querySelector(".chat-composer"),runs=[...document.querySelectorAll(".chat-tool-run")];
+   runs[1].open=true;runs[1].dispatchEvent(new Event("toggle"));
+   await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+   feed.scrollTop=0;feed.dispatchEvent(new Event("scroll"));
+   const br=btn.getBoundingClientRect(),jr=jump.getBoundingClientRect(),cr=comp.getBoundingClientRect();
+   return {btnHidden:btn.hidden,jumpHidden:jump.hidden,expanded:btn.dataset.expanded,runsOpen:runs.map(r=>r.open),br:{top:br.top,bottom:br.bottom,right:br.right,width:br.width,height:br.height},jr:{top:jr.top,bottom:jr.bottom,right:jr.right},cr:{top:cr.top}};
+  `);
+  assert.equal(toggleOpenState.btnHidden,false,'work-process toggle shows when work runs exist');
+  assert.equal(toggleOpenState.jumpHidden,false,'jump button shows when scrolled up');
+  assert.equal(toggleOpenState.expanded,'true','opening a run switches toggle to collapse-all');
+  assert(Math.abs(toggleOpenState.br.right-toggleOpenState.jr.right)<=1,'toggle aligns horizontally with jump button');
+  assert(toggleOpenState.br.bottom<=toggleOpenState.jr.top-6,'toggle sits cleanly above jump button');
+  assert(toggleOpenState.jr.bottom<=toggleOpenState.cr.top,'floating buttons stay above composer');
+  await browser('click','.chat-process-toggle');
+  await browser('wait','--fn','document.querySelector(".chat-process-toggle")?.dataset?.expanded==="false"');
+  const toggleCollapsed=await evaluate(`
+   const btn=document.querySelector(".chat-process-toggle"),runs=[...document.querySelectorAll(".chat-tool-run")],br=btn.getBoundingClientRect();
+   return {expanded:btn.dataset.expanded,runsOpen:runs.map(r=>r.open),top:br.top,bottom:br.bottom};
+  `);
+  assert.deepEqual(toggleCollapsed.runsOpen,[false,false],'bulk click collapses all work runs');
+  assert(Math.abs(toggleCollapsed.top-toggleOpenState.br.top)<=1,'toggle stays in fixed vertical slot without jumping');
+  await browser('click','.chat-process-toggle');
+  await browser('wait','--fn','document.querySelector(".chat-process-toggle")?.dataset?.expanded==="true"');
+  const toggleReopened=await evaluate('return [...document.querySelectorAll(".chat-tool-run")].map(r=>r.open);');
+  assert.deepEqual(toggleReopened,[true,true],'second click expands all work runs');
+  console.log('PASS Chromium 390x844 chat prefetch, automatic pagination, stable reader anchor, trusted touch, dictation stability, immediate scroll-to-bottom on submit and bulk work-process toggle');
  }finally{for(const p of pending.values()){clearTimeout(p.timer);p.reject(Error('CDP closed'));}socket?.close();await browser('close').catch(()=>{});await new Promise(resolve=>server.close(resolve));}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

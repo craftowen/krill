@@ -6179,6 +6179,237 @@ async function unboundEmptyAndVisibilityTransitions() {
     fx.dispose();
     console.log("PASS failed queued prompts preserve text/photos without dropping or clobbering active drafts");
   }
+
+  // Floating bulk work-process toggle button above jump-to-bottom.
+  {
+    const iconPaths = (btn) =>
+      btn
+        .descendants()
+        .filter((n) => n.tag === "path")
+        .map((n) => n.attrs.d);
+    const EXPAND_PATHS = ["m7 15 5 5 5-5", "m7 9 5-5 5 5"];
+    const COLLAPSE_PATHS = ["m7 20 5-5 5 5", "m7 4 5 5 5-5"];
+
+    // 1. Hidden when chat has no work process blocks (empty, user/assistant/question/permission only).
+    const plain = fixture({ lang: "ko" });
+    await flush();
+    const plainToggle = plain.find("chat-process-toggle");
+    assert(plainToggle, "floating work-process toggle button mounts in chat view");
+    assert.equal(plainToggle.hidden, true, "hidden in empty chat");
+    await plain.poll({
+      generation: "g-plain",
+      agent: "claude",
+      bound: true,
+      next_offset: 3,
+      items: [
+        { id: "u1", kind: "user", text: "Line\n".repeat(12) },
+        { id: "a1", kind: "assistant", text: "```js\nconsole.log(1)\n```" },
+        {
+          id: "q1",
+          kind: "question",
+          title: "Pick",
+          text: "Choose one",
+          options: [{ label: "A" }, { label: "B" }],
+        },
+      ],
+    });
+    assert.equal(
+      plainToggle.hidden,
+      true,
+      "hidden when only user/assistant/question cards exist",
+    );
+    plain.dispose();
+
+    // 2. Visible with work runs + standalone reasoning; syncs with manual toggles, bulk collapse/expand, active Working run, and preserves unrelated disclosures.
+    const bulk = fixture({ lang: "ko" });
+    bulk.state.sessions.set(7, { id: 7, state: "Working", cwd: "/work" });
+    await flush();
+    await bulk.poll({
+      generation: "g-bulk",
+      agent: "agy",
+      bound: true,
+      next_offset: 9,
+      items: [
+        { id: "u1", kind: "user", text: "작업 시작해줘" },
+        { id: "r0", kind: "reasoning", text: "단독 생각 과정 내용입니다." },
+        { id: "a0", kind: "assistant", text: "첫 번째 단계입니다.\n다음으로 도구를 실행합니다." },
+        {
+          id: "t1",
+          kind: "tool_call",
+          call_id: "c1",
+          tool_name: "read_file",
+          file_path: "/work/a.rs",
+        },
+        { id: "tr1", kind: "tool_result", call_id: "c1", text: "ok" },
+        {
+          id: "q1",
+          kind: "question",
+          title: "Confirm",
+          text: "Proceed?",
+          options: [{ label: "Yes" }, { label: "No" }],
+        },
+        { id: "a1", kind: "assistant", text: "두 번째 작업 진행합니다." },
+        { id: "r2", kind: "reasoning", text: "진행 중 생각" },
+        {
+          id: "t2",
+          kind: "tool_call",
+          call_id: "c2",
+          tool_name: "run_command",
+          title: "cargo nextest",
+          text: "cargo nextest",
+        },
+      ],
+    });
+
+    const toggleBtn = bulk.find("chat-process-toggle");
+    const jumpBtn = bulk.find("chat-jump-bottom");
+    const runs = bulk.root
+      .descendants()
+      .filter((n) => n.className === "chat-tool-run");
+    const standaloneReasoning = bulk
+      .find("chat-feed")
+      .children.find((n) => n.className === "chat-card chat-reasoning")
+      ?.children?.[0];
+    const pastQuestion = bulk.find("chat-past-question");
+    assert.equal(runs.length, 2, "two work runs (completed + active Working)");
+    assert(standaloneReasoning, "standalone top-level reasoning exists");
+    assert.equal(runs[1].dataset.active, "true", "tail run is active Working");
+    assert.equal(jumpBtn.hidden, true, "jump button is hidden while following at bottom");
+    assert.equal(
+      toggleBtn.hidden,
+      false,
+      "work-process toggle remains visible even when jump button is hidden",
+    );
+    assert.equal(toggleBtn.dataset.expanded, "false");
+    assert.equal(toggleBtn.attrs["aria-pressed"], "false");
+    assert.equal(toggleBtn.attrs["aria-label"], "작업 과정 모두 펼치기");
+    assert.equal(toggleBtn.title, "작업 과정 모두 펼치기");
+    assert.deepEqual(iconPaths(toggleBtn), EXPAND_PATHS);
+
+    // Open pastQuestion independently to prove bulk toggle never touches unrelated disclosures.
+    pastQuestion.open = true;
+    pastQuestion.dispatchEvent(new Event("toggle"));
+    assert.equal(
+      toggleBtn.dataset.expanded,
+      "false",
+      "opening a question card does not flip work-process toggle state",
+    );
+
+    // Bulk expand when all work processes are closed.
+    toggleBtn.action();
+    assert.equal(runs[0].open, true);
+    assert.equal(runs[1].open, true);
+    assert.equal(standaloneReasoning.open, true);
+    assert.equal(
+      standaloneReasoning.children.length,
+      2,
+      "bulk expand synchronously populates lazy reasoning body",
+    );
+    assert.equal(toggleBtn.dataset.expanded, "true");
+    assert.equal(toggleBtn.attrs["aria-pressed"], "true");
+    assert.equal(toggleBtn.attrs["aria-label"], "작업 과정 모두 접기");
+    assert.equal(toggleBtn.title, "작업 과정 모두 접기");
+    assert.deepEqual(iconPaths(toggleBtn), COLLAPSE_PATHS);
+    assert.equal(pastQuestion.open, true, "unrelated question card stays open");
+
+    // Bulk collapse closes everything including active Working run.
+    toggleBtn.action();
+    assert.equal(runs[0].open, false);
+    assert.equal(runs[1].open, false);
+    assert.equal(standaloneReasoning.open, false);
+    assert.equal(toggleBtn.dataset.expanded, "false");
+    assert.equal(toggleBtn.attrs["aria-label"], "작업 과정 모두 펼치기");
+    assert.deepEqual(iconPaths(toggleBtn), EXPAND_PATHS);
+    assert.equal(pastQuestion.open, true, "unrelated question card is untouched on collapse");
+
+    // Manually opening a single run (the active Working run) switches button to collapse-all, and clicking closes it.
+    runs[1].open = true;
+    runs[1].dispatchEvent(new Event("toggle"));
+    assert.equal(toggleBtn.dataset.expanded, "true");
+    assert.equal(toggleBtn.attrs["aria-label"], "작업 과정 모두 접기");
+    assert.deepEqual(iconPaths(toggleBtn), COLLAPSE_PATHS);
+
+    // Manually closing that run switches button back to expand-all.
+    runs[1].open = false;
+    runs[1].dispatchEvent(new Event("toggle"));
+    assert.equal(toggleBtn.dataset.expanded, "false");
+    assert.equal(toggleBtn.attrs["aria-label"], "작업 과정 모두 펼치기");
+
+    // Manually open 1 of 3 targets, then bulk click collapses all.
+    runs[0].open = true;
+    runs[0].dispatchEvent(new Event("toggle"));
+    assert.equal(toggleBtn.dataset.expanded, "true");
+    toggleBtn.action();
+    assert.equal(runs[0].open, false);
+    assert.equal(runs[1].open, false);
+    assert.equal(standaloneReasoning.open, false);
+    assert.equal(toggleBtn.dataset.expanded, "false");
+
+    // 3. Session switch isolates toggle state per session (no state leak from session 7 to session 8).
+    toggleBtn.action(); // Expand all on session 7
+    assert.equal(toggleBtn.dataset.expanded, "true");
+    bulk.dispose();
+
+    bulk.state.sessions.set(8, { id: 8, state: "Waiting", cwd: "/work2" });
+    const s7Items = bulk.entry.items.slice();
+    bulk.handler = async (req) =>
+      req.action === "chat_poll"
+        ? req.session === 8
+          ? {
+              generation: "g-s8",
+              agent: "claude",
+              bound: true,
+              next_offset: 2,
+              items: [
+                { id: "s8-u", kind: "user", text: "다른 세션" },
+                { id: "s8-t", kind: "tool_call", tool_name: "read_file", file_path: "/work2/b.rs" },
+              ],
+            }
+          : {
+              generation: "g-bulk",
+              agent: "agy",
+              bound: true,
+              next_offset: s7Items.length,
+              items: s7Items,
+            }
+        : { sent: true };
+    const s8View = bulk.M.chat.mount(bulk.root, { ctx: bulk.ctx, sessionId: 8 });
+    await flush();
+    const s8Toggle = bulk.find("chat-process-toggle");
+    const s8Run = bulk.find("chat-tool-run");
+    assert.equal(s8Run.open, false, "new session starts collapsed without leaking previous session state");
+    assert.equal(s8Toggle.hidden, false);
+    assert.equal(s8Toggle.dataset.expanded, "false");
+    assert.equal(s8Toggle.attrs["aria-label"], "작업 과정 모두 펼치기");
+    s8View.unmount();
+
+    // Switching back to session 7 restores session 7's open state accurately.
+    const s7Back = bulk.M.chat.mount(bulk.root, { ctx: bulk.ctx, sessionId: 7 });
+    await flush();
+    assert.equal(bulk.find("chat-process-toggle").dataset.expanded, "true");
+    assert.equal(bulk.find("chat-process-toggle").attrs["aria-label"], "작업 과정 모두 접기");
+    s7Back.unmount();
+
+    // 4. English locale labels.
+    const en = fixture({ lang: "en" });
+    await flush();
+    await en.poll({
+      generation: "g-en",
+      agent: "claude",
+      bound: true,
+      next_offset: 1,
+      items: [{ id: "t1", kind: "tool_call", tool_name: "read_file", file_path: "/a" }],
+    });
+    const enBtn = en.find("chat-process-toggle");
+    assert.equal(enBtn.attrs["aria-label"], "Expand all work steps");
+    enBtn.action();
+    assert.equal(enBtn.attrs["aria-label"], "Collapse all work steps");
+    en.dispose();
+
+    console.log(
+      "PASS floating bulk work-process toggle: visibility, expand/collapse all, manual sync, active run, unrelated disclosures, i18n, and session isolation",
+    );
+  }
 }
 main().catch((error) => {
   console.error(error);
