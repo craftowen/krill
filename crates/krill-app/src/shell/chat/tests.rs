@@ -1348,3 +1348,233 @@ fn memory_receipt_summary_reads_like_orca() {
     );
     assert_eq!(receipt(0, 0, false).summary(), "메모리 업데이트됨");
 }
+
+#[test]
+fn strip_image_token_spans_markers_and_payload_whitespace_separation() {
+    use gpui_component::input::{InlineToken, InputContent};
+
+    let image_att = |path: &str| DraftAttachment {
+        path: std::path::PathBuf::from(path),
+        preview_path: None,
+        display_name: std::path::Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        byte_len: 42,
+        is_image: true,
+    };
+    let img1 = image_att("/tmp/a.png");
+    let img2 = image_att("/tmp/b.png");
+    let spaced = image_att("/Users/owen/my shot.png");
+    let tok =
+        |path: &str, label: &str| InlineToken::new(format!("{IMAGE_TOKEN_PREFIX}{path}"), label);
+
+    // Leading token directly before text (`[Image #1]이거 봐`).
+    let c = InputContent::new("[Image #1]이거 봐")
+        .with_token(0..10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(strip_image_token_spans(c.text(), c.tokens()), "이거 봐");
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&img1))
+            .as_deref(),
+        Some("/tmp/a.png 이거 봐")
+    );
+
+    // Leading token with space (`[Image #1] 이거 봐`) does not double spaces.
+    let c = InputContent::new("[Image #1] 이거 봐")
+        .with_token(0..10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(strip_image_token_spans(c.text(), c.tokens()), "이거 봐");
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&img1))
+            .as_deref(),
+        Some("/tmp/a.png 이거 봐")
+    );
+
+    // Quoted path with spaces still gets trailing space before adjacent text.
+    let c = InputContent::new("[Image #1]이거 봐")
+        .with_token(0..10, tok("/Users/owen/my shot.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&spaced))
+            .as_deref(),
+        Some("'/Users/owen/my shot.png' 이거 봐")
+    );
+
+    // Adjacent inline tokens (`[Image #1][Image #2]비교`).
+    let c = InputContent::new("[Image #1][Image #2]비교")
+        .with_token(0..10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap()
+        .with_token(10..20, tok("/tmp/b.png", "[Image #2]"))
+        .unwrap();
+    assert_eq!(strip_image_token_spans(c.text(), c.tokens()), "비교");
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), &[img1.clone(), img2.clone()])
+            .as_deref(),
+        Some("/tmp/a.png /tmp/b.png 비교")
+    );
+
+    // Mid-text inline token with and without spaces (`앞 [Image #1] 뒤`, `앞[Image #1]뒤`).
+    let prefix_len = "앞 ".len();
+    let c = InputContent::new("앞 [Image #1] 뒤")
+        .with_token(prefix_len..prefix_len + 10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(strip_image_token_spans(c.text(), c.tokens()), "앞 뒤");
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&img1))
+            .as_deref(),
+        Some("앞 /tmp/a.png 뒤")
+    );
+
+    let tight_len = "앞".len();
+    let c = InputContent::new("앞[Image #1]뒤")
+        .with_token(tight_len..tight_len + 10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(strip_image_token_spans(c.text(), c.tokens()), "앞 뒤");
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&img1))
+            .as_deref(),
+        Some("앞 /tmp/a.png 뒤")
+    );
+
+    // Image-only prompt (`[Image #1]`).
+    let c = InputContent::new("[Image #1]")
+        .with_token(0..10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(strip_image_token_spans(c.text(), c.tokens()), "");
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&img1))
+            .as_deref(),
+        Some("/tmp/a.png")
+    );
+
+    // Removed image token produces neither a path nor extra spaces.
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), &[]),
+        None
+    );
+    let c = InputContent::new("앞[Image #1]뒤")
+        .with_token(tight_len..tight_len + 10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), &[]).as_deref(),
+        Some("앞뒤")
+    );
+    let c = InputContent::new("[Image #1][Image #2]이거 봐")
+        .with_token(0..10, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap()
+        .with_token(10..20, tok("/tmp/b.png", "[Image #2]"))
+        .unwrap();
+    assert_eq!(
+        build_chat_payload_with_tokens(c.text(), c.tokens(), std::slice::from_ref(&img1))
+            .as_deref(),
+        Some("/tmp/a.png 이거 봐")
+    );
+
+    // Literal non-token `[Image #1]` and non-image tokens are preserved by `strip_image_token_spans`.
+    assert_eq!(
+        strip_image_token_spans("[Image #1] 이거 봐", &[]),
+        "[Image #1] 이거 봐"
+    );
+    let mention = InlineToken::new("mention:src/main.rs", "@src/main.rs");
+    let c = InputContent::new("@src/main.rs [Image #1] 봐")
+        .with_token(0..12, mention)
+        .unwrap()
+        .with_token(13..23, tok("/tmp/a.png", "[Image #1]"))
+        .unwrap();
+    assert_eq!(
+        strip_image_token_spans(c.text(), c.tokens()),
+        "@src/main.rs 봐"
+    );
+
+    // `strip_chat_image_markers` removes case-insensitive `[Image #<digits>]` anywhere.
+    assert_eq!(strip_chat_image_markers("[Image #1] 이거 봐"), "이거 봐");
+    assert_eq!(strip_chat_image_markers("[Image #1]이거 봐"), "이거 봐");
+    assert_eq!(strip_chat_image_markers("앞 [image #12] 뒤"), "앞 뒤");
+    assert_eq!(strip_chat_image_markers("앞[IMAGE #3]뒤"), "앞 뒤");
+    assert_eq!(strip_chat_image_markers("[Image #1][Image #2]"), "");
+    assert_eq!(
+        strip_chat_image_markers("keep [Image #] [Image #1a] [Image #1"),
+        "keep [Image #] [Image #1a] [Image #1"
+    );
+}
+
+#[test]
+fn upload_chat_attachments_with_maps_remote_path_and_registers_preview() {
+    let img = DraftAttachment {
+        path: std::path::PathBuf::from("/local/shot.png"),
+        preview_path: None,
+        display_name: "shot.png".into(),
+        byte_len: 128,
+        is_image: true,
+    };
+    let doc = DraftAttachment {
+        path: std::path::PathBuf::from("/local/notes.txt"),
+        preview_path: None,
+        display_name: "notes.txt".into(),
+        byte_len: 64,
+        is_image: false,
+    };
+    let uploaded = upload_chat_attachments_with(vec![img.clone(), doc.clone()], |path| {
+        let name = path.file_name()?.to_str()?;
+        Some(format!("/var/folders/remote/krill-paste.test/{name}"))
+    })
+    .expect("all uploads succeeded");
+    assert_eq!(uploaded.len(), 2);
+    assert_eq!(
+        uploaded[0].path,
+        std::path::PathBuf::from("/var/folders/remote/krill-paste.test/shot.png")
+    );
+    assert_eq!(
+        uploaded[0].preview_path.as_deref(),
+        Some(std::path::Path::new("/local/shot.png"))
+    );
+    assert_eq!(
+        uploaded[0].preview_path(),
+        std::path::Path::new("/local/shot.png")
+    );
+    assert_eq!(
+        uploaded[1].path,
+        std::path::PathBuf::from("/var/folders/remote/krill-paste.test/notes.txt")
+    );
+    assert_eq!(uploaded[1].preview_path, None);
+
+    // Partial upload failure aborts the whole batch without leaking local paths.
+    let failed = upload_chat_attachments_with(vec![img.clone(), doc], |path| {
+        if path.ends_with("shot.png") {
+            Some("/tmp/remote/shot.png".to_owned())
+        } else {
+            None
+        }
+    });
+    assert!(failed.is_none());
+
+    // Control characters in remote path are rejected.
+    let invalid =
+        upload_chat_attachments_with(vec![img], |_| Some("/tmp/bad\npath.png".to_owned()));
+    assert!(invalid.is_none());
+
+    // ChatImages remote preview registry resolves exact and macOS `/private/` aliases.
+    let mut images = images::ChatImages::default();
+    images.register_remote_preview(
+        std::path::PathBuf::from("/var/folders/remote/krill-paste.test/shot.png"),
+        std::path::PathBuf::from("/local/shot.png"),
+    );
+    assert_eq!(
+        images.resolve_remote_preview(std::path::Path::new(
+            "/var/folders/remote/krill-paste.test/shot.png"
+        )),
+        Some(std::path::Path::new("/local/shot.png"))
+    );
+    assert_eq!(
+        images.resolve_remote_preview(std::path::Path::new(
+            "/private/var/folders/remote/krill-paste.test/shot.png"
+        )),
+        Some(std::path::Path::new("/local/shot.png"))
+    );
+    assert_eq!(
+        images.resolve_remote_preview(std::path::Path::new("/remote/unknown.png")),
+        None
+    );
+}

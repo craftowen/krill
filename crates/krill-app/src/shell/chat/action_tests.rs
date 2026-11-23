@@ -957,6 +957,7 @@ fn chat_working_stop_button_sends_single_interrupt_latches_turn_and_preserves_dr
                 vec![super::DraftAttachment {
                     display_name: "notes.txt".into(),
                     path: std::path::PathBuf::from("/tmp/notes.txt"),
+                    preview_path: None,
                     byte_len: 12,
                     is_image: false,
                 }],

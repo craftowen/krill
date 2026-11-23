@@ -101,7 +101,36 @@ fn png_bytes(path: &Path) -> Option<Vec<u8>> {
 #[derive(Default)]
 pub(crate) struct ChatImages {
     thumbs: HashMap<PathBuf, Loaded>,
+    remote_previews: HashMap<PathBuf, PathBuf>,
     pub(super) viewer: Option<ImageViewer>,
+}
+
+impl ChatImages {
+    pub(super) fn register_remote_preview(&mut self, remote: PathBuf, local: PathBuf) {
+        if self.remote_previews.len() >= MAX_CACHED_THUMBS
+            && !self.remote_previews.contains_key(&remote)
+        {
+            self.remote_previews.clear();
+        }
+        self.remote_previews.insert(remote, local);
+    }
+
+    pub(super) fn resolve_remote_preview(&self, remote: &Path) -> Option<&Path> {
+        if let Some(local) = self.remote_previews.get(remote) {
+            return Some(local.as_path());
+        }
+        let raw = remote.to_str()?;
+        let alt = if let Some(rest) = raw.strip_prefix("/private/") {
+            format!("/{rest}")
+        } else if raw.starts_with("/tmp/") || raw.starts_with("/var/") {
+            format!("/private{raw}")
+        } else {
+            return None;
+        };
+        self.remote_previews
+            .get(Path::new(&alt))
+            .map(PathBuf::as_path)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -279,34 +308,47 @@ impl Shell {
     }
 
     /// A row of message image tiles that open the viewer (Orca `NativeChatImageAttachments`:
-    /// `mb-2 flex flex-wrap gap-1.5`, 80 px tiles). Remote hosts' files are not readable
-    /// here, so their tiles stay icons and do not open.
+    /// `mb-2 flex flex-wrap gap-1.5`, 80 px tiles). Each slot holds a locally readable path or
+    /// `None` for an unknown remote image, which stays an icon and does not open.
     pub(super) fn chat_message_images(
         &mut self,
         id_prefix: &str,
-        paths: &[PathBuf],
+        paths: &[Option<PathBuf>],
         numbers: &[usize],
-        readable: bool,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         if paths.is_empty() {
             return None;
         }
         let p = ui::palette(cx);
+        let mut viewer_paths = Vec::new();
+        let mut viewer_numbers = Vec::new();
+        let mut viewer_indices = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            if let Some(path) = path {
+                viewer_indices.push(Some(viewer_paths.len()));
+                viewer_paths.push(path.clone());
+                if let Some(number) = numbers.get(index).copied() {
+                    viewer_numbers.push(number);
+                }
+            } else {
+                viewer_indices.push(None);
+            }
+        }
         let mut row = div().flex().flex_wrap().gap_1p5();
         for (index, path) in paths.iter().enumerate() {
-            let loaded = if readable {
-                self.chat_thumbnail(path, cx)
-            } else {
-                Loaded::Failed
+            let loaded = match path {
+                Some(path) => self.chat_thumbnail(path, cx),
+                None => Loaded::Failed,
             };
             let number = numbers.get(index).copied();
             let label = number.map_or_else(
                 || ctext::IMAGE_VIEW.get().to_owned(),
                 |n| ctext::IMAGE_NUMBER.format(&[("number", &n.to_string())]),
             );
-            let open_paths = paths.to_vec();
-            let open_numbers = numbers.to_vec();
+            let open_index = viewer_indices.get(index).copied().flatten();
+            let open_paths = viewer_paths.clone();
+            let open_numbers = viewer_numbers.clone();
             let tile = image_tile(
                 SharedString::from(format!("{id_prefix}-image-{index}")),
                 &loaded,
@@ -318,13 +360,13 @@ impl Shell {
             .tooltip(move |window, cx| {
                 gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
             })
-            .when(readable, |tile| {
+            .when_some(open_index, |tile, viewer_idx| {
                 tile.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_chat_image_viewer(
                             open_paths.clone(),
                             open_numbers.clone(),
-                            index,
+                            viewer_idx,
                             window,
                             cx,
                         );
