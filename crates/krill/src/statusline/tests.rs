@@ -438,3 +438,86 @@ fn uninstall_targets_recorded_receipt_change_path() {
     assert!(!paths.receipt.exists());
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn windows_chain_shell_falls_back_to_powershell_when_git_bash_and_sh_are_absent() {
+    let root = temp_root("win-chain-shell");
+    let empty_path = root.join("empty-bin");
+    std::fs::create_dir_all(&empty_path).unwrap();
+
+    // 1. Explicit CLAUDE_CODE_GIT_BASH_PATH wins with `-c`.
+    let custom_bash = root.join("custom").join("bash.exe");
+    let (bin, args) = resolve_windows_chain_shell(
+        Some(custom_bash.as_os_str()),
+        Some(empty_path.as_os_str()),
+        None,
+    );
+    assert_eq!(bin, custom_bash);
+    assert_eq!(args, &["-c"]);
+
+    // 2. Without Git Bash or sh on PATH, falls back to SystemRoot PowerShell (or bare powershell.exe).
+    let sys_root = root.join("Windows");
+    let ps_exe = sys_root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    std::fs::create_dir_all(ps_exe.parent().unwrap()).unwrap();
+    std::fs::write(&ps_exe, b"stub").unwrap();
+
+    let (bin, args) = resolve_windows_chain_shell(
+        None,
+        Some(empty_path.as_os_str()),
+        Some(sys_root.as_os_str()),
+    );
+    assert_eq!(bin, ps_exe);
+    assert_eq!(
+        args,
+        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+    );
+
+    let (bin, args) = resolve_windows_chain_shell(None, Some(empty_path.as_os_str()), None);
+    assert_eq!(bin, PathBuf::from("powershell.exe"));
+    assert_eq!(
+        args,
+        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+    );
+
+    // 3. Git sibling bin\bash.exe is detected when git is on PATH.
+    let git_root = root.join("Git");
+    let git_cmd = git_root.join("cmd");
+    let git_bin = git_root.join("bin");
+    std::fs::create_dir_all(&git_cmd).unwrap();
+    std::fs::create_dir_all(&git_bin).unwrap();
+    let git_exe = git_cmd.join(if cfg!(windows) { "git.exe" } else { "git" });
+    std::fs::write(&git_exe, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&git_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let bash_exe = git_bin.join("bash.exe");
+    std::fs::write(&bash_exe, b"stub").unwrap();
+
+    let (bin, args) =
+        resolve_windows_chain_shell(None, Some(git_cmd.as_os_str()), Some(sys_root.as_os_str()));
+    assert_eq!(bin, bash_exe);
+    assert_eq!(args, &["-c"]);
+
+    // 4. `sh` on PATH is used before PowerShell fallback.
+    let sh_dir = root.join("sh-bin");
+    std::fs::create_dir_all(&sh_dir).unwrap();
+    let sh_exe = sh_dir.join(if cfg!(windows) { "sh.exe" } else { "sh" });
+    std::fs::write(&sh_exe, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&sh_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (bin, args) =
+        resolve_windows_chain_shell(None, Some(sh_dir.as_os_str()), Some(sys_root.as_os_str()));
+    assert_eq!(bin, sh_exe);
+    assert_eq!(args, &["-c"]);
+
+    std::fs::remove_dir_all(&root).ok();
+}

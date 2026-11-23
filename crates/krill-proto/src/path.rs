@@ -109,6 +109,10 @@ pub fn within(path: &Path, root: &Path) -> bool {
                 .split('/')
                 .chain(root_str.split('/'))
                 .any(|p| p == "..")
+                || path.components().chain(root.components()).any(|c| {
+                    matches!(c, std::path::Component::ParentDir)
+                        || matches!(c, std::path::Component::Normal(s) if s == "..")
+                })
             {
                 return false;
             }
@@ -190,5 +194,26 @@ mod tests {
         assert!(!within(Path::new("/repository"), Path::new("/repo")));
         assert!(!within(Path::new("/repo/../outside"), Path::new("/repo")));
         assert!(!within(Path::new("/repo/sub"), Path::new("/repo/../repo")));
+        #[cfg(windows)]
+        {
+            assert!(!within(
+                Path::new(r"\\?\Volume{abc}\repo\..\outside"),
+                Path::new(r"\\?\Volume{abc}\repo")
+            ));
+            assert!(!within(Path::new(r"\repo\..\outside"), Path::new(r"\repo")));
+            assert!(!within(
+                Path::new(r"C:repo\..\outside"),
+                Path::new(r"C:repo")
+            ));
+            assert!(!within(Path::new(r"repo\..\outside"), Path::new("repo")));
+        }
+        #[cfg(unix)]
+        {
+            // Literal backslashes in Unix filenames keep native Path semantics.
+            assert!(within(
+                Path::new(r"dir/a\..\b/child"),
+                Path::new(r"dir/a\..\b")
+            ));
+        }
     }
 }

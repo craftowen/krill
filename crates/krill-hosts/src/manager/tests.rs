@@ -524,3 +524,104 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '
     drop(manager);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn stale_host_target_record_outcome_cannot_drop_replacement_tunnel() {
+    let dir =
+        std::env::temp_dir().join(format!("krill-r3p05-stale-outcome-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; sleep 60' "${fwd%%:*}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    let mut host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec.clone()]);
+
+    let old_target = manager.target_for(&host, None).unwrap();
+    let _sock1 = manager.ensure_tunnel_socket("studio").unwrap();
+    old_target.record_outcome(true, None);
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // 1. Transport config change creates a new registration and replacement tunnel.
+    host_spec.port = Some(2223);
+    manager.sync_specs(&[host_spec.clone()]);
+    let new_target = manager.target_for(&host, None).unwrap();
+    let _sock2 = manager.ensure_tunnel_socket("studio").unwrap();
+    new_target.record_outcome(true, None);
+    let pid2 = manager.tunnel_pid("studio").unwrap();
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    let broken = io::Error::new(io::ErrorKind::BrokenPipe, "old tunnel closed");
+    old_target.record_outcome(false, Some(&broken));
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid2),
+        "stale HostTarget::record_outcome must not tear down replacement tunnel"
+    );
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // 2. Remove & re-add host creates a brand-new slot; old replacement target must not touch it.
+    manager.sync_specs(&[]);
+    manager.sync_specs(&[host_spec]);
+    let recreated_target = manager.target_for(&host, None).unwrap();
+    let _sock3 = manager.ensure_tunnel_socket("studio").unwrap();
+    recreated_target.record_outcome(true, None);
+    let pid3 = manager.tunnel_pid("studio").unwrap();
+
+    let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "removed slot EOF");
+    new_target.record_outcome(false, Some(&eof));
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid3),
+        "removed HostTarget::record_outcome must not tear down re-added host tunnel"
+    );
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sync_specs_transport_change_keeps_manually_disconnected_host_disconnected() {
+    let fake = FakeSsh::new("r3p08-suspended-edit", false);
+    let manager = fake.manager();
+    let mut host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec.clone()]);
+
+    manager.disconnect_now("studio");
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+
+    host_spec.port = Some(2299);
+    manager.sync_specs(&[host_spec]);
+    assert_eq!(
+        manager.status("studio"),
+        HostStatus::Disconnected,
+        "transport edit on a suspended host must not strand status in Connecting"
+    );
+    assert_eq!(
+        manager.statuses().first().map(|(_, status)| *status),
+        Some(HostStatus::Disconnected)
+    );
+    let target = manager.target_for(&host, None).unwrap();
+    assert!(!target.is_current());
+
+    manager.reconnect_now("studio");
+    assert_eq!(manager.status("studio"), HostStatus::Connecting);
+    assert!(target.is_current());
+}

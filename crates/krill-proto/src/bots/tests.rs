@@ -668,8 +668,28 @@ fn zip_reader_rejects_zip_slip_disallowed_paths_and_crc_tampering() {
         "\\windows\\system32",
         "C:evil.txt",
         "skills/a/b\0c",
+        "skills/demo/SKILL.md:hidden",
+        "skills/demo/C:evil",
+        "skills/demo/SKILL.md.",
+        "skills/demo/SKILL.md ",
+        "skills/demo/CON.md",
+        "skills/demo/CON .md",
+        "skills/demo/NUL",
+        "skills/demo/com1.txt",
+        "skills/demo/lpt¹.md",
+        "skills/demo/a?b.md",
+        "skills/demo/a*b.md",
+        "skills/demo/a<b.md",
+        "skills/demo/sub./SKILL.md",
     ] {
-        assert!(validate_zip_entry_path(unsafe_path).is_err());
+        assert!(
+            validate_zip_entry_path(unsafe_path).is_err(),
+            "expected unsafe zip entry path to be rejected: {unsafe_path:?}"
+        );
+        assert!(
+            validate_bot_package_path(unsafe_path).is_err(),
+            "expected unsafe bot package path to be rejected: {unsafe_path:?}"
+        );
     }
 
     // Disallowed non-bot path inside an otherwise valid zip must be rejected by import_bot_zip.

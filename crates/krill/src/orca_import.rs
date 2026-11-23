@@ -129,11 +129,11 @@ use krill_proto::agent_history::{
     Action, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, Response, VaultAgent, VaultTarget,
 };
 use krill_proto::bots::{
-    BOT_LOOK_AROUND_FOCUS_MAX_BYTES, BotConfig, BotGroupChat, BotId, BotItemActor, BotItemDecision,
-    BotItemStatus, BotMember, BotScheduleConfig, BotSlug, BotSuggestion, ExternalBotCandidate,
-    ExternalBotSourceApp, ExternalSource, bot_slug_from_name, discover_external_bots_filtered,
-    expand_tilde, init_bot_home, soul_description, strip_png_metadata, validate_bot_id,
-    validate_bot_slug,
+    BOT_ID_MAX_BYTES, BOT_LOOK_AROUND_FOCUS_MAX_BYTES, BOT_SLUG_MAX_BYTES, BotConfig, BotGroupChat,
+    BotId, BotItemActor, BotItemDecision, BotItemStatus, BotMember, BotScheduleConfig, BotSlug,
+    BotSuggestion, ExternalBotCandidate, ExternalBotSourceApp, ExternalSource, bot_slug_from_name,
+    discover_external_bots_filtered, expand_tilde, init_bot_home, soul_description,
+    strip_png_metadata, validate_bot_id, validate_bot_slug,
 };
 use krill_proto::config_document;
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
@@ -707,7 +707,7 @@ pub fn repo_hook_config_in(state_dir: &Path, repo_top: &Path) -> Option<StoredPr
 #[cfg(test)]
 fn path_aliases(path: &Path) -> Vec<String> {
     let mut out = vec![path.to_string_lossy().into_owned()];
-    if let Ok(canon) = fs::canonicalize(path) {
+    if let Ok(canon) = krill_proto::os::canonicalize(path) {
         let s = canon.to_string_lossy().into_owned();
         if !out.contains(&s) {
             out.push(s);
@@ -2906,16 +2906,17 @@ fn lexical_private_alias(path: &Path) -> PathBuf {
 }
 
 /// Orca가 준 경로(심볼릭 링크 포함 가능)를 저장용 정규 경로로 바꾼다(OWE-803).
-/// 존재하면 `fs::canonicalize`로 풀고, 없으면 macOS 기본 별칭만 어휘적으로 맞춘다.
+/// 존재하면 `krill_proto::os::canonicalize`로 풀고(Windows verbatim 접두어 제거 포함),
+/// 없으면 macOS 기본 별칭만 어휘적으로 맞춘다.
 /// `[[projects]] path`와 `[worktrees]`·`[lineage]` 키가 같은 표기를 쓰게 해
 /// 사이드바에서 동일 폴더가 2번 렌더링되지 않게 한다.
 fn normalize_import_path(path: &Path) -> PathBuf {
-    if let Ok(canon) = fs::canonicalize(path) {
+    if let Ok(canon) = krill_proto::os::canonicalize(path) {
         return canon;
     }
     let aliased = lexical_private_alias(path);
     if aliased != path {
-        if let Ok(canon) = fs::canonicalize(&aliased) {
+        if let Ok(canon) = krill_proto::os::canonicalize(&aliased) {
             return canon;
         }
         return aliased;
@@ -4657,7 +4658,15 @@ pub fn rrule_to_utc_cron(rrule: Option<&str>, dtstart: Option<&str>) -> String {
     }
 
     if let Some(raw) = rrule {
-        let body = raw.trim().strip_prefix("RRULE:").unwrap_or(raw.trim());
+        let trimmed = raw.trim();
+        let body = if trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RRULE:"))
+        {
+            trimmed.get(6..).unwrap_or_default()
+        } else {
+            trimmed
+        };
         for token in body.split(';') {
             let Some((k, v)) = token.split_once('=') else {
                 continue;
@@ -5022,7 +5031,8 @@ fn sync_bots_index(
             }
         } else {
             // Allocate non-colliding slug and ID across existing + intra-run bots.
-            let unique_slug = allocate_unique_bot_slug(&existing_bots, bots_root, &config.slug);
+            let unique_slug = allocate_unique_bot_slug(&existing_bots, bots_root, &config.slug)
+                .map_err(invalid_data)?;
             config.slug = unique_slug.clone();
             unique_slug.as_str().clone_into(&mut config.folder);
             if existing_bots.iter().any(|b| b.id == config.id) {
@@ -5282,7 +5292,21 @@ fn import_bots_domain(
     Ok(summary)
 }
 
-fn allocate_unique_bot_slug(existing: &[BotConfig], bots_root: &Path, base: &BotSlug) -> BotSlug {
+fn truncate_slug_prefix(raw: &str, max_bytes: usize) -> &str {
+    let mut end = raw.len().min(max_bytes);
+    while end > 0 && !raw.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    raw.get(..end)
+        .unwrap_or_default()
+        .trim_end_matches(['-', '_'])
+}
+
+fn allocate_unique_bot_slug(
+    existing: &[BotConfig],
+    bots_root: &Path,
+    base: &BotSlug,
+) -> Result<BotSlug, String> {
     let taken = |cand: &str| {
         existing
             .iter()
@@ -5290,29 +5314,48 @@ fn allocate_unique_bot_slug(existing: &[BotConfig], bots_root: &Path, base: &Bot
             || fs::symlink_metadata(bots_root.join(cand)).is_ok()
     };
     if !taken(base.as_str()) {
-        return base.clone();
+        return Ok(base.clone());
     }
     for n in 2..=9999_u32 {
-        let candidate = format!("{}-{n}", base.as_str());
+        let suffix = format!("-{n}");
+        let max_prefix = BOT_SLUG_MAX_BYTES.saturating_sub(suffix.len());
+        let prefix = truncate_slug_prefix(base.as_str(), max_prefix);
+        let prefix = if prefix.is_empty() { "bot" } else { prefix };
+        let candidate = format!("{prefix}{suffix}");
         if validate_bot_slug(&candidate).is_ok()
             && let Ok(slug) = BotSlug::new(&candidate)
             && !taken(slug.as_str())
         {
-            return slug;
+            return Ok(slug);
         }
     }
-    base.clone()
+    Err(format!(
+        "unable to allocate unique bot slug for '{}'",
+        base.as_str()
+    ))
 }
 
 fn allocate_unique_bot_id(existing: &[BotConfig], base_slug: &str) -> Result<BotId, String> {
-    let first = format!("bot-{base_slug}");
+    let first_prefix = truncate_slug_prefix(base_slug, BOT_ID_MAX_BYTES.saturating_sub(4));
+    let first = if first_prefix.is_empty() {
+        "bot".to_owned()
+    } else {
+        format!("bot-{first_prefix}")
+    };
     if let Ok(id) = BotId::new(&first)
         && !existing.iter().any(|b| b.id == id)
     {
         return Ok(id);
     }
     for n in 2..=9999_u32 {
-        let cand = format!("bot-{base_slug}-{n}");
+        let suffix = format!("-{n}");
+        let max_prefix = BOT_ID_MAX_BYTES.saturating_sub(4 + suffix.len());
+        let prefix = truncate_slug_prefix(base_slug, max_prefix);
+        let cand = if prefix.is_empty() {
+            format!("bot{suffix}")
+        } else {
+            format!("bot-{prefix}{suffix}")
+        };
         if let Ok(id) = BotId::new(&cand)
             && !existing.iter().any(|b| b.id == id)
         {
@@ -5540,7 +5583,15 @@ fn build_krill_bot_config(
     let id = raw_id
         .and_then(|id| validate_bot_id(id).ok())
         .and_then(|id| BotId::new(id).ok())
-        .or_else(|| BotId::new(format!("orca-{}", slug.as_str())).ok())
+        .or_else(|| {
+            let prefix = truncate_slug_prefix(slug.as_str(), BOT_ID_MAX_BYTES.saturating_sub(5));
+            let derived = if prefix.is_empty() {
+                "orca-bot".to_owned()
+            } else {
+                format!("orca-{prefix}")
+            };
+            BotId::new(derived).ok()
+        })
         .ok_or_else(|| "unable to derive valid bot id".to_owned())?;
 
     let raw_agent = disk
@@ -10152,13 +10203,77 @@ PRAGMA wal_checkpoint(TRUNCATE);
         fs::write(existing_dir.join("notes.txt"), "keep me").unwrap();
 
         let base = BotSlug::new("helper").unwrap();
-        let allocated = allocate_unique_bot_slug(&[], &bots_root, &base);
+        let allocated = allocate_unique_bot_slug(&[], &bots_root, &base).unwrap();
         assert_eq!(allocated.as_str(), "helper-2");
         assert_eq!(
             fs::read_to_string(existing_dir.join("notes.txt")).unwrap(),
             "keep me"
         );
 
+        // Max-length (64-byte) slug collision truncates prefix instead of returning colliding base.
+        let long_slug_str = "a".repeat(BOT_SLUG_MAX_BYTES);
+        let long_base = BotSlug::new(&long_slug_str).unwrap();
+        fs::create_dir_all(bots_root.join(&long_slug_str)).unwrap();
+        let allocated_long = allocate_unique_bot_slug(&[], &bots_root, &long_base).unwrap();
+        assert_ne!(allocated_long.as_str(), long_slug_str);
+        assert!(allocated_long.as_str().len() <= BOT_SLUG_MAX_BYTES);
+        assert!(allocated_long.as_str().ends_with("-2"));
+
+        // Hyphen right at truncation boundary must not produce `--2`.
+        let boundary_slug_str = format!("{}-a", "b".repeat(BOT_SLUG_MAX_BYTES - 2));
+        let boundary_base = BotSlug::new(&boundary_slug_str).unwrap();
+        fs::create_dir_all(bots_root.join(&boundary_slug_str)).unwrap();
+        let allocated_boundary = allocate_unique_bot_slug(&[], &bots_root, &boundary_base).unwrap();
+        assert!(!allocated_boundary.as_str().contains("--"));
+        assert!(allocated_boundary.as_str().len() <= BOT_SLUG_MAX_BYTES);
+        assert!(allocated_boundary.as_str().ends_with("-2"));
+
+        // `build_krill_bot_config` and `allocate_unique_bot_id` truncate prefixes for 64-byte slugs.
+        let built_long = build_krill_bot_config(&long_slug_str, None, None, None, 0).unwrap();
+        assert!(built_long.id.as_str().starts_with("orca-"));
+        assert!(built_long.id.as_str().len() <= BOT_ID_MAX_BYTES);
+
+        let id1 = allocate_unique_bot_id(&[], &long_slug_str).unwrap();
+        assert!(id1.as_str().starts_with("bot-"));
+        assert!(id1.as_str().len() <= BOT_ID_MAX_BYTES);
+        let mut existing_bot = built_long;
+        existing_bot.id = id1.clone();
+        let id2 = allocate_unique_bot_id(&[existing_bot], &long_slug_str).unwrap();
+        assert_ne!(id2, id1);
+        assert!(id2.as_str().len() <= BOT_ID_MAX_BYTES);
+        assert!(id2.as_str().ends_with("-2"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rrule_to_utc_cron_strips_rrule_prefix_case_insensitively() {
+        assert_eq!(
+            rrule_to_utc_cron(Some("rrule:FREQ=HOURLY;INTERVAL=2"), None),
+            "0 */2 * * *"
+        );
+        assert_eq!(
+            rrule_to_utc_cron(Some("Rrule:FREQ=MONTHLY;BYMONTHDAY=15"), None),
+            "0 9 15 * *"
+        );
+        assert_eq!(
+            automation_rrule_to_cron(Some("rRuLe:FREQ=MINUTELY;INTERVAL=5"), None),
+            "*/5 * * * *"
+        );
+    }
+
+    #[test]
+    fn normalize_import_path_strips_windows_verbatim_prefix() {
+        let root = std::env::temp_dir().join(format!("krill-r3p-14-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let normalized = normalize_import_path(&root);
+        let text = normalized.to_string_lossy();
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "normalized import path must not keep Windows verbatim prefix: {text}"
+        );
+        assert_eq!(normalized, krill_proto::os::canonicalize(&root).unwrap());
         fs::remove_dir_all(&root).ok();
     }
 

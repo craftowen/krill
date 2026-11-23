@@ -2113,16 +2113,28 @@ impl OrchestrationStore {
     }
 
     pub fn resolve_recipients(&self, to: &str, run_id: Option<&str>) -> Vec<String> {
+        self.resolve_recipients_with_status_override(to, run_id, None)
+    }
+
+    fn resolve_recipients_with_status_override(
+        &self,
+        to: &str,
+        run_id: Option<&str>,
+        status_override: Option<(&str, DispatchStatus)>,
+    ) -> Vec<String> {
         let target = to.trim();
         if !target.starts_with('@') {
             return vec![target.to_owned()];
         }
         let mut names = BTreeSet::new();
         for d in &self.dispatches {
+            let status = status_override
+                .filter(|(id, _)| *id == d.id)
+                .map_or(d.status, |(_, s)| s);
             if run_id.is_some_and(|rid| d.run_id != rid)
                 || d.release_state == DispatchReleaseState::Released
                 || matches!(
-                    d.status,
+                    status,
                     DispatchStatus::Abandoned | DispatchStatus::Failed | DispatchStatus::Released
                 )
             {
@@ -2130,8 +2142,8 @@ impl OrchestrationStore {
             }
             let include = match target {
                 "@all" => true,
-                "@idle" => d.status != DispatchStatus::Active,
-                "@active" => d.status == DispatchStatus::Active,
+                "@idle" => status != DispatchStatus::Active,
+                "@active" => status == DispatchStatus::Active,
                 "@claude" => d.agent.eq_ignore_ascii_case("claude"),
                 "@codex" => d.agent.eq_ignore_ascii_case("codex"),
                 "@opencode" => d.agent.eq_ignore_ascii_case("opencode"),
@@ -2174,6 +2186,7 @@ impl OrchestrationStore {
         let mut resolved_task_id = params.task_id.clone();
         let mut resolved_run_id = params.run_id.clone();
         let mut resolved_dispatch_id = params.dispatch_id.clone();
+        let mut worker_done_failed: Option<bool> = None;
 
         if params.msg_type == MessageType::WorkerDone {
             let failed = match params.outcome.as_deref() {
@@ -2287,38 +2300,17 @@ impl OrchestrationStore {
                 }
             }
 
+            // 4. Validate dispatch is still active (read-only; state is mutated only after frame check passes).
             if let Some(ref disp_id) = resolved_dispatch_id
-                && let Some(disp) = self.dispatches.iter_mut().find(|d| d.id == *disp_id)
+                && let Some(disp) = self.dispatches.iter().find(|d| d.id == *disp_id)
+                && disp.status != DispatchStatus::Active
             {
-                if disp.status != DispatchStatus::Active {
-                    return Err(invalid(format!(
-                        "dispatch '{disp_id}' is no longer active ({})",
-                        disp.status.as_str()
-                    )));
-                }
-                disp.status = if failed {
-                    DispatchStatus::Failed
-                } else {
-                    DispatchStatus::Succeeded
-                };
-                disp.summary = Some(summary.to_owned());
-                disp.ended_at_ms = Some(now);
+                return Err(invalid(format!(
+                    "dispatch '{disp_id}' is no longer active ({})",
+                    disp.status.as_str()
+                )));
             }
-
-            if let Some(ref tid) = resolved_task_id
-                && let Some(task) = self.tasks.iter_mut().find(|t| t.id == *tid)
-            {
-                task.status = if failed {
-                    TaskStatus::Failed
-                } else {
-                    TaskStatus::Completed
-                };
-                task.result_summary = Some(summary.to_owned());
-                task.active_dispatch_id = None;
-                task.updated_at_ms = now;
-            }
-
-            self.reconverge_dag();
+            worker_done_failed = Some(failed);
         }
 
         if resolved_run_id.is_none() {
@@ -2339,10 +2331,28 @@ impl OrchestrationStore {
                 .map(|d| d.run_id.clone())
                 .or_else(|| self.current_run_id.clone());
         }
-        let recipients = self.resolve_recipients(to, resolved_run_id.as_deref());
-        let mut created = Vec::new();
+        let status_override = worker_done_failed.and_then(|failed| {
+            resolved_dispatch_id.as_deref().map(|disp_id| {
+                (
+                    disp_id,
+                    if failed {
+                        DispatchStatus::Failed
+                    } else {
+                        DispatchStatus::Succeeded
+                    },
+                )
+            })
+        });
+        let recipients = self.resolve_recipients_with_status_override(
+            to,
+            resolved_run_id.as_deref(),
+            status_override,
+        );
+        let mut preview_seq = self.next_seq;
+        let mut created = Vec::with_capacity(recipients.len());
         for rcpt in recipients {
-            let msg_id = self.alloc_id("msg");
+            preview_seq = preview_seq.saturating_add(1);
+            let msg_id = format!("msg-{preview_seq}");
             let msg = OrchMessage {
                 id: msg_id,
                 run_id: resolved_run_id.clone(),
@@ -2366,6 +2376,33 @@ impl OrchestrationStore {
                 created.len()
             )));
         }
+        if let Some(failed) = worker_done_failed {
+            if let Some(ref disp_id) = resolved_dispatch_id
+                && let Some(disp) = self.dispatches.iter_mut().find(|d| d.id == *disp_id)
+            {
+                disp.status = if failed {
+                    DispatchStatus::Failed
+                } else {
+                    DispatchStatus::Succeeded
+                };
+                disp.summary = Some(summary.to_owned());
+                disp.ended_at_ms = Some(now);
+            }
+            if let Some(ref tid) = resolved_task_id
+                && let Some(task) = self.tasks.iter_mut().find(|t| t.id == *tid)
+            {
+                task.status = if failed {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                };
+                task.result_summary = Some(summary.to_owned());
+                task.active_dispatch_id = None;
+                task.updated_at_ms = now;
+            }
+            self.reconverge_dag();
+        }
+        self.next_seq = preview_seq;
         self.messages.extend(created.iter().cloned());
         self.prune_messages();
         Ok(created)
@@ -2855,12 +2892,13 @@ pub fn worker_launch_profile(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> io::Result<crate::agent::Profile> {
-    let runtime = profile
+    let runtime_raw = profile
         .program()
         .and_then(|p| Path::new(p).file_stem())
         .and_then(|p| p.to_str())
         .unwrap_or(agent)
         .to_owned();
+    let runtime = crate::agent::canonical_id(&runtime_raw);
     let mut profile = profile.clone();
     crate::agent::encode_agent_program_id(
         agent,
@@ -2870,32 +2908,81 @@ pub fn worker_launch_profile(
         },
     )
     .map_err(invalid)?;
-    if let Some(model) = model {
-        if model.trim().is_empty() {
-            return Err(invalid("model must not be empty"));
+
+    let mut resolved_model = match model {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(invalid("model must not be empty"));
+            }
+            Some(trimmed.to_owned())
         }
+        None => None,
+    };
+
+    let mut resolved_effort = match effort {
+        Some(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            let supported = match runtime {
+                "codex" | "pi" | "omp" => matches!(
+                    normalized.as_str(),
+                    "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ),
+                "claude" | "openclaude" | "opencode" => {
+                    matches!(normalized.as_str(), "low" | "medium" | "high" | "max")
+                }
+                "agy" => matches!(
+                    normalized.as_str(),
+                    "low" | "medium" | "high" | "xhigh" | "max"
+                ),
+                "grok" => matches!(normalized.as_str(), "low" | "medium" | "high" | "xhigh"),
+                _ => {
+                    return Err(invalid(
+                        "effort override is unsupported for this agent profile",
+                    ));
+                }
+            };
+            if !supported {
+                return Err(invalid(format!(
+                    "effort '{normalized}' is unsupported for agent '{runtime}'"
+                )));
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+
+    let effort_requested = resolved_effort.is_some();
+    if runtime == "agy"
+        && let (Some(model_id), Some(eff)) = (&mut resolved_model, &resolved_effort)
+    {
+        let (family, existing_suffix) = crate::agent::strip_agy_effort_suffix(model_id);
+        match existing_suffix {
+            Some(existing) if existing == eff.as_str() => {
+                // Model ID already encodes the requested effort; avoid redundant `--effort`.
+                resolved_effort = None;
+            }
+            Some(_) => {
+                // Antigravity CLI rejects `--model <family>-<old> --effort <new>`.
+                *model_id = family.to_owned();
+            }
+            None => {}
+        }
+    }
+
+    if let Some(model_id) = resolved_model {
         profile.launch = without_worker_options(&profile.launch, &["--model", "-m"], None);
         profile.yolo_args = without_worker_options(&profile.yolo_args, &["--model", "-m"], None);
-        profile
-            .launch
-            .extend(["--model".to_owned(), model.to_owned()]);
+        let model_flag = if runtime == "grok" { "-m" } else { "--model" };
+        profile.launch.extend([model_flag.to_owned(), model_id]);
     }
-    if let Some(effort) = effort {
-        if !matches!(
-            effort,
-            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        ) {
-            return Err(invalid("invalid effort"));
-        }
-        let mapped = if effort == "max" { "xhigh" } else { effort };
-        let runtime = crate::agent::canonical_id(&runtime);
-        if matches!(effort, "minimal" | "xhigh") && !matches!(runtime, "codex" | "pi") {
-            return Err(invalid("minimal and xhigh effort require Codex or Pi"));
-        }
+
+    if effort_requested {
         let flags: &[&str] = match runtime {
-            "claude" => &["--effort"],
-            "pi" => &["--thinking"],
+            "claude" | "openclaude" | "agy" => &["--effort"],
+            "pi" | "omp" => &["--thinking"],
             "opencode" => &["--variant"],
+            "grok" => &["--reasoning-effort"],
             _ => &[],
         };
         profile.launch = without_worker_options(
@@ -2908,14 +2995,19 @@ pub fn worker_launch_profile(
             flags,
             (runtime == "codex").then_some("model_reasoning_effort="),
         );
+    }
+
+    if let Some(eff) = resolved_effort {
+        let mapped = if eff == "max" { "xhigh" } else { eff.as_str() };
         let args = match runtime {
             "codex" => [
                 "-c".to_owned(),
                 format!("model_reasoning_effort=\"{mapped}\""),
             ],
-            "claude" => ["--effort".to_owned(), effort.to_owned()],
-            "pi" => ["--thinking".to_owned(), mapped.to_owned()],
-            "opencode" => ["--variant".to_owned(), effort.to_owned()],
+            "claude" | "openclaude" | "agy" => ["--effort".to_owned(), eff],
+            "pi" | "omp" => ["--thinking".to_owned(), mapped.to_owned()],
+            "opencode" => ["--variant".to_owned(), eff],
+            "grok" => ["--reasoning-effort".to_owned(), eff],
             _ => {
                 return Err(invalid(
                     "effort override is unsupported for this agent profile",
@@ -6892,5 +6984,171 @@ mod frame_bound_tests {
         for bad in [".GIT", ".Git/hooks", ".git.", "GIT~1", "sub/.GIT/config"] {
             assert!(validate_symlink_path(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn worker_launch_profile_supports_agy_openclaude_omp_and_grok_overrides() -> io::Result<()> {
+        let agents = crate::agent::Agents::load(None).unwrap();
+
+        let (_, agy_base) = agents.resolve("agy").unwrap();
+        let agy_high = worker_launch_profile(agy_base, "agy", None, Some("high"))?;
+        assert_eq!(agy_high.launch, ["agy", "--effort", "high"]);
+        let agy_xhigh = worker_launch_profile(agy_base, "agy", None, Some("xhigh"))?;
+        assert_eq!(agy_xhigh.launch, ["agy", "--effort", "xhigh"]);
+        let agy_max = worker_launch_profile(agy_base, "agy", None, Some("max"))?;
+        assert_eq!(agy_max.launch, ["agy", "--effort", "max"]);
+        assert!(worker_launch_profile(agy_base, "agy", None, Some("minimal")).is_err());
+
+        // Conflicting `-high` suffix stripped when overriding effort to `medium`.
+        let agy_conflict =
+            worker_launch_profile(agy_base, "agy", Some("gemini-3-flash-high"), Some("medium"))?;
+        assert_eq!(
+            agy_conflict.launch,
+            ["agy", "--model", "gemini-3-flash", "--effort", "medium"]
+        );
+
+        // Matching `-high` suffix avoids redundant `--effort high` (and strips any prior `--effort`).
+        let mut agy_with_old = agy_base.clone();
+        agy_with_old
+            .launch
+            .extend(["--effort".to_owned(), "low".to_owned()]);
+        let agy_same = worker_launch_profile(
+            &agy_with_old,
+            "agy",
+            Some("gemini-3-flash-high"),
+            Some("high"),
+        )?;
+        assert_eq!(agy_same.launch, ["agy", "--model", "gemini-3-flash-high"]);
+
+        let (_, openclaude_base) = agents.resolve("openclaude").unwrap();
+        let oc = worker_launch_profile(openclaude_base, "openclaude", Some("sonnet"), Some("max"))?;
+        assert_eq!(
+            oc.launch,
+            ["openclaude", "--model", "sonnet", "--effort", "max"]
+        );
+        assert!(worker_launch_profile(openclaude_base, "openclaude", None, Some("xhigh")).is_err());
+
+        let (_, omp_base) = agents.resolve("omp").unwrap();
+        let omp_min = worker_launch_profile(omp_base, "omp", None, Some("minimal"))?;
+        assert_eq!(omp_min.launch, ["omp", "--thinking", "minimal"]);
+        let omp_max = worker_launch_profile(omp_base, "omp", None, Some("max"))?;
+        assert_eq!(omp_max.launch, ["omp", "--thinking", "xhigh"]);
+
+        let (_, grok_base) = agents.resolve("grok").unwrap();
+        let grok = worker_launch_profile(grok_base, "grok", Some("grok-4"), Some("xhigh"))?;
+        assert_eq!(
+            grok.launch,
+            ["grok", "-m", "grok-4", "--reasoning-effort", "xhigh"]
+        );
+        assert!(worker_launch_profile(grok_base, "grok", None, Some("max")).is_err());
+        assert!(worker_launch_profile(grok_base, "grok", None, Some("minimal")).is_err());
+
+        let (_, opencode_base) = agents.resolve("opencode").unwrap();
+        let opencode = worker_launch_profile(opencode_base, "opencode", None, Some("high"))?;
+        assert_eq!(opencode.launch, ["opencode", "--variant", "high"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_worker_done_fanout_leaves_dispatch_task_dag_and_seq_unchanged() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("atomic-worker-done", None)?;
+        let task_a = store.create_task(&run.id, "upstream", "", vec![])?;
+        let task_b = store.create_task(&run.id, "downstream", "", vec![task_a.id.clone()])?;
+        assert_eq!(
+            store
+                .tasks
+                .iter()
+                .find(|t| t.id == task_b.id)
+                .map(|t| t.status),
+            Some(TaskStatus::Pending)
+        );
+        let disp_a = store.start_worker(
+            &run.id,
+            Some(&task_a.id),
+            "worker-a",
+            "claude",
+            None,
+            "/tmp",
+            "do a",
+        )?;
+        for i in 0..5 {
+            store.start_worker(
+                &run.id,
+                None,
+                &format!("peer-{i}"),
+                "claude",
+                None,
+                "/tmp",
+                "watch",
+            )?;
+        }
+        let seq_before = store.next_seq;
+        let messages_before = store.messages.len();
+
+        let oversized = SendParams {
+            from: "worker-a".into(),
+            to: "@all".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "finished a".into(),
+            body: "x".repeat(250 * 1024),
+            run_id: Some(run.id.clone()),
+            task_id: Some(task_a.id.clone()),
+            dispatch_id: Some(disp_a.id.clone()),
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        };
+        let err = store.send_message(&oversized).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        // Dispatch, task, downstream DAG status, next_seq, and messages must remain completely unchanged.
+        assert_eq!(store.next_seq, seq_before);
+        assert_eq!(store.messages.len(), messages_before);
+        let disp_after = store.dispatches.iter().find(|d| d.id == disp_a.id).unwrap();
+        assert_eq!(disp_after.status, DispatchStatus::Active);
+        assert!(disp_after.ended_at_ms.is_none());
+        let task_a_after = store.tasks.iter().find(|t| t.id == task_a.id).unwrap();
+        assert_eq!(task_a_after.status, TaskStatus::Dispatched);
+        assert_eq!(
+            task_a_after.active_dispatch_id.as_deref(),
+            Some(disp_a.id.as_str())
+        );
+        let task_b_after = store.tasks.iter().find(|t| t.id == task_b.id).unwrap();
+        assert_eq!(task_b_after.status, TaskStatus::Pending);
+
+        // Retrying on the same `&mut OrchestrationStore` with a single recipient must succeed cleanly.
+        let retry = SendParams {
+            to: "coordinator".into(),
+            ..oversized
+        };
+        let created = store.send_message(&retry)?;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].id, format!("msg-{}", seq_before + 1));
+        assert_eq!(
+            store
+                .dispatches
+                .iter()
+                .find(|d| d.id == disp_a.id)
+                .map(|d| d.status),
+            Some(DispatchStatus::Succeeded)
+        );
+        assert_eq!(
+            store
+                .tasks
+                .iter()
+                .find(|t| t.id == task_a.id)
+                .map(|t| t.status),
+            Some(TaskStatus::Completed)
+        );
+        assert_eq!(
+            store
+                .tasks
+                .iter()
+                .find(|t| t.id == task_b.id)
+                .map(|t| t.status),
+            Some(TaskStatus::Ready)
+        );
+        Ok(())
     }
 }

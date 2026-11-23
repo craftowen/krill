@@ -622,11 +622,7 @@ pub(crate) fn run_piped_ssh_with_timeout(
     stdin_bytes: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> io::Result<std::process::Output> {
-    use std::io::Read as _;
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
     static JOBS: AtomicUsize = AtomicUsize::new(0);
     struct Permit;
     impl Drop for Permit {
@@ -639,6 +635,20 @@ pub(crate) fn run_piped_ssh_with_timeout(
     })
     .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "managed SSH workers busy"))?;
     let _permit = Permit;
+    run_piped_command_with_timeout(ssh_bin, args, stdin_bytes, timeout)
+}
+
+#[cfg(unix)]
+pub(crate) fn run_piped_command_with_timeout(
+    ssh_bin: &OsStr,
+    args: &[String],
+    stdin_bytes: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
     let deadline = Instant::now() + timeout;
     // Socket pairs provide safe nonblocking stdio without FFI or detached pipe workers.
     let (mut stdout, child_out) = UnixStream::pair()?;

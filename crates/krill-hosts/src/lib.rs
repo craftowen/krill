@@ -259,6 +259,9 @@ impl HostTarget {
 
     /// 재사용 중인 소켓의 요청 성공/실패를 연결 관리자에 알린다.
     pub fn record_outcome(&self, ok: bool, err: Option<&io::Error>) {
+        if !self.is_current() {
+            return;
+        }
         if let Some(c) = &self.connector {
             (c.on_outcome)(ok, err);
         }

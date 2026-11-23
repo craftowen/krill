@@ -225,33 +225,72 @@ fn resolve_chain(
     }
 }
 
-/// 체인 명령을 해석할 POSIX 셸. 설치한 statusLine 명령 자체가 POSIX 인용이라 Claude Code가 그 명령을
-/// 돌린 셸과 같은 종류여야 한다: Windows는 Git Bash(`CLAUDE_CODE_GIT_BASH_PATH`, 없으면 PATH의 `git` 옆
-/// `bin\bash.exe`, 그것도 없으면 PATH의 `sh`).
+/// 체인 명령을 해석할 셸과 실행 플래그.
+/// Unix는 `/bin/sh -c`. Windows는 Git Bash(`CLAUDE_CODE_GIT_BASH_PATH`, PATH의 `git` 옆
+/// `bin\bash.exe`, PATH의 `sh`)를 우선 쓰고, 없으면 PowerShell(`-NoLogo -NoProfile -NonInteractive -Command`)로
+/// 폴백해 Git Bash가 없는 PowerShell 전용 호스트에서도 체인 statusLine이 동작하게 한다.
 #[cfg(unix)]
-fn chain_shell() -> PathBuf {
-    PathBuf::from("/bin/sh")
+fn chain_shell() -> (PathBuf, &'static [&'static str]) {
+    (PathBuf::from("/bin/sh"), &["-c"])
 }
 
 #[cfg(windows)]
-fn chain_shell() -> PathBuf {
-    std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            let git = krill_proto::agent::which("git", &std::env::var_os("PATH")?)?;
-            Some(git.parent()?.parent()?.join("bin").join("bash.exe")).filter(|b| b.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from("sh"))
+fn chain_shell() -> (PathBuf, &'static [&'static str]) {
+    let git_bash = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH");
+    let path_env = std::env::var_os("PATH");
+    let system_root = std::env::var_os("SystemRoot");
+    resolve_windows_chain_shell(
+        git_bash.as_deref(),
+        path_env.as_deref(),
+        system_root.as_deref(),
+    )
 }
 
-/// 사용자 명령을 [`chain_shell`]`-c`로 실행하고 stdout을 그대로 돌려준다.
+#[cfg(any(windows, test))]
+fn resolve_windows_chain_shell(
+    git_bash_path: Option<&OsStr>,
+    path_env: Option<&OsStr>,
+    system_root: Option<&OsStr>,
+) -> (PathBuf, &'static [&'static str]) {
+    const POSIX_ARGS: &[&str] = &["-c"];
+    const POWERSHELL_ARGS: &[&str] = &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"];
+    if let Some(bash) = git_bash_path.filter(|p| !p.is_empty()) {
+        return (PathBuf::from(bash), POSIX_ARGS);
+    }
+    if let Some(path) = path_env {
+        if let Some(bash) = krill_proto::agent::which("git", path)
+            .and_then(|git| Some(git.parent()?.parent()?.join("bin").join("bash.exe")))
+            .filter(|b| b.is_file())
+        {
+            return (bash, POSIX_ARGS);
+        }
+        if let Some(sh) = krill_proto::agent::which("sh", path) {
+            return (sh, POSIX_ARGS);
+        }
+    }
+    let powershell = system_root
+        .filter(|root| !root.is_empty())
+        .map(|root| {
+            PathBuf::from(root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+    (powershell, POWERSHELL_ARGS)
+}
+
+/// 사용자 명령을 [`chain_shell`]로 실행하고 stdout을 그대로 돌려준다.
 /// 실패·타임아웃은 빈 출력이다(표시 우선).
 fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + wait;
-    let mut shell = std::process::Command::new(chain_shell());
+    let (shell_bin, shell_args) = chain_shell();
+    let mut shell = std::process::Command::new(shell_bin);
+    krill_proto::os::configure_background(&mut shell);
     shell
-        .arg("-c")
+        .args(shell_args)
         .arg(command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

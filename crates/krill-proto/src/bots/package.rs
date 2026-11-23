@@ -910,6 +910,27 @@ pub fn import_bot_zip(archive: &[u8]) -> Result<BotPackageData, PackageError> {
     })
 }
 
+fn is_unsafe_windows_segment(segment: &str) -> bool {
+    if segment.ends_with(['.', ' ']) || segment.contains([':', '<', '>', '"', '|', '?', '*']) {
+        return true;
+    }
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            upper.strip_prefix(prefix).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+}
+
 /// Validates a raw ZIP archive entry path against zip-slip / traversal / control bytes.
 pub fn validate_zip_entry_path(path: &str) -> Result<(), PackageError> {
     if path.is_empty()
@@ -928,7 +949,11 @@ pub fn validate_zip_entry_path(path: &str) -> Result<(), PackageError> {
         return Err(PackageError::UnsafePath(path.to_owned()));
     }
     for segment in path.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || is_unsafe_windows_segment(segment)
+        {
             return Err(PackageError::UnsafePath(path.to_owned()));
         }
     }

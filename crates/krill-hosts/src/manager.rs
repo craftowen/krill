@@ -247,10 +247,16 @@ impl HostManager {
                     if transport_changed {
                         slot.registration = Arc::new(());
                         slot.generation = slot.generation.wrapping_add(1);
+                        slot.transport_epoch.fetch_add(1, Ordering::Release);
                         slot.tunnel = None;
                         slot.failures = 0;
                         slot.next_retry_at = None;
-                        slot.status = HostStatus::Connecting;
+                        slot.last_error = None;
+                        slot.status = if slot.suspended {
+                            HostStatus::Disconnected
+                        } else {
+                            HostStatus::Connecting
+                        };
                     }
                 }
                 keep.insert(spec.id.clone(), existing);
@@ -458,13 +464,22 @@ impl HostManager {
                     {
                         let manager = self.clone();
                         let host_id = id.clone();
+                        let expected_slot = Arc::downgrade(&slot);
+                        let expected_reg = Arc::clone(&registration);
                         move |ok, err| {
                             let tid = std::thread::current().id();
                             let token = outcome_attempts
                                 .lock()
                                 .ok()
                                 .and_then(|mut g| g.remove(&tid));
-                            manager.record_ipc_outcome_for_attempt(&host_id, token, ok, err);
+                            manager.record_ipc_outcome_for_target(
+                                &host_id,
+                                &expected_slot,
+                                &expected_reg,
+                                token,
+                                ok,
+                                err,
+                            );
                         }
                     },
                 )
@@ -677,6 +692,25 @@ impl HostManager {
         self.record_ipc_outcome_for_attempt(id, None, ok, err);
     }
 
+    fn record_ipc_outcome_for_target(
+        &self,
+        id: &str,
+        expected_slot: &std::sync::Weak<Mutex<RemoteSlot>>,
+        expected_reg: &Arc<()>,
+        attempt: Option<(Arc<()>, u64)>,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
+        let (Some(slot), Some(expected)) = (self.slot(id), expected_slot.upgrade()) else {
+            return;
+        };
+        if !Arc::ptr_eq(&slot, &expected) {
+            return;
+        }
+        Self::record_ipc_outcome_in_slot(&slot, Some(expected_reg), attempt, ok, err);
+    }
+
+    #[cfg(all(test, unix))]
     fn record_ipc_outcome_for_attempt(
         &self,
         id: &str,
@@ -687,11 +721,26 @@ impl HostManager {
         let Some(slot) = self.slot(id) else {
             return;
         };
+        Self::record_ipc_outcome_in_slot(&slot, None, attempt, ok, err);
+    }
+
+    fn record_ipc_outcome_in_slot(
+        slot: &Mutex<RemoteSlot>,
+        expected_reg: Option<&Arc<()>>,
+        attempt: Option<(Arc<()>, u64)>,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
         let Ok(mut s) = slot.lock() else {
             return;
         };
-        if let Some((expected_reg, expected_gen)) = attempt
-            && (!Arc::ptr_eq(&s.registration, &expected_reg) || s.generation != expected_gen)
+        if let Some(reg) = expected_reg
+            && !Arc::ptr_eq(&s.registration, reg)
+        {
+            return;
+        }
+        if let Some((attempt_reg, attempt_gen)) = attempt
+            && (!Arc::ptr_eq(&s.registration, &attempt_reg) || s.generation != attempt_gen)
         {
             return;
         }
