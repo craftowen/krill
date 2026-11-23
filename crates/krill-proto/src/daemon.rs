@@ -449,6 +449,11 @@ impl Paths {
     pub fn dev() -> io::Result<Self> {
         let state = state_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        Self::with_state_dir(&state)
+    }
+
+    /// `dev()`와 같되 상태 디렉터리를 직접 지정한다(`--state-dir`).
+    pub fn with_state_dir(state: &Path) -> io::Result<Self> {
         let exe = std::env::current_exe()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut apps = Vec::new();
@@ -458,7 +463,7 @@ impl Paths {
             }
             apps.push(PathBuf::from("/Applications/Krill.app"));
         }
-        Self::from_exe(&exe, &state, &apps)
+        Self::from_exe(&exe, state, &apps)
     }
 
     fn from_exe(exe: &Path, state: &Path, apps: &[PathBuf]) -> io::Result<Self> {

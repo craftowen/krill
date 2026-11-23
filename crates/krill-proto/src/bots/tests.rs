@@ -2575,3 +2575,206 @@ fn bot_session_refusal_formats_versions_and_host_names_in_en_and_ko() {
     );
     assert!(!agy_missing.message_en(None).contains("this computer"));
 }
+
+#[test]
+fn upcoming_schedule_wire_encoding_is_n_minus_1_compatible_and_preserves_json() {
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct LegacyScheduleUpcoming {
+        id: String,
+        next_ms: Option<u64>,
+        last_ms: Option<u64>,
+        running: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct LegacyUpcoming {
+        look_around_last_ms: Option<u64>,
+        look_around_next_ms: Option<u64>,
+        tidy_last_ms: Option<u64>,
+        tidy_next_ms: Option<u64>,
+        schedules: Vec<LegacyScheduleUpcoming>,
+        up_next_seen_ms: u64,
+        items_seen_event_id: u64,
+    }
+
+    // Verify variant tag constant matches postcard's derived discriminant.
+    let empty_up = BotRpcResponse::Upcoming(BotUpcoming::default());
+    assert_eq!(
+        postcard::to_stdvec(&empty_up).unwrap()[0],
+        super::rpc::UPCOMING_RESPONSE_TAG
+    );
+
+    let full = BotUpcoming {
+        look_around_last_ms: Some(100),
+        look_around_next_ms: Some(200),
+        tidy_last_ms: Some(300),
+        tidy_next_ms: Some(400),
+        schedules: vec![
+            BotScheduleUpcoming {
+                id: "nightly".to_owned(),
+                next_ms: Some(1_000),
+                last_ms: Some(900),
+                running: true,
+                last_error: Some("CLI too old".to_owned()),
+                last_refusal: Some(BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0")),
+            },
+            BotScheduleUpcoming {
+                id: "clean".to_owned(),
+                next_ms: Some(2_000),
+                last_ms: None,
+                running: false,
+                last_error: None,
+                last_refusal: None,
+            },
+        ],
+        up_next_seen_ms: 55,
+        items_seen_event_id: 77,
+    };
+
+    // 1. New -> New roundtrip via BotRpcResponse and Reply::Bot.
+    let resp = BotRpcResponse::Upcoming(full.clone());
+    let bot_frame = resp.encode().unwrap();
+    let (bk, bbody) = read_frame(&mut bot_frame.as_slice()).unwrap().unwrap();
+    assert_eq!(BotRpcResponse::decode(bk, &bbody).unwrap(), resp);
+
+    let ctrl = Reply::Bot(resp.clone());
+    let ctrl_frame = ctrl.encode().unwrap();
+    let (ck, cbody) = read_frame(&mut ctrl_frame.as_slice()).unwrap().unwrap();
+    assert_eq!(Reply::decode(ck, &cbody).unwrap(), ctrl);
+
+    // 2. Old v0.3.22 reader decodes new bytes (with trailing error/refusal extensions) cleanly.
+    assert_eq!(bbody[0], super::rpc::UPCOMING_RESPONSE_TAG);
+    let legacy_decoded: LegacyUpcoming = postcard::from_bytes(&bbody[1..]).unwrap();
+    assert_eq!(legacy_decoded.schedules.len(), 2);
+    assert_eq!(legacy_decoded.schedules[0].id, "nightly");
+    assert!(legacy_decoded.schedules[0].running);
+    assert_eq!(legacy_decoded.schedules[1].id, "clean");
+    assert_eq!(legacy_decoded.up_next_seen_ms, 55);
+    assert_eq!(legacy_decoded.items_seen_event_id, 77);
+
+    // 3. Old v0.3.22 writer -> New decoder yields None for last_error / last_refusal.
+    let mut legacy_body = vec![super::rpc::UPCOMING_RESPONSE_TAG];
+    legacy_body.extend(postcard::to_stdvec(&legacy_decoded).unwrap());
+    let decoded_from_old = BotRpcResponse::decode(BOT_REPLY, &legacy_body).unwrap();
+    let BotRpcResponse::Upcoming(up_from_old) = decoded_from_old else {
+        panic!("expected Upcoming");
+    };
+    assert_eq!(up_from_old.schedules.len(), 2);
+    assert_eq!(up_from_old.schedules[0].id, "nightly");
+    assert_eq!(up_from_old.schedules[0].last_error, None);
+    assert_eq!(up_from_old.schedules[0].last_refusal, None);
+    assert_eq!(up_from_old.items_seen_event_id, 77);
+
+    // Also via Reply::Bot (tag 33 + legacy_body).
+    let mut legacy_ctrl_body = vec![33_u8];
+    legacy_ctrl_body.extend_from_slice(&legacy_body);
+    let ctrl_from_old = Reply::decode(crate::control::kind::REPLY, &legacy_ctrl_body).unwrap();
+    assert_eq!(
+        ctrl_from_old,
+        Reply::Bot(BotRpcResponse::Upcoming(up_from_old.clone()))
+    );
+
+    // 4. When no schedule has last_error or last_refusal, encoded bytes match v0.3.22 exactly.
+    let no_ext_frame = BotRpcResponse::Upcoming(up_from_old).encode().unwrap();
+    let (_, no_ext_body) = read_frame(&mut no_ext_frame.as_slice()).unwrap().unwrap();
+    assert_eq!(no_ext_body, legacy_body);
+
+    // 5. JSON serialization still preserves all 6 fields.
+    let json = serde_json::to_string(&full).unwrap();
+    let json_rt: BotUpcoming = serde_json::from_str(&json).unwrap();
+    assert_eq!(json_rt, full);
+}
+
+#[test]
+fn export_bot_home_zip_skips_hidden_and_disallowed_paths_in_skills_and_memory() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-export-filter-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(dir.join("skills/valid-skill")).unwrap();
+    fs::create_dir_all(dir.join("skills/MySkill")).unwrap();
+    fs::create_dir_all(dir.join("skills/.hidden-dir")).unwrap();
+    fs::create_dir_all(dir.join("memory")).unwrap();
+
+    fs::write(dir.join("SOUL.md"), "# Soul\n").unwrap();
+    // Invalid / macOS clutter that must be skipped instead of failing export:
+    fs::write(dir.join("skills/.DS_Store"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    fs::write(
+        dir.join("skills/valid-skill/.DS_Store"),
+        [0xff, 0xfe, 0x00, 0x02],
+    )
+    .unwrap();
+    fs::write(dir.join("skills/.hidden-dir/file.md"), "hidden").unwrap();
+    fs::write(dir.join("skills/README.md"), "top level file").unwrap();
+    fs::write(dir.join("skills/MySkill/SKILL.md"), "non-slug dir").unwrap();
+    fs::write(dir.join("memory/.DS_Store"), [0xff, 0xfe, 0x00, 0x03]).unwrap();
+    fs::write(dir.join("memory/NOTES.MD"), "uppercase ext").unwrap();
+    fs::write(dir.join("memory/v1.0.md"), "dotted stem").unwrap();
+
+    // Valid files that must be preserved:
+    fs::write(dir.join("skills/valid-skill/SKILL.md"), "# Valid Skill\n").unwrap();
+    fs::write(dir.join("memory/valid-topic.md"), "# Valid Topic\n").unwrap();
+
+    let cfg = sample_bot_config();
+    let zip = export_bot_home_zip(
+        &dir,
+        &cfg,
+        BotPackageExportOptions {
+            include_memory: true,
+            include_avatar: false,
+        },
+    )
+    .unwrap();
+    let imported = import_bot_zip(&zip).unwrap();
+    assert_eq!(
+        imported
+            .skills
+            .get("valid-skill/SKILL.md")
+            .map(String::as_str),
+        Some("# Valid Skill\n")
+    );
+    assert_eq!(imported.skills.len(), 1);
+    assert_eq!(
+        imported
+            .memory_topics
+            .get("valid-topic.md")
+            .map(String::as_str),
+        Some("# Valid Topic\n")
+    );
+    assert_eq!(imported.memory_topics.len(), 1);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn extract_group_mention_ids_enforces_word_boundaries() {
+    let ops = BotId::new("bot-ops").unwrap();
+    let ops_lead = BotId::new("bot-ops-lead").unwrap();
+    let code = BotId::new("bot-code").unwrap();
+    let members = [
+        (&ops, "ops", "Ops"),
+        (&ops_lead, "ops-lead", "Ops Lead"),
+        (&code, "code", "Code"),
+    ];
+
+    // Emails and identifier prefixes must not false-trigger mentions.
+    assert!(
+        extract_group_mention_ids("Mail alice@ops.example.com and @CodeReview", &members)
+            .is_empty()
+    );
+    // Multi-word mention requires a word boundary after the full name ("@Ops Leader" != "@Ops Lead").
+    let spaced_only = [(&ops_lead, "ops-lead", "Ops Lead"), (&code, "code", "Code")];
+    assert!(extract_group_mention_ids("Ask @Ops Leader tomorrow", &spaced_only).is_empty());
+    assert_eq!(
+        extract_group_mention_ids("Ask @Ops Leader tomorrow", &members),
+        vec![ops.clone()]
+    );
+
+    // Exact multi-word mention prefers Ops Lead over prefix Ops and preserves order.
+    assert_eq!(
+        extract_group_mention_ids("Hey @Ops Lead, check with @Code!", &members),
+        vec![ops_lead.clone(), code.clone()]
+    );
+    // Punctuation after single-word or multi-word mention is a valid boundary.
+    assert_eq!(
+        extract_group_mention_ids("Ping @Ops. Also @Ops-Lead?", &members),
+        vec![ops, ops_lead]
+    );
+}

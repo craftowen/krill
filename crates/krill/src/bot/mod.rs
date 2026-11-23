@@ -86,6 +86,7 @@ Look Around, Schedules, Sessions & Messaging:
   schedules [<bot>] [ls | add --name <n> --cron <expr> --prompt <text> [--id <id>] [--timezone <tz>] [--disabled]
                      | enable <id> | disable <id> | rm <id>] [--json]
   sessions [<bot>] [ls | reset [--session <id>] | stop <id> | retry-kickoff | take-over <id> | run-again <id>] [--json]
+  offer [<bot> | --bot <bot>] --name <n> --purpose <p> [--json]
   reply [<bot>] (<text> | --text <text>) [--link <external-id>] [--file <path>...] [--react <emoji>] [--json]
   send --to bot:<slug> [--from <sender>] [--type status|question|handoff]
        [--subject <text>] [--thread <id>] <message> [--json]
@@ -203,6 +204,13 @@ pub(crate) fn ensure_bots_feature(features: u64) -> Result<(), CliError> {
     Ok(())
 }
 
+pub(crate) fn format_session_refusal(
+    refusal: &krill_proto::bots::BotSessionRefusal,
+    host: Option<&str>,
+) -> String {
+    refusal.message_en(host.or(Some("this computer")))
+}
+
 impl BotClient for DaemonBotClient {
     fn call(&mut self, request: BotRpcRequest) -> Result<BotRpcResponse, CliError> {
         let encoded = Request::Bot(request)
@@ -228,9 +236,9 @@ impl BotClient for DaemonBotClient {
             .map_err(|e| CliError::fail(format!("decode bot reply: {e}")))?;
         match reply {
             Reply::Bot(BotRpcResponse::Error(msg)) => Err(CliError::fail(msg)),
-            Reply::Bot(BotRpcResponse::SessionRefused(refusal)) => {
-                Err(CliError::fail(refusal.message_en(Some("this computer"))))
-            }
+            Reply::Bot(BotRpcResponse::SessionRefused(refusal)) => Err(CliError::fail(
+                format_session_refusal(&refusal, self.target.host()),
+            )),
             Reply::Bot(resp) => Ok(resp),
             Reply::Failed(failure) => Err(CliError::fail(failure.to_string())),
             _ => Err(CliError::fail("unexpected non-bot reply from krilld")),

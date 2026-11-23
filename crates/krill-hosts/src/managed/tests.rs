@@ -764,3 +764,34 @@ fn run_piped_ssh_preserves_stderr_when_remote_exits_before_draining_large_stdin(
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn classify_remote_error_prioritizes_ssh_auth_over_generic_permission_denied() {
+    for auth_err in [
+        "user@host: Permission denied (publickey).",
+        "Permission denied (publickey,keyboard-interactive).",
+        "Permission denied (password).",
+        "Host key verification failed.",
+        "Authentication failed for host",
+    ] {
+        assert_eq!(
+            classify_remote_error(auth_err, Some(255)),
+            InstallFailureKind::Auth,
+            "{auth_err}"
+        );
+    }
+    assert_eq!(
+        classify_remote_error("mkdir: /opt/krill: Permission denied", Some(1)),
+        InstallFailureKind::Permission
+    );
+
+    let fake_out = std::process::Output {
+        status: std::process::Command::new("/usr/bin/false")
+            .status()
+            .unwrap(),
+        stdout: Vec::new(),
+        stderr: b"user@host: Permission denied (publickey).\n".to_vec(),
+    };
+    let err = ssh_failed(&test_opts(), "mkdir", &fake_out);
+    assert_eq!(err.kind, InstallFailureKind::Auth);
+}

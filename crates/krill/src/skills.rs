@@ -92,7 +92,13 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
     };
     match sub.as_str() {
         "list" | "ls" => {
-            let json = rest.iter().any(|a| a == "--json");
+            let mut json = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+                }
+            }
             let skills = builtin_skills();
             if json {
                 print_json(&skills)?;
@@ -577,8 +583,8 @@ fn cmd_reference(state_dir: &Path, args: &[String]) -> io::Result<()> {
 }
 
 fn dispatch_ports(args: &[String]) -> io::Result<()> {
-    let entries = collect_ports(args)?;
-    if args.iter().any(|arg| arg == "--json") {
+    let (entries, json) = collect_ports_parsed(args)?;
+    if json {
         print_json(&entries)?;
     } else {
         println!("SESSION\tPORT\tREACHABLE\tURL");
@@ -595,22 +601,37 @@ fn dispatch_ports(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_ports(args: &[String]) -> io::Result<Vec<PortEntry>> {
-    collect_ports_with(
+    collect_ports_parsed(args).map(|(entries, _)| entries)
+}
+
+fn collect_ports_parsed(args: &[String]) -> io::Result<(Vec<PortEntry>, bool)> {
+    collect_ports_with_mode(
         args,
         crate::session::capture_session_text,
         crate::session::list_session_ids,
     )
 }
 
+#[cfg(test)]
 fn collect_ports_with(
     args: &[String],
     capture: impl Fn(u64) -> std::result::Result<String, String>,
     list: impl Fn() -> std::result::Result<Vec<u64>, String>,
 ) -> io::Result<Vec<PortEntry>> {
+    collect_ports_with_mode(args, capture, list).map(|(entries, _)| entries)
+}
+
+fn collect_ports_with_mode(
+    args: &[String],
+    capture: impl Fn(u64) -> std::result::Result<String, String>,
+    list: impl Fn() -> std::result::Result<Vec<u64>, String>,
+) -> io::Result<(Vec<PortEntry>, bool)> {
     let mut session_filter = None;
     let mut probe = true;
     let mut sample_text = None;
+    let mut json = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -622,7 +643,7 @@ fn collect_ports_with(
             "--text" => {
                 sample_text = Some(it.next().ok_or_else(|| bad_arg("missing --text"))?);
             }
-            "--json" => {}
+            "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
@@ -655,7 +676,7 @@ fn collect_ports_with(
         }
     }
 
-    Ok(entries)
+    Ok((entries, json))
 }
 
 fn parse_reference_args(args: &[String]) -> io::Result<(Option<PathBuf>, bool, Vec<String>)> {
@@ -1032,6 +1053,28 @@ mod tests {
         assert_eq!(entries[0].session_id, 42);
         assert!(collect_ports(&args(&["--session", "0", "--no-probe"])).is_err());
         assert!(collect_ports(&args(&["--session", "s0", "--no-probe"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn skills_list_rejects_unknown_flags_and_ports_honors_parsed_json_flag() -> io::Result<()> {
+        let err = dispatch_skills(&args(&["list", "--unknown"])).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        dispatch_skills(&args(&["list", "--json"]))?;
+
+        // `--text --json` passes "--json" as the text payload, NOT as JSON mode.
+        let (entries, json) = collect_ports_parsed(&args(&["--text", "--json", "--no-probe"]))?;
+        assert!(entries.is_empty());
+        assert!(!json);
+
+        let (entries, json) = collect_ports_parsed(&args(&[
+            "--text",
+            "http://127.0.0.1:4173",
+            "--no-probe",
+            "--json",
+        ]))?;
+        assert_eq!(entries.len(), 1);
+        assert!(json);
         Ok(())
     }
 }

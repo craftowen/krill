@@ -2259,7 +2259,338 @@ fn offer_proposes_a_bot_from_the_bots_own_chat() {
             bot: "shop".to_owned(),
             name: "Ledger".to_owned(),
             purpose: "Keeps the spend sheet.".to_owned(),
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_command(
+            &s(&[
+                "offer",
+                "--bot",
+                "ops",
+                "--name",
+                "Ledger",
+                "--purpose",
+                "Keeps the spend sheet.",
+                "--json",
+            ]),
+            None
+        )
+        .unwrap(),
+        BotCommand::Offer {
+            bot: "ops".to_owned(),
+            name: "Ledger".to_owned(),
+            purpose: "Keeps the spend sheet.".to_owned(),
+            json: true,
         }
     );
     assert!(parse_command(&s(&["offer", "--name", "Ledger"]), Some("shop")).is_err());
+    assert!(USAGE.contains("offer "));
+    assert!(crate::USAGE.contains("/offer/"));
+
+    let bot = sample_bot();
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let mut client = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::Text("Offered Ledger\n".to_owned()),
+        BotRpcResponse::Bot(Box::new(bot)),
+        BotRpcResponse::Text("Offered Ledger\n".to_owned()),
+    ]);
+    let text_out = execute_online(
+        parse_command(
+            &s(&[
+                "offer",
+                "bot-pr-1",
+                "--name",
+                "Ledger",
+                "--purpose",
+                "Tracks spend",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert_eq!(text_out, "Offered Ledger");
+
+    let json_out = execute_online(
+        parse_command(
+            &s(&[
+                "offer",
+                "--bot",
+                "bot-pr-1",
+                "--name",
+                "Ledger",
+                "--purpose",
+                "Tracks spend",
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["message"], "Offered Ledger");
+}
+
+#[test]
+fn session_refusal_uses_remote_host_name_when_present() {
+    let refusal = krill_proto::bots::BotSessionRefusal::cli_not_installed("claude");
+    let remote = super::format_session_refusal(&refusal, Some("user@remote"));
+    assert!(remote.contains("user@remote"), "{remote}");
+    assert!(!remote.contains("this computer"), "{remote}");
+    let local = super::format_session_refusal(&refusal, None);
+    assert!(local.contains("this computer"), "{local}");
+}
+
+#[test]
+fn items_ls_with_status_filter_and_pagination_computes_accurate_counts_and_cursors() {
+    use krill_proto::bots::BotUpcoming;
+    let bot_id = BotId::new("bot-pr-1").unwrap();
+    let mk_item = |num: u64, status: BotItemStatus, ts: u64, snooze: Option<u64>, ev_id: u64| {
+        let mut item = sample_item();
+        item.uid = format!("item-uid-{num}");
+        item.number = num;
+        item.owner_bot_id = bot_id.clone();
+        item.title = format!("Item {num}");
+        item.status = status;
+        item.last_activity_at_ms = ts;
+        item.snoozed_until_ms = snooze;
+        item.events = vec![BotItemEvent {
+            id: ev_id,
+            item_uid: item.uid.clone(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Bot {
+                bot_id: bot_id.clone(),
+                session_id: None,
+            },
+            text: "hi".to_owned(),
+            decisions: Vec::new(),
+            created_at_ms: ts,
+        }];
+        item
+    };
+    let all_items = vec![
+        mk_item(1, BotItemStatus::NeedsYou, 100, None, 10),
+        mk_item(2, BotItemStatus::Working, 250, None, 20),
+        mk_item(3, BotItemStatus::NeedsYou, 200, None, 30),
+        mk_item(4, BotItemStatus::NeedsYou, 300, None, 40),
+        mk_item(5, BotItemStatus::NeedsYou, 400, Some(9_999), 50),
+    ];
+    let upcoming = BotUpcoming {
+        items_seen_event_id: 25,
+        ..BotUpcoming::default()
+    };
+
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let mut client = MockClient::new([
+        // Call 1: --status needs_you --limit 2 --page 1 --json
+        BotRpcResponse::Items(all_items.clone()),
+        BotRpcResponse::Upcoming(upcoming.clone()),
+        // Call 2: --status needs_you --limit 2 --page 2 --json
+        BotRpcResponse::Items(all_items.clone()),
+        BotRpcResponse::Upcoming(upcoming.clone()),
+        // Call 3: --status needs_you --limit 2 --page 3 --json (exhausted)
+        BotRpcResponse::Items(all_items.clone()),
+        BotRpcResponse::Upcoming(upcoming.clone()),
+        // Call 4: --status needs_you --limit 2 --cursor <page1_cursor> --json
+        BotRpcResponse::Items(all_items.clone()),
+        BotRpcResponse::Upcoming(upcoming.clone()),
+        // Call 5: --status needs_you --limit 2 --include-snoozed --json
+        BotRpcResponse::Items(all_items.clone()),
+        BotRpcResponse::Upcoming(upcoming),
+        // Call 6: --status planned --limit 2 --json (zero matches; no Upcoming needed)
+        BotRpcResponse::Items(all_items),
+    ]);
+
+    let p1_raw = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "ls",
+                "--status",
+                "needs_you",
+                "--limit",
+                "2",
+                "--page",
+                "1",
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    let p1: BotItemsPage = serde_json::from_str(&p1_raw).unwrap();
+    assert_eq!(p1.total_count, 3);
+    assert_eq!(p1.unseen_count, 2); // events 30, 40 > 25 (item 1 has ev 10 <= 25; item 5 is snoozed)
+    assert_eq!(
+        p1.items.iter().map(|i| i.number).collect::<Vec<_>>(),
+        vec![4, 3]
+    );
+    let cursor1 = p1
+        .next_cursor
+        .clone()
+        .expect("page 1 must have next_cursor");
+
+    let p2_raw = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "ls",
+                "--status",
+                "needs_you",
+                "--limit",
+                "2",
+                "--page",
+                "2",
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    let p2: BotItemsPage = serde_json::from_str(&p2_raw).unwrap();
+    assert_eq!(p2.total_count, 3);
+    assert_eq!(p2.unseen_count, 2);
+    assert_eq!(
+        p2.items.iter().map(|i| i.number).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(p2.next_cursor, None);
+
+    let p3_raw = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "ls",
+                "--status",
+                "needs_you",
+                "--limit",
+                "2",
+                "--page",
+                "3",
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    let p3: BotItemsPage = serde_json::from_str(&p3_raw).unwrap();
+    assert_eq!(p3.total_count, 3);
+    assert!(p3.items.is_empty());
+    assert_eq!(p3.next_cursor, None);
+
+    let cur_raw = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "ls",
+                "--status",
+                "needs_you",
+                "--limit",
+                "2",
+                "--cursor",
+                &cursor1,
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    let cur_page: BotItemsPage = serde_json::from_str(&cur_raw).unwrap();
+    assert_eq!(
+        cur_page.items.iter().map(|i| i.number).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(cur_page.next_cursor, None);
+
+    let snoozed_raw = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "ls",
+                "--status",
+                "needs_you",
+                "--limit",
+                "2",
+                "--include-snoozed",
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    let snoozed_page: BotItemsPage = serde_json::from_str(&snoozed_raw).unwrap();
+    assert_eq!(snoozed_page.total_count, 4);
+    assert_eq!(snoozed_page.unseen_count, 3);
+    assert_eq!(
+        snoozed_page
+            .items
+            .iter()
+            .map(|i| i.number)
+            .collect::<Vec<_>>(),
+        vec![5, 4]
+    );
+
+    let zero_raw = execute_online(
+        parse_command(
+            &s(&[
+                "items", "ls", "--status", "planned", "--limit", "2", "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    let zero_page: BotItemsPage = serde_json::from_str(&zero_raw).unwrap();
+    assert_eq!(zero_page.total_count, 0);
+    assert_eq!(zero_page.unseen_count, 0);
+    assert!(zero_page.items.is_empty());
+    assert_eq!(zero_page.next_cursor, None);
+
+    assert!(
+        client
+            .recorded
+            .iter()
+            .all(|req| !matches!(req, BotRpcRequest::ListItemsPage { .. }))
+    );
 }

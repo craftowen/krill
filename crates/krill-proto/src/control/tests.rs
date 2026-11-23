@@ -1708,3 +1708,9 @@ fn states_startup_stall_tail_round_trips_and_old_decoders_ignore_it() {
     body.extend(postcard::to_stdvec(&Some(String::new())).unwrap());
     assert!(Reply::decode(kind::REPLY, &body).is_err());
 }
+
+#[test]
+fn reply_bot_tag_matches_derived_discriminant() {
+    let encoded = postcard::to_stdvec(&Reply::Bot(crate::bots::BotRpcResponse::Ok)).unwrap();
+    assert_eq!(encoded[0], REPLY_BOT_TAG);
+}

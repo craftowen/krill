@@ -1548,13 +1548,22 @@ const fn default_poll_interval() -> u64 {
     DEFAULT_CONNECTOR_POLL_INTERVAL_SECS
 }
 
+fn is_mention_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
 /// Extracts mentioned group member IDs from message or draft text (`@everyone`, `@id`, `@slug`,
-/// `@name`, and `@Hyphenated-Name`), preserving first-seen order without duplicates.
+/// `@name`, `@Full Name`, and `@Hyphenated-Name`), preserving first-seen order without duplicates.
 #[must_use]
 pub fn extract_group_mention_ids(text: &str, members: &[(&BotId, &str, &str)]) -> Vec<BotId> {
     let mut mentioned = Vec::new();
     let mut seen = BTreeSet::new();
     let chars: Vec<char> = text.chars().collect();
+    let spaced_names: Vec<(&BotId, Vec<char>)> = members
+        .iter()
+        .filter(|(_, _, name)| name.contains(' '))
+        .map(|(id, _, name)| (*id, name.chars().collect()))
+        .collect();
     let mut i = 0;
     while i < chars.len() {
         if chars.get(i).copied() == Some('@') {
@@ -1564,11 +1573,43 @@ pub fn extract_group_mention_ids(text: &str, members: &[(&BotId, &str, &str)]) -
                     .is_some_and(|c| !c.is_alphanumeric() && *c != '_');
             if prev_ok {
                 let start = i.saturating_add(1);
+                // Prefer the longest exact `@<Full Name With Spaces>` match with a word boundary
+                // after the name, so `@Ops Lead` does not spuriously dispatch `@Ops` when both exist.
+                let mut best_spaced_len = 0usize;
+                for (_, name_chars) in &spaced_names {
+                    let end = start.saturating_add(name_chars.len());
+                    if name_chars.len() > best_spaced_len
+                        && let Some(slice) = chars.get(start..end)
+                        && slice
+                            .iter()
+                            .zip(name_chars.iter())
+                            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                        && chars.get(end).is_none_or(|c| !is_mention_token_char(*c))
+                    {
+                        best_spaced_len = name_chars.len();
+                    }
+                }
+                if best_spaced_len > 0 {
+                    let end = start.saturating_add(best_spaced_len);
+                    if let Some(slice) = chars.get(start..end) {
+                        for (id, name_chars) in &spaced_names {
+                            if name_chars.len() == best_spaced_len
+                                && slice
+                                    .iter()
+                                    .zip(name_chars.iter())
+                                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                                && seen.insert((*id).clone())
+                            {
+                                mentioned.push((*id).clone());
+                            }
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+
                 let mut end = start;
-                while end < chars.len()
-                    && chars
-                        .get(end)
-                        .is_some_and(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                while end < chars.len() && chars.get(end).is_some_and(|c| is_mention_token_char(*c))
                 {
                     end = end.saturating_add(1);
                 }
@@ -1581,6 +1622,9 @@ pub fn extract_group_mention_ids(text: &str, members: &[(&BotId, &str, &str)]) -
                     }
                 } else if !token.is_empty() {
                     for (id, slug, name) in members {
+                        if name.is_empty() && slug.is_empty() && id.as_str().is_empty() {
+                            continue;
+                        }
                         let hyphen = name.replace(' ', "-");
                         let matched = id.as_str().eq_ignore_ascii_case(&token)
                             || slug.eq_ignore_ascii_case(&token)
@@ -1594,14 +1638,6 @@ pub fn extract_group_mention_ids(text: &str, members: &[(&BotId, &str, &str)]) -
             }
         }
         i = i.saturating_add(1);
-    }
-    // Also match exact `@<Full Name With Spaces>` mentions when member names contain spaces.
-    let lower = text.to_ascii_lowercase();
-    for (id, _, name) in members {
-        let needle = format!("@{}", name.to_ascii_lowercase());
-        if lower.contains(&needle) && seen.insert((*id).clone()) {
-            mentioned.push((*id).clone());
-        }
     }
     mentioned
 }
