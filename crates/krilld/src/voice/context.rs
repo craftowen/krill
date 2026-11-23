@@ -313,12 +313,26 @@ fn evict_if_full(map: &mut HashMap<ContextKey, TargetEntry>, incoming: &ContextK
     }
 }
 
+fn has_git_ancestor(dir: &std::path::Path) -> bool {
+    let mut cur = Some(dir);
+    while let Some(path) = cur {
+        if path.join(".git").exists() {
+            return true;
+        }
+        cur = path.parent();
+    }
+    false
+}
+
 fn collect_git_vocab(dir: &PathBuf) -> Vec<String> {
+    if !has_git_ancestor(dir) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
     if let Ok(branch_out) = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .args(["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(dir)
         .output()
         && branch_out.status.success()
@@ -339,7 +353,7 @@ fn collect_git_vocab(dir: &PathBuf) -> Vec<String> {
     }
 
     if let Ok(status_out) = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["--no-optional-locks", "status", "--porcelain"])
         .current_dir(dir)
         .output()
         && status_out.status.success()

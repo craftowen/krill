@@ -39,7 +39,10 @@ impl MockPipito {
             while !stop_bg.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // macOS/BSD inherits O_NONBLOCK from listener; switch to blocking before reading.
+                        stream.set_nonblocking(false).ok();
                         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
                         let mut raw = Vec::new();
                         let mut buf = [0u8; 4096];
                         let mut content_len = None;
@@ -107,6 +110,7 @@ impl MockPipito {
                             resp_body.len()
                         );
                         stream.write_all(resp.as_bytes()).ok();
+                        stream.flush().ok();
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));

@@ -490,7 +490,9 @@ impl VoiceService {
                     guard.learn_text(prompt, 1, now_ms);
                 }
                 guard.record_tokens(&names, 2, now_ms);
-                guard.flush_now().ok();
+                // Keep bootstrap strictly in-memory so a detached background thread never
+                // creates files in state_dir concurrently with teardown/cleanup; persistence
+                // runs synchronously on the next prompt flush, config update, or feedback.
             })
             .ok();
     }
