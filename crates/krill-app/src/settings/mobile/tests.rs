@@ -727,3 +727,55 @@ fn relay_click_starts_desktop_sign_in_and_resumes_pairing_once(cx: &mut gpui::Te
         1
     );
 }
+
+/// 단독 페이지 우상단 툴바의 사이드바 표시 토글은 360~1100px·1x~2x에서 카드와 겹치거나
+/// 잘리지 않고, 토글 전후 버튼·닫기 버튼 경계가 흔들리지 않으며 설정을 반전한다.
+#[gpui::test]
+fn mobile_page_sidebar_toggle_fits_without_overlap_or_shift(cx: &mut gpui::TestAppContext) {
+    let (_view, vcx) = offer_view(cx, true);
+    for width in [360., 480., 720., 959., 1100.] {
+        for scale in [1., 1.25, 1.5, 2.] {
+            redraw(vcx, width, scale);
+            let toggle = vcx
+                .debug_bounds("mobile-page-sidebar-toggle")
+                .expect("sidebar toggle");
+            let close = vcx.debug_bounds("mobile-page-close").expect("close");
+            let card = vcx.debug_bounds("mobile-page-card").expect("card");
+            assert!(
+                inside(span(toggle), (0., width)) && inside(span(close), (0., width)),
+                "toolbar clipped at w={width} @{scale}x: toggle={toggle:?} close={close:?}"
+            );
+            assert!(
+                toggle.right() <= close.left(),
+                "toggle overlaps close at w={width} @{scale}x: toggle={toggle:?} close={close:?}"
+            );
+            assert!(
+                toggle.bottom() <= card.top() && close.bottom() <= card.top(),
+                "toolbar overlaps card at w={width} @{scale}x: toggle={toggle:?} close={close:?} card={card:?}"
+            );
+        }
+    }
+
+    redraw(vcx, 959., 1.);
+    let before_toggle = vcx.debug_bounds("mobile-page-sidebar-toggle").unwrap();
+    let before_close = vcx.debug_bounds("mobile-page-close").unwrap();
+    vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
+
+    vcx.simulate_click(before_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(!super::super::current(cx).show_mobile_button));
+    assert_eq!(
+        vcx.debug_bounds("mobile-page-sidebar-toggle").unwrap(),
+        before_toggle,
+        "reserved label must prevent toggle button layout shift"
+    );
+    assert_eq!(
+        vcx.debug_bounds("mobile-page-close").unwrap(),
+        before_close,
+        "close button must not shift when sidebar toggle label changes"
+    );
+
+    vcx.simulate_click(before_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
+}

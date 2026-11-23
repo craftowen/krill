@@ -477,3 +477,61 @@ fn saved_window_needs_a_reachable_title_bar_on_one_display() {
     let left_monitor = Bounds::new(gpui::point(px(-1200.), px(-100.)), display.size);
     assert!(has_visible_title_area(at(-1000., -50.), left_monitor));
 }
+
+#[gpui::test]
+fn view_menu_show_mobile_button_tracks_state_toggle_and_language(cx: &mut gpui::TestAppContext) {
+    use krill_app::i18n::{Language, catalog};
+    let dir = std::env::temp_dir().join(format!("mk-menu-mobile-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    cx.update(|cx| {
+        init(cx);
+        krill_app::settings::init_at(Some(dir.clone()), cx);
+    });
+    cx.run_until_parked();
+
+    let mobile_menu_checked = |cx: &App| -> Option<bool> {
+        let menus = cx.get_menus()?;
+        let view = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == catalog::general::VIEW.get())?;
+        view.items.iter().find_map(|item| {
+            if let gpui::OwnedMenuItem::Action { name, checked, .. } = item
+                && name.as_str() == catalog::general::SHOW_MOBILE_BUTTON.get()
+            {
+                Some(*checked)
+            } else {
+                None
+            }
+        })
+    };
+
+    cx.update(|cx| {
+        assert!(cx.is_action_available(&krill_app::settings::ToggleMobileButton));
+        assert_eq!(mobile_menu_checked(cx), Some(true));
+        cx.dispatch_action(&krill_app::settings::ToggleMobileButton);
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(!krill_app::settings::current(cx).show_mobile_button);
+        assert_eq!(mobile_menu_checked(cx), Some(false));
+    });
+
+    // 한·영 전환 시 라벨이 새 언어로 바뀌고 체크 상태(false)가 유지된다.
+    for language in [Language::En, Language::Ko] {
+        cx.update(|cx| krill_app::settings::set_language(language, cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(mobile_menu_checked(cx), Some(false));
+        });
+    }
+
+    // 다시 토글하면 true로 돌아오고 메뉴 체크도 복원된다.
+    cx.update(|cx| cx.dispatch_action(&krill_app::settings::ToggleMobileButton));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(krill_app::settings::current(cx).show_mobile_button);
+        assert_eq!(mobile_menu_checked(cx), Some(true));
+    });
+    std::fs::remove_dir_all(dir).ok();
+}

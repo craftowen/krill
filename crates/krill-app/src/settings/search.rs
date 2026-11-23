@@ -189,4 +189,15 @@ mod tests {
         assert_eq!(search_tabs(""), AdminTab::ALL);
         assert_eq!(search_tabs("   "), AdminTab::ALL);
     }
+
+    #[test]
+    fn mobile_sidebar_toggle_is_indexed_in_korean_and_english() {
+        use crate::i18n::catalog::mobile;
+        for query in ["사이드바", "숨기기", "Krill 모바일 버튼", "sidebar", "hide"] {
+            assert!(
+                search_hits(query).contains(&(AdminTab::Mobile, mobile::SHOW_MOBILE_BUTTON)),
+                "missing mobile sidebar hit for `{query}`"
+            );
+        }
+    }
 }

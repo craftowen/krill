@@ -11254,6 +11254,76 @@ fn automations_sidebar_visibility_defaults_and_toml_roundtrip() {
     }
 }
 
+#[test]
+fn mobile_sidebar_visibility_defaults_and_toml_roundtrip() {
+    let mut settings = Settings::default();
+    assert!(settings.show_mobile_button);
+    assert!(
+        Settings::parse_with_language("theme = 'dark'", Language::En)
+            .unwrap()
+            .show_mobile_button
+    );
+    settings.show_mobile_button = false;
+    let custom = crate::ui::terminal_themes::parse_ghostty_theme(
+        "background = #112233\nforeground = #ddeeff\n",
+        "sample",
+        None,
+    )
+    .unwrap();
+    settings.terminal_custom_themes.push(custom);
+    let encoded = settings.to_toml();
+    assert_eq!(
+        Settings::parse_with_language(&encoded, settings.language).unwrap(),
+        settings
+    );
+    assert!(encoded.contains("show_mobile_button = false"));
+    if let Some(table) = encoded.find("[[terminal_custom_themes]]") {
+        assert!(encoded.find("show_mobile_button").unwrap() < table);
+    }
+}
+
+#[gpui::test]
+fn appearance_show_mobile_switch_and_toggle_action_persist(cx: &mut TestAppContext) {
+    let d = dir("mobile-button-toggle");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(1400.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(current(cx).show_mobile_button);
+        assert!(cx.is_action_available(&ToggleMobileButton));
+    });
+    click_install_control(vcx, "appearance-show-mobile-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).show_mobile_button));
+    let on_disk = fs::read_to_string(d.join(SETTINGS_FILE)).unwrap();
+    assert!(on_disk.contains("show_mobile_button = false"), "{on_disk}");
+
+    vcx.update(|window, cx| {
+        window.dispatch_action(Box::new(ToggleMobileButton), cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert!(current(cx).show_mobile_button));
+
+    // 설정 > 모바일 탭의 스위치와 검색 점프도 동일한 설정을 제어한다.
+    view.update(vcx, |v, cx| {
+        v.open_search_hit(
+            (
+                AdminTab::Mobile,
+                crate::i18n::catalog::mobile::SHOW_MOBILE_BUTTON,
+            ),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.tab, AdminTab::Mobile);
+        assert!(v.search_focus.rendered.get());
+    });
+    click_install_control(vcx, "mobile-show-sidebar-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).show_mobile_button));
+    fs::remove_dir_all(d).ok();
+}
+
 #[cfg(unix)]
 #[gpui::test]
 fn remote_host_accounts_can_be_selected_and_switched_over_host_target(cx: &mut TestAppContext) {

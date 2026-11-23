@@ -2354,6 +2354,7 @@ impl Shell {
             (Kind::OpenChecks, jtext::ACT_OPEN_CHECKS.get()),
             (Kind::OpenDisk, jtext::ACT_OPEN_DISK.get()),
             (Kind::OpenAutomations, jtext::ACT_OPEN_AUTOMATIONS.get()),
+            (Kind::OpenMobile, jtext::ACT_OPEN_MOBILE.get()),
             (
                 Kind::EditQuickCommands,
                 jtext::ACT_EDIT_QUICK_COMMANDS.get(),
@@ -2493,6 +2494,10 @@ impl Shell {
                 // 사이드바에서 숨긴 자동화를 되돌리는 경로이기도 하다.
                 krill_app::settings::edit(cx, |s| s.show_automations_button = true);
                 self.open_automations(Some(window), cx);
+            }
+            jump::ActionKind::OpenMobile => {
+                // 사용자가 사이드바에서 숨긴 설정은 유지한 채 모바일 페이지만 연다.
+                self.open_mobile_page(Some(window), cx);
             }
             jump::ActionKind::EditQuickCommands => {
                 self.open_settings(
