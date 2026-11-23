@@ -6,9 +6,7 @@
 //! `krill-app`(`gpui`)이나 `ring`을 직접 의존성에 추가하지 않고 형제 실행 파일 `krill-app`을 호출한다.
 
 use std::ffi::OsString;
-#[cfg(not(target_os = "linux"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "linux"))]
 use std::process::Command;
 use std::process::ExitCode;
@@ -17,6 +15,7 @@ const USAGE: &str = "usage: krill update [--check] [--app <path>] [--state-dir <
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     let mut app_bundle: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
     let mut check = false;
     let mut json = false;
     let mut idx = 0;
@@ -44,10 +43,11 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 idx += 2;
             }
             "--state-dir" => {
-                if raw.get(idx + 1).is_none() {
+                let Some(val) = raw.get(idx + 1) else {
                     eprintln!("{USAGE}");
                     return ExitCode::from(2);
-                }
+                };
+                state_dir = Some(PathBuf::from(val));
                 idx += 2;
             }
             _ => {
@@ -60,11 +60,11 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         let _ = app_bundle;
-        upgrade_daemon(check, json)
+        upgrade_daemon(state_dir.as_deref(), check, json)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (check, json);
+        let _ = (check, json, state_dir);
         delegate_to_app(raw, app_bundle.as_deref())
     }
 }
@@ -87,10 +87,70 @@ fn daemon_check_report(current: &str, running: &str, json: bool) -> String {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn daemon_paths(state_dir: Option<&Path>) -> std::io::Result<krill_proto::daemon::Paths> {
+    match state_dir {
+        Some(dir) => krill_proto::daemon::Paths::with_state_dir(dir),
+        None => krill_proto::daemon::Paths::dev(),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy)]
+enum DaemonUpgradeOutcome<'a> {
+    Upgraded(&'a str),
+    UpToDate(&'a str),
+    NotRunning,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn daemon_upgrade_report(outcome: DaemonUpgradeOutcome<'_>, json: bool) -> String {
+    match outcome {
+        DaemonUpgradeOutcome::Upgraded(build) => {
+            if json {
+                serde_json::json!({
+                    "status": "upgraded",
+                    "upgraded": true,
+                    "running": build,
+                    "installed": krill_proto::BUILD,
+                })
+                .to_string()
+            } else {
+                format!("daemon upgraded to {build}")
+            }
+        }
+        DaemonUpgradeOutcome::UpToDate(build) => {
+            if json {
+                serde_json::json!({
+                    "status": "up_to_date",
+                    "upgraded": false,
+                    "running": build,
+                    "installed": build,
+                })
+                .to_string()
+            } else {
+                format!("daemon is up to date ({build})")
+            }
+        }
+        DaemonUpgradeOutcome::NotRunning => {
+            if json {
+                serde_json::json!({
+                    "status": "not_running",
+                    "upgraded": false,
+                    "installed": krill_proto::BUILD,
+                })
+                .to_string()
+            } else {
+                "daemon is not running; it will start with the installed binaries".to_owned()
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn upgrade_daemon(check: bool, json: bool) -> ExitCode {
+fn upgrade_daemon(state_dir: Option<&Path>, check: bool, json: bool) -> ExitCode {
     use krill_proto::daemon;
-    let paths = match daemon::Paths::dev() {
+    let paths = match daemon_paths(state_dir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("krill update: {e}");
@@ -114,15 +174,28 @@ fn upgrade_daemon(check: bool, json: bool) -> ExitCode {
         };
     }
     match daemon::upgrade(&paths, &hello) {
-        Ok(Some(server)) => println!("daemon upgraded to {}", server.build),
-        Ok(None) => println!("daemon is up to date ({})", krill_proto::BUILD),
+        Ok(Some(server)) => {
+            println!(
+                "{}",
+                daemon_upgrade_report(DaemonUpgradeOutcome::Upgraded(&server.build), json)
+            );
+        }
+        Ok(None) => {
+            println!(
+                "{}",
+                daemon_upgrade_report(DaemonUpgradeOutcome::UpToDate(krill_proto::BUILD), json)
+            );
+        }
         Err(e)
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            println!("daemon is not running; it will start with the installed binaries");
+            println!(
+                "{}",
+                daemon_upgrade_report(DaemonUpgradeOutcome::NotRunning, json)
+            );
         }
         Err(e) => {
             eprintln!("krill update: daemon upgrade failed: {e}");
@@ -222,6 +295,50 @@ mod tests {
         assert_eq!(json["running"], "0.2.9");
         assert!(daemon_check_report("0.2.9", "0.2.9", false).contains("up to date"));
         assert!(daemon_check_report("0.2.10", "0.2.9", false).contains("can be upgraded"));
+    }
+
+    #[test]
+    fn daemon_paths_honors_custom_state_dir_and_upgrade_report_honors_json() {
+        let custom = std::env::temp_dir().join(format!("krill-upd-state-{}", std::process::id()));
+        let paths = daemon_paths(Some(&custom)).unwrap();
+        assert_eq!(paths.socket, custom.join("run/krilld.sock"));
+
+        let upg: serde_json::Value = serde_json::from_str(&daemon_upgrade_report(
+            DaemonUpgradeOutcome::Upgraded("0.3.23"),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(upg["status"], "upgraded");
+        assert_eq!(upg["upgraded"], true);
+        assert_eq!(upg["running"], "0.3.23");
+
+        let cur: serde_json::Value = serde_json::from_str(&daemon_upgrade_report(
+            DaemonUpgradeOutcome::UpToDate("0.3.23"),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(cur["status"], "up_to_date");
+        assert_eq!(cur["upgraded"], false);
+
+        let off: serde_json::Value = serde_json::from_str(&daemon_upgrade_report(
+            DaemonUpgradeOutcome::NotRunning,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(off["status"], "not_running");
+        assert_eq!(off["upgraded"], false);
+
+        assert!(
+            daemon_upgrade_report(DaemonUpgradeOutcome::Upgraded("0.3.23"), false)
+                .contains("daemon upgraded to 0.3.23")
+        );
+        assert!(
+            daemon_upgrade_report(DaemonUpgradeOutcome::UpToDate("0.3.23"), false)
+                .contains("up to date (0.3.23)")
+        );
+        assert!(
+            daemon_upgrade_report(DaemonUpgradeOutcome::NotRunning, false).contains("not running")
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

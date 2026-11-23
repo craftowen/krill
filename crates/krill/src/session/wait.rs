@@ -10,6 +10,7 @@ use krill_proto::control::{
     FEAT_WAIT_STATUS, Reply, Request,
 };
 use krill_proto::daemon::{self, Connection};
+use krill_proto::hook::FEAT_HOOK;
 use krill_proto::ipc::{ClientHello, ClientRole};
 use regex::Regex;
 
@@ -246,29 +247,67 @@ fn pattern_probe(
     Ok(bytes.is_some_and(|bytes| pattern.is_match(&String::from_utf8_lossy(&bytes))))
 }
 
+#[derive(Debug, Default)]
+enum DoneBaseline {
+    #[default]
+    Uninitialized,
+    SawNonDone,
+    InitialDone(Option<u64>),
+}
+
+/// Tracks `--for done` completion strictly in daemon-clock space so remote host clock skew
+/// or local NTP adjustments can never prevent a real turn completion from matching.
+#[derive(Debug, Default)]
+struct DoneTracker {
+    baseline: DoneBaseline,
+}
+
+impl DoneTracker {
+    fn needs_timestamp(&self, state: AgentState) -> bool {
+        state == AgentState::Done && !matches!(self.baseline, DoneBaseline::SawNonDone)
+    }
+
+    fn observe(&mut self, state: AgentState, since: Option<u64>) -> bool {
+        if state != AgentState::Done {
+            self.baseline = DoneBaseline::SawNonDone;
+            return false;
+        }
+        match self.baseline {
+            DoneBaseline::Uninitialized => {
+                self.baseline = DoneBaseline::InitialDone(since);
+                false
+            }
+            DoneBaseline::SawNonDone => true,
+            DoneBaseline::InitialDone(Some(initial_ns)) => since.is_some_and(|ns| ns != initial_ns),
+            DoneBaseline::InitialDone(None) => since.is_some(),
+        }
+    }
+}
+
+fn required_features(options: &Options) -> u64 {
+    FEAT_CONTROL
+        | FEAT_WAIT_STATUS
+        | if options.pattern.is_some() {
+            FEAT_CLI
+        } else {
+            0
+        }
+        | if matches!(options.condition, Condition::State(AgentState::Done)) {
+            FEAT_HOOK
+        } else {
+            0
+        }
+}
+
 pub(super) fn run(args: &[OsString], target: &Target) -> Result<()> {
     let (session, args) = args.split_first().ok_or_else(usage)?;
     let session = id(session)?;
     let options = Options::parse(args)?;
     let start = Instant::now();
-    let started_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-    let mut initial_done: Option<Option<u64>> = None;
+    let mut done_tracker = DoneTracker::default();
     // A zero timeout is an immediate condition probe, preserving MK-045 behavior.
     let limit = options.timeout.filter(|t| !t.is_zero());
-    let mut c = connection(
-        target,
-        FEAT_CONTROL
-            | FEAT_WAIT_STATUS
-            | if options.pattern.is_some() {
-                FEAT_CLI
-            } else {
-                0
-            },
-        start,
-        limit,
-    )?;
+    let mut c = connection(target, required_features(&options), start, limit)?;
     let mut capture_stamp = None;
     loop {
         if let Some(t) = limit {
@@ -298,15 +337,12 @@ pub(super) fn run(args: &[OsString], target: &Target) -> Result<()> {
             let quiet = Duration::from_millis(quiet_ms) >= options.quiet;
             Ok(match options.condition {
                 Condition::State(AgentState::Done) => {
-                    if state == AgentState::Done {
-                        let since = done_since(&mut c.stream, session)?;
-                        let baseline = *initial_done
-                            .get_or_insert_with(|| since.filter(|&ns| ns <= started_ns));
-                        since.is_some_and(|ns| ns >= started_ns && Some(ns) != baseline)
+                    let since = if done_tracker.needs_timestamp(state) {
+                        done_since(&mut c.stream, session)?
                     } else {
-                        initial_done = Some(None);
-                        false
-                    }
+                        None
+                    };
+                    done_tracker.observe(state, since)
                 }
                 Condition::State(target) => state == target,
                 Condition::Idle => {
@@ -457,5 +493,36 @@ mod tests {
 
         assert!(Options::parse(&os(&["--pattern", "READY", "--quiet-ms", "500"])).is_err());
         assert!(Options::parse(&os(&["--for", "done", "--pattern", "READY"])).is_err());
+    }
+
+    #[test]
+    fn done_tracker_works_under_remote_clock_skew_and_requires_hook_feature() {
+        let os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        let done_opts = Options::parse(&os(&["--for", "done"])).unwrap();
+        assert_ne!(required_features(&done_opts) & FEAT_HOOK, 0);
+        let idle_opts = Options::parse(&os(&["--for", "idle"])).unwrap();
+        assert_eq!(required_features(&idle_opts) & FEAT_HOOK, 0);
+
+        // Remote daemon clock far behind local wall clock (e.g. 1_000ns vs 1e18ns):
+        // 1. Working -> Done must match immediately without comparing to local SystemTime.
+        let mut tracker = DoneTracker::default();
+        assert!(!tracker.needs_timestamp(AgentState::Working));
+        assert!(!tracker.observe(AgentState::Working, None));
+        assert!(!tracker.needs_timestamp(AgentState::Done));
+        assert!(tracker.observe(AgentState::Done, None));
+
+        // 2. Initially Done(1_000) ignores stale Done(1_000), then matches on new Done(2_000).
+        let mut tracker = DoneTracker::default();
+        assert!(tracker.needs_timestamp(AgentState::Done));
+        assert!(!tracker.observe(AgentState::Done, Some(1_000)));
+        assert!(tracker.needs_timestamp(AgentState::Done));
+        assert!(!tracker.observe(AgentState::Done, Some(1_000)));
+        assert!(tracker.observe(AgentState::Done, Some(2_000)));
+
+        // 3. Initially Done(1_000) -> Working -> Done(1_000) still matches via state transition.
+        let mut tracker = DoneTracker::default();
+        assert!(!tracker.observe(AgentState::Done, Some(1_000)));
+        assert!(!tracker.observe(AgentState::Working, None));
+        assert!(tracker.observe(AgentState::Done, Some(1_000)));
     }
 }

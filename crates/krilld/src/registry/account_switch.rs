@@ -195,17 +195,14 @@ impl Registry {
             .and_then(ProviderKind::parse)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one queued selection and its locks"
-    )]
-    fn queue_session_account_switch_locked(
+    /// Performs live-process discovery and durable handoff I/O outside `self.account_work.pending`
+    /// so `Registry::close` and input recovery are never stalled on `/bin/ps` or `fsync`.
+    fn queue_session_account_switch_unlocked(
         &self,
         session: SessionId,
         provider: ProviderKind,
         account_id: &str,
         snapshot: &AccountsSnapshot,
-        pending: &mut BTreeMap<SwitchScope, accounts::switch_work::SwitchTarget>,
         home: &Path,
         interrupt_busy: bool,
     ) -> Result<(), Failure> {
@@ -277,6 +274,7 @@ impl Registry {
         if self.agents.account_binding_retiring(session) {
             // Retirement has committed its durable alias. Preserve it while a later
             // selection waits to be applied to the confirmed replacement.
+            let mut pending = lock(&self.account_work.pending);
             pending.insert(
                 SwitchScope::Session(session, provider),
                 accounts::switch_work::SwitchTarget {
@@ -289,29 +287,32 @@ impl Registry {
             self.account_work.wake.notify_one();
             return Ok(());
         }
-        let mut handoffs = lock(&self.account_handoffs);
-        let previous = handoffs.get(&session).cloned();
-        if stored.account.as_ref().is_some_and(|a| a.id == account_id) {
-            handoffs.remove(&session);
-        } else {
-            handoffs.insert(
-                session,
-                SessionHandoff {
-                    from: session,
-                    to: None,
-                    account_id: account_id.into(),
-                    error: None,
-                },
-            );
-        }
-        if let Err(error) = self.write_account_handoffs(&handoffs) {
-            if let Some(previous) = previous {
-                handoffs.insert(session, previous);
-            } else {
+        {
+            let mut handoffs = lock(&self.account_handoffs);
+            let previous = handoffs.get(&session).cloned();
+            if stored.account.as_ref().is_some_and(|a| a.id == account_id) {
                 handoffs.remove(&session);
+            } else {
+                handoffs.insert(
+                    session,
+                    SessionHandoff {
+                        from: session,
+                        to: None,
+                        account_id: account_id.into(),
+                        error: None,
+                    },
+                );
             }
-            return Err(super::os(&error));
+            if let Err(error) = self.write_account_handoffs(&handoffs) {
+                if let Some(previous) = previous {
+                    handoffs.insert(session, previous);
+                } else {
+                    handoffs.remove(&session);
+                }
+                return Err(super::os(&error));
+            }
         }
+        let mut pending = lock(&self.account_work.pending);
         pending.insert(
             SwitchScope::Session(session, provider),
             accounts::switch_work::SwitchTarget {
@@ -321,7 +322,6 @@ impl Registry {
                 interrupt_busy,
             },
         );
-        drop(handoffs);
         self.account_work.wake.notify_one();
         Ok(())
     }
@@ -356,18 +356,14 @@ impl Registry {
         let unique: std::collections::BTreeSet<_> = sessions.iter().copied().collect();
         let mut first_error = None;
         for session in unique {
-            let queued = {
-                let mut pending = lock(&self.account_work.pending);
-                self.queue_session_account_switch_locked(
-                    session,
-                    provider,
-                    account_id,
-                    snapshot,
-                    &mut pending,
-                    home,
-                    interrupt_busy,
-                )
-            };
+            let queued = self.queue_session_account_switch_unlocked(
+                session,
+                provider,
+                account_id,
+                snapshot,
+                home,
+                interrupt_busy,
+            );
             match queued {
                 Ok(()) => self.acknowledge_retained_handoff(session),
                 Err(error) => {
@@ -386,18 +382,9 @@ impl Registry {
         snapshot: &AccountsSnapshot,
         home: &Path,
     ) -> Result<(), Failure> {
-        {
-            let mut pending = lock(&self.account_work.pending);
-            self.queue_session_account_switch_locked(
-                session,
-                provider,
-                account_id,
-                snapshot,
-                &mut pending,
-                home,
-                false,
-            )?;
-        }
+        self.queue_session_account_switch_unlocked(
+            session, provider, account_id, snapshot, home, false,
+        )?;
         self.acknowledge_retained_handoff(session);
         Ok(())
     }
@@ -807,15 +794,16 @@ impl Registry {
             hibernation_blocked: true,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         })
     }
 
     pub(super) fn queue_account_switch(&self, provider: ProviderKind, account_id: &str) {
+        self.prepare_account_switch_in(provider, account_id, &accounts::default_home(), false);
         let mut pending = lock(&self.account_work.pending);
         pending.retain(
             |scope, _| !matches!(scope, SwitchScope::Session(_, selected) if *selected == provider),
         );
-        self.prepare_account_switch_in(provider, account_id, &accounts::default_home(), false);
         pending.insert(
             SwitchScope::Provider(provider),
             crate::usage::accounts::switch_work::SwitchTarget {
@@ -1038,15 +1026,21 @@ impl Registry {
     /// The user is ending this conversation's session, so nothing may resume it on their behalf.
     /// An attempt already in flight sees its selection disappear and stops its replacement.
     pub(super) fn cancel_queued_account_switch(&self, session: SessionId) {
-        let mut pending = lock(&self.account_work.pending);
-        let mut handoffs = lock(&self.account_handoffs);
-        if handoffs
-            .get(&session)
-            .is_some_and(|h| h.to.is_none() && h.error.is_none())
-        {
-            handoffs.remove(&session);
-            self.write_account_handoffs(&handoffs).ok();
-            pending
+        let cancelled = {
+            let mut handoffs = lock(&self.account_handoffs);
+            if handoffs
+                .get(&session)
+                .is_some_and(|h| h.to.is_none() && h.error.is_none())
+            {
+                handoffs.remove(&session);
+                self.write_account_handoffs(&handoffs).ok();
+                true
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            lock(&self.account_work.pending)
                 .retain(|scope, _| !matches!(scope, SwitchScope::Session(id, _) if *id == session));
         }
     }
@@ -1180,22 +1174,24 @@ impl Registry {
             let mut work = BTreeMap::new();
             for scope in ready {
                 if let Some(target) = pending.remove(&scope) {
-                    if !target.prepared
-                        && let SwitchScope::Provider(provider) = scope
-                    {
-                        self.prepare_account_switch_excluding(
-                            provider,
-                            &target.account_id,
-                            home,
-                            true,
-                            &excluded,
-                        );
-                    }
                     work.insert(scope, target);
                 }
             }
             (work, excluded)
         };
+        for (scope, target) in &pending {
+            if !target.prepared
+                && let SwitchScope::Provider(provider) = scope
+            {
+                self.prepare_account_switch_excluding(
+                    *provider,
+                    &target.account_id,
+                    home,
+                    true,
+                    &excluded,
+                );
+            }
+        }
         let handoffs: Vec<_> = lock(&self.account_handoffs)
             .values()
             .filter(|h| h.to.is_none() && h.error.is_none())
@@ -1316,8 +1312,8 @@ impl Registry {
             handoffs.retarget_completed_aliases(old, new);
         }
         drop(handoffs);
-        self.save_account_handoffs().ok();
         drop(selection);
+        self.save_account_handoffs().ok();
     }
 
     fn account_selection_current(
@@ -1609,29 +1605,33 @@ impl Registry {
         // Account discovery may perform CLI IO. Refresh before the atomic recheck and
         // transfer; requests arriving during discovery take precedence below.
         let snapshot = snapshot();
-        let mut pending = lock(&self.account_work.pending);
-        let old_target = pending.remove(&old_scope);
-        if pending.contains_key(&new_scope) {
-            return Ok(());
-        }
-        let target = old_target
-            .as_ref()
-            .or_else(|| pending.get(&provider_scope))
-            .map(|target| target.account_id.clone());
+        let (old_target, target) = {
+            let mut pending = lock(&self.account_work.pending);
+            let old_target = pending.remove(&old_scope);
+            if pending.contains_key(&new_scope) {
+                return Ok(());
+            }
+            let target = old_target
+                .as_ref()
+                .or_else(|| pending.get(&provider_scope))
+                .map(|target| target.account_id.clone());
+            (old_target, target)
+        };
         if let Some(target) = target.filter(|target| target != current_account) {
-            let result = self.queue_session_account_switch_locked(
+            let result = self.queue_session_account_switch_unlocked(
                 new,
                 provider,
                 &target,
                 &snapshot,
-                &mut pending,
                 &accounts::default_home(),
                 old_target.as_ref().is_some_and(|t| t.interrupt_busy),
             );
             if result.is_err()
                 && let Some(old_target) = old_target
             {
-                pending.insert(old_scope, old_target);
+                lock(&self.account_work.pending)
+                    .entry(old_scope)
+                    .or_insert(old_target);
             }
             return result;
         }
@@ -1868,6 +1868,7 @@ impl Registry {
         let prepared_transcript = transcript::prepare_bound(
             provider,
             home,
+            state_dir.as_deref(),
             &source,
             target,
             &session_id,

@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use krill_proto::bots::{
     BotAccessRequestStatus, BotConfig, BotId, BotItemLink, BotItemStatus, BotScheduleUpcoming,
-    BotSuggestion, BotUpcoming, DEFAULT_LOOK_AROUND_MAX_SUGGESTIONS, ExternalSource,
-    LookAroundEvery, TidyEvery, soul_description,
+    BotSettingsExtras, BotSuggestion, BotUpcoming, DEFAULT_LOOK_AROUND_MAX_SUGGESTIONS,
+    ExternalSource, LookAroundEvery, TidyEvery, soul_description,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::write_atomic_0600;
@@ -744,6 +744,31 @@ pub fn dismiss_suggestion(
     Ok(updated)
 }
 
+/// Builds the kickoff prompt for `StartSuggestion` WITHOUT mutating suggestion or cooldown state,
+/// so callers only commit dismissal after `start_bot_session` succeeds.
+pub fn preview_start_suggestion(
+    store: &BotStore,
+    bot_id: &BotId,
+    suggestion_id: &str,
+) -> io::Result<(BotSuggestion, String)> {
+    let list = store.load_suggestions(bot_id)?;
+    let Some(entry) = list.into_iter().find(|s| s.id == suggestion_id) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("suggestion not found: {suggestion_id}"),
+        ));
+    };
+    let mut prompt = format!(
+        "Owner acted on your Up Next suggestion:\nTitle: {}\nReason: {}\nAction: {}",
+        entry.title, entry.why, entry.ask
+    );
+    if let Some(link) = &entry.link {
+        prompt.push_str("\nReference: ");
+        prompt.push_str(link);
+    }
+    Ok((entry, prompt))
+}
+
 /// Prepares the kickoff prompt for `StartSuggestion` and marks that suggestion dismissed/started.
 pub fn prepare_start_suggestion(
     store: &BotStore,
@@ -752,34 +777,8 @@ pub fn prepare_start_suggestion(
     suggestion_id: &str,
     now_ms: u64,
 ) -> io::Result<(BotSuggestion, String)> {
-    let mut list = store.load_suggestions(bot_id)?;
-    let Some(pos) = list.iter().position(|s| s.id == suggestion_id) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("suggestion not found: {suggestion_id}"),
-        ));
-    };
-    let updated = {
-        let Some(entry) = list.get_mut(pos) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "suggestion disappeared",
-            ));
-        };
-        entry.dismissed = true;
-        entry.clone()
-    };
-    scheduler_state.record_suggestion_dismissed(bot_id, &updated, now_ms)?;
-    store.save_suggestions(bot_id, &list)?;
-
-    let mut prompt = format!(
-        "Owner acted on your Up Next suggestion:\nTitle: {}\nReason: {}\nAction: {}",
-        updated.title, updated.why, updated.ask
-    );
-    if let Some(link) = &updated.link {
-        prompt.push_str("\nReference: ");
-        prompt.push_str(link);
-    }
+    let (_, prompt) = preview_start_suggestion(store, bot_id, suggestion_id)?;
+    let updated = dismiss_suggestion(store, scheduler_state, bot_id, suggestion_id, now_ms)?;
     Ok((updated, prompt))
 }
 
@@ -816,6 +815,18 @@ pub fn bot_upcoming(
     running: impl Fn(&str) -> bool,
     now_ms: u64,
 ) -> BotUpcoming {
+    bot_upcoming_with_extras(bot, BotSettingsExtras::default(), state, running, now_ms)
+}
+
+/// Same as [`bot_upcoming`], using the persisted `settings_extras` presets (`look_around_every`,
+/// `tidy_every`) and [`local_tz`] fallback — matching [`BotsManager::tick_periodic`].
+pub fn bot_upcoming_with_extras(
+    bot: &BotConfig,
+    extras: BotSettingsExtras,
+    state: &SchedulerStateStore,
+    running: impl Fn(&str) -> bool,
+    now_ms: u64,
+) -> BotUpcoming {
     let LastRuns {
         look: look_last,
         tidy: tidy_last,
@@ -823,30 +834,23 @@ pub fn bot_upcoming(
         crons,
         cron_errors,
     } = state.last_runs(&bot.id);
-    let tz = bot.schedules.iter().find_map(|s| s.timezone.as_deref());
-    let after = |last: Option<u64>, interval_secs: u64| {
-        let due = last.map_or(now_ms, |l| {
-            l.saturating_add(interval_secs.max(60).saturating_mul(1_000))
-        });
-        due.max(now_ms)
-    };
+    let bot_tz = bot
+        .schedules
+        .iter()
+        .find_map(|s| s.timezone.clone())
+        .or_else(local_tz);
+    let tz = bot_tz.as_deref();
     let look_next = bot.look_around.enabled.then(|| {
-        let mut next = after(look_last, bot.look_around.interval_secs);
-        // Weekdays only: a weekend looks first thing Monday.
-        for _ in 0..3 {
-            if !bot.look_around.weekdays_only || !is_weekend_in_tz(next / 1_000, tz) {
-                break;
-            }
-            let [minute, hour, ..] = cron_calendar_for_tz(next / 1_000, tz).unwrap_or_default();
-            let into_day = u64::from(hour * 60 + minute).saturating_mul(60_000);
-            next = (next - next % 60_000)
-                .saturating_sub(into_day)
-                .saturating_add(86_400_000);
-        }
-        next
+        next_look_around_ms(
+            extras.look_around_every,
+            bot.look_around.weekdays_only,
+            tz,
+            look_last,
+            now_ms,
+        )
     });
     let tidy_next = (bot.memory_tidy.enabled && !tidy_off)
-        .then(|| after(tidy_last, bot.memory_tidy.interval_secs));
+        .then(|| next_tidy_ms(extras.tidy_every, tz, tidy_last, now_ms));
     let now_secs = now_ms / 1_000;
     let schedules = bot
         .schedules
@@ -877,13 +881,87 @@ pub fn bot_upcoming(
         .collect();
     BotUpcoming {
         look_around_last_ms: look_last,
-        look_around_next_ms: look_next,
+        look_around_next_ms: look_next.flatten(),
         tidy_last_ms: tidy_last,
-        tidy_next_ms: tidy_next,
+        tidy_next_ms: tidy_next.flatten(),
         schedules,
         up_next_seen_ms: state.up_next_seen_at(&bot.id),
         items_seen_event_id: 0,
     }
+}
+
+/// Computes the next Unix ms when Look Around will be due under `every`/`weekdays_only`/`tz`,
+/// matching [`SchedulerStateStore::look_around_is_due`].
+#[must_use]
+pub fn next_look_around_ms(
+    every: LookAroundEvery,
+    weekdays_only: bool,
+    tz: Option<&str>,
+    last_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<u64> {
+    let hours = every.hours();
+    let now_secs = now_ms / 1_000;
+    if !(weekdays_only && is_weekend_in_tz(now_secs, tz))
+        && let Some(slot) = latest_slot_ms(now_ms, tz, hours)
+        && last_ms.is_none_or(|last| last < slot)
+    {
+        return Some(now_ms);
+    }
+    let [minute, hour, ..] = cron_calendar_for_tz(now_secs, tz).ok()?;
+    let into_day_secs = u64::from(hour) * 3_600 + u64::from(minute) * 60 + now_secs % 60;
+    let today_midnight_ms = now_secs.saturating_sub(into_day_secs).saturating_mul(1_000);
+    for day_offset in 0..=4_u64 {
+        let day_ms = today_midnight_ms.saturating_add(day_offset.saturating_mul(86_400_000));
+        // Sample noon of that day to avoid midnight DST edge effects when checking weekday.
+        let noon_secs = (day_ms / 1_000).saturating_add(12 * 3_600);
+        if weekdays_only && is_weekend_in_tz(noon_secs, tz) {
+            continue;
+        }
+        for &slot_hour in hours {
+            let candidate_ms =
+                day_ms.saturating_add(u64::from(slot_hour).saturating_mul(3_600_000));
+            if candidate_ms > now_ms && last_ms.is_none_or(|last| last < candidate_ms) {
+                return Some(candidate_ms);
+            }
+        }
+    }
+    None
+}
+
+/// Computes the next Unix ms when Memory Tidy will be due under `every`/`tz`, matching
+/// [`SchedulerStateStore::tidy_is_due`].
+#[must_use]
+pub fn next_tidy_ms(
+    every: TidyEvery,
+    tz: Option<&str>,
+    last_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<u64> {
+    if let Some(after) = tidy_due_after_ms(every, tz, now_ms)
+        && last_ms.is_none_or(|last| last < after)
+    {
+        return Some(now_ms);
+    }
+    let now_secs = now_ms / 1_000;
+    let [minute, hour, ..] = cron_calendar_for_tz(now_secs, tz).ok()?;
+    let into_day_secs = u64::from(hour) * 3_600 + u64::from(minute) * 60 + now_secs % 60;
+    let today_3am_ms = now_secs
+        .saturating_sub(into_day_secs)
+        .saturating_mul(1_000)
+        .saturating_add(3 * 3_600_000);
+    let last = last_ms.unwrap_or(0);
+    let back_ms = match every {
+        TidyEvery::Night => 0_u64,
+        TidyEvery::Week => 6 * 86_400_000,
+    };
+    for day_offset in 0..=8_u64 {
+        let cand_3am = today_3am_ms.saturating_add(day_offset.saturating_mul(86_400_000));
+        if cand_3am > now_ms && cand_3am.saturating_sub(back_ms) > last {
+            return Some(cand_3am);
+        }
+    }
+    None
 }
 
 /// `tz`'s offset from UTC in minutes at `unix_secs` (within a day either way).
@@ -925,13 +1003,40 @@ pub fn tidy_due_after_ms(every: TidyEvery, tz: Option<&str>, now_ms: u64) -> Opt
     })
 }
 
-/// This computer's IANA zone from `/etc/localtime`, so presets run on the owner's wall clock.
+/// This computer's local IANA zone (Unix `/etc/localtime`) or fixed UTC offset (`+HH:MM` on
+/// Windows), so presets run on the owner's wall clock.
 #[must_use]
 pub fn local_tz() -> Option<String> {
-    let target = std::fs::read_link("/etc/localtime").ok()?;
-    let target = target.to_string_lossy();
-    let (_, name) = target.split_once("zoneinfo/")?;
-    Some(name.to_owned())
+    #[cfg(unix)]
+    {
+        if let Ok(target) = std::fs::read_link("/etc/localtime") {
+            let target = target.to_string_lossy();
+            if let Some((_, name)) = target.split_once("zoneinfo/") {
+                return Some(name.to_owned());
+            }
+        }
+        if let Ok(env_tz) = std::env::var("TZ") {
+            let trimmed = env_tz.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("local") {
+                return Some(trimmed.to_owned());
+            }
+        }
+        None
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(env_tz) = std::env::var("TZ") {
+            let trimmed = env_tz.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("local") {
+                return Some(trimmed.to_owned());
+            }
+        }
+        windows_local_offset_secs().map(format_fixed_offset_secs)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 /// Computes `[minute, hour, day, month, weekday]` (`weekday` 0=Sun..6=Sat) in `tz` (default UTC).
@@ -977,10 +1082,80 @@ pub fn cron_calendar_for_tz(unix_secs: u64, tz: Option<&str>) -> io::Result<[u32
             }
         }
     }
+    #[cfg(windows)]
+    {
+        if spec.eq_ignore_ascii_case("local") {
+            if let Ok(env_tz) = std::env::var("TZ")
+                && !env_tz.trim().is_empty()
+                && !env_tz.eq_ignore_ascii_case("local")
+            {
+                return cron_calendar_for_tz(unix_secs, Some(env_tz.trim()));
+            }
+            if let Some(offset) = windows_local_offset_secs() {
+                return calendar_from_offset(unix_secs, offset);
+            }
+            return crate::sys::cron_calendar(unix_secs);
+        }
+    }
     if let Some(offset_secs) = fallback_iana_fixed_offset(spec) {
         return calendar_from_offset(unix_secs, offset_secs);
     }
     crate::sys::cron_calendar(unix_secs)
+}
+
+#[cfg(any(windows, test))]
+fn format_fixed_offset_secs(offset_secs: i64) -> String {
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs_mins = offset_secs.unsigned_abs() / 60;
+    let hours = abs_mins / 60;
+    let mins = abs_mins % 60;
+    format!("{sign}{hours:02}:{mins:02}")
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_active_time_bias_secs(reg_output: &str) -> Option<i64> {
+    for line in reg_output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens
+            .first()
+            .is_some_and(|t| t.eq_ignore_ascii_case("ActiveTimeBias"))
+            && let Some(val_str) = tokens.last()
+        {
+            let raw_u32 = if let Some(hex) = val_str
+                .strip_prefix("0x")
+                .or_else(|| val_str.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16).ok()?
+            } else {
+                val_str.parse::<u32>().ok()?
+            };
+            // Windows ActiveTimeBias is a signed 32-bit minute bias where UTC = local + bias.
+            let bias_mins = i64::from(raw_u32.cast_signed());
+            if (-840..=840).contains(&bias_mins) {
+                return Some(-bias_mins * 60);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_local_offset_secs() -> Option<i64> {
+    let out = krill_proto::os::background_command("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation",
+            "/v",
+            "ActiveTimeBias",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_windows_active_time_bias_secs(&text)
 }
 
 fn calendar_from_offset(unix_secs: u64, offset_secs: i64) -> io::Result<[u32; 5]> {
@@ -1305,19 +1480,39 @@ mod tests {
         // 2026-11-23 (a Monday) 06:30 UTC = 08:30 at +02:00.
         let now = 1_795_415_400_000;
         let up = bot_upcoming(&bot, &sched, |_| false, now);
-        // Never looked: due now.
+        // Never looked and 08:00 slot passed: due now.
         assert_eq!(up.look_around_next_ms, Some(now));
         assert_eq!(up.schedules[0].next_ms, Some(now + 30 * 60_000));
         sched.record_look_around(&bot.id, now).unwrap();
         let up = bot_upcoming(&bot, &sched, |id| id == "s1", now + 60_000);
         assert_eq!(up.look_around_last_ms, Some(now));
-        assert_eq!(up.look_around_next_ms, Some(now + 3_600_000));
+        // Default Every4h slots are 08:00, 12:00, 16:00, 20:00 -> next slot after 08:31 is 12:00 (+3h30m from 08:30).
+        assert_eq!(up.look_around_next_ms, Some(now + 210 * 60_000));
         assert!(up.schedules[0].running);
+        // Custom settings_extras (Mornings = [8]): after 08:30, next 08:00 slot is tomorrow (+23h30m from 08:30).
+        let extras = BotSettingsExtras {
+            look_around_every: LookAroundEvery::Mornings,
+            tidy_every: TidyEvery::Week,
+            ..BotSettingsExtras::default()
+        };
+        let up_mornings = bot_upcoming_with_extras(&bot, extras, &sched, |_| false, now + 60_000);
+        assert_eq!(up_mornings.look_around_next_ms, Some(now + 1_410 * 60_000));
         bot.look_around.enabled = false;
         bot.schedules[0].enabled = false;
         let up = bot_upcoming(&bot, &sched, |_| false, now);
         assert_eq!(up.look_around_next_ms, None);
         assert_eq!(up.schedules[0].next_ms, None);
+    }
+
+    #[test]
+    fn parses_windows_active_time_bias_registry_output() {
+        let kst = "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\r\n    ActiveTimeBias    REG_DWORD    0xfffffde4\r\n";
+        assert_eq!(parse_windows_active_time_bias_secs(kst), Some(9 * 3_600));
+        assert_eq!(format_fixed_offset_secs(9 * 3_600), "+09:00");
+
+        let edt = "    ActiveTimeBias    REG_DWORD    0xf0\r\n";
+        assert_eq!(parse_windows_active_time_bias_secs(edt), Some(-4 * 3_600));
+        assert_eq!(format_fixed_offset_secs(-4 * 3_600), "-04:00");
     }
 
     #[test]

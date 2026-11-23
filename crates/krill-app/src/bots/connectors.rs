@@ -79,6 +79,7 @@ pub(super) struct ConnectorsState {
 impl ConnectorsState {
     pub(super) fn input_is_composing(&self, window: &mut Window, app: &mut App) -> bool {
         [
+            &self.add_search,
             &self.tg_token,
             &self.tg_chats,
             &self.tg_users,
@@ -111,22 +112,36 @@ impl ConnectorsState {
     pub(super) fn refresh_placeholders(&self, window: &mut Window, cx: &mut Context<View>) {
         let secret_ph = text::SECRET_PLACEHOLDER.get();
         let member_ph = text::ACTS_FOR_MEMBER_PLACEHOLDER.get();
+        let channels_ph = text::ALLOWED_CHANNELS_LABEL.get();
+        let users_ph = text::ALLOWED_USERS_LABEL.get();
+        let poll_ph = text::POLL_INTERVAL_LABEL.get();
         let updates = [
+            (
+                &self.add_search,
+                crate::i18n::catalog::bot_home::SEARCH_APPS.get(),
+            ),
             (&self.tg_token, secret_ph),
             (&self.tg_chats, text::TELEGRAM_CHATS_PLACEHOLDER.get()),
             (&self.tg_users, text::TELEGRAM_USERS_PLACEHOLDER.get()),
             (&self.tg_member, member_ph),
             (&self.slack_app_token, secret_ph),
             (&self.slack_bot_token, secret_ph),
+            (&self.slack_channels, channels_ph),
+            (&self.slack_users, users_ph),
             (&self.slack_member, member_ph),
             (&self.discord_token, secret_ph),
             (&self.discord_guilds, text::DISCORD_GUILDS_PLACEHOLDER.get()),
+            (&self.discord_channels, channels_ph),
+            (&self.discord_users, users_ph),
             (&self.discord_member, member_ph),
             (&self.google_oauth_json, secret_ph),
+            (&self.google_poll, poll_ph),
             (&self.github_token, secret_ph),
             (&self.github_repos, text::GITHUB_REPOS_PLACEHOLDER.get()),
+            (&self.github_poll, poll_ph),
             (&self.linear_api_key, secret_ph),
             (&self.linear_teams, text::LINEAR_TEAMS_PLACEHOLDER.get()),
+            (&self.linear_poll, poll_ph),
             (&self.composio_api_key, secret_ph),
             (
                 &self.pairing_code_input,
@@ -453,14 +468,16 @@ impl View {
                     Ok((BotRpcResponse::Bot(updated), statuses)) => {
                         this.upsert_bot_config(*updated);
                         if let Some(st) = statuses {
-                            this.connectors.bot_statuses = st;
+                            this.sync_bot_connector_statuses(&bot_id, st);
                         }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::CONNECTOR_SAVED.get()));
                     }
                     Ok((_, statuses)) => {
                         if let Some(st) = statuses {
-                            this.connectors.bot_statuses = st;
+                            this.sync_bot_connector_statuses(&bot_id, st);
                         }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::CONNECTOR_SAVED.get()));
                     }
                     Err(err) => {
@@ -472,6 +489,14 @@ impl View {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn sync_bot_connector_statuses(&mut self, bot_id: &BotId, statuses: Vec<BotConnectorStatus>) {
+        self.all_connector_statuses.retain(|s| &s.bot_id != bot_id);
+        self.all_connector_statuses.extend(statuses.iter().cloned());
+        if self.selected_bot_id.as_ref().is_none_or(|id| id == bot_id) {
+            self.connectors.bot_statuses = statuses;
+        }
     }
 
     pub fn save_connector_secret(
@@ -489,6 +514,7 @@ impl View {
         let trimmed = value.trim().to_owned();
         if trimmed.is_empty() {
             self.error = Some(SharedString::from(text::ERR_EMPTY_FIELD.get()));
+            self.notice = None;
             cx.notify();
             return;
         }
@@ -497,6 +523,7 @@ impl View {
         self.error = None;
         self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
+            let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -507,37 +534,55 @@ impl View {
                             value: trimmed,
                         },
                     )?;
-                    match call_checked(
+                    let resp = match call_checked(
                         &rpc,
                         &BotRpcRequest::SetConnectorConfig {
-                            bot_id,
+                            bot_id: bot_id_bg.clone(),
                             connectors: Box::new(updated_connectors),
                         },
                     ) {
-                        Ok(resp) => Ok(resp),
+                        Ok(resp) => resp,
                         Err(err) => {
                             drop(rpc(&BotRpcRequest::DeleteSecret { secret_ref }));
-                            Err(text::ROLLBACK_NOTICE.format(&[("err", &err)]))
+                            return Err(text::ROLLBACK_NOTICE.format(&[("err", &err)]));
                         }
-                    }
+                    };
+                    let statuses = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ConnectorStatus {
+                            bot_id: Some(bot_id_bg),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::ConnectorStatuses(s)) => Some(s),
+                        _ => None,
+                    };
+                    Ok::<_, String>((resp, statuses))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.connectors.busy = false;
                 match res {
-                    Ok(BotRpcResponse::Bot(updated)) => {
+                    Ok((BotRpcResponse::Bot(updated), statuses)) => {
                         this.upsert_bot_config(*updated);
+                        if let Some(st) = statuses {
+                            this.sync_bot_connector_statuses(&bot_id, st);
+                        }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
                         }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SECRET_SAVED.get()));
                     }
-                    Ok(_) => {
+                    Ok((_, statuses)) => {
+                        if let Some(st) = statuses {
+                            this.sync_bot_connector_statuses(&bot_id, st);
+                        }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
                         }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SECRET_SAVED.get()));
                     }
                     Err(err) => {
@@ -566,27 +611,46 @@ impl View {
         self.error = None;
         self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
+            let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
                 .spawn(async move {
                     call_checked(&rpc, &BotRpcRequest::DeleteSecret { secret_ref })?;
-                    call_checked(
+                    let resp = call_checked(
                         &rpc,
                         &BotRpcRequest::SetConnectorConfig {
-                            bot_id,
+                            bot_id: bot_id_bg.clone(),
                             connectors: Box::new(updated_connectors),
                         },
-                    )
+                    )?;
+                    let statuses = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ConnectorStatus {
+                            bot_id: Some(bot_id_bg),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::ConnectorStatuses(s)) => Some(s),
+                        _ => None,
+                    };
+                    Ok::<_, String>((resp, statuses))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.connectors.busy = false;
                 match res {
-                    Ok(BotRpcResponse::Bot(updated)) => {
+                    Ok((BotRpcResponse::Bot(updated), statuses)) => {
                         this.upsert_bot_config(*updated);
+                        if let Some(st) = statuses {
+                            this.sync_bot_connector_statuses(&bot_id, st);
+                        }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SECRET_DELETED.get()));
                     }
-                    Ok(_) => {
+                    Ok((_, statuses)) => {
+                        if let Some(st) = statuses {
+                            this.sync_bot_connector_statuses(&bot_id, st);
+                        }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SECRET_DELETED.get()));
                     }
                     Err(err) => {
@@ -607,6 +671,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
@@ -630,7 +695,8 @@ impl View {
                 this.connectors.busy = false;
                 match res {
                     Ok(BotRpcResponse::ConnectorStatuses(list)) => {
-                        this.connectors.bot_statuses = list;
+                        this.sync_bot_connector_statuses(&bot_id, list);
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::CONNECTOR_RELOADED.get()));
                     }
                     Ok(other) => {
@@ -661,6 +727,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -797,13 +864,16 @@ impl View {
             .clone()
             .unwrap_or_else(|| connector_secret_ref(bot_id.as_str(), "google-oauth"));
         next_c.google.oauth_client_secret_ref = Some(sref.clone());
-        self.connector_task = Some(cx.spawn(async move |this, cx| {
+        self.error = None;
+        self.notice = None;
+        self.oauth_file_task = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = chosen.await else {
                 return;
             };
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
+            let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -815,28 +885,46 @@ impl View {
                             value: content,
                         },
                     )?;
-                    match call_checked(
+                    let resp = match call_checked(
                         &rpc,
                         &BotRpcRequest::SetConnectorConfig {
-                            bot_id,
+                            bot_id: bot_id_bg.clone(),
                             connectors: Box::new(next_c),
                         },
                     ) {
-                        Ok(r) => Ok(r),
+                        Ok(r) => r,
                         Err(err) => {
                             drop(rpc(&BotRpcRequest::DeleteSecret { secret_ref: sref }));
-                            Err(text::ROLLBACK_NOTICE.format(&[("err", &err)]))
+                            return Err(text::ROLLBACK_NOTICE.format(&[("err", &err)]));
                         }
-                    }
+                    };
+                    let statuses = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ConnectorStatus {
+                            bot_id: Some(bot_id_bg),
+                        },
+                    ) {
+                        Ok(BotRpcResponse::ConnectorStatuses(s)) => Some(s),
+                        _ => None,
+                    };
+                    Ok::<_, String>((resp, statuses))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 match res {
-                    Ok(BotRpcResponse::Bot(updated)) => {
+                    Ok((BotRpcResponse::Bot(updated), statuses)) => {
                         this.upsert_bot_config(*updated);
+                        if let Some(st) = statuses {
+                            this.sync_bot_connector_statuses(&bot_id, st);
+                        }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SECRET_SAVED.get()));
                     }
-                    Ok(_) => {
+                    Ok((_, statuses)) => {
+                        if let Some(st) = statuses {
+                            this.sync_bot_connector_statuses(&bot_id, st);
+                        }
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SECRET_SAVED.get()));
                     }
                     Err(err) => {
@@ -861,6 +949,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -902,6 +991,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -921,7 +1011,7 @@ impl View {
                         {
                             cx.open_url(&redirect_url);
                         }
-                        this.notice = Some(SharedString::from(text::GOOGLE_OAUTH_OPENED.get()));
+                        this.notice = Some(SharedString::from(text::COMPOSIO_OAUTH_OPENED.get()));
                     }
                     Ok(other) => {
                         this.error = Some(SharedString::from(format!(
@@ -949,6 +1039,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let cid = connection_id.clone();
             let res = cx
@@ -995,6 +1086,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1044,13 +1136,14 @@ impl View {
         let trimmed = code.trim().to_owned();
         if trimmed.is_empty() {
             self.error = Some(SharedString::from(text::ERR_EMPTY_FIELD.get()));
+            self.notice = None;
             cx.notify();
             return;
         }
         let rpc = self.rpc.clone();
-        let selected_bot_id = self.selected_bot_id.clone();
         self.connectors.busy = true;
         self.error = None;
+        self.notice = None;
         self.connector_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1076,22 +1169,31 @@ impl View {
                             clear_input_on_window(&mut slot, this.window_handle, cx);
                         }
                         if let BotRpcResponse::AccessRequestDecided(decided) = resp {
-                            for list in [
-                                &mut this.connectors.bot_access_requests,
-                                &mut this.all_access_requests,
-                            ] {
-                                if let Some(slot) =
-                                    list.iter_mut().find(|r| r.token == decided.token)
+                            if let Some(slot) = this
+                                .all_access_requests
+                                .iter_mut()
+                                .find(|r| r.token == decided.token)
+                            {
+                                *slot = decided.clone();
+                            } else {
+                                this.all_access_requests.push(decided.clone());
+                            }
+                            if this.selected_bot_id.as_ref() == Some(&decided.bot_id) {
+                                if let Some(slot) = this
+                                    .connectors
+                                    .bot_access_requests
+                                    .iter_mut()
+                                    .find(|r| r.token == decided.token)
                                 {
-                                    *slot = decided.clone();
+                                    *slot = decided;
                                 } else {
-                                    list.push(decided.clone());
+                                    this.connectors.bot_access_requests.push(decided);
                                 }
                             }
                         }
                         if let Some(all) = all_req {
                             this.all_access_requests.clone_from(&all);
-                            if let Some(bid) = &selected_bot_id {
+                            if let Some(bid) = &this.selected_bot_id {
                                 this.connectors.bot_access_requests =
                                     all.into_iter().filter(|r| &r.bot_id == bid).collect();
                             }
@@ -1115,12 +1217,13 @@ impl View {
         source: ExternalSource,
         enabled: bool,
     ) -> (ConnectorHealthState, Option<&BotConnectorStatus>) {
-        if let Some(st) = self
-            .connectors
-            .bot_statuses
-            .iter()
-            .find(|s| s.source == source)
-        {
+        if let Some(st) = self.connectors.bot_statuses.iter().find(|s| {
+            s.source == source
+                && self
+                    .selected_bot_id
+                    .as_ref()
+                    .is_none_or(|id| &s.bot_id == id)
+        }) {
             (st.state, Some(st))
         } else if enabled {
             (ConnectorHealthState::Disconnected, None)

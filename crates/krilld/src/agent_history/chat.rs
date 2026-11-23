@@ -3307,6 +3307,7 @@ mod tests {
                 hibernation_blocked: false,
                 account: None,
                 bot_instructions: None,
+                launched_at: None,
             };
             let roots = VaultRoots {
                 claude: vec![dir.clone()],
@@ -3678,6 +3679,7 @@ mod tests {
             hibernation_blocked: true,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         let snap = poll_session_in(&roots, Some(&stored), b"/tmp/agy-demo", 0);
         assert!(snap.bound);
@@ -3818,6 +3820,7 @@ mod cross_platform_tests {
             hibernation_blocked: false,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         let snap1 = poll_session_in(&roots1, Some(&stored_exe), br"D:\work\App", 0);
         assert!(
@@ -4044,6 +4047,7 @@ mod performance_tests {
             hibernation_blocked: false,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         let empty_ids = BTreeSet::new();
         let empty_paths = BTreeSet::new();
@@ -4097,6 +4101,7 @@ mod performance_tests {
             hibernation_blocked: false,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         let empty_ids = BTreeSet::new();
         let empty_paths = BTreeSet::new();
@@ -4198,6 +4203,7 @@ mod performance_tests {
             hibernation_blocked: true,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         let empty_ids = BTreeSet::new();
         let empty_paths = BTreeSet::new();
@@ -4365,6 +4371,7 @@ mod performance_tests {
             hibernation_blocked: true,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
 
         // 1) 이미 다른 세션이 선점(claimed)한 대화 ID면 바인딩하지 않는다.
@@ -4440,5 +4447,60 @@ mod performance_tests {
         assert!(claude_out[1].text.contains("+d"));
         assert!(claude_out[2].text.contains("+++ b/c.rs"));
         assert!(claude_out[2].text.contains("+fn main() {}"));
+    }
+
+    #[test]
+    fn cwd_fallback_filter_keeps_allowing_transcript_after_launch_metadata_rewrite() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-chat-launched-at-rewrite-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let control = crate::agent::control::Control::new(Some(&root));
+        let sid = krill_proto::SessionId(404);
+        control
+            .remember_session(
+                sid,
+                &krill_proto::control::AgentLaunch {
+                    profile: "claude".into(),
+                    permission: krill_proto::agent::Permission::Manual,
+                },
+                None,
+                b"/work".to_vec(),
+                None,
+            )
+            .unwrap();
+        let transcript = root.join("transcript.jsonl");
+        fs::write(&transcript, "{\"sessionId\":\"conv-1\"}\n").unwrap();
+        let birth = file_birth_or_mtime(&transcript).unwrap();
+        // Backdate original launch to 60s before transcript creation, then trigger atomic rewrites.
+        let orig_launch = birth.saturating_sub(60);
+        let launch_file = root.join("agent-launches/404.json");
+        let mut raw: Value = serde_json::from_slice(&fs::read(&launch_file).unwrap()).unwrap();
+        raw["launched_at"] = serde_json::json!(orig_launch);
+        fs::write(&launch_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        control
+            .remember_bot_instructions(sid, "system instructions")
+            .unwrap();
+        control.record_hook_session(
+            sid,
+            br#"{"hook_event_name":"PreToolUse","tool_name":"Task"}"#,
+        );
+
+        let empty_ids = BTreeSet::new();
+        let empty_paths = BTreeSet::new();
+        let filter = CwdFallbackFilter {
+            min_birth_secs: control.launched_at(sid),
+            claimed_ids: &empty_ids,
+            claimed_paths: &empty_paths,
+        };
+        assert_eq!(filter.min_birth_secs, Some(orig_launch));
+        assert!(
+            filter.allows(&transcript, "conv-1"),
+            "atomic metadata rewrite must not advance min_birth_secs past transcript birth"
+        );
+        fs::remove_dir_all(root).ok();
     }
 }

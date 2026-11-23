@@ -77,21 +77,27 @@ pub(super) struct BotPanel {
     /// The bot list changed since `view` last loaded it.
     pub stale: bool,
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
+    pub chat_search_lang: Option<krill_app::i18n::Language>,
     pub chat_query: String,
     /// Chats unfolded to show their workers (every chat starts folded, as in Orca).
     pub chat_unfolded: std::collections::BTreeSet<krill_proto::SessionId>,
-    /// What the header last drew from `view`: its filter, whether an item is open, and the
-    /// automations' line ("Idle · next 8:00 PM · Look around", with its narrow form).
+    /// What the header last drew from `view`: its filter, whether an item is open, the
+    /// automations' line ("Idle · next 8:00 PM · Look around", with its narrow form), the
+    /// settings subpage crumb, and the group panel filter state/counts.
     pub home_chrome: HomeChrome,
     /// A draft for this bot's Home Chat composer, put in once its chat is on screen.
     pub pending_draft: Option<(BotId, String)>,
 }
 
-pub(super) type HomeChrome = (
-    Option<krill_app::bots::HomeFilter>,
-    bool,
-    Option<(String, Option<String>, bool)>,
-);
+#[derive(Default, PartialEq, Eq)]
+pub(super) struct HomeChrome {
+    pub filter: Option<krill_app::bots::HomeFilter>,
+    pub item_open: bool,
+    pub quiet_line: Option<(String, Option<String>, bool)>,
+    pub settings_subpage: Option<&'static str>,
+    pub group_filter: krill_app::bots::GroupItemsFilter,
+    pub group_filter_counts: (Vec<(BotId, usize)>, usize),
+}
 
 /// How a bot chat is named: Home Chat for the Home Chat (krilld lists it first), else its own
 /// label (krilld's default label is just the bot's name), else its thread, else Orca's "New chat".
@@ -228,7 +234,14 @@ impl Shell {
         .detach();
         cx.observe(&view, |this, view, cx| {
             let v = view.read(cx);
-            let chrome = (v.home_filter(), v.home_item_open(), v.home_quiet_line());
+            let chrome = HomeChrome {
+                filter: v.home_filter(),
+                item_open: v.home_item_open(),
+                quiet_line: v.home_quiet_line(),
+                settings_subpage: v.settings_subpage(),
+                group_filter: v.group_items_filter(),
+                group_filter_counts: v.group_filter_counts(),
+            };
             if this.bot_ui.panel.home_chrome != chrome {
                 this.bot_ui.panel.home_chrome = chrome;
                 cx.notify();
@@ -343,6 +356,20 @@ impl Shell {
             }
             Some(view)
         });
+        // Switching bots while on the Chats tab still needs `view` synced so `chat_workers(&bot.id)`
+        // reflects the focused bot rather than a previous bot or group panel.
+        if tab == BotPanelTab::Chats
+            && let Some(view) = self.bot_panel_view(cx)
+        {
+            if std::mem::take(&mut self.bot_ui.panel.stale) {
+                view.update(cx, krill_app::bots::View::reload);
+            }
+            if self.bot_ui.panel.shown.as_ref().map(|(id, _)| id) != Some(&bot.id)
+                && view.update(cx, |v, cx| v.show_in_panel(&bot.id, DetailTab::Items, cx))
+            {
+                self.bot_ui.panel.shown = Some((bot.id.clone(), DetailTab::Items));
+            }
+        }
         let body: AnyElement = match tab {
             BotPanelTab::Files => self.diff.clone().into_any_element(),
             BotPanelTab::Chats => self.render_bot_chats(bot, p, cx).into_any_element(),
@@ -511,7 +538,7 @@ impl Shell {
         // Orca says what its automations do while nothing waits or runs ("Running …", "Idle ·
         // next 8:00 PM · Look around"); the bot's job is the sidebar's line only.
         let quiet = !bot.paused && bot.attention == 0 && bot.working() == 0;
-        let quiet_line = self.bot_ui.panel.home_chrome.2.clone();
+        let quiet_line = self.bot_ui.panel.home_chrome.quiet_line.clone();
         let automation_running = quiet_line.as_ref().is_some_and(|q| q.2);
         let status = if quiet || activity.trim().is_empty() {
             match quiet_line {
@@ -1342,7 +1369,14 @@ impl Shell {
     }
 
     fn ensure_bot_chat_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.bot_ui.panel.chat_search.is_some() {
+        let lang = krill_app::i18n::language();
+        if let Some((input, _)) = &self.bot_ui.panel.chat_search {
+            if self.bot_ui.panel.chat_search_lang != Some(lang) {
+                input.update(cx, |s, cx| {
+                    s.set_placeholder(text::BP_SEARCH_CHATS.get(), window, cx);
+                });
+                self.bot_ui.panel.chat_search_lang = Some(lang);
+            }
             return;
         }
         let input =
@@ -1354,6 +1388,7 @@ impl Shell {
             }
         });
         self.bot_ui.panel.chat_search = Some((input, sub));
+        self.bot_ui.panel.chat_search_lang = Some(lang);
     }
 
     /// Stop, run again or take over: one krilld call, then the sidebar poll catches up.

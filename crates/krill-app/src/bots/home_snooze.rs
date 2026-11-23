@@ -156,15 +156,17 @@ impl View {
     /// Writes one change to each of these items, one after another, then clears the selection.
     pub(super) fn update_items_batch(
         &mut self,
-        bot_id: BotId,
+        _bot_id: BotId,
         params: Vec<UpdateBotItemParams>,
         cx: &mut Context<Self>,
     ) {
-        if params.is_empty() {
+        if params.is_empty() || self.items.busy {
             return;
         }
         let rpc = self.rpc.clone();
+        self.items.busy = true;
         self.error = None;
+        self.notice = None;
         self.items.selected.clear();
         self.item_task = Some(cx.spawn(async move |this, cx| {
             let results = cx
@@ -177,9 +179,13 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.items.busy = false;
                 for res in results {
                     match res {
-                        Ok(BotRpcResponse::Item(updated)) => this.upsert_item(*updated, &bot_id),
+                        Ok(BotRpcResponse::Item(updated)) => {
+                            let owner_id = updated.owner_bot_id.clone();
+                            this.upsert_item(*updated, &owner_id);
+                        }
                         Ok(BotRpcResponse::Error(err)) | Err(err) => {
                             this.error = Some(SharedString::from(err));
                         }
@@ -191,6 +197,7 @@ impl View {
             })
             .ok();
         }));
+        cx.notify();
     }
 
     /// Snoozes (or unsnoozes, `None`) these items.
@@ -347,20 +354,30 @@ impl View {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(header)
             .child(body);
-        let backdrop = div()
-            .id("bot-snooze-pick-backdrop")
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.items.snooze_pick = None;
-                    cx.notify();
-                }),
-            )
-            .child(dialog);
+        let backdrop = ui::modal_focus_scope(
+            div()
+                .id("bot-snooze-pick-backdrop")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
+                        this.items.snooze_pick = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.items.snooze_pick = None;
+                        cx.notify();
+                    }),
+                )
+                .child(dialog),
+            &self.focus,
+        );
         Some(ui::modal_backdrop(window.viewport_size(), backdrop).into_any_element())
     }
 

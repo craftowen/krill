@@ -43,10 +43,10 @@ pub struct ParsedWsUrl {
 
 /// Parses a WebSocket URL (`wss://` for any host, `ws://` strictly for loopback hosts).
 pub fn parse_ws_url(raw: &str) -> io::Result<ParsedWsUrl> {
-    if raw.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+    if raw.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "WebSocket URL contains forbidden control characters",
+            "WebSocket URL contains forbidden whitespace or control characters",
         ));
     }
     let (tls, rest, default_port) = if let Some(r) = raw.strip_prefix("wss://") {
@@ -1007,5 +1007,19 @@ pub(crate) mod tests {
             WsEvent::Text("tail".to_owned())
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn parse_ws_url_rejects_spaces_and_control_characters() {
+        for bad in [
+            "wss://example.com/a b",
+            "wss://example.com/path\tfoo",
+            "wss://example.com/path\x0bfoo",
+            "wss://example.com/path\x7ffoo",
+            "ws://127.0.0.1:8080/a b",
+        ] {
+            let err = parse_ws_url(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "url: {bad:?}");
+        }
     }
 }

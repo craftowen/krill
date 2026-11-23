@@ -378,6 +378,7 @@ impl View {
             .get_or_insert_with(|| {
                 let input =
                     cx.new(|cx| InputState::new(window, cx).placeholder(hm::CANCEL_REASON.get()));
+                cx.observe(&input, |_, _, cx| cx.notify()).detach();
                 input.update(cx, |s, cx| s.focus(window, cx));
                 input
             })
@@ -459,20 +460,33 @@ impl View {
                         .on_click(cx.listener(|this, _, _, cx| this.submit_cancel(cx))),
                     ),
             );
-        let backdrop = div()
-            .id("bot-cancel-ask-backdrop")
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.items.cancel_ask = None;
-                    cx.notify();
-                }),
-            )
-            .child(dialog);
+        let backdrop = ui::modal_focus_scope(
+            div()
+                .id("bot-cancel-ask-backdrop")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "escape"
+                        && !ev.keystroke.modifiers.modified()
+                        && !this.input_is_composing(window, cx)
+                    {
+                        this.items.cancel_ask = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.items.cancel_ask = None;
+                        cx.notify();
+                    }),
+                )
+                .child(dialog),
+            &self.focus,
+        );
         Some(ui::modal_backdrop(window.viewport_size(), backdrop).into_any_element())
     }
 

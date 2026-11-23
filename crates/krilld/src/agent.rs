@@ -426,6 +426,37 @@ pub(crate) fn launch_selected_in(
     launch_selected_in_with_bot_mcp(profile, permission, session, state, selected, None, None)
 }
 
+/// 중간 실패 시 이 세션용 임시 settings·MCP·지침 파일을 자동 정리하는 RAII 가드.
+struct SessionFilesGuard<'a> {
+    state: Option<&'a Path>,
+    session: krill_proto::SessionId,
+    armed: bool,
+}
+
+impl<'a> SessionFilesGuard<'a> {
+    fn new(state: Option<&'a Path>, session: krill_proto::SessionId) -> Self {
+        Self {
+            state,
+            session,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionFilesGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(state) = self.state
+        {
+            claude::discard(state, self.session);
+        }
+    }
+}
+
 /// Bot-aware extension of [`launch_selected_in`] that injects MCP servers, the separated bot home
 /// (Claude: settings `additionalDirectories`, no trust prompt), and loopback entries in `NO_PROXY`/`no_proxy`.
 pub(crate) fn launch_selected_in_with_bot_mcp(
@@ -437,6 +468,7 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
     cwd: Option<&Path>,
     bot_mcp: Option<&BotMcpLaunchConfig>,
 ) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
+    let mut files_guard = SessionFilesGuard::new(state, session);
     let selected = selected
         .map(|id| selected_account(profile, state, id))
         .transpose()?;
@@ -469,11 +501,9 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
             let args = instruction_args(&effective, &mut login.env, state, session, text)?;
             effective.launch.splice(1..1, args);
         }
-        return Ok((
-            wrap_account(&effective, permission, login, account.as_ref()),
-            None,
-            account,
-        ));
+        let launch = wrap_account(&effective, permission, login, account.as_ref());
+        files_guard.disarm();
+        return Ok((launch, None, account));
     }
 
     if is(profile, "claude") {
@@ -502,6 +532,7 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
             let args = instruction_args(profile, &mut launch.env, state, session, text)?;
             launch.argv.extend(args.into_iter().map(String::into_bytes));
         }
+        files_guard.disarm();
         return Ok((launch, Some(id), account));
     }
 
@@ -536,11 +567,9 @@ pub(crate) fn launch_selected_in_with_bot_mcp(
             }
         }
     }
-    Ok((
-        wrap_account(profile, permission, login, account.as_ref()),
-        None,
-        account,
-    ))
+    let launch = wrap_account(profile, permission, login, account.as_ref());
+    files_guard.disarm();
+    Ok((launch, None, account))
 }
 
 /// 각 에이전트가 봇 지침을 시스템 프롬프트로 받는 인자(프로그램 바로 뒤에 넣는다)와 env.
@@ -591,7 +620,7 @@ fn instruction_args(
     if is(profile, "opencode") {
         // OpenCode 2.x는 설정의 instructions를 읽지 않고 설정 폴더의 AGENTS.md만 읽는다. 사용자 설정 폴더의
         // 항목을 링크한 전용 폴더에 사용자 AGENTS.md + 지침을 둔다(Orca `opencode-instructions-config-dir`).
-        let source = opencode_config_dir(env);
+        let source = opencode_config_dir(profile, env);
         let dir = claude::create_instructions_dir(state, session)?;
         let own = std::fs::read_to_string(source.join("AGENTS.md")).ok();
         let combined = [own.as_deref().map(str::trim), Some(text)]
@@ -631,12 +660,18 @@ fn instruction_args(
 }
 
 /// 이 실행이 Krill 없이 읽을 `OpenCode` 설정 폴더: `OPENCODE_CONFIG_DIR`, 아니면 XDG 폴더.
-fn opencode_config_dir(env: &[(Vec<u8>, Vec<u8>)]) -> PathBuf {
+fn opencode_config_dir(profile: &Profile, env: &[(Vec<u8>, Vec<u8>)]) -> PathBuf {
     let var = |key: &str| {
-        env.iter()
-            .rev()
-            .find(|(k, _)| k.as_slice() == key.as_bytes())
-            .and_then(|(_, v)| std::str::from_utf8(v).ok().map(ToOwned::to_owned))
+        profile
+            .env
+            .get(key)
+            .cloned()
+            .or_else(|| {
+                env.iter()
+                    .rev()
+                    .find(|(k, _)| k.as_slice() == key.as_bytes())
+                    .and_then(|(_, v)| std::str::from_utf8(v).ok().map(ToOwned::to_owned))
+            })
             .or_else(|| std::env::var(key).ok())
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
@@ -753,14 +788,44 @@ pub(crate) fn resume_in(
     session_id: Option<&str>,
     account: Option<&LaunchAccount>,
 ) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
+    resume_in_with_bot_instructions(
+        profile, permission, session, state, session_id, account, None,
+    )
+}
+
+/// [`resume_in`]에 봇 지침을 다시 붙인다. 지침은 대화 기록이 아니라 시스템 프롬프트에 있어서
+/// 재개(holder까지 죽은 뒤 cold resume 등) 때 다시 넘기지 않으면 봇 정체성을 잃는다.
+/// `login.env` 구성 이후에 `instruction_args`를 호출해 로그인 셸/프로필의 `OPENCODE_CONFIG_DIR`·
+/// `XDG_CONFIG_HOME`을 그대로 읽도록 한다.
+pub(crate) fn resume_in_with_bot_instructions(
+    profile: &Profile,
+    permission: Permission,
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    session_id: Option<&str>,
+    account: Option<&LaunchAccount>,
+    instructions: Option<&str>,
+) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
     if session_id.is_some_and(|id| !control::valid_session_id(id)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid agent session id",
         ));
     }
+    let mut files_guard = SessionFilesGuard::new(state, session);
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, account);
+    let instructions =
+        instructions.filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile));
+    let mut effective_profile = std::borrow::Cow::Borrowed(profile);
+    if let Some(text) = instructions {
+        let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
+        let args = instruction_args(&effective_profile, &mut login.env, state_dir, session, text)?;
+        if !args.is_empty() && !effective_profile.launch.is_empty() {
+            effective_profile.to_mut().launch.splice(1..1, args);
+        }
+    }
+    let profile = effective_profile.as_ref();
     let kept_id = session_id.filter(|s| !s.is_empty()).map(str::to_owned);
     if is(profile, "codex") {
         let hooked = codex_hooks(profile, state, &login.env)?;
@@ -770,6 +835,7 @@ pub(crate) fn resume_in(
         if let Some(id) = &kept_id {
             launch.argv.push(id.as_bytes().to_vec());
         }
+        files_guard.disarm();
         return Ok((launch, kept_id, account));
     }
     if is(profile, "claude") {
@@ -782,6 +848,7 @@ pub(crate) fn resume_in(
             claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?
         };
         let launch = settings.resume(profile, permission, login, kept_id.as_deref())?;
+        files_guard.disarm();
         return Ok((launch, kept_id, account));
     }
     if is(profile, "agy") || is(profile, "antigravity") {
@@ -792,6 +859,7 @@ pub(crate) fn resume_in(
         } else {
             launch.argv.push(b"-c".to_vec());
         }
+        files_guard.disarm();
         return Ok((launch, kept_id, account));
     }
     if is(profile, "opencode") {
@@ -802,45 +870,12 @@ pub(crate) fn resume_in(
         } else {
             launch.argv.push(b"--continue".to_vec());
         }
+        files_guard.disarm();
         return Ok((launch, kept_id, account));
     }
-    Ok((
-        wrap_account(profile, permission, login, account.as_ref()),
-        kept_id,
-        account,
-    ))
-}
-
-/// [`resume_in`]에 봇 지침을 다시 붙인다. 지침은 대화 기록이 아니라 시스템 프롬프트에 있어서
-/// 재개(holder까지 죽은 뒤 cold resume 등) 때 다시 넘기지 않으면 봇 정체성을 잃는다.
-pub(crate) fn resume_in_with_bot_instructions(
-    profile: &Profile,
-    permission: Permission,
-    session: krill_proto::SessionId,
-    state: Option<&Path>,
-    session_id: Option<&str>,
-    account: Option<&LaunchAccount>,
-    instructions: Option<&str>,
-) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
-    let Some(text) =
-        instructions.filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile))
-    else {
-        return resume_in(profile, permission, session, state, session_id, account);
-    };
-    let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
-    let mut env = Vec::new();
-    let mut with_args = profile.clone();
-    let args = instruction_args(profile, &mut env, state_dir, session, text)?;
-    if !with_args.launch.is_empty() {
-        with_args.launch.splice(1..1, args);
-    }
-    let (mut launch, kept, account) =
-        resume_in(&with_args, permission, session, state, session_id, account)?;
-    for (k, v) in env {
-        launch.env.retain(|(ek, _)| ek != &k);
-        launch.env.push((k, v));
-    }
-    Ok((launch, kept, account))
+    let launch = wrap_account(profile, permission, login, account.as_ref());
+    files_guard.disarm();
+    Ok((launch, kept_id, account))
 }
 
 /// 실행 중이거나 기록이 남은 에이전트 세션의 대화를 포크해 새 세션으로 띄우는 실행 argv·env를 만든다(OWE-736, MK-182).
@@ -862,6 +897,7 @@ pub(crate) fn fork_in(
             "invalid agent session id",
         ));
     }
+    let mut files_guard = SessionFilesGuard::new(state, session);
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, account);
     let kept_id = session_id.filter(|s| !s.is_empty()).map(str::to_owned);
@@ -875,6 +911,7 @@ pub(crate) fn fork_in(
         } else {
             launch.argv.push(b"--last".to_vec());
         }
+        files_guard.disarm();
         return Ok((launch, None, account));
     }
     if is(profile, "claude") {
@@ -884,13 +921,12 @@ pub(crate) fn fork_in(
         let settings =
             claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?;
         let launch = settings.fork(profile, permission, login, kept_id.as_deref())?;
+        files_guard.disarm();
         return Ok((launch, None, account));
     }
-    Ok((
-        wrap_account(profile, permission, login, account.as_ref()),
-        None,
-        account,
-    ))
+    let launch = wrap_account(profile, permission, login, account.as_ref());
+    files_guard.disarm();
+    Ok((launch, None, account))
 }
 
 /// 재개·휴면 깨우기에 쓸 계정(OWE-698, OWE-753). 기록된 계정은 프로필 폴더가 남아 있으면 그대로 쓴다(계정을

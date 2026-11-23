@@ -1,6 +1,7 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
 //! Command execution for `krill bot` (offline catalog + daemon RPC dispatch).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -15,10 +16,11 @@ use krill_proto::bots::catalog::{
 use krill_proto::bots::home::append_memory_fact;
 use krill_proto::bots::package::{BotPackageExportOptions, MAX_AVATAR_PNG_BYTES, import_bot_zip};
 use krill_proto::bots::{
-    BotConfig, BotId, BotItemLink, BotItemStatus, BotItemsPage, BotMcpAuthKind, BotMcpToolConfig,
-    BotRpcRequest, BotRpcResponse, BotScheduleConfig, BotSlug, CreateBotItemParams,
-    CreateBotParams, CreateBotV2Params, FieldPatch, GoogleServicesConfig, MAX_RPC_ZIP_BYTES,
-    UpdateBotExtrasParams, UpdateBotItemParams, UpdateBotParams, validate_bot_slug,
+    BotConfig, BotId, BotItem, BotItemLink, BotItemStatus, BotItemsPage, BotMcpAuthKind,
+    BotMcpToolConfig, BotRpcRequest, BotRpcResponse, BotScheduleConfig, BotSlug,
+    CreateBotItemParams, CreateBotParams, CreateBotV2Params, FieldPatch, GoogleServicesConfig,
+    MAX_RPC_ZIP_BYTES, UpdateBotExtrasParams, UpdateBotItemParams, UpdateBotParams,
+    validate_bot_slug,
 };
 
 use super::format;
@@ -430,6 +432,21 @@ where
                     items.retain(|i| i.status == filter);
                 }
                 format::format_items(&items, json)
+            } else if let Some(filter) = status {
+                let page_resp = list_filtered_items_page(
+                    client,
+                    FilteredItemsPageQuery {
+                        bot_id,
+                        status: filter,
+                        include_closed,
+                        include_snoozed,
+                        limit,
+                        cursor: cursor.as_deref(),
+                        page,
+                        now_ms,
+                    },
+                )?;
+                format::format_items_page(&page_resp, json)
             } else {
                 let mut cur_cursor = cursor;
                 if let Some(target_page) = page
@@ -469,12 +486,9 @@ where
                     limit,
                     cursor: cur_cursor,
                 })?;
-                let BotRpcResponse::ItemsPage(mut page_resp) = resp else {
+                let BotRpcResponse::ItemsPage(page_resp) = resp else {
                     return Err(CliError::fail("unexpected reply for ListItemsPage"));
                 };
-                if let Some(filter) = status {
-                    page_resp.items.retain(|i| i.status == filter);
-                }
                 format::format_items_page(&page_resp, json)
             }
         }
@@ -923,14 +937,21 @@ where
             };
             format::format_item_detail(&item, json)
         }
-        BotCommand::Offer { bot, name, purpose } => {
+        BotCommand::Offer {
+            bot,
+            name,
+            purpose,
+            json,
+        } => {
             let bot_id = resolve_bot_id(client, &bot)?;
             match client.call(BotRpcRequest::OfferBot {
                 bot_id,
                 name,
                 purpose,
             })? {
-                BotRpcResponse::Text(message) => Ok(format!("{message}\n")),
+                BotRpcResponse::Text(message) => {
+                    format::format_ok(message.trim_end_matches(['\r', '\n']), json)
+                }
                 _ => Err(CliError::fail("unexpected reply for OfferBot")),
             }
         }
@@ -2569,4 +2590,139 @@ pub(crate) fn today_iso_utc(epoch_secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     format!("{year:04}-{m:02}-{d:02}")
+}
+
+const DEFAULT_ITEMS_PAGE_LIMIT: usize = 50;
+const MAX_ITEMS_PAGE_LIMIT: usize = 200;
+
+fn parse_items_cursor(raw: &str) -> Result<(u64, &str), CliError> {
+    let Some((ts_str, uid)) = raw.split_once('|') else {
+        return Err(CliError::usage(
+            "invalid --cursor (expected <timestamp_ms>|<uid>)",
+        ));
+    };
+    let ts = ts_str
+        .parse::<u64>()
+        .map_err(|_| CliError::usage("invalid --cursor timestamp"))?;
+    if uid.is_empty() {
+        return Err(CliError::usage("invalid --cursor uid"));
+    }
+    Ok((ts, uid))
+}
+
+struct FilteredItemsPageQuery<'a> {
+    bot_id: Option<BotId>,
+    status: BotItemStatus,
+    include_closed: bool,
+    include_snoozed: bool,
+    limit: Option<u32>,
+    cursor: Option<&'a str>,
+    page: Option<u32>,
+    now_ms: u64,
+}
+
+fn list_filtered_items_page(
+    client: &mut dyn BotClient,
+    query: FilteredItemsPageQuery<'_>,
+) -> Result<BotItemsPage, CliError> {
+    let FilteredItemsPageQuery {
+        bot_id,
+        status,
+        include_closed,
+        include_snoozed,
+        limit,
+        cursor,
+        page,
+        now_ms,
+    } = query;
+    let parsed_cursor = cursor
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_items_cursor)
+        .transpose()?;
+
+    let resp = client.call(BotRpcRequest::ListItems {
+        bot_id,
+        include_closed,
+    })?;
+    let BotRpcResponse::Items(mut items) = resp else {
+        return Err(CliError::fail("unexpected reply for ListItems"));
+    };
+
+    items.retain(|item| {
+        item.status == status
+            && (include_snoozed || item.snoozed_until_ms.is_none_or(|until| until <= now_ms))
+    });
+    items.sort_by(|a, b| {
+        b.last_activity_at_ms
+            .cmp(&a.last_activity_at_ms)
+            .then_with(|| b.uid.cmp(&a.uid))
+    });
+
+    let total_count = items.len();
+    let unseen_count = if items.is_empty() {
+        0
+    } else {
+        let mut seen_by_bot: BTreeMap<BotId, u64> = BTreeMap::new();
+        let owners: BTreeSet<BotId> = items.iter().map(|i| i.owner_bot_id.clone()).collect();
+        for owner in owners {
+            let seen_id = match client.call(BotRpcRequest::GetBotUpcoming {
+                bot_id: owner.clone(),
+            }) {
+                Ok(BotRpcResponse::Upcoming(up)) => up.items_seen_event_id,
+                _ => 0,
+            };
+            seen_by_bot.insert(owner, seen_id);
+        }
+        items
+            .iter()
+            .filter(|item| {
+                let seen_id = seen_by_bot.get(&item.owner_bot_id).copied().unwrap_or(0);
+                item.events.iter().any(|ev| ev.id > seen_id)
+            })
+            .count()
+    };
+
+    let after_cursor: Vec<BotItem> = match parsed_cursor {
+        Some((cursor_ts, cursor_uid)) => items
+            .into_iter()
+            .filter(|item| {
+                item.last_activity_at_ms < cursor_ts
+                    || (item.last_activity_at_ms == cursor_ts && item.uid.as_str() < cursor_uid)
+            })
+            .collect(),
+        None => items,
+    };
+
+    let page_limit = limit
+        .and_then(|n| usize::try_from(n).ok())
+        .map_or(DEFAULT_ITEMS_PAGE_LIMIT, |n| {
+            n.clamp(1, MAX_ITEMS_PAGE_LIMIT)
+        });
+    let skip = page.map_or(0, |p| {
+        usize::try_from(p.saturating_sub(1))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(page_limit)
+    });
+    let page_items: Vec<BotItem> = after_cursor
+        .iter()
+        .skip(skip)
+        .take(page_limit)
+        .cloned()
+        .collect();
+    let has_more = after_cursor.len() > skip.saturating_add(page_items.len());
+    let next_cursor = if has_more {
+        page_items
+            .last()
+            .map(|last| format!("{}|{}", last.last_activity_at_ms, last.uid))
+    } else {
+        None
+    };
+
+    Ok(BotItemsPage {
+        items: page_items,
+        next_cursor,
+        total_count,
+        unseen_count,
+    })
 }

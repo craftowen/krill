@@ -73,6 +73,7 @@ pub(super) struct ImportDialog {
     pub scanned: bool,
     pub scan_host: Option<HostId>,
     pub candidates: Vec<ExternalBotCandidate>,
+    pub canonical_paths: std::collections::HashMap<String, String>,
     pub host_bots: Vec<BotConfig>,
     pub imported_sources: Vec<(String, BotId)>,
     pub picture: PictureState,
@@ -100,6 +101,7 @@ impl ImportDialog {
             scanned: false,
             scan_host: None,
             candidates: Vec::new(),
+            canonical_paths: std::collections::HashMap::new(),
             host_bots: Vec::new(),
             imported_sources: Vec::new(),
             picture: PictureState::new("import-bot", None, cx),
@@ -107,6 +109,13 @@ impl ImportDialog {
             scan_task: None,
             subs: Vec::new(),
         }
+    }
+
+    pub fn input_is_composing(&self, window: &mut Window, app: &mut gpui::App) -> bool {
+        super::opt_input_composing(self.name_input.as_ref(), window, app)
+            || super::opt_textarea_composing(self.reply_input.as_ref(), window, app)
+            || super::opt_input_composing(self.filter_input.as_ref(), window, app)
+            || self.picture.input_is_composing(window, app)
     }
 }
 
@@ -206,6 +215,7 @@ impl View {
 
     /// Opens Import: a fresh dialog, and a look for bots on the active host.
     pub(super) fn reset_import_dialog(&mut self, cx: &mut Context<Self>) {
+        self.import_dialog.picture.cancel_running_generation();
         let mut next = ImportDialog::new(cx);
         let choices = self.import_host_choices(cx);
         let setup = BotAgentSetup::from_hosts(choices, Self::import_runs_on_mut, cx);
@@ -217,11 +227,8 @@ impl View {
         self.scan_import_host(cx);
     }
 
-    fn import_runs_on_mut(&mut self) -> &mut BotAgentSetup {
-        self.import_dialog
-            .runs_on
-            .as_mut()
-            .unwrap_or_else(|| unreachable!("import runs_on initialized on reset_import_dialog"))
+    fn import_runs_on_mut(&mut self) -> Option<&mut BotAgentSetup> {
+        self.import_dialog.runs_on.as_mut()
     }
 
     fn import_picture_mut(&mut self) -> &mut PictureState {
@@ -237,10 +244,12 @@ impl View {
             Some(setup) => (setup.rpc.clone(), setup.host_id.clone()),
             None => (self.rpc.clone(), self.host.clone()),
         };
+        let is_local = host_id.is_local();
         self.import_dialog.scan_host = Some(host_id.clone());
         self.import_dialog.scanning = true;
         self.import_dialog.scanned = false;
         self.import_dialog.candidates.clear();
+        self.import_dialog.canonical_paths.clear();
         self.import_dialog.imported_sources.clear();
         self.error = None;
         let active_host = self.host.clone();
@@ -265,6 +274,17 @@ impl View {
                             ));
                         }
                     };
+                    let mut canonical_paths = std::collections::HashMap::new();
+                    if is_local {
+                        for cand in &cands {
+                            if let Ok(canon) = std::fs::canonicalize(&cand.path) {
+                                canonical_paths.insert(
+                                    cand.path.clone(),
+                                    canon.to_string_lossy().into_owned(),
+                                );
+                            }
+                        }
+                    }
                     let imported_sources =
                         match call_checked(&rpc, &BotRpcRequest::ListImportedSources) {
                             Ok(BotRpcResponse::ImportedSources(sources)) => sources,
@@ -278,15 +298,16 @@ impl View {
                             _ => Vec::new(),
                         }
                     };
-                    Ok::<_, String>((cands, imported_sources, bots))
+                    Ok::<_, String>((cands, canonical_paths, imported_sources, bots))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.import_dialog.scanning = false;
                 this.import_dialog.scanned = true;
                 match outcome {
-                    Ok((cands, sources, bots)) => {
+                    Ok((cands, canonical_paths, sources, bots)) => {
                         this.import_dialog.candidates.clone_from(&cands);
+                        this.import_dialog.canonical_paths = canonical_paths;
                         this.import_dialog.imported_sources = sources;
                         this.import_dialog.host_bots = bots;
                         this.import_state.candidates = cands;
@@ -339,6 +360,10 @@ impl View {
             &self.import_dialog.host_bots,
             &self.import_dialog.imported_sources,
             &cand.path,
+            self.import_dialog
+                .canonical_paths
+                .get(&cand.path)
+                .map(String::as_str),
         )
     }
 
@@ -361,18 +386,23 @@ impl View {
         if self.import_dialog.name_input.is_none() {
             let input =
                 cx.new(|cx| InputState::new(window, cx).placeholder(text::NAME_PLACEHOLDER.get()));
-            let sub = cx.subscribe_in(
-                &input,
-                window,
-                |this, inp, ev: &InputEvent, _, cx| match ev {
-                    InputEvent::Change => {
-                        this.import_dialog.typed = Some(inp.read(cx).value().to_string());
-                        cx.notify();
-                    }
-                    InputEvent::PressEnter { .. } => this.submit_import_or_update(cx),
-                    _ => {}
-                },
-            );
+            let sub =
+                cx.subscribe_in(
+                    &input,
+                    window,
+                    |this, inp, ev: &InputEvent, window, cx| match ev {
+                        InputEvent::Change => {
+                            this.import_dialog.typed = Some(inp.read(cx).value().to_string());
+                            cx.notify();
+                        }
+                        InputEvent::PressEnter { .. }
+                            if !crate::jump::entity_input_is_composing(inp, window, cx) =>
+                        {
+                            this.submit_import_or_update(cx);
+                        }
+                        _ => {}
+                    },
+                );
             self.import_dialog.subs.push(sub);
             input.update(cx, |s, cx| s.focus(window, cx));
             self.import_dialog.name_input = Some(input);
@@ -545,9 +575,10 @@ impl View {
 
         self.import_dialog.creating = true;
         self.error = None;
+        self.notice = None;
         cx.notify();
 
-        self.import_task = Some(cx.spawn(async move |this, cx| {
+        self.import_create_task = Some(cx.spawn(async move |this, cx| {
             let made = cx
                 .background_executor()
                 .spawn(async move {
@@ -670,6 +701,10 @@ impl View {
                     &self.import_dialog.host_bots,
                     &self.import_dialog.imported_sources,
                     &p.path,
+                    self.import_dialog
+                        .canonical_paths
+                        .get(&p.path)
+                        .map(String::as_str),
                 )
             })
             .cloned();
@@ -929,6 +964,7 @@ impl View {
                         this.import_dialog.typed = None;
                         cx.notify();
                     } else {
+                        this.import_dialog.picture.cancel_running_generation();
                         cx.emit(super::Close);
                     }
                 })),
@@ -1007,7 +1043,13 @@ impl View {
                         .icon(IconName::Close)
                         .accessibility_label(text::CLOSE.get())
                         .debug_selector(|| "bot-import-close".into())
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(super::Close))),
+                        .disabled(self.import_dialog.creating)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.import_dialog.creating {
+                                this.import_dialog.picture.cancel_running_generation();
+                                cx.emit(super::Close);
+                            }
+                        })),
                 ),
             )
             .child(
@@ -1062,10 +1104,10 @@ impl View {
             .map(|i| i.read(cx).value().trim().to_lowercase())
             .unwrap_or_default();
         let picked = self.import_pick().map(pick_key);
-        let row = |id: SharedString, on: bool| {
+        let row = |id: SharedString, debug_sel: String, on: bool| {
             div()
-                .id(id.clone())
-                .debug_selector(move || id.to_string())
+                .id(id)
+                .debug_selector(move || debug_sel.clone())
                 .role(gpui::Role::Button)
                 .tab_index(0)
                 .flex()
@@ -1121,9 +1163,10 @@ impl View {
             .border_1()
             .border_color(p.border)
             .p_1();
-        for c in cands
+        for (idx, c) in cands
             .iter()
             .filter(|c| query.is_empty() || c.name.to_lowercase().contains(&query))
+            .enumerate()
         {
             let key = pick_key(c);
             let on = picked.as_deref() == Some(key.as_str());
@@ -1131,59 +1174,71 @@ impl View {
                 &self.import_dialog.host_bots,
                 &self.import_dialog.imported_sources,
                 &c.path,
+                self.import_dialog
+                    .canonical_paths
+                    .get(&c.path)
+                    .map(String::as_str),
             );
             rows = rows.child(
-                row(format!("bot-import-pick-{}", c.name).into(), on)
-                    .aria_selected(on)
-                    .child(tile(initial(&c.name)))
-                    .child(words(c.name.clone(), row_detail(c, existing)))
-                    .when(on, |d| {
-                        d.child(
-                            Icon::new(IconName::Check)
-                                .size(px(16.))
-                                .text_color(p.foreground),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.import_dialog.picked = Some(key.clone());
-                        this.import_dialog.typed = None;
-                        cx.notify();
-                    })),
-            );
-        }
-        rows = rows.child(
-            row("bot-import-other-app".into(), false)
-                .child(
-                    div()
-                        .size(px(28.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(ui::RADIUS_LG)
-                        .border_1()
-                        .border_dashed()
-                        .border_color(p.input)
-                        .child(
-                            Icon::new(IconName::Plus)
-                                .size(px(14.))
-                                .text_color(p.muted_foreground),
-                        ),
+                row(
+                    format!("bot-import-pick-{idx}-{key}").into(),
+                    format!("bot-import-pick-{}", c.name),
+                    on,
                 )
-                .child(words(
-                    text::OTHER_APP.get().to_owned(),
-                    text::OTHER_APP_NOTE.get().to_owned(),
-                ))
-                .child(
-                    Icon::new(IconName::ChevronRight)
-                        .size(px(16.))
-                        .text_color(p.muted_foreground),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.import_dialog.view = ImportView::Export;
+                .aria_selected(on)
+                .child(tile(initial(&c.name)))
+                .child(words(c.name.clone(), row_detail(c, existing)))
+                .when(on, |d| {
+                    d.child(
+                        Icon::new(IconName::Check)
+                            .size(px(16.))
+                            .text_color(p.foreground),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.import_dialog.picked = Some(key.clone());
                     this.import_dialog.typed = None;
                     cx.notify();
                 })),
+            );
+        }
+        rows = rows.child(
+            row(
+                "bot-import-other-app".into(),
+                "bot-import-other-app".to_owned(),
+                false,
+            )
+            .child(
+                div()
+                    .size(px(28.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(ui::RADIUS_LG)
+                    .border_1()
+                    .border_dashed()
+                    .border_color(p.input)
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(px(14.))
+                            .text_color(p.muted_foreground),
+                    ),
+            )
+            .child(words(
+                text::OTHER_APP.get().to_owned(),
+                text::OTHER_APP_NOTE.get().to_owned(),
+            ))
+            .child(
+                Icon::new(IconName::ChevronRight)
+                    .size(px(16.))
+                    .text_color(p.muted_foreground),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.import_dialog.view = ImportView::Export;
+                this.import_dialog.typed = None;
+                cx.notify();
+            })),
         );
         let count = if self.import_dialog.scanning {
             text::LOOKING.get().to_owned()

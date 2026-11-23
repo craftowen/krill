@@ -130,12 +130,17 @@ pub(super) fn prepare(
     id: &str,
     cwd: &[u8],
 ) -> io::Result<PreparedTranscript> {
-    prepare_bound(provider, home, source, target, id, cwd, None)
+    prepare_bound(provider, home, None, source, target, id, cwd, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "account switch transcript bridge requires provider, home, state_dir, accounts, and bound identity"
+)]
 pub(super) fn prepare_bound(
     provider: ProviderKind,
     home: &Path,
+    state_dir: Option<&Path>,
     source: &LaunchAccount,
     target: &AccountInfo,
     id: &str,
@@ -222,7 +227,7 @@ pub(super) fn prepare_bound(
             }
             let bridged = agy::prepare(bound_root.as_deref(), &roots, &target_root, id)?;
             if !target.host_default {
-                accounts::agy_native::sync_account_dir(home, None, to);
+                accounts::agy_native::sync_account_dir(home, state_dir, to);
                 if target_root != host_agy {
                     agy::prepare(
                         Some(&target_root),
@@ -864,6 +869,7 @@ esac
                 hibernation_blocked: false,
                 account: Some(source.clone()),
                 bot_instructions: None,
+                launched_at: None,
             });
         }
         for stored in &sessions {
@@ -919,6 +925,7 @@ esac
             hibernation_blocked: false,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         assert_eq!(
             session_id(ProviderKind::Codex, &stored).unwrap_err().kind(),
@@ -1001,6 +1008,7 @@ mod bound_path_tests {
         prepare_bound(
             ProviderKind::Codex,
             &root,
+            None,
             &source,
             &target,
             "known",
@@ -1026,6 +1034,7 @@ mod bound_path_tests {
             prepare_bound(
                 ProviderKind::Codex,
                 &root,
+                None,
                 &alias_source,
                 &target,
                 "known",
@@ -1039,7 +1048,7 @@ mod bound_path_tests {
         let foreign = root.join("foreign.jsonl");
         fs::write(&foreign, fs::read(&path).unwrap()).unwrap();
         assert!(
-            matches!(prepare_bound(ProviderKind::Codex, &root, &source, &target, "known", b"", foreign.to_str()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
+            matches!(prepare_bound(ProviderKind::Codex, &root, None, &source, &target, "known", b"", foreign.to_str()), Err(e) if e.kind() == io::ErrorKind::InvalidData)
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1083,6 +1092,7 @@ mod bound_path_tests {
         prepare_bound(
             ProviderKind::Claude,
             &root,
+            None,
             &source,
             &target,
             id,
@@ -1107,6 +1117,7 @@ mod bound_path_tests {
                 prepare_bound(
                     ProviderKind::Claude,
                     &root,
+                    None,
                     &source,
                     &target,
                     id,
@@ -1183,6 +1194,7 @@ mod bound_path_tests {
             account: Some(source.clone()),
             hibernation_blocked: false,
             bot_instructions: None,
+            launched_at: None,
         };
         assert!(!has_claude_transcript(&root, Some(&source), &stored));
         fs::write(&transcript, b"").unwrap();
@@ -1242,6 +1254,107 @@ mod bound_path_tests {
                 .unwrap()
                 .kind(),
             io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agy_prepare_bound_passes_custom_state_dir_to_preserve_refreshed_host_token() {
+        let root =
+            std::env::temp_dir().join(format!("kas-agy-custom-state-dir-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("custom-state");
+        let prof1 = root.join("prof1");
+        let prof2 = root.join("prof2");
+        for dir in [&home, &prof1, &prof2] {
+            fs::create_dir_all(dir.join(".gemini/antigravity-cli/conversations")).unwrap();
+        }
+        fs::create_dir_all(&state).unwrap();
+
+        let id = "11111111-2222-4333-8444-555555555555";
+        let db = prof1.join(format!(".gemini/antigravity-cli/conversations/{id}.db"));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT); INSERT INTO messages (body) VALUES ('hello');").unwrap();
+        drop(conn);
+
+        let tok1_old = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-old"}}"#;
+        let tok1_refreshed = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-refreshed"}}"#;
+        let tok2 = br#"{"auth_method":"consumer","id_token_email":"two@example.test","token":{"access_token":"tok2"}}"#;
+        fs::write(
+            prof1.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            tok1_old,
+        )
+        .unwrap();
+        fs::write(
+            prof2.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            tok2,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            tok1_refreshed,
+        )
+        .unwrap();
+
+        let file = accounts::AccountsFile {
+            accounts: vec![
+                accounts::StoredAccount {
+                    id: "agy-1".into(),
+                    provider: "agy".into(),
+                    label: "One".into(),
+                    email: Some("one@example.test".into()),
+                    profile_dir: prof1.display().to_string(),
+                },
+                accounts::StoredAccount {
+                    id: "agy-2".into(),
+                    provider: "agy".into(),
+                    label: "Two".into(),
+                    email: Some("two@example.test".into()),
+                    profile_dir: prof2.display().to_string(),
+                },
+            ],
+            ..accounts::AccountsFile::default()
+        };
+        accounts::save_file(&home, Some(&state), &file).unwrap();
+
+        let source = LaunchAccount {
+            id: "agy-1".into(),
+            env_key: "ANTIGRAVITY_CLI_HOME".into(),
+            dir: prof1.display().to_string(),
+        };
+        let target = AccountInfo {
+            id: "agy-2".into(),
+            provider: ProviderKind::Antigravity,
+            label: "Two".into(),
+            email: Some("two@example.test".into()),
+            profile_dir: prof2.display().to_string(),
+            active: true,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+
+        let prepared = prepare_bound(
+            ProviderKind::Antigravity,
+            &home,
+            Some(&state),
+            &source,
+            &target,
+            id,
+            b"",
+            None,
+        )
+        .unwrap();
+        prepared.verify().unwrap();
+        assert_eq!(
+            fs::read(prof1.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+            tok1_refreshed,
+            "refreshed host token must be backed up using custom state_dir accounts.toml"
+        );
+        assert_eq!(
+            fs::read(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+            tok2
         );
         fs::remove_dir_all(root).unwrap();
     }

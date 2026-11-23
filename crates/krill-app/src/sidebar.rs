@@ -2633,6 +2633,12 @@ impl Sidebar {
         self.unread.contains(&id)
     }
 
+    /// 호스트를 확인하는 미확인 여부 조회(미확인 추적은 로컬 호스트 세션에만 적용된다).
+    #[must_use]
+    pub fn is_unread_on(&self, host: &HostId, id: SessionId) -> bool {
+        host.is_local() && self.is_unread(id)
+    }
+
     /// 에이전트 대시보드에서 완료(`Done | Exited`) 카드가 이미 읽음 처리된 상태면 읽은 순번(`Some(seq)`)을 돌려준다.
     /// 아직 확인하지 않은 완료 카드이거나 새로 완료된 카드면 `None`이다.
     #[must_use]
@@ -2654,7 +2660,7 @@ impl Sidebar {
         if matches!(session.status.state, AgentState::Done | AgentState::Exited) {
             self.dashboard_read_order(host, session).is_none()
         } else {
-            host.is_local() && self.is_unread(session.id)
+            self.is_unread_on(host, session.id)
         }
     }
 

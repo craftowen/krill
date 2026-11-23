@@ -153,13 +153,17 @@ impl Shell {
         hosts
     }
 
-    /// `<state>/bots/<slug>` for bots on this Mac.
-    pub(super) fn bot_folder(&self, bot: &SidebarBot) -> Option<std::path::PathBuf> {
-        self.launch_host
-            .is_local()
+    /// `<state>/bots/<slug>` for bots on `host` (local only).
+    pub(super) fn bot_folder_on(host: &HostId, bot: &SidebarBot) -> Option<std::path::PathBuf> {
+        host.is_local()
             .then(krill_proto::daemon::state_dir)
             .flatten()
             .map(|state| state.join("bots").join(&bot.slug))
+    }
+
+    /// `<state>/bots/<slug>` for bots on this Mac.
+    pub(super) fn bot_folder(&self, bot: &SidebarBot) -> Option<std::path::PathBuf> {
+        Self::bot_folder_on(&self.launch_host, bot)
     }
 
     /// Opens New bot (optionally from a template) on the next render.
@@ -248,7 +252,7 @@ impl Shell {
             new_bot::Event::OpenImport => {
                 self.bot_ui.new_bot = None;
                 self.bot_ui.back_to_templates = false;
-                self.open_bots_screen(BotsScreen::Import, window, cx);
+                self.open_bots_screen(BotsScreen::Import, Some(window), cx);
             }
             new_bot::Event::UpdateHost => {
                 self.bot_ui.new_bot = None;
@@ -263,6 +267,12 @@ impl Shell {
                 if *host != self.launch_host {
                     self.set_launch_host(host.clone(), cx);
                     self.sidebar_bots.clear();
+                    self.sidebar_groups.clear();
+                    self.bot_ui.avatars.clear();
+                    self.bot_ui.renaming = None;
+                    self.bot_ui.renaming_group = None;
+                    self.bot_ui.panel.shown = None;
+                    self.bot_ui.panel.settings = None;
                 }
                 if let Some(err) = warning {
                     self.notice = Some(err.clone());
@@ -306,6 +316,9 @@ impl Shell {
             .and_then(SidebarBot::home_session)
         {
             let session = live.session_id;
+            if let Some(draft) = kickoff {
+                self.bot_ui.panel.pending_draft = Some((bot_id.clone(), draft));
+            }
             self.open_bot_session(&bot_id, session, cx);
             return;
         }
@@ -347,10 +360,16 @@ impl Shell {
             return;
         }
         if !self.bot_ui.opening.insert(bot_id.clone()) {
+            if let Some(pane) = target_pane {
+                self.clear_split_launcher_launching(pane);
+            }
             return;
         }
         let name = bot.map(|b| b.name.clone()).unwrap_or_default();
-        let host_name: Option<String> = match &self.launch_host {
+        let host = self.launch_host.clone();
+        let bot_meta = bot.map(SidebarBot::session_meta);
+        let bot_folder = bot.and_then(|b| Self::bot_folder_on(&host, b));
+        let host_name: Option<String> = match &host {
             HostId::Local => Some(krill_app::bots::rpc::local_host_label().to_owned()),
             HostId::Remote(id) => {
                 let label = self.remote_host_name(id, cx);
@@ -385,7 +404,9 @@ impl Shell {
                         pid,
                     }) => {
                         // Show the new Home Chat under the bot now; the poll fills in the rest.
-                        if let Some(row) = this.sidebar_bots.iter_mut().find(|b| b.id == bot_id) {
+                        if this.launch_host == host
+                            && let Some(row) = this.sidebar_bots.iter_mut().find(|b| b.id == bot_id)
+                        {
                             // krilld lists the Home Chat first, then newest.
                             let at = usize::from(row.home_session().is_some());
                             row.sessions.insert(
@@ -401,11 +422,17 @@ impl Shell {
                                     created_at_ms: now_secs().saturating_mul(1000),
                                 },
                             );
+                        } else if let Some(meta) = bot_meta {
+                            this.sidebar.update(cx, |sb, cx| {
+                                sb.register_bot_session(host.clone(), session_id, meta, cx);
+                            });
                         }
                         if let Some(pane) = target_pane.filter(|p| this.layout.pane_exists(*p)) {
-                            this.open_bot_session_in_pane(&bot_id, session_id, pane, cx);
+                            this.open_bot_session_in_pane_on(
+                                &host, &bot_id, session_id, pane, bot_folder, cx,
+                            );
                         } else {
-                            this.open_bot_session(&bot_id, session_id, cx);
+                            this.open_bot_session_on(host, &bot_id, session_id, cx);
                         }
                         this.refresh_bots_badge(cx);
                     }
@@ -421,28 +448,35 @@ impl Shell {
         .detach();
     }
 
-    /// Replaces a launcher pane in place with a live bot chat session.
-    pub(super) fn open_bot_session_in_pane(
+    /// Replaces a launcher pane in place with a live bot chat session on `host`.
+    fn open_bot_session_in_pane_on(
         &mut self,
+        host: &HostId,
         bot_id: &BotId,
         session: krill_proto::SessionId,
         pane: krill_app::layout::PaneId,
+        fallback_folder: Option<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {
         use krill_proto::os::ffi::OsStrExt as _;
-        let host = self.launch_host.clone();
-        let bot = self.sidebar_bots.iter().find(|b| &b.id == bot_id).cloned();
+        let bot = (*host == self.launch_host)
+            .then(|| self.sidebar_bots.iter().find(|b| &b.id == bot_id).cloned())
+            .flatten();
         if let Some(meta) = bot.as_ref().map(SidebarBot::session_meta) {
             self.sidebar.update(cx, |sb, cx| {
                 sb.register_bot_session(host.clone(), session, meta, cx);
             });
         }
-        let folder = bot.as_ref().and_then(|b| self.bot_folder(b)).or_else(|| {
-            self.sidebar
-                .read(cx)
-                .folder_on(&host, session)
-                .map(std::path::Path::to_path_buf)
-        });
+        let folder = bot
+            .as_ref()
+            .and_then(|b| Self::bot_folder_on(host, b))
+            .or(fallback_folder)
+            .or_else(|| {
+                self.sidebar
+                    .read(cx)
+                    .folder_on(host, session)
+                    .map(std::path::Path::to_path_buf)
+            });
         self.split_launchers.remove(&pane);
         self.workspace_closing.remove(&(host.clone(), session));
         self.change(true, cx, |l| {
@@ -477,11 +511,22 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let host = self.launch_host.clone();
-        if let Some(meta) = self
-            .sidebar_bots
-            .iter()
-            .find(|b| &b.id == bot_id)
-            .map(SidebarBot::session_meta)
+        self.open_bot_session_on(host, bot_id, session, cx);
+    }
+
+    pub(super) fn open_bot_session_on(
+        &mut self,
+        host: HostId,
+        bot_id: &BotId,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if host == self.launch_host
+            && let Some(meta) = self
+                .sidebar_bots
+                .iter()
+                .find(|b| &b.id == bot_id)
+                .map(SidebarBot::session_meta)
         {
             self.sidebar.update(cx, |sb, cx| {
                 sb.register_bot_session(host.clone(), session, meta, cx);
@@ -855,13 +900,13 @@ pub(super) enum BotsScreen {
 }
 
 impl Shell {
-    fn open_bots_screen(
+    pub(super) fn open_bots_screen(
         &mut self,
         screen: BotsScreen,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        self.open_bots(Some(window), cx);
+        self.open_bots(window, cx);
         if let Some(view) = self.bots_cache.clone() {
             view.update(cx, |v, cx| match screen {
                 BotsScreen::Import => v.open_import(cx),

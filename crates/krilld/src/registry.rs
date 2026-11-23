@@ -216,6 +216,9 @@ pub struct Registry {
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
     orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
+    /// Serializes concurrent worker launches for the same `dispatch_id` without holding
+    /// the global `orchestration.json` flock across holder spawn.
+    orch_launching: (Mutex<HashSet<String>>, std::sync::Condvar),
 }
 
 impl std::fmt::Debug for Registry {
@@ -307,6 +310,7 @@ impl Registry {
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
             orch_mail_notified_done: Mutex::default(),
+            orch_launching: (Mutex::default(), std::sync::Condvar::new()),
             watch: crate::watch::Watch::new(if holder.is_some() {
                 HolderStatus::Linked
             } else {
@@ -1640,6 +1644,39 @@ impl Registry {
         )
     }
 
+    /// Decodes a query-encoded `Program::Agent { id }` (e.g. `claude?model=...&effort=...`),
+    /// folds Antigravity level model IDs, and applies launch overrides onto a cloned profile.
+    fn resolve_agent_profile_with_overrides(
+        &self,
+        id: &str,
+    ) -> Result<
+        (
+            String,
+            krill_proto::agent::Profile,
+            krill_proto::agent::Permission,
+        ),
+        Failure,
+    > {
+        let (base_id, mut overrides) =
+            krill_proto::agent::decode_agent_program_id(id).map_err(|_| Failure::BadRequest)?;
+        let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
+        let (canonical, base_profile) = agents.resolve(base_id).ok_or(Failure::UnknownAgent)?;
+        let mut profile = base_profile.clone();
+        if canonical == "agy"
+            && let Some(ref model) = overrides.model
+            && let Some((family, eff)) =
+                crate::mobile::fold_agy_model_selection(None, model, overrides.effort.as_deref())
+        {
+            overrides.model = Some(family);
+            overrides.effort = Some(eff);
+        }
+        if !overrides.is_empty() {
+            krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)
+                .map_err(|_| Failure::BadRequest)?;
+        }
+        Ok((canonical.to_owned(), profile, agents.permission))
+    }
+
     fn create(&self, peer: &Peer, mut c: Create) -> Result<Reply, Failure> {
         sanitize_spawn_cwd(&mut c.cwd);
         if c.account.is_some() && !matches!(c.program, Program::Agent { .. }) {
@@ -1661,35 +1698,19 @@ impl Registry {
             Program::Login => crate::agent::login_in(state.as_deref()),
             Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
             Program::Agent { id } => {
-                let (base_id, mut overrides) = krill_proto::agent::decode_agent_program_id(&id)
-                    .map_err(|_| Failure::BadRequest)?;
-                let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
-                let (canonical, base_profile) =
-                    agents.resolve(base_id).ok_or(Failure::UnknownAgent)?;
-                let mut profile = base_profile.clone();
-                if canonical == "agy"
-                    && let Some(ref model) = overrides.model
-                    && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
-                        None,
-                        model,
-                        overrides.effort.as_deref(),
-                    )
-                {
-                    overrides.model = Some(family);
-                    overrides.effort = Some(eff);
-                }
-                if !overrides.is_empty() {
-                    krill_proto::agent::apply_launch_overrides(canonical, &mut profile, &overrides)
-                        .map_err(|_| Failure::BadRequest)?;
-                }
+                let (canonical, profile, permission) =
+                    self.resolve_agent_profile_with_overrides(&id)?;
                 let (launch, session_id, account) = crate::agent::launch_selected_in(
                     &profile,
-                    agents.permission,
+                    permission,
                     session,
                     state.as_deref(),
                     c.account.as_deref(),
                 )
-                .map_err(|e| os(&e))?;
+                .map_err(|e| {
+                    self.discard_settings(session);
+                    os(&e)
+                })?;
                 crate::agent::pre_trust_workspace(&profile, &c.cwd, account.as_ref());
                 if !cfg!(test) && canonical == "agy" {
                     agy_prewarm = Some(
@@ -1707,8 +1728,8 @@ impl Registry {
                     );
                 }
                 let metadata = control::AgentLaunch {
-                    profile: canonical.to_owned(),
-                    permission: agents.permission,
+                    profile: canonical,
+                    permission,
                 };
                 self.agents
                     .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
@@ -1805,7 +1826,10 @@ impl Registry {
             source_sid.as_deref(),
             account.as_ref(),
         )
-        .map_err(|e| os(&e))?;
+        .map_err(|e| {
+            self.discard_settings(session);
+            os(&e)
+        })?;
         let metadata = control::AgentLaunch {
             profile: canonical.to_owned(),
             permission,
@@ -1946,29 +1970,32 @@ impl Registry {
                 Program::Login => crate::agent::login_in(state.as_deref()),
                 Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
                 Program::Agent { id } => {
-                    let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
-                    let (canonical, profile) = agents.resolve(&id).ok_or(Failure::UnknownAgent)?;
+                    let (canonical, profile, permission) =
+                        self.resolve_agent_profile_with_overrides(&id)?;
                     let account = crate::agent::resume_target(
-                        profile,
+                        &profile,
                         state.as_deref(),
                         c.account.as_deref(),
                         None,
                         fallback_sid.as_deref(),
                     )
                     .map_err(|e| os(&e))?;
-                    crate::agent::pre_trust_workspace(profile, &c.cwd, account.as_ref());
+                    crate::agent::pre_trust_workspace(&profile, &c.cwd, account.as_ref());
                     let (launch, session_id, account) = crate::agent::resume_in(
-                        profile,
-                        agents.permission,
+                        &profile,
+                        permission,
                         session,
                         state.as_deref(),
                         fallback_sid.as_deref(),
                         account.as_ref(),
                     )
-                    .map_err(|e| os(&e))?;
+                    .map_err(|e| {
+                        self.discard_settings(session);
+                        os(&e)
+                    })?;
                     let metadata = control::AgentLaunch {
-                        profile: canonical.to_owned(),
-                        permission: agents.permission,
+                        profile: canonical,
+                        permission,
                     };
                     self.agents
                         .remember_session(session, &metadata, session_id, c.cwd.clone(), account)
@@ -3608,6 +3635,7 @@ impl Registry {
                 hibernation_blocked: true,
                 account: None,
                 bot_instructions: None,
+                launched_at: None,
             })
         });
 
@@ -3890,13 +3918,16 @@ impl Registry {
         let was_working = status.state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
         self.acknowledge_retained_handoff(session);
-        if submit
-            && !status.agent.is_empty()
-            && status.state != control::AgentState::Exited
-            && let Ok(text) = std::str::from_utf8(bytes)
-            && let Some(dir) = self.state_dir()
-        {
-            krill_proto::git::record_session_prompt(&dir, session, text, status::now_ns()).ok();
+        if submit && let Ok(text) = std::str::from_utf8(bytes) {
+            if let Some(bots) = self.bots.get() {
+                bots.on_owner_prompt_submitted(session, text);
+            }
+            if !status.agent.is_empty()
+                && status.state != control::AgentState::Exited
+                && let Some(dir) = self.state_dir()
+            {
+                krill_proto::git::record_session_prompt(&dir, session, text, status::now_ns()).ok();
+            }
         }
         if submit && wait_submit {
             let deadline = Instant::now() + Duration::from_millis(500);
@@ -4039,8 +4070,9 @@ impl Registry {
             .state_dir()
             .ok_or_else(|| "daemon state directory unavailable for bots".to_owned())?;
         let weak_reg = self.self_ref.get().cloned().unwrap_or_default();
-        let created = crate::bots::BotsManager::new(dir, weak_reg);
-        Ok(self.bots.get_or_init(|| created))
+        Ok(self
+            .bots
+            .get_or_init(|| crate::bots::BotsManager::new(dir, weak_reg)))
     }
 
     /// Dispatches a [`krill_proto::bots::BotRpcRequest`] carrying connection peer/observer context.
@@ -4185,7 +4217,7 @@ impl Registry {
         }
         // Admission check: verify the agent CLI is installed and meets minimum version before spawn.
         if let Some(program) = profile.program() {
-            let exe = resolve_bot_cli_executable(program);
+            let exe = resolve_bot_cli_executable(program, &profile.env);
             let Some(exe) = exe else {
                 return Err(BotStartError::Refused(
                     BotSessionRefusal::cli_not_installed(canonical),
@@ -4216,6 +4248,7 @@ impl Registry {
             bot_mcp,
         )
         .map_err(|err| {
+            self.discard_settings(session);
             BotStartError::Refused(BotSessionRefusal::spawn_failed(canonical, err.to_string()))
         })?;
         launch.env.extend(extra_env);
@@ -4331,6 +4364,9 @@ impl Registry {
 
     /// Launch from a dispatch recorded before spawn. Overrides affect only this profile
     /// clone, so configured accounts, trust, hooks and launch metadata remain intact.
+    ///
+    /// Serializes duplicate launches for the same `dispatch_id` in-process and releases
+    /// the global `orchestration.json` flock before spawning the holder process.
     fn launch_orchestration_worker(
         &self,
         dispatch_id: &str,
@@ -4339,11 +4375,46 @@ impl Registry {
         use krill_proto::orchestration::{
             DispatchSessionOrigin, DispatchStatus, OrchestrationStore, worker_launch_profile,
         };
+        struct DispatchLaunchGuard<'a> {
+            gate: &'a (Mutex<HashSet<String>>, std::sync::Condvar),
+            dispatch_id: String,
+        }
+        impl Drop for DispatchLaunchGuard<'_> {
+            fn drop(&mut self) {
+                lock(&self.gate.0).remove(&self.dispatch_id);
+                self.gate.1.notify_all();
+            }
+        }
+        enum CommitOutcome {
+            Committed(krill_proto::orchestration::Dispatch),
+            AlreadyLaunched(krill_proto::orchestration::Dispatch),
+            Ineligible(&'static str),
+        }
+
         let dir = self
             .state_dir()
             .ok_or_else(|| io::Error::other("missing state directory"))?;
-        // The orchestration lock serializes duplicate launch requests for one dispatch.
-        OrchestrationStore::mutate(&dir, |store| {
+
+        // Phase 0: serialize concurrent launch attempts for the same dispatch_id without
+        // blocking unrelated dispatches or other orchestration RPCs on the global flock.
+        let _claim = {
+            let (mtx, cvar) = &self.orch_launching;
+            let mut active = lock(mtx);
+            while active.contains(dispatch_id) {
+                active = cvar
+                    .wait(active)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            active.insert(dispatch_id.to_owned());
+            DispatchLaunchGuard {
+                gate: &self.orch_launching,
+                dispatch_id: dispatch_id.to_owned(),
+            }
+        };
+
+        // Phase 1: read & validate the dispatch without holding the orchestration flock across spawn.
+        let dispatch = {
+            let store = OrchestrationStore::load(&dir)?;
             let dispatch = store
                 .dispatches
                 .iter()
@@ -4360,61 +4431,78 @@ impl Registry {
             if dispatch.session_id.is_some() {
                 return Ok(dispatch);
             }
-            let agents = self.agents.agents()?;
-            let (canonical, profile) = agents
-                .resolve(&dispatch.agent)
-                .ok_or_else(|| io::Error::other("unknown agent profile"))?;
-            let profile = worker_launch_profile(
-                profile,
-                canonical,
-                dispatch.model.as_deref(),
-                dispatch.effort.as_deref(),
-            )?;
-            let holder = self
-                .holder
-                .as_ref()
-                .ok_or_else(|| io::Error::other("no holder"))?;
-            let session = self.reserve_session_id(None)?;
-            let cwd = dispatch.cwd.as_bytes().to_vec();
-            let (launch, agent_session_id, account) = crate::agent::launch_selected_in(
-                &profile,
-                agents.permission,
-                session,
-                Some(&dir),
-                account,
-            )?;
-            crate::agent::pre_trust_workspace(&profile, &cwd, account.as_ref());
-            let metadata = control::AgentLaunch {
-                profile: canonical.to_owned(),
-                permission: agents.permission,
+            dispatch
+        };
+
+        // Phase 2: prepare profile/settings and spawn the holder completely outside the flock.
+        let agents = self.agents.agents()?;
+        let (canonical, profile) = agents
+            .resolve(&dispatch.agent)
+            .ok_or_else(|| io::Error::other("unknown agent profile"))?;
+        let profile = worker_launch_profile(
+            profile,
+            canonical,
+            dispatch.model.as_deref(),
+            dispatch.effort.as_deref(),
+        )?;
+        let holder = self
+            .holder
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no holder"))?;
+        let session = self.reserve_session_id(None)?;
+        let cwd = dispatch.cwd.as_bytes().to_vec();
+        let (mut launch, agent_session_id, account) = crate::agent::launch_selected_in(
+            &profile,
+            agents.permission,
+            session,
+            Some(&dir),
+            account,
+        )
+        .inspect_err(|_| self.discard_settings(session))?;
+        crate::agent::pre_trust_workspace(&profile, &cwd, account.as_ref());
+        let metadata = control::AgentLaunch {
+            profile: canonical.to_owned(),
+            permission: agents.permission,
+        };
+        self.agents
+            .remember_session(session, &metadata, agent_session_id, cwd.clone(), account)
+            .inspect_err(|_| self.discard_settings(session))?;
+        for (key, value) in [
+            ("KRILL_ORCH_DEPTH", dispatch.depth.saturating_add(1)),
+            (
+                "KRILL_ORCH_MAX_DEPTH",
+                krill_proto::orchestration::MAX_WORKER_DEPTH,
+            ),
+        ] {
+            launch
+                .env
+                .push((key.as_bytes().to_vec(), value.to_string().into_bytes()));
+        }
+        let (session, _) = self
+            .spawn_holder(holder, session, launch.argv, launch.env, cwd, 120, 36)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Phase 3: short flock commit; if the dispatch became ineligible or already got a session
+        // while we were spawning, tear down the orphan session outside the flock.
+        let commit = OrchestrationStore::mutate(&dir, |store| {
+            let Some(stored) = store.dispatches.iter_mut().find(|d| d.id == dispatch_id) else {
+                return Ok(CommitOutcome::Ineligible("dispatch missing after launch"));
             };
-            self.agents
-                .remember_session(session, &metadata, agent_session_id, cwd.clone(), account)
-                .inspect_err(|_| self.discard_settings(session))?;
-            let mut launch = launch;
-            for (key, value) in [
-                ("KRILL_ORCH_DEPTH", dispatch.depth.saturating_add(1)),
-                (
-                    "KRILL_ORCH_MAX_DEPTH",
-                    krill_proto::orchestration::MAX_WORKER_DEPTH,
-                ),
-            ] {
-                launch
-                    .env
-                    .push((key.as_bytes().to_vec(), value.to_string().into_bytes()));
+            if stored.session_id.is_some() {
+                return Ok(CommitOutcome::AlreadyLaunched(stored.clone()));
             }
-            let (session, _) = self
-                .spawn_holder(holder, session, launch.argv, launch.env, cwd, 120, 36)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let stored = store
-                .dispatches
-                .iter_mut()
-                .find(|d| d.id == dispatch_id)
-                .ok_or_else(|| io::Error::other("dispatch missing after launch"))?;
+            if stored.status != DispatchStatus::Active
+                || stored.session_origin == DispatchSessionOrigin::Borrowed
+            {
+                return Ok(CommitOutcome::Ineligible(
+                    "dispatch is not eligible for a new session",
+                ));
+            }
             stored.session_id = Some(session.0);
+            let run_id = stored.run_id.clone();
             let result = stored.clone();
             if let Ok(sid) = u32::try_from(session.0) {
-                store.session_runs.insert(sid, dispatch.run_id);
+                store.session_runs.insert(sid, run_id);
             }
             let dispatch_msg_ids: Vec<String> = store
                 .messages
@@ -4432,8 +4520,45 @@ impl Registry {
                     .or_default()
                     .extend(dispatch_msg_ids);
             }
-            Ok(result)
-        })
+            Ok(CommitOutcome::Committed(result))
+        });
+
+        match commit {
+            Ok(CommitOutcome::Committed(result)) => Ok(result),
+            Ok(CommitOutcome::AlreadyLaunched(existing)) => {
+                self.close(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    session,
+                )
+                .ok();
+                Ok(existing)
+            }
+            Ok(CommitOutcome::Ineligible(reason)) => {
+                self.close(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    session,
+                )
+                .ok();
+                Err(io::Error::other(reason))
+            }
+            Err(err) => {
+                self.close(
+                    &Peer {
+                        pid: None,
+                        scope: Scope::Full,
+                    },
+                    session,
+                )
+                .ok();
+                Err(err)
+            }
+        }
     }
 
     /// Submit only a mailbox pointer to an idle live PTY, once per unacknowledged mail.
@@ -5256,13 +5381,41 @@ fn oversized_reply(reply: &Reply, bytes: u64) -> Reply {
     }
 }
 
-/// Resolves a bot agent profile's executable path against the login `PATH` and `~/.local/bin`
-/// so missing CLIs produce a clear refusal before spawning a PTY.
-fn resolve_bot_cli_executable(program: &str) -> Option<PathBuf> {
+/// Resolves a bot agent profile's executable path against `profile.env["PATH"]`, the login `PATH`,
+/// process `PATH`, and `~/.local/bin` so missing CLIs produce a clear refusal before spawning a PTY.
+/// Path-qualified executables use `krill_proto::agent::which` so Windows `PATHEXT` resolution and
+/// Unix `+x` permission checks match normal PATH lookups.
+fn resolve_bot_cli_executable(
+    program: &str,
+    profile_env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
     use krill_proto::os::ffi::OsStrExt as _;
     let path = Path::new(program);
+    if program.contains(std::path::is_separator) {
+        return krill_proto::agent::which(program, std::ffi::OsStr::new(""));
+    }
     if path.components().count() > 1 {
-        return path.is_file().then(|| path.to_path_buf());
+        let file_name = path.file_name().and_then(|n| n.to_str())?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        return krill_proto::agent::which(file_name, parent.as_os_str());
+    }
+    if let Some(profile_path) = profile_env
+        .iter()
+        .find(|(k, _)| {
+            #[cfg(windows)]
+            {
+                k.eq_ignore_ascii_case("PATH")
+            }
+            #[cfg(not(windows))]
+            {
+                k.as_str() == "PATH"
+            }
+        })
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+        && let Some(found) = krill_proto::agent::which(program, std::ffi::OsStr::new(profile_path))
+    {
+        return Some(found);
     }
     let login_path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
     if let Some(found) = krill_proto::agent::which(program, login_path) {
@@ -6449,5 +6602,76 @@ mod spawn_observability_tests {
         assert_eq!(inputs.sessions[0].status.agent, "agy");
         drop(reg);
         std::fs::remove_dir_all(dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bot_cli_executable_enforces_unix_exec_bit_and_searches_profile_env_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("krill-bot-cli-resolve-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let bin_dir = root.join("custom-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let non_exec = bin_dir.join("not-exec");
+        std::fs::write(&non_exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            resolve_bot_cli_executable(non_exec.to_str().unwrap(), &BTreeMap::new()),
+            None,
+            "path-qualified non-executable file must be rejected on Unix"
+        );
+
+        let exec = bin_dir.join("my-custom-agent");
+        std::fs::write(&exec, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_bot_cli_executable(exec.to_str().unwrap(), &BTreeMap::new()),
+            Some(exec.clone())
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_owned(), bin_dir.display().to_string());
+        assert_eq!(
+            resolve_bot_cli_executable("my-custom-agent", &env),
+            Some(exec)
+        );
+        assert_eq!(
+            resolve_bot_cli_executable("my-custom-agent", &BTreeMap::new()),
+            None
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_agent_profile_with_overrides_decodes_query_id_for_resume_and_create() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-resolve-overrides-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = Registry::new(None, Some(&dir));
+        let encoded = krill_proto::agent::encode_agent_program_id(
+            "claude",
+            &krill_proto::agent::LaunchOverrides {
+                model: Some("claude-opus-4-6".to_owned()),
+                effort: Some("high".to_owned()),
+            },
+        )
+        .unwrap();
+        let (canonical, profile, _perm) =
+            reg.resolve_agent_profile_with_overrides(&encoded).unwrap();
+        assert_eq!(canonical, "claude");
+        assert!(
+            profile
+                .launch
+                .windows(2)
+                .any(|w| w == ["--model", "claude-opus-4-6"]),
+            "launch args missing decoded --model override: {:?}",
+            profile.launch
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -283,10 +283,10 @@ pub struct ParsedUrl {
 
 /// Parses an `http://` or `https://` URL into host, port, `Host` header, and request target.
 pub fn parse_url(raw: &str) -> io::Result<ParsedUrl> {
-    if raw.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+    if raw.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "URL contains forbidden control characters",
+            "URL contains forbidden whitespace or control characters",
         ));
     }
     let (https, rest, default_port) = if let Some(r) = raw.strip_prefix("https://") {
@@ -684,7 +684,7 @@ enum ChunkStreamState {
     ReadingSize,
     ReadingData { remaining: usize },
     ExpectDataCrlf { remaining: usize },
-    ReadingTrailers,
+    ReadingTrailers { bytes_read: usize },
     Done,
 }
 
@@ -856,7 +856,7 @@ impl StreamingHttpResponse {
                         })?;
                         self.cursor = self.cursor.saturating_add(pos).saturating_add(2);
                         self.chunk_decoder = if chunk_len == 0 {
-                            ChunkStreamState::ReadingTrailers
+                            ChunkStreamState::ReadingTrailers { bytes_read: 0 }
                         } else {
                             ChunkStreamState::ReadingData {
                                 remaining: chunk_len,
@@ -916,15 +916,31 @@ impl StreamingHttpResponse {
                         self.chunk_decoder = ChunkStreamState::ExpectDataCrlf { remaining: 1 };
                     }
                 }
-                ChunkStreamState::ReadingTrailers => {
+                ChunkStreamState::ReadingTrailers { bytes_read } => {
                     let slice = self.raw.get(self.cursor..).unwrap_or_default();
                     if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        let next_total = bytes_read.saturating_add(pos).saturating_add(2);
+                        if next_total > MAX_HEADER_BYTES {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "chunked HTTP trailers exceed limit",
+                            ));
+                        }
                         self.cursor = self.cursor.saturating_add(pos).saturating_add(2);
                         if pos == 0 {
                             self.chunk_decoder = ChunkStreamState::Done;
                             return Ok(None);
                         }
+                        self.chunk_decoder = ChunkStreamState::ReadingTrailers {
+                            bytes_read: next_total,
+                        };
                         continue;
+                    }
+                    if bytes_read.saturating_add(slice.len()) > MAX_HEADER_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunked HTTP trailers exceed limit",
+                        ));
                     }
                 }
             }
@@ -1841,5 +1857,54 @@ mod tests {
                 ("state".to_owned(), "hello world".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_url_rejects_spaces_and_control_characters() {
+        for bad in [
+            "https://example.com/a b",
+            "https://example.com/path\tfoo",
+            "https://example.com/path\x1ffoo",
+            "https://example.com/path\x7ffoo",
+            "http://127.0.0.1:8080/hello world",
+        ] {
+            let err = parse_url(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "url: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_chunked_trailers_enforce_max_header_bytes_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let n = sock.read(&mut req_buf).unwrap_or(0);
+            assert!(n > 0);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+            )
+            .ok();
+            let filler = vec![b'X'; 8192];
+            for _ in 0..16 {
+                if sock.write_all(&filler).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut stream = send_streaming(
+            &HttpRequest::get(format!("http://{addr}/events"))
+                .with_timeout(Duration::from_secs(5))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        let err = stream
+            .read_next_stream_chunk(Duration::from_secs(2), None)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("trailers"));
+        server.join().ok();
     }
 }

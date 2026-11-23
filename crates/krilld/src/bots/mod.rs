@@ -20,7 +20,7 @@ pub mod store;
 pub mod tool_relay;
 pub mod trackers;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -79,6 +79,8 @@ pub struct BotsManager {
     memory_tidy_tracker: MemoryTidyTracker,
     look_around_tracker: LookAroundTracker,
     active_cron_sessions: Mutex<HashMap<(BotId, String), SessionId>>,
+    in_flight_composio: Mutex<HashSet<BotId>>,
+    in_flight_schedules: Mutex<HashSet<(BotId, String)>>,
     boot_reconciled: OnceLock<()>,
     google_endpoints: GoogleEndpoints,
     tracker_endpoints: TrackerEndpoints,
@@ -148,6 +150,8 @@ impl BotsManager {
             memory_tidy_tracker: MemoryTidyTracker::default(),
             look_around_tracker: LookAroundTracker::default(),
             active_cron_sessions: Mutex::new(HashMap::new()),
+            in_flight_composio: Mutex::new(HashSet::new()),
+            in_flight_schedules: Mutex::new(HashSet::new()),
             boot_reconciled: OnceLock::new(),
             google_endpoints,
             tracker_endpoints,
@@ -313,6 +317,11 @@ impl BotsManager {
         }
     }
 
+    /// Records a direct owner prompt submitted to a live bot session (`SendInput` / mobile `Prompt`).
+    pub fn on_owner_prompt_submitted(&self, session_id: SessionId, prompt: &str) {
+        self.runtime.on_owner_prompt_submitted(session_id, prompt);
+    }
+
     /// Hook event notification forwarded from [`Registry`] (fast-paths out for non-bot sessions).
     pub fn on_hook_event(&self, registry: &Registry, session_id: SessionId, event: &HookEvent) {
         if !self.runtime.is_bot_session(session_id) {
@@ -335,12 +344,12 @@ impl BotsManager {
                     .collect();
                 let ts = now_ms();
                 for (bid, sched_id) in matching_scheds {
-                    let refusal = self.store.get_bot(&bid).ok().flatten().map(|bot| {
-                        krill_proto::bots::BotSessionRefusal::quota_exceeded(
-                            &bot.agent_id,
-                            err_text.clone(),
-                        )
-                    });
+                    let refusal = self
+                        .store
+                        .get_bot(&bid)
+                        .ok()
+                        .flatten()
+                        .and_then(|bot| classify_turn_error_refusal(&bot.agent_id, &err_text));
                     self.scheduler_state
                         .record_schedule_error(&bid, &sched_id, err_text.clone(), refusal, ts)
                         .ok();
@@ -388,26 +397,24 @@ impl BotsManager {
                 let bot_tz = bot_tz.as_deref();
                 let extras = self.store.settings_extras(&bot.id).unwrap_or_default();
                 if bot.memory_tidy.enabled
-                    && self.scheduler_state.tidy_is_due(
-                        &bot.id,
-                        extras.tidy_every,
-                        bot_tz,
-                        ts_ms,
-                    )
-                    && self.memory_tidy_tracker.is_due(
-                        &bot.id,
-                        extras.tidy_every,
-                        bot_tz,
-                        ts_ms,
-                    )
+                    && self
+                        .scheduler_state
+                        .tidy_is_due(&bot.id, extras.tidy_every, bot_tz, ts_ms)
+                    && self
+                        .memory_tidy_tracker
+                        .is_due(&bot.id, extras.tidy_every, bot_tz, ts_ms)
                 {
-                    memory_tidy::run_memory_tidy_tracked(
+                    if memory_tidy::run_memory_tidy_tracked(
                         &self.store,
                         Some(&self.scheduler_state),
                         &bot.id,
                         ts_ms,
                     )
-                    .ok();
+                    .is_ok()
+                        && let Ok(content) = self.store.get_memory(&bot.id)
+                    {
+                        self.runtime.refresh_memory_snapshot(&bot.id, &content);
+                    }
                     self.memory_tidy_tracker.record(&bot.id, ts_ms);
                 }
                 if bot.look_around.enabled
@@ -442,33 +449,11 @@ impl BotsManager {
                         .get(&bot.id)
                         .copied()
                         .unwrap_or(0);
-                    if ts_ms.saturating_sub(last) >= 60_000 {
+                    if ts_ms.saturating_sub(last) >= 60_000
+                        && lock(&self.in_flight_composio).insert(bot.id.clone())
+                    {
                         lock(&self.composio_last_poll_ms).insert(bot.id.clone(), ts_ms);
-                        if let Ok(created) = composio::poll_composio_triggers(
-                            bot,
-                            &self.secrets,
-                            &self.items,
-                            &self.composio_base_url,
-                            ts_ms,
-                        ) && !created.is_empty()
-                        {
-                            let prompt = format!(
-                                "[{} new Composio trigger item(s) arrived. Review `items_list` and take action if needed.]",
-                                created.len()
-                            );
-                            self.runtime
-                                .deliver_or_wake_bot(
-                                    registry,
-                                    &self.store,
-                                    &self.secrets,
-                                    &self.tool_relay,
-                                    &self.composio_base_url,
-                                    &bot.id,
-                                    &prompt,
-                                    ts_ms,
-                                )
-                                .ok();
-                        }
+                        self.spawn_composio_poll(bot.clone(), ts_ms);
                     }
                 }
 
@@ -484,13 +469,124 @@ impl BotsManager {
                     if let Ok(cron) = Cron::parse(&sched.cron)
                         && cron.matches(cal)
                     {
-                        self.run_schedule(registry, &bot.id, sched, Some(minute))
-                            .ok();
+                        self.spawn_due_schedule(bot.id.clone(), sched.clone(), minute);
                     }
                 }
             }
         }))
         .ok();
+    }
+
+    fn spawn_composio_poll(&self, bot: BotConfig, ts_ms: u64) {
+        let Some(mgr_w) = self.self_weak.get().cloned() else {
+            lock(&self.in_flight_composio).remove(&bot.id);
+            return;
+        };
+        let reg_w = self.registry.clone();
+        let bid = bot.id.clone();
+        let bid_err = bid.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("bot-composio-{}", bot.slug.as_str()))
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                struct InFlightGuard {
+                    mgr: Weak<BotsManager>,
+                    bot_id: BotId,
+                }
+                impl Drop for InFlightGuard {
+                    fn drop(&mut self) {
+                        if let Some(m) = self.mgr.upgrade() {
+                            lock(&m.in_flight_composio).remove(&self.bot_id);
+                        }
+                    }
+                }
+                let _guard = InFlightGuard {
+                    mgr: mgr_w.clone(),
+                    bot_id: bid,
+                };
+                let (Some(mgr), Some(reg)) = (mgr_w.upgrade(), reg_w.upgrade()) else {
+                    return;
+                };
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Ok(created) = composio::poll_composio_triggers(
+                        &bot,
+                        &mgr.secrets,
+                        &mgr.items,
+                        &mgr.composio_base_url,
+                        ts_ms,
+                    ) && !created.is_empty()
+                    {
+                        let prompt = format!(
+                            "[{} new Composio trigger item(s) arrived. Review `items_list` and take action if needed.]",
+                            created.len()
+                        );
+                        mgr.runtime
+                            .deliver_or_wake_bot(
+                                &reg,
+                                &mgr.store,
+                                &mgr.secrets,
+                                &mgr.tool_relay,
+                                &mgr.composio_base_url,
+                                &bot.id,
+                                &prompt,
+                                ts_ms,
+                            )
+                            .ok();
+                    }
+                }))
+                .ok();
+            });
+        if spawned.is_err() {
+            lock(&self.in_flight_composio).remove(&bid_err);
+        }
+    }
+
+    fn spawn_due_schedule(
+        &self,
+        bot_id: BotId,
+        sched: krill_proto::bots::BotScheduleConfig,
+        minute: u64,
+    ) {
+        let key = (bot_id.clone(), sched.id.clone());
+        if !lock(&self.in_flight_schedules).insert(key.clone()) {
+            return;
+        }
+        let Some(mgr_w) = self.self_weak.get().cloned() else {
+            lock(&self.in_flight_schedules).remove(&key);
+            return;
+        };
+        let reg_w = self.registry.clone();
+        let key_err = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("bot-sched-{}", sched.id))
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                struct SchedGuard {
+                    mgr: Weak<BotsManager>,
+                    key: (BotId, String),
+                }
+                impl Drop for SchedGuard {
+                    fn drop(&mut self) {
+                        if let Some(m) = self.mgr.upgrade() {
+                            lock(&m.in_flight_schedules).remove(&self.key);
+                        }
+                    }
+                }
+                let _guard = SchedGuard {
+                    mgr: mgr_w.clone(),
+                    key,
+                };
+                let (Some(mgr), Some(reg)) = (mgr_w.upgrade(), reg_w.upgrade()) else {
+                    return;
+                };
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    mgr.run_schedule(&reg, &bot_id, &sched, Some(minute)).ok();
+                }))
+                .ok();
+            });
+        if spawned.is_err() {
+            lock(&self.in_flight_schedules).remove(&key_err);
+        }
     }
 
     /// Runs one due schedule as its bot. While the schedule's conversation is still on its last
@@ -503,6 +599,28 @@ impl BotsManager {
         sched: &krill_proto::bots::BotScheduleConfig,
         minute: Option<u64>,
     ) -> Result<(), runtime::BotStartError> {
+        let bot = self
+            .store
+            .get_bot(bot_id)
+            .map_err(|err| runtime::BotStartError::Other(err.to_string()))?
+            .ok_or_else(|| {
+                runtime::BotStartError::Other(format!("bot not found: {}", bot_id.as_str()))
+            })?;
+        if bot.paused {
+            let err = runtime::BotStartError::Refused(
+                krill_proto::bots::BotSessionRefusal::bot_paused(&bot.name),
+            );
+            self.scheduler_state
+                .record_schedule_error(
+                    bot_id,
+                    &sched.id,
+                    err.message(),
+                    err.refusal().cloned(),
+                    now_ms(),
+                )
+                .ok();
+            return Err(err);
+        }
         if self.schedule_running(registry, bot_id, &sched.id)
             || minute.is_some_and(|minute| {
                 !self
@@ -646,6 +764,11 @@ impl BotsManager {
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::CreateBot(mut params) => {
+                if !params.agent_id.trim().is_empty()
+                    && let Err(err) = validate_agent_profile(registry, &params.agent_id)
+                {
+                    return BotRpcResponse::Error(err);
+                }
                 if krill_proto::agent::canonical_id(params.agent_id.trim()) == "agy"
                     && let Some(ref model) = params.model
                     && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
@@ -666,6 +789,11 @@ impl BotsManager {
                 }
             }
             BotRpcRequest::CreateBotV2(mut params) => {
+                if !params.base.agent_id.trim().is_empty()
+                    && let Err(err) = validate_agent_profile(registry, &params.base.agent_id)
+                {
+                    return BotRpcResponse::Error(err);
+                }
                 if krill_proto::agent::canonical_id(params.base.agent_id.trim()) == "agy"
                     && let Some(ref model) = params.base.model
                     && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
@@ -686,6 +814,11 @@ impl BotsManager {
                 }
             }
             BotRpcRequest::UpdateBot(mut params) => {
+                if let Some(ref raw_agent) = params.agent_id
+                    && let Err(err) = validate_agent_profile(registry, raw_agent)
+                {
+                    return BotRpcResponse::Error(err);
+                }
                 let prev_bot = self.store.get_bot(&params.bot_id).ok().flatten();
                 let prev_agent = prev_bot
                     .as_ref()
@@ -750,28 +883,43 @@ impl BotsManager {
             BotRpcRequest::DeleteBot {
                 bot_id,
                 delete_home,
-            } => match self.store.delete_bot(&bot_id, delete_home) {
-                Ok(removed) => {
-                    self.runtime
-                        .reset_chat(registry, &self.store, &self.tool_relay, &bot_id, None, ts)
-                        .ok();
-                    self.items.delete_bot_items(&bot_id).ok();
-                    let extra_refs = collect_bot_secret_refs(&removed);
-                    self.secrets.delete_bot_secrets(&bot_id, &extra_refs).ok();
-                    self.tool_relay.unregister_bot(&bot_id);
-                    composio::cleanup_composio_bot(
-                        &bot_id,
-                        Some(self.store.root()),
-                        &self.tool_relay,
-                    );
-                    self.scheduler_state.forget_bot(&bot_id).ok();
-                    lock(&self.composio_statuses).remove(&bot_id);
-                    lock(&self.composio_last_poll_ms).remove(&bot_id);
-                    self.reconcile_all_lazy_workers();
-                    BotRpcResponse::Deleted { bot_id }
+            } => {
+                match self.store.get_bot(&bot_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return BotRpcResponse::Error(format!(
+                            "bot not found: {}",
+                            bot_id.as_str()
+                        ));
+                    }
+                    Err(err) => return BotRpcResponse::Error(err.to_string()),
                 }
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+                // Stop all live PTY sessions & clear active cron bindings BEFORE removing the bot
+                // from `BotStore`, so `DeleteBot` never leaks running agent processes.
+                self.runtime
+                    .stop_all_for_bot(registry, &self.tool_relay, &bot_id);
+                lock(&self.active_cron_sessions).retain(|(bid, _), _| bid != &bot_id);
+                match self.store.delete_bot_with_cleanup(&bot_id, delete_home) {
+                    Ok((removed, removed_group_ids)) => {
+                        self.groups.on_bot_deleted(&bot_id, &removed_group_ids);
+                        self.items.delete_bot_items(&bot_id).ok();
+                        let extra_refs = collect_bot_secret_refs(&removed);
+                        self.secrets.delete_bot_secrets(&bot_id, &extra_refs).ok();
+                        self.tool_relay.unregister_bot(&bot_id);
+                        composio::cleanup_composio_bot(
+                            &bot_id,
+                            Some(self.store.root()),
+                            &self.tool_relay,
+                        );
+                        self.scheduler_state.forget_bot(&bot_id).ok();
+                        lock(&self.composio_statuses).remove(&bot_id);
+                        lock(&self.composio_last_poll_ms).remove(&bot_id);
+                        self.reconcile_all_lazy_workers();
+                        BotRpcResponse::Deleted { bot_id }
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::StartBotSession {
                 bot_id,
                 cwd,
@@ -881,11 +1029,16 @@ impl BotsManager {
                 "update",
                 ts,
             ) {
-                Ok(_) => BotRpcResponse::MemoryUpdated {
-                    content,
-                    restored_facts: Vec::new(),
-                    removed_count: 0,
-                },
+                Ok(_) => {
+                    if caller_bot.is_none() {
+                        self.runtime.refresh_memory_snapshot(&bot_id, &content);
+                    }
+                    BotRpcResponse::MemoryUpdated {
+                        content,
+                        restored_facts: Vec::new(),
+                        removed_count: 0,
+                    }
+                }
                 Err(MemoryUpdateError::DeletionBlocked(violation)) => {
                     BotRpcResponse::Error(format!(
                         "MemoryDeletionViolation: {violation} ({})",
@@ -896,11 +1049,14 @@ impl BotsManager {
             },
             BotRpcRequest::ForgetMemoryFact { bot_id, fact } => {
                 match self.store.forget_memory_fact(&bot_id, &fact) {
-                    Ok((content, removed_count)) => BotRpcResponse::MemoryUpdated {
-                        content,
-                        restored_facts: Vec::new(),
-                        removed_count,
-                    },
+                    Ok((content, removed_count)) => {
+                        self.runtime.refresh_memory_snapshot(&bot_id, &content);
+                        BotRpcResponse::MemoryUpdated {
+                            content,
+                            restored_facts: Vec::new(),
+                            removed_count,
+                        }
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -918,11 +1074,14 @@ impl BotsManager {
                 .store
                 .edit_memory_fact(&bot_id, &old_fact, &new_fact, &memory_actor, ts)
             {
-                Ok(content) => BotRpcResponse::MemoryUpdated {
-                    content,
-                    restored_facts: Vec::new(),
-                    removed_count: 0,
-                },
+                Ok(content) => {
+                    self.runtime.refresh_memory_snapshot(&bot_id, &content);
+                    BotRpcResponse::MemoryUpdated {
+                        content,
+                        restored_facts: Vec::new(),
+                        removed_count: 0,
+                    }
+                }
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::UndoMemoryChange { bot_id, entry_id } => {
@@ -930,11 +1089,14 @@ impl BotsManager {
                     .store
                     .undo_memory_entry(&bot_id, &entry_id, &memory_actor, ts)
                 {
-                    Ok(content) => BotRpcResponse::MemoryUpdated {
-                        content,
-                        restored_facts: Vec::new(),
-                        removed_count: 0,
-                    },
+                    Ok(content) => {
+                        self.runtime.refresh_memory_snapshot(&bot_id, &content);
+                        BotRpcResponse::MemoryUpdated {
+                            content,
+                            restored_facts: Vec::new(),
+                            removed_count: 0,
+                        }
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -946,6 +1108,9 @@ impl BotsManager {
                     ts,
                 ) {
                     Ok((summary, changes)) => {
+                        if let Ok(content) = self.store.get_memory(&bot_id) {
+                            self.runtime.refresh_memory_snapshot(&bot_id, &content);
+                        }
                         self.memory_tidy_tracker.record(&bot_id, ts);
                         BotRpcResponse::MemoryTidyResult {
                             bot_id,
@@ -975,11 +1140,14 @@ impl BotsManager {
                     &memory_actor,
                     ts,
                 ) {
-                    Ok((content, restored_facts, removed_count)) => BotRpcResponse::MemoryUpdated {
-                        content,
-                        restored_facts,
-                        removed_count,
-                    },
+                    Ok((content, restored_facts, removed_count)) => {
+                        self.runtime.refresh_memory_snapshot(&bot_id, &content);
+                        BotRpcResponse::MemoryUpdated {
+                            content,
+                            restored_facts,
+                            removed_count,
+                        }
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -1048,13 +1216,7 @@ impl BotsManager {
                 bot_id,
                 suggestion_id,
             } => {
-                match look_around::prepare_start_suggestion(
-                    &self.store,
-                    &self.scheduler_state,
-                    &bot_id,
-                    &suggestion_id,
-                    ts,
-                ) {
+                match look_around::preview_start_suggestion(&self.store, &bot_id, &suggestion_id) {
                     Ok((_sugg, prompt)) => match self.runtime.start_bot_session(
                         registry,
                         &self.store,
@@ -1066,11 +1228,21 @@ impl BotsManager {
                         Some(&prompt),
                         None,
                     ) {
-                        Ok((session_id, pid)) => BotRpcResponse::SessionStarted {
-                            bot_id,
-                            session_id,
-                            pid,
-                        },
+                        Ok((session_id, pid)) => {
+                            look_around::dismiss_suggestion(
+                                &self.store,
+                                &self.scheduler_state,
+                                &bot_id,
+                                &suggestion_id,
+                                ts,
+                            )
+                            .ok();
+                            BotRpcResponse::SessionStarted {
+                                bot_id,
+                                session_id,
+                                pid,
+                            }
+                        }
                         Err(err) => err.into_rpc_response(),
                     },
                     Err(err) => BotRpcResponse::Error(err.to_string()),
@@ -1605,30 +1777,52 @@ impl BotsManager {
                 zip_bytes,
                 name_override,
                 agent_override,
-            } => match self.store.import_bot_zip(
-                &zip_bytes,
-                name_override.as_deref(),
-                agent_override.as_deref(),
-                ts,
-            ) {
-                Ok(bot) => BotRpcResponse::Bot(Box::new(bot)),
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            } => {
+                if let Some(ref raw_agent) = agent_override
+                    && !raw_agent.trim().is_empty()
+                    && let Err(err) = validate_agent_profile(registry, raw_agent)
+                {
+                    return BotRpcResponse::Error(err);
+                }
+                match self.store.import_bot_zip(
+                    &zip_bytes,
+                    name_override.as_deref(),
+                    agent_override.as_deref(),
+                    ts,
+                ) {
+                    Ok(bot) => {
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::ImportBotZipV2 {
                 zip_bytes,
                 slug_override,
                 name_override,
                 agent_override,
-            } => match self.store.import_bot_zip_v2(
-                &zip_bytes,
-                slug_override.as_ref().map(BotSlug::as_str),
-                name_override.as_deref(),
-                agent_override.as_deref(),
-                ts,
-            ) {
-                Ok(bot) => BotRpcResponse::Bot(Box::new(bot)),
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            } => {
+                if let Some(ref raw_agent) = agent_override
+                    && !raw_agent.trim().is_empty()
+                    && let Err(err) = validate_agent_profile(registry, raw_agent)
+                {
+                    return BotRpcResponse::Error(err);
+                }
+                match self.store.import_bot_zip_v2(
+                    &zip_bytes,
+                    slug_override.as_ref().map(BotSlug::as_str),
+                    name_override.as_deref(),
+                    agent_override.as_deref(),
+                    ts,
+                ) {
+                    Ok(bot) => {
+                        self.reconcile_for_bot(&bot);
+                        BotRpcResponse::Bot(Box::new(bot))
+                    }
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::UploadBotAvatar { bot_id, png_bytes } => {
                 match self.store.upload_avatar(&bot_id, &png_bytes, ts) {
                     Ok(data) => BotRpcResponse::BotAvatar(data),
@@ -1649,10 +1843,18 @@ impl BotsManager {
                     .filter(|s| !s.trim().is_empty())
                     .map(Path::new);
                 match self.store.import_external_bots(source, custom, dry_run, ts) {
-                    Ok((candidates, imported)) => BotRpcResponse::ImportedExternalBots {
-                        candidates,
-                        imported,
-                    },
+                    Ok((candidates, imported)) => {
+                        if !imported.is_empty() {
+                            for bot in &imported {
+                                self.reconcile_for_bot(bot);
+                            }
+                            self.reconcile_enabled_workers();
+                        }
+                        BotRpcResponse::ImportedExternalBots {
+                            candidates,
+                            imported,
+                        }
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -1666,15 +1868,19 @@ impl BotsManager {
                 }
             }
             BotRpcRequest::GetBotUpcoming { bot_id } => match self.store.get_bot(&bot_id) {
-                Ok(Some(bot)) => BotRpcResponse::Upcoming(krill_proto::bots::BotUpcoming {
-                    items_seen_event_id: self.items.items_seen_event_id(&bot_id).unwrap_or(0),
-                    ..look_around::bot_upcoming(
-                        &bot,
-                        &self.scheduler_state,
-                        |id| self.schedule_running(registry, &bot_id, id),
-                        ts,
-                    )
-                }),
+                Ok(Some(bot)) => {
+                    let extras = self.store.settings_extras(&bot_id).unwrap_or_default();
+                    BotRpcResponse::Upcoming(krill_proto::bots::BotUpcoming {
+                        items_seen_event_id: self.items.items_seen_event_id(&bot_id).unwrap_or(0),
+                        ..look_around::bot_upcoming_with_extras(
+                            &bot,
+                            extras,
+                            &self.scheduler_state,
+                            |id| self.schedule_running(registry, &bot_id, id),
+                            ts,
+                        )
+                    })
+                }
                 Ok(None) => BotRpcResponse::Error(format!("bot not found: {}", bot_id.as_str())),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
@@ -1770,8 +1976,24 @@ impl BotsManager {
             BotRpcRequest::ImportExternalBotCopy {
                 source,
                 path,
-                params,
+                mut params,
             } => {
+                if !params.base.agent_id.trim().is_empty()
+                    && let Err(err) = validate_agent_profile(registry, &params.base.agent_id)
+                {
+                    return BotRpcResponse::Error(err);
+                }
+                if krill_proto::agent::canonical_id(params.base.agent_id.trim()) == "agy"
+                    && let Some(ref model) = params.base.model
+                    && let Some((family, eff)) = crate::mobile::fold_agy_model_selection(
+                        None,
+                        model,
+                        params.base.effort.as_deref(),
+                    )
+                {
+                    params.base.model = Some(family);
+                    params.base.effort = Some(eff);
+                }
                 match self
                     .store
                     .import_external_bot_copy(source, &path, *params, ts)
@@ -1936,22 +2158,57 @@ impl BotsManager {
         ts: u64,
     ) -> BotRpcResponse {
         let mut dispatched_bots = Vec::new();
+        let mut failures = Vec::new();
         for target in &plan.target_bots {
-            if let Ok((sid, _)) = self.runtime.deliver_or_wake_bot(
+            match self.runtime.deliver_group_turn(
                 registry,
                 &self.store,
                 &self.secrets,
                 &self.tool_relay,
                 &self.composio_base_url,
                 &target.id,
+                &plan.group.id,
+                &plan.thread.thread_id,
                 &plan.prompt_for_bot,
                 ts,
             ) {
-                self.groups
-                    .record_turn_started(&plan.group.id, &plan.thread.thread_id, target, sid, ts)
-                    .ok();
-                dispatched_bots.push(target.id.clone());
+                Ok((sid, turn_seq, _)) => {
+                    self.groups
+                        .record_turn_started_seq(
+                            &plan.group.id,
+                            &plan.thread.thread_id,
+                            target,
+                            sid,
+                            Some(turn_seq),
+                            ts,
+                        )
+                        .ok();
+                    dispatched_bots.push(target.id.clone());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        group = %plan.group.id,
+                        bot = %target.id.as_str(),
+                        "group dispatch failed for target bot"
+                    );
+                    self.groups
+                        .record_dispatch_failure(
+                            &plan.group.id,
+                            &plan.thread.thread_id,
+                            target,
+                            &err,
+                            ts,
+                        )
+                        .ok();
+                    failures.push(format!("{}: {err}", target.id.as_str()));
+                }
             }
+        }
+        if !plan.target_bots.is_empty() && dispatched_bots.is_empty() {
+            return BotRpcResponse::Error(format!(
+                "group dispatch failed: {}",
+                failures.join("; ")
+            ));
         }
         BotRpcResponse::GroupMessagePosted {
             message: plan.posted_message,
@@ -2195,8 +2452,15 @@ fn authorize_bot_session_rpc(
         | BotRpcRequest::GetBotUpcoming { .. }
         | BotRpcRequest::GetBotSettingsExtras { .. }
         | BotRpcRequest::ListBotOffers { .. }
-        | BotRpcRequest::ListImportedSources
-        | BotRpcRequest::SendBotMail { .. } => Ok(()),
+        | BotRpcRequest::ListImportedSources => Ok(()),
+        BotRpcRequest::SendBotMail { from, .. } => {
+            let trimmed = from.trim();
+            if trimmed == caller_bot.as_str() || trimmed == format!("bot:{}", caller_bot.as_str()) {
+                Ok(())
+            } else {
+                deny("bot cannot spoof SendBotMail sender")
+            }
+        }
         // A bot proposes bots only from its own chat; the owner answers them.
         BotRpcRequest::OfferBot { bot_id, .. } if bot_id == caller_bot => Ok(()),
         BotRpcRequest::OfferBot { .. } => deny("cannot propose a bot for another bot"),
@@ -2704,15 +2968,21 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "missing required 'content'".to_owned())?;
-                let allow_deletions = arguments
+                if arguments
                     .get("allow_deletions")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                {
+                    return Err(
+                        "permission denied for bot session: bots cannot bypass MemoryGuard allow_deletions"
+                            .to_owned(),
+                    );
+                }
                 mgr.store
                     .apply_memory_with_history(
                         &ctx.bot_id,
                         content,
-                        allow_deletions,
+                        false,
                         &memory_actor,
                         "mcp_update",
                         ts,
@@ -2734,6 +3004,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .store
                     .forget_memory_fact(&ctx.bot_id, fact)
                     .map_err(|e| e.to_string())?;
+                mgr.runtime.refresh_memory_snapshot(&ctx.bot_id, &content);
                 Ok(json!({ "removed_count": removed_count, "content": content }).to_string())
             }
             "memory_history" => {
@@ -2751,8 +3022,9 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                 let to_raw = arguments
                     .get("to_bot")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| "missing required 'to_bot'".to_owned())?;
-                let to_bot = BotId::new(to_raw).map_err(|e| e.to_string())?;
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
+                    .ok_or_else(|| "missing or invalid required 'to_bot'".to_owned())?;
                 let subject = arguments
                     .get("subject")
                     .and_then(Value::as_str)
@@ -2766,7 +3038,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     &mgr.tool_relay,
                     &mgr.composio_base_url,
                     ctx.bot_id.as_str(),
-                    to_bot.as_str(),
+                    to_raw,
                     subject,
                     body,
                     thread_id,
@@ -2805,32 +3077,54 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     )
                     .map_err(|e| e.to_string())?;
                 let mut dispatched = Vec::new();
+                let mut failed = Vec::new();
                 for target in &plan.target_bots {
-                    if let Ok((sid, _)) = mgr.runtime.deliver_or_wake_bot(
+                    match mgr.runtime.deliver_group_turn(
                         &reg,
                         &mgr.store,
                         &mgr.secrets,
                         &mgr.tool_relay,
                         &mgr.composio_base_url,
                         &target.id,
+                        &plan.group.id,
+                        &plan.thread.thread_id,
                         &plan.prompt_for_bot,
                         ts,
                     ) {
-                        mgr.groups
-                            .record_turn_started(
-                                &plan.group.id,
-                                &plan.thread.thread_id,
-                                target,
-                                sid,
-                                ts,
-                            )
-                            .ok();
-                        dispatched.push(target.id.clone());
+                        Ok((sid, turn_seq, _)) => {
+                            mgr.groups
+                                .record_turn_started_seq(
+                                    &plan.group.id,
+                                    &plan.thread.thread_id,
+                                    target,
+                                    sid,
+                                    Some(turn_seq),
+                                    ts,
+                                )
+                                .ok();
+                            dispatched.push(target.id.clone());
+                        }
+                        Err(err) => {
+                            mgr.groups
+                                .record_dispatch_failure(
+                                    &plan.group.id,
+                                    &plan.thread.thread_id,
+                                    target,
+                                    &err,
+                                    ts,
+                                )
+                                .ok();
+                            failed.push(json!({
+                                "bot_id": target.id.as_str(),
+                                "error": err,
+                            }));
+                        }
                     }
                 }
                 serde_json::to_string(&json!({
                     "message": plan.posted_message,
                     "dispatched_bots": dispatched,
+                    "failed_bots": failed,
                 }))
                 .map_err(|e| e.to_string())
             }
@@ -2988,6 +3282,55 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
             other => Err(format!("unknown built-in tool: {other}")),
         }
     }
+}
+
+fn validate_agent_profile(registry: &Registry, raw_agent_id: &str) -> Result<(), String> {
+    let trimmed = raw_agent_id.trim();
+    if trimmed.is_empty() {
+        return Err("agent_id cannot be empty".to_owned());
+    }
+    let agents = registry
+        .agent_control()
+        .agents()
+        .map_err(|err| err.to_string())?;
+    if agents.resolve(trimmed).is_some() {
+        Ok(())
+    } else {
+        Err(format!("unknown agent profile: {trimmed}"))
+    }
+}
+
+fn classify_turn_error_refusal(
+    agent_id: &str,
+    err_text: &str,
+) -> Option<krill_proto::bots::BotSessionRefusal> {
+    let lower = err_text.to_ascii_lowercase();
+    if lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("resource_exhausted")
+        || lower.contains("resource exhausted")
+        || lower.contains("usage limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+    {
+        return Some(krill_proto::bots::BotSessionRefusal::quota_exceeded(
+            agent_id,
+            err_text.to_owned(),
+        ));
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("sign in")
+        || lower.contains("signed out")
+        || lower.contains("not logged in")
+        || lower.contains("authentication")
+        || lower.contains("401")
+    {
+        return Some(krill_proto::bots::BotSessionRefusal::auth_required(
+            agent_id,
+        ));
+    }
+    None
 }
 
 fn parse_item_status(raw: &str) -> Option<BotItemStatus> {
@@ -4698,6 +5041,298 @@ mod tests {
         assert_eq!(
             sched_after.last_refusal.as_ref().map(|r| r.code),
             Some(BotRefusalCode::QuotaExceeded)
+        );
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn wave2_regressions_delete_memory_hooks_mail_suggestions_refusals_and_groups() {
+        use krill_proto::bots::{
+            BotGroupReplyMode, BotRefusalCode, CreateBotParams, FieldPatch, UpdateBotParams,
+        };
+        use krill_proto::hook::{EventId, HookEvent, Input};
+
+        let state =
+            std::env::temp_dir().join(format!("krilld-wave2-core-reg-{}", std::process::id()));
+        fs::remove_dir_all(&state).ok();
+        fs::create_dir_all(&state).unwrap();
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        // S-02: CreateBot & UpdateBot reject unknown agent_id.
+        let bad_create = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Bad Agent".to_owned(),
+                agent_id: "nonexistent-agent".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        );
+        assert!(
+            matches!(bad_create, BotRpcResponse::Error(ref msg) if msg.contains("unknown agent")),
+            "{bad_create:?}"
+        );
+
+        let BotRpcResponse::Bot(bot) = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+                name: "Core Bot".to_owned(),
+                agent_id: "agy".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            })),
+        ) else {
+            panic!("expected Bot");
+        };
+
+        let bad_update = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::UpdateBot(Box::new(UpdateBotParams {
+                bot_id: bot.id.clone(),
+                name: None,
+                description: None,
+                emoji: FieldPatch::Unchanged,
+                avatar: FieldPatch::Unchanged,
+                agent_id: Some("nonexistent-agent".to_owned()),
+                model: FieldPatch::Unchanged,
+                effort: FieldPatch::Unchanged,
+                permission_mode: None,
+                workspace: FieldPatch::Unchanged,
+                paused: None,
+                first_run_completed: None,
+                notifications: None,
+                schedules: None,
+                look_around: None,
+                memory_tidy: None,
+                mcp_tools: None,
+            })),
+        );
+        assert!(
+            matches!(bad_update, BotRpcResponse::Error(ref msg) if msg.contains("unknown agent")),
+            "{bad_update:?}"
+        );
+
+        // D-04: MCP memory_update with allow_deletions=true must be blocked.
+        let mcp_handler = DaemonBuiltinMcpHandler {
+            registry: Arc::downgrade(&reg),
+            manager: Arc::downgrade(&mgr),
+        };
+        let mcp_ctx = BuiltinMcpCallContext {
+            bot_id: bot.id.clone(),
+            session_id: Some(SessionId(501)),
+            link: None,
+        };
+        let mcp_del = mcp_handler.call_tool(
+            &mcp_ctx,
+            "memory_update",
+            &json!({"content": "# Memory\n", "allow_deletions": true}),
+        );
+        assert!(mcp_del.is_err(), "MCP allow_deletions=true must fail");
+
+        // D-05: Owner ForgetMemoryFact refreshes live session snapshot so Stop does not heal it back.
+        mgr.store
+            .update_memory(
+                &bot.id,
+                "# Memory\n\n- 2026-11-20 Secret fact\n- 2026-11-20 Keep fact\n",
+                true,
+            )
+            .unwrap();
+        let live_sid = SessionId(501);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            live_sid,
+            crate::bots::runtime::BotSessionBinding {
+                bot_id: bot.id.clone(),
+                link_id: None,
+                memory_snapshot: krill_proto::bots::MemorySnapshot::capture(
+                    &mgr.store.get_memory(&bot.id).unwrap(),
+                ),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 0,
+                label: "Core Bot".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: false,
+                last_prompt: None,
+            },
+        );
+        let forgot = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::ForgetMemoryFact {
+                bot_id: bot.id.clone(),
+                fact: "Secret fact".to_owned(),
+            },
+        );
+        assert!(matches!(forgot, BotRpcResponse::MemoryUpdated { .. }));
+
+        // D-06: UserPromptSubmit hook marks owner_turn_pending=true and records last_prompt.
+        let submit_ev = HookEvent {
+            id: EventId {
+                unix_ns: 200,
+                pid: 1,
+            },
+            agent: "agy".to_owned(),
+            ppid: 1,
+            input: Input::Complete,
+            payload: br#"{"hook_event_name":"UserPromptSubmit","prompt":"Hello from chat"}"#
+                .to_vec(),
+        };
+        mgr.on_hook_event(&reg, live_sid, &submit_ev);
+        assert!(mgr.runtime.turn_running(live_sid));
+        let stop_ok = HookEvent {
+            id: EventId {
+                unix_ns: 300,
+                pid: 1,
+            },
+            agent: "agy".to_owned(),
+            ppid: 1,
+            input: Input::Complete,
+            payload: br#"{"hook_event_name":"Stop","fullyIdle":true}"#.to_vec(),
+        };
+        mgr.on_hook_event(&reg, live_sid, &stop_ok);
+        assert!(!mgr.runtime.turn_running(live_sid));
+        assert!(
+            !mgr.store
+                .get_memory(&bot.id)
+                .unwrap()
+                .contains("Secret fact"),
+            "owner-forgotten fact must NOT be restored by system:heal"
+        );
+        assert!(
+            mgr.store
+                .get_bot(&bot.id)
+                .unwrap()
+                .unwrap()
+                .first_run_completed,
+            "clean UserPromptSubmit -> Stop must mark first_run_completed"
+        );
+
+        // D-08: SendBotMail sender spoofing denied for bot sessions.
+        let spoof = mgr.handle_rpc_for_peer(
+            &reg,
+            Some(live_sid),
+            false,
+            BotRpcRequest::SendBotMail {
+                from: "owner".to_owned(),
+                to_bot: bot.id.as_str().to_owned(),
+                subject: "Spoof".to_owned(),
+                body: "No".to_owned(),
+                thread_id: None,
+            },
+        );
+        assert!(matches!(spoof, BotRpcResponse::Error(ref m) if m.contains("spoof")));
+
+        // D-30: Generic non-quota Antigravity Stop error must NOT record QuotaExceeded refusal.
+        assert_eq!(
+            classify_turn_error_refusal("agy", "network timeout connecting to backend"),
+            None
+        );
+        assert_eq!(
+            classify_turn_error_refusal("agy", "RESOURCE_EXHAUSTED (code 429): quota reached")
+                .map(|r| r.code),
+            Some(BotRefusalCode::QuotaExceeded)
+        );
+
+        // D-13(c): StartSuggestion on paused bot must NOT dismiss the suggestion.
+        mgr.store
+            .update_bot(
+                UpdateBotParams {
+                    bot_id: bot.id.clone(),
+                    name: None,
+                    description: None,
+                    emoji: FieldPatch::Unchanged,
+                    avatar: FieldPatch::Unchanged,
+                    agent_id: None,
+                    model: FieldPatch::Unchanged,
+                    effort: FieldPatch::Unchanged,
+                    permission_mode: None,
+                    workspace: FieldPatch::Unchanged,
+                    paused: Some(true),
+                    first_run_completed: None,
+                    notifications: None,
+                    schedules: None,
+                    look_around: None,
+                    memory_tidy: None,
+                    mcp_tools: None,
+                },
+                2_000,
+            )
+            .unwrap();
+        let sugg = krill_proto::bots::BotSuggestion {
+            id: "sugg-keep-1".to_owned(),
+            bot_id: bot.id.clone(),
+            title: "Check deploy".to_owned(),
+            why: "Pending PR".to_owned(),
+            ask: "Review it".to_owned(),
+            link: None,
+            source: None,
+            dismissed: false,
+            created_at_ms: 2_000,
+        };
+        mgr.store.save_suggestions(&bot.id, &[sugg]).unwrap();
+        let start_sugg = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::StartSuggestion {
+                bot_id: bot.id.clone(),
+                suggestion_id: "sugg-keep-1".to_owned(),
+            },
+        );
+        assert!(matches!(start_sugg, BotRpcResponse::SessionRefused(_)));
+        let remaining = look_around::list_suggestions(&mgr.store, Some(&bot.id), false).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "failed StartSuggestion must keep suggestion active"
+        );
+
+        // D-02: DeleteBot removes live session bindings, cron sessions, offers, and 0-member groups.
+        let solo_grp = mgr
+            .store
+            .create_group("Solo Group", vec![bot.id.clone()], String::new(), 3_000)
+            .unwrap();
+        let _ = mgr
+            .groups
+            .prepare_message_dispatch(
+                &mgr.store,
+                &solo_grp.id,
+                None,
+                "owner",
+                "hi",
+                Some(BotGroupReplyMode::All),
+                3_010,
+            )
+            .unwrap();
+        lock(&mgr.active_cron_sessions).insert((bot.id.clone(), "cron-1".to_owned()), live_sid);
+        let del = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::DeleteBot {
+                bot_id: bot.id.clone(),
+                delete_home: true,
+            },
+        );
+        assert!(matches!(del, BotRpcResponse::Deleted { .. }));
+        assert!(!mgr.runtime.is_bot_session(live_sid));
+        assert!(lock(&mgr.active_cron_sessions).is_empty());
+        assert!(
+            mgr.store.list_groups().unwrap().is_empty(),
+            "0-member zombie group must be pruned when its last bot is deleted"
         );
 
         mgr.shutdown();

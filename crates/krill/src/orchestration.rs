@@ -409,7 +409,13 @@ fn cmd_run_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--title" | "--objective" => title = it.next().cloned(),
+            "--title" | "--objective" => {
+                title = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
             "--worktree" | "--cwd" => {
                 it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
             }
@@ -579,7 +585,13 @@ fn cmd_run_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
 }
 
 fn cmd_run_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let json = has_flag(args, "--json");
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
     let store = ctx.load_store()?;
     if json {
         print_json(&store.runs)?;
@@ -607,10 +619,16 @@ fn cmd_task_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--run" => run_id = it.next().cloned(),
-            "--title" | "--task-title" => title = it.next().cloned(),
+            "--run" => run_id = Some(take_opt(&mut it, "--run")?.clone()),
+            "--title" | "--task-title" => {
+                title = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
             "--desc" | "--description" | "--spec" => {
-                desc = it.next().cloned().unwrap_or_default();
+                desc.clone_from(it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?);
             }
             "--parent" => {
                 let p = it.next().ok_or_else(|| bad_arg("missing --parent"))?;
@@ -619,24 +637,23 @@ fn cmd_task_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 }
             }
             "--deps" => {
-                if let Some(raw) = it.next() {
-                    if raw.trim_start().starts_with('[') {
-                        let parsed = serde_json::from_str::<Vec<String>>(raw)
-                            .map_err(|e| bad_arg(format!("invalid --deps JSON: {e}")))?;
-                        deps.extend(
-                            parsed
-                                .into_iter()
-                                .map(|s| s.trim().to_owned())
-                                .filter(|s| !s.is_empty()),
-                        );
-                    } else {
-                        deps.extend(
-                            raw.split(',')
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_owned),
-                        );
-                    }
+                let raw = take_opt(&mut it, "--deps")?;
+                if raw.trim_start().starts_with('[') {
+                    let parsed = serde_json::from_str::<Vec<String>>(raw)
+                        .map_err(|e| bad_arg(format!("invalid --deps JSON: {e}")))?;
+                    deps.extend(
+                        parsed
+                            .into_iter()
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty()),
+                    );
+                } else {
+                    deps.extend(
+                        raw.split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                    );
                 }
             }
             "--json" => json = true,
@@ -696,7 +713,7 @@ fn cmd_task_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--run" => run_filter = it.next().cloned(),
+            "--run" => run_filter = Some(take_opt(&mut it, "--run")?.clone()),
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
@@ -746,7 +763,13 @@ fn cmd_task_update_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --status"))?;
                 status = Some(TaskStatus::parse(raw)?);
             }
-            "--summary" | "--result" => summary = it.next().cloned(),
+            "--summary" | "--result" => {
+                summary = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
             "--json" => json = true,
             s if !s.starts_with('-') && task_id.is_none() => {
                 task_id = Some(s.to_owned());
@@ -1525,23 +1548,35 @@ fn cmd_send_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--from" => from = it.next().cloned(),
-            "--to" => to = it.next().cloned(),
+            "--from" => from = Some(take_opt(&mut it, "--from")?.clone()),
+            "--to" => to = Some(take_opt(&mut it, "--to")?.clone()),
             "--type" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --type"))?;
                 msg_type = MessageType::parse(raw)?;
             }
-            "--summary" | "--subject" => summary = it.next().cloned(),
-            "--body" => body = it.next().cloned().unwrap_or_default(),
-            "--files-modified" => files_modified = it.next().cloned(),
-            "--report-path" => report_path = it.next().cloned(),
+            "--summary" | "--subject" => {
+                summary = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
+            "--body" => {
+                body.clone_from(it.next().ok_or_else(|| bad_arg("missing --body"))?);
+            }
+            "--files-modified" => {
+                files_modified = Some(take_opt(&mut it, "--files-modified")?.clone());
+            }
+            "--report-path" => {
+                report_path = Some(take_opt(&mut it, "--report-path")?.clone());
+            }
             "--phase" | "--thread-id" | "--priority" => {
                 it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
             }
-            "--run" => run_id = it.next().cloned(),
-            "--task" | "--task-id" => task_id = it.next().cloned(),
-            "--dispatch" | "--dispatch-id" => dispatch_id = it.next().cloned(),
-            "--outcome" | "--status" => outcome = it.next().cloned(),
+            "--run" => run_id = Some(take_opt(&mut it, "--run")?.clone()),
+            "--task" | "--task-id" => task_id = Some(take_opt(&mut it, arg)?.clone()),
+            "--dispatch" | "--dispatch-id" => dispatch_id = Some(take_opt(&mut it, arg)?.clone()),
+            "--outcome" | "--status" => outcome = Some(take_opt(&mut it, arg)?.clone()),
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
@@ -1638,10 +1673,9 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 to = Some(val.clone());
             }
             "--types" | "--type" => {
-                if let Some(raw) = it.next() {
-                    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                        types.push(MessageType::parse(part)?);
-                    }
+                let raw = take_opt(&mut it, arg)?;
+                for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    types.push(MessageType::parse(part)?);
                 }
             }
             "--unread" => unread_only = true,
@@ -1876,13 +1910,21 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--from" => from = it.next().cloned(),
-            "--to" => to = it.next().cloned(),
-            "--summary" | "--question" => summary = it.next().cloned(),
-            "--body" => body = it.next().cloned().unwrap_or_default(),
-            "--options" => options = it.next().cloned(),
-            "--run" => run_id = it.next().cloned(),
-            "--task" => task_id = it.next().cloned(),
+            "--from" => from = Some(take_opt(&mut it, "--from")?.clone()),
+            "--to" => to = Some(take_opt(&mut it, "--to")?.clone()),
+            "--summary" | "--question" => {
+                summary = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
+            "--body" => {
+                body.clone_from(it.next().ok_or_else(|| bad_arg("missing --body"))?);
+            }
+            "--options" => options = Some(take_opt(&mut it, "--options")?.clone()),
+            "--run" => run_id = Some(take_opt(&mut it, "--run")?.clone()),
+            "--task" => task_id = Some(take_opt(&mut it, "--task")?.clone()),
             "--question-id" | "--id" | "--resume" => {
                 question_id = Some(take_opt(&mut it, "--question-id")?.clone());
             }
@@ -2020,7 +2062,13 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             "--from" => {
                 from = Some(it.next().ok_or_else(|| bad_arg("missing --from"))?.clone());
             }
-            "--body" | "--answer" => body = it.next().cloned(),
+            "--body" | "--answer" => {
+                body = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
             "--json" => json = true,
             s if !s.starts_with('-') && msg_id.is_none() => {
                 msg_id = Some(s.to_owned());
@@ -2099,19 +2147,24 @@ fn cmd_gate_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             "--from" => {
                 from.clone_from(it.next().ok_or_else(|| bad_arg("missing --from"))?);
             }
-            "--question" => question = it.next().cloned(),
-            "--options" => {
-                if let Some(raw) = it.next() {
-                    options.extend(
-                        raw.split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned),
-                    );
-                }
+            "--question" => {
+                question = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg("missing --question"))?
+                        .clone(),
+                );
             }
-            "--run" => run_id = it.next().cloned(),
-            "--task" => task_id = it.next().cloned(),
+            "--options" => {
+                let raw = take_opt(&mut it, "--options")?;
+                options.extend(
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            "--run" => run_id = Some(take_opt(&mut it, "--run")?.clone()),
+            "--task" => task_id = Some(take_opt(&mut it, "--task")?.clone()),
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
@@ -2149,8 +2202,15 @@ fn cmd_gate_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
 }
 
 fn cmd_gate_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let pending_only = args.iter().any(|a| a == "--pending");
-    let json = args.iter().any(|a| a == "--json");
+    let mut pending_only = false;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--pending" => pending_only = true,
+            "--json" => json = true,
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
     let store = ctx.load_store()?;
     let gates: Vec<_> = store
         .gates
@@ -2193,8 +2253,20 @@ fn cmd_gate_resolve_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 let id = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
                 gate_id = Some(id.clone());
             }
-            "--decision" | "--resolution" => decision = it.next().cloned(),
-            "--rationale" => rationale = it.next().cloned(),
+            "--decision" | "--resolution" => {
+                decision = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg(format!("missing {arg}")))?
+                        .clone(),
+                );
+            }
+            "--rationale" => {
+                rationale = Some(
+                    it.next()
+                        .ok_or_else(|| bad_arg("missing --rationale"))?
+                        .clone(),
+                );
+            }
             "--by" => {
                 by.clone_from(it.next().ok_or_else(|| bad_arg("missing --by"))?);
             }
@@ -4876,5 +4948,38 @@ mod snapshot_fallback_tests {
         assert_eq!(resolve_env_depth_for(false, None, Some("3")), Some(3));
         assert_eq!(resolve_caller_pane_for(true, Some("42")), None);
         assert_eq!(resolve_caller_pane_for(false, Some("42")), Some(42));
+    }
+
+    #[test]
+    fn list_and_option_parsers_reject_unknown_flags_and_missing_values() {
+        let dir = std::env::temp_dir().join(format!("mk-orch-strict-args-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+        // Unknown flags in run-list and gate-list must fail with InvalidInput (exit 2).
+        for err in [
+            cmd_run_list(&dir, &args(&["--stauts", "active"])).unwrap_err(),
+            cmd_gate_list(&dir, &args(&["--bogus"])).unwrap_err(),
+            // Missing option values must fail with InvalidInput (exit 2).
+            cmd_task_list(&dir, &args(&["--run"])).unwrap_err(),
+            cmd_task_list(&dir, &args(&["--run", "--json"])).unwrap_err(),
+            cmd_task_create(&dir, &args(&["--title", "t", "--deps"])).unwrap_err(),
+            cmd_task_create(&dir, &args(&["--title", "t", "--desc"])).unwrap_err(),
+            cmd_task_create(&dir, &args(&["--title"])).unwrap_err(),
+            cmd_task_create(&dir, &args(&["--title", "t", "--run"])).unwrap_err(),
+            cmd_gate_create(&dir, &args(&["--question", "q", "--options"])).unwrap_err(),
+            cmd_gate_create(&dir, &args(&["--question", "q", "--run"])).unwrap_err(),
+            cmd_gate_create(&dir, &args(&["--question"])).unwrap_err(),
+            cmd_send(&dir, &args(&["--from", "w", "--summary", "s", "--body"])).unwrap_err(),
+            cmd_send(&dir, &args(&["--from", "w", "--summary", "s", "--run"])).unwrap_err(),
+            cmd_check(&dir, &args(&["--to", "coordinator", "--types"])).unwrap_err(),
+            cmd_ask(&dir, &args(&["--from", "w", "--summary", "s", "--options"])).unwrap_err(),
+            cmd_ask(&dir, &args(&["--from", "w", "--summary", "s", "--body"])).unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

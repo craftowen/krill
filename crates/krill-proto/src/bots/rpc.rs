@@ -1567,12 +1567,162 @@ impl fmt::Debug for BotRpcResponse {
     }
 }
 
+/// Frozen v0.3.22 4-field postcard layout of [`BotScheduleUpcoming`].
+/// `last_error` and `last_refusal` travel as postcard trailing extensions so N-1 peers
+/// can decode the first 4 fields cleanly while JSON still serializes all 6 fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct BotScheduleUpcomingV1 {
+    id: String,
+    #[serde(default)]
+    next_ms: Option<u64>,
+    #[serde(default)]
+    last_ms: Option<u64>,
+    #[serde(default)]
+    running: bool,
+}
+
+/// Frozen v0.3.22 postcard layout of [`BotUpcoming`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct BotUpcomingV1 {
+    #[serde(default)]
+    look_around_last_ms: Option<u64>,
+    #[serde(default)]
+    look_around_next_ms: Option<u64>,
+    #[serde(default)]
+    tidy_last_ms: Option<u64>,
+    #[serde(default)]
+    tidy_next_ms: Option<u64>,
+    #[serde(default)]
+    schedules: Vec<BotScheduleUpcomingV1>,
+    #[serde(default)]
+    up_next_seen_ms: u64,
+    #[serde(default)]
+    items_seen_event_id: u64,
+}
+
+/// Postcard variant discriminant for [`BotRpcResponse::Upcoming`] (0-indexed variant 39).
+pub(crate) const UPCOMING_RESPONSE_TAG: u8 = 39;
+
+impl BotRpcResponse {
+    /// Encodes this response into postcard body bytes, preserving the frozen v0.3.22
+    /// 4-field layout for [`BotRpcResponse::Upcoming`] and appending `last_error` /
+    /// `last_refusal` as trailing postcard extensions.
+    pub(crate) fn encode_wire_body(&self) -> Result<Vec<u8>, crate::ipc::Error> {
+        if let Self::Upcoming(up) = self {
+            let v1 = BotUpcomingV1 {
+                look_around_last_ms: up.look_around_last_ms,
+                look_around_next_ms: up.look_around_next_ms,
+                tidy_last_ms: up.tidy_last_ms,
+                tidy_next_ms: up.tidy_next_ms,
+                schedules: up
+                    .schedules
+                    .iter()
+                    .map(|s| BotScheduleUpcomingV1 {
+                        id: s.id.clone(),
+                        next_ms: s.next_ms,
+                        last_ms: s.last_ms,
+                        running: s.running,
+                    })
+                    .collect(),
+                up_next_seen_ms: up.up_next_seen_ms,
+                items_seen_event_id: up.items_seen_event_id,
+            };
+            let mut body =
+                postcard::to_stdvec(&UPCOMING_RESPONSE_TAG).map_err(crate::ipc::Error::Codec)?;
+            body.extend(postcard::to_stdvec(&v1).map_err(crate::ipc::Error::Codec)?);
+            let has_refusal = up.schedules.iter().any(|s| s.last_refusal.is_some());
+            let has_error = has_refusal || up.schedules.iter().any(|s| s.last_error.is_some());
+            if has_error {
+                for sched in &up.schedules {
+                    body.extend(
+                        postcard::to_stdvec(&sched.last_error).map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            if has_refusal {
+                for sched in &up.schedules {
+                    body.extend(
+                        postcard::to_stdvec(&sched.last_refusal)
+                            .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            return Ok(body);
+        }
+        postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)
+    }
+
+    /// Decodes postcard body bytes produced by either this build or v0.3.22.
+    pub(crate) fn decode_wire_body(body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if body.first() == Some(&UPCOMING_RESPONSE_TAG) {
+            let (_, rest) =
+                postcard::take_from_bytes::<u8>(body).map_err(crate::ipc::Error::Codec)?;
+            let (v1, mut tail) = postcard::take_from_bytes::<BotUpcomingV1>(rest)
+                .map_err(crate::ipc::Error::Codec)?;
+            let mut schedules: Vec<BotScheduleUpcoming> = v1
+                .schedules
+                .into_iter()
+                .map(|s| BotScheduleUpcoming {
+                    id: s.id,
+                    next_ms: s.next_ms,
+                    last_ms: s.last_ms,
+                    running: s.running,
+                    last_error: None,
+                    last_refusal: None,
+                })
+                .collect();
+            if !tail.is_empty() {
+                for sched in &mut schedules {
+                    let (err, next) = postcard::take_from_bytes::<Option<String>>(tail)
+                        .map_err(crate::ipc::Error::Codec)?;
+                    sched.last_error = err;
+                    tail = next;
+                }
+            }
+            if !tail.is_empty() {
+                for sched in &mut schedules {
+                    let (refusal, next) =
+                        postcard::take_from_bytes::<Option<super::BotSessionRefusal>>(tail)
+                            .map_err(crate::ipc::Error::Codec)?;
+                    sched.last_refusal = refusal;
+                    tail = next;
+                }
+            }
+            return Ok(Self::Upcoming(BotUpcoming {
+                look_around_last_ms: v1.look_around_last_ms,
+                look_around_next_ms: v1.look_around_next_ms,
+                tidy_last_ms: v1.tidy_last_ms,
+                tidy_next_ms: v1.tidy_next_ms,
+                schedules,
+                up_next_seen_ms: v1.up_next_seen_ms,
+                items_seen_event_id: v1.items_seen_event_id,
+            }));
+        }
+        postcard::from_bytes(body).map_err(crate::ipc::Error::Codec)
+    }
+}
+
 impl Msg for BotRpcRequest {
     const KIND: u8 = BOT_REQ;
 }
 
 impl Msg for BotRpcResponse {
     const KIND: u8 = BOT_REPLY;
+
+    fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
+        let body = self.encode_wire_body()?;
+        crate::ipc::encode_frame(Self::KIND, &body)
+    }
+
+    fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if kind != Self::KIND {
+            return Err(crate::ipc::Error::UnexpectedKind {
+                want: Self::KIND,
+                got: kind,
+            });
+        }
+        Self::decode_wire_body(body)
+    }
 }
 
 fn rpc_zip_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {

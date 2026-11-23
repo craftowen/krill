@@ -382,7 +382,8 @@ impl View {
             return;
         };
         self.error = None;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        self.notice = None;
+        self.patch_task = Some(cx.spawn(async move |this, cx| {
             let (res, up) = cx
                 .background_executor()
                 .spawn(async move {
@@ -444,17 +445,19 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let host_name = self.refusal_host_name();
         self.soul_memory.look_around_running = true;
         self.items.look_error = None;
         self.look_task = Some(cx.spawn(async move |this, cx| {
             let (res, up) = cx
                 .background_executor()
                 .spawn(async move {
-                    let res = call_checked(
+                    let res = call_checked_on(
                         &rpc,
                         &BotRpcRequest::RunLookAround {
                             bot_id: bot_id.clone(),
                         },
+                        host_name.as_deref(),
                     );
                     let up = match call_checked(&rpc, &BotRpcRequest::GetBotUpcoming { bot_id }) {
                         Ok(BotRpcResponse::Upcoming(up)) => Some(up),

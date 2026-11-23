@@ -1061,5 +1061,531 @@ async function botsScreens(){
  rf.abort.abort();
  console.log('PASS mobile bots screens: routes, Home entry, #/bots, #/bots/:id, #/up-next, decisions, groups, soul/memory, refusals, no innerHTML');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function mobileAuditWave2Regressions(){
+ const assetRoot=path.join(__dirname,'../src/mobile/assets');
+ const appSrc=fs.readFileSync(path.join(assetRoot,'app.js'),'utf8');
+ const clientSrc=fs.readFileSync(path.join(assetRoot,'client.js'),'utf8');
+ const chatSrc=fs.readFileSync(path.join(assetRoot,'screens/chat.js'),'utf8');
+ const cssSrc=fs.readFileSync(path.join(assetRoot,'app.css'),'utf8');
+ const i18nSrc=fs.readFileSync(path.join(assetRoot,'i18n.js'),'utf8');
+
+ // M-01 & M-09: app.js ctx RPC/refresh/createSession wrappers return rejected Promises (never sync throw) on stale/cached targets.
+ {
+  const start=appSrc.indexOf('const screenTransport=transport'),end=appSrc.indexOf(',creating:()=>creating};',start)+',creating:()=>creating};'.length;
+  const abort=new AbortController(),state={cached:false};
+  let transport={ready:true,rpc:()=>Promise.resolve({ok:true}),rpcLatest:()=>Promise.resolve({ok:true}),refresh:()=>Promise.resolve({})};
+  const box=vm.createContext({
+   state,transport,hostGeneration:1,abort,pool:null,
+   el:()=>{},button:()=>{},icon:()=>{},go:()=>{},setRoute:()=>{},back:()=>{},backTo:()=>{},t:x=>x,
+   install:{},route:{},header:()=>{},dot:()=>{},rollup:()=>{},groupRoute:()=>{},linkRow:()=>{},
+   sheet:()=>{},closeSheet:()=>{},longPress:()=>{},savePreferences:()=>{},rememberSession:()=>{},
+   resumeLastSession:()=>{},scanQr:()=>{},pasteLink:()=>{},newWorkspace:()=>{},sessionKey:()=>{},
+   endpoint:{profiles:()=>[]},selectHost:()=>{},forgetHost:()=>{},renameHost:()=>{},hostRoute:()=>{},
+   getConnections:()=>[],openRecent:()=>{},reconnectHost:()=>{},photo:()=>{},toast:()=>{},error:()=>{},
+   act:fn=>fn(),render:()=>{},createSession:()=>Promise.resolve({}),snapshot:()=>{},activateEntrySilent:()=>{},
+  });
+  vm.runInContext(appSrc.slice(start,end)+'\nglobalThis.testCtx=ctx;',box);
+  box.hostGeneration=2;
+  for(const [name,call] of [
+   ['rpc',()=>box.testCtx.rpc({action:'chat_unsubscribe',session:1})],
+   ['rpcForHost',()=>box.testCtx.rpcForHost(null,{action:'bots.list'})],
+   ['rpcLatest',()=>box.testCtx.rpcLatest('k',{action:'git'})],
+   ['refresh',()=>box.testCtx.refresh()],
+   ['refreshHost',()=>box.testCtx.refreshHost(null)],
+   ['createSession',()=>box.testCtx.createSession({key:'g'},'claude',{action:'create_terminal'})],
+  ]){
+   let p;
+   assert.doesNotThrow(()=>{p=call();},`${name} must not throw synchronously on target change`);
+   await assert.rejects(p,/Screen target changed/,`${name} must reject asynchronously`);
+  }
+ }
+
+ // M-01 & M-06: chat.js unmount survives sync-throwing ctx.rpc & clears mounts/listeners; Stop unlocks on interrupt error or interrupted:false.
+ {
+  const f=fixture('home');
+  const E=f.root.constructor;
+  const addedListeners=[],removedListeners=[];
+  const chatDoc={
+   activeElement:f.doc.body,body:f.doc.body,hidden:false,visibilityState:'visible',
+   documentElement:new E('html'),
+   createElement:tag=>new E(tag),
+   createElementNS:(_,tag)=>new E(tag),
+   addEventListener:(ev,fn)=>{addedListeners.push([ev,fn]);},
+   removeEventListener:(ev,fn)=>{removedListeners.push([ev,fn]);},
+   querySelector:()=>null,querySelectorAll:()=>[],
+  };
+  let rpcImpl=async req=>{
+   if(req.action==='chat_poll')return {items:[],next_offset:10,agent:'claude',bound:true,has_more:false};
+   if(req.action==='chat_subscribe')return {subscribed:true};
+   if(req.action==='chat_unsubscribe')return {unsubscribed:true};
+   if(req.action==='chat_composer')return {};
+   return {};
+  };
+  const chatCalls=[];
+  const chatState={
+   snapshot:{capabilities:{chat_push:true,chat_interrupt:true,chat_tail:true},sessions:[{id:7,state:'Working',agent:'claude',state_since_unix_ns:'100'}]},
+   connection:{phase:'ready',generation:1},cached:false,
+   sessions:new Map([[7,{id:7,state:'Working',agent:'claude',state_since_unix_ns:'100'}]]),
+   groups:new Map(),drafts:new Map(),preferences:{},chatCache:new Map(),ui:{},
+  };
+  const chatErrors=[];
+  const chatCtx={
+   ...f.ctx,state:chatState,
+   act:fn=>Promise.resolve().then(fn).catch(e=>chatErrors.push(e)),
+   error:e=>chatErrors.push(e),
+   rpc:req=>{chatCalls.push(req);return rpcImpl(req);},
+   refresh:async()=>{},
+   sessionKey:id=>`s:${id}`,
+  };
+  const chatSandbox=vm.createContext({
+   document:chatDoc,window:globalThis,navigator:{clipboard:{writeText:async()=>{}}},
+   AbortController,Date,console,Math,Map,Set,Array,Object,JSON,Number,String,Boolean,Promise,Error,RegExp,
+   setTimeout:()=>0,
+   clearTimeout:()=>{},requestAnimationFrame:fn=>fn(),
+   KrillMobile:{agentName:a=>a,agentIcon:()=>new E('svg')},
+  });
+  vm.runInContext(chatSrc,chatSandbox);
+  const host=new E('div');chatDoc.body.append(host);
+  const handle=chatSandbox.KrillMobile.chat.mount(host,{ctx:chatCtx,sessionId:7,active:()=>true});
+  await f.flush();
+  assert(chatCalls.some(c=>c.action==='chat_subscribe'&&c.session===7),'chat_subscribe sent');
+  const entry=chatState.chatCache.get(7);
+  assert.equal(entry.mounts,1);
+
+  // M-06 case 1: interrupt RPC fails -> entry.stopping and stopCooldownUntil reset immediately.
+  const sendBtn=host.querySelector('.composer-send');
+  assert(sendBtn,'send/stop button exists');
+  rpcImpl=async req=>{if(req.action==='interrupt')throw Error('network lost');return {};};
+  const clickEv=new Event('click',{cancelable:true});clickEv.detail=1;
+  sendBtn.dispatchEvent(clickEv);
+  await f.flush();
+  assert.equal(entry.stopping,false,'M-06: stopping unlocked after interrupt RPC failure');
+  assert.equal(entry.stopCooldownUntil,0,'M-06: stop cooldown cleared on interrupt RPC failure');
+  assert.equal(sendBtn.disabled,false,'M-06: stop button re-enabled after interrupt failure');
+
+  // M-06 case 2: interrupt returns {interrupted:false} -> entry.stopping unlocked.
+  rpcImpl=async req=>{if(req.action==='interrupt')return {interrupted:false};return {};};
+  const clickEv2=new Event('click',{cancelable:true});clickEv2.detail=1;
+  sendBtn.dispatchEvent(clickEv2);
+  await f.flush();
+  assert.equal(entry.stopping,false,'M-06: stopping unlocked when daemon reports interrupted:false');
+
+  // M-01: unmount() survives a synchronously throwing ctx.rpc (e.g., inside clearHost) and runs full cleanup.
+  chatCtx.rpc=()=>{throw Error('Screen target changed');};
+  assert.doesNotThrow(()=>handle.unmount(),'M-01: chat unmount must not throw when ctx.rpc throws synchronously');
+  assert.equal(entry.mounts,0,'M-01: entry.mounts decremented despite chat_unsubscribe failure');
+  assert(removedListeners.some(([ev])=>ev==='visibilitychange'),'M-01: visibilitychange listener removed');
+  assert(removedListeners.some(([ev])=>ev==='keydown'),'M-01: keydown listener removed');
+  f.abort.abort();
+ }
+
+ // M-02: setDeviceFilter() calls render() when transport swaps, and workspaces.js uses createSessionForHost.
+ {
+  const fnLine=appSrc.split('\n').find(l=>l.includes('function setDeviceFilter('));
+  const tA={id:'tA'},tB={id:'tB'};
+  let renders=0,updates=0,pills=0,tabBars=0;
+  const box=vm.createContext({
+   state:{ui:{deviceFilter:'all'}},transport:tA,
+   pool:{get:id=>id==='b'?{id:'b',transport:tB}:id==='a'?{id:'a',transport:tA}:null},
+   activateEntrySilent:e=>{box.transport=e.transport;},
+   render:()=>{renders++;},syncDevicePills:()=>{pills++;},syncTabBar:()=>{tabBars++;},
+   screen:{update:()=>{updates++;}},
+  });
+  vm.runInContext(fnLine+'\nglobalThis.setDeviceFilter=setDeviceFilter;',box);
+  box.setDeviceFilter('a');
+  assert.equal(renders,0,'same transport skips full render');assert.equal(updates,1);
+  box.setDeviceFilter('b');
+  assert.equal(renders,1,'M-02: switching to another host transport triggers render() to rebind screen ctx');
+  assert.equal(updates,1,'M-02: render() replaces stale screen.update()');
+  box.setDeviceFilter('all');
+  assert.equal(renders,1,'all filter preserves current transport without full remount');assert.equal(updates,2);
+
+  // workspaces.js passes hostId to ctx.createSessionForHost when starting a session on a sessionless workspace.
+  const wf=fixture('workspaces');
+  const createdForHost=[];
+  wf.ctx.createSessionForHost=(hostId,group,agent,req)=>{createdForHost.push({hostId,workspace:group.key,agent,req});return Promise.resolve();};
+  const hB={id:'host-b',name:'MacBook',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{workspace_create:true},agents:[{id:'claude',name:'Claude'}],repositories:[{key:'r1',label:'Repo'}],workspaces:[{key:'w-empty',repo_key:'r1',label:'Empty',path:'/tmp/e'}],sessions:[]}};
+  wf.ctx.connections=[hB];
+  wf.state.groups=new Map([['w-empty',{key:'w-empty',label:'Empty',path:'/tmp/e',repoKey:'r1',sessions:[]}]]);
+  wf.view.update();
+  const row=wf.all().find(n=>n.dataset.group==='w-empty');
+  assert(row,'sessionless workspace row rendered');
+  await row.action();
+  const sheetBody=wf.ctx.el('div');
+  wf.sheets.at(-1)[3](sheetBody);
+  await sheetBody.querySelector('.new-tab-tile').action();
+  assert.equal(createdForHost.length,1);
+  assert.equal(createdForHost[0].hostId,'host-b');
+  assert.equal(createdForHost[0].workspace,'w-empty');
+  wf.abort.abort();
+ }
+
+ // M-03 & M-05: client.js pool forwards onChatPush to active handler; isRead covers chat_composer + 13 bots.* read actions.
+ {
+  const cBox=vm.createContext({
+   TextEncoder,TextDecoder,Uint8Array,DataView,URL,URLSearchParams,AbortController,Map,Set,Promise,Error,Date,Math,JSON,Number,String,Array,Object,RegExp,
+   setTimeout,clearTimeout,crypto:{getRandomValues:b=>b.fill(1)},
+   MkCrypto:{enc:new TextEncoder(),dec:new TextDecoder(),hex:()=>'00',unhex:()=>new Uint8Array(32),sha256:()=>new Uint8Array(32),concat:(...a)=>new Uint8Array(0),Channel:class{}},
+  });
+  vm.runInContext(clientSrc,cBox);
+  const captured=[],received=[];
+  const endpoint={
+   profiles:()=>[{id:'h1',name:'One',active:true}],
+   forHost:()=>({credentials:{device_id:'d1',credential:'c1'},describeHost(){}}),
+  };
+  const pool=cBox.KrillMobile.transport.pool({
+   endpoint,
+   onChatPush:(entry,payload)=>received.push({id:entry.id,payload}),
+   create:opts=>{captured.push(opts);return {connect(){},close(){},resume(){},updateBusy:false};},
+  });
+  pool.sync();
+  assert.equal(captured.length,1);
+  assert.equal(typeof captured[0].onChatPush,'function','M-03: pool passes onChatPush to transport.create');
+  captured[0].onChatPush({push:'chat_delta',session:7,items:[]});
+  assert.equal(received.length,1);
+  assert.equal(received[0].id,'h1');
+  assert.equal(received[0].payload.push,'chat_delta');
+  pool.close();
+  captured[0].onChatPush({push:'chat_stale',session:7});
+  assert.equal(received.length,1,'M-03: closed pool ignores late chat pushes');
+  assert(appSrc.includes('onChatPush:(entry,p)=>{if(entry.transport===transport&&entry.id===activeView?.id)M.chat?.onPush?.(p);}'),'M-03: app.js wires pool onChatPush to M.chat.onPush for active host only');
+
+  // M-05: verify isRead() via transport.rpcLatest (closed transport rejects reads immediately without 20s reconnect wait).
+  const tr=cBox.KrillMobile.transport.create({credentials:{device_id:'d1',credential:'c1'},url:'wss://example.test/ws',warmTerminal:false});
+  tr.close();
+  const readActions=['chat_composer','bots.list','bots.templates','bots.models','bots.upcoming','bots.items','bots.access.list','bots.connectors.status','bots.groups.list','bots.groups.read','bots.suggestions.list','bots.avatar.read','bots.soul.get','bots.memory.get'];
+  for(const action of readActions){
+   const p=tr.rpcLatest('k:'+action,{action});
+   let err=null;try{await p;}catch(e){err=e;}
+   assert(err&&!/Only reads can be coalesced/.test(err.message),`M-05: ${action} must be treated as a read action, got: ${err?.message}`);
+  }
+  await assert.rejects(()=>tr.rpcLatest('mut',{action:'bots.update'}),/Only reads can be coalesced/,'M-05: mutations remain non-read');
+ }
+
+ // M-04 & M-08: multi-host bots.groups.create, bots.access.redeem, and multi-host cursor pagination (bots.list & bots.items).
+ {
+  const hostCalls=[];
+  const h1={id:'h1',name:'Mac Mini',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true},agents:[{id:'claude',name:'Claude'}]}};
+  const h2={id:'h2',name:'MacBook',active:false,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true},agents:[{id:'codex',name:'Codex'}]}};
+  const bf=fixture('bots',{state:{snapshot:{capabilities:{bots:true}}}});
+  bf.ctx.connections=[h1,h2];
+  bf.ctx.rpcForHost=async(hid,req)=>{
+   hostCalls.push({hid,req});
+   if(req.action==='bots.list'){
+    if(hid==='h1')return req.cursor?{bots:[{id:'b1-p2',slug:'b1p2',name:'Mini Bot 2',agent_id:'claude'}],next_cursor:null}:{bots:[{id:'b1',slug:'b1',name:'Mini Bot 1',agent_id:'claude'}],next_cursor:'c-h1'};
+    if(hid==='h2')return req.cursor?{bots:[{id:'b2-p2',slug:'b2p2',name:'Book Bot 2',agent_id:'codex'}],next_cursor:null}:{bots:[{id:'b2',slug:'b2',name:'Book Bot 1',agent_id:'codex'}],next_cursor:'c-h2'};
+   }
+   if(req.action==='bots.items')return {items:[]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.connectors.status')return {statuses:[]};
+   if(req.action==='bots.groups.list')return {groups:[]};
+   return {};
+  };
+  bf.view.update();
+  await bf.flush();
+  assert(bf.root.textContent.includes('Mini Bot 1')&&bf.root.textContent.includes('Book Bot 1'));
+
+  // M-08 bots.list: Load more drains h1 cursor, then keeps Load more to drain h2 cursor.
+  assert(bf.byText('Load more'),'M-08: Load more shown when hosts have cursors');
+  await bf.byText('Load more').action();
+  await bf.flush();
+  assert(bf.root.textContent.includes('Mini Bot 2'),'M-08: h1 page 2 loaded');
+  assert(bf.byText('Load more'),'M-08: Load more remains visible for h2 cursor');
+  await bf.byText('Load more').action();
+  await bf.flush();
+  assert(bf.root.textContent.includes('Book Bot 2'),'M-08: h2 page 2 loaded');
+  assert(!bf.byText('Load more'),'M-08: Load more hides only after all host cursors drain');
+
+  // M-04 groups.create: host selector filters bots to chosen host and calls rpcForHost(hid).
+  await bf.byText('+ New group').action();
+  const grpBody=bf.ctx.el('div');
+  bf.sheets.at(-1)[3](grpBody);
+  const grpHostSel=grpBody.querySelector('select');
+  assert(grpHostSel,'M-04: group sheet shows desktop selector for multi-host');
+  grpHostSel.value='h2';
+  emit(grpHostSel,'change');
+  assert(grpBody.textContent.includes('Book Bot 1')&&!grpBody.textContent.includes('Mini Bot 1'),'M-04: group sheet only lists bots from selected host');
+  grpBody.querySelector('input').value='Book Squad';
+  await grpBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Create Group').action();
+  assert(hostCalls.some(c=>c.hid==='h2'&&c.req.action==='bots.groups.create'&&c.req.name==='Book Squad'&&c.req.bot_ids.every(id=>id.startsWith('b2'))),'M-04: bots.groups.create targets selected host with only its bots');
+
+  // M-04 access.redeem: host selector in .bots-redeem-form targets chosen host via rpcForHost.
+  const redeemForm=bf.find('.bots-redeem-form');
+  const redeemSel=redeemForm.querySelector('select');
+  assert(redeemSel,'M-04: access redeem form shows desktop selector for multi-host');
+  redeemSel.value='h2';
+  emit(redeemSel,'change');
+  const redeemInput=redeemForm.querySelector('input');
+  redeemInput.value='PAIR-H2';
+  await bf.byText('Redeem').action();
+  assert(hostCalls.some(c=>c.hid==='h2'&&c.req.action==='bots.access.redeem'&&c.req.code==='PAIR-H2'),'M-04: bots.access.redeem targets selected host');
+  bf.abort.abort();
+ }
+
+ // M-07 & M-08 (up-next): status:"needs_you", Closed/Snoozed client filtering, legacy daemon fallback, and multi-host items pagination.
+ {
+  const itemCalls=[];
+  const futureMs=Date.now()+3600000;
+  const pastMs=Date.now()-60000;
+  const h1={id:'h1',name:'Mini',active:true,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true},sessions:[],orchestration:{}}};
+  const h2={id:'h2',name:'Book',active:false,connection:{phase:'ready'},cached:false,snapshot:{capabilities:{bots:true},sessions:[],orchestration:{}}};
+  const uf=fixture('up-next',{state:{snapshot:{capabilities:{bots:true}}}});
+  uf.ctx.connections=[h1,h2];
+  uf.ctx.rpcForHost=async(hid,req)=>{
+   itemCalls.push({hid,req});
+   if(req.action==='bots.list')return {bots:[{id:'b1',name:'Bot 1'}]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   if(req.action==='bots.items'){
+    if(req.status==='needs_you'){
+     if(hid==='h1')return req.cursor?{items:[{uid:'n1-p2',owner_bot_id:'b1',title:'Needs H1 P2',status:'needs_you'}],next_cursor:null}:{items:[{uid:'n1',owner_bot_id:'b1',title:'Needs H1',status:'needs_you'}],next_cursor:'ih1'};
+     return req.cursor?{items:[{uid:'n2-p2',owner_bot_id:'b1',title:'Needs H2 P2',status:'needs_you'}],next_cursor:null}:{items:[{uid:'n2',owner_bot_id:'b1',title:'Needs H2',status:'needs_you'}],next_cursor:'ih2'};
+    }
+    if(req.include_closed){
+     return {items:[
+      {uid:'open-1',owner_bot_id:'b1',title:'Open Leak',status:'working'},
+      {uid:'done-1',owner_bot_id:'b1',title:'Done Item',status:'done'},
+      {uid:'can-1',owner_bot_id:'b1',title:'Canceled Item',status:'canceled'},
+     ],next_cursor:null};
+    }
+    if(req.include_snoozed){
+     return {items:[
+      {uid:'unsnoozed',owner_bot_id:'b1',title:'Active Leak',status:'planned',snoozed_until_ms:null},
+      {uid:'expired',owner_bot_id:'b1',title:'Expired Snooze',status:'planned',snoozed_until_ms:pastMs},
+      {uid:'snoozed-1',owner_bot_id:'b1',title:'Real Snoozed',status:'planned',snoozed_until_ms:futureMs},
+     ],next_cursor:null};
+    }
+    return {items:[],next_cursor:null};
+   }
+   return {};
+  };
+  uf.view.update();
+  await uf.flush();
+  assert(itemCalls.some(c=>c.req.action==='bots.items'&&c.req.status==='needs_you'),'M-07: Needs You sends status:"needs_you"');
+  assert(uf.byText('Load more'),'M-08: up-next Load more shown');
+  await uf.byText('Load more').action();
+  await uf.flush();
+  assert(uf.root.textContent.includes('Needs H1 P2')&&uf.byText('Load more'),'M-08: up-next keeps Load more for h2');
+  await uf.byText('Load more').action();
+  await uf.flush();
+  assert(uf.root.textContent.includes('Needs H2 P2')&&!uf.byText('Load more'),'M-08: up-next drains all host cursors');
+
+  // Closed filter renders only done/canceled items.
+  await uf.byText('Closed').action();
+  await uf.flush();
+  assert(uf.root.textContent.includes('Done Item')&&uf.root.textContent.includes('Canceled Item'),'M-07: Closed shows done & canceled');
+  assert(!uf.root.textContent.includes('Open Leak'),'M-07: Closed excludes open items');
+
+  // Snoozed filter renders only items with snoozed_until_ms > Date.now().
+  await uf.byText('Snoozed').action();
+  await uf.flush();
+  assert(uf.root.textContent.includes('Real Snoozed'),'M-07: Snoozed shows future-snoozed items');
+  assert(!uf.root.textContent.includes('Active Leak')&&!uf.root.textContent.includes('Expired Snooze'),'M-07: Snoozed excludes unsnoozed/expired items');
+  uf.abort.abort();
+
+  // Legacy daemon fallback when bots.items rejects unknown field `status` definitively.
+  const legacyCalls=[];
+  const lf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    legacyCalls.push(req);
+    if(req.action==='bots.items'){
+     if(req.status)throw Object.assign(Error('unknown field `status`'),{definitive:true});
+     return {items:[{uid:'ny',owner_bot_id:'b1',title:'Legacy Needs',status:'needs_you'},{uid:'wk',owner_bot_id:'b1',title:'Legacy Working',status:'working'}]};
+    }
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1'}]};
+    return {requests:[],suggestions:[]};
+   },
+  });
+  await lf.flush();
+  assert(legacyCalls.some(c=>c.action==='bots.items'&&c.status==='needs_you'));
+  assert(legacyCalls.some(c=>c.action==='bots.items'&&!('status' in c)),'M-07: retries without status on definitive rejection');
+  assert(lf.root.textContent.includes('Legacy Needs')&&!lf.root.textContent.includes('Legacy Working'),'M-07: client filter still isolates needs_you on legacy daemon');
+  lf.abort.abort();
+ }
+
+ // M-09: sync-throwing refreshHost/rpc does not crash openCreateBotSheet, mountBotDetail, or details.js accounts panel.
+ {
+  const sf=fixture('bots',{
+   route:{botId:'b1'},
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'Bot 1',agent_id:'claude'}]};
+    if(req.action==='bots.models')throw Error('Screen target changed');
+    if(req.action==='bots.update')return {bot:{id:'b1',name:'Bot 1',agent_id:'claude'}};
+    return {items:[],statuses:[],suggestions:[],requests:[]};
+   },
+  });
+  sf.ctx.refreshHost=()=>{throw Error('Screen target changed');};
+  await sf.flush();
+  await sf.byText('Agent').action();
+  const body=sf.ctx.el('div');
+  assert.doesNotThrow(()=>sf.sheets.at(-1)[3](body),'M-09: bots.models sync throw caught in Agent sheet');
+  const saveBtn=body.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Save');
+  await assert.doesNotReject(()=>saveBtn.action(),'M-09: sync-throwing refreshHost after bots.update does not fail save');
+  sf.abort.abort();
+
+  const af=fixture('accounts',{rpc:req=>req.action==='switch_account'?{accounts:[{id:'a1',provider:'Claude',email:'a@b.c',active:true,host_default:true}],statuses:[]}:{accounts:[{id:'a1',provider:'Claude',email:'a@b.c',active:false,host_default:true}],statuses:[]}});
+  af.ctx.refresh=()=>{throw Error('Screen target changed');};
+  await af.flush();
+  await assert.doesNotReject(async()=>{await af.find('.account-row').action();await af.flush();},'M-09: details.js accounts panel swallows sync-throwing refresh after switch_account');
+  assert.equal(af.errors.length,0,'M-09: accounts switch reports no spurious error on sync-throwing refresh');
+  af.abort.abort();
+ }
+
+ // M-10 & M-12: single-host fallback (h.id === null) group toggle/active/refresh + focus/draft/select preservation across draw().
+ {
+  let groupReads=0;
+  const f=fixture('bots',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',slug:'triage',name:'Triage',agent_id:'claude'}]};
+    if(req.action==='bots.items')return {items:[]};
+    if(req.action==='bots.access.list')return {requests:[]};
+    if(req.action==='bots.connectors.status')return {statuses:[]};
+    if(req.action==='bots.groups.list')return {groups:[{id:'grp-1',name:'Core',bot_ids:['b1']}]};
+    if(req.action==='bots.groups.read'){groupReads++;return {group:{group:{id:'grp-1',name:'Core',bot_ids:['b1']},threads:[{thread_id:'t1',title:'Main'}],messages:[{sender_name:'Triage',body:'Hi'}],active_run:false}};}
+    return {};
+   },
+  });
+  await f.flush();
+  // M-10: open group in single-host fallback -> .active class set -> refresh reloads group -> re-click collapses without re-fetching.
+  await f.find('.bots-group-row').action();
+  await f.flush();
+  assert.equal(groupReads,1);
+  assert(f.find('.bots-group-row').classList.contains('active'),'M-10: single-host fallback marks open group row .active');
+  assert(f.find('.bot-group-panel'),'M-10: group panel opens');
+
+  // M-12: codeInput, modeSelect, and groupTextarea preserve DOM identity, focus, value, and selection across background draw().
+  const codeInput=f.find('.bots-redeem-form').querySelector('input');
+  codeInput.value='UNSAVED-CODE';
+  codeInput.focus();
+  const modeSel=f.find('.bot-group-panel').querySelector('select');
+  modeSel.value='all';
+  emit(modeSel,'change');
+  const grpArea=f.find('.bot-group-panel').querySelector('textarea');
+  grpArea.value='draft in progress';
+  emit(grpArea,'input');
+  f.view.update();
+  assert.equal(f.find('.bots-redeem-form').querySelector('input'),codeInput,'M-12: codeInput node reused across draw');
+  assert.equal(codeInput.value,'UNSAVED-CODE','M-12: codeInput value preserved across draw');
+  assert.equal(f.doc.activeElement,codeInput,'M-12: codeInput focus preserved across draw');
+  assert.equal(f.find('.bot-group-panel').querySelector('select').value,'all','M-12: group reply mode preserved across draw');
+  grpArea.focus();
+  f.view.update();
+  assert.equal(f.find('.bot-group-panel').querySelector('textarea'),grpArea,'M-12: group textarea reused across draw');
+  assert.equal(f.doc.activeElement,grpArea,'M-12: group textarea focus preserved across draw');
+  assert.equal(grpArea.value,'draft in progress');
+
+  // M-10: refresh reloads active group on single-host fallback.
+  await f.byText('Refresh').action();
+  await f.flush();
+  assert.equal(groupReads,2,'M-10: refresh reloads active group in single-host fallback');
+
+  // M-10: clicking active group row again collapses it instead of re-fetching.
+  await f.find('.bots-group-row').action();
+  await f.flush();
+  assert.equal(groupReads,2,'M-10: re-clicking active group does not re-fetch');
+  assert.equal(f.find('.bot-group-panel'),null,'M-10: re-clicking active group collapses panel');
+  f.abort.abort();
+
+  // M-12: up-next item textarea keeps focus across background draw().
+  const uf=fixture('up-next',{
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'B1'}]};
+    if(req.action==='bots.items')return {items:[{uid:'i1',owner_bot_id:'b1',title:'Check',status:'needs_you'}]};
+    return {requests:[],suggestions:[]};
+   },
+  });
+  await uf.flush();
+  const commentArea=uf.find('.bot-item-card').querySelector('textarea');
+  commentArea.focus();commentArea.value='typing comment';emit(commentArea,'input');
+  uf.view.update();
+  assert.equal(uf.find('.bot-item-card').querySelector('textarea'),commentArea,'M-12: item textarea reused in place');
+  assert.equal(uf.doc.activeElement,commentArea,'M-12: item textarea keeps focus on draw()');
+  assert.equal(commentArea.value,'typing comment');
+  uf.abort.abort();
+
+  // M-12 & M-15: mountBotDetail keeps External reply + SOUL.md/MEMORY.md focus across draw() AND maps error_category cleanly.
+  const df=fixture('bots',{
+   route:{botId:'b1'},
+   state:{snapshot:{capabilities:{bots:true}}},
+   rpc:req=>{
+    if(req.action==='bots.list')return {bots:[{id:'b1',name:'Bot 1',agent_id:'claude'}]};
+    if(req.action==='bots.items')return {items:[]};
+    if(req.action==='bots.connectors.status')return {statuses:[
+     {bot_id:'b1',source:'telegram',state:'error',error_category:'signed_out'},
+     {bot_id:'b1',source:'slack',state:'error',error_category:'usage_limit'},
+     {bot_id:'b1',source:'discord',state:'error',error_category:'not_set_up'},
+     {bot_id:'b1',source:'gmail',state:'error',error_category:'folder_missing'},
+     {bot_id:'b1',source:'linear',state:'error',error_category:'agent_error'},
+    ]};
+    if(req.action==='bots.soul.get')return {content:'# Initial Soul'};
+    if(req.action==='bots.memory.get')return {content:'- Fact 1'};
+    return {suggestions:[],requests:[]};
+   },
+  });
+  await df.flush();
+  for(const label of ['Signed out','Usage limit reached','Not set up','Folder missing','Agent error']){
+   assert(df.root.textContent.includes(label),`M-15: connector status renders human label "${label}"`);
+  }
+  for(const raw of ['signed_out','usage_limit','not_set_up','folder_missing','agent_error']){
+   assert(!df.root.textContent.includes(raw),`M-15: raw enum "${raw}" must not appear in UI`);
+  }
+  const replyArea=df.find('.bot-reply-card').querySelector('textarea');
+  replyArea.focus();replyArea.value='draft reply';emit(replyArea,'input');
+  df.view.update();
+  assert.equal(df.find('.bot-reply-card').querySelector('textarea'),replyArea,'M-12: external reply textarea reused');
+  assert.equal(df.doc.activeElement,replyArea,'M-12: external reply textarea keeps focus on draw()');
+  await df.byText('Load').action();
+  await df.flush();
+  const [soulArea,memArea]=df.find('.bot-docs-card').querySelectorAll('textarea');
+  soulArea.focus();soulArea.value='# Edited Soul';emit(soulArea,'input');
+  df.view.update();
+  assert.equal(df.find('.bot-docs-card').querySelectorAll('textarea')[0],soulArea,'M-12: SOUL.md textarea reused');
+  assert.equal(df.doc.activeElement,soulArea,'M-12: SOUL.md textarea keeps focus on draw()');
+  assert.equal(soulArea.value,'# Edited Soul');
+  memArea.focus();memArea.value='- Edited Fact';emit(memArea,'input');
+  df.view.update();
+  assert.equal(df.find('.bot-docs-card').querySelectorAll('textarea')[1],memArea,'M-12: MEMORY.md textarea reused');
+  assert.equal(df.doc.activeElement,memArea,'M-12: MEMORY.md textarea keeps focus on draw()');
+  df.abort.abort();
+ }
+
+ // M-13: showConnection() keeps #connection-banner visible on main tabs when phase === 'auth_required'.
+ {
+  const showLine=appSrc.split('\n').find(l=>l.includes('function showConnection('));
+  const f=fixture('home'),E=f.root.constructor;
+  const banner=new E('div'),notice=new E('div');
+  const box=vm.createContext({
+   state:{connection:{phase:'idle',message:''},logs:[],cached:false},
+   endpoint:{profiles:()=>[{id:'h1',name:'PC',active:true}]},
+   banner,notice,activeRouteScreen:'bots',pendingHostAction:null,
+   el:(...v)=>new E(...v),t:s=>s,button:(l,a,c)=>new E('button',l,c),
+   transport:{reconnect(){}},scanQr(){},hideNotice(){},update(){},Date,Math,
+  });
+  vm.runInContext(showLine+'\nglobalThis.showConnection=showConnection;',box);
+  box.showConnection({phase:'disconnected',message:'Disconnected'});
+  assert.equal(banner.hidden,true,'M-13: main tab hides banner on ordinary disconnect');
+  box.showConnection({phase:'auth_required',message:'Sign in again'});
+  assert.equal(banner.hidden,false,'M-13: main tab shows banner on auth_required');
+  f.abort.abort();
+ }
+
+ // M-14: app.css defines spacing layout for .bots-items-list and .bot-item-decisions.
+ assert(/\.bots-items-list,\.bot-item-decisions\{display:flex;flex-direction:column;gap:10px\}/.test(cssSrc),'M-14: .bots-items-list and .bot-item-decisions gap rules present');
+
+ // M-15: i18n.js provides Korean translations for all 5 connector error categories.
+ {
+  const iBox=vm.createContext({navigator:{language:'ko'}});
+  vm.runInContext(i18nSrc,iBox);
+  for(const key of ['Signed out','Usage limit reached','Not set up','Folder missing','Agent error']){
+   const ko=iBox.KrillMobile.i18n.dictionary[key];
+   assert(typeof ko==='string'&&ko.length>0&&ko!==key,`M-15: Korean translation exists for "${key}"`);
+  }
+ }
+ console.log('PASS mobile audit wave 2 regressions: M-01..M-10, M-12..M-15');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

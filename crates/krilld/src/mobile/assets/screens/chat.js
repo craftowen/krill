@@ -3015,12 +3015,28 @@ if (!disposed) updateComposer();
 stopCooldownTimer?.unref?.();
 updateComposer();
 run(async () => {
+try {
 const res = await ctx.rpc({ action: "interrupt", session: sessionId });
-if (res?.interrupted === false && ownsEntry()) {
-await ctx.refresh?.();
+if (res?.interrupted === false) {
+entry.stopping = false;
+entry.stopStamp = null;
+if (!disposed) updateComposer();
+else entry.notifyComposer?.();
+if (ownsEntry()) await ctx.refresh?.();
 } else if (!disposed) {
 await pollNow();
 await ctx.refresh?.();
+}
+} catch (err) {
+entry.stopping = false;
+entry.stopStamp = null;
+entry.stopCooldownUntil = 0;
+entry.stopCooldownStamp = null;
+clearTimeout(stopCooldownTimer);
+stopCooldownTimer = null;
+if (!disposed) updateComposer();
+else entry.notifyComposer?.();
+throw err;
 }
 });
 });
@@ -4888,10 +4904,12 @@ subscribed = false;
 subscribedOffset = null;
 subscribedConn = null;
 schedule();
-if (state.connection?.phase === "ready") {
-ctx
-.rpc({ action: "chat_unsubscribe", session: sessionId })
-.catch(() => {});
+if (!state.cached && state.connection?.phase === "ready") {
+try {
+Promise.resolve(
+ctx.rpc({ action: "chat_unsubscribe", session: sessionId }),
+).catch(() => {});
+} catch {}
 }
 }
 return;
@@ -4907,16 +4925,21 @@ subscribedOffset = entry.offset;
 subscribedConn = connGen;
 schedule();
 const sentOffset = entry.offset;
-ctx
-.rpc({ action: "chat_subscribe", session: sessionId, offset: sentOffset })
-.catch(() => {
+const clearSub = () => {
 if (subscribedOffset === sentOffset && subscribedConn === connGen) {
 subscribed = false;
 subscribedOffset = null;
 subscribedConn = null;
 schedule();
 }
-});
+};
+try {
+Promise.resolve(
+ctx.rpc({ action: "chat_subscribe", session: sessionId, offset: sentOffset }),
+).catch(clearSub);
+} catch {
+clearSub();
+}
 }
 function applyPollPayload(
 res,
@@ -5431,10 +5454,13 @@ if (subscribed) {
 subscribed = false;
 subscribedOffset = null;
 subscribedConn = null;
-if (state.connection?.phase === "ready")
-ctx
-.rpc({ action: "chat_unsubscribe", session: sessionId })
-.catch(() => {});
+if (!state.cached && state.connection?.phase === "ready") {
+try {
+Promise.resolve(
+ctx.rpc({ action: "chat_unsubscribe", session: sessionId }),
+).catch(() => {});
+} catch {}
+}
 }
 if (panelOpen(replyPanel)) ctx.closeSheet?.();
 entry.mounts = Math.max(0, (entry.mounts || 1) - 1);

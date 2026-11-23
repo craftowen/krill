@@ -790,13 +790,15 @@ pub fn export_bot_home_zip(
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if Path::new(&name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                {
-                    let content = read_bounded_utf8_file(&path, &name, MAX_ZIP_ENTRY_BYTES)?;
-                    memory_topics.insert(name, content);
+                if name.starts_with('.') {
+                    continue;
                 }
+                let archive_path = format!("memory/{name}");
+                if validate_bot_package_path(&archive_path).is_err() {
+                    continue;
+                }
+                let content = read_bounded_utf8_file(&path, &name, MAX_ZIP_ENTRY_BYTES)?;
+                memory_topics.insert(name, content);
             }
         }
     }
@@ -984,12 +986,19 @@ fn collect_text_files_inner(
         .map_err(|err| PackageError::Io(format!("read {}: {err}", current.display())))?;
     for entry in iter {
         let entry = entry.map_err(|err| PackageError::Io(err.to_string()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
         let path = entry.path();
         let meta = fs::symlink_metadata(&path).map_err(|err| PackageError::Io(err.to_string()))?;
         if meta.file_type().is_symlink() {
             continue;
         }
         if meta.is_dir() {
+            if depth == 0 && validate_bot_slug(&name).is_err() {
+                continue;
+            }
             collect_text_files_inner(root, &path, out, visited, depth.saturating_add(1))?;
         } else if meta.is_file() {
             let rel = path
@@ -1000,6 +1009,10 @@ fn collect_text_files_inner(
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
+            let archive_path = format!("skills/{rel_str}");
+            if validate_bot_package_path(&archive_path).is_err() {
+                continue;
+            }
             if !visited.insert(rel_str.clone()) {
                 continue;
             }

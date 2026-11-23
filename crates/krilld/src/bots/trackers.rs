@@ -98,17 +98,10 @@ pub fn poll_github_bot(
                     .with_ssrf_policy(policy_for_url(&url)),
             )
             .map_err(|err| tracker_transport_err("GitHub", &err))?;
-            if resp.status == 401 || resp.status == 403 {
-                return Err(BotErrorDetail {
-                    category: BotErrorCategory::SignedOut,
-                    agent_name: None,
-                    message: format!("GitHub authentication failed (HTTP {})", resp.status),
-                    resets_at_ms: None,
-                });
+            if !resp.is_success() {
+                return Err(github_http_error(&resp));
             }
-            if resp.is_success()
-                && let Ok(list) = resp.json::<Vec<serde_json::Value>>()
-            {
+            if let Ok(list) = resp.json::<Vec<serde_json::Value>>() {
                 for notif in list {
                     let title = notif
                         .get("subject")
@@ -165,17 +158,10 @@ pub fn poll_github_bot(
                         .with_ssrf_policy(policy_for_url(&prs_url)),
                 )
                 .map_err(|err| tracker_transport_err("GitHub", &err))?;
-                if resp.status == 401 || resp.status == 403 {
-                    return Err(BotErrorDetail {
-                        category: BotErrorCategory::SignedOut,
-                        agent_name: None,
-                        message: format!("GitHub authentication failed (HTTP {})", resp.status),
-                        resets_at_ms: None,
-                    });
+                if !resp.is_success() {
+                    return Err(github_http_error(&resp));
                 }
-                if resp.is_success()
-                    && let Ok(prs) = resp.json::<Vec<serde_json::Value>>()
-                {
+                if let Ok(prs) = resp.json::<Vec<serde_json::Value>>() {
                     for pr in prs {
                         created = created.saturating_add(ingest_github_pr(
                             items, &bot.id, repo, &pr, &actor, current_ms,
@@ -192,20 +178,10 @@ pub fn poll_github_bot(
                         .with_ssrf_policy(policy_for_url(&issues_url)),
                 )
                 .map_err(|err| tracker_transport_err("GitHub", &err))?;
-                if issues_resp.status == 401 || issues_resp.status == 403 {
-                    return Err(BotErrorDetail {
-                        category: BotErrorCategory::SignedOut,
-                        agent_name: None,
-                        message: format!(
-                            "GitHub authentication failed (HTTP {})",
-                            issues_resp.status
-                        ),
-                        resets_at_ms: None,
-                    });
+                if !issues_resp.is_success() {
+                    return Err(github_http_error(&issues_resp));
                 }
-                if issues_resp.is_success()
-                    && let Ok(issues) = issues_resp.json::<Vec<serde_json::Value>>()
-                {
+                if let Ok(issues) = issues_resp.json::<Vec<serde_json::Value>>() {
                     for issue in issues {
                         created = created.saturating_add(ingest_github_issue(
                             items, &bot.id, repo, &issue, &actor, current_ms,
@@ -285,9 +261,8 @@ pub fn poll_github_bot(
                 }
             }
             let issues_endpoint = format!("repos/{repo}/issues?state=open&per_page=10");
-            if let Ok(issues_json) = run_gh_cli(&["api", &issues_endpoint])
-                && let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&issues_json)
-            {
+            let issues_json = run_gh_cli(&["api", &issues_endpoint])?;
+            if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&issues_json) {
                 for issue in issues {
                     created = created.saturating_add(ingest_github_issue(
                         items, &bot.id, repo, &issue, &actor, current_ms,
@@ -412,7 +387,9 @@ fn ingest_github_pr(
     ))
 }
 
-fn drain_bounded_pipe<R: io::Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+fn drain_bounded_pipe<R: io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> io::Result<JoinHandle<Vec<u8>>> {
     thread::Builder::new()
         .name("bot-gh-pipe".to_owned())
         .stack_size(64 * 1024)
@@ -437,7 +414,6 @@ fn drain_bounded_pipe<R: io::Read + Send + 'static>(pipe: Option<R>) -> JoinHand
             }
             out
         })
-        .unwrap_or_else(|_| thread::spawn(Vec::new))
 }
 
 fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
@@ -455,8 +431,31 @@ fn run_gh_cli(args: &[&str]) -> Result<String, BotErrorDetail> {
         })?;
 
     // Drain stdout & stderr concurrently BEFORE waiting so >64 KiB output never deadlocks pipes.
-    let stdout_handle = drain_bounded_pipe(child.stdout.take());
-    let stderr_handle = drain_bounded_pipe(child.stderr.take());
+    let stdout_handle = match drain_bounded_pipe(child.stdout.take()) {
+        Ok(h) => h,
+        Err(err) => {
+            krill_proto::os::kill_tree(&mut child);
+            return Err(BotErrorDetail {
+                category: BotErrorCategory::AgentError,
+                agent_name: None,
+                message: format!("failed to spawn gh stdout drain thread: {}", err.kind()),
+                resets_at_ms: None,
+            });
+        }
+    };
+    let stderr_handle = match drain_bounded_pipe(child.stderr.take()) {
+        Ok(h) => h,
+        Err(err) => {
+            krill_proto::os::kill_tree(&mut child);
+            stdout_handle.join().ok();
+            return Err(BotErrorDetail {
+                category: BotErrorCategory::AgentError,
+                agent_name: None,
+                message: format!("failed to spawn gh stderr drain thread: {}", err.kind()),
+                resets_at_ms: None,
+            });
+        }
+    };
 
     let deadline = Instant::now() + GH_TIMEOUT;
     let status = loop {
@@ -685,6 +684,33 @@ fn is_valid_github_repo(repo: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn github_http_error(resp: &http_client::HttpResponse) -> BotErrorDetail {
+    if resp.status == 429
+        || (resp.status == 403 && resp.header("x-ratelimit-remaining") == Some("0"))
+    {
+        return BotErrorDetail {
+            category: BotErrorCategory::UsageLimit,
+            agent_name: None,
+            message: format!("GitHub API rate limited (HTTP {})", resp.status),
+            resets_at_ms: None,
+        };
+    }
+    if resp.status == 401 || resp.status == 403 {
+        return BotErrorDetail {
+            category: BotErrorCategory::SignedOut,
+            agent_name: None,
+            message: format!("GitHub authentication failed (HTTP {})", resp.status),
+            resets_at_ms: None,
+        };
+    }
+    BotErrorDetail {
+        category: BotErrorCategory::AgentError,
+        agent_name: None,
+        message: format!("GitHub API returned HTTP {}", resp.status),
+        resets_at_ms: None,
+    }
 }
 
 fn tracker_transport_err(provider: &str, err: &io::Error) -> BotErrorDetail {
@@ -1499,6 +1525,64 @@ mod tests {
         let lin_res = test_linear(&bot, &secrets, &endpoints);
         assert!(lin_res.ok);
         assert_eq!(lin_res.account_label.as_deref(), Some("owen@example.com"));
+
+        srv.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn poll_github_propagates_404_429_and_5xx_errors_instead_of_reporting_ok() {
+        let dir = temp_dir("gh-non-2xx");
+        let secrets = SecretVault::with_static_key(dir.clone(), [0x33; 32]);
+        let items = BotItemsStore::new(dir.join("items.db"));
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+
+        let srv = thread::spawn(move || {
+            let responses = [
+                ("404 Not Found", r#"{"message":"Not Found"}"#),
+                ("429 Too Many Requests", r#"{"message":"rate limit"}"#),
+                ("502 Bad Gateway", r#"{"message":"upstream down"}"#),
+            ];
+            for (status, body) in responses {
+                let (mut sock, _) = mock.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                assert!(n > 0);
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+
+        let bot_id = BotId::new("bot-gh-non2xx").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "GhNon2xx", "claude", 1_000).unwrap();
+        bot.connectors.github.repos = vec!["acme/missing".to_owned()];
+        secrets
+            .set_secret(&bot_id, "github_token", Zeroizing::new("ghp_1".to_owned()))
+            .unwrap();
+        let endpoints = TrackerEndpoints {
+            github_api_base: format!("http://{addr}"),
+            linear_graphql_url: format!("http://{addr}/graphql"),
+        };
+
+        // 404 -> AgentError
+        let e404 = poll_github_bot(&bot, &secrets, &items, &endpoints, 1_000).unwrap_err();
+        assert_eq!(e404.category, BotErrorCategory::AgentError);
+        assert!(e404.message.contains("404"));
+
+        // 429 -> UsageLimit
+        let e429 = poll_github_bot(&bot, &secrets, &items, &endpoints, 2_000).unwrap_err();
+        assert_eq!(e429.category, BotErrorCategory::UsageLimit);
+        assert!(e429.message.contains("429"));
+
+        // 502 on notifications -> AgentError
+        bot.connectors.github.repos.clear();
+        let e502 = poll_github_bot(&bot, &secrets, &items, &endpoints, 3_000).unwrap_err();
+        assert_eq!(e502.category, BotErrorCategory::AgentError);
+        assert!(e502.message.contains("502"));
 
         srv.join().unwrap();
         fs::remove_dir_all(&dir).ok();

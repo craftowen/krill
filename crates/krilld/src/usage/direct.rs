@@ -1754,6 +1754,8 @@ pub(crate) mod agy {
         if latched() {
             return None;
         }
+        let host = dir == accounts::host_default_dir(home, ProviderKind::Antigravity);
+        super::evict_if_credentials_changed(home, ProviderKind::Antigravity, dir, host);
         lock(&CACHE)
             .get(&(home.to_path_buf(), dir.to_path_buf()))
             .filter(|(at, _)| at.elapsed() < TTL)
@@ -1795,6 +1797,7 @@ pub(crate) mod agy {
             profiles.push((dir, false));
         }
         for (dir, host) in profiles {
+            super::evict_if_credentials_changed(home, ProviderKind::Antigravity, &dir, host);
             let key = (home.to_path_buf(), dir);
             if lock(&CACHE)
                 .get(&key)
@@ -1815,6 +1818,15 @@ pub(crate) mod agy {
         }
     }
 
+    fn record_failed(key: &Key) {
+        let mut failed = lock(&FAILED);
+        failed.retain(|_, at| at.elapsed() < TTL);
+        if failed.len() >= 256 {
+            failed.pop_first();
+        }
+        failed.insert(key.clone(), Instant::now());
+    }
+
     fn should_probe(dir: &Path, host: bool) -> bool {
         super::antigravity_auth(dir, host).is_some_and(|a| a.logged_in)
     }
@@ -1825,12 +1837,16 @@ pub(crate) mod agy {
             .name("agy-usage".into())
             .spawn(move || {
                 // An unauthenticated profile must never run `/usage` (it can
-                // start interactive OAuth). Keep this check off request threads.
+                // start interactive OAuth). Keep this check off request threads
+                // and serialized with `agy_native` host token mutations.
                 let started = Instant::now();
                 let authenticated = std::panic::catch_unwind(|| {
                     let file = accounts::load_file(&job.0, state.as_deref());
-                    accounts::agy_native::reconcile_host_to_profiles(&job.0, &file.accounts);
-                    should_probe(&job.1, host)
+                    accounts::agy_native::reconcile_host_to_profiles_then(
+                        &job.0,
+                        &file.accounts,
+                        || should_probe(&job.1, host),
+                    )
                 })
                 .unwrap_or(false);
                 if started.elapsed() >= Duration::from_secs(2) {
@@ -1841,7 +1857,11 @@ pub(crate) mod agy {
                         "agy authentication check slow"
                     );
                 }
+                let direct_key = (job.0.clone(), ProviderKind::Antigravity, job.1.clone());
                 if !authenticated {
+                    let digest = super::credential_digest(ProviderKind::Antigravity, &job.1, host);
+                    lock(&super::CREDENTIAL_DIGESTS).insert(direct_key, digest);
+                    record_failed(&job);
                     lock(&PENDING).remove(&job);
                     return;
                 }
@@ -1857,6 +1877,7 @@ pub(crate) mod agy {
                     lock(&PENDING).remove(&job);
                     return;
                 }
+                lock(&super::CREDENTIAL_DIGESTS).insert(direct_key, after);
                 if let Some((usage, meters)) = usage {
                     lock(&FAILED).remove(&job);
                     super::super::meters::remember(
@@ -1893,12 +1914,7 @@ pub(crate) mod agy {
                         ),
                     );
                 } else {
-                    let mut failed = lock(&FAILED);
-                    failed.retain(|_, at| at.elapsed() < TTL);
-                    if failed.len() >= 256 {
-                        failed.pop_first();
-                    }
-                    failed.insert(job.clone(), Instant::now());
+                    record_failed(&job);
                 }
                 lock(&PENDING).remove(&job);
             });
@@ -2439,26 +2455,62 @@ pub(crate) mod agy {
         }
 
         #[test]
-        fn signed_out_auth_worker_releases_pending_without_caching_failure() {
+        fn signed_out_auth_worker_caches_failure_until_credentials_change_or_evict() {
             let _serial = serial();
             reset_latch_for_tests();
-            let home =
+            let root =
                 std::env::temp_dir().join(format!("agy-auth-signed-out-{}", std::process::id()));
-            let key = (home.clone(), home.join("missing-profile"));
+            std::fs::remove_dir_all(&root).ok();
+            let home = root.join("home");
+            let profile = root.join("profile");
+            std::fs::create_dir_all(profile.join(".gemini/antigravity-cli")).unwrap();
+            let key = (home.clone(), profile.clone());
             assert!(lock(&PENDING).insert(key.clone()));
             spawn(&key, false, None);
             let deadline = Instant::now() + Duration::from_secs(2);
             while lock(&PENDING).contains(&key) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let pending = lock(&PENDING).contains(&key);
-            let failed = lock(&FAILED).contains_key(&key);
-            reset_latch_for_tests();
-            assert!(!pending, "signed-out authentication must release its job");
             assert!(
-                !failed,
-                "a subsequent login must not wait for the usage failure cooldown"
+                !lock(&PENDING).contains(&key),
+                "signed-out authentication must release its job"
             );
+            assert!(
+                lock(&FAILED).contains_key(&key),
+                "signed-out profile must be cached in FAILED to avoid re-spawning every poll"
+            );
+            let mut file = accounts::AccountsFile::default();
+            file.accounts.push(accounts::StoredAccount {
+                id: "agy-signed-out".into(),
+                provider: "agy".into(),
+                label: "SignedOut".into(),
+                email: None,
+                profile_dir: profile.display().to_string(),
+            });
+            let mut scheduled = Vec::new();
+            refresh_with(&home, None, &file, Duration::from_secs(300), |k, _, _| {
+                scheduled.push(k.clone());
+            });
+            assert!(
+                !scheduled.contains(&key),
+                "cached unauthenticated profile must not re-schedule within interval"
+            );
+            // Logging in writes the OAuth token; credential digest change must evict FAILED immediately.
+            std::fs::write(
+                profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+                br#"{"auth_method":"consumer","token":{"access_token":"fresh"}}"#,
+            )
+            .unwrap();
+            scheduled.clear();
+            refresh_with(&home, None, &file, Duration::from_secs(300), |k, _, _| {
+                scheduled.push(k.clone());
+            });
+            assert!(
+                scheduled.contains(&key),
+                "a subsequent login must immediately evict FAILED and re-schedule"
+            );
+            reset_latch_for_tests();
+            std::fs::remove_dir_all(root).ok();
         }
 
         const USAGE_ENVELOPE: &str = r#"{

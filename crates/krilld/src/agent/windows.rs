@@ -104,14 +104,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
     }
     // 셸은 에이전트 계정 env 없이, 세션 env(`MK_PANE_ID` 등)는 그대로 받는다.
     let login = crate::shell::Shell::Login.launch();
-    let Some((program, shell_args)) = login.argv.split_first() else {
+    let Some(mut shell) = fallback_shell_command(&login) else {
         return code;
     };
-    let mut shell = Command::new(OsStr::from_bytes(program));
-    shell
-        .args(shell_args.iter().map(|a| OsStr::from_bytes(a)))
-        .env_remove("KRILL_ACCOUNT_PROVIDER")
-        .env_remove("KRILL_ACCOUNT_DIR");
     match shell.status() {
         Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
         Err(error) => {
@@ -119,6 +114,29 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
             ExitCode::FAILURE
         }
     }
+}
+
+/// Windows 폴백 셸(`then_shell`)에 에이전트 계정 격리 변수가 누수되지 않도록 제거할 목록.
+#[cfg(any(windows, test))]
+const FALLBACK_SHELL_REMOVED_ENVS: &[&str] = &[
+    "KRILL_ACCOUNT_PROVIDER",
+    "KRILL_ACCOUNT_DIR",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "OPENCODE_DB",
+];
+
+#[cfg(any(windows, test))]
+fn fallback_shell_command(login: &Launch) -> Option<Command> {
+    let (program, shell_args) = login.argv.split_first()?;
+    let mut shell = Command::new(OsStr::from_bytes(program));
+    shell.args(shell_args.iter().map(|a| OsStr::from_bytes(a)));
+    for key in FALLBACK_SHELL_REMOVED_ENVS {
+        shell.env_remove(key);
+    }
+    Some(shell)
 }
 
 pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Option<Command> {

@@ -29,6 +29,7 @@ use super::{PaneId, Shell};
 
 /// 채팅 상태의 키. 세션 ID는 데몬마다 따로 세므로 로컬과 원격 세션 번호가 겹친다.
 pub(super) type ChatKey = (krill_app::hosts::HostId, SessionId);
+pub(super) type BotKey = (krill_app::hosts::HostId, krill_proto::bots::BotId);
 
 #[cfg(test)]
 pub(super) fn local_key(session: SessionId) -> ChatKey {
@@ -538,10 +539,14 @@ pub(super) struct ChatFindState {
 #[derive(Default)]
 pub(crate) struct ChatState {
     /// Each bot's item changes, as chat lines, and when they were read (Orca's item note rows).
-    bot_notes: BTreeMap<krill_proto::bots::BotId, (std::time::Instant, Vec<BotNote>)>,
-    bot_notes_tasks: BTreeMap<krill_proto::bots::BotId, Task<()>>,
+    bot_notes: BTreeMap<BotKey, (std::time::Instant, Vec<BotNote>)>,
+    bot_notes_tasks: BTreeMap<BotKey, Task<()>>,
     /// Each bot's SOUL.md first paragraph, the persona line its empty chat says (Orca).
-    pub(super) bot_souls: BTreeMap<krill_proto::bots::BotId, String>,
+    pub(super) bot_souls: BTreeMap<BotKey, String>,
+    /// Offer IDs currently creating a bot, to prevent duplicate creation on double click.
+    pub(super) creating_offers: BTreeSet<String>,
+    /// Last known bot metadata for open bot chats so host switches don't strip open chat chrome.
+    cached_bots: BTreeMap<ChatKey, krill_app::bots::SidebarBot>,
     /// Memory receipts the reader opened, by their time (Orca's memory note disclosure).
     pub(super) open_memory_notes: BTreeSet<u64>,
     /// Images whose chip was put in each composer's text (Orca's inline image reference).
@@ -555,8 +560,9 @@ pub(crate) struct ChatState {
     pub logs: BTreeMap<ChatKey, SessionChatLog>,
     pub inputs: BTreeMap<ChatKey, (gpui::Entity<TextareaState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
-    pub task: Option<Task<()>>,
-    pub poll_generation: u64,
+    pub poll_tasks: BTreeMap<ChatKey, Task<()>>,
+    poll_generations: BTreeMap<ChatKey, u64>,
+    next_poll_generation: u64,
     pub copied_item: Option<(ChatKey, usize, std::time::Instant)>,
     copied_item_timer: Option<Task<()>>,
     pub(super) copied_code: Option<(ChatKey, CopiedCodeTarget)>,
@@ -586,7 +592,7 @@ pub(crate) struct ChatState {
     pub(super) stop_cooldown_since: BTreeMap<ChatKey, u64>,
     stop_cooldown_timers: BTreeMap<ChatKey, Task<()>>,
     pub(super) question_other_inputs:
-        BTreeMap<String, gpui::Entity<gpui_component::input::InputState>>,
+        BTreeMap<(ChatKey, String), gpui::Entity<gpui_component::input::InputState>>,
     #[cfg(test)]
     send_input: Option<Box<dyn FnMut(Vec<u8>) -> bool>>,
     #[cfg(test)]
@@ -1264,10 +1270,20 @@ impl Shell {
     /// another chat the changes it made. The bot's items are read again every few seconds.
     pub(super) fn sync_bot_item_notes(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
         const REFRESH: Duration = Duration::from_secs(5);
-        let Some(bot) = self.chat_bot(key) else {
+        if key.0 == self.launch_host
+            && let Some(live_bot) = self
+                .sidebar_bots
+                .iter()
+                .find(|b| b.sessions.iter().any(|s| s.session_id == key.1))
+                .cloned()
+        {
+            self.chat.cached_bots.insert(key.clone(), live_bot);
+        }
+        let Some(bot) = self.chat_bot(key).cloned() else {
             return;
         };
         let bot_id = bot.id.clone();
+        let bot_key: BotKey = (key.0.clone(), bot_id.clone());
         let home = bot.home_session().is_some_and(|h| h.session_id == key.1);
         let since = bot
             .sessions
@@ -1277,16 +1293,17 @@ impl Shell {
         let stale = self
             .chat
             .bot_notes
-            .get(&bot_id)
+            .get(&bot_key)
             .is_none_or(|(at, _)| at.elapsed() >= REFRESH);
         if stale
-            && !self.chat.bot_notes_tasks.contains_key(&bot_id)
-            && let Some(rpc) = self.bot_rpc()
+            && !self.chat.bot_notes_tasks.contains_key(&bot_key)
+            && let Some(rpc) = self.bot_rpc_on(&key.0)
         {
-            let id = bot_id.clone();
+            let id = bot_id;
+            let task_bot_key = bot_key.clone();
             let task = cx.spawn(async move |this, cx| {
                 use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
-                let bot = id.clone();
+                let bot = id;
                 let (items, soul, memory, offers) = cx
                     .background_executor()
                     .spawn(async move {
@@ -1307,14 +1324,14 @@ impl Shell {
                     })
                     .await;
                 this.update(cx, |this, cx| {
-                    this.chat.bot_notes_tasks.remove(&id);
+                    this.chat.bot_notes_tasks.remove(&task_bot_key);
                     if let Ok(BotRpcResponse::Text(soul)) = soul {
                         match krill_proto::bots::soul_description(&soul) {
-                            Some(line) => this.chat.bot_souls.insert(id.clone(), line),
-                            None => this.chat.bot_souls.remove(&id),
+                            Some(line) => this.chat.bot_souls.insert(task_bot_key.clone(), line),
+                            None => this.chat.bot_souls.remove(&task_bot_key),
                         };
                     }
-                    let previous = this.chat.bot_notes.remove(&id).map(|(_, n)| n);
+                    let previous = this.chat.bot_notes.remove(&task_bot_key).map(|(_, n)| n);
                     let notes = match (items, memory) {
                         (Ok(BotRpcResponse::Items(items)), memory) => {
                             let mut notes = bot_notes(&items);
@@ -1331,17 +1348,17 @@ impl Shell {
                     };
                     this.chat
                         .bot_notes
-                        .insert(id, (std::time::Instant::now(), notes));
+                        .insert(task_bot_key, (std::time::Instant::now(), notes));
                     cx.notify();
                 })
                 .ok();
             });
-            self.chat.bot_notes_tasks.insert(bot_id.clone(), task);
+            self.chat.bot_notes_tasks.insert(bot_key.clone(), task);
         }
         let notes: Vec<Arc<work_run::ItemNote>> = self
             .chat
             .bot_notes
-            .get(&bot_id)
+            .get(&bot_key)
             .map(|(_, notes)| {
                 notes
                     .iter()
@@ -1363,12 +1380,27 @@ impl Shell {
 
     /// The bot whose chat this is (Orca's bot chat: persona, permission chip, its folder).
     pub(super) fn chat_bot(&self, key: &ChatKey) -> Option<&krill_app::bots::SidebarBot> {
-        if key.0 != self.launch_host {
-            return None;
+        if key.0 == self.launch_host {
+            return self
+                .sidebar_bots
+                .iter()
+                .find(|b| b.sessions.iter().any(|s| s.session_id == key.1));
         }
-        self.sidebar_bots
-            .iter()
-            .find(|b| b.sessions.iter().any(|s| s.session_id == key.1))
+        self.chat.cached_bots.get(key)
+    }
+
+    pub(super) fn chat_host_label(
+        &self,
+        host: &krill_app::hosts::HostId,
+        cx: &gpui::App,
+    ) -> SharedString {
+        match host {
+            krill_app::hosts::HostId::Local => krill_app::i18n::catalog::bots::HOST_LOCAL
+                .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
+                .get()
+                .into(),
+            krill_app::hosts::HostId::Remote(id) => self.remote_host_name(id, cx).into(),
+        }
     }
 
     pub(super) fn chat_key(&self, pane: PaneId) -> Option<ChatKey> {
@@ -1415,6 +1447,9 @@ impl Shell {
         let chat = &mut self.chat;
         let keep = |key: &ChatKey| shown.contains(key);
         chat.poll_failed.retain(keep);
+        chat.poll_tasks.retain(|key, _| keep(key));
+        chat.poll_generations.retain(|key, _| keep(key));
+        chat.cached_bots.retain(|key, _| keep(key));
         chat.logs.retain(|key, _| keep(key));
         chat.inputs.retain(|key, _| keep(key));
         chat.quick_menu.retain(keep);
@@ -1431,6 +1466,13 @@ impl Shell {
         chat.multiline_blocked.retain(keep);
         chat.interrupt_latched.retain(keep);
         chat.interrupt_turn_since.retain(|key, _| keep(key));
+        chat.stop_cooldown_since.retain(|key, _| keep(key));
+        chat.stop_cooldown_timers.retain(|key, _| keep(key));
+        chat.sent_history.retain(|key, _| keep(key));
+        chat.history_cursor.retain(|key, _| keep(key));
+        chat.history_saved_draft.retain(|key, _| keep(key));
+        chat.image_tokens.retain(|key, _| keep(key));
+        chat.question_other_inputs.retain(|(key, _), _| keep(key));
         chat.auto_continue.retain(|key, _| keep(key));
         chat.auto_continue_declined.retain(|key, _| keep(key));
         let sending = &chat.prompt_tasks;
@@ -1562,6 +1604,22 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn switch_pane_to_terminal_opt(
+        &mut self,
+        pane: PaneId,
+        key: &ChatKey,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(window) = window {
+            self.switch_pane_to_terminal(pane, window, cx);
+        } else {
+            self.set_pane_chat_view(pane, false, cx);
+            self.chat.focus_pending = Some(ChatFocus::Terminal(key.clone()));
+            cx.notify();
+        }
+    }
+
     /// `[Chat | Term]` 모드를 토글한다(OWE-946 / MK-243).
     pub(super) fn toggle_chat_view(&mut self, cx: &mut Context<Self>) {
         self.diff
@@ -1582,7 +1640,7 @@ impl Shell {
         });
         if chat {
             self.chat.last_poll = None;
-            self.poll_active_chat(cx);
+            self.poll_visible_chats(cx);
         }
         cx.notify();
     }
@@ -1606,14 +1664,44 @@ impl Shell {
         }
     }
 
-    fn active_chat_poll_interval(&self, cx: &gpui::App) -> Duration {
+    fn visible_chat_panes(&self, cx: &gpui::App) -> Vec<(PaneId, SessionId)> {
+        let mut seen: BTreeSet<ChatKey> = BTreeSet::new();
+        let mut out = Vec::new();
+        let focused = self.layout.focused();
+        for pane in focused.into_iter().chain(
+            self.layout
+                .visible()
+                .into_iter()
+                .filter(|p| Some(*p) != focused),
+        ) {
+            if !self.layout.pane_exists(pane)
+                || self.layout.file(pane).is_some()
+                || !self.is_pane_chat_view(pane, cx)
+            {
+                continue;
+            }
+            let Some(session) = self.layout.session(pane) else {
+                continue;
+            };
+            let key = (self.layout.host(pane).clone(), session);
+            if seen.insert(key) {
+                out.push((pane, session));
+            }
+        }
+        out
+    }
+
+    fn has_visible_chat_view_in(&self, cx: &gpui::App) -> bool {
+        !self.visible_chat_panes(cx).is_empty()
+    }
+
+    fn pane_chat_poll_interval(
+        &self,
+        pane: PaneId,
+        session: SessionId,
+        cx: &gpui::App,
+    ) -> Duration {
         use krill_proto::control::AgentState;
-        let Some(pane) = self.layout.focused() else {
-            return Duration::from_millis(800);
-        };
-        let Some(session) = self.layout.session(pane) else {
-            return Duration::from_millis(800);
-        };
         let key = (self.layout.host(pane).clone(), session);
         match self.session_status(&key, cx).map(|(state, _)| state) {
             Some(AgentState::Working) => Duration::from_millis(250),
@@ -1624,9 +1712,27 @@ impl Shell {
         }
     }
 
+    fn active_chat_poll_interval(&self, cx: &gpui::App) -> Duration {
+        let visible = self.visible_chat_panes(cx);
+        if let Some(min_interval) = visible
+            .into_iter()
+            .map(|(pane, session)| self.pane_chat_poll_interval(pane, session, cx))
+            .min()
+        {
+            return min_interval;
+        }
+        let Some(pane) = self.layout.focused() else {
+            return Duration::from_millis(800);
+        };
+        let Some(session) = self.layout.session(pane) else {
+            return Duration::from_millis(800);
+        };
+        self.pane_chat_poll_interval(pane, session, cx)
+    }
+
     pub(super) fn maybe_poll_active_chat(&mut self, cx: &mut Context<Self>) {
         self.prune_chat_lists();
-        if !self.is_active_chat_view_in(cx) {
+        if !self.has_visible_chat_view_in(cx) {
             return;
         }
         let interval = self.active_chat_poll_interval(cx);
@@ -1638,11 +1744,11 @@ impl Shell {
         {
             return;
         }
-        self.poll_active_chat(cx);
+        self.poll_visible_chats(cx);
     }
 
     // Transcript flushes and hook binding can happen after the final PTY redraw.
-    // Keep retrying while Chat is visible, with at most one request in flight.
+    // Keep retrying while any Chat pane is visible, with at most one request in flight per session.
     fn ensure_chat_poll_timer(&mut self, cx: &mut Context<Self>) {
         if self.chat.poll_timer.is_some() {
             return;
@@ -1653,14 +1759,14 @@ impl Shell {
                 cx.background_executor().timer(sleep_for).await;
                 let next_interval = this
                     .update(cx, |this, cx| {
-                        if this.page_open()
+                        if this.has_blocking_overlay()
                             || this.dashboard.is_some()
-                            || !this.is_active_chat_view_in(cx)
+                            || !this.has_visible_chat_view_in(cx)
                         {
                             this.chat.poll_timer = None;
                             return None;
                         }
-                        this.poll_active_chat(cx);
+                        this.poll_visible_chats(cx);
                         Some(this.active_chat_poll_interval(cx))
                     })
                     .ok()
@@ -1673,15 +1779,17 @@ impl Shell {
         }));
     }
 
+    /// 데몬에 `Action::ChatPoll`을 요청해 보이는 모든 Chat 패인의 증분 트랜스크립트를 가져온다.
+    pub(super) fn poll_visible_chats(&mut self, cx: &mut Context<Self>) {
+        let panes = self.visible_chat_panes(cx);
+        for (pane, session) in panes {
+            self.poll_session_chat(pane, session, cx);
+        }
+    }
+
     /// 데몬에 `Action::ChatPoll`을 요청해 활성 세션의 증분 트랜스크립트를 가져온다.
     pub(super) fn poll_active_chat(&mut self, cx: &mut Context<Self>) {
-        let Some(pane) = self.layout.focused() else {
-            return;
-        };
-        let Some(session) = self.active_session_id() else {
-            return;
-        };
-        self.poll_session_chat(pane, session, cx);
+        self.poll_visible_chats(cx);
     }
 
     fn poll_session_chat(
@@ -1690,12 +1798,15 @@ impl Shell {
         session: SessionId,
         cx: &mut Context<Self>,
     ) {
-        if self.chat.task.is_some() || !self.is_pane_chat_view(pane, cx) {
+        if !self.is_pane_chat_view(pane, cx) {
+            return;
+        }
+        let host = self.layout.host(pane).clone();
+        let key = (host.clone(), session);
+        if self.chat.poll_tasks.contains_key(&key) {
             return;
         }
         self.ensure_chat_poll_timer(cx);
-        let host = self.layout.host(pane).clone();
-        let key = (host.clone(), session);
         let Some(target) = self.target_for_host(&host) else {
             if self.chat.poll_failed.insert(key) {
                 cx.notify();
@@ -1708,8 +1819,9 @@ impl Shell {
         #[cfg(test)]
         let gate = self.chat.next_poll_io.take();
         self.chat.last_poll = Some(std::time::Instant::now());
-        self.chat.poll_generation = self.chat.poll_generation.wrapping_add(1);
-        let generation = self.chat.poll_generation;
+        self.chat.next_poll_generation = self.chat.next_poll_generation.wrapping_add(1);
+        let generation = self.chat.next_poll_generation;
+        self.chat.poll_generations.insert(key.clone(), generation);
         let offset = self.chat.logs.get(&key).map_or(0, |log| log.offset);
         let seed = self
             .chat
@@ -1727,7 +1839,8 @@ impl Shell {
             .get(&key)
             .filter(|log| log.bound && log.meta.model.is_some())
             .map(|log| log.binding.clone());
-        self.chat.task = Some(cx.spawn(async move |this, cx| {
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
             let seeding = seed.is_some();
             let (page, reply, meta) = cx
                 .background_executor()
@@ -1753,33 +1866,34 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.chat.poll_generation != generation {
+                if this.chat.poll_generations.get(&task_key).copied() != Some(generation) {
                     return;
                 }
-                this.chat.task = None;
+                this.chat.poll_tasks.remove(&task_key);
                 this.sync_chat_interrupt_latches(cx);
-                if this.layout.host(pane) == &host
+                if this.layout.pane_exists(pane)
+                    && this.layout.host(pane) == &host
                     && this.layout.session(pane) == Some(session)
                     && this.is_pane_chat_view(pane, cx)
-                    && this.chat.logs.get(&key).map_or(0, |log| log.offset) == offset
+                    && this.chat.logs.get(&task_key).map_or(0, |log| log.offset) == offset
                 {
                     if seeding {
-                        this.chat.logs.entry(key.clone()).or_default().seeded = true;
+                        this.chat.logs.entry(task_key.clone()).or_default().seeded = true;
                     }
                     let agent_state = this.session_agent_state(&host, session, cx);
                     let now = std::time::Instant::now();
                     if let Some(page) = page {
-                        this.chat.poll_failed.remove(&key);
+                        this.chat.poll_failed.remove(&task_key);
                         this.apply_chat_tail(session, host, page, meta, agent_state, now);
-                        this.refresh_chat_composer(&key, false, cx);
-                        this.flush_queued_chat_prompt_if_ready(&key, cx);
+                        this.refresh_chat_composer(&task_key, false, cx);
+                        this.flush_queued_chat_prompt_if_ready(&task_key, cx);
                     } else if let Some(Ok(Reply::AgentHistory(Response::ChatPolled(snapshot)))) =
                         reply
                     {
                         let composer_interval = if this
                             .chat
                             .logs
-                            .get(&key)
+                            .get(&task_key)
                             .is_none_or(|log| log.meta.model.is_none() || !log.meta.supported)
                         {
                             Duration::from_millis(1500)
@@ -1791,9 +1905,9 @@ impl Shell {
                             || this
                                 .chat
                                 .last_composer_poll
-                                .get(&key)
+                                .get(&task_key)
                                 .is_none_or(|t| t.elapsed() >= composer_interval);
-                        this.chat.poll_failed.remove(&key);
+                        this.chat.poll_failed.remove(&task_key);
                         this.apply_chat_poll_for_host_with_state(
                             session,
                             host,
@@ -1803,24 +1917,19 @@ impl Shell {
                             now,
                         );
                         if refresh_composer {
-                            this.refresh_chat_composer(&key, false, cx);
+                            this.refresh_chat_composer(&task_key, false, cx);
                         }
-                        this.flush_queued_chat_prompt_if_ready(&key, cx);
+                        this.flush_queued_chat_prompt_if_ready(&task_key, cx);
                     } else {
-                        this.chat.poll_failed.insert(key.clone());
+                        this.chat.poll_failed.insert(task_key.clone());
                     }
-                    this.load_earlier_chat(pane, &key, cx);
+                    this.load_earlier_chat(pane, &task_key, cx);
                     cx.notify();
-                }
-                if this
-                    .active_session_id()
-                    .is_some_and(|active| active != session)
-                {
-                    this.poll_active_chat(cx);
                 }
             })
             .ok();
-        }));
+        });
+        self.chat.poll_tasks.insert(key, task);
     }
 
     /// Shows the newest rows at once. Older rows arrive above the viewport through
@@ -2501,6 +2610,8 @@ impl Shell {
                 }
                 InputEvent::Change => {
                     this.chat.prompt_review.remove(&focus_key);
+                    this.chat.prompt_failed.remove(&focus_key);
+                    this.chat.multiline_blocked.remove(&focus_key);
                     this.sync_chat_autocomplete(&focus_key, window, cx);
                     cx.notify();
                 }
@@ -2561,11 +2672,13 @@ impl Shell {
 
     pub(super) fn ensure_question_other_input(
         &mut self,
+        key: &ChatKey,
         answer_key: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Entity<gpui_component::input::InputState> {
-        if let Some(existing) = self.chat.question_other_inputs.get(answer_key) {
+        let map_key = (key.clone(), answer_key.to_owned());
+        if let Some(existing) = self.chat.question_other_inputs.get(&map_key) {
             return existing.clone();
         }
         let state = cx.new(|cx| {
@@ -2574,7 +2687,7 @@ impl Shell {
         });
         self.chat
             .question_other_inputs
-            .insert(answer_key.to_owned(), state.clone());
+            .insert(map_key, state.clone());
         state
     }
 
@@ -2708,39 +2821,7 @@ impl Shell {
         };
         self.chat.multiline_blocked.remove(key);
         let (origin_epoch, origin_item, opens_terminal, local_slash) =
-            self.chat.logs.get(key).map_or_else(
-                || {
-                    (
-                        0,
-                        0,
-                        attachments.is_empty()
-                            && catalog::slash_command_opens_in_terminal(
-                                "",
-                                &submitted_payload,
-                                false,
-                            ),
-                        attachments.is_empty()
-                            && catalog::slash_command_is_local_non_echoed("", &submitted_payload),
-                    )
-                },
-                |l| {
-                    let opens = attachments.is_empty()
-                        && catalog::slash_command_opens_in_terminal(
-                            &l.agent,
-                            &submitted_payload,
-                            l.meta.supported,
-                        );
-                    let local = attachments.is_empty()
-                        && !opens
-                        && catalog::slash_command_is_local_non_echoed(&l.agent, &submitted_payload);
-                    (
-                        l.epoch,
-                        l.base_index.saturating_add(l.items.len()),
-                        opens,
-                        local,
-                    )
-                },
-            );
+            self.pending_prompt_meta(key, &submitted_payload, attachments.is_empty());
         self.cancel_auto_continue(key, cx);
         self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
         let pending_id = self.chat.next_pending_id;
@@ -2783,7 +2864,7 @@ impl Shell {
                 local_slash,
                 steer,
             },
-            window,
+            Some(window),
             cx,
         );
     }
@@ -2906,6 +2987,43 @@ impl Shell {
         }
     }
 
+    fn pending_prompt_meta(
+        &self,
+        key: &ChatKey,
+        submitted_payload: &str,
+        no_attachments: bool,
+    ) -> (u64, usize, bool, bool) {
+        self.chat.logs.get(key).map_or_else(
+            || {
+                (
+                    0,
+                    0,
+                    no_attachments
+                        && catalog::slash_command_opens_in_terminal("", submitted_payload, false),
+                    no_attachments
+                        && catalog::slash_command_is_local_non_echoed("", submitted_payload),
+                )
+            },
+            |l| {
+                let opens = no_attachments
+                    && catalog::slash_command_opens_in_terminal(
+                        &l.agent,
+                        submitted_payload,
+                        l.meta.supported,
+                    );
+                let local = no_attachments
+                    && !opens
+                    && catalog::slash_command_is_local_non_echoed(&l.agent, submitted_payload);
+                (
+                    l.epoch,
+                    l.base_index.saturating_add(l.items.len()),
+                    opens,
+                    local,
+                )
+            },
+        )
+    }
+
     pub(super) fn flush_queued_chat_prompt_if_ready(
         &mut self,
         key: &ChatKey,
@@ -2943,7 +3061,7 @@ impl Shell {
             .live
             .get(&pane)
             .map_or_else(Default::default, |live| live.pane.modes());
-        let krill_app::security::PastePlan::Immediate(mut bytes) =
+        let krill_app::security::PastePlan::Immediate(bytes) =
             self.plan_terminal_paste(pane, queued.submitted_payload.as_bytes(), modes, cx)
         else {
             if let Some(log) = self.chat.logs.get_mut(key) {
@@ -2954,12 +3072,13 @@ impl Shell {
             return;
         };
         self.chat.multiline_blocked.remove(key);
-        let (origin_epoch, origin_item) = self.chat.logs.get(key).map_or((0, 0), |l| {
-            (l.epoch, l.base_index.saturating_add(l.items.len()))
-        });
+        let (origin_epoch, origin_item, opens_terminal, local_slash) = self.pending_prompt_meta(
+            key,
+            &queued.submitted_payload,
+            queued.attachments.is_empty(),
+        );
         let pending_id = queued.id;
-        let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
-            || queued.submitted_payload.contains(['\n', '\r']);
+        let submitted_payload = queued.submitted_payload;
         self.chat
             .pending_prompts
             .entry(key.clone())
@@ -2967,7 +3086,7 @@ impl Shell {
             .push(PendingChatPrompt {
                 id: pending_id,
                 origin_item,
-                submitted_payload: queued.submitted_payload,
+                submitted_payload: submitted_payload.clone(),
                 display_text: queued.display_text,
                 attachments: queued.attachments,
                 status: PendingStatus::Sending,
@@ -2976,38 +3095,25 @@ impl Shell {
             .pending_epochs
             .insert((key.clone(), pending_id), origin_epoch);
         self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
-        if !bracketed {
-            bytes.push(b'\r');
+        if let Some(list) = self.chat.lists.get_mut(&(pane, session)) {
+            list.state.set_follow_mode(gpui::FollowMode::Tail);
         }
-        if !self.send_to_chat_pane(pane, session, &bytes, cx) {
-            self.confirm_pending_prompt(key, pending_id);
-            self.chat.prompt_failed.insert(key.clone());
-            cx.notify();
-            return;
-        }
-        if bracketed {
-            let task_key = key.clone();
-            let task = cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(krill_proto::input::PASTE_SUBMIT_DELAY)
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.chat.prompt_tasks.remove(&task_key);
-                    let ok = this.send_to_chat_pane(pane, session, b"\r", cx);
-                    if ok {
-                        this.confirm_pending_prompt(&task_key, pending_id);
-                    } else {
-                        this.chat.prompt_failed.insert(task_key.clone());
-                    }
-                    cx.notify();
-                })
-                .ok();
-            });
-            self.chat.prompt_tasks.insert(key.clone(), task);
-        } else {
-            self.confirm_pending_prompt(key, pending_id);
-        }
-        cx.notify();
+        self.dispatch_pending_chat_prompt(
+            PendingDispatch {
+                key: key.clone(),
+                pane,
+                session,
+                pending_id,
+                submitted_payload,
+                bytes,
+                modes,
+                opens_terminal,
+                local_slash,
+                steer: false,
+            },
+            None,
+            cx,
+        );
     }
 
     pub(super) fn is_chat_stop_cooldown(&self, key: &ChatKey, cx: &gpui::App) -> bool {
@@ -3611,7 +3717,7 @@ impl Shell {
     fn dispatch_pending_chat_prompt(
         &mut self,
         mut dispatch: PendingDispatch,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let is_agy = self.chat_is_agy(&dispatch.key, cx);
@@ -3654,6 +3760,7 @@ impl Shell {
         } else {
             0
         };
+        let initial_status = self.session_status(&dispatch.key, cx);
         dispatch.bytes.push(b'\r');
         if self.send_to_session(&dispatch.key, &dispatch.bytes, cx) {
             self.chat.prompt_failed.remove(&dispatch.key);
@@ -3667,6 +3774,7 @@ impl Shell {
                         .get(&dispatch.pane)
                         .and_then(|live| live.target.clone()),
                     epoch: self.chat.logs.get(&dispatch.key).map_or(0, |log| log.epoch),
+                    initial_status,
                 };
                 let Some(receipt) = self
                     .live
@@ -3679,7 +3787,7 @@ impl Shell {
                             pending_id: dispatch.pending_id,
                             immediate_send_failure: true,
                         },
-                        Some(window),
+                        window,
                         cx,
                     );
                     cx.notify();
@@ -3689,7 +3797,12 @@ impl Shell {
                     krill_proto::input::Delivery::Applied => {
                         self.confirm_pending_prompt(&dispatch.key, dispatch.pending_id);
                         if dispatch.opens_terminal {
-                            self.switch_pane_to_terminal(dispatch.pane, window, cx);
+                            self.switch_pane_to_terminal_opt(
+                                dispatch.pane,
+                                &dispatch.key,
+                                window,
+                                cx,
+                            );
                         }
                     }
                     krill_proto::input::Delivery::Uncertain => {
@@ -3699,7 +3812,7 @@ impl Shell {
                                 pending_id: dispatch.pending_id,
                                 immediate_send_failure: false,
                             },
-                            Some(window),
+                            window,
                             cx,
                         );
                     }
@@ -3709,7 +3822,7 @@ impl Shell {
                             dispatch.pending_id,
                             receipt,
                             dispatch.opens_terminal,
-                            window,
+                            window.as_deref(),
                             cx,
                         );
                     }
@@ -3726,7 +3839,8 @@ impl Shell {
                         is_agy,
                         baseline_queued,
                     },
-                    window,
+                    initial_status,
+                    window.as_deref(),
                     cx,
                 );
             }
@@ -3737,7 +3851,7 @@ impl Shell {
                     pending_id: dispatch.pending_id,
                     immediate_send_failure: true,
                 },
-                Some(window),
+                window,
                 cx,
             );
         }
@@ -3750,13 +3864,14 @@ impl Shell {
         pending_id: u64,
         receipt: krill_proto::input::Receipt,
         switch_to_terminal: bool,
-        window: &mut Window,
+        window: Option<&Window>,
         cx: &mut Context<Self>,
     ) {
         let task_key = origin.key();
         let pane = origin.pane;
         let map_key = (task_key.clone(), pending_id);
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let win = window.map(Window::window_handle).or(self.window);
+        let task = cx.spawn(async move |this, cx| {
             enum Step {
                 Wait,
                 Applied(bool),
@@ -3764,7 +3879,7 @@ impl Shell {
             }
             for _ in 0..prompt::RECEIPT_POLLS {
                 cx.background_executor().timer(prompt::POLL).await;
-                let Ok(step) = this.update_in(cx, |this, _, cx| {
+                let Ok(step) = this.update(cx, |this, cx| {
                     if !this.has_pending_prompt(&task_key, pending_id) {
                         return Step::Applied(false);
                     }
@@ -3781,32 +3896,30 @@ impl Shell {
                 match step {
                     Step::Wait => {}
                     Step::Applied(current) => {
-                        this.update_in(cx, |this, window, cx| {
+                        prompt::update_with_optional_window(&this, win, cx, |this, window, cx| {
                             this.confirm_pending_prompt(&task_key, pending_id);
                             if current && switch_to_terminal {
-                                this.switch_pane_to_terminal(pane, window, cx);
+                                this.switch_pane_to_terminal_opt(pane, &task_key, window, cx);
                             } else {
                                 cx.notify();
                             }
-                        })
-                        .ok();
+                        });
                         return;
                     }
                     Step::Failed => break,
                 }
             }
-            this.update_in(cx, |this, window, cx| {
+            prompt::update_with_optional_window(&this, win, cx, |this, window, cx| {
                 this.transition_pending_to_review_required(
                     PendingReview {
                         key: &task_key,
                         pending_id,
                         immediate_send_failure: false,
                     },
-                    Some(window),
+                    window,
                     cx,
                 );
-            })
-            .ok();
+            });
         });
         self.chat.turn_tasks.insert(map_key, task);
     }
@@ -3814,7 +3927,8 @@ impl Shell {
     fn spawn_unbracketed_turn_watcher(
         &mut self,
         watch: UnbracketedWatch,
-        window: &mut Window,
+        initial_status: Option<(krill_proto::control::AgentState, u64)>,
+        window: Option<&Window>,
         cx: &mut Context<Self>,
     ) {
         const POLL: Duration = Duration::from_millis(20);
@@ -3833,24 +3947,30 @@ impl Shell {
             .get(&(task_key.clone(), pending_id))
             .copied()
             .unwrap_or(0);
+        let origin = prompt::Origin {
+            pane,
+            session,
+            host: task_key.0.clone(),
+            target: self.live.get(&pane).and_then(|live| live.target.clone()),
+            epoch: origin_epoch,
+            initial_status,
+        };
+        let win = window.map(Window::window_handle).or(self.window);
         let map_key = (task_key.clone(), pending_id);
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             enum Outcome {
-                Pending,
                 Confirmed,
-                Failed,
                 AgyQueued { send_immediately_hint: bool },
+                Detached,
+                Failed,
+                Wait,
             }
             for step in 0..TURN_POLLS {
                 cx.background_executor().timer(POLL).await;
-                let Ok(outcome) = this.update_in(cx, |this, _, cx| {
+                let Ok(outcome) = this.update(cx, |this, cx| {
+                    this.reconcile_pending_prompts_on_poll(&task_key);
                     if !this.has_pending_prompt(&task_key, pending_id) {
                         return Outcome::Confirmed;
-                    }
-                    let same_epoch =
-                        this.chat.logs.get(&task_key).map_or(0, |log| log.epoch) == origin_epoch;
-                    if !same_epoch || !this.is_pane_chat_view(pane, cx) {
-                        return Outcome::Failed;
                     }
                     #[cfg(test)]
                     {
@@ -3858,11 +3978,20 @@ impl Shell {
                             if confirmed {
                                 return Outcome::Confirmed;
                             }
-                        } else if this.chat.send_input.is_some() && this.chat.poll_call.is_none() {
+                        } else if this.chat_prompt_turn_started(&task_key, initial_status, cx)
+                            || (this.chat.send_input.is_some() && this.chat.poll_call.is_none())
+                        {
                             return Outcome::Confirmed;
                         }
                     }
-                    if is_agy
+                    #[cfg(not(test))]
+                    if this.chat_prompt_turn_started(&task_key, initial_status, cx) {
+                        return Outcome::Confirmed;
+                    }
+                    let same_epoch =
+                        this.chat.logs.get(&task_key).map_or(0, |log| log.epoch) == origin_epoch;
+                    if same_epoch
+                        && is_agy
                         && let Some(qm) = this.live.get(&pane).and_then(|live| {
                             #[cfg(test)]
                             if this.chat.prompt_confirmed == Some(false) {
@@ -3879,16 +4008,22 @@ impl Shell {
                             send_immediately_hint: qm.send_immediately_hint,
                         };
                     }
+                    if this.chat_prompt_view_detached(&origin, cx) {
+                        return Outcome::Detached;
+                    }
+                    if !same_epoch {
+                        return Outcome::Failed;
+                    }
                     if step % 5 == 0 {
                         this.poll_session_chat(pane, session, cx);
                     }
-                    Outcome::Pending
+                    Outcome::Wait
                 }) else {
                     return;
                 };
                 match outcome {
-                    Outcome::Confirmed => {
-                        this.update_in(cx, |this, _, cx| {
+                    Outcome::Confirmed | Outcome::Detached => {
+                        this.update(cx, |this, cx| {
                             this.confirm_pending_prompt(&task_key, pending_id);
                             cx.notify();
                         })
@@ -3898,8 +4033,8 @@ impl Shell {
                     Outcome::AgyQueued {
                         send_immediately_hint,
                     } => {
-                        this.update_in(cx, |this, _, cx| {
-                            if steer && send_immediately_hint {
+                        this.update(cx, |this, cx| {
+                            if steer && send_immediately_hint && this.is_pane_chat_view(pane, cx) {
                                 let _ = this.send_chat_prompt_input(
                                     pane,
                                     session,
@@ -3913,21 +4048,20 @@ impl Shell {
                         return;
                     }
                     Outcome::Failed => break,
-                    Outcome::Pending => {}
+                    Outcome::Wait => {}
                 }
             }
-            this.update_in(cx, |this, window, cx| {
+            prompt::update_with_optional_window(&this, win, cx, |this, window, cx| {
                 this.transition_pending_to_review_required(
                     PendingReview {
                         key: &task_key,
                         pending_id,
                         immediate_send_failure: false,
                     },
-                    Some(window),
+                    window,
                     cx,
                 );
-            })
-            .ok();
+            });
         });
         self.chat.turn_tasks.insert(map_key, task);
     }
@@ -4183,39 +4317,7 @@ impl Shell {
         };
         self.chat.multiline_blocked.remove(key);
         let (origin_epoch, origin_item, opens_terminal, local_slash) =
-            self.chat.logs.get(key).map_or_else(
-                || {
-                    (
-                        0,
-                        0,
-                        no_attachments
-                            && catalog::slash_command_opens_in_terminal(
-                                "",
-                                &submitted_payload,
-                                false,
-                            ),
-                        no_attachments
-                            && catalog::slash_command_is_local_non_echoed("", &submitted_payload),
-                    )
-                },
-                |l| {
-                    let opens = no_attachments
-                        && catalog::slash_command_opens_in_terminal(
-                            &l.agent,
-                            &submitted_payload,
-                            l.meta.supported,
-                        );
-                    let local = no_attachments
-                        && !opens
-                        && catalog::slash_command_is_local_non_echoed(&l.agent, &submitted_payload);
-                    (
-                        l.epoch,
-                        l.base_index.saturating_add(l.items.len()),
-                        opens,
-                        local,
-                    )
-                },
-            );
+            self.pending_prompt_meta(key, &submitted_payload, no_attachments);
         if let Some(entries) = self.chat.pending_prompts.get_mut(key)
             && let Some(entry) = entries.iter_mut().find(|p| p.id == pending_id)
         {
@@ -4241,7 +4343,7 @@ impl Shell {
                 local_slash,
                 steer: false,
             },
-            window,
+            Some(window),
             cx,
         );
     }
@@ -4268,13 +4370,15 @@ impl Shell {
     /// Not now (`created: None`) or the bot made from a proposal, recorded on the proposal.
     pub(super) fn resolve_bot_offer(
         &mut self,
+        key: &ChatKey,
         offer_id: &str,
         created: Option<krill_proto::bots::BotId>,
         cx: &mut Context<Self>,
     ) {
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(&key.0) else {
             return;
         };
+        let host = key.0.clone();
         let request = krill_proto::bots::BotRpcRequest::ResolveBotOffer {
             offer_id: offer_id.to_owned(),
             created,
@@ -4289,7 +4393,7 @@ impl Shell {
                     this.notice = Some(err);
                 }
                 // Read the cards again now rather than on the next refresh.
-                this.chat.bot_notes.clear();
+                this.chat.bot_notes.retain(|(h, _), _| h != &host);
                 cx.notify();
             })
             .ok();
@@ -4305,9 +4409,14 @@ impl Shell {
         offer: &krill_proto::bots::BotOffer,
         cx: &mut Context<Self>,
     ) {
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(&key.0) else {
             return;
         };
+        if !self.chat.creating_offers.insert(offer.offer_id.clone()) {
+            return;
+        }
+        cx.notify();
+        let host = key.0.clone();
         let agent_id = self
             .chat_bot(key)
             .map_or_else(|| "claude".to_owned(), |bot| bot.agent_id.clone());
@@ -4325,6 +4434,7 @@ impl Shell {
             initial_soul: Some(format!("# {}\n\n{}\n", offer.name, offer.purpose)),
         };
         let offer_id = offer.offer_id.clone();
+        let done_offer_id = offer_id.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -4345,11 +4455,14 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.chat.creating_offers.remove(&done_offer_id);
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.chat.bot_notes.clear();
-                this.refresh_bots_badge(cx);
+                this.chat.bot_notes.retain(|(h, _), _| h != &host);
+                if host == this.launch_host {
+                    this.refresh_bots_badge(cx);
+                }
                 cx.notify();
             })
             .ok();

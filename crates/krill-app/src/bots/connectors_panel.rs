@@ -233,11 +233,13 @@ impl View {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let status = self
-            .connectors
-            .bot_statuses
-            .iter()
-            .find(|s| s.source == source);
+        let status = self.connectors.bot_statuses.iter().find(|s| {
+            s.source == source
+                && self
+                    .selected_bot_id
+                    .as_ref()
+                    .is_none_or(|id| &s.bot_id == id)
+        });
         let state = status.map_or(ConnectorHealthState::Disconnected, |s| s.state);
         let description = match (state, status) {
             (ConnectorHealthState::Connected, Some(s)) => s
@@ -499,6 +501,12 @@ impl View {
                 let debug = sel.clone();
                 let open = cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                     this.connectors.adding = None;
+                    this.connectors.add_rail = 0;
+                    super::clear_input_on_window(
+                        &mut this.connectors.add_search,
+                        this.window_handle,
+                        cx,
+                    );
                     this.connectors.page = Some(source);
                     cx.notify();
                 });
@@ -562,6 +570,8 @@ impl View {
         }
         let close = cx.listener(|this, _, _, cx| {
             this.connectors.adding = None;
+            this.connectors.add_rail = 0;
+            super::clear_input_on_window(&mut this.connectors.add_search, this.window_handle, cx);
             cx.notify();
         });
         let dialog = div()
@@ -634,20 +644,45 @@ impl View {
                         ),
                 ),
             );
-        let backdrop = div()
-            .id("bot-connector-add-backdrop")
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.connectors.adding = None;
-                    cx.notify();
-                }),
-            )
-            .child(dialog);
+        let backdrop = ui::modal_focus_scope(
+            div()
+                .id("bot-connector-add-backdrop")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if ev.keystroke.key == "escape"
+                        && !ev.keystroke.modifiers.modified()
+                        && !this.input_is_composing(window, cx)
+                    {
+                        this.connectors.adding = None;
+                        this.connectors.add_rail = 0;
+                        super::clear_input_on_window(
+                            &mut this.connectors.add_search,
+                            this.window_handle,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.connectors.adding = None;
+                        this.connectors.add_rail = 0;
+                        super::clear_input_on_window(
+                            &mut this.connectors.add_search,
+                            this.window_handle,
+                            cx,
+                        );
+                        cx.notify();
+                    }),
+                )
+                .child(dialog),
+            &self.focus,
+        );
         Some(ui::modal_backdrop(window.viewport_size(), backdrop).into_any_element())
     }
 }

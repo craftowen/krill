@@ -280,7 +280,10 @@ pub(super) fn stale_label(stale: BotItemsStale) -> String {
 /// The bot's computer as Settings names it: this Mac, or the paired host's label.
 pub(super) fn computer_name(view: &View) -> String {
     if view.host.is_local() {
-        text::HOST_LOCAL.get().to_owned()
+        text::HOST_LOCAL
+            .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+            .get()
+            .to_owned()
     } else {
         view.available_hosts
             .iter()
@@ -299,7 +302,8 @@ impl View {
             .find(|b| b.id == params.bot_id)
             .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
         self.error = None;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        self.notice = None;
+        self.patch_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(
@@ -412,7 +416,8 @@ impl View {
     ) {
         let rpc = self.rpc.clone();
         self.error = None;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        self.notice = None;
+        self.patch_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {

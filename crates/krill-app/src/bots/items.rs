@@ -195,6 +195,11 @@ impl ItemsState {
             || opt_input_composing(self.edit_title_input.as_ref(), window, app)
             || opt_input_composing(self.edit_desc_input.as_ref(), window, app)
             || opt_input_composing(self.edit_done_input.as_ref(), window, app)
+            || opt_input_composing(
+                self.cancel_ask.as_ref().and_then(|a| a.input.as_ref()),
+                window,
+                app,
+            )
             || self
                 .comment_inputs
                 .values()
@@ -228,6 +233,15 @@ impl ItemsState {
         if let Some(i) = &self.edit_done_input {
             i.update(cx, |s, cx| {
                 s.set_placeholder(text::ITEM_EDIT_DONE_PLACEHOLDER.get(), window, cx);
+            });
+        }
+        if let Some(i) = self.cancel_ask.as_ref().and_then(|a| a.input.as_ref()) {
+            i.update(cx, |s, cx| {
+                s.set_placeholder(
+                    crate::i18n::catalog::bot_home::CANCEL_REASON.get(),
+                    window,
+                    cx,
+                );
             });
         }
         for i in self.comment_inputs.values() {
@@ -312,7 +326,12 @@ impl View {
         cx.notify();
     }
 
-    fn ensure_items_inputs(&mut self, bot_id: &BotId, window: &mut Window, cx: &mut Context<Self>) {
+    fn ensure_items_inputs(
+        &mut self,
+        _bot_id: &BotId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !cx.has_global::<gpui_component::Theme>() {
             return;
         }
@@ -320,13 +339,13 @@ impl View {
             let title_inp = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::NEW_ITEM_TITLE_PLACEHOLDER.get())
             });
-            let bid = bot_id.clone();
             let sub = cx.subscribe_in(
                 &title_inp,
                 window,
-                move |this, inp, ev: &InputEvent, window, cx| {
+                |this, inp, ev: &InputEvent, window, cx| {
                     if matches!(ev, InputEvent::PressEnter { .. })
                         && !crate::jump::entity_input_is_composing(inp, window, cx)
+                        && let Some(bid) = this.selected_bot_id.clone()
                     {
                         let title = inp.read(cx).value().to_string();
                         let desc = this
@@ -334,7 +353,7 @@ impl View {
                             .new_desc_input
                             .as_ref()
                             .map(|d| d.read(cx).value().to_string());
-                        this.create_bot_item(bid.clone(), &title, desc, Some(window), cx);
+                        this.create_bot_item(bid, &title, desc, Some(window), cx);
                     }
                 },
             );
@@ -345,13 +364,13 @@ impl View {
             let desc_inp = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(text::NEW_ITEM_DESC_PLACEHOLDER.get())
             });
-            let bid = bot_id.clone();
             let sub = cx.subscribe_in(
                 &desc_inp,
                 window,
-                move |this, inp, ev: &InputEvent, window, cx| {
+                |this, inp, ev: &InputEvent, window, cx| {
                     if matches!(ev, InputEvent::PressEnter { .. })
                         && !crate::jump::entity_input_is_composing(inp, window, cx)
+                        && let Some(bid) = this.selected_bot_id.clone()
                     {
                         let title = this
                             .items
@@ -360,7 +379,7 @@ impl View {
                             .map(|t| t.read(cx).value().to_string())
                             .unwrap_or_default();
                         let desc = inp.read(cx).value().to_string();
-                        this.create_bot_item(bid.clone(), &title, Some(desc), Some(window), cx);
+                        this.create_bot_item(bid, &title, Some(desc), Some(window), cx);
                     }
                 },
             );
@@ -386,9 +405,10 @@ impl View {
             let sub = cx.subscribe_in(
                 &input,
                 window,
-                move |this, inp, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::PressEnter { .. })
-                        && !crate::jump::entity_input_is_composing(inp, window, cx)
+                move |this, inp, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::Change => cx.notify(),
+                    InputEvent::PressEnter { .. }
+                        if !crate::jump::entity_input_is_composing(inp, window, cx) =>
                     {
                         let body = inp.read(cx).value().to_string();
                         this.send_item_comment(
@@ -398,6 +418,7 @@ impl View {
                             cx,
                         );
                     }
+                    _ => {}
                 },
             );
             self.items
@@ -497,6 +518,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.items.busy = true;
         self.error = None;
+        self.notice = None;
         self.item_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
@@ -663,6 +685,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.items.busy = true;
         self.error = None;
+        self.notice = None;
         self.item_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -674,7 +697,9 @@ impl View {
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
-                        this.upsert_item(*updated, &bot_id);
+                        let owner_id = updated.owner_bot_id.clone();
+                        this.upsert_item(*updated, &owner_id);
+                        let _ = &bot_id;
                         if close_edit {
                             this.items.editing_item_uid = None;
                         }
@@ -707,19 +732,32 @@ impl View {
         clear_input: Option<Entity<InputState>>,
         cx: &mut Context<Self>,
     ) {
+        self.submit_item_comment_with_attachments(item_uid, body, clear_input, false, cx);
+    }
+
+    pub(super) fn submit_item_comment_with_attachments(
+        &mut self,
+        item_uid: String,
+        body: &str,
+        clear_input: Option<Entity<InputState>>,
+        clear_attachments: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.items.busy {
             return;
         }
         let trimmed = body.trim().to_owned();
         if trimmed.is_empty() {
             self.error = Some(SharedString::from(text::ERR_EMPTY_FIELD.get()));
+            self.notice = None;
             cx.notify();
             return;
         }
         let rpc = self.rpc.clone();
-        let selected_bot_id = self.selected_bot_id.clone();
+        let uid_for_clear = item_uid.clone();
         self.items.busy = true;
         self.error = None;
+        self.notice = None;
         self.item_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -738,8 +776,10 @@ impl View {
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
-                        if let Some(bot_id) = selected_bot_id {
-                            this.upsert_item(*updated, &bot_id);
+                        let owner_id = updated.owner_bot_id.clone();
+                        this.upsert_item(*updated, &owner_id);
+                        if clear_attachments {
+                            this.items.attachments.remove(&uid_for_clear);
                         }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
@@ -776,6 +816,7 @@ impl View {
         let trimmed = target.trim().to_owned();
         if trimmed.is_empty() {
             self.error = Some(SharedString::from(text::ERR_EMPTY_FIELD.get()));
+            self.notice = None;
             cx.notify();
             return;
         }
@@ -792,9 +833,9 @@ impl View {
             LinkKindChoice::File => BotItemLink::File(trimmed),
         };
         let rpc = self.rpc.clone();
-        let selected_bot_id = self.selected_bot_id.clone();
         self.items.busy = true;
         self.error = None;
+        self.notice = None;
         self.item_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -812,9 +853,8 @@ impl View {
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
-                        if let Some(bot_id) = selected_bot_id {
-                            this.upsert_item(*updated, &bot_id);
-                        }
+                        let owner_id = updated.owner_bot_id.clone();
+                        this.upsert_item(*updated, &owner_id);
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
@@ -844,19 +884,47 @@ impl View {
         clear_input: Option<Entity<InputState>>,
         cx: &mut Context<Self>,
     ) {
+        self.answer_item_decision_with_cleanup(
+            item_uid,
+            answer_text,
+            option_index,
+            clear_input,
+            false,
+            None,
+            cx,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "coordinates optional attachment and multi-step cleanup on RPC success"
+    )]
+    pub(super) fn answer_item_decision_with_cleanup(
+        &mut self,
+        item_uid: String,
+        answer_text: Option<String>,
+        option_index: Option<u32>,
+        clear_input: Option<Entity<InputState>>,
+        clear_attachments: bool,
+        clear_ask_step: Option<(String, u64)>,
+        cx: &mut Context<Self>,
+    ) {
         if self.items.busy {
             return;
         }
         let cleaned_text = answer_text.map(|s| s.trim().to_owned());
         if option_index.is_none() && cleaned_text.as_deref().is_none_or(str::is_empty) {
             self.error = Some(SharedString::from(text::ERR_EMPTY_FIELD.get()));
+            self.notice = None;
             cx.notify();
             return;
         }
         let rpc = self.rpc.clone();
         let selected_bot_id = self.selected_bot_id.clone();
+        let uid_for_clear = item_uid.clone();
         self.items.busy = true;
         self.error = None;
+        self.notice = None;
         self.item_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -877,8 +945,13 @@ impl View {
                 this.items.busy = false;
                 match res {
                     Ok(BotRpcResponse::Item(updated)) => {
-                        if let Some(bot_id) = selected_bot_id {
-                            this.upsert_item(*updated, &bot_id);
+                        let owner_id = updated.owner_bot_id.clone();
+                        this.upsert_item(*updated, &owner_id);
+                        if clear_attachments {
+                            this.items.attachments.remove(&uid_for_clear);
+                        }
+                        if let Some(key) = clear_ask_step {
+                            this.items.ask_steps.remove(&key);
                         }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
@@ -887,6 +960,12 @@ impl View {
                         this.emit_badge(cx);
                     }
                     Ok(_) => {
+                        if clear_attachments {
+                            this.items.attachments.remove(&uid_for_clear);
+                        }
+                        if let Some(key) = clear_ask_step {
+                            this.items.ask_steps.remove(&key);
+                        }
                         if let Some(inp) = clear_input {
                             let mut slot = Some(inp);
                             clear_input_on_window(&mut slot, this.window_handle, cx);
@@ -906,14 +985,32 @@ impl View {
         cx.notify();
     }
 
-    pub fn mark_bot_items_opened(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
-        if self.items.busy {
-            return;
-        }
+    /// Quietly records that the owner opened Home and saw the bot's items, without blocking
+    /// item actions (`items.busy`) or flashing a "Saved" notice banner.
+    pub(super) fn mark_bot_items_opened_silently(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
         let rpc = self.rpc.clone();
-        self.items.busy = true;
+        self.mark_items_seen_task = Some(cx.spawn(async move |_this, cx| {
+            drop(
+                cx.background_executor()
+                    .spawn(async move {
+                        expect_ok(
+                            &rpc,
+                            &BotRpcRequest::MarkBotItemsOpened {
+                                bot_id,
+                                up_to_event_id: None,
+                            },
+                        )
+                    })
+                    .await,
+            );
+        }));
+    }
+
+    pub fn mark_bot_items_opened(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
+        let rpc = self.rpc.clone();
         self.error = None;
-        self.item_task = Some(cx.spawn(async move |this, cx| {
+        self.notice = None;
+        self.mark_items_seen_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -927,7 +1024,6 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.items.busy = false;
                 match res {
                     Ok(()) => this.notice = Some(SharedString::from(text::SAVED.get())),
                     Err(err) => this.error = Some(SharedString::from(err)),
@@ -939,14 +1035,25 @@ impl View {
         cx.notify();
     }
 
-    pub(super) fn upsert_item(&mut self, updated: BotItem, bot_id: &BotId) {
+    pub(super) fn upsert_item(&mut self, updated: BotItem, _bot_id: &BotId) {
+        let owner_id = updated.owner_bot_id.clone();
+        if let Some(slot) = self
+            .group_panel
+            .all_items
+            .iter_mut()
+            .find(|i| i.uid == updated.uid)
+        {
+            *slot = updated.clone();
+        } else if self.group_panel.active && self.group_panel.member_ids.contains(&owner_id) {
+            self.group_panel.all_items.insert(0, updated.clone());
+        }
         if let Some(slot) = self.items.items.iter_mut().find(|i| i.uid == updated.uid) {
             *slot = updated;
         } else {
             self.items.items.insert(0, updated);
         }
         self.items.bump_items_rev();
-        self.sync_open_items_for_bot(bot_id);
+        self.sync_open_items_for_bot(&owner_id);
     }
 
     pub(super) fn render_items_tab(

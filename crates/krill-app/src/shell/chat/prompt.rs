@@ -31,13 +31,21 @@ pub(super) struct Origin {
     pub host: krill_app::hosts::HostId,
     pub target: Option<krill_app::hosts::HostTarget>,
     pub epoch: u64,
+    pub initial_status: Option<(krill_proto::control::AgentState, u64)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinishOutcome {
+    Confirmed,
+    Detached,
+    ReviewRequired,
 }
 
 #[derive(Clone, Copy)]
 struct FinishPrompt<'a> {
     key: &'a ChatKey,
     pending_id: u64,
-    confirmed: bool,
+    outcome: FinishOutcome,
 }
 
 impl Origin {
@@ -46,16 +54,41 @@ impl Origin {
     }
 }
 
+pub(super) fn update_with_optional_window(
+    this: &gpui::WeakEntity<Shell>,
+    win: Option<gpui::AnyWindowHandle>,
+    cx: &mut gpui::AsyncApp,
+    f: impl FnOnce(&mut Shell, Option<&mut Window>, &mut Context<Shell>),
+) {
+    let mut f = Some(f);
+    if let Some(handle) = win {
+        let ran = handle
+            .update(cx, |_, window, cx| {
+                if let Some(f) = f.take() {
+                    this.update(cx, |this, cx| f(this, Some(window), cx)).ok();
+                }
+            })
+            .is_ok();
+        if ran {
+            return;
+        }
+    }
+    if let Some(f) = f.take() {
+        this.update(cx, |this, cx| f(this, None, cx)).ok();
+    }
+}
+
 impl Shell {
-    pub(super) fn chat_prompt_current(&self, origin: &Origin, cx: &Context<Self>) -> bool {
+    pub(super) fn chat_prompt_transport_current(&self, origin: &Origin) -> bool {
         let Origin {
             pane,
             session,
             host,
             target,
             epoch,
+            ..
         } = origin;
-        self.is_pane_chat_view(*pane, cx)
+        self.layout.pane_exists(*pane)
             && self.layout.host(*pane) == host
             && self.layout.session(*pane) == Some(*session)
             && self.chat.logs.get(&origin.key()).map_or(0, |log| log.epoch) == *epoch
@@ -73,13 +106,50 @@ impl Shell {
                 .is_some_and(krill_app::hosts::HostTarget::is_current)
     }
 
+    pub(super) fn chat_prompt_current(&self, origin: &Origin, cx: &gpui::App) -> bool {
+        self.is_pane_chat_view(origin.pane, cx) && self.chat_prompt_transport_current(origin)
+    }
+
+    pub(super) fn chat_prompt_view_detached(&self, origin: &Origin, cx: &gpui::App) -> bool {
+        if !self.layout.pane_exists(origin.pane) {
+            return true;
+        }
+        self.layout.host(origin.pane) == &origin.host
+            && self.layout.session(origin.pane) == Some(origin.session)
+            && (!self.is_pane_chat_view(origin.pane, cx)
+                || !self.layout.visible().contains(&origin.pane))
+    }
+
+    pub(super) fn chat_prompt_turn_started(
+        &self,
+        key: &ChatKey,
+        initial_status: Option<(krill_proto::control::AgentState, u64)>,
+        cx: &gpui::App,
+    ) -> bool {
+        use krill_proto::control::AgentState;
+        let Some((state, since)) = self.session_status(key, cx) else {
+            return false;
+        };
+        match initial_status {
+            Some((AgentState::Working, prev_since)) => {
+                state == AgentState::Working && since != prev_since
+            }
+            Some((_, prev_since)) => {
+                state == AgentState::Working
+                    || (since > prev_since
+                        && matches!(state, AgentState::Done | AgentState::Waiting))
+            }
+            None => state == AgentState::Working,
+        }
+    }
+
     pub(super) fn chat_prompt_delivery(
         &self,
         origin: &Origin,
         receipt: Receipt,
-        cx: &Context<Self>,
+        _cx: &gpui::App,
     ) -> Delivery {
-        if !self.chat_prompt_current(origin, cx) {
+        if !self.chat_prompt_transport_current(origin) {
             return Delivery::Uncertain;
         }
         #[cfg(test)]
@@ -111,7 +181,7 @@ impl Shell {
         )
     }
 
-    fn chat_prompt_confirmed(&mut self, origin: &Origin, pending_id: u64) -> bool {
+    fn chat_prompt_confirmed(&mut self, origin: &Origin, pending_id: u64, cx: &gpui::App) -> bool {
         #[cfg(test)]
         if let Some(confirmed) = self.chat.prompt_confirmed {
             return confirmed;
@@ -119,6 +189,9 @@ impl Shell {
         let key = origin.key();
         self.reconcile_pending_prompts_on_poll(&key);
         if !self.has_pending_prompt(&key, pending_id) {
+            return true;
+        }
+        if self.chat_prompt_turn_started(&key, origin.initial_status, cx) {
             return true;
         }
         #[cfg(test)]
@@ -135,27 +208,34 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.chat.prompt_tasks.remove(finish.key);
-        if finish.confirmed {
-            self.chat.prompt_failed.remove(finish.key);
-            self.confirm_pending_prompt(finish.key, finish.pending_id);
-            cx.notify();
-        } else {
-            self.transition_pending_to_review_required(
-                super::PendingReview {
-                    key: finish.key,
-                    pending_id: finish.pending_id,
-                    immediate_send_failure: false,
-                },
-                window,
-                cx,
-            );
+        match finish.outcome {
+            FinishOutcome::Confirmed => {
+                self.chat.prompt_failed.remove(finish.key);
+                self.confirm_pending_prompt(finish.key, finish.pending_id);
+                cx.notify();
+            }
+            FinishOutcome::Detached => {
+                self.confirm_pending_prompt(finish.key, finish.pending_id);
+                cx.notify();
+            }
+            FinishOutcome::ReviewRequired => {
+                self.transition_pending_to_review_required(
+                    super::PendingReview {
+                        key: finish.key,
+                        pending_id: finish.pending_id,
+                        immediate_send_failure: false,
+                    },
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
     pub(super) fn start_chat_prompt(
         &mut self,
         prompt: ChatPrompt,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let ChatPrompt {
@@ -176,6 +256,7 @@ impl Shell {
             host: key.0.clone(),
             target: self.live.get(&pane).and_then(|live| live.target.clone()),
             epoch: log.map_or(0, |log| log.epoch),
+            initial_status: self.session_status(&key, cx),
         };
         let baseline_queued = if is_agy {
             self.live.get(&pane).map_or(0, |live| {
@@ -188,6 +269,7 @@ impl Shell {
         } else {
             0
         };
+        let win = window.as_deref().map(Window::window_handle).or(self.window);
         if !self.send_to_chat_pane(pane, session, &bytes, cx) {
             self.transition_pending_to_review_required(
                 super::PendingReview {
@@ -195,7 +277,7 @@ impl Shell {
                     pending_id,
                     immediate_send_failure: true,
                 },
-                Some(window),
+                window,
                 cx,
             );
             return;
@@ -207,19 +289,19 @@ impl Shell {
                     pending_id,
                     immediate_send_failure: true,
                 },
-                Some(window),
+                window,
                 cx,
             );
             return;
         };
         self.chat.prompt_failed.remove(&key);
         let task_key = key.clone();
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             // Queue acceptance can precede the actual Windows pipe write by an
             // arbitrary interval. Start settling only after the Applied ACK.
             let mut applied = false;
             for _ in 0..RECEIPT_POLLS {
-                let Ok(delivery) = this.update_in(cx, |this, _, cx| {
+                let Ok(delivery) = this.update(cx, |this, cx| {
                     this.chat_prompt_delivery(&origin, receipt, cx)
                 }) else {
                     return;
@@ -234,25 +316,24 @@ impl Shell {
                 }
             }
             if !applied {
-                this.update_in(cx, |this, window, cx| {
+                update_with_optional_window(&this, win, cx, |this, window, cx| {
                     this.finish_chat_prompt(
                         FinishPrompt {
                             key: &task_key,
                             pending_id,
-                            confirmed: false,
+                            outcome: FinishOutcome::ReviewRequired,
                         },
-                        Some(window),
+                        window,
                         cx,
                     );
-                })
-                .ok();
+                });
                 return;
             }
             cx.background_executor()
                 .timer(krill_proto::input::PASTE_SUBMIT_DELAY)
                 .await;
             let enter = this
-                .update_in(cx, |this, _, cx| {
+                .update(cx, |this, cx| {
                     if this.chat_prompt_delivery(&origin, receipt, cx) != Delivery::Applied
                         || !this.send_chat_prompt_input(pane, session, b"\r", cx)
                     {
@@ -263,25 +344,24 @@ impl Shell {
                 .ok()
                 .flatten();
             let Some(enter) = enter else {
-                this.update_in(cx, |this, window, cx| {
+                update_with_optional_window(&this, win, cx, |this, window, cx| {
                     this.finish_chat_prompt(
                         FinishPrompt {
                             key: &task_key,
                             pending_id,
-                            confirmed: false,
+                            outcome: FinishOutcome::ReviewRequired,
                         },
-                        Some(window),
+                        window,
                         cx,
                     );
-                })
-                .ok();
+                });
                 return;
             };
             let mut applied = false;
             for _ in 0..RECEIPT_POLLS {
-                let Ok(delivery) = this.update_in(cx, |this, _, cx| {
-                    this.chat_prompt_delivery(&origin, enter, cx)
-                }) else {
+                let Ok(delivery) =
+                    this.update(cx, |this, cx| this.chat_prompt_delivery(&origin, enter, cx))
+                else {
                     return;
                 };
                 match delivery {
@@ -294,93 +374,94 @@ impl Shell {
                 }
             }
             if applied && kind == PromptKind::OpensTerminal {
-                this.update_in(cx, |this, window, cx| {
+                update_with_optional_window(&this, win, cx, |this, window, cx| {
                     let current = this.chat_prompt_current(&origin, cx);
                     this.finish_chat_prompt(
                         FinishPrompt {
                             key: &task_key,
                             pending_id,
-                            confirmed: true,
+                            outcome: FinishOutcome::Confirmed,
                         },
-                        Some(window),
+                        None,
                         cx,
                     );
                     if current {
-                        this.switch_pane_to_terminal(pane, window, cx);
+                        this.switch_pane_to_terminal_opt(pane, &task_key, window, cx);
                     }
-                })
-                .ok();
+                });
                 return;
             }
             if applied && kind == PromptKind::LocalSlash {
-                this.update_in(cx, |this, window, cx| {
+                update_with_optional_window(&this, win, cx, |this, window, cx| {
                     this.finish_chat_prompt(
                         FinishPrompt {
                             key: &task_key,
                             pending_id,
-                            confirmed: true,
+                            outcome: FinishOutcome::Confirmed,
                         },
-                        Some(window),
+                        window,
                         cx,
                     );
-                })
-                .ok();
+                });
                 return;
             }
             if applied {
-                enum TurnCheck {
-                    Pending,
-                    Invalid,
+                enum WatchStep {
                     Confirmed,
                     AgyQueued { send_immediately_hint: bool },
+                    Detached,
+                    Failed,
+                    Wait,
                 }
                 for step in 0..TURN_POLLS {
-                    let Ok(check) = this.update_in(cx, |this, _, cx| {
-                        if !this.chat_prompt_current(&origin, cx) {
-                            return TurnCheck::Invalid;
-                        }
-                        if this.chat_prompt_confirmed(&origin, pending_id) {
-                            return TurnCheck::Confirmed;
+                    let Ok(watch) = this.update(cx, |this, cx| {
+                        if this.chat_prompt_confirmed(&origin, pending_id, cx) {
+                            return WatchStep::Confirmed;
                         }
                         if is_agy
+                            && this.chat_prompt_transport_current(&origin)
                             && let Some(qm) = this.chat_agy_queued_match(
                                 &origin,
                                 &submitted_payload,
                                 baseline_queued,
                             )
                         {
-                            return TurnCheck::AgyQueued {
+                            return WatchStep::AgyQueued {
                                 send_immediately_hint: qm.send_immediately_hint,
                             };
+                        }
+                        if this.chat_prompt_view_detached(&origin, cx) {
+                            return WatchStep::Detached;
+                        }
+                        if !this.chat_prompt_transport_current(&origin) {
+                            return WatchStep::Failed;
                         }
                         if step % 5 == 0 {
                             this.poll_session_chat(pane, session, cx);
                         }
-                        TurnCheck::Pending
+                        WatchStep::Wait
                     }) else {
                         return;
                     };
-                    match check {
-                        TurnCheck::Invalid => break,
-                        TurnCheck::Confirmed => {
-                            this.update_in(cx, |this, window, cx| {
+                    match watch {
+                        WatchStep::Confirmed => {
+                            update_with_optional_window(&this, win, cx, |this, window, cx| {
                                 this.finish_chat_prompt(
                                     FinishPrompt {
                                         key: &task_key,
                                         pending_id,
-                                        confirmed: true,
+                                        outcome: FinishOutcome::Confirmed,
                                     },
-                                    Some(window),
+                                    window,
                                     cx,
                                 );
-                            })
-                            .ok();
+                            });
                             return;
                         }
-                        TurnCheck::AgyQueued {
+                        WatchStep::AgyQueued {
                             send_immediately_hint,
                         } => {
-                            this.update_in(cx, |this, _, cx| {
+                            this.update(cx, |this, cx| {
                                 if steer
                                     && send_immediately_hint
                                     && this.chat_prompt_current(&origin, cx)
@@ -397,25 +478,38 @@ impl Shell {
                             .ok();
                             return;
                         }
-                        TurnCheck::Pending => {}
+                        WatchStep::Detached => {
+                            update_with_optional_window(&this, win, cx, |this, window, cx| {
+                                this.finish_chat_prompt(
+                                    FinishPrompt {
+                                        key: &task_key,
+                                        pending_id,
+                                        outcome: FinishOutcome::Detached,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            });
+                            return;
+                        }
+                        WatchStep::Failed => break,
+                        WatchStep::Wait => cx.background_executor().timer(POLL).await,
                     }
-                    cx.background_executor().timer(POLL).await;
                 }
             }
             // Applied only proves a PTY write, never provider consumption. Keep
             // the draft and require review rather than replaying or adding Enter.
-            this.update_in(cx, |this, window, cx| {
+            update_with_optional_window(&this, win, cx, |this, window, cx| {
                 this.finish_chat_prompt(
                     FinishPrompt {
                         key: &task_key,
                         pending_id,
-                        confirmed: false,
+                        outcome: FinishOutcome::ReviewRequired,
                     },
-                    Some(window),
+                    window,
                     cx,
                 );
-            })
-            .ok();
+            });
         });
         self.chat.prompt_tasks.insert(key, task);
         cx.notify();

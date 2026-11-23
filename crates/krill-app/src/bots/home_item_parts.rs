@@ -655,7 +655,11 @@ impl View {
                                 }),
                         )
                         .tooltip(move |w, cx| ui::tooltip_view("bot-item-pr", tip.clone(), w, cx))
-                        .on_click(move |_, _, cx| cx.open_url(&open))
+                        .on_click(move |_, _, cx| {
+                            if open.starts_with("https://") || open.starts_with("http://") {
+                                cx.open_url(&open);
+                            }
+                        })
                         .into_any_element()
                 }
                 BotItemLink::Url(v) => {
@@ -690,7 +694,7 @@ impl View {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .child(path.rsplit('/').next().unwrap_or(&path).to_owned()),
+                                .child(path.rsplit(['/', '\\']).next().unwrap_or(&path).to_owned()),
                         )
                         .on_click(move |_, _, cx| {
                             if !path.is_empty() {
@@ -713,18 +717,54 @@ impl View {
         cx: &mut Context<Self>,
     ) {
         let rpc = self.rpc.clone();
-        cx.background_executor()
-            .spawn(async move {
-                call_checked(
-                    &rpc,
-                    &BotRpcRequest::StopBotSession {
-                        bot_id,
-                        session_id: sid,
-                    },
-                )
-                .ok();
+        self.error = None;
+        self.notice = None;
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    call_checked(
+                        &rpc,
+                        &BotRpcRequest::StopBotSession {
+                            bot_id,
+                            session_id: sid,
+                        },
+                    )?;
+                    let sessions = match call_checked(
+                        &rpc,
+                        &BotRpcRequest::ListBotSessions { bot_id: None },
+                    ) {
+                        Ok(krill_proto::bots::BotRpcResponse::BotSessions(list)) => Some(list),
+                        _ => None,
+                    };
+                    Ok::<_, String>(sessions)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(Some(list)) => {
+                        this.bot_sessions = list;
+                        this.emit_sessions_changed(cx);
+                    }
+                    Ok(None) => {
+                        if let Some(sess) =
+                            this.bot_sessions.iter_mut().find(|s| s.session_id == sid)
+                        {
+                            sess.live = false;
+                            sess.working = false;
+                        }
+                        this.emit_sessions_changed(cx);
+                    }
+                    Err(err) => {
+                        this.error = Some(SharedString::from(err));
+                        this.notice = None;
+                    }
+                }
+                cx.notify();
             })
-            .detach();
+            .ok();
+        })
+        .detach();
     }
 
     /// An Edited event: "changed {field} ›" per field, its before and after on click.
@@ -1093,10 +1133,39 @@ impl View {
         uid: String,
         key: &(String, u64),
         decisions: &[BotItemDecision],
+        answers: Vec<Option<String>>,
+        typed: Option<(usize, String)>,
+        extra_comment: Option<String>,
+        clear_input: Option<gpui::Entity<gpui_component::input::InputState>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_held_answers_with_attachments(
+            uid,
+            key,
+            decisions,
+            answers,
+            typed,
+            extra_comment,
+            clear_input,
+            false,
+            cx,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "posts held multi-question answers with deferred cleanup"
+    )]
+    pub(super) fn send_held_answers_with_attachments(
+        &mut self,
+        uid: String,
+        key: &(String, u64),
+        decisions: &[BotItemDecision],
         mut answers: Vec<Option<String>>,
         typed: Option<(usize, String)>,
         extra_comment: Option<String>,
         clear_input: Option<gpui::Entity<gpui_component::input::InputState>>,
+        clear_attachments: bool,
         cx: &mut Context<Self>,
     ) {
         if self.items.busy {
@@ -1122,8 +1191,15 @@ impl View {
         if body.is_empty() {
             return;
         }
-        self.items.ask_steps.remove(key);
-        self.answer_item_decision(uid, Some(body), None, clear_input, cx);
+        self.answer_item_decision_with_cleanup(
+            uid,
+            Some(body),
+            None,
+            clear_input,
+            clear_attachments,
+            Some(key.clone()),
+            cx,
+        );
     }
 
     /// The workers each of the bot's chats started (Orca's chat tree): the Dispatch links its

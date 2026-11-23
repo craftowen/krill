@@ -112,6 +112,12 @@ pub struct PictureState {
     gen_task: Option<Task<()>>,
 }
 
+impl Drop for PictureState {
+    fn drop(&mut self) {
+        self.cancel_running_generation();
+    }
+}
+
 impl PictureState {
     #[must_use]
     pub fn new(prefix: &'static str, template_mascot: Option<&'static str>, cx: &mut App) -> Self {
@@ -325,6 +331,11 @@ impl PictureState {
             self.gen_run = GenRunState::Idle;
         }
         self.gen_task = None;
+    }
+
+    pub fn input_is_composing(&self, window: &mut Window, app: &mut App) -> bool {
+        super::opt_input_composing(self.hex_input.as_ref(), window, app)
+            || super::opt_textarea_composing(self.gen_input.as_ref(), window, app)
     }
 
     pub fn open_popover<E: 'static>(
@@ -742,11 +753,13 @@ impl PictureState {
             window,
             move |this, inp, ev: &InputEvent, window, cx| match ev {
                 InputEvent::Change => {
-                    let val = inp.read(cx).value().to_string();
-                    if val.chars().count() > MAX_AVATAR_DESCRIPTION_CHARS {
-                        let clipped: String =
-                            val.chars().take(MAX_AVATAR_DESCRIPTION_CHARS).collect();
-                        inp.update(cx, |s, cx| s.set_value(clipped, window, cx));
+                    if !super::opt_textarea_composing(Some(inp), window, cx) {
+                        let val = inp.read(cx).value().to_string();
+                        if val.chars().count() > MAX_AVATAR_DESCRIPTION_CHARS {
+                            let clipped: String =
+                                val.chars().take(MAX_AVATAR_DESCRIPTION_CHARS).collect();
+                            inp.update(cx, |s, cx| s.set_value(clipped, window, cx));
+                        }
                     }
                     let s = lens(this);
                     if matches!(s.gen_run, GenRunState::Error { .. }) {
@@ -754,7 +767,9 @@ impl PictureState {
                     }
                     cx.notify();
                 }
-                InputEvent::PressEnter { .. } => {
+                InputEvent::PressEnter { .. }
+                    if !super::opt_textarea_composing(Some(inp), window, cx) =>
+                {
                     lens(this).start_generation(lens, cx);
                 }
                 _ => {}

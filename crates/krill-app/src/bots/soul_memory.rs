@@ -827,8 +827,9 @@ impl View {
     pub fn select_memory_topic(&mut self, bot_id: BotId, topic: &str, cx: &mut Context<Self>) {
         let rpc = self.rpc.clone();
         self.error = None;
+        self.notice = None;
         let topic_owned = topic.to_owned();
-        self.memory_task = Some(cx.spawn(async move |this, cx| {
+        self.topic_read_task = Some(cx.spawn(async move |this, cx| {
             let topic_bg = topic_owned.clone();
             let res = cx
                 .background_executor()

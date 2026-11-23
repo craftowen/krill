@@ -26,8 +26,8 @@
   let data=null,failure=null,busy=null,loading=false,phase,handoffTimer=null,hostId=opts.hostId||null;const sections=new Map(),rows=new Map();let serial=0;
   const activeHost=()=>hostId?(ctx.getConnections?.()||[]).find(h=>h.id===hostId):null;
   const curPhase=()=>activeHost()?.connection?.phase??ctx.state.connection.phase;
-  const runRpc=req=>hostId&&ctx.rpcForHost?ctx.rpcForHost(hostId,req):ctx.rpc(req);
-  const runRefresh=()=>hostId&&ctx.refreshHost?ctx.refreshHost(hostId):ctx.refresh?.();
+  const runRpc=req=>{try{return Promise.resolve(hostId&&ctx.rpcForHost?ctx.rpcForHost(hostId,req):ctx.rpc(req));}catch(e){return Promise.reject(e);}};
+  const runRefresh=()=>{try{return Promise.resolve(hostId&&ctx.refreshHost?ctx.refreshHost(hostId):ctx.refresh?.());}catch(e){return Promise.reject(e);}};
   const hasPendingHandoff=d=>(d?.details?.handoffs||[]).some(h=>h.to==null&&!h.error);
   function scheduleHandoffPoll(){clearTimeout(handoffTimer);handoffTimer=null;if(!ctx.signal.aborted&&hasPendingHandoff(data))handoffTimer=setTimeout(()=>{handoffTimer=null;if(!document.hidden)load();},500);}
   async function load(){if(loading||curPhase()!=='ready'){draw();return;}const wasPending=hasPendingHandoff(data);loading=true;draw();try{const result=await runRpc({action:'accounts'});if(ctx.signal.aborted)return;data=result;failure=null;if(wasPending&&!hasPendingHandoff(data))runRefresh()?.catch?.(()=>{});}catch(e){if(ctx.signal.aborted)return;failure=cleanError(e,t);}finally{loading=false;draw();scheduleHandoffPoll();}}

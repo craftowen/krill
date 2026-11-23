@@ -383,6 +383,13 @@ impl Shell {
     }
 
     fn load_split_launcher_files(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.layout.host(pane).is_remote() {
+            if let Some(launcher) = self.split_launchers.get_mut(&pane) {
+                launcher.files_loading = false;
+                launcher.files_loaded = true;
+            }
+            return;
+        }
         let root = self
             .split_launchers
             .get(&pane)
@@ -583,6 +590,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .split_launchers
+            .get(&pane)
+            .is_some_and(|launcher| launcher.launching)
+        {
+            return;
+        }
         let rows = self.launcher_rows(pane, cx);
         let Some(row) = rows.get(index).cloned() else {
             return;
@@ -608,7 +622,17 @@ impl Shell {
         pane: PaneId,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .split_launchers
+            .get(&pane)
+            .is_some_and(|launcher| launcher.launching)
+        {
+            return;
+        }
         if let Some(bot) = self.bot_for_pane(pane).cloned() {
+            if self.bot_ui.opening.contains(&bot.id) {
+                return;
+            }
             if let Some(launcher) = self.split_launchers.get_mut(&pane) {
                 launcher.launching = true;
             }
@@ -626,9 +650,21 @@ impl Shell {
         agent_id: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(bot) = self.bot_for_pane(pane).cloned()
-            && (agent_id.is_empty() || bot.agent_id.eq_ignore_ascii_case(&agent_id))
+        if self
+            .split_launchers
+            .get(&pane)
+            .is_some_and(|launcher| launcher.launching)
         {
+            return;
+        }
+        if let Some(bot) = self.bot_for_pane(pane).cloned()
+            && (agent_id.is_empty()
+                || krill_proto::agent::canonical_id(&bot.agent_id)
+                    .eq_ignore_ascii_case(krill_proto::agent::canonical_id(&agent_id)))
+        {
+            if self.bot_ui.opening.contains(&bot.id) {
+                return;
+            }
             if let Some(launcher) = self.split_launchers.get_mut(&pane) {
                 launcher.launching = true;
             }
@@ -662,6 +698,13 @@ impl Shell {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .split_launchers
+            .get(&pane)
+            .is_some_and(|launcher| launcher.launching)
+        {
+            return;
+        }
         let cwd = self.launcher_cwd(pane);
         self.split_launchers.remove(&pane);
         self.change(true, cx, |l| {
@@ -692,6 +735,13 @@ impl Shell {
         rel_path: PathBuf,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .split_launchers
+            .get(&pane)
+            .is_some_and(|launcher| launcher.launching)
+        {
+            return;
+        }
         let root = self.launcher_cwd(pane);
         let full_path = if rel_path.is_absolute() {
             rel_path
@@ -1724,6 +1774,67 @@ mod tests {
             Some(&Program::Agent {
                 id: "codex".to_owned()
             })
+        );
+    }
+
+    #[gpui::test]
+    fn launcher_guards_duplicate_launch_remote_files_and_canonical_agent_id(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, vcx, calls, _home) = setup_bot_shell(cx, "guards-remote-canonical");
+        shell.update(vcx, |s, cx| {
+            // Bot configured with alias `claude-code` should match `claude` via canonical_id.
+            s.sidebar_bots[0].agent_id = "claude-code".to_owned();
+            s.split_active(Axis::Horizontal, cx);
+        });
+        vcx.run_until_parked();
+        let pane = shell.read_with(vcx, |s, _| s.layout.focused().unwrap());
+
+        // Remote host launcher must NOT run local quick_open::list.
+        shell.update(vcx, |s, cx| {
+            s.layout.set_host(pane, HostId::Remote("remote-box".into()));
+            s.load_split_launcher_files(pane, cx);
+        });
+        vcx.run_until_parked();
+        shell.read_with(vcx, |s, _| {
+            let l = s.split_launchers.get(&pane).unwrap();
+            assert!(l.files_loaded);
+            assert!(l.files.is_empty());
+        });
+
+        // Switch back to Local, simulate in-flight `launching = true` -> duplicate triggers ignored.
+        calls.lock().unwrap().clear();
+        shell.update(vcx, |s, cx| {
+            s.layout.set_host(pane, HostId::Local);
+            if let Some(l) = s.split_launchers.get_mut(&pane) {
+                l.launching = true;
+            }
+            s.launch_default_agent_in_launcher_pane(pane, cx);
+            s.launch_agent_in_launcher_pane(pane, "claude".to_owned(), cx);
+        });
+        vcx.run_until_parked();
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, BotRpcRequest::StartBotSession { .. })),
+            "launching guard must prevent duplicate StartBotSession RPCs"
+        );
+
+        // Clear launching flag and pick `"claude"` against bot with `"claude-code"` -> starts bot session.
+        shell.update(vcx, |s, cx| {
+            s.clear_split_launcher_launching(pane);
+            s.launch_agent_in_launcher_pane(pane, "claude".to_owned(), cx);
+        });
+        vcx.run_until_parked();
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(r, BotRpcRequest::StartBotSession { .. })),
+            "canonical_id must match claude-code bot when claude is selected"
         );
     }
 }

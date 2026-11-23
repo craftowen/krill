@@ -528,18 +528,20 @@ pub fn classify_remote_error(stderr: &str, code: Option<i32>) -> InstallFailureK
     if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
         return InstallFailureKind::DiskFull;
     }
+    if lower.contains("host key verification failed")
+        || lower.contains("permission denied (publickey")
+        || lower.contains("permission denied (keyboard-interactive")
+        || lower.contains("permission denied (password")
+        || lower.contains("authentication failed")
+    {
+        return InstallFailureKind::Auth;
+    }
     if lower.contains("permission denied")
         || lower.contains("operation not permitted")
         || lower.contains("permissiondenied")
     {
         // SSH 접속 단계의 동일 문구는 호출자가 Auth로 올린다.
         return InstallFailureKind::Permission;
-    }
-    if lower.contains("host key verification failed")
-        || lower.contains("permission denied (publickey")
-        || lower.contains("authentication failed")
-    {
-        return InstallFailureKind::Auth;
     }
     if lower.contains("could not resolve hostname")
         || lower.contains("no route to host")

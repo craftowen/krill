@@ -9,6 +9,7 @@ fn stored(profile: &str, account: Option<LaunchAccount>) -> StoredLaunch {
         hibernation_blocked: true,
         account,
         bot_instructions: None,
+        launched_at: None,
     }
 }
 #[test]

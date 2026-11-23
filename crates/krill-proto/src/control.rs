@@ -1340,6 +1340,9 @@ impl Msg for Request {
         })
     }
 }
+/// Postcard variant discriminant for [`Reply::Bot`] (0-indexed variant 33).
+const REPLY_BOT_TAG: u8 = 33;
+
 impl Msg for Reply {
     const KIND: u8 = kind::REPLY;
 
@@ -1435,10 +1438,22 @@ impl Msg for Reply {
             }
             return crate::ipc::encode_frame(Self::KIND, &body);
         }
+        if let Self::Bot(resp) = self {
+            let mut body = postcard::to_stdvec(&REPLY_BOT_TAG).map_err(crate::ipc::Error::Codec)?;
+            body.extend(resp.encode_wire_body()?);
+            return crate::ipc::encode_frame(Self::KIND, &body);
+        }
         crate::ipc::encode(Self::KIND, self)
     }
 
     fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if kind == Self::KIND && body.first() == Some(&REPLY_BOT_TAG) {
+            let (_, rest) =
+                postcard::take_from_bytes::<u8>(body).map_err(crate::ipc::Error::Codec)?;
+            return Ok(Self::Bot(crate::bots::BotRpcResponse::decode_wire_body(
+                rest,
+            )?));
+        }
         if kind == Self::KIND && body.first() == Some(&4) {
             let (mut reply, rest) =
                 postcard::take_from_bytes::<Self>(body).map_err(crate::ipc::Error::Codec)?;

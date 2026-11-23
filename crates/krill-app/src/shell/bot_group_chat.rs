@@ -60,6 +60,7 @@ pub(super) struct RoomState {
     pub loading_earlier: bool,
     pub sending: bool,
     pub error: Option<String>,
+    pub action_error: Option<String>,
     pub composer: Option<(Entity<TextareaState>, Subscription)>,
     pub draft: String,
     pub expanded_turns: HashSet<String>,
@@ -168,10 +169,72 @@ fn now_unix_ms() -> u64 {
 fn format_elapsed(ms: u64) -> String {
     let secs = ms / 1000;
     if secs < 60 {
-        format!("{secs}s")
+        text::GRP_ELAPSED_SEC.format(&[("s", &secs.to_string())])
     } else {
-        format!("{}m {}s", secs / 60, secs % 60)
+        let mins = secs / 60;
+        let rem = secs % 60;
+        text::GRP_ELAPSED_MIN_SEC.format(&[("m", &mins.to_string()), ("s", &rem.to_string())])
     }
+}
+
+/// Returns whether an existing group pane targets the same thread as `requested_tid`,
+/// treating `None` as equivalent to its loaded `active_thread_id` or `default_tid`.
+fn same_group_thread(
+    existing_tid: Option<&str>,
+    existing_active_tid: Option<&str>,
+    requested_tid: Option<&str>,
+    default_tid: Option<&str>,
+) -> bool {
+    let eff_existing = existing_tid.or(existing_active_tid).or(default_tid);
+    let eff_requested = requested_tid.or(default_tid);
+    match (eff_existing, eff_requested) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Merges a fresh latest-page poll into an existing room view so older messages previously
+/// fetched via "Load earlier" (and the corresponding `has_earlier` flag) are preserved.
+fn merge_polled_room(
+    prev: Option<&BotGroupRoomView>,
+    mut polled: BotGroupRoomView,
+) -> BotGroupRoomView {
+    let Some(prev) = prev else {
+        return polled;
+    };
+    if let (Some(a), Some(b)) = (&prev.active_thread_id, &polled.active_thread_id)
+        && a != b
+    {
+        return polled;
+    }
+    let Some(first_polled) = polled.messages.first() else {
+        return polled;
+    };
+    let Some(overlap_idx) = prev
+        .messages
+        .iter()
+        .position(|m| m.message_id == first_polled.message_id)
+    else {
+        return polled;
+    };
+    if overlap_idx == 0 {
+        return polled;
+    }
+    let polled_ids: HashSet<&str> = polled
+        .messages
+        .iter()
+        .map(|m| m.message_id.as_str())
+        .collect();
+    let mut merged: Vec<BotGroupMessage> = prev.messages[..overlap_idx]
+        .iter()
+        .filter(|m| !polled_ids.contains(m.message_id.as_str()))
+        .cloned()
+        .collect();
+    merged.append(&mut polled.messages);
+    polled.messages = merged;
+    polled.has_earlier = prev.has_earlier;
+    polled
 }
 
 impl Shell {
@@ -275,27 +338,66 @@ impl Shell {
             group_id: group_id.to_owned(),
             thread_id: thread_id.map(str::to_owned),
         };
-        let existing = (0..self.layout.tabs().len()).find_map(|tab_idx| {
-            self.layout.tab_panes(tab_idx).into_iter().find(|&p| {
-                self.layout.host(p) == &host
-                    && self.layout.group_pane(p).is_some_and(|g| {
-                        g.group_id == group_id
-                            && match &target.thread_id {
-                                Some(tid) => g.thread_id.as_deref() == Some(tid.as_str()),
-                                None => g.thread_id.is_none(),
-                            }
-                    })
+        let default_tid: Option<String> = self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(&GroupRoomKey {
+                host: host.clone(),
+                group_id: group_id.to_owned(),
+                thread_id: None,
             })
-        });
+            .and_then(|r| r.room.as_ref())
+            .and_then(|v| {
+                v.active_thread_id
+                    .clone()
+                    .or_else(|| v.threads.first().map(|t| t.thread_id.clone()))
+            })
+            .or_else(|| {
+                self.sidebar_groups
+                    .iter()
+                    .find(|s| s.group.id == group_id)
+                    .and_then(|s| s.threads.first().map(|t| t.thread_id.clone()))
+            });
+        let existing: Option<(PaneId, Option<String>)> =
+            (0..self.layout.tabs().len()).find_map(|tab_idx| {
+                self.layout.tab_panes(tab_idx).into_iter().find_map(|p| {
+                    if self.layout.host(p) != &host {
+                        return None;
+                    }
+                    let g = self.layout.group_pane(p)?;
+                    if g.group_id != group_id {
+                        return None;
+                    }
+                    let existing_active_tid = self
+                        .bot_ui
+                        .group_chat
+                        .rooms
+                        .get(&GroupRoomKey {
+                            host: host.clone(),
+                            group_id: group_id.to_owned(),
+                            thread_id: g.thread_id.clone(),
+                        })
+                        .and_then(|r| r.room.as_ref())
+                        .and_then(|v| v.active_thread_id.as_deref());
+                    same_group_thread(
+                        g.thread_id.as_deref(),
+                        existing_active_tid,
+                        target.thread_id.as_deref(),
+                        default_tid.as_deref(),
+                    )
+                    .then(|| (p, g.thread_id.clone()))
+                })
+            });
 
-        let pane = if let Some(pane) = existing {
+        let (pane, key_thread_id) = if let Some((pane, existing_tid)) = existing {
             self.change(true, cx, |l| {
                 if let Some(tab) = l.tab_of_pane(pane) {
                     l.activate(tab);
                 }
                 l.focus(pane);
             });
-            pane
+            (pane, existing_tid)
         } else {
             let mut opened = None;
             self.change(true, cx, |l| {
@@ -309,13 +411,13 @@ impl Shell {
             let Some(pane) = opened else {
                 return;
             };
-            pane
+            (pane, target.thread_id)
         };
 
         let key = GroupRoomKey {
             host,
             group_id: group_id.to_owned(),
-            thread_id: target.thread_id,
+            thread_id: key_thread_id,
         };
         let entry = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
         entry.focus_composer = ComposerFocus::Focus;
@@ -515,12 +617,14 @@ impl Shell {
                     Ok(BotRpcResponse::GroupRoom(view)) => {
                         state.reply_audience = view.reply_audience.clone();
                         state.error = None;
-                        state.room = Some(view);
+                        let merged = merge_polled_room(state.room.as_ref(), view);
+                        state.room = Some(merged);
                     }
                     Ok(BotRpcResponse::GroupView(old)) => {
                         // Graceful fallback if daemon predates ReadGroupRoom.
+                        state.error = None;
                         let active_thread_id = old.threads.first().map(|t| t.thread_id.clone());
-                        state.room = Some(BotGroupRoomView {
+                        let fallback = BotGroupRoomView {
                             group: old.group,
                             reply_audience: state.reply_audience.clone(),
                             threads: old.threads,
@@ -528,7 +632,9 @@ impl Shell {
                             messages: old.messages,
                             has_earlier: false,
                             active_turns: Vec::new(),
-                        });
+                        };
+                        let merged = merge_polled_room(state.room.as_ref(), fallback);
+                        state.room = Some(merged);
                     }
                     Ok(_) => {}
                     Err(err) => state.error = Some(err),
@@ -559,6 +665,7 @@ impl Shell {
             return;
         };
         state.loading_earlier = true;
+        state.action_error = None;
         let gid = key.group_id.clone();
         let tid = key.thread_id.clone();
         cx.notify();
@@ -580,13 +687,28 @@ impl Shell {
             this.update(cx, |this, cx| {
                 let state = this.bot_ui.group_chat.rooms.entry(key).or_default();
                 state.loading_earlier = false;
-                if let Ok(BotRpcResponse::GroupRoom(earlier)) = res
-                    && let Some(room) = &mut state.room
-                {
-                    let mut merged = earlier.messages;
-                    merged.append(&mut room.messages);
-                    room.messages = merged;
-                    room.has_earlier = earlier.has_earlier;
+                match res {
+                    Ok(BotRpcResponse::GroupRoom(earlier)) => {
+                        if let Some(room) = &mut state.room {
+                            let existing_ids: HashSet<&str> = room
+                                .messages
+                                .iter()
+                                .map(|m| m.message_id.as_str())
+                                .collect();
+                            let mut merged: Vec<BotGroupMessage> = earlier
+                                .messages
+                                .into_iter()
+                                .filter(|m| !existing_ids.contains(m.message_id.as_str()))
+                                .collect();
+                            merged.append(&mut room.messages);
+                            room.messages = merged;
+                            room.has_earlier = earlier.has_earlier;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        state.action_error = Some(err);
+                    }
                 }
                 cx.notify();
             })
@@ -628,6 +750,9 @@ impl Shell {
                     cx.notify();
                 }
                 InputEvent::PressEnter { secondary, .. } if !secondary => {
+                    if Self::chat_input_is_composing(state, window, cx) {
+                        return;
+                    }
                     this.send_group_composer_message(sub_key.clone(), window, cx);
                 }
                 _ => {}
@@ -680,6 +805,7 @@ impl Shell {
         };
         let state = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
         state.reply_audience = audience.clone();
+        state.action_error = None;
         if let Some(s) = self
             .sidebar_groups
             .iter_mut()
@@ -706,7 +832,7 @@ impl Shell {
                 if let Err(err) = res
                     && let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key)
                 {
-                    room.error = Some(err);
+                    room.action_error = Some(err);
                 }
                 cx.notify();
             })
@@ -733,17 +859,14 @@ impl Shell {
         }
         let audience = state.reply_audience.clone();
         let input = state.composer.as_ref().map(|(c, _)| c.clone());
+        let sent_draft = state.draft.clone();
         state.sending = true;
-        state.error = None;
-        state.draft.clear();
-        if let Some(inp) = input {
-            inp.update(cx, |s, cx| s.set_value("", window, cx));
-        }
+        state.action_error = None;
         let gid = key.group_id.clone();
         let tid = key.thread_id.clone();
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -759,11 +882,16 @@ impl Shell {
                     )
                 })
                 .await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
+                let mut clear_input = false;
                 if let Some(room_state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
                     room_state.sending = false;
                     match res {
                         Ok(BotRpcResponse::GroupMessagePosted { message, .. }) => {
+                            if room_state.draft == sent_draft {
+                                room_state.draft.clear();
+                                clear_input = true;
+                            }
                             if let Some(room) = &mut room_state.room {
                                 room.active_thread_id
                                     .get_or_insert_with(|| message.thread_id.clone());
@@ -776,11 +904,20 @@ impl Shell {
                                 }
                             }
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if room_state.draft == sent_draft {
+                                room_state.draft.clear();
+                                clear_input = true;
+                            }
+                        }
                         Err(err) => {
-                            room_state.error = Some(text::GRP_SEND_FAILED.format(&[("err", &err)]));
+                            room_state.action_error =
+                                Some(text::GRP_SEND_FAILED.format(&[("err", &err)]));
                         }
                     }
+                }
+                if clear_input && let Some(inp) = input {
+                    inp.update(cx, |s, cx| s.set_value("", window, cx));
                 }
                 this.poll_group_room(key, cx);
                 this.refresh_bots_badge(cx);
@@ -800,6 +937,9 @@ impl Shell {
         let Some(rpc) = self.bot_rpc_on(&key.host) else {
             return;
         };
+        if let Some(room) = self.bot_ui.group_chat.rooms.get_mut(&key) {
+            room.action_error = None;
+        }
         let gid = key.group_id.clone();
         let tid = key.thread_id.clone();
         cx.spawn(async move |this, cx| {
@@ -820,7 +960,7 @@ impl Shell {
                 if let Err(err) = res
                     && let Some(room) = this.bot_ui.group_chat.rooms.get_mut(&key)
                 {
-                    room.error = Some(err);
+                    room.action_error = Some(err);
                 }
                 this.poll_group_room(key, cx);
                 this.refresh_bots_badge(cx);
@@ -838,6 +978,9 @@ impl Shell {
         raw: &str,
         cx: &mut Context<Self>,
     ) {
+        if let Some(state) = self.bot_ui.group_chat.rooms.get_mut(&key) {
+            state.action_error = None;
+        }
         let target = self.target_for_host(&key.host);
         let bytes = raw.as_bytes().to_vec();
         cx.spawn(async move |this, cx| {
@@ -845,20 +988,23 @@ impl Shell {
                 .background_executor()
                 .spawn(async move {
                     let call = krill_app::resources::daemon_call_for(target);
-                    call(&Request::SendInput {
+                    match call(&Request::SendInput {
                         session,
                         bytes,
-                        submit: true,
+                        submit: false,
                         wait_submit: false,
-                    })
-                    .err()
+                    }) {
+                        Ok(Reply::Failed(failure)) => Some(failure.to_string()),
+                        Ok(_) => None,
+                        Err(err) => Some(err.to_string()),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(err) = err
                     && let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key)
                 {
-                    state.error = Some(err.to_string());
+                    state.action_error = Some(err);
                 }
                 this.poll_group_room(key, cx);
                 this.refresh_bots_badge(cx);
@@ -1028,12 +1174,20 @@ impl Shell {
             .rooms
             .get(&key)
             .is_some_and(|r| r.loading_earlier);
-        let error_msg = self
+        let poll_error = self
             .bot_ui
             .group_chat
             .rooms
             .get(&key)
             .and_then(|r| r.error.clone());
+        let action_error = self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(&key)
+            .and_then(|r| r.action_error.clone());
+        let dismissible_action_error = action_error.is_some();
+        let error_msg = action_error.or(poll_error);
         let expanded_turns = self
             .bot_ui
             .group_chat
@@ -1101,6 +1255,7 @@ impl Shell {
             .font_family(ui::FONT_UI)
             .child(header)
             .children(error_msg.map(|err| {
+                let dismiss_key = key.clone();
                 div()
                     .mx_4()
                     .mt_2()
@@ -1110,9 +1265,30 @@ impl Shell {
                     .border_1()
                     .border_color(p.destructive.opacity(0.4))
                     .bg(p.destructive.opacity(0.1))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .text_size(ui::TEXT_XS)
                     .text_color(p.destructive)
-                    .child(err)
+                    .child(div().flex_1().min_w_0().child(err))
+                    .when(dismissible_action_error, |d| {
+                        d.child(
+                            Button::new("group-action-error-dismiss")
+                                .debug_selector(|| "group-action-error-dismiss".into())
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(room) =
+                                        this.bot_ui.group_chat.rooms.get_mut(&dismiss_key)
+                                    {
+                                        room.action_error = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
             }))
             .child(body)
             .children(approval_dock)
@@ -1728,6 +1904,7 @@ impl Shell {
         let av = self.bot_avatar(&active.bot, 20., px(6.), p);
         let sid = active.session_id;
         let bid = active.bot.id.clone();
+        let bid_body = active.bot.id.clone();
 
         let header = div()
             .flex()
@@ -1837,6 +2014,44 @@ impl Shell {
                     })
                     .child(opts)
             }
+            Some(item) if item.kind == ChatItemKind::Question => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .when(!item.text.trim().is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.foreground)
+                            .line_clamp(3)
+                            .child(item.text.clone()),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::GRP_QUESTION_OPEN_HINT.get()),
+                        )
+                        .child(
+                            Button::new("grp-dock-open-chat")
+                                .debug_selector(|| "grp-dock-open-chat".into())
+                                .primary()
+                                .xsmall()
+                                .label(text::OPEN_CHAT.get())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_bot_session(&bid_body, sid, cx);
+                                })),
+                        ),
+                ),
             Some(item) => {
                 let k1 = key.clone();
                 let k2 = key.clone();
@@ -2327,5 +2542,143 @@ mod tests {
         );
         assert_eq!(trailing_mention_query("email@domain.com"), None);
         assert_eq!(insert_mention_token("hey @al", 4, "alice"), "hey @alice ");
+    }
+
+    fn sample_room_msg(id: &str, body: &str, created_at_ms: u64) -> BotGroupMessage {
+        BotGroupMessage {
+            message_id: id.to_owned(),
+            group_id: "grp-1".to_owned(),
+            thread_id: "thr-main".to_owned(),
+            sender_id: "owner".to_owned(),
+            sender_name: "You".to_owned(),
+            body: body.to_owned(),
+            mentions: Vec::new(),
+            created_at_ms,
+            in_progress: false,
+        }
+    }
+
+    fn sample_room(
+        thread_id: Option<&str>,
+        messages: Vec<BotGroupMessage>,
+        has_earlier: bool,
+    ) -> BotGroupRoomView {
+        BotGroupRoomView {
+            group: krill_proto::bots::BotGroupChat {
+                id: "grp-1".to_owned(),
+                name: "Crew".to_owned(),
+                bot_ids: Vec::new(),
+                description: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            reply_audience: BotGroupReplyAudience::Mentions,
+            threads: Vec::new(),
+            active_thread_id: thread_id.map(str::to_owned),
+            messages,
+            has_earlier,
+            active_turns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_polled_room_preserves_earlier_messages_and_flags() {
+        let prev = sample_room(
+            Some("thr-main"),
+            vec![
+                sample_room_msg("m1", "old 1", 10),
+                sample_room_msg("m2", "old 2", 20),
+                sample_room_msg("m3", "mid 3", 30),
+                sample_room_msg("m4", "draft", 40),
+            ],
+            false,
+        );
+        let polled = sample_room(
+            Some("thr-main"),
+            vec![
+                sample_room_msg("m3", "mid 3", 30),
+                sample_room_msg("m4", "final", 40),
+                sample_room_msg("m5", "new 5", 50),
+            ],
+            true,
+        );
+        let merged = merge_polled_room(Some(&prev), polled);
+        let ids: Vec<&str> = merged
+            .messages
+            .iter()
+            .map(|m| m.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4", "m5"]);
+        assert_eq!(merged.messages[3].body, "final");
+        assert!(
+            !merged.has_earlier,
+            "should keep prev.has_earlier when older prefix is preserved"
+        );
+
+        // Switching threads discards previous thread messages.
+        let other_thread = sample_room(
+            Some("thr-other"),
+            vec![sample_room_msg("m3", "other", 30)],
+            true,
+        );
+        let replaced = merge_polled_room(Some(&prev), other_thread);
+        assert_eq!(replaced.messages.len(), 1);
+        assert!(replaced.has_earlier);
+
+        // When no older prefix existed (overlap at index 0), polled has_earlier wins.
+        let same_start = sample_room(
+            Some("thr-main"),
+            vec![sample_room_msg("m1", "old 1", 10)],
+            true,
+        );
+        let merged_zero = merge_polled_room(Some(&prev), same_start);
+        assert_eq!(merged_zero.messages.len(), 1);
+        assert!(merged_zero.has_earlier);
+    }
+
+    #[test]
+    fn same_group_thread_deduplicates_none_and_default_thread() {
+        // Sidebar opened with None, room resolved thr-main; header clicks thr-main.
+        assert!(same_group_thread(
+            None,
+            Some("thr-main"),
+            Some("thr-main"),
+            Some("thr-main")
+        ));
+        // Opened with explicit thr-main; sidebar clicks group (None).
+        assert!(same_group_thread(
+            Some("thr-main"),
+            Some("thr-main"),
+            None,
+            Some("thr-main")
+        ));
+        // Sidebar opened with None (resolved thr-main); header clicks secondary thr-2.
+        assert!(!same_group_thread(
+            None,
+            Some("thr-main"),
+            Some("thr-2"),
+            Some("thr-main")
+        ));
+        // Secondary thread pane does not match default None request when default is thr-main.
+        assert!(!same_group_thread(
+            Some("thr-2"),
+            Some("thr-2"),
+            None,
+            Some("thr-main")
+        ));
+        // Group with no threads yet: None matches None.
+        assert!(same_group_thread(None, None, None, None));
+    }
+
+    #[test]
+    fn format_elapsed_uses_localized_templates() {
+        assert_eq!(
+            format_elapsed(42_500),
+            text::GRP_ELAPSED_SEC.format(&[("s", "42")])
+        );
+        assert_eq!(
+            format_elapsed(125_000),
+            text::GRP_ELAPSED_MIN_SEC.format(&[("m", "2"), ("s", "5")])
+        );
     }
 }

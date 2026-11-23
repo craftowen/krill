@@ -156,6 +156,7 @@ mod owner_tests {
             hibernation_blocked: false,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         }
     }
 

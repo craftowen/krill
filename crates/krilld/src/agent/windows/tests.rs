@@ -155,3 +155,31 @@ fn codex_trust_preset_uses_the_native_project_path() {
     assert!(text.contains("# user settings"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn fallback_shell_strips_provider_and_opencode_account_isolation_envs() {
+    let login = Launch {
+        argv: vec![b"powershell.exe".to_vec(), b"-NoLogo".to_vec()],
+        env: Vec::new(),
+    };
+    let shell = fallback_shell_command(&login).expect("fallback shell command");
+    let removed: Vec<String> = shell
+        .get_envs()
+        .filter(|(_, val)| val.is_none())
+        .map(|(key, _)| key.to_string_lossy().into_owned())
+        .collect();
+    for expected in [
+        "KRILL_ACCOUNT_PROVIDER",
+        "KRILL_ACCOUNT_DIR",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "OPENCODE_DB",
+    ] {
+        assert!(
+            removed.iter().any(|k| k.eq_ignore_ascii_case(expected)),
+            "missing env_remove for {expected}: {removed:?}"
+        );
+    }
+}

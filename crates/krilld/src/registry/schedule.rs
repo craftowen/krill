@@ -21,7 +21,7 @@ use krill_proto::schedule::{
 
 use crate::child::{PipeReader, own_group, spawn};
 
-use super::{Create, Peer, Program, Registry, Reply, Scope, lock};
+use super::{Create, Failure, Peer, Program, Registry, Reply, Scope, lock};
 
 /// Default execution timeout for schedule `precheck` shell commands.
 #[cfg(not(test))]
@@ -285,9 +285,9 @@ impl Registry {
         let Some(dir) = self.dir.as_deref() else {
             return Ok(());
         };
-        // Serialize against upgrades; an old daemon must not spawn during handover.
-        let upgrading = lock(&self.upgrading);
-        if *upgrading {
+        // Fast check without holding `self.upgrading` across slow prechecks or git worktrees;
+        // handover serialization is re-checked and held only around session spawn.
+        if *lock(&self.upgrading) {
             return Ok(());
         }
         if self
@@ -303,14 +303,20 @@ impl Registry {
             .as_secs();
         let minute = seconds / 60;
         let has_run_now = dir.join(RUN_NOW).exists();
-        let mut last = lock(&self.schedule_minute);
-        if !has_run_now && last.is_some_and(|previous| previous >= minute) {
+        if !has_run_now && lock(&self.schedule_minute).is_some_and(|previous| previous >= minute) {
             return Ok(());
         }
         let calendar = crate::sys::cron_calendar(seconds)?;
         let _guard = exclusive(dir)?;
-        let cron_due = last.is_none_or(|previous| previous < minute);
-        *last = Some(minute);
+        let cron_due = {
+            let mut last = lock(&self.schedule_minute);
+            if !has_run_now && last.is_some_and(|previous| previous >= minute) {
+                return Ok(());
+            }
+            let due = last.is_none_or(|previous| previous < minute);
+            *last = Some(minute);
+            due
+        };
         let schedules = Schedules::load(dir)?;
         if schedules.schedule.is_empty() && !dir.join(RUNS).exists() {
             if dir.join(RUN_NOW).exists() {
@@ -476,6 +482,13 @@ impl Registry {
                                 .is_some_and(|e| !e.session.is_closed())
                     };
                     if alive && let Some(tap) = self.tap(&peer, id) {
+                        let upgrading = lock(&self.upgrading);
+                        if *upgrading {
+                            run.phase = "failed".into();
+                            run.error = Some("daemon upgrade in progress".into());
+                            journal.append(&run)?;
+                            break;
+                        }
                         if let Err(e) =
                             Registry::deliver_input_to_tap(&tap, entry.prompt.as_bytes(), true)
                         {
@@ -486,6 +499,7 @@ impl Registry {
                             run.session = Some(id.0);
                             run.cwd = Some(entry.cwd.clone());
                         }
+                        drop(upgrading);
                         journal.append(&run)?;
                         continue;
                     }
@@ -556,27 +570,39 @@ impl Registry {
             let cwd_bytes = run_cwd.as_os_str().as_bytes().to_vec();
             let is_agent_launch = launch_as_agent;
             let prompt = entry.prompt;
-            if let Some((_, profile)) = &resolved_agent {
-                crate::agent::pre_trust_workspace(profile, &cwd_bytes, None);
-            }
-            let create = Create {
-                account: None,
-                program: schedule_program(
-                    &program,
-                    extra_args,
-                    &prompt,
-                    is_agent_launch,
-                    resolved_agent.as_ref(),
-                ),
-                cwd: cwd_bytes,
-                cols: 80,
-                rows: 24,
-            };
+            let target = schedule_target(
+                &program,
+                extra_args,
+                &prompt,
+                is_agent_launch,
+                resolved_agent.as_ref(),
+            );
             let peer = Peer {
                 pid: None,
                 scope: Scope::Full,
             };
-            if let Ok(Reply::Created { session, .. }) = self.create(&peer, create) {
+            let created = {
+                // Acquire `self.upgrading` only around session creation, never during precheck/worktree.
+                let upgrading = lock(&self.upgrading);
+                if *upgrading {
+                    run.phase = "failed".into();
+                    run.error = Some("daemon upgrade in progress".into());
+                    journal.append(&run)?;
+                    break;
+                }
+                if self
+                    .holder
+                    .as_ref()
+                    .is_some_and(|holder| !holder.is_connected())
+                {
+                    run.phase = "failed".into();
+                    run.error = Some("session holder disconnected".into());
+                    journal.append(&run)?;
+                    break;
+                }
+                self.create_schedule_session(&peer, target, cwd_bytes)
+            };
+            if let Ok(Reply::Created { session, .. }) = created {
                 run.phase = "spawned".into();
                 run.session = Some(session.0);
                 if is_agent_launch
@@ -622,82 +648,202 @@ impl Registry {
         }
         Ok(())
     }
+
+    fn create_schedule_session(
+        &self,
+        peer: &Peer,
+        target: ScheduleTarget,
+        mut cwd: Vec<u8>,
+    ) -> Result<Reply, Failure> {
+        match target {
+            ScheduleTarget::Custom(program) => self.create(
+                peer,
+                Create {
+                    account: None,
+                    program,
+                    cwd,
+                    cols: 80,
+                    rows: 24,
+                },
+            ),
+            ScheduleTarget::Agent { canonical, profile } => {
+                super::sanitize_spawn_cwd(&mut cwd);
+                let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
+                let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
+                let session = self.reserve_session_id(None).map_err(|e| super::os(&e))?;
+                let state = self.state_dir();
+                let (launch, session_id, account) = crate::agent::launch_selected_in(
+                    &profile,
+                    agents.permission,
+                    session,
+                    state.as_deref(),
+                    None,
+                )
+                .map_err(|e| {
+                    self.discard_settings(session);
+                    super::os(&e)
+                })?;
+                crate::agent::pre_trust_workspace(&profile, &cwd, account.as_ref());
+                let agy_prewarm = if !cfg!(test) && canonical == "agy" {
+                    Some(
+                        account
+                            .as_ref()
+                            .filter(|a| !a.dir.is_empty())
+                            .map(|a| PathBuf::from(&a.dir))
+                            .or_else(|| {
+                                profile
+                                    .env
+                                    .get("ANTIGRAVITY_CLI_HOME")
+                                    .filter(|p| !p.is_empty())
+                                    .map(PathBuf::from)
+                            }),
+                    )
+                } else {
+                    None
+                };
+                let metadata = krill_proto::control::AgentLaunch {
+                    profile: canonical,
+                    permission: agents.permission,
+                };
+                self.agents
+                    .remember_session(session, &metadata, session_id, cwd.clone(), account)
+                    .map_err(|e| {
+                        self.discard_settings(session);
+                        super::os(&e)
+                    })?;
+                let (session, pid) =
+                    self.spawn_holder(holder, session, launch.argv, launch.env, cwd, 80, 24)?;
+                if let Some(config) = agy_prewarm
+                    && let Some(home) = krill_proto::os::home_dir()
+                {
+                    crate::mobile::prewarm_agy_launch(&home, config);
+                }
+                Ok(Reply::Created { session, pid })
+            }
+        }
+    }
 }
 
-fn schedule_program(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScheduleTarget {
+    Agent {
+        canonical: String,
+        profile: krill_proto::agent::Profile,
+    },
+    Custom(Program),
+}
+
+fn schedule_target(
     program: &str,
     extra_args: Vec<String>,
     prompt: &str,
     is_agent: bool,
     resolved: Option<&(String, krill_proto::agent::Profile)>,
-) -> Program {
-    if is_agent
-        && extra_args.is_empty()
-        && let Some((canonical, _)) = resolved
-    {
-        return Program::Agent {
-            id: canonical.clone(),
+) -> ScheduleTarget {
+    if is_agent && let Some((canonical, base_profile)) = resolved {
+        let mut profile = base_profile.clone();
+        profile.launch.extend(extra_args);
+        if canonical == "agy" {
+            normalize_agy_schedule_args(&mut profile.launch);
+        }
+        return ScheduleTarget::Agent {
+            canonical: canonical.clone(),
+            profile,
         };
     }
-    let mut args = Vec::new();
-    let executable = if is_agent && let Some((_, profile)) = resolved {
-        args.extend(profile.launch.iter().skip(1).cloned());
-        profile.program().unwrap_or(program)
-    } else {
-        program
-    };
-    args.extend(extra_args);
-    if is_agent && resolved.is_some_and(|(canon, _)| canon == "agy") {
-        normalize_agy_schedule_args(&mut args);
-    }
+    let mut args = extra_args;
     if !is_agent && !prompt.is_empty() {
         args.push(prompt.into());
     }
-    Program::Custom {
-        program: executable.as_bytes().to_vec(),
+    ScheduleTarget::Custom(Program::Custom {
+        program: program.as_bytes().to_vec(),
         args: args.into_iter().map(String::into_bytes).collect(),
-    }
+    })
 }
 
-/// Folds an Antigravity level model ID in schedule `--model` / `--effort` flags onto its listed
-/// family + effort so effort stays adjustable after launch (Orca `c5de2672` / `#46941`).
+/// Folds an Antigravity level model ID in schedule `--model` / `--effort` (and `--model=` /
+/// `--effort=`) flags onto its listed family + effort so effort stays adjustable after launch
+/// (Orca `c5de2672` / `#46941`).
 fn normalize_agy_schedule_args(args: &mut Vec<String>) {
-    let mut model_idx: Option<usize> = None;
-    let mut effort_idx: Option<usize> = None;
+    normalize_agy_schedule_args_with(args, |model, effort| {
+        crate::mobile::fold_agy_model_selection(None, model, effort)
+    });
+}
+
+fn normalize_agy_schedule_args_with(
+    args: &mut Vec<String>,
+    fold: impl FnOnce(&str, Option<&str>) -> Option<(String, String)>,
+) {
+    #[derive(Clone, Copy)]
+    enum FlagSlot {
+        Separate(usize),
+        Inline(usize),
+    }
+
+    let mut model_slot: Option<FlagSlot> = None;
+    let mut effort_slot: Option<FlagSlot> = None;
     let mut i = 0;
     while let Some(arg) = args.get(i) {
-        match arg.as_str() {
-            "--model" if i + 1 < args.len() => {
-                model_idx = Some(i + 1);
-                i += 2;
-            }
-            "--effort" if i + 1 < args.len() => {
-                effort_idx = Some(i + 1);
-                i += 2;
-            }
-            _ => i += 1,
+        if arg == "--model" && i + 1 < args.len() {
+            model_slot = Some(FlagSlot::Separate(i + 1));
+            i += 2;
+        } else if arg.starts_with("--model=") {
+            model_slot = Some(FlagSlot::Inline(i));
+            i += 1;
+        } else if arg == "--effort" && i + 1 < args.len() {
+            effort_slot = Some(FlagSlot::Separate(i + 1));
+            i += 2;
+        } else if arg.starts_with("--effort=") {
+            effort_slot = Some(FlagSlot::Inline(i));
+            i += 1;
+        } else {
+            i += 1;
         }
     }
-    let Some(m_idx) = model_idx else {
+    let Some(m_slot) = model_slot else {
         return;
     };
-    let Some(current_model) = args.get(m_idx).map(String::as_str) else {
+    let current_model = match m_slot {
+        FlagSlot::Separate(idx) => args.get(idx).map(String::as_str),
+        FlagSlot::Inline(idx) => args.get(idx).and_then(|s| s.strip_prefix("--model=")),
+    };
+    let Some(current_model) = current_model.filter(|s| !s.is_empty()) else {
         return;
     };
-    let current_effort = effort_idx.and_then(|idx| args.get(idx)).map(String::as_str);
-    if let Some((family, eff)) =
-        crate::mobile::fold_agy_model_selection(None, current_model, current_effort)
-    {
-        if let Some(slot) = args.get_mut(m_idx) {
-            *slot = family;
+    let current_effort = match effort_slot {
+        Some(FlagSlot::Separate(idx)) => args.get(idx).map(String::as_str),
+        Some(FlagSlot::Inline(idx)) => args.get(idx).and_then(|s| s.strip_prefix("--effort=")),
+        None => None,
+    }
+    .filter(|s| !s.is_empty());
+    if let Some((family, eff)) = fold(current_model, current_effort) {
+        match m_slot {
+            FlagSlot::Separate(idx) => {
+                if let Some(slot) = args.get_mut(idx) {
+                    *slot = family;
+                }
+            }
+            FlagSlot::Inline(idx) => {
+                if let Some(slot) = args.get_mut(idx) {
+                    *slot = format!("--model={family}");
+                }
+            }
         }
-        if let Some(e_idx) = effort_idx
-            && let Some(slot) = args.get_mut(e_idx)
-        {
-            *slot = eff;
-        } else {
-            args.push("--effort".to_owned());
-            args.push(eff);
+        match effort_slot {
+            Some(FlagSlot::Separate(idx)) => {
+                if let Some(slot) = args.get_mut(idx) {
+                    *slot = eff;
+                }
+            }
+            Some(FlagSlot::Inline(idx)) => {
+                if let Some(slot) = args.get_mut(idx) {
+                    *slot = format!("--effort={eff}");
+                }
+            }
+            None => {
+                args.push("--effort".to_owned());
+                args.push(eff);
+            }
         }
     }
 }

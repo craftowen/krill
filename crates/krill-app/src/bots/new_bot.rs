@@ -271,8 +271,12 @@ impl NewBot {
         me
     }
 
-    fn setup_mut(&mut self) -> &mut BotAgentSetup {
-        &mut self.setup
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches BotAgentSetup optional lens signature"
+    )]
+    fn setup_mut(&mut self) -> Option<&mut BotAgentSetup> {
+        Some(&mut self.setup)
     }
 
     pub(super) fn picture_mut(&mut self) -> &mut PictureState {
@@ -393,6 +397,7 @@ impl NewBot {
             || super::opt_textarea_composing(self.watches.as_ref(), window, cx)
             || super::opt_textarea_composing(self.does.as_ref(), window, cx)
             || super::opt_textarea_composing(self.reports.as_ref(), window, cx)
+            || self.picture.input_is_composing(window, cx)
     }
 
     fn identity_too_long(&self, cx: &App) -> bool {

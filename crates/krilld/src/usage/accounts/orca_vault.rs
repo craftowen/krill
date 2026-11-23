@@ -126,6 +126,7 @@ fn apply(
         }
         save_inner(home, state, &file)?;
     }
+    super::agy_native::sync_active_from_disk(home, state);
     Ok(refresh_accounts_with(home, state, false))
 }
 

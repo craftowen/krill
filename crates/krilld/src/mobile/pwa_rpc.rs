@@ -368,8 +368,20 @@ fn bound_bot_list_payload(
         .map(<[Value]>::to_vec)
         .unwrap_or_default();
     let mut truncated = upstream_next_cursor.is_some() || end < items.len();
-    let mut next_cursor =
-        upstream_next_cursor.or_else(|| (end < items.len()).then(|| end.to_string()));
+    let mut next_cursor = upstream_next_cursor.or_else(|| {
+        if end < items.len() {
+            if list_key == "items" {
+                page_items
+                    .last()
+                    .and_then(item_cursor_from_value)
+                    .or_else(|| Some(end.to_string()))
+            } else {
+                Some(end.to_string())
+            }
+        } else {
+            None
+        }
+    });
 
     let mut data = build_bot_list_value(
         list_key,
@@ -415,7 +427,11 @@ fn bound_bot_list_payload(
         if !page_items.is_empty() {
             page_items.clear();
             truncated = true;
-            next_cursor = Some(slice_start.to_string());
+            next_cursor = if list_key == "items" {
+                None
+            } else {
+                Some(slice_start.to_string())
+            };
             data = build_bot_list_value(
                 list_key,
                 &page_items,
@@ -433,7 +449,9 @@ fn bound_bot_list_payload(
 
 fn bound_group_view_payload(mut data: Value) -> io::Result<Value> {
     let max_wrapped = ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM);
-    let mut truncated = false;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("truncated".to_owned(), Value::Bool(false));
+    }
     while wrapped_ok_len(&data) >= max_wrapped {
         let drained = data
             .get_mut("group")
@@ -452,10 +470,9 @@ fn bound_group_view_payload(mut data: Value) -> io::Result<Value> {
         if !drained {
             return Err(io::Error::other("response exceeds mobile frame limit"));
         }
-        truncated = true;
-    }
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert("truncated".to_owned(), Value::Bool(truncated));
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("truncated".to_owned(), Value::Bool(true));
+        }
     }
     Ok(data)
 }
@@ -848,6 +865,8 @@ enum Action {
     BotsItems {
         #[serde(default)]
         bot_id: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
         #[serde(default)]
         include_closed: bool,
         #[serde(default)]
@@ -1511,6 +1530,11 @@ impl Backend {
                 if let Some(baseline) = agy_steer_baseline {
                     self.promote_agy_steer_if_queued(session, &combined, baseline);
                 }
+                if let Some(reg) = self.registry.upgrade()
+                    && let Some(bots) = reg.bots_if_initialized()
+                {
+                    bots.on_owner_prompt_submitted(SessionId(session), &combined);
+                }
                 Ok(json!({"sent":true}))
             }
             Action::Interrupt { session } => {
@@ -1607,7 +1631,7 @@ impl Backend {
             Action::Orchestration => self.orchestration(),
             Action::GateReply { id, decision } => {
                 let dir = self.dir.as_deref().ok_or_else(invalid)?;
-                to_value(OrchestrationStore::mutate(dir, |store| {
+                let out = to_value(OrchestrationStore::mutate(dir, |store| {
                     if !store
                         .gates
                         .iter()
@@ -1616,14 +1640,19 @@ impl Backend {
                         return Err(io::Error::other("This request is no longer pending."));
                     }
                     store.resolve_gate(&id, &decision, None, "mobile")
-                })?)
+                })?)?;
+                if let Some(reg) = self.registry.upgrade() {
+                    reg.notify_orch();
+                }
+                *crate::session::lock(&self.snapshot_cache) = None;
+                Ok(out)
             }
             Action::QuestionReply { id, body } => {
                 if body.len() > 16 * 1024 {
                     return Err(invalid());
                 }
                 let dir = self.dir.as_deref().ok_or_else(invalid)?;
-                to_value(OrchestrationStore::mutate(dir, |store| {
+                let out = to_value(OrchestrationStore::mutate(dir, |store| {
                     if body.trim().is_empty() {
                         return Err(invalid());
                     }
@@ -1635,7 +1664,12 @@ impl Backend {
                         return Err(io::Error::other("This request is no longer pending."));
                     }
                     store.reply_message(&id, "mobile", &body)
-                })?)
+                })?)?;
+                if let Some(reg) = self.registry.upgrade() {
+                    reg.notify_orch();
+                }
+                *crate::session::lock(&self.snapshot_cache) = None;
+                Ok(out)
             }
             Action::Handoff { session, agent } => {
                 let agent = krill_proto::agent::canonical_id(&agent);
@@ -1791,6 +1825,7 @@ impl Backend {
                 }
             }
             Action::BotsUpcoming { bot_id } => {
+                self.ensure_bots_active()?;
                 let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::GetBotUpcoming { bot_id })? {
                     krill_proto::bots::BotRpcResponse::Upcoming(up) => Ok(to_value(up)?),
@@ -1976,13 +2011,20 @@ impl Backend {
             }
             Action::BotsItems {
                 bot_id,
+                status,
                 include_closed,
                 include_snoozed,
                 limit,
                 cursor,
             } => {
                 let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
-                let use_page_rpc = cursor.is_some() || limit.is_some() || include_snoozed;
+                let status_filter = match status.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                {
+                    Some(raw) => Some(
+                        crate::bots::items::BotItemsStatusFilter::parse(raw).ok_or_else(invalid)?,
+                    ),
+                    None => None,
+                };
                 let bounded_limit = match limit {
                     Some(0) => return Err(invalid()),
                     Some(n) => usize::try_from(n)
@@ -2002,8 +2044,20 @@ impl Backend {
                         &[("unseen_count", json!(0))],
                     );
                 }
-                if use_page_rpc {
-                    let req_limit = u32::try_from(bounded_limit).unwrap_or(100);
+                let req_limit = u32::try_from(bounded_limit).unwrap_or(100);
+                let page = if let Some(filter) = status_filter {
+                    let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                    let mgr = registry.bots().map_err(io::Error::other)?;
+                    mgr.items().list_items_page_filtered(
+                        bot_id.as_ref(),
+                        Some(filter),
+                        include_closed,
+                        include_snoozed,
+                        Some(req_limit),
+                        validated_cursor.as_deref(),
+                        unix_ms(),
+                    )?
+                } else {
                     match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListItemsPage {
                         bot_id,
                         include_closed,
@@ -2011,54 +2065,29 @@ impl Backend {
                         limit: Some(req_limit),
                         cursor: validated_cursor.clone(),
                     })? {
-                        krill_proto::bots::BotRpcResponse::ItemsPage(page) => {
-                            let total = page.total_count;
-                            let unseen = page.unseen_count;
-                            let next = page.next_cursor;
-                            let values = page
-                                .items
-                                .into_iter()
-                                .map(serde_json::to_value)
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(|_| invalid())?;
-                            let page_len = values.len().max(1);
-                            bound_bot_list_payload(
-                                &values,
-                                "items",
-                                0,
-                                page_len,
-                                total,
-                                next,
-                                &[("unseen_count", json!(unseen))],
-                            )
-                        }
-                        _ => Err(invalid()),
+                        krill_proto::bots::BotRpcResponse::ItemsPage(page) => page,
+                        _ => return Err(invalid()),
                     }
-                } else {
-                    match self.bot_rpc(krill_proto::bots::BotRpcRequest::ListItems {
-                        bot_id,
-                        include_closed,
-                    })? {
-                        krill_proto::bots::BotRpcResponse::Items(items) => {
-                            let total = items.len();
-                            let values = items
-                                .into_iter()
-                                .map(serde_json::to_value)
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(|_| invalid())?;
-                            bound_bot_list_payload(
-                                &values,
-                                "items",
-                                0,
-                                bounded_limit,
-                                total,
-                                None,
-                                &[],
-                            )
-                        }
-                        _ => Err(invalid()),
-                    }
-                }
+                };
+                let total = page.total_count;
+                let unseen = page.unseen_count;
+                let next = page.next_cursor;
+                let values = page
+                    .items
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| invalid())?;
+                let page_len = values.len().max(1);
+                bound_bot_list_payload(
+                    &values,
+                    "items",
+                    0,
+                    page_len,
+                    total,
+                    next,
+                    &[("unseen_count", json!(unseen))],
+                )
             }
             Action::BotsItemCreate {
                 bot_id,
@@ -2770,27 +2799,11 @@ impl Backend {
         &self,
         req: krill_proto::bots::BotRpcRequest,
     ) -> io::Result<krill_proto::bots::BotRpcResponse> {
-        let mutates = matches!(
-            req,
-            krill_proto::bots::BotRpcRequest::CreateBotV2(_)
-                | krill_proto::bots::BotRpcRequest::CreateItem(_)
-                | krill_proto::bots::BotRpcRequest::UpdateItem(_)
-                | krill_proto::bots::BotRpcRequest::AnswerBotItem { .. }
-                | krill_proto::bots::BotRpcRequest::AddItemLink { .. }
-                | krill_proto::bots::BotRpcRequest::DecideAccessRequest { .. }
-                | krill_proto::bots::BotRpcRequest::RedeemPairingCode { .. }
-                | krill_proto::bots::BotRpcRequest::PostBotReply { .. }
-                | krill_proto::bots::BotRpcRequest::CreateGroup { .. }
-                | krill_proto::bots::BotRpcRequest::SendGroupMessage { .. }
-                | krill_proto::bots::BotRpcRequest::NewGroupThread { .. }
-                | krill_proto::bots::BotRpcRequest::StopGroup { .. }
-                | krill_proto::bots::BotRpcRequest::RunLookAround { .. }
-                | krill_proto::bots::BotRpcRequest::DismissSuggestion { .. }
-                | krill_proto::bots::BotRpcRequest::StartSuggestion { .. }
-                | krill_proto::bots::BotRpcRequest::SetSoul { .. }
-                | krill_proto::bots::BotRpcRequest::UpdateMemory { .. }
-                | krill_proto::bots::BotRpcRequest::StartBotSession { .. }
-        );
+        let mutates = !req.is_read_only()
+            && !matches!(
+                req,
+                krill_proto::bots::BotRpcRequest::ListAccessRequests { .. }
+            );
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         let mgr = registry.bots().map_err(io::Error::other)?;
         match mgr.handle_rpc(&registry, req) {
@@ -2820,6 +2833,14 @@ impl Backend {
     fn send_prompt(&self, session: u64, text: &str) -> io::Result<()> {
         if text.is_empty() {
             return self.input(session, b"\r".to_vec());
+        }
+        if text.len() > krill_proto::input::MAX_INPUT {
+            return Err(invalid());
+        }
+        if let Some(reg) = self.registry.upgrade()
+            && let Some(tap) = reg.session_tap(SessionId(session))
+        {
+            return crate::registry::Registry::deliver_input_to_tap(&tap, text.as_bytes(), true);
         }
         let bracketed = self.session_bracketed_paste(session) || text.contains(['\n', '\r']);
         let payload = if bracketed {
@@ -6670,6 +6691,23 @@ mod revision_tests {
             page2["data"]["items"][0]["uid"]
         );
 
+        // D-10 + M-07: bots.items supports optional status filtering ("needs_you" / "planned").
+        let planned_only: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.items",
+                    "bot_id": v2_id,
+                    "status": "planned"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(planned_only["ok"], true, "{planned_only}");
+        let planned_items = planned_only["data"]["items"].as_array().unwrap();
+        assert_eq!(planned_items.len(), 1);
+        assert_eq!(planned_items[0]["status"], "planned");
+
         let ask_upd: Value = serde_json::from_str(
             &backend.request(
                 &json!({
@@ -7250,6 +7288,7 @@ mod revision_tests {
             r#"{"action":"handoff","session":1,"agent":"antigravity"}"#,
             r#"{"action":"bots.chat.open","bot_id":"b1","prompt":"check inbox"}"#,
             r#"{"action":"bots.items","limit":25,"cursor":"10","include_snoozed":true}"#,
+            r#"{"action":"bots.items","status":"needs_you","limit":25}"#,
             r#"{"action":"bots.item.answer","item_id":"item-1","option_index":0,"answer_text":"Go"}"#,
             r#"{"action":"bots.groups.read","group_id":"grp-1","thread_id":"thr-1","limit":20}"#,
             r#"{"action":"bots.groups.send","group_id":"grp-1","text":"@b1 hello","reply_mode":"mentions"}"#,
@@ -7270,6 +7309,19 @@ mod revision_tests {
                 r#"{"action":"bots.item.answer","item_id":"i","unknown":1}"#
             )
             .is_err()
+        );
+
+        // D-33(c): bound_group_view_payload enforces budget WITH "truncated" field present.
+        let huge_msgs: Vec<Value> = (0..60)
+            .map(|i| json!({"message_id": format!("m-{i}"), "body": "x".repeat(20_000)}))
+            .collect();
+        let bounded_grp = bound_group_view_payload(json!({
+            "group": { "messages": huge_msgs }
+        }))
+        .unwrap();
+        assert_eq!(bounded_grp["truncated"], true);
+        assert!(
+            wrapped_ok_len(&bounded_grp) < ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM)
         );
     }
 }

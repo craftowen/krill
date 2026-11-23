@@ -1976,7 +1976,18 @@ fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prune
             }),
         )
         .unwrap();
-    // Backdate Session 51's launch record so it is not treated as mid-startup (< 5s).
+    // Backdate Session 51's launch record (both JSON `launched_at` and file timestamps) so it is
+    // not treated as mid-startup (< 5s).
+    let launch_path = state.join("agent-launches/51.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+    let old_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_sub(30);
+    stored["launched_at"] = serde_json::json!(old_secs);
+    fs::write(&launch_path, serde_json::to_vec(&stored).unwrap()).unwrap();
     #[cfg(target_os = "macos")]
     {
         use std::os::macos::fs::FileTimesExt as _;
@@ -1986,7 +1997,7 @@ fn unbound_session_skips_auto_switch_and_cancelled_opt_out_until_bound_and_prune
             .set_modified(old_time);
         fs::File::options()
             .write(true)
-            .open(state.join("agent-launches/51.json"))
+            .open(&launch_path)
             .unwrap()
             .set_times(times)
             .unwrap();
@@ -4332,6 +4343,70 @@ fn switch_control_inspects_switches_only_the_default_and_hands_off_selected_sess
             Err(expected)
         );
     }
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn automatic_switch_does_not_treat_rewritten_old_unbound_session_as_recently_launched() {
+    let root = std::env::temp_dir().join(format!(
+        "kas-recently-launched-immutable-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let to = root.join("codex-target");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+    let snapshot = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+    let session = SessionId(39375);
+    let (reg, _original) = kept_fixture(&state, session);
+    reg.agents
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+            },
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+    let launch_path = state.join("agent-launches/39375.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(&launch_path).unwrap()).unwrap();
+    let old_ts = raw["launched_at"].as_u64().unwrap().saturating_sub(60);
+    raw["launched_at"] = serde_json::json!(old_ts);
+    fs::write(&launch_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    reg.agents.record_hook_session(
+        session,
+        br#"{"hook_event_name":"PreToolUse","tool_name":"Task"}"#,
+    );
+    assert_eq!(reg.agents.launched_at(session), Some(old_ts));
+
+    reg.prepare_account_switch_in(ProviderKind::Codex, &target, &home, true);
+    assert!(
+        !lock(&reg.account_handoffs).contains_key(&session),
+        "old unbound session must not be enqueued as recently_launched after metadata rewrite"
+    );
     drop(reg);
     fs::remove_dir_all(root).unwrap();
 }

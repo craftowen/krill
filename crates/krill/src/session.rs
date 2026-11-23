@@ -1481,6 +1481,8 @@ pub fn resolve_session_cwd(id: u64) -> io::Result<std::path::PathBuf> {
             "krilld does not support sidebar query",
         ));
     }
+    c.stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    c.stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let Reply::Sidebar(sidebar) =
         request(&mut c.stream, &Request::Sidebar).map_err(|e| io::Error::other(e.text))?
     else {

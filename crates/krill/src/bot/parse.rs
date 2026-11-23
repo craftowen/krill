@@ -277,6 +277,7 @@ pub(crate) enum BotCommand {
         bot: String,
         name: String,
         purpose: String,
+        json: bool,
     },
     Reply {
         bot: String,
@@ -687,7 +688,7 @@ pub(crate) fn help_text(topic: Option<&str>) -> &'static str {
             "usage: krill bot update <bot> [--name <n>] [--description <d>] [--agent <id>] [--model <m>|--clear-model] [--effort <e>|--clear-effort] [--emoji <e>|--clear-emoji] [--avatar <a>|--clear-avatar] [--avatar-color <hex>|--clear-avatar-color] [--folder <p>|--clear-workspace] [--permission <manual|yolo>] [--first-run-completed <on|off>] [--pause|--resume] [--look-around <on|off>] [--look-around-interval <secs>] [--look-around-max <n>] [--look-around-weekdays <on|off>] [--look-around-focus <text>] [--memory-tidy <on|off>] [--memory-tidy-interval <secs>] [--notify-permission <on|off>] [--notify-complete <on|off>] [--notify-error <on|off>] [--json]"
         }
         Some("offer") => {
-            "usage: krill bot offer [<bot>] --name <name> --purpose <text>  (propose a new bot; your owner sees a card in this chat and nothing is created until they press Create bot)"
+            "usage: krill bot offer [<bot> | --bot <bot>] --name <name> --purpose <text> [--json]  (propose a new bot; your owner sees a card in this chat and nothing is created until they press Create bot)"
         }
         Some("soul") => {
             "usage: krill bot soul [<bot>] [get | set (--text <str> | --file <path> | --stdin)] [--json]"
@@ -2363,14 +2364,19 @@ fn parse_suggest(args: &[String], default_bot: Option<&str>) -> Result<BotComman
     }
 }
 
-/// `krill bot offer --name <n> --purpose <p>`: a bot proposes a new bot (Orca `bot create --offer`).
+/// `krill bot offer [<bot> | --bot <bot>] --name <n> --purpose <p> [--json]`: a bot proposes a new bot (Orca `bot create --offer`).
 fn parse_offer(args: &[String], default_bot: Option<&str>) -> Result<BotCommand, CliError> {
     let mut bot: Option<String> = None;
     let mut name: Option<String> = None;
     let mut purpose: Option<String> = None;
+    let mut json = false;
     let mut idx = 0usize;
     while let Some(arg) = args.get(idx) {
-        if let Some(val) = take_opt(args, &mut idx, "--name")? {
+        if arg == "--json" {
+            json = true;
+        } else if let Some(val) = take_opt(args, &mut idx, "--bot")? {
+            bot = Some(val.to_owned());
+        } else if let Some(val) = take_opt(args, &mut idx, "--name")? {
             name = Some(val.to_owned());
         } else if let Some(val) = take_opt(args, &mut idx, "--purpose")? {
             purpose = Some(val.to_owned());
@@ -2388,6 +2394,7 @@ fn parse_offer(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
         bot: require_bot(bot, default_bot, "offer")?,
         name,
         purpose,
+        json,
     })
 }
 

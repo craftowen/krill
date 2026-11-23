@@ -26,8 +26,8 @@ use zeroize::Zeroizing;
 
 use crate::bots::connectors::policy_for_api_base;
 use crate::bots::connectors::router::{
-    ConversationRouter, DeliveryTarget, PlatformSender, classify_error, now_ms,
-    sanitize_error_for_status,
+    ConversationRouter, DeliveryTarget, InboundRouteOutcome, PlatformSender, classify_error,
+    now_ms, sanitize_error_for_status,
 };
 use crate::bots::connectors::ws_client::{WsClient, WsEvent};
 use crate::bots::connectors::{ConnectorBridge, InboundExternalMessage, StopFlag};
@@ -162,22 +162,21 @@ impl DiscordSender {
     }
 
     /// Resolves `(channel_type, parent_id)` lazily via cached `GET /channels/{id}`.
+    /// Transient REST errors are NOT cached so subsequent messages can retry metadata lookup.
     fn resolve_channel_meta(&self, channel_id: &str) -> (Option<u64>, Option<String>) {
         if let Some(cached) = lock(&self.channel_cache).get(channel_id).cloned() {
             return cached;
         }
         let path = format!("/channels/{}", http_client::percent_encode(channel_id));
-        let resolved = self
-            .request_json(HttpMethod::Get, &path, None, true)
-            .ok()
-            .map_or((None, None), |val| {
-                let ctype = val.get("type").and_then(Value::as_u64);
-                let parent = val
-                    .get("parent_id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                (ctype, parent)
-            });
+        let Ok(val) = self.request_json(HttpMethod::Get, &path, None, true) else {
+            return (None, None);
+        };
+        let ctype = val.get("type").and_then(Value::as_u64);
+        let parent = val
+            .get("parent_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let resolved = (ctype, parent);
         let mut cache = lock(&self.channel_cache);
         if cache.len() >= 512
             && let Some(first) = cache.keys().next().cloned()
@@ -240,7 +239,11 @@ impl DiscordSender {
         content: &str,
         ephemeral: bool,
     ) -> io::Result<()> {
-        let path = format!("/interactions/{interaction_id}/{interaction_token}/callback");
+        let path = format!(
+            "/interactions/{}/{}/callback",
+            http_client::percent_encode(interaction_id),
+            http_client::percent_encode(interaction_token)
+        );
         let flags = if ephemeral { 64 } else { 0 };
         let payload = json!({
             "type": 4,
@@ -269,7 +272,10 @@ impl PlatformSender for DiscordSender {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&target.channel_id);
-        let path = format!("/channels/{channel}/messages");
+        let path = format!(
+            "/channels/{}/messages",
+            http_client::percent_encode(channel)
+        );
         let mut payload = json!({ "content": text });
         if let Some(ref reply_id) = target.reply_to_message_id
             && !reply_id.trim().is_empty()
@@ -300,7 +306,11 @@ impl PlatformSender for DiscordSender {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&target.channel_id);
-        let path = format!("/channels/{channel}/messages/{message_id}");
+        let path = format!(
+            "/channels/{}/messages/{}",
+            http_client::percent_encode(channel),
+            http_client::percent_encode(message_id)
+        );
         let payload = json!({ "content": text });
         self.request_json(HttpMethod::Patch, &path, Some(&payload), true)?;
         Ok(())
@@ -320,7 +330,11 @@ impl PlatformSender for DiscordSender {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&target.channel_id);
-        let url = format!("{}/channels/{channel}/messages", self.api_base);
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.api_base,
+            http_client::percent_encode(channel)
+        );
 
         let mut json_meta = json!({});
         if let Some(cap) = caption.filter(|c| !c.trim().is_empty())
@@ -409,7 +423,9 @@ impl PlatformSender for DiscordSender {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&target.channel_id);
         let path = format!(
-            "/channels/{channel}/messages/{message_id}/reactions/{}/@me",
+            "/channels/{}/messages/{}/reactions/{}/@me",
+            http_client::percent_encode(channel),
+            http_client::percent_encode(message_id),
             http_client::percent_encode(emoji)
         );
         self.request_json(HttpMethod::Put, &path, None, true)?;
@@ -986,15 +1002,6 @@ fn handle_message_create(
         return;
     }
 
-    if is_thread {
-        if participated_threads.len() >= 1_024
-            && let Some(first) = participated_threads.iter().next().cloned()
-        {
-            participated_threads.remove(&first);
-        }
-        participated_threads.insert(channel_id.to_owned());
-    }
-
     let thread_id = is_thread.then(|| channel_id.to_owned());
     let sender_name = author
         .get("global_name")
@@ -1027,7 +1034,15 @@ fn handle_message_create(
         external_message_id: msg_id,
         acts_for,
     };
-    router.handle_inbound_message(inbound, target, sender.as_ref());
+    let outcome = router.handle_inbound_message(inbound, target, sender.as_ref());
+    if is_thread && matches!(outcome, InboundRouteOutcome::Dispatched(_)) {
+        if participated_threads.len() >= 1_024
+            && let Some(first) = participated_threads.iter().next().cloned()
+        {
+            participated_threads.remove(&first);
+        }
+        participated_threads.insert(channel_id.to_owned());
+    }
 }
 
 fn handle_interaction_create(
@@ -1050,6 +1065,32 @@ fn handle_interaction_create(
         .get("channel_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let guild_id = data.get("guild_id").and_then(Value::as_str);
+    let mut channel_type = data
+        .get("channel")
+        .and_then(|c| c.get("type"))
+        .or_else(|| data.get("channel_type"))
+        .and_then(Value::as_u64);
+    let mut parent_id = data
+        .get("channel")
+        .and_then(|c| c.get("parent_id"))
+        .or_else(|| data.get("parent_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if guild_id.is_some() && !channel_id.is_empty() && channel_type.is_none() && parent_id.is_none()
+    {
+        let (fetched_type, fetched_parent) = sender.resolve_channel_meta(channel_id);
+        channel_type = fetched_type;
+        parent_id = fetched_parent;
+    }
+    let is_thread = matches!(channel_type, Some(10..=12)) || parent_id.is_some();
+    let gate_channel_id = if is_thread {
+        parent_id.as_deref().unwrap_or(channel_id)
+    } else {
+        channel_id
+    };
+    let thread_id = is_thread.then_some(channel_id);
+
     let user = data
         .get("member")
         .and_then(|m| m.get("user"))
@@ -1071,12 +1112,14 @@ fn handle_interaction_create(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    let outcome = router.handle_gate_callback(
+    let outcome = router.handle_gate_callback_with_context(
         bot_id,
         ExternalSource::Discord,
+        guild_id,
         sender_id,
         sender_name,
-        channel_id,
+        gate_channel_id,
+        thread_id,
         custom_id,
     );
     sender
@@ -1743,5 +1786,155 @@ mod tests {
 
         srv.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discord_does_not_cache_transient_channel_meta_error_encodes_paths_and_only_tracks_dispatched_threads()
+     {
+        struct DenyBridge(BotConfig);
+        impl ConnectorBridge for DenyBridge {
+            fn dispatch_external_message(
+                &self,
+                _msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unexpected"))
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Denied("nope".to_owned()))
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _workspace_id: Option<&str>,
+                _channel_id: &str,
+                _thread_id: Option<&str>,
+                _acts_for: ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.0.id == bot_id).then(|| self.0.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.0.clone()]
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_bg = Arc::clone(&seen_paths);
+
+        let srv = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let (_method, path, _auth, _body) = read_http(&mut sock);
+                lock(&seen_bg).push(path);
+                let (status, body) = if idx == 0 {
+                    // First resolve_channel_meta fails transiently.
+                    ("500 Internal Server Error", r#"{"message":"oops"}"#)
+                } else if idx == 1 {
+                    // Retry must hit the server again and succeed!
+                    (
+                        "200 OK",
+                        r#"{"id":"th-1","type":11,"parent_id":"ch-parent"}"#,
+                    )
+                } else {
+                    ("200 OK", r#"{"id":"m-enc"}"#)
+                };
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+
+        let sender = Arc::new(DiscordSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("tok".to_owned()),
+        ));
+
+        // Transient error returns (None, None) and is NOT cached.
+        assert_eq!(sender.resolve_channel_meta("th-1"), (None, None));
+        // Next call retries and gets real thread metadata, which IS cached.
+        assert_eq!(
+            sender.resolve_channel_meta("th-1"),
+            (Some(11), Some("ch-parent".to_owned()))
+        );
+        // Third call hits cache (no extra HTTP request).
+        assert_eq!(
+            sender.resolve_channel_meta("th-1"),
+            (Some(11), Some("ch-parent".to_owned()))
+        );
+
+        // Path parameters with special chars are percent-encoded.
+        let enc_target = DeliveryTarget {
+            source: ExternalSource::Discord,
+            workspace_id: Some("g1".to_owned()),
+            channel_id: "ch/1?x=2".to_owned(),
+            thread_id: None,
+            reply_to_message_id: None,
+        };
+        assert_eq!(sender.send_message(&enc_target, "hi").unwrap(), "m-enc");
+
+        srv.join().unwrap();
+        let paths = lock(&seen_paths);
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[2], "/channels/ch%2F1%3Fx%3D2/messages");
+
+        // D-23c: Denied/paused thread mention must NOT add thread to participated_threads.
+        let bot_id = BotId::new("dc-part").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "DcPart", "claude", 1_000).unwrap();
+        bot.paused = true;
+        let bridge: Arc<dyn ConnectorBridge> = Arc::new(DenyBridge(bot));
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge)));
+        let mut participated = BTreeSet::new();
+        let event = json!({
+            "id": "m-1",
+            "guild_id": "g-1",
+            "channel_id": "th-99",
+            "channel_type": 11,
+            "parent_id": "ch-1",
+            "content": "<@900> hello",
+            "author": { "id": "u-evil", "username": "evil" },
+            "mentions": [{ "id": "900" }]
+        });
+        handle_message_create(
+            &bot_id,
+            Some("900"),
+            &event,
+            &sender,
+            &bridge,
+            &router,
+            &mut participated,
+        );
+        assert!(participated.is_empty());
     }
 }

@@ -5,6 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use krill_proto::control::{FEAT_CONTROL, FEAT_GIT_CHANGES, Reply, Request};
 use krill_proto::daemon::{self, Paths};
@@ -13,6 +14,7 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 
 const USAGE: &str = "usage: krill changes [--repo <path>]";
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
@@ -91,6 +93,12 @@ fn query(repo: &Path) -> Result<(), String> {
     if conn.negotiated.features & required != required {
         return Err("krilld does not support git changes; update the daemon".to_owned());
     }
+    conn.stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    conn.stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
     conn.stream
         .write_all(
             &Request::GitChanges {

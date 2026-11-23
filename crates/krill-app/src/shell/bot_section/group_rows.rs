@@ -658,18 +658,28 @@ impl Shell {
             s
         });
         let gid_sub = gid.clone();
-        let sub = cx.subscribe(&input, move |this, input, ev: &InputEvent, cx| match ev {
-            InputEvent::PressEnter { .. } => {
-                let next = input.read(cx).value().trim().to_owned();
-                this.bot_ui.renaming_group = None;
-                this.rename_group_rpc(&gid_sub, &next, cx);
-            }
-            InputEvent::Blur => {
-                this.bot_ui.renaming_group = None;
-                cx.notify();
-            }
-            _ => {}
-        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => {
+                    let composing = input.update(cx, |s, cx| {
+                        gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
+                    });
+                    if composing {
+                        return;
+                    }
+                    let next = input.read(cx).value().trim().to_owned();
+                    this.bot_ui.renaming_group = None;
+                    this.rename_group_rpc(&gid_sub, &next, cx);
+                }
+                InputEvent::Blur => {
+                    this.bot_ui.renaming_group = None;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
         input.update(cx, |s, cx| s.focus(window, cx));
         self.bot_ui.renaming_group = Some((gid, input, sub));
         cx.notify();

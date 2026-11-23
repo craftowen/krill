@@ -147,6 +147,19 @@ pub fn undo_memory_tidy(
     Ok((restored, Vec::new(), 0))
 }
 
+struct WinnerFact {
+    date: Option<String>,
+    text: String,
+    source: Option<String>,
+    order: usize,
+    winning_idx: usize,
+}
+
+enum TidySegment {
+    Raw(String),
+    Facts(Vec<usize>),
+}
+
 fn run_memory_tidy_inner(
     store: &BotStore,
     bot_id: &BotId,
@@ -168,25 +181,16 @@ fn run_memory_tidy_inner(
         return Ok(("MEMORY.md has no facts to tidy.".to_owned(), 0, None));
     }
 
-    // Preserve header lines above the first fact (or `# Memory` fallback).
-    let first_fact_line = parsed.first().map_or(0, |f| f.line);
     let raw_lines: Vec<&str> = old.lines().collect();
-    let mut header_lines: Vec<String> = raw_lines
-        .get(..first_fact_line)
-        .unwrap_or_default()
-        .iter()
-        .map(|l| (*l).trim_end().to_owned())
-        .collect();
-    while header_lines.last().is_some_and(String::is_empty) {
-        header_lines.pop();
-    }
-    if header_lines.is_empty() {
-        header_lines.push("# Memory".to_owned());
+    let mut fact_by_line: HashMap<usize, usize> = HashMap::with_capacity(parsed.len());
+    for (idx, fact) in parsed.iter().enumerate() {
+        fact_by_line.insert(fact.line, idx);
     }
 
-    // Deduplicate facts by normalized text key, preferring the newest date and richer provenance.
-    let mut deduped: BTreeMap<String, (Option<String>, String, Option<String>, usize)> =
-        BTreeMap::new();
+    // Deduplicate facts globally by normalized text key, preferring the newest date and richer
+    // provenance, while tracking the winning parsed index so each surviving fact stays in its
+    // own section.
+    let mut deduped: BTreeMap<String, WinnerFact> = BTreeMap::new();
     let mut duplicate_count: u32 = 0;
 
     for (order, fact) in parsed.iter().enumerate() {
@@ -195,63 +199,93 @@ fn run_memory_tidy_inner(
             continue;
         }
         match deduped.get_mut(&key) {
-            Some((existing_date, existing_text, existing_src, existing_order)) => {
+            Some(existing) => {
                 duplicate_count = duplicate_count.saturating_add(1);
-                let replace = match (existing_date.as_deref(), fact.date.as_deref()) {
+                let replace = match (existing.date.as_deref(), fact.date.as_deref()) {
                     (Some(a), Some(b)) => b > a,
                     (None, Some(_)) => true,
                     _ => false,
                 };
                 if replace {
-                    existing_date.clone_from(&fact.date);
-                    *existing_text = normalize_key(&fact.text);
-                    *existing_order = order;
+                    existing.date.clone_from(&fact.date);
+                    existing.text = key;
+                    existing.order = order;
+                    existing.winning_idx = order;
                 }
-                if existing_src.is_none() && fact.source.is_some() {
-                    existing_src.clone_from(&fact.source);
+                if existing.source.is_none() && fact.source.is_some() {
+                    existing.source.clone_from(&fact.source);
                 }
             }
             None => {
                 deduped.insert(
-                    key,
-                    (
-                        fact.date.clone(),
-                        normalize_key(&fact.text),
-                        fact.source.clone(),
+                    key.clone(),
+                    WinnerFact {
+                        date: fact.date.clone(),
+                        text: key,
+                        source: fact.source.clone(),
                         order,
-                    ),
+                        winning_idx: order,
+                    },
                 );
             }
         }
     }
 
-    // Sort newest date first, preserving original order as tie-breaker.
-    let mut ordered: Vec<(Option<String>, String, Option<String>, usize)> =
-        deduped.into_values().collect();
-    ordered.sort_by(|a, b| match (&b.0, &a.0) {
-        (Some(db), Some(da)) => db.cmp(da).then_with(|| a.3.cmp(&b.3)),
+    // Rank all surviving facts newest-date-first so overflow archival always archives the oldest.
+    let mut ranked: Vec<WinnerFact> = deduped.into_values().collect();
+    ranked.sort_by(|a, b| match (&b.date, &a.date) {
+        (Some(db), Some(da)) => db.cmp(da).then_with(|| a.order.cmp(&b.order)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.3.cmp(&b.3),
+        (None, None) => a.order.cmp(&b.order),
     });
 
-    let formatted_facts: Vec<String> = ordered
+    // Partition raw lines into preserved non-fact segments (headings, subheadings, prose, blanks)
+    // and contiguous fact blocks so no `##` heading or prose after the first fact is dropped.
+    let mut segments: Vec<TidySegment> = Vec::new();
+    let has_leading_non_fact = raw_lines
         .iter()
-        .map(|(date, text, src, _)| format_fact(date.as_deref(), text, src.as_deref()))
-        .collect();
+        .enumerate()
+        .take_while(|(line_idx, _)| !fact_by_line.contains_key(line_idx))
+        .any(|(_, line)| !line.trim().is_empty());
+    if !has_leading_non_fact {
+        segments.push(TidySegment::Raw("# Memory".to_owned()));
+        segments.push(TidySegment::Raw(String::new()));
+    }
+    for (line_idx, line) in raw_lines.iter().enumerate() {
+        if let Some(&fact_idx) = fact_by_line.get(&line_idx) {
+            if let Some(TidySegment::Facts(group)) = segments.last_mut() {
+                group.push(fact_idx);
+            } else {
+                segments.push(TidySegment::Facts(vec![fact_idx]));
+            }
+        } else {
+            let trimmed = (*line).trim_end().to_owned();
+            // Collapse consecutive blank lines while preserving section spacing.
+            if trimmed.is_empty()
+                && matches!(segments.last(), Some(TidySegment::Raw(prev)) if prev.is_empty())
+            {
+                continue;
+            }
+            segments.push(TidySegment::Raw(trimmed));
+        }
+    }
+    while matches!(segments.last(), Some(TidySegment::Raw(s)) if s.is_empty()) {
+        segments.pop();
+    }
 
-    // Reserve header + blank separator line inside `BOT_MEMORY_INDEX_LINE_CAP`.
-    let header_overhead = header_lines.len().saturating_add(1);
-    let max_facts = BOT_MEMORY_INDEX_LINE_CAP.saturating_sub(header_overhead);
+    let raw_line_count = segments
+        .iter()
+        .filter(|seg| matches!(seg, TidySegment::Raw(_)))
+        .count();
+    let max_facts = BOT_MEMORY_INDEX_LINE_CAP.saturating_sub(raw_line_count);
 
     let mut archived_count: u32 = 0;
-    let final_facts = if formatted_facts.len() > max_facts && max_facts > 1 {
+    let mut archive_notice: Option<String> = None;
+    let mut archived_winners: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if ranked.len() > max_facts && max_facts > 1 {
         let keep_count = max_facts.saturating_sub(1);
-        let kept = formatted_facts
-            .get(..keep_count)
-            .unwrap_or_default()
-            .to_vec();
-        let overflow = formatted_facts.get(keep_count..).unwrap_or_default();
+        let overflow = ranked.get(keep_count..).unwrap_or_default();
         archived_count = u32::try_from(overflow.len()).unwrap_or(u32::MAX);
 
         let ym = format_utc_ym(now_ms / 1_000);
@@ -260,27 +294,67 @@ fn run_memory_tidy_inner(
         ensure_no_symlink_path(&archive_path)?;
         let mut archive_body = std::fs::read_to_string(&archive_path)
             .unwrap_or_else(|_| format!("# Archived Memory ({ym})\n\n"));
-        for line in overflow {
+        for fact in overflow {
+            archived_winners.insert(fact.winning_idx);
+            let line = format_fact(fact.date.as_deref(), &fact.text, fact.source.as_deref());
             if !archive_body.contains(line.as_str()) {
-                archive_body.push_str(line);
+                archive_body.push_str(&line);
                 archive_body.push('\n');
             }
         }
         write_atomic_0600(&archive_path, archive_body.as_bytes())?;
 
-        let mut next = kept;
         let today = format_utc_ymd(now_ms / 1_000);
-        next.push(format!(
+        archive_notice = Some(format!(
             "- {today} Archived {archived_count} older memory fact(s) in memory/{archive_name}"
         ));
-        next
-    } else {
-        formatted_facts
-    };
+    }
 
-    let mut rebuilt = header_lines.join("\n");
-    rebuilt.push_str("\n\n");
-    rebuilt.push_str(&final_facts.join("\n"));
+    let mut winner_by_idx: HashMap<usize, &WinnerFact> = HashMap::with_capacity(ranked.len());
+    for fact in &ranked {
+        if !archived_winners.contains(&fact.winning_idx) {
+            winner_by_idx.insert(fact.winning_idx, fact);
+        }
+    }
+
+    let mut rebuilt_lines: Vec<String> = Vec::new();
+    for seg in segments {
+        match seg {
+            TidySegment::Raw(line) => {
+                if line.is_empty() && rebuilt_lines.last().is_some_and(String::is_empty) {
+                    continue;
+                }
+                rebuilt_lines.push(line);
+            }
+            TidySegment::Facts(group) => {
+                let mut surviving: Vec<&WinnerFact> = group
+                    .into_iter()
+                    .filter_map(|idx| winner_by_idx.get(&idx).copied())
+                    .collect();
+                surviving.sort_by(|a, b| match (&b.date, &a.date) {
+                    (Some(db), Some(da)) => db.cmp(da).then_with(|| a.order.cmp(&b.order)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.order.cmp(&b.order),
+                });
+                for fact in surviving {
+                    rebuilt_lines.push(format_fact(
+                        fact.date.as_deref(),
+                        &fact.text,
+                        fact.source.as_deref(),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(notice) = archive_notice {
+        rebuilt_lines.push(notice);
+    }
+    while rebuilt_lines.last().is_some_and(String::is_empty) {
+        rebuilt_lines.pop();
+    }
+
+    let mut rebuilt = rebuilt_lines.join("\n");
     rebuilt.push('\n');
 
     let changed = rebuilt != old;
@@ -549,5 +623,59 @@ mod tests {
             tidy_due_after_ms(TidyEvery::Week, None, day + 5 * H),
             Some(day + 3 * H - 6 * 24 * H)
         );
+    }
+
+    #[test]
+    fn memory_tidy_preserves_subheadings_and_prose() {
+        let root = temp_dir("subheadings");
+        let store = BotStore::new(root.clone());
+        let sched = SchedulerStateStore::new(root.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Section Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let structured = "# Memory\n\n\
+                          ## Preferences\n\
+                          Always prefer concise answers.\n\
+                          - 2026-11-01 Uses Rust\n\
+                          - 2026-11-10 Uses   Rust · from: Chat\n\n\
+                          ## Architecture\n\
+                          Daemon owns PTY state.\n\
+                          - 2026-11-02 Target dir is external SSD\n\
+                          - 2026-11-12 Never drop user headings\n";
+        store.update_memory(&bot.id, structured, true).unwrap();
+
+        let (_, changes) =
+            run_memory_tidy_tracked(&store, Some(&sched), &bot.id, 1_795_000_000_000).unwrap();
+        assert!(changes >= 1);
+
+        let cleaned = store.get_memory(&bot.id).unwrap();
+        assert!(cleaned.contains("## Preferences"), "{cleaned}");
+        assert!(
+            cleaned.contains("Always prefer concise answers."),
+            "{cleaned}"
+        );
+        assert!(cleaned.contains("## Architecture"), "{cleaned}");
+        assert!(cleaned.contains("Daemon owns PTY state."), "{cleaned}");
+        assert!(cleaned.contains("Never drop user headings"), "{cleaned}");
+        assert!(cleaned.contains("Target dir is external SSD"), "{cleaned}");
+        assert_eq!(parse_memory_facts(&cleaned).len(), 3);
+
+        fs::remove_dir_all(&root).ok();
     }
 }

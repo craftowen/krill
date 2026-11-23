@@ -240,11 +240,20 @@ struct WorkerHandle {
     handle: Option<JoinHandle<()>>,
 }
 
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            self.stop.signal();
+        }
+    }
+}
+
 /// Lifecycle coordinator for local-first Telegram, Slack Socket Mode, and Discord Gateway workers.
 pub struct ConnectorManager {
     bridge: Arc<dyn ConnectorBridge>,
     endpoints: ConnectorEndpoints,
     router: Arc<ConversationRouter>,
+    reload_lock: Mutex<()>,
     workers: Mutex<BTreeMap<(BotId, ExternalSource), WorkerHandle>>,
     statuses: Mutex<BTreeMap<(BotId, ExternalSource), BotConnectorStatus>>,
 }
@@ -282,6 +291,7 @@ impl ConnectorManager {
             bridge,
             endpoints,
             router,
+            reload_lock: Mutex::new(()),
             workers: Mutex::new(BTreeMap::new()),
             statuses: Mutex::new(BTreeMap::new()),
         }
@@ -294,7 +304,12 @@ impl ConnectorManager {
     }
 
     /// Reconciles messaging connector workers (`Telegram`, `Slack`, `Discord`) for `bot_id` (or all bots).
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "preserves ConnectorManager::reload fallible API contract for callers"
+    )]
     pub fn reload(&self, bot_id: Option<&BotId>) -> io::Result<()> {
+        let _reload_guard = lock(&self.reload_lock);
         let bots: Vec<BotConfig> = match bot_id {
             Some(id) => self.bridge.get_bot_config(id).into_iter().collect(),
             None => self.bridge.list_bots(),
@@ -317,8 +332,8 @@ impl ConnectorManager {
                     bot.connectors.telegram.secret_ref.as_deref(),
                     "telegram",
                     "telegram_token",
-                )? {
-                    Some(token) => {
+                ) {
+                    Ok(Some(token)) => {
                         let fp = hash_telegram(&bot, token.as_str());
                         desired.insert(
                             key,
@@ -329,11 +344,18 @@ impl ConnectorManager {
                             },
                         );
                     }
-                    None => {
+                    Ok(None) => {
                         missing_secret_statuses.push(not_set_up_status(
                             &bot.id,
                             ExternalSource::Telegram,
                             "Missing Telegram bot token in secret vault",
+                        ));
+                    }
+                    Err(err) => {
+                        missing_secret_statuses.push(not_set_up_status(
+                            &bot.id,
+                            ExternalSource::Telegram,
+                            &format!("Failed reading Telegram secret: {}", err.kind()),
                         ));
                     }
                 }
@@ -341,22 +363,22 @@ impl ConnectorManager {
             if bot.connectors.slack.enabled {
                 let key = (bot.id.clone(), ExternalSource::Slack);
                 enabled_keys.insert(key.clone());
-                let app_tok = resolve_with_fallback(
+                let app_res = resolve_with_fallback(
                     self.bridge.as_ref(),
                     &bot.id,
                     bot.connectors.slack.app_token_secret_ref.as_deref(),
                     "slack-app",
                     "slack_app_token",
-                )?;
-                let bot_tok = resolve_with_fallback(
+                );
+                let bot_res = resolve_with_fallback(
                     self.bridge.as_ref(),
                     &bot.id,
                     bot.connectors.slack.bot_token_secret_ref.as_deref(),
                     "slack-bot",
                     "slack_bot_token",
-                )?;
-                match (app_tok, bot_tok) {
-                    (Some(app_token), Some(bot_token)) => {
+                );
+                match (app_res, bot_res) {
+                    (Ok(Some(app_token)), Ok(Some(bot_token))) => {
                         let fp = hash_slack(&bot, app_token.as_str(), bot_token.as_str());
                         desired.insert(
                             key,
@@ -367,6 +389,13 @@ impl ConnectorManager {
                                 fp,
                             },
                         );
+                    }
+                    (Err(err), _) | (_, Err(err)) => {
+                        missing_secret_statuses.push(not_set_up_status(
+                            &bot.id,
+                            ExternalSource::Slack,
+                            &format!("Failed reading Slack secret: {}", err.kind()),
+                        ));
                     }
                     _ => {
                         missing_secret_statuses.push(not_set_up_status(
@@ -386,8 +415,8 @@ impl ConnectorManager {
                     bot.connectors.discord.bot_token_secret_ref.as_deref(),
                     "discord",
                     "discord_token",
-                )? {
-                    Some(token) => {
+                ) {
+                    Ok(Some(token)) => {
                         let fp = hash_discord(&bot, token.as_str());
                         desired.insert(
                             key,
@@ -398,11 +427,18 @@ impl ConnectorManager {
                             },
                         );
                     }
-                    None => {
+                    Ok(None) => {
                         missing_secret_statuses.push(not_set_up_status(
                             &bot.id,
                             ExternalSource::Discord,
                             "Missing Discord bot token in secret vault",
+                        ));
+                    }
+                    Err(err) => {
+                        missing_secret_statuses.push(not_set_up_status(
+                            &bot.id,
+                            ExternalSource::Discord,
+                            &format!("Failed reading Discord secret: {}", err.kind()),
                         ));
                     }
                 }
@@ -536,7 +572,7 @@ impl ConnectorManager {
             };
 
             if let Ok(jh) = handle_res {
-                lock(&self.workers).insert(
+                let replaced = lock(&self.workers).insert(
                     key,
                     WorkerHandle {
                         fingerprint: fp,
@@ -544,6 +580,12 @@ impl ConnectorManager {
                         handle: Some(jh),
                     },
                 );
+                if let Some(mut old) = replaced {
+                    old.stop.signal();
+                    if let Some(old_jh) = old.handle.take() {
+                        old_jh.join().ok();
+                    }
+                }
             } else {
                 self.router.unregister_sender(&key.0, source);
                 self.update_status(BotConnectorStatus {
@@ -655,7 +697,33 @@ impl ConnectorManager {
                         };
                     }
                 };
-                SlackSender::new(&endpoints.slack, bot_tok).test_connection()
+                let app_tok = match resolve_with_fallback(
+                    self.bridge.as_ref(),
+                    &bot.id,
+                    bot.connectors.slack.app_token_secret_ref.as_deref(),
+                    "slack-app",
+                    "slack_app_token",
+                ) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: "Missing Slack app token (xapp-) in secret vault".to_owned(),
+                        };
+                    }
+                    Err(err) => {
+                        return BotConnectorTestResult {
+                            source,
+                            ok: false,
+                            account_label: None,
+                            detail: format!("Failed reading Slack app secret: {}", err.kind()),
+                        };
+                    }
+                };
+                SlackSender::new(&endpoints.slack, bot_tok)
+                    .test_connection_with_app_token(app_tok.as_str())
             }
             ExternalSource::Discord => {
                 let tok = match resolve_with_fallback(
@@ -717,6 +785,7 @@ impl ConnectorManager {
 
     /// Stops all connector workers cleanly and clears runtime state.
     pub fn shutdown(&self) {
+        let _reload_guard = lock(&self.reload_lock);
         let drained: Vec<WorkerHandle> = {
             let mut workers = lock(&self.workers);
             workers.values().for_each(|w| w.stop.signal());
@@ -929,6 +998,112 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].state, ConnectorHealthState::Error);
         assert_eq!(statuses[0].error_category, Some(BotErrorCategory::NotSetUp));
+
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn reload_isolates_secret_vault_errors_per_connector_and_test_slack_requires_app_token() {
+        struct MixedSecretBridge {
+            bots: Mutex<Vec<BotConfig>>,
+            fail_bot: BotId,
+            slack_bot_only: BotId,
+        }
+        impl ConnectorBridge for MixedSecretBridge {
+            fn dispatch_external_message(
+                &self,
+                _msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Denied("unused".to_owned()))
+            }
+            fn resolve_secret(
+                &self,
+                bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                if bot_id == &self.fail_bot {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt ref"));
+                }
+                if bot_id == &self.slack_bot_only && fallback_key == "slack-bot" {
+                    return Ok(Some(Zeroizing::new("xoxb-only".to_owned())));
+                }
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _workspace_id: Option<&str>,
+                _channel_id: &str,
+                _thread_id: Option<&str>,
+                _acts_for: ActsFor,
+            ) -> io::Result<ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                lock(&self.bots).iter().find(|b| &b.id == bot_id).cloned()
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                lock(&self.bots).clone()
+            }
+        }
+
+        let bad_id = BotId::new("bot-bad-sec").unwrap();
+        let mut bad_bot = BotConfig::new(bad_id.clone(), "BadSec", "claude", 1_000).unwrap();
+        bad_bot.connectors.telegram.enabled = true;
+
+        let ok_id = BotId::new("bot-ok-sec").unwrap();
+        let mut ok_bot = BotConfig::new(ok_id.clone(), "OkSec", "claude", 1_000).unwrap();
+        ok_bot.connectors.slack.enabled = true;
+
+        let bridge = Arc::new(MixedSecretBridge {
+            bots: Mutex::new(vec![bad_bot, ok_bot.clone()]),
+            fail_bot: bad_id.clone(),
+            slack_bot_only: ok_id.clone(),
+        });
+        let mgr = ConnectorManager::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+
+        // Reload must NOT abort on bad_bot's vault error; both bots get reconciled statuses.
+        mgr.reload(None).unwrap();
+        let bad_st = mgr.statuses(Some(&bad_id));
+        assert_eq!(bad_st.len(), 1);
+        assert_eq!(bad_st[0].state, ConnectorHealthState::Error);
+        assert!(
+            bad_st[0]
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Failed reading Telegram secret")
+        );
+        let ok_st = mgr.statuses(Some(&ok_id));
+        assert_eq!(ok_st.len(), 1);
+        assert_eq!(ok_st[0].error_category, Some(BotErrorCategory::NotSetUp));
+
+        // D-35f: Slack connector test must fail when xapp- app token is missing even if xoxb- exists.
+        let test_res = mgr.test_connector(&ok_bot, ExternalSource::Slack);
+        assert!(!test_res.ok);
+        assert!(test_res.detail.contains("xapp-"));
 
         mgr.shutdown();
     }

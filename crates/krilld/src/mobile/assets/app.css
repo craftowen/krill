@@ -969,12 +969,13 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-status-pill.connected{color:var(--status-connected,#22c55e)}
 .bot-status-pill.blocked{color:var(--status-blocked,#ef4444)}
 .bot-chat-btn{flex:none}
+.bots-items-list,.bot-item-decisions{display:flex;flex-direction:column;gap:10px}
 .bot-item-card,.bot-reply-card,.bot-docs-card,.bot-group-panel{display:flex;flex-direction:column;gap:10px;padding:14px;border-radius:16px;background:var(--group-surface);border:1px solid var(--border)}
 .bot-item-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .bot-owner-chip{min-height:var(--touch-target);padding:0 6px}
 .bot-item-form,.bots-redeem-form{display:flex;flex-direction:column;gap:8px;width:100%}
-.bots-redeem-form{flex-direction:row;padding:10px 14px;border-top:1px solid var(--border);align-items:center}
-.bots-redeem-form input{flex:1;min-width:0}
+.bots-redeem-form{flex-direction:row;flex-wrap:wrap;padding:10px 14px;border-top:1px solid var(--border);align-items:center}
+.bots-redeem-form input{flex:1;min-width:120px}
 .bot-item-form textarea,.bot-docs-card textarea{width:100%;min-height:56px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--surface-base);color:var(--foreground);font:inherit;resize:vertical}
 .bot-decision-box{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:12px;background:var(--surface-base);border:1px solid var(--border)}
 .bot-decision-q{margin:0;font-weight:600}

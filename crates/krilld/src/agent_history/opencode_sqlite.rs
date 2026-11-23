@@ -717,6 +717,7 @@ mod tests {
             hibernation_blocked: false,
             account: None,
             bot_instructions: None,
+            launched_at: None,
         };
         let page = chat::poll_session_in(&roots, Some(&stored), b"", 0);
         assert!(page.bound);
