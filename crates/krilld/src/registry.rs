@@ -3840,7 +3840,7 @@ impl Registry {
         out
     }
 
-    fn wait_for_paste_submit_settle(tap: &Tap, before_end: u64) {
+    pub(crate) fn wait_for_paste_submit_settle(tap: &Tap, before_end: u64) {
         const ECHO_WAIT_MAX: Duration = Duration::from_millis(500);
         const ECHO_DRAIN_MAX: Duration = Duration::from_millis(800);
 
