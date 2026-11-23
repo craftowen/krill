@@ -1019,3 +1019,61 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .workspaces:has(>.tab-bar)>.workspace-bottom-bar{order:90;padding-bottom:8px}
 .bots .filter-chip,.up-next .filter-chip,.bots .small{min-height:var(--touch-target);min-width:var(--touch-target)}
 .bots .home-section-heading{margin-top:4px;align-items:center}
+/* Bot Mobile UX A+C+D: avatar rail, one-tap decision deck, 4-tab workspace, embedded chat, collapsible items */
+.bot-rail{flex:none;width:100%;max-width:100%;overflow:hidden}
+.bot-rail-scroll{display:flex;gap:8px;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;padding:4px 2px 6px;-webkit-overflow-scrolling:touch}
+.bot-rail-scroll::-webkit-scrollbar{display:none}
+.bot-workspace-rail{flex:none;padding:4px 12px 2px;border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.bot-rail-item{flex:none;min-width:56px;max-width:68px;min-height:var(--touch-target);display:flex;flex-direction:column;align-items:center;gap:4px;padding:2px;color:var(--muted-foreground);text-align:center}
+.bot-rail-item.active{color:var(--foreground);font-weight:600}
+.bot-rail-ring{position:relative;display:inline-flex;padding:2px;border-radius:13px;border:2px solid transparent}
+.bot-rail-item.active .bot-rail-ring{border-color:var(--accent)}
+.bot-rail-item.needs .bot-rail-ring{border-color:var(--status-waiting)}
+.bot-rail-dot{position:absolute;right:-1px;bottom:-1px;width:10px;height:10px;border-radius:50%;border:2px solid var(--surface-base);background:var(--text-muted)}
+.bot-rail-dot.connected{background:var(--status-connected)}
+.bot-rail-dot.working{background:var(--status-working)}
+.bot-rail-dot.waiting{background:var(--status-waiting)}
+.bot-rail-dot.blocked{background:var(--status-blocked)}
+.bot-rail-badge{position:absolute;top:-4px;right:-4px;min-width:17px;height:17px;padding:0 4px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:17px;text-align:center;font-variant-numeric:tabular-nums}
+.bot-rail-name{font-size:calc(11px * var(--ui-scale,1));max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bot-avatar.has-color{color:var(--on-accent)}
+.bot-group-avatar{background:var(--accent);color:var(--on-accent)}
+.bot-add-avatar{border:1px dashed var(--floating-border);background:var(--surface-raised);color:var(--foreground)}
+.bot-seg-tabs{flex:none;display:flex;gap:4px;padding:4px;border-radius:var(--radius-md);background:var(--surface-raised);border:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
+.bot-seg-tabs::-webkit-scrollbar{display:none}
+.bot-workspace-tabs{margin:6px 12px}
+.bot-seg-tab{flex:1 1 0;min-width:0;min-height:var(--touch-target);padding:4px 8px;border-radius:var(--radius-sm);display:inline-flex;align-items:center;justify-content:center;gap:4px;font-size:calc(12px * var(--ui-scale,1));font-weight:600;color:var(--muted-foreground);white-space:nowrap}
+.bot-seg-tab.active{background:var(--surface-base);color:var(--foreground);box-shadow:0 1px 2px rgba(0,0,0,.16)}
+.bot-seg-badge{min-width:16px;height:16px;padding:0 4px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}
+.bot-seg-badge.blocked{background:var(--status-blocked)}
+.bot-decision-deck{flex:none;width:100%}
+.bot-decision-deck.compact{padding:0 12px}
+.bot-decision-card{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border-radius:var(--radius-card);background:var(--group-surface);border:1px solid var(--border);border-left:3px solid var(--status-waiting)}
+.bot-decision-card.blocked{border-left-color:var(--status-blocked)}
+.bot-decision-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.bot-decision-card-title{font-size:var(--font-body);overflow-wrap:anywhere}
+.bot-decision-card-sub{font-size:var(--font-meta);margin:0;overflow-wrap:anywhere}
+.bot-decision-card-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.bot-deck-next{margin-left:auto}
+.bot-workspace-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.bot-chat-top{flex:none;display:flex;flex-direction:column;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.bot-thread-bar{display:flex;align-items:center;gap:6px;padding:4px 12px 0;overflow-x:auto;scrollbar-width:none}
+.bot-thread-bar::-webkit-scrollbar{display:none}
+.bot-thread-chip,.bot-new-chat-btn{flex:none}
+.bot-term-btn{flex:none;margin-left:auto}
+.bot-worker-strip{display:flex;align-items:center;gap:8px;margin:0 12px;padding:6px 10px;border-radius:var(--radius-sm);background:var(--surface-raised);border:1px solid var(--border);font-size:var(--font-meta)}
+.bot-worker-copy{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bot-chat-stage{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.bot-chat-empty{flex:1;min-height:0;overflow:auto;padding:20px 16px;display:flex;flex-direction:column;gap:12px;justify-content:center}
+.bot-first-chat-form{display:flex;flex-direction:column;gap:8px}
+.bot-first-chat-form textarea{min-height:68px;border-radius:var(--radius-md);background:var(--surface-panel)}
+.bot-item-head-right{display:inline-flex;align-items:center;gap:4px;flex:none}
+.bot-item-details{display:flex;flex-direction:column;gap:8px;padding-top:6px;border-top:1px solid var(--border)}
+.bot-reply-fold{border:1px solid var(--border);border-radius:var(--radius-card);background:var(--group-surface);overflow:hidden}
+.bot-reply-fold-summary{min-height:var(--touch-target);padding:10px 14px;display:flex;align-items:center;font-weight:600;cursor:pointer}
+.bot-reply-fold>.bot-reply-card{border:0;border-top:1px solid var(--border);border-radius:0}
+.bot-group-promoted-head{display:flex;align-items:center;gap:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.bot-group-messages.promoted{max-height:46svh;min-height:140px}
+.bot-automation-row{flex-wrap:wrap;align-items:flex-start}
+#mobile-app .bot-workspace>.page-header:not(.title-header) .header-copy{padding-right:0;text-align:left}
+@media(max-width:360px){.bot-workspace-tabs{margin:4px 8px}.bot-seg-tab{padding:4px;font-size:calc(11px * var(--ui-scale,1))}.bot-rail-item{min-width:50px}}

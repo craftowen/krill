@@ -839,10 +839,11 @@ async function botsScreens(){
  assert(hf.find('.workspace-list'),'legacy hosts without bots capability fall back to Projects');
  hf.abort.abort();
 
- // 3. #/bots screen: list, paused badge, Open Chat, Create Bot sheet, Access approve + redeem, Group Chat
+ // 3. #/bots screen (A+C+D): avatar rail, one-tap decision deck, Open Chat keeps bot context, promoted Group Chat, Create Bot sheet, Access approve + redeem
  const botsData=[
-  {id:'b1',slug:'triage',name:'Triage Bot',agent_id:'claude',description:'Triages PRs',paused:false,avatar_color:'#2563eb'},
-  {id:'b2',slug:'sleepy',name:'Paused Bot',agent_id:'codex',description:'Paused',paused:true},
+  {id:'b1',slug:'triage',name:'Triage Bot',agent_id:'claude',description:'Triages PRs',paused:false,avatar_color:'#2563eb',schedules:[{id:'nightly',name:'Nightly triage',cron:'0 9 * * *',prompt:'Triage',enabled:true},{id:'weekly',name:'Weekly digest',cron:'0 17 * * 5',prompt:'Digest',enabled:false}]},
+  {id:'b2',slug:'sleepy',name:'Paused Bot',agent_id:'codex',description:'Paused',paused:true,schedules:[]},
+  {id:'b3',slug:'agybot',name:'Agy Bot',agent_id:'agy',model:'gemini-3.8-flash-low',effort:'high',description:'Antigravity helper',paused:false,schedules:[]},
  ];
  const itemData=[
   {uid:'item-1',owner_bot_id:'b1',title:'Review release',status:'needs_you',description:'Check hashes',done_means:'Signed',links:[{url:'https://example.com/pr/1'}],events:[{id:1,decisions:[{question:'Ship release?',options:['Approve','Hold'],recommended:0}]}],snoozed_until_ms:null},
@@ -850,8 +851,10 @@ async function botsScreens(){
  const accessData=[{token:'tok-1',bot_id:'b1',source:'telegram',sender_id:'77',sender_name:'Alice',status:'pending'}];
  const groupsData=[{id:'grp-1',name:'Eng Team',bot_ids:['b1'],description:'Sync'}];
  const suggestionsData=[{id:'sug-1',bot_id:'b1',title:'Check CI failures',why:'2 checks failed',ask:'Inspect main'}];
+ const botSessionsData=[{session_id:99,bot_id:'b1',pid:4242,live:true,working:true,label:'Home',created_at_ms:1000}];
+ let tabBarSynced=0;
  const bf=fixture('bots',{
-  state:{snapshot:{capabilities:{bots:true},agents:[{id:'claude',name:'Claude Code'}]}},
+  state:{snapshot:{capabilities:{bots:true},agents:[{id:'claude',name:'Claude Code'},{id:'agy',name:'Antigravity'}]}},
   refresh:()=>{bf.state.sessions.set(99,{id:99,groupKey:'cwd:/bots/b1'});bf.state.groups.set('cwd:/bots/b1',{key:'cwd:/bots/b1',sessions:[{id:99}]});},
   rpc:req=>{
    if(req.action==='bots.list')return {bots:botsData,truncated:false,next_cursor:null};
@@ -859,6 +862,7 @@ async function botsScreens(){
    if(req.action==='bots.access.list')return {requests:accessData,truncated:false,next_cursor:null};
    if(req.action==='bots.connectors.status')return {statuses:[{bot_id:'b1',source:'telegram',enabled:true,state:'connected'}]};
    if(req.action==='bots.groups.list')return {groups:groupsData,truncated:false,next_cursor:null};
+   if(req.action==='bots.sessions.list')return {sessions:botSessionsData};
    if(req.action==='bots.groups.read')return {group:{group:groupsData[0],threads:[{thread_id:'t2',title:'Latest'},{thread_id:'t1',title:'Oldest'}],messages:[{sender_name:'Triage Bot',body:'Ready'}],active_run:false}};
    if(req.action==='bots.groups.new_thread')return {group:{group:groupsData[0],threads:[{thread_id:'t3',title:'New thread'},{thread_id:'t2',title:'Latest'},{thread_id:'t1',title:'Oldest'}],messages:[],active_run:false}};
    if(req.action==='bots.chat.open')return {bot_id:'b1',session_id:99,pid:4242};
@@ -868,25 +872,46 @@ async function botsScreens(){
    return {};
   }
  });
+ bf.ctx.syncTabBar=()=>{tabBarSynced++;};
  await bf.flush();
  assert(bf.root.textContent.includes('Triage Bot'));
+ assert(bf.root.textContent.includes('Agy Bot')&&bf.root.textContent.includes('Antigravity'),'agy bot renders Antigravity label on Bots hub');
  assert(bf.root.textContent.includes('1 needs you'));
+ // C: Top avatar rail renders bots + group + New Bot with numeric badge
+ assert(bf.find('.bot-rail'),'avatar quick-switch rail renders on Bots hub');
+ const railItems=bf.all().filter(n=>n.className&&n.className.includes('bot-rail-item'));
+ assert(railItems.some(n=>n.dataset.botRailId==='b1'&&n.textContent.includes('1')),'bot rail item shows needs_you badge');
+ assert(railItems.some(n=>n.dataset.botRailId==='b3'),'agy bot appears in avatar rail');
+ assert(railItems.some(n=>n.dataset.groupRailId==='grp-1'),'group chat appears in avatar rail');
+ // D: One-tap decision deck renders urgent Needs You item and syncs tab bar on answer
+ const deck=bf.find('.bot-decision-deck');
+ assert(deck&&deck.textContent.includes('Review release')&&deck.textContent.includes('Ship release?'),'decision deck shows urgent item');
+ const deckApprove=deck.descendants().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')==='Approve');
+ await deckApprove.action();
+ assert(bf.calls.some(c=>c.action==='bots.item.answer'&&c.item_id==='item-1'&&c.option_index===0));
+ assert(tabBarSynced>0,'answering decision card syncs bottom To Do tab badge');
+ // Open Chat keeps bot context inside #/bots/:id (does not jump out to /host/.../group/...)
  const chatButtons=bf.all().filter(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Open Chat');
- assert.equal(chatButtons.length,2);
+ assert.equal(chatButtons.length,3);
  assert.equal(chatButtons[0].disabled,false);
- assert.equal(chatButtons[1].disabled,true,'Paused bot disables Open Chat');
+ const pausedBtn=chatButtons.find(b=>b.disabled);
+ assert(pausedBtn,'Paused bot disables Open Chat');
  await chatButtons[0].action();
- assert.equal(bf.routes.at(-1),'/host/local/group/cwd:/bots/b1/s/99');
+ assert.equal(bf.routes.at(-1),'/bots/b1','Open Chat stays inside bot workspace instead of jumping to project session');
 
- await bf.byText('Approve').action();
+ const accessApprove=bf.find('.bots-access-card').descendants().find(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Approve');
+ await accessApprove.action();
  assert(bf.calls.some(c=>c.action==='bots.access.decide'&&c.token==='tok-1'&&c.approve===true));
  const codeInput=bf.find('.bots-redeem-form').querySelector('input');
  codeInput.value='PAIR-99';
  await bf.byText('Redeem').action();
  assert(bf.calls.some(c=>c.action==='bots.access.redeem'&&c.code==='PAIR-99'));
 
- await bf.find('.bots-group-row').action();
+ // Promoted Group Chat via avatar rail 1-tap
+ const grpRailBtn=bf.all().find(n=>n.dataset?.groupRailId==='grp-1');
+ await grpRailBtn.action();
  await bf.flush();
+ assert(bf.find('.bot-group-promoted'),'tapping group in rail opens promoted Group Chat view');
  assert(bf.root.textContent.includes('Ready'));
  const grpArea=bf.find('.bot-group-panel').querySelector('textarea');
  grpArea.value='@triage status?';
@@ -897,6 +922,8 @@ async function botsScreens(){
  grpAreaAfter.value='@triage in new thread';
  await bf.find('.bot-group-panel').querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Send').action();
  assert(bf.calls.some(c=>c.action==='bots.groups.send'&&c.group_id==='grp-1'&&c.thread_id==='t3'&&c.text==='@triage in new thread'));
+ await bf.byText('Back to bots').action();
+ assert(!bf.find('.bot-group-promoted'),'Back to bots closes promoted group chat');
 
  await bf.byText('New Bot').action();
  const sheet=bf.sheets.at(-1);
@@ -965,25 +992,75 @@ async function botsScreens(){
  assert(uni.root.textContent.includes('All caught up'));
  uni.abort.abort();
 
+ // 5. #/bots/:id Bot Workspace (A+C+D): 4 segment tabs, embedded chat, worker strip, collapsible items, automations run/toggle, settings (agy + pause + SOUL/MEMORY)
+ let mountedChatSessions=[];
+ let unmountedChats=0;
  const df=fixture('bots',{
   route:{botId:'b1'},
   state:{snapshot:{capabilities:{bots:true}}},
+  refresh:()=>{df.state.sessions.set(99,{id:99,groupKey:'cwd:/bots/b1'});df.state.groups.set('cwd:/bots/b1',{key:'cwd:/bots/b1',sessions:[{id:99}]});},
   rpc:req=>{
    if(req.action==='bots.list')return {bots:botsData};
-   if(req.action==='bots.items')return {items:[]};
+   if(req.action==='bots.items')return {items:itemData};
    if(req.action==='bots.connectors.status')return {statuses:[{bot_id:'b1',source:'telegram',state:'connected'}]};
-   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:suggestionsData};
    if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.sessions.list')return {sessions:botSessionsData};
+   if(req.action==='bots.groups.list')return {groups:groupsData};
+   if(req.action==='bots.upcoming')return {look_around_last_ms:Date.now()-60000,schedules:[{id:'nightly',running:false,next_ms:Date.now()+3600000}]};
    if(req.action==='bots.soul.get')return {bot_id:'b1',content:'# Soul'};
    if(req.action==='bots.memory.get')return {bot_id:'b1',content:'- Fact'};
    if(req.action==='bots.memory.update')return {content:'- Fact\n- More',restored_facts:[]};
    if(req.action==='bots.look_around')return {suggestions:[]};
+   if(req.action==='bots.schedule.run')return {started:true};
+   if(req.action==='bots.schedule.toggle'){botsData[0].schedules[0].enabled=req.enabled;return {bot:botsData[0]};}
+   if(req.action==='bots.sessions.stop')return {stopped:true};
    if(req.action==='bots.models')return {models:req.agent_id==='agy'?[{id:'gemini-3.8-flash-low',label:'Gemini 3.8 Flash (Low)'}]:[{id:'opus',label:'Opus'}]};
-   if(req.action==='bots.update'){botsData[0]={...botsData[0],agent_id:req.agent_id||botsData[0].agent_id,model:req.clear_model?null:(req.model??botsData[0].model),effort:req.clear_effort?null:(req.effort??botsData[0].effort)};return {bot:botsData[0]};}
+   if(req.action==='bots.update'){botsData[0]={...botsData[0],paused:req.paused??botsData[0].paused,agent_id:req.agent_id||botsData[0].agent_id,model:req.clear_model?null:(req.model??botsData[0].model),effort:req.clear_effort?null:(req.effort??botsData[0].effort)};return {bot:botsData[0]};}
    return {};
   }
  });
+ df.M.chat={mount:(node,opts)=>{mountedChatSessions.push(opts.sessionId);node.append(df.ctx.el('div',`Embedded chat #${opts.sessionId}`,'chat-view'));return {setVisible(){},update(){},unmount(){unmountedChats++;}};}};
+ df.view.update();
  await df.flush();
+ // Default Chat tab mounts embedded chat + shows avatar rail + worker strip + Terminal switch
+ const segTabs=df.all().filter(n=>n.dataset?.botTab);
+ assert.deepEqual(segTabs.map(n=>n.dataset.botTab),['chat','work','automations','settings'],'4 segment tabs in Bot Workspace');
+ assert(df.find('.bot-rail'),'avatar rail renders inside Bot Workspace for 1-tap switching');
+ assert(mountedChatSessions.includes(99),'M.chat.mount embeds live bot session inside Chat tab');
+ assert(df.find('.bot-worker-strip'),'worker strip shows active bot session');
+ await df.find('.bot-worker-strip').descendants().find(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Stop').action();
+ assert(df.calls.some(c=>c.action==='bots.sessions.stop'&&c.bot_id==='b1'&&c.session_id===99));
+
+ // Work tab: collapsible item cards + Look Around + External reply
+ await segTabs.find(n=>n.dataset.botTab==='work').action();
+ const itemDetails=df.find('.bot-item-details');
+ assert(itemDetails&&itemDetails.hidden,'item details start collapsed in Work tab to avoid mis-taps');
+ await df.byText('Details').action();
+ assert(!df.find('.bot-item-details').hidden,'tapping Details expands item details');
+ await df.byText('Look Around').action();
+ assert(df.calls.some(c=>c.action==='bots.look_around'&&c.bot_id==='b1'));
+ const replyBox=df.find('.bot-reply-card').querySelector('textarea');
+ replyBox.value='Ack';
+ await df.byText('Send reply').action();
+ assert(df.calls.some(c=>c.action==='bots.reply'&&c.bot_id==='b1'&&c.text==='Ack'));
+
+ // Automations tab: lists all schedules (active + paused) and supports Run now + Pause/Enable toggle
+ await segTabs.find(n=>n.dataset.botTab==='automations').action();
+ assert(df.root.textContent.includes('Nightly triage')&&df.root.textContent.includes('Weekly digest'),'Automations tab shows all schedules, not just failures');
+ const autoRunBtns=df.all().filter(b=>b.tagName==='BUTTON'&&b.getAttribute('aria-label')==='Run now');
+ assert(autoRunBtns.length>=2,'Look Around + schedules have Run now buttons');
+ await autoRunBtns[1].action();
+ assert(df.calls.some(c=>c.action==='bots.schedule.run'&&c.bot_id==='b1'&&c.schedule_id==='nightly'));
+ await df.byText('Pause').action();
+ assert(df.calls.some(c=>c.action==='bots.schedule.toggle'&&c.bot_id==='b1'&&c.schedule_id==='nightly'&&c.enabled===false));
+
+ // Settings tab: Pause/Resume, agy provider switch, SOUL & MEMORY auto-loaded
+ await segTabs.find(n=>n.dataset.botTab==='settings').action();
+ await df.flush();
+ assert(df.root.textContent.includes('SOUL.md'),'Settings tab loads SOUL.md');
+ await df.byText('Save Soul').action();
+ assert(df.calls.some(c=>c.action==='bots.soul.set'&&c.content==='# Soul'));
  await df.byText('Agent').action();
  assert.equal(df.sheets.at(-1)[0],'Agent');
  const agentBody=df.ctx.el('div');
@@ -1000,19 +1077,12 @@ async function botsScreens(){
  await saveBtn.action();
  await df.flush();
  assert(df.calls.some(c=>c.action==='bots.update'&&c.bot_id==='b1'&&c.agent_id==='agy'&&c.model==='gemini-3.8-flash-low'));
- await df.byText('Look Around').action();
- assert(df.calls.some(c=>c.action==='bots.look_around'&&c.bot_id==='b1'));
- const replyBox=df.find('.bot-reply-card').querySelector('textarea');
- replyBox.value='Ack';
- await df.byText('Send reply').action();
- assert(df.calls.some(c=>c.action==='bots.reply'&&c.bot_id==='b1'&&c.text==='Ack'));
- await df.byText('Load').action();
- assert(df.root.textContent.includes('SOUL.md'));
- await df.byText('Save Soul').action();
- assert(df.calls.some(c=>c.action==='bots.soul.set'&&c.content==='# Soul'));
+ assert(df.root.textContent.includes('Antigravity'),'Settings tab displays Antigravity for agy bot');
+ df.view.cleanup?.();
+ assert(unmountedChats>0,'leaving Bot Workspace unmounts embedded chat cleanly');
  df.abort.abort();
 
- // Refused bot chats on mobile: Open Chat, agent switch Home Chat (#46862), and failed automation run cards (#46892).
+ // 6. Refused bot chats on mobile: Start chat refusal, agent switch Home Chat (#46862), and failed automation decision card (#46892).
  const tooOldRefusal={code:'cli_too_old',agent:'hermes',installed_version:'0.20.5',minimum_version:'0.23.0'};
  const rf=fixture('bots',{
   route:{botId:'b1'},
@@ -1023,6 +1093,8 @@ async function botsScreens(){
    if(req.action==='bots.connectors.status')return {statuses:[]};
    if(req.action==='bots.suggestions.list')return {suggestions:[]};
    if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.sessions.list')return {sessions:[]};
+   if(req.action==='bots.groups.list')return {groups:[]};
    if(req.action==='bots.upcoming')return {schedules:[{id:'nightly',running:false,last_error:'Your Hermes CLI on this computer is 0.20.5. Chats need 0.23.0 or newer.',last_refusal:tooOldRefusal}]};
    if(req.action==='bots.models')return {models:[]};
    if(req.action==='bots.update')return {bot:{...botsData[0],agent_id:req.agent_id||'hermes'}};
@@ -1033,17 +1105,18 @@ async function botsScreens(){
  const toasts=[];
  rf.ctx.toast=(m)=>toasts.push(m);
  await rf.flush();
- // Failed automation run card shows phone-side refusal text without calling desktop "this computer".
+ // Failed automation card surfaces immediately on Chat tab decision deck with phone-side refusal text (no "this computer").
  const runRow=rf.find('.bot-automation-run-row');
  assert(runRow,'failed automation run card must render on mobile');
  assert(runRow.textContent.includes('Hermes')&&runRow.textContent.includes('0.20.5')&&runRow.textContent.includes('0.23.0'),runRow.textContent);
  assert(!runRow.textContent.includes('this computer'),runRow.textContent);
- // Explicit Open Chat tap rejects with worded refusal.
+ // Explicit Start chat tap rejects with worded refusal without "this computer".
  let openErr=null;
- try{await rf.byText('Open Chat').action();}catch(e){openErr=e;}
+ try{await rf.byText('Start chat').action();}catch(e){openErr=e;}
  assert(openErr&&openErr.message.includes('Hermes')&&openErr.message.includes('0.20.5')&&openErr.message.includes('0.23.0'),String(openErr));
  assert(!openErr.message.includes('this computer'),openErr.message);
- // Switching agent in Agent sheet ensures Home Chat and toasts why it was refused (#46862).
+ // Switching agent in Settings -> Agent sheet ensures Home Chat and toasts why it was refused (#46862).
+ await rf.all().find(n=>n.dataset?.botTab==='settings').action();
  await rf.byText('Agent').action();
  const switchBody=rf.ctx.el('div');
  rf.sheets.at(-1)[3](switchBody);
@@ -1059,7 +1132,16 @@ async function botsScreens(){
  assert(lastToast.includes('Hermes')&&lastToast.includes('0.20.5')&&lastToast.includes('0.23.0'),lastToast);
  assert(!lastToast.includes('this computer'),lastToast);
  rf.abort.abort();
- console.log('PASS mobile bots screens: routes, Home entry, #/bots, #/bots/:id, #/up-next, decisions, groups, soul/memory, refusals, no innerHTML');
+
+ // 7. Korean i18n coverage for all new Bot UX A+C+D copy
+ const koBox=vm.createContext({navigator:{language:'ko'}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),koBox);
+ const K=koBox.KrillMobile.i18n;
+ for(const key of ['Quick switch','Back to bots','New Chat','Home Chat','Work','Start chat','Active workers','Run now','Pause','Resume','Enable','No scheduled automations configured.','Bot status','Provider & model','Failed automation','Access request','Needs attention','Open in terminal']){
+  assert.notEqual(K.t(key),key,`missing ko translation for "${key}"`);
+ }
+ assert.equal(K.t('{0} active',2),'2개 실행 중');
+ console.log('PASS mobile bots screens (A+C+D): rail, decision deck, 4-tab workspace, embedded chat, worker strip, collapsible items, automations, agy, promoted groups, refusals, ko i18n, no innerHTML');
 }
 async function mobileAuditWave2Regressions(){
  const assetRoot=path.join(__dirname,'../src/mobile/assets');
@@ -1297,6 +1379,7 @@ async function mobileAuditWave2Regressions(){
   assert(!bf.byText('Load more'),'M-08: Load more hides only after all host cursors drain');
 
   // M-04 groups.create: host selector filters bots to chosen host and calls rpcForHost(hid).
+  await bf.all().find(n=>n.dataset?.hubMode==='groups').action();
   await bf.byText('+ New group').action();
   const grpBody=bf.ctx.el('div');
   bf.sheets.at(-1)[3](grpBody);
@@ -1418,6 +1501,7 @@ async function mobileAuditWave2Regressions(){
   });
   sf.ctx.refreshHost=()=>{throw Error('Screen target changed');};
   await sf.flush();
+  await sf.all().find(n=>n.dataset?.botTab==='settings').action();
   await sf.byText('Agent').action();
   const body=sf.ctx.el('div');
   assert.doesNotThrow(()=>sf.sheets.at(-1)[3](body),'M-09: bots.models sync throw caught in Agent sheet');
@@ -1449,6 +1533,7 @@ async function mobileAuditWave2Regressions(){
    },
   });
   await f.flush();
+  await f.all().find(n=>n.dataset?.hubMode==='groups').action();
   // M-10: open group in single-host fallback -> .active class set -> refresh reloads group -> re-click collapses without re-fetching.
   await f.find('.bots-group-row').action();
   await f.flush();
@@ -1527,19 +1612,20 @@ async function mobileAuditWave2Regressions(){
    },
   });
   await df.flush();
+  await df.all().find(n=>n.dataset?.botTab==='work').action();
+  const replyArea=df.find('.bot-reply-card').querySelector('textarea');
+  replyArea.focus();replyArea.value='draft reply';emit(replyArea,'input');
+  df.view.update();
+  assert.equal(df.find('.bot-reply-card').querySelector('textarea'),replyArea,'M-12: external reply textarea reused');
+  assert.equal(df.doc.activeElement,replyArea,'M-12: external reply textarea keeps focus on draw()');
+  await df.all().find(n=>n.dataset?.botTab==='settings').action();
+  await df.flush();
   for(const label of ['Signed out','Usage limit reached','Not set up','Folder missing','Agent error']){
    assert(df.root.textContent.includes(label),`M-15: connector status renders human label "${label}"`);
   }
   for(const raw of ['signed_out','usage_limit','not_set_up','folder_missing','agent_error']){
    assert(!df.root.textContent.includes(raw),`M-15: raw enum "${raw}" must not appear in UI`);
   }
-  const replyArea=df.find('.bot-reply-card').querySelector('textarea');
-  replyArea.focus();replyArea.value='draft reply';emit(replyArea,'input');
-  df.view.update();
-  assert.equal(df.find('.bot-reply-card').querySelector('textarea'),replyArea,'M-12: external reply textarea reused');
-  assert.equal(df.doc.activeElement,replyArea,'M-12: external reply textarea keeps focus on draw()');
-  await df.byText('Load').action();
-  await df.flush();
   const [soulArea,memArea]=df.find('.bot-docs-card').querySelectorAll('textarea');
   soulArea.focus();soulArea.value='# Edited Soul';emit(soulArea,'input');
   df.view.update();
