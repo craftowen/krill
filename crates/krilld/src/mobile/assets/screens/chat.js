@@ -201,6 +201,14 @@ d: "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.106-3.105c.32-.322.863-.
 },
 ],
 chevronRight: [{ tag: "path", d: "m9 18 6-6-6-6" }],
+chevronsDownUp: [
+{ tag: "path", d: "m7 20 5-5 5 5" },
+{ tag: "path", d: "m7 4 5 5 5-5" },
+],
+chevronsUpDown: [
+{ tag: "path", d: "m7 15 5 5 5-5" },
+{ tag: "path", d: "m7 9 5-5 5 5" },
+],
 arrowDown: [{ tag: "path", d: "M12 5v14m-7-7 7 7 7-7" }],
 check: [{ tag: "path", d: "M20 6 9 17l-5-5" }],
 search: [
@@ -915,6 +923,113 @@ if (jumpGlyph) jumpBtn.replaceChildren(jumpGlyph);
 function syncJumpButton() {
 jumpBtn.hidden = !entry.items.length || (following && !entry.live);
 }
+const processToggleBtn = button(
+t("Expand all work steps"),
+() => {
+if (!active()) return;
+toggleAllWorkProcesses();
+},
+"chat-process-toggle",
+);
+processToggleBtn.type = "button";
+processToggleBtn.hidden = true;
+let processToggleExpanded = null;
+function workProcessTargets() {
+const targets = [];
+for (const group of toolRuns.values()) {
+if (group.details?.parentElement === feed)
+targets.push({ details: group.details, key: group.discloseKey });
+}
+for (const [key, card] of cards) {
+if (card._item?.kind !== "reasoning" || card.parentElement !== feed)
+continue;
+const details = card.children?.[0];
+if (details?.tagName === "DETAILS" || details?.tag === "details")
+targets.push({ details, key });
+}
+return targets;
+}
+function syncProcessToggleButton() {
+const targets = workProcessTargets();
+processToggleBtn.hidden = !targets.length;
+if (!targets.length) return;
+const anyOpen = targets.some((item) => Boolean(item.details.open));
+const label = t(
+anyOpen ? "Collapse all work steps" : "Expand all work steps",
+);
+processToggleBtn.setAttribute("aria-label", label);
+processToggleBtn.title = label;
+processToggleBtn.setAttribute("aria-pressed", String(anyOpen));
+processToggleBtn.dataset.expanded = String(anyOpen);
+if (processToggleExpanded !== anyOpen) {
+processToggleExpanded = anyOpen;
+const glyph = svgIcon(anyOpen ? "chevronsDownUp" : "chevronsUpDown");
+if (glyph) processToggleBtn.replaceChildren(glyph);
+}
+}
+function toggleAllWorkProcesses() {
+const targets = workProcessTargets();
+if (!targets.length) {
+syncProcessToggleButton();
+return;
+}
+const anyOpen = targets.some((item) => Boolean(item.details.open)),
+targetOpen = !anyOpen,
+anchor = readerAnchor(),
+feedTop = feed.getBoundingClientRect?.().top,
+anchorIsTarget =
+!targetOpen &&
+anchor &&
+targets.some(
+({ details }) =>
+details === anchor.node || details.parentElement === anchor.node,
+);
+entry.disclosures ||= new Map();
+for (const { details, key } of targets) {
+if (Boolean(details.open) !== targetOpen) details.open = targetOpen;
+if (targetOpen) {
+entry.disclosures.set(key, true);
+details._loadLazy?.();
+} else {
+entry.disclosures.delete(key);
+}
+}
+syncProcessToggleButton();
+if (following && !entry.live) {
+pinLatestSoon();
+} else {
+if (
+anchorIsTarget &&
+anchor.node.parentElement &&
+typeof feedTop === "number" &&
+anchor.top < feedTop
+) {
+const nextTop = anchor.node.getBoundingClientRect?.().top;
+if (typeof nextTop === "number") {
+feed.scrollTop += nextTop - feedTop;
+lastTop = feed.scrollTop;
+}
+} else {
+restoreReader(anchor);
+}
+if (!targetOpen && !entry.live) {
+const gap =
+(feed.scrollHeight || 0) -
+(feed.scrollTop || 0) -
+(feed.clientHeight || 0);
+if (gap <= 1) {
+following = true;
+if (entry.unreadFromId) {
+entry.unreadFromId = null;
+unreadDivider?.remove();
+}
+syncLiveCardVisibility();
+}
+}
+syncScroll();
+syncJumpButton();
+}
+}
 const pollStatus = el("div", undefined, "chat-actions"),
 pollText = el("span", undefined, "muted");
 pollStatus.setAttribute("role", "status");
@@ -929,9 +1044,24 @@ const input = el("textarea", undefined, "chat-input");
 input.rows = 1;
 input.placeholder = t("Message agent (Bracketed Paste)…");
 input.setAttribute("aria-label", t("Chat prompt"));
+let floatLiveCard = null,
+floatRateBanner = null;
 function syncComposerHeight() {
-if (shell.style && composer.offsetHeight)
-shell.style.setProperty("--chat-composer-h", composer.offsetHeight + "px");
+if (shell.style && composer.offsetHeight) {
+const composerH = composer.offsetHeight;
+shell.style.setProperty("--chat-composer-h", composerH + "px");
+const floatBottom =
+composerH +
+(floatLiveCard && !floatLiveCard.hidden && floatLiveCard.offsetHeight
+? floatLiveCard.offsetHeight + 16
+: 0) +
+(floatRateBanner &&
+!floatRateBanner.hidden &&
+floatRateBanner.offsetHeight
+? floatRateBanner.offsetHeight + 4
+: 0);
+shell.style.setProperty("--chat-float-bottom", floatBottom + "px");
+}
 }
 let sizedValue = null,
 sizedWidth = -1;
@@ -2347,6 +2477,7 @@ const text = liveQuestion ? t("Answer the current question above") : agent
 : t("Message agent (Bracketed Paste)…");
 if (input.placeholder !== text) input.placeholder = text;
 rateLimitBanner.hidden = !Boolean(status?.rate_limited);
+syncComposerHeight();
 for (const card of cards.values()) card._syncPermission?.();
 }
 function copyText(text, node) {
@@ -3182,7 +3313,11 @@ openSearch();
 }
 };
 globalThis.document?.addEventListener?.("keydown", onDocKeyDown);
-shell.append(history, pollStatus, searchBar, feed, skeleton, streamingDots, jumpBtn, liveCard, rateLimitBanner, composer, actionsDialog);
+floatLiveCard = liveCard;
+floatRateBanner = rateLimitBanner;
+resize?.observe(liveCard);
+resize?.observe(rateLimitBanner);
+shell.append(history, pollStatus, searchBar, feed, skeleton, streamingDots, processToggleBtn, jumpBtn, liveCard, rateLimitBanner, composer, actionsDialog);
 root.replaceChildren(shell);
 // Only a complete live terminal screen supplies an answer target. Historical cards stay inert.
 let liveQuestion = null,
@@ -3233,6 +3368,7 @@ function syncLiveCardVisibility() {
 if (!liveCard) return;
 liveCard.hidden =
 !liveQuestion || Boolean(activeQuestionKey && following && !entry.live);
+syncComposerHeight();
 }
 function syncQuestionCards() {
 activeQuestionKey = computeActiveQuestionKey();
@@ -3969,6 +4105,7 @@ empty.append(el("p", t("Start a conversation"), "muted"));
 feed.append(empty);
 }
 syncJumpButton();
+syncProcessToggleButton();
 applySearch();
 const first = entry.items[0];
 const start = first?._pageStart || 0;
@@ -4003,18 +4140,21 @@ const current = resolve();
 entry.disclosures ||= new Map();
 if (node.open) entry.disclosures.set(current, true);
 else entry.disclosures.delete(current);
+syncProcessToggleButton();
 });
 }
 function lazyDetails(details, build) {
-if (details.open) build();
-else
-details.addEventListener("toggle", () => {
-if (details.open && !details.dataset.loaded) {
+const load = () => {
+if (details.dataset.loaded) return;
 details.dataset.loaded = "true";
 build();
-}
+};
+details._loadLazy = load;
+if (details.open) load();
+else
+details.addEventListener("toggle", () => {
+if (details.open) load();
 });
-if (details.open) details.dataset.loaded = "true";
 }
 function renderCard(item, key) {
 const kind = item.kind || "assistant",
@@ -4789,6 +4929,10 @@ optimisticShown = "";
 feed.replaceChildren();
 resize?.disconnect();
 resize?.observe(feed);
+resize?.observe(composer);
+if (floatLiveCard) resize?.observe(floatLiveCard);
+if (floatRateBanner) resize?.observe(floatRateBanner);
+syncProcessToggleButton();
 }
 // Pages are chronological links. Cursor numbers may decrease between live pages.
 function rememberPage(start, next) {

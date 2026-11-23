@@ -3155,14 +3155,6 @@ impl Backend {
         if text.is_empty() {
             return self.input(session, b"\r".to_vec());
         }
-        if text.len() > krill_proto::input::MAX_INPUT {
-            return Err(invalid());
-        }
-        if let Some(reg) = self.registry.upgrade()
-            && let Some(tap) = reg.session_tap(SessionId(session))
-        {
-            return crate::registry::Registry::deliver_input_to_tap(&tap, text.as_bytes(), true);
-        }
         let bracketed = self.session_bracketed_paste(session) || text.contains(['\n', '\r']);
         let payload = if bracketed {
             format_bracketed_paste(text)
@@ -3171,6 +3163,16 @@ impl Backend {
         };
         if payload.len() > krill_proto::input::MAX_INPUT {
             return Err(invalid());
+        }
+        if let Some(reg) = self.registry.upgrade()
+            && let Some(tap) = reg.session_tap(SessionId(session))
+        {
+            let before_end = tap.pulse().end;
+            if !payload.is_empty() {
+                tap.write_input(&payload, None)?;
+                crate::registry::Registry::wait_for_paste_submit_settle(&tap, before_end);
+            }
+            return tap.write_input(b"\r", None);
         }
         let delay = if bracketed {
             krill_proto::input::PASTE_SUBMIT_DELAY
@@ -7516,6 +7518,46 @@ mod revision_tests {
         )
         .unwrap();
         assert_eq!(steer_res["ok"], true, "{steer_res}");
+
+        let read_pty = |pty: &mut fs::File| -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 256];
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                match pty.read(&mut buf) {
+                    Ok(n) if n > 0 => out.extend_from_slice(&buf[..n]),
+                    Ok(_) => break,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        if !out.is_empty() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("unexpected PTY read error: {e}"),
+                }
+            }
+            out
+        };
+        assert_eq!(read_pty(&mut pty), b"keep tests minimal\r");
+
+        // Multiline mobile prompts on a non-bracketed live PTY must preserve newlines inside
+        // bracketed paste framing (never flatten with " | ") and still strip control bytes.
+        let multiline_res: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "prompt",
+                    "session": session_id,
+                    "text": "line1\nline2\x1b[31m\x03\nline3"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(multiline_res["ok"], true, "{multiline_res}");
+        assert_eq!(
+            read_pty(&mut pty),
+            b"\x1b[200~line1\nline2[31m\nline3\x1b[201~\r"
+        );
 
         let inflight_deadline = Instant::now() + Duration::from_secs(5);
         while !crate::session::lock(&backend.git_inflight).is_empty()
