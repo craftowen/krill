@@ -186,6 +186,29 @@ fn trim_str_url_end(mut s: &str, trim_punct: bool) -> &str {
 /// 외부 브라우저로 넘길 URL을 정규화한다.
 ///
 /// Markdown GFM 자동 링크나 터미널 링크 뒤에 닫힘 괄호·한국어 조사(`)하면`)가 붙은 경우
+/// Returns a sanitized `http://` or `https://` URL with a non-empty host authority.
+pub fn sanitize_http_url(raw: &str) -> Option<String> {
+    let clean = sanitize_external_url(raw)?;
+    let rest = if clean
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        clean.get(8..)?
+    } else if clean
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        clean.get(7..)?
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') {
+        return None;
+    }
+    Some(clean)
+}
+
 /// 불균형 꼬리를 잘라내고, 비ASCII 경로·호스트를 percent-encoding/punycode ASCII URL로
 /// 변환해 macOS `NSURL::URLWithString:`이 `nil`을 돌려보내는 문제를 막는다.
 pub fn sanitize_external_url(raw: &str) -> Option<String> {

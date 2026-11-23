@@ -1358,17 +1358,68 @@ const ICON_RETRY_AFTER_NETWORK_ERROR: std::time::Duration = std::time::Duration:
 #[cfg(not(test))]
 const ICON_RETRY_AFTER_INVALID_IMAGE: std::time::Duration = std::time::Duration::from_secs(600);
 
+const REMOTE_ICON_CURL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(7);
+
+fn remote_icon_curl_args(clean_url: &str) -> [&str; 12] {
+    [
+        "-fsSL",
+        "--globoff",
+        "--proto",
+        "=http,https",
+        "--proto-redir",
+        "=http,https",
+        "--max-time",
+        "5",
+        "--max-filesize",
+        "262144",
+        "--",
+        clean_url,
+    ]
+}
+
+fn build_remote_icon_command(
+    tool: impl AsRef<OsStr>,
+    url: &str,
+) -> Option<(String, std::process::Command)> {
+    let clean_url = crate::terminal::path_link::sanitize_http_url(url)?;
+    let mut cmd = crate::platform::background_command(tool);
+    cmd.args(remote_icon_curl_args(&clean_url));
+    Some((clean_url, cmd))
+}
+
+fn fetch_remote_icon_bytes_with_tool(tool: impl AsRef<OsStr>, url: &str) -> io::Result<Vec<u8>> {
+    let Some((_, mut cmd)) = build_remote_icon_command(tool, url) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid remote icon URL",
+        ));
+    };
+    let out = crate::settings::child::output(
+        &mut cmd,
+        REMOTE_ICON_CURL_TIMEOUT,
+        u64::try_from(MAX_ICON_IMAGE_BYTES).unwrap_or(u64::MAX),
+    )?;
+    if !out.status.success() {
+        return Err(io::Error::other("remote icon fetch failed"));
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(not(test))]
+fn fetch_remote_icon_bytes(url: &str) -> io::Result<Vec<u8>> {
+    fetch_remote_icon_bytes_with_tool(crate::updater::system_tool("curl"), url)
+}
 fn resolve_or_fetch_remote_icon(
     url: &str,
     cache_dir: &Path,
 ) -> Option<crate::ui::icons::ProjectIcon> {
-    let target = cached_icon_path_for_url(cache_dir, url);
+    let clean_url = crate::terminal::path_link::sanitize_http_url(url)?;
+    let target = cached_icon_path_for_url(cache_dir, &clean_url);
     if has_valid_icon_magic(&target) {
         return Some(crate::ui::icons::ProjectIcon::Image(target));
     }
     #[cfg(not(test))]
     {
-        let clean_url = url.trim().to_owned();
         let recently_failed = FAILED_ICON_URLS.lock().is_ok_and(|mut failed| {
             let now = std::time::Instant::now();
             failed.retain(|_, retry_at| *retry_at > now);
@@ -1380,26 +1431,11 @@ fn resolve_or_fetch_remote_icon(
                 .is_ok_and(|mut set| set.insert(clean_url.clone()));
         if should_spawn {
             std::thread::spawn(move || {
-                let out = crate::platform::background_command(crate::updater::system_tool("curl"))
-                    .args([
-                        "-fsSL",
-                        "--max-time",
-                        "5",
-                        "--max-filesize",
-                        "262144",
-                        &clean_url,
-                    ])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .output();
-                let retry_after = match out {
-                    Ok(out) if out.status.success() => {
-                        write_cached_icon_bytes(&target, &out.stdout)
-                            .err()
-                            .map(|_| ICON_RETRY_AFTER_INVALID_IMAGE)
-                    }
-                    _ => Some(ICON_RETRY_AFTER_NETWORK_ERROR),
+                let retry_after = match fetch_remote_icon_bytes(&clean_url) {
+                    Ok(bytes) => write_cached_icon_bytes(&target, &bytes)
+                        .err()
+                        .map(|_| ICON_RETRY_AFTER_INVALID_IMAGE),
+                    Err(_) => Some(ICON_RETRY_AFTER_NETWORK_ERROR),
                 };
                 if let Some(wait) = retry_after
                     && let Ok(mut failed) = FAILED_ICON_URLS.lock()
@@ -1636,35 +1672,22 @@ fn cache_remote_repo_icon_file(
 }
 
 fn fetch_remote_icon_sync(url: &str, cache_dir: &Path) -> Option<crate::ui::icons::ProjectIcon> {
-    let target = cached_icon_path_for_url(cache_dir, url);
+    let clean_url = crate::terminal::path_link::sanitize_http_url(url)?;
+    let target = cached_icon_path_for_url(cache_dir, &clean_url);
     if has_valid_icon_magic(&target) {
         return Some(crate::ui::icons::ProjectIcon::Image(target));
     }
     #[cfg(not(test))]
     {
-        let clean_url = url.trim().to_owned();
         let recently_failed = FAILED_ICON_URLS.lock().is_ok_and(|mut failed| {
             let now = std::time::Instant::now();
             failed.retain(|_, retry_at| *retry_at > now);
             failed.contains_key(&clean_url)
         });
         if !recently_failed {
-            let out = crate::platform::background_command(crate::updater::system_tool("curl"))
-                .args([
-                    "-fsSL",
-                    "--max-time",
-                    "5",
-                    "--max-filesize",
-                    "262144",
-                    &clean_url,
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output();
-            match out {
-                Ok(out) if out.status.success() => {
-                    if write_cached_icon_bytes(&target, &out.stdout).is_ok() {
+            match fetch_remote_icon_bytes(&clean_url) {
+                Ok(bytes) => {
+                    if write_cached_icon_bytes(&target, &bytes).is_ok() {
                         return Some(crate::ui::icons::ProjectIcon::Image(target));
                     }
                     if let Ok(mut failed) = FAILED_ICON_URLS.lock() {
@@ -1674,7 +1697,7 @@ fn fetch_remote_icon_sync(url: &str, cache_dir: &Path) -> Option<crate::ui::icon
                         );
                     }
                 }
-                _ => {
+                Err(_) => {
                     if let Ok(mut failed) = FAILED_ICON_URLS.lock() {
                         failed.insert(
                             clean_url,
@@ -3054,4 +3077,152 @@ fn windows_projects_are_stored_without_the_verbatim_prefix() {
     // 이미 정리된 경로로 다시 등록해도 중복이 생기지 않는다.
     assert!(!register_project(&state, &project).unwrap());
     fs::remove_dir_all(&state).ok();
+}
+
+#[cfg(test)]
+#[test]
+fn favicon_url_from_website_validates_strict_dns_hostname() {
+    assert_eq!(
+        favicon_url_from_website("https://aasoft.kr/docs").as_deref(),
+        Some("https://www.google.com/s2/favicons?domain=aasoft.kr&sz=64")
+    );
+    assert_eq!(
+        favicon_url_from_website("http://www.Sub-1.Example.co.uk:8443/app?a=1#h").as_deref(),
+        Some("https://www.google.com/s2/favicons?domain=sub-1.example.co.uk&sz=64")
+    );
+    assert_eq!(
+        favicon_url_from_website("example.org").as_deref(),
+        Some("https://www.google.com/s2/favicons?domain=example.org&sz=64")
+    );
+
+    // Reject curl globbing, query/parameter injection, control/whitespace, non-ASCII, and invalid DNS labels.
+    let long_label = format!("{}.example.com", "a".repeat(64));
+    let too_long_host = format!(
+        "{}.{}.{}.{}.com",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(63)
+    );
+    for bad in [
+        "https://a.b[1-100000]",
+        "https://a.b{x,y}",
+        "https://a[0-9].example.com",
+        "https://a.b&sz=999",
+        "https://a.b=1",
+        "https://a.b%26sz=999",
+        "https://a.b\r\n",
+        "https://a.b\r\nc",
+        "https://a.b\x1bc",
+        "https://a.b\0c",
+        "https://a b.com",
+        "https://한글.kr",
+        "https://-bad.example.com",
+        "https://bad-.example.com",
+        "https://a..b.com",
+        "https://.example.com",
+        "https://example.com.",
+        "https://www.",
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://0.0.0.0",
+        "https://[::1]",
+        "https://github.com/craftowen/krill",
+        "https://gitlab.com/org/repo",
+        "https://bitbucket.org/org/repo",
+        long_label.as_str(),
+        too_long_host.as_str(),
+    ] {
+        assert_eq!(
+            favicon_url_from_website(bad),
+            None,
+            "hostname must be rejected: {bad:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn remote_icon_fetch_uses_hardened_curl_args_and_bounds_output() {
+    let url = "https://www.google.com/s2/favicons?domain=example.com&sz=64";
+    assert_eq!(
+        remote_icon_curl_args(url),
+        [
+            "-fsSL",
+            "--globoff",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
+            "--max-time",
+            "5",
+            "--max-filesize",
+            "262144",
+            "--",
+            url,
+        ]
+    );
+
+    assert!(build_remote_icon_command("curl", "file:///etc/passwd").is_none());
+    assert!(build_remote_icon_command("curl", "ftp://example.com/icon.png").is_none());
+    assert!(build_remote_icon_command("curl", "javascript:alert(1)").is_none());
+    assert!(build_remote_icon_command("curl", "https://example.com/a b.png").is_none());
+    assert_eq!(
+        fetch_remote_icon_bytes_with_tool("curl", "file:///etc/passwd")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+
+    let (clean, cmd) = build_remote_icon_command("curl", url).unwrap();
+    assert_eq!(clean, url);
+    let args: Vec<_> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        remote_icon_curl_args(url)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("krill-icon-curl-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let fake_curl = dir.join("fake-curl");
+        fs::write(
+            &fake_curl,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv\"\nprintf '\\211PNG\\r\\n\\032\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_curl, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let bytes = fetch_remote_icon_bytes_with_tool(fake_curl.to_str().unwrap(), url).unwrap();
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+        let argv = fs::read_to_string(dir.join("argv")).unwrap();
+        let recorded: Vec<&str> = argv.lines().collect();
+        assert_eq!(recorded, remote_icon_curl_args(url));
+
+        // Exceeding MAX_ICON_IMAGE_BYTES must be rejected by settings::child::output even if curl ignores --max-filesize.
+        let flood_curl = dir.join("flood-curl");
+        fs::write(
+            &flood_curl,
+            format!(
+                "#!/bin/sh\n/usr/bin/perl -e 'print \"A\" x {}'\n",
+                MAX_ICON_IMAGE_BYTES + 64
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&flood_curl, fs::Permissions::from_mode(0o700)).unwrap();
+        let err = fetch_remote_icon_bytes_with_tool(flood_curl.to_str().unwrap(), url).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

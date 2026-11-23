@@ -676,8 +676,8 @@ fn exchange_target_with_features(
         | krill_proto::usage::FEAT_USAGE_REFRESH
         | krill_proto::usage::FEAT_SESSION_ACCOUNT_SWITCH
         | krill_proto::usage::FEAT_ACCOUNT_SWITCH_CONTROL;
-    let mut conn = target
-        .connect(&hello)
+    let (mut conn, epoch) = target
+        .connect_with_epoch(&hello)
         .map_err(|e| crate::errors::user_daemon_error(&e))?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err(
@@ -709,7 +709,7 @@ fn exchange_target_with_features(
             .to_owned()
     })?;
     if let Err(err) = conn.stream.write_all(&encoded) {
-        target.record_outcome(false, Some(&err));
+        target.record_outcome_for_epoch(epoch, false, Some(&err));
         return Err(crate::errors::user_io_error(&err));
     }
     let (kind, body) = match ipc::read_frame(&mut conn.stream) {
@@ -720,7 +720,7 @@ fn exchange_target_with_features(
                 .to_owned());
         }
         Err(err) => {
-            target.record_outcome(false, Some(&err));
+            target.record_outcome_for_epoch(epoch, false, Some(&err));
             if matches!(req, UsageRequest::ConsumeResetCredit { .. })
                 && matches!(
                     err.kind(),
@@ -739,7 +739,7 @@ fn exchange_target_with_features(
             .get()
             .to_owned()
     })?;
-    target.record_outcome(true, None);
+    target.record_outcome_for_epoch(epoch, true, None);
     Ok((reply, conn.negotiated.features))
 }
 
