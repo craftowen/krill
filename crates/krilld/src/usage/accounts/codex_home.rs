@@ -95,7 +95,26 @@ pub(super) fn prepare(_: &Path, source: &Path) -> io::Result<PathBuf> {
 }
 
 /// Upgrade older registrations without modifying the Orca profile they referenced.
+/// Per-account failures are isolated so all ready accounts are migrated and saved.
 pub(crate) fn migrate(home: &Path, state: Option<&Path>) -> io::Result<()> {
+    migrate_inner(home, state, None)
+}
+
+/// Opportunistically migrates ready Codex registrations during account switching without
+/// letting an unrelated failing Codex account block switching to `target_account_id`.
+pub(crate) fn migrate_for_switch(
+    home: &Path,
+    state: Option<&Path>,
+    target_account_id: &str,
+) -> io::Result<()> {
+    migrate_inner(home, state, Some(target_account_id))
+}
+
+fn migrate_inner(
+    home: &Path,
+    state: Option<&Path>,
+    only_error_for: Option<&str>,
+) -> io::Result<()> {
     let _guard = lock(&SAVE_LOCK);
     let mut file = match load_file_result(home, state) {
         Ok(file) => file,
@@ -103,6 +122,7 @@ pub(crate) fn migrate(home: &Path, state: Option<&Path>) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let mut changed = false;
+    let mut reported_error: Option<io::Error> = None;
     for account in &mut file.accounts {
         if ProviderKind::parse(&account.provider) != Some(ProviderKind::Codex) {
             continue;
@@ -111,24 +131,40 @@ pub(crate) fn migrate(home: &Path, state: Option<&Path>) -> io::Result<()> {
         if !source.is_dir() {
             continue;
         }
-        let target = if source.starts_with(profiles::managed_root(home).join("codex")) {
+        let result = if source.starts_with(profiles::managed_root(home).join("codex")) {
             profiles::try_migrate_long_codex_profile(
                 home,
                 account.id.strip_prefix("codex-").unwrap_or(&account.id),
                 source,
-            )?
+            )
         } else {
-            prepare(home, source)?
+            prepare(home, source)
         };
-        if target != source {
-            account.profile_dir = target.display().to_string();
-            changed = true;
+        match result {
+            Ok(target) => {
+                if target != source {
+                    account.profile_dir = target.display().to_string();
+                    changed = true;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    kind = ?error.kind(),
+                    account = %super::redacted_account_id(&account.id),
+                    "Codex profile migration skipped for account"
+                );
+                if only_error_for.is_none_or(|target| target == account.id)
+                    && reported_error.is_none()
+                {
+                    reported_error = Some(error);
+                }
+            }
         }
     }
     if changed {
         save_inner(home, state, &file)?;
     }
-    Ok(())
+    reported_error.map_or(Ok(()), Err)
 }
 
 #[cfg(all(test, unix))]
@@ -216,5 +252,67 @@ mod registration_regressions {
             b"private rules"
         );
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn migrate_isolates_per_account_errors_saves_succeeded_and_switch_ignores_unrelated_failure() {
+        let home = std::env::temp_dir().join(format!("r2d12-codex-isolate-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let src_ok =
+            profiles::managed_root(&home).join("codex/ok-account-with-a-very-long-profile-home");
+        let src_bad =
+            profiles::managed_root(&home).join("codex/bad-account-with-a-very-long-profile-home");
+        std::fs::create_dir_all(&src_ok).unwrap();
+        std::fs::create_dir_all(&src_bad).unwrap();
+        std::fs::write(
+            src_ok.join("auth.json"),
+            r#"{"tokens":{"access_token":"ok"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src_bad.join("auth.json"),
+            r#"{"tokens":{"access_token":"bad"}}"#,
+        )
+        .unwrap();
+
+        let mut file = AccountsFile::default();
+        file.accounts.push(StoredAccount {
+            id: "codex-ok".into(),
+            provider: "codex".into(),
+            label: "Ok".into(),
+            email: None,
+            profile_dir: src_ok.display().to_string(),
+        });
+        file.accounts.push(StoredAccount {
+            id: "codex-bad".into(),
+            provider: "codex".into(),
+            label: "Bad".into(),
+            email: None,
+            profile_dir: src_bad.display().to_string(),
+        });
+        let path = config_path(&home, None);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, toml::to_string(&file).unwrap()).unwrap();
+
+        // Pre-occupy only `codex-bad`'s short target directory so `codex-bad` fails AlreadyExists.
+        let target_ok = profiles::short_codex_profile_dir(&home, "ok");
+        let target_bad = profiles::short_codex_profile_dir(&home, "bad");
+        std::fs::create_dir_all(&target_bad).unwrap();
+
+        // Global migrate reports the error, yet STILL persists `codex-ok`'s migrated profile_dir!
+        assert!(migrate(&home, None).is_err());
+        let saved = load_file_result(&home, None).unwrap();
+        let ok_acc = saved.accounts.iter().find(|a| a.id == "codex-ok").unwrap();
+        let bad_acc = saved.accounts.iter().find(|a| a.id == "codex-bad").unwrap();
+        assert_eq!(ok_acc.profile_dir, target_ok.display().to_string());
+        assert_eq!(bad_acc.profile_dir, src_bad.display().to_string());
+
+        // Switching to codex-host or codex-ok must NOT be blocked by unrelated failing codex-bad.
+        crate::usage::accounts::switch_account(&home, None, ProviderKind::Codex, "codex-host")
+            .expect("unrelated failing codex profile must not block switching to codex-host");
+        crate::usage::accounts::switch_account(&home, None, ProviderKind::Codex, "codex-ok")
+            .expect("unrelated failing codex profile must not block switching to codex-ok");
+
+        std::fs::remove_dir_all(home).ok();
     }
 }

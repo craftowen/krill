@@ -308,6 +308,50 @@ fn needs_agy_ssh_mode_matches_case_insensitively_across_args() {
     ));
 }
 
+#[test]
+fn windows_command_dedupes_mixed_case_path_comspec_and_markers_last_wins() {
+    let exe = std::env::current_exe().unwrap();
+    let exe_dir = exe.parent().unwrap();
+    let exe_name = exe.file_name().unwrap();
+    let vars = vec![
+        (b"Path".to_vec(), b"/nonexistent-old-path".to_vec()),
+        (b"ComSpec".to_vec(), b"old-cmd.exe".to_vec()),
+        (b"COMSPEC".to_vec(), b"new-cmd.exe".to_vec()),
+        (b"Krill_Account_Provider".to_vec(), b"claude".to_vec()),
+        (b"KRILL_ACCOUNT_PROVIDER".to_vec(), b"codex".to_vec()),
+        (b"Krill_Account_Dir".to_vec(), b"/stale-dir".to_vec()),
+        (b"KRILL_ACCOUNT_DIR".to_vec(), b"/selected-codex".to_vec()),
+        (b"Codex_Home".to_vec(), b"/leaked-codex".to_vec()),
+        (b"OpenAI_Api_Key".to_vec(), b"sk-leaked".to_vec()),
+        (
+            b"PATH".to_vec(),
+            exe_dir.as_os_str().as_encoded_bytes().to_vec(),
+        ),
+    ];
+    let cmd = command(exe_name, vars).expect("must resolve executable from last-wins PATH");
+    assert_eq!(value(&cmd, "CODEX_HOME"), Some("/selected-codex".into()));
+    assert_eq!(value(&cmd, "OPENAI_API_KEY"), None);
+    assert_eq!(value(&cmd, "COMSPEC"), Some("new-cmd.exe".into()));
+    let path_entries: Vec<_> = cmd
+        .get_envs()
+        .filter(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .collect();
+    assert_eq!(
+        path_entries.len(),
+        1,
+        "duplicate PATH entries must be deduped"
+    );
+    let comspec_entries: Vec<_> = cmd
+        .get_envs()
+        .filter(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("COMSPEC"))
+        .collect();
+    assert_eq!(
+        comspec_entries.len(),
+        1,
+        "duplicate ComSpec entries must be deduped"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_pre_trust_rejects_drive_roots_and_avoids_verbatim_prefix() {

@@ -311,7 +311,7 @@ fn resume_and_session_id_roundtrip() {
         Some(sid.as_str())
     );
     let next = Settings::create(&tmp.0, &krill, SessionId(6), Some("2.1.299")).unwrap();
-    let next_path = next.path.clone();
+    let original_path = next.path.clone();
     let launch = next
         .resume(
             &profile(Path::new("claude")),
@@ -330,10 +330,90 @@ fn resume_and_session_id_roundtrip() {
         "{argv:?}"
     );
     assert!(!argv.iter().any(|a| a == "--session-id"), "{argv:?}");
+    assert_eq!(
+        session_id(&tmp.0, SessionId(6)),
+        None,
+        "resumed Claude session must never expose an uninjected random UUID from settings filename"
+    );
+    assert!(!original_path.exists());
+    let resume_settings_path = argv
+        .windows(2)
+        .find_map(|w| (w[0] == "--settings").then(|| PathBuf::from(w[1].as_ref())))
+        .expect("--settings flag");
+    assert!(
+        resume_settings_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("6-resume-"),
+        "expected 6-resume-<uuid>.json, got {resume_settings_path:?}"
+    );
+    assert!(resume_settings_path.is_file());
+    discard(&tmp.0, SessionId(6));
+    assert!(!resume_settings_path.exists());
+}
+
+#[test]
+fn create_for_resume_hides_uninjected_uuid_and_cleans_up_on_sweep() {
+    let tmp = Temp::new();
+    let krill = tmp.script("krill", "#!/bin/sh\nexit 0\n");
+    let resumed =
+        Settings::create_for_resume(&tmp.0, &krill, SessionId(18), Some("2.1.299")).unwrap();
+    let resume_path = resumed.path.clone();
+    assert!(
+        resume_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("18-resume-")
+    );
+    assert_eq!(session_id(&tmp.0, SessionId(18)), None);
+    let launch = resumed
+        .resume(
+            &profile(Path::new("claude")),
+            Permission::Manual,
+            tmp.login(),
+            Some("11111111-2222-4333-8444-555555555555"),
+        )
+        .unwrap();
     assert!(
         launch
             .argv
-            .contains(&next_path.as_os_str().as_bytes().to_vec())
+            .contains(&resume_path.as_os_str().as_bytes().to_vec())
+    );
+    assert_eq!(session_id(&tmp.0, SessionId(18)), None);
+    assert_eq!(sweep(&tmp.0, &[]), 1);
+    assert!(!resume_path.exists());
+}
+
+#[test]
+fn probe_rejects_nonzero_exit_after_stdout_eof_and_never_runs_fallback_shell() {
+    let tmp = Temp::new();
+    let marker = tmp.0.join("fallback-ran");
+    let fake_shell = tmp.script(
+        "fake-shell",
+        &format!("#!/bin/sh\nif [ \"$1\" = -l ] && [ \"$#\" = 1 ]; then echo ran > '{}'; exit 0; fi\nexec /bin/sh \"$@\"\n", marker.display()),
+    );
+    // Prints valid version, closes stdout immediately so reader hits EOF, delays 60ms, then exits 1.
+    let failing = tmp.script(
+        "claude",
+        "#!/bin/sh\nprintf '2.1.299 (Claude Code)\\n'\nexec 1>&-\nsleep 0.06\nexit 1\n",
+    );
+    let mut login = tmp.login();
+    login.env.push((
+        b"SHELL".to_vec(),
+        fake_shell.as_os_str().as_bytes().to_vec(),
+    ));
+    let version = probe_now_with_timeout(&profile(&failing), &login, Duration::from_secs(2));
+    assert_eq!(
+        version, None,
+        "non-zero exit after stdout EOF must not be accepted as a valid probe"
+    );
+    assert!(
+        !marker.exists(),
+        "version probe must not spawn PREFLIGHT fallback login shell"
     );
 }
 

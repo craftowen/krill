@@ -321,6 +321,14 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
 }
 
 fn provision_opencode(home: &Path, profile: &Path) -> io::Result<Report> {
+    provision_opencode_with(home, profile, crate::os::symlink)
+}
+
+fn provision_opencode_with(
+    home: &Path,
+    profile: &Path,
+    mut symlink_fn: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Report> {
     let mut report = Report::default();
     let host_data = home.join(".local/share/opencode");
     if !host_data.is_dir() {
@@ -348,23 +356,7 @@ fn provision_opencode(home: &Path, profile: &Path) -> io::Result<Report> {
             continue;
         }
         let dst = prof_data.join(name);
-        match dst.symlink_metadata() {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                if std::fs::read_link(&dst)? != src {
-                    report.conflicts.push(name);
-                }
-                continue;
-            }
-            Ok(meta) if meta.is_dir() && std::fs::remove_dir(&dst).is_ok() => {}
-            Ok(_) => {
-                report.conflicts.push(name);
-                continue;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        crate::os::symlink(&src, &dst)?;
-        report.changed.push(name);
+        link_with(&src, &dst, name, &mut report, &mut symlink_fn)?;
     }
     Ok(report)
 }
@@ -537,7 +529,6 @@ fn publish_mcp(dst: &Path, bytes: &[u8], original: Option<&[u8]>) -> io::Result<
 
 /// 없으면 링크, 빈 폴더면 링크로 바꾼다(기존 빈 프로필 이전). 같은 링크면 그대로, 그 밖은 충돌.
 /// 링크 미지원 환경(`Unsupported`, 예: Windows)은 무시해 뒤이은 파일 복사·MCP 병합을 계속한다.
-#[cfg(any(not(unix), test))]
 fn link_with(
     src: &Path,
     dst: &Path,

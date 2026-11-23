@@ -122,3 +122,50 @@ fn discover_resolves_repo_linked_worktree_and_non_repo_without_spawning_git() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn repo_hook_config_matches_windows_verbatim_slash_and_case_variants() {
+    let root = std::env::temp_dir().join(format!("r2d17-compat-win-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+
+    fs::write(
+        root.join("projects.toml"),
+        r#"
+[[projects]]
+path = 'C:\Users\Owen\MyRepo'
+worktree_base_path = 'C:\Users\Owen\worktrees'
+hook_mode = "override"
+setup_script = "echo setup"
+symlink_paths = [".env"]
+
+[[projects]]
+path = '\\server\share\SharedRepo'
+hook_mode = "override"
+setup_script = "echo unc"
+"#,
+    )
+    .unwrap();
+
+    for variant in [
+        "C:/Users/Owen/MyRepo",
+        r"\\?\C:\Users\Owen\MyRepo",
+        r"c:\users\owen\myrepo\",
+        "c:/users/owen/myrepo/",
+    ] {
+        let cfg = repo_hook_config(Path::new(variant), Some(&root))
+            .unwrap_or_else(|| panic!("expected projects.toml match for {variant:?}"));
+        assert_eq!(cfg.setup_script.as_deref(), Some("echo setup"));
+        assert_eq!(cfg.hook_mode.as_deref(), Some("override"));
+        assert_eq!(cfg.symlink_paths, vec![".env".to_owned()]);
+    }
+
+    let unc_cfg = repo_hook_config(Path::new(r"\\?\UNC\server\share\SharedRepo"), Some(&root))
+        .expect("verbatim UNC path must match ordinary UNC path");
+    assert_eq!(unc_cfg.setup_script.as_deref(), Some("echo unc"));
+
+    // Unix paths remain case-sensitive.
+    assert!(!project_paths_match("/tmp/MyRepo", "/tmp/myrepo"));
+
+    fs::remove_dir_all(root).ok();
+}

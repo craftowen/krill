@@ -27,6 +27,30 @@ const SCAN_TIME: Duration = Duration::from_secs(3);
 const SNIPPET_CHARS: usize = 140;
 const TITLE_CHARS: usize = 120;
 const MAX_CACHE_ENTRIES: usize = 2048;
+/// Cumulative serialized byte budget for `SearchSnapshot`, staying well below
+/// `krill_proto::ipc::MAX_FRAME` (1 MiB) so large search results truncate instead of `EMSGSIZE`.
+const MAX_SEARCH_RESPONSE_BYTES: usize = 768 * 1024;
+
+fn clamp_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or_default().to_owned()
+}
+
+fn estimated_vault_hit_wire_bytes(hit: &VaultHit) -> usize {
+    hit.id.len()
+        + hit.cwd.len()
+        + hit.title.len()
+        + hit.summary.len()
+        + hit.snippet.len()
+        + hit.role.len()
+        + 64
+}
 
 #[derive(Debug, Clone)]
 struct CachedVaultDoc {
@@ -535,11 +559,21 @@ fn search_in_with_budget(
     } else {
         usize::from(query.limit).min(MAX_ENTRIES)
     };
-    let truncated = indexer.truncated || hits.len() > limit;
-    hits.truncate(limit);
+    let mut truncated = indexer.truncated || hits.len() > limit;
+    let mut kept = Vec::with_capacity(hits.len().min(limit));
+    let mut used_bytes = 0usize;
+    for hit in hits.into_iter().take(limit) {
+        let size = estimated_vault_hit_wire_bytes(&hit);
+        if !kept.is_empty() && used_bytes.saturating_add(size) > MAX_SEARCH_RESPONSE_BYTES {
+            truncated = true;
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(size);
+        kept.push(hit);
+    }
 
     SearchSnapshot {
-        hits,
+        hits: kept,
         truncated,
         skipped: indexer.skipped,
     }
@@ -720,7 +754,10 @@ impl ParsedQuery {
         }
 
         let (role, snippet) = if let Some((r, text, _)) = best_msg {
-            (r.to_owned(), extract_snippet(text, &self.terms))
+            (
+                clamp_utf8_bytes(r, MAX_TEXT),
+                extract_snippet(text, &self.terms),
+            )
         } else if summary_hits > 0 {
             (
                 "summary".to_owned(),
@@ -737,8 +774,8 @@ impl ParsedQuery {
 
         Some(VaultHit {
             agent: doc.agent,
-            id: doc.id,
-            cwd: doc.cwd,
+            id: clamp_utf8_bytes(&doc.id, MAX_TEXT),
+            cwd: clamp_utf8_bytes(&doc.cwd, MAX_TEXT),
             modified: doc.modified,
             title: truncate_chars(&one_line(&title), TITLE_CHARS),
             summary: truncate_chars(&one_line(&doc.summary), SNIPPET_CHARS),
@@ -4345,6 +4382,104 @@ mod sweep_regressions {
                 "forbidden content indexed in vault: {forbidden}"
             );
         }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vault_search_clamps_oversized_role_and_caps_response_under_max_frame() {
+        use krill_proto::agent_history::Response;
+        use krill_proto::control::Reply;
+        use krill_proto::screen::Msg as _;
+
+        let root = std::env::temp_dir().join(format!("r2d14-vault-budget-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let proj = root.join("claude/projects/huge-proj");
+        let oc_proj = root.join("opencode/storage/session/proj-role");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&oc_proj).unwrap();
+
+        // 1. Oversized multibyte UTF-8 role (> 4096 bytes) must clamp on a valid UTF-8 boundary.
+        let huge_role = "역할".repeat(1000); // 6000 bytes
+        assert!(huge_role.len() > MAX_TEXT);
+        let role_file = oc_proj.join("ses-huge-role.json");
+        fs::write(
+            &role_file,
+            serde_json::json!({
+                "id": "ses-huge-role",
+                "directory": "/tmp/huge-role-proj",
+                "messages": [{
+                    "id": "msg-huge-role",
+                    "role": huge_role,
+                    "content": "FIND_R2D14_ROLE_NEEDLE"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let roots = VaultRoots {
+            claude: vec![root.join("claude")],
+            opencode: vec![root.join("opencode")],
+            ..VaultRoots::default()
+        };
+        let role_snap = search_in(
+            &roots,
+            &SearchQuery {
+                query: "FIND_R2D14_ROLE_NEEDLE".into(),
+                ..SearchQuery::default()
+            },
+        );
+        assert_eq!(role_snap.hits.len(), 1);
+        assert!(role_snap.hits[0].role.len() <= MAX_TEXT);
+        assert!(role_snap.hits[0].role.starts_with("역할"));
+        let wire = Reply::AgentHistory(Response::Searched(role_snap))
+            .encode()
+            .expect("encode clamped role");
+        assert!(
+            Reply::decode(wire[4], wire.get(5..).unwrap()).is_ok(),
+            "client decode must succeed"
+        );
+
+        // 2. 100 hits with ~11 KiB each (> 1 MiB) must cap under ipc::MAX_FRAME and set truncated.
+        let long_cwd = format!("/tmp/{}", "d".repeat(3800));
+        let long_title = "가".repeat(120); // 360 B
+        let long_role = "r".repeat(3800);
+        let long_text = format!("FIND_R2D14_BULK {}", "한".repeat(400));
+        for i in 0..100 {
+            let p = oc_proj.join(format!("ses-bulk-{i:03}.json"));
+            let body = serde_json::json!({
+                "id": format!("ses-bulk-{i:03}-{}", "i".repeat(3000)),
+                "directory": long_cwd,
+                "title": long_title,
+                "messages": [{
+                    "id": format!("msg-bulk-{i:03}"),
+                    "role": long_role,
+                    "content": long_text
+                }]
+            })
+            .to_string();
+            fs::write(&p, body).unwrap();
+        }
+        let bulk_snap = search_in(
+            &roots,
+            &SearchQuery {
+                query: "FIND_R2D14_BULK".into(),
+                limit: 100,
+                ..SearchQuery::default()
+            },
+        );
+        assert!(!bulk_snap.hits.is_empty());
+        assert!(bulk_snap.hits.len() < 100, "byte budget must cap hit count");
+        assert!(
+            bulk_snap.truncated,
+            "capped SearchSnapshot must set truncated=true"
+        );
+        let bulk_wire = Reply::AgentHistory(Response::Searched(bulk_snap))
+            .encode()
+            .expect("SearchSnapshot must fit under ipc::MAX_FRAME");
+        assert!(bulk_wire.len() < krill_proto::ipc::MAX_FRAME);
+        assert!(Reply::decode(bulk_wire[4], bulk_wire.get(5..).unwrap()).is_ok());
 
         fs::remove_dir_all(&root).ok();
     }

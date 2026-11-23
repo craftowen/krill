@@ -1720,9 +1720,14 @@ fn orchestration_ipc_wakes_check_messages_and_enforces_worker_depth() {
         elapsed < Duration::from_secs(2),
         "condvar wakeup took too long: {elapsed:?}"
     );
-    let Reply::Orchestration(OrchResponse::Messages(msgs)) = wait_reply else {
-        panic!("expected Messages response");
+    let Reply::Orchestration(OrchResponse::Delivery {
+        delivery: Some(delivery),
+        messages: msgs,
+    }) = wait_reply
+    else {
+        panic!("expected Delivery response with acked batch, got {wait_reply:?}");
     };
+    assert!(delivery.acked);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].summary, "done");
 
@@ -4249,4 +4254,192 @@ fn discover_hook_identity_skips_exited_sessions_without_resurrecting_binding() {
     assert_eq!(stored.transcript_path, None);
     drop(reg);
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_messages_v2_all_ack_returns_delivery_for_newly_acked_and_messages_for_history() {
+    use krill_proto::orchestration::{
+        MessageType, OrchAction, OrchResponse, OrchestrationStore, SendParams,
+    };
+
+    let dir = std::env::temp_dir().join(format!("krill-r2d02-all-ack-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let run = OrchestrationStore::mutate(&dir, |s| s.create_run("r2d02", None)).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+
+    let Reply::Orchestration(OrchResponse::Dispatch(disp1)) = reg
+        .orchestration(
+            &peer,
+            OrchAction::StartWorker {
+                run_id: run.id.clone(),
+                task_id: None,
+                worker_name: "worker-1".into(),
+                agent: "claude".into(),
+                session_id: Some(101),
+                cwd: "/tmp".into(),
+                prompt: "work-1".into(),
+                depth: 1,
+                max_depth: 2,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected Dispatch response for worker-1");
+    };
+    let Reply::Orchestration(OrchResponse::Dispatch(disp2)) = reg
+        .orchestration(
+            &peer,
+            OrchAction::StartWorker {
+                run_id: run.id.clone(),
+                task_id: None,
+                worker_name: "worker-2".into(),
+                agent: "claude".into(),
+                session_id: Some(102),
+                cwd: "/tmp".into(),
+                prompt: "work-2".into(),
+                depth: 1,
+                max_depth: 2,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("expected Dispatch response for worker-2");
+    };
+
+    let sent = reg
+        .orchestration(
+            &peer,
+            OrchAction::SendMessage(SendParams {
+                from: "worker-1".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                task_id: None,
+                dispatch_id: Some(disp1.id),
+                run_id: Some(run.id.clone()),
+                summary: "finished".into(),
+                body: "ok".into(),
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(sent, Reply::Orchestration(OrchResponse::Messages(ref m)) if m.len() == 1),
+        "expected SendMessage to succeed, got {sent:?}"
+    );
+
+    // First --all --ack acknowledges the unread message and must preserve Some(delivery).
+    let first = reg
+        .orchestration(
+            &peer,
+            OrchAction::CheckMessages {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: false,
+                ack: true,
+                wait_ms: 0,
+                run_id: None,
+                delivery_id: None,
+            },
+        )
+        .unwrap();
+    let Reply::Orchestration(OrchResponse::Delivery {
+        delivery: Some(delivery),
+        messages,
+    }) = first
+    else {
+        panic!("expected Delivery with Some(delivery) for newly acked --all --ack, got {first:?}");
+    };
+    assert!(delivery.acked);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].summary, "finished");
+
+    // Second --all --ack returns only already-acked history (delivery = None) as Messages.
+    let second = reg
+        .orchestration(
+            &peer,
+            OrchAction::CheckMessages {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: false,
+                ack: true,
+                wait_ms: 0,
+                run_id: None,
+                delivery_id: None,
+            },
+        )
+        .unwrap();
+    let Reply::Orchestration(OrchResponse::Messages(history)) = second else {
+        panic!("expected Messages for already-acked history with delivery=None, got {second:?}");
+    };
+    assert_eq!(history.len(), 1);
+
+    // Legacy CheckMessagesLegacy always returns Messages even when unread mail is delivered.
+    let legacy_sent = reg
+        .orchestration(
+            &peer,
+            OrchAction::SendMessage(SendParams {
+                from: "worker-2".into(),
+                to: "coordinator".into(),
+                msg_type: MessageType::WorkerDone,
+                task_id: None,
+                dispatch_id: Some(disp2.id),
+                run_id: Some(run.id),
+                summary: "legacy".into(),
+                body: "ok".into(),
+                outcome: Some("succeeded".into()),
+                reply_to: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(legacy_sent, Reply::Orchestration(OrchResponse::Messages(ref m)) if m.len() == 1),
+        "expected legacy SendMessage to succeed, got {legacy_sent:?}"
+    );
+    let legacy = reg
+        .orchestration(
+            &peer,
+            OrchAction::CheckMessagesLegacy {
+                recipient: Some("coordinator".into()),
+                types: vec![],
+                unread_only: true,
+                ack: true,
+                wait_ms: 0,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        legacy,
+        Reply::Orchestration(OrchResponse::Messages(ref m)) if m.len() == 1
+    ));
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn strip_bracketed_paste_end_removes_nested_escape_sequences_to_fixed_point() {
+    for payload in [
+        b"hello \x1b[201~world".as_slice(),
+        b"\x1b[\x1b[201~201~\r/cmd",
+        b"\x1b[\x1b[\x1b[201~201~201~injected",
+        b"a\x1b[2\x1b[201~01~b",
+    ] {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"\x1b[200~");
+        Registry::strip_bracketed_paste_end(payload, &mut framed);
+        let body = &framed[6..];
+        assert!(
+            !body.windows(6).any(|w| w == b"\x1b[201~"),
+            "stripped paste body still contains ESC[201~: {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    let mut nested = Vec::new();
+    Registry::strip_bracketed_paste_end(b"\x1b[\x1b[201~201~\r/cmd", &mut nested);
+    assert_eq!(nested, b"\r/cmd");
 }

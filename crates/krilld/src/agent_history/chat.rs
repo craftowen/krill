@@ -33,6 +33,39 @@ use super::vault::{
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
 const MAX_POLL_BYTES: u64 = 512 * 1024;
 const MAX_SKIP_BYTES: u64 = 64 * 1024 * 1024;
+/// Cumulative serialized byte budget for one `ChatPollSnapshot` page, staying well below
+/// `krill_proto::ipc::MAX_FRAME` (1 MiB) so large histories paginate instead of hitting `EMSGSIZE`.
+const MAX_CHAT_RESPONSE_BYTES: usize = 512 * 1024;
+
+fn estimated_chat_item_wire_bytes(item: &ChatItem) -> usize {
+    let options_bytes: usize = item
+        .options
+        .iter()
+        .map(|opt| opt.label.len() + opt.description.len() + 8)
+        .sum();
+    item.text.len()
+        + item.title.len()
+        + item.tool_name.len()
+        + item.tool_id.len()
+        + item.file_path.len()
+        + options_bytes
+        + 48
+}
+
+fn cap_single_record_items(items: &mut Vec<ChatItem>, max_bytes: usize) -> usize {
+    let mut used = 0usize;
+    let mut keep = 0usize;
+    for item in items.iter() {
+        let size = estimated_chat_item_wire_bytes(item);
+        if keep > 0 && used.saturating_add(size) > max_bytes {
+            break;
+        }
+        used = used.saturating_add(size);
+        keep += 1;
+    }
+    items.truncate(keep);
+    used
+}
 // OpenCode JSON end fingerprints and SQLite proof tokens fit JS-safe integers.
 // Tokens are opaque: only byte/raw-row cursors have numeric ordering.
 const OPENCODE_END: u64 = 1 << 52;
@@ -278,7 +311,21 @@ pub(crate) fn latest_page(
                 .unwrap_or(usize::MAX)
                 .min(page.items.len())
         });
-        let start = end.saturating_sub(MAX_CHAT_ITEMS);
+        let mut start = end;
+        let mut used_bytes = 0usize;
+        let mut count = 0usize;
+        while start > 0 && count < MAX_CHAT_ITEMS {
+            let Some(item) = page.items.get(start - 1) else {
+                break;
+            };
+            let item_bytes = estimated_chat_item_wire_bytes(item);
+            if count > 0 && used_bytes.saturating_add(item_bytes) > MAX_CHAT_RESPONSE_BYTES {
+                break;
+            }
+            used_bytes = used_bytes.saturating_add(item_bytes);
+            count += 1;
+            start -= 1;
+        }
         page.items = page.items.get(start..end).unwrap_or_default().to_vec();
         if before.is_some() {
             page.next_offset = u64::try_from(end).unwrap_or(0);
@@ -401,6 +448,7 @@ fn poll_transcript_file_until(
     let mut line = Vec::new();
     let mut consumed = start_offset;
     let mut batch_bytes = 0_u64;
+    let mut page_bytes = 0_usize;
     let mut items: Vec<ChatItem> = Vec::new();
     let mut previous_codex_record = None;
     let max_line = usize::try_from(MAX_POLL_BYTES).unwrap_or(512 * 1024);
@@ -525,15 +573,21 @@ fn poll_transcript_file_until(
         } else {
             previous_codex_record = codex_record;
         }
+        let mut line_bytes: usize = line_items.iter().map(estimated_chat_item_wire_bytes).sum();
         if !line_items.is_empty()
             && !items.is_empty()
-            && items.len().saturating_add(line_items.len()) > MAX_CHAT_ITEMS
+            && (items.len().saturating_add(line_items.len()) > MAX_CHAT_ITEMS
+                || page_bytes.saturating_add(line_bytes) > MAX_CHAT_RESPONSE_BYTES)
         {
             break;
         }
+        if items.is_empty() && line_bytes > MAX_CHAT_RESPONSE_BYTES {
+            line_bytes = cap_single_record_items(&mut line_items, MAX_CHAT_RESPONSE_BYTES);
+        }
         consumed = consumed.saturating_add(n_u64);
+        page_bytes = page_bytes.saturating_add(line_bytes);
         items.extend(line_items);
-        if items.len() > MAX_CHAT_ITEMS {
+        if items.len() > MAX_CHAT_ITEMS || page_bytes >= MAX_CHAT_RESPONSE_BYTES {
             break;
         }
     }
@@ -610,12 +664,25 @@ fn poll_opencode_session(
     let requested = usize::try_from(offset).unwrap_or(usize::MAX);
     let reset = stale || requested > total;
     let start = if reset { 0 } else { requested };
-    let end = limit
+    let slice_limit = limit
         .filter(|n| *n < OPENCODE_END)
         .map_or(total, |n| {
             usize::try_from(n).unwrap_or(usize::MAX).min(total)
         })
         .min(start.saturating_add(MAX_CHAT_ITEMS));
+    let mut end = start;
+    let mut used_bytes = 0usize;
+    while end < slice_limit {
+        let Some(item) = page.items.get(end) else {
+            break;
+        };
+        let item_bytes = estimated_chat_item_wire_bytes(item);
+        if end > start && used_bytes.saturating_add(item_bytes) > MAX_CHAT_RESPONSE_BYTES {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(item_bytes);
+        end += 1;
+    }
     page.items = page.items.get(start..end).unwrap_or_default().to_vec();
     page.next_offset = if end < total || limit.is_some_and(|n| n < OPENCODE_END) {
         u64::try_from(end).unwrap_or(0)
@@ -784,24 +851,34 @@ fn poll_opencode_database(
         .unwrap_or(total)
         .min(total);
     let mut remaining = MAX_SKIP_BYTES;
+    let mut page_bytes = 0usize;
     let mut digest = session.prefix_digest;
     for (record, proof) in session.messages.into_iter().zip(session.message_digests) {
         if consumed >= end {
             break;
         }
         let mut items = Vec::new();
-        parse_opencode_message_record(&record, None, &mut items, &mut remaining);
-        // Keep whole messages on either side of the page boundary, just as latest
-        // and byte-backed pages do. A single large message may exceed the soft cap.
+        parse_opencode_message_record(&record, None, &mut items, &mut remaining, None);
+        let mut record_bytes: usize = items.iter().map(estimated_chat_item_wire_bytes).sum();
+        // Keep whole messages on either side of the page boundary while staying within
+        // both the item count and IPC wire-frame byte budgets.
         if !items.is_empty()
             && !page.items.is_empty()
-            && page.items.len().saturating_add(items.len()) > MAX_CHAT_ITEMS
+            && (page.items.len().saturating_add(items.len()) > MAX_CHAT_ITEMS
+                || page_bytes.saturating_add(record_bytes) > MAX_CHAT_RESPONSE_BYTES)
         {
             break;
         }
+        if page.items.is_empty() && record_bytes > MAX_CHAT_RESPONSE_BYTES {
+            record_bytes = cap_single_record_items(&mut items, MAX_CHAT_RESPONSE_BYTES);
+        }
+        page_bytes = page_bytes.saturating_add(record_bytes);
         page.items.extend(items);
         consumed = consumed.saturating_add(1);
         digest = proof;
+        if page_bytes >= MAX_CHAT_RESPONSE_BYTES {
+            break;
+        }
     }
     page.next_offset = if limit.is_some() && consumed == end {
         // A verified historical boundary is immutable, even if it used to be the
@@ -874,6 +951,7 @@ fn latest_opencode_database(
     let take = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
     let mut records = Vec::new();
     let mut count = 0usize;
+    let mut page_bytes = 0usize;
     let mut remaining = MAX_SKIP_BYTES;
     for record in session
         .messages
@@ -884,13 +962,21 @@ fn latest_opencode_database(
         .rev()
     {
         let mut items = Vec::new();
-        parse_opencode_message_record(&record, None, &mut items, &mut remaining);
-        if count > 0 && count.saturating_add(items.len()) > MAX_CHAT_ITEMS {
+        parse_opencode_message_record(&record, None, &mut items, &mut remaining, None);
+        let mut record_bytes: usize = items.iter().map(estimated_chat_item_wire_bytes).sum();
+        if count > 0
+            && (count.saturating_add(items.len()) > MAX_CHAT_ITEMS
+                || page_bytes.saturating_add(record_bytes) > MAX_CHAT_RESPONSE_BYTES)
+        {
             break;
         }
+        if count == 0 && record_bytes > MAX_CHAT_RESPONSE_BYTES {
+            record_bytes = cap_single_record_items(&mut items, MAX_CHAT_RESPONSE_BYTES);
+        }
         count = count.saturating_add(items.len());
+        page_bytes = page_bytes.saturating_add(record_bytes);
         records.push(items);
-        if count >= MAX_CHAT_ITEMS {
+        if count >= MAX_CHAT_ITEMS || page_bytes >= MAX_CHAT_RESPONSE_BYTES {
             break;
         }
     }
@@ -939,27 +1025,29 @@ fn load_opencode_session(agent: &str, sid: &str, path: &Path, path_str: &str) ->
     crate::agent::control::cache::stamp(path).hash(&mut fingerprint);
     // The session document is bounded individually; external messages share a 64 MiB budget.
     remaining = MAX_SKIP_BYTES;
-    parse_opencode_value(&embedded, storage_root, &mut page.items, &mut remaining);
+    parse_opencode_value(
+        &embedded,
+        storage_root,
+        &mut page.items,
+        &mut remaining,
+        Some(&mut fingerprint),
+    );
     if let Some(root) = storage_root
         && crate::agent::control::valid_session_id(&page.session_id)
     {
         for message in sorted_json_files(&root.join("message").join(&page.session_id)) {
             message.hash(&mut fingerprint);
             crate::agent::control::cache::stamp(&message).hash(&mut fingerprint);
-            if let Some(id) = message
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .filter(|id| crate::agent::control::valid_session_id(id))
-            {
-                for part in sorted_json_files(&root.join("part").join(id)) {
-                    part.hash(&mut fingerprint);
-                    crate::agent::control::cache::stamp(&part).hash(&mut fingerprint);
-                }
-            }
             let Ok(value) = read_json_bounded(&message, &mut remaining) else {
                 return page;
             };
-            parse_opencode_message_record(&value, storage_root, &mut page.items, &mut remaining);
+            parse_opencode_message_record(
+                &value,
+                storage_root,
+                &mut page.items,
+                &mut remaining,
+                Some(&mut fingerprint),
+            );
         }
     }
     if remaining == 0 {
@@ -1606,20 +1694,45 @@ fn find_newest_transcript_by_cwd(
                 }
             }
             for base in opencode_candidate_bases(root) {
-                if let Ok(files) = fs::read_dir(&base) {
-                    for file in files.take(128).flatten() {
-                        if !budget.take() {
-                            break;
-                        }
-                        let p = file.path();
-                        if p.extension().is_some_and(|e| e == "jsonl" || e == "json")
-                            && let Some(mtime) = file_mtime(&p)
-                            && best.as_ref().is_none_or(|b| mtime > b.0)
-                            && let Some((sid, file_cwd)) = peek_jsonl_id_and_cwd(&p)
-                            && cwds_match(norm_cwd, &file_cwd)
-                            && filter.allows(&p, &sid)
-                        {
-                            best = Some((mtime, p, sid));
+                if !fs::symlink_metadata(&base)
+                    .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.file_type().is_dir())
+                {
+                    continue;
+                }
+                let Ok(entries) = fs::read_dir(&base) else {
+                    continue;
+                };
+                for entry in entries.take(256).flatten() {
+                    if !budget.take() {
+                        break;
+                    }
+                    let Ok(ft) = entry.file_type() else {
+                        continue;
+                    };
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                    let p = entry.path();
+                    if ft.is_file() {
+                        consider_opencode_session_file(&p, norm_cwd, filter, &mut best);
+                    } else if ft.is_dir()
+                        && let Ok(nested) = fs::read_dir(&p)
+                    {
+                        for child in nested.take(128).flatten() {
+                            if !budget.take() {
+                                break;
+                            }
+                            if child
+                                .file_type()
+                                .is_ok_and(|kind| !kind.is_symlink() && kind.is_file())
+                            {
+                                consider_opencode_session_file(
+                                    &child.path(),
+                                    norm_cwd,
+                                    filter,
+                                    &mut best,
+                                );
+                            }
                         }
                     }
                 }
@@ -1839,6 +1952,70 @@ fn peek_agy_transcript_cwd(path: &Path, by_display: &BTreeMap<String, String>) -
     None
 }
 
+fn consider_opencode_session_file(
+    p: &Path,
+    norm_cwd: &str,
+    filter: &CwdFallbackFilter<'_>,
+    best: &mut Option<(u64, PathBuf, String)>,
+) {
+    if p.extension().is_some_and(|e| e == "jsonl" || e == "json")
+        && let Some(mtime) = file_mtime(p)
+        && best.as_ref().is_none_or(|b| mtime > b.0)
+        && let Some((sid, file_cwd)) = peek_opencode_session_id_and_cwd(p)
+        && cwds_match(norm_cwd, &file_cwd)
+        && filter.allows(p, &sid)
+    {
+        *best = Some((mtime, p.to_path_buf(), sid));
+    }
+}
+
+fn peek_opencode_session_id_and_cwd(path: &Path) -> Option<(String, String)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return None;
+    }
+    if path.extension().is_some_and(|e| e == "json") {
+        let mut remaining = MAX_POLL_BYTES;
+        if let Ok(v) = read_json_bounded(path, &mut remaining)
+            && v.is_object()
+        {
+            if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            let sid = v
+                .get("sessionId")
+                .or_else(|| v.get("conversationId"))
+                .or_else(|| v.get("id"))
+                .or_else(|| v.get("payload").and_then(|p| p.get("id")))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map_or_else(
+                    || {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_owned()
+                    },
+                    str::to_owned,
+                );
+            let cwd = v
+                .get("cwd")
+                .or_else(|| v.get("directory"))
+                .or_else(|| v.get("workspace"))
+                .or_else(|| v.get("path"))
+                .or_else(|| v.get("project").and_then(|p| p.get("worktree")))
+                .or_else(|| v.get("payload").and_then(|p| p.get("cwd")))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)?;
+            return Some((sid, cwd));
+        }
+    }
+    peek_jsonl_id_and_cwd(path)
+}
+
 fn peek_jsonl_id_and_cwd(path: &Path) -> Option<(String, String)> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::with_capacity(8192, file.take(256 * 1024));
@@ -1921,7 +2098,7 @@ fn parse_line_into_items(agent: VaultAgent, v: &Value, out: &mut Vec<ChatItem>) 
         VaultAgent::Agy => parse_agy_line(v, out),
         VaultAgent::OpenCode => {
             let mut remaining = MAX_POLL_BYTES;
-            parse_opencode_value(v, None, out, &mut remaining);
+            parse_opencode_value(v, None, out, &mut remaining, None);
         }
     }
     for item in out
@@ -2307,15 +2484,22 @@ fn parse_opencode_value(
     storage_root: Option<&Path>,
     out: &mut Vec<ChatItem>,
     remaining: &mut u64,
+    mut fingerprint: Option<&mut std::collections::hash_map::DefaultHasher>,
 ) {
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         for item in arr {
-            parse_opencode_message_record(item, storage_root, out, remaining);
+            parse_opencode_message_record(
+                item,
+                storage_root,
+                out,
+                remaining,
+                fingerprint.as_deref_mut(),
+            );
         }
         return;
     }
     if v.get("role").is_some() || v.get("parts").is_some() || v.get("content").is_some() {
-        parse_opencode_message_record(v, storage_root, out, remaining);
+        parse_opencode_message_record(v, storage_root, out, remaining, fingerprint);
     }
 }
 
@@ -2324,6 +2508,7 @@ fn parse_opencode_message_record(
     storage_root: Option<&Path>,
     out: &mut Vec<ChatItem>,
     remaining: &mut u64,
+    fingerprint: Option<&mut std::collections::hash_map::DefaultHasher>,
 ) {
     let role = v.get("role").and_then(Value::as_str).unwrap_or("user");
     if role == "developer" || role == "system" {
@@ -2343,7 +2528,16 @@ fn parse_opencode_message_record(
     if let (Some(sr), Some(msg_id)) = (storage_root, v.get("id").and_then(Value::as_str))
         && crate::agent::control::valid_session_id(msg_id)
     {
-        for pf in sorted_json_files(&sr.join("part").join(msg_id)) {
+        let part_files = sorted_json_files(&sr.join("part").join(msg_id));
+        if let Some(fp) = fingerprint {
+            msg_id.hash(fp);
+            part_files.len().hash(fp);
+            for pf in &part_files {
+                pf.hash(fp);
+                crate::agent::control::cache::stamp(pf).hash(fp);
+            }
+        }
+        for pf in part_files {
             if let Ok(pv) = read_json_bounded(&pf, remaining) {
                 parse_opencode_part(default_kind, &pv, out);
             }
@@ -4658,6 +4852,315 @@ mod performance_tests {
             filter.allows(&transcript, "conv-1"),
             "atomic metadata rewrite must not advance min_birth_secs past transcript birth"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn opencode_json_and_sqlite_pages_respect_ipc_frame_byte_budget() {
+        use krill_proto::agent_history::Response;
+        use krill_proto::control::Reply;
+        use krill_proto::screen::Msg as _;
+
+        let root = std::env::temp_dir().join(format!("r2d06-oc-budget-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let storage = root.join("opencode/storage");
+        let sess_dir = storage.join("session/proj-a");
+        let msg_dir = storage.join("message/ses_big");
+        fs::create_dir_all(&sess_dir).unwrap();
+        fs::create_dir_all(&msg_dir).unwrap();
+        let json_path = sess_dir.join("ses_big.json");
+
+        // 100 external message files x ~15 KiB = ~1.5 MiB (> ipc::MAX_FRAME = 1 MiB)
+        let big_text = "A".repeat(15_000);
+        fs::write(
+            &json_path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "ses_big",
+                "directory": "/tmp/big-proj"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for i in 0..100 {
+            fs::write(
+                msg_dir.join(format!("msg-{i:03}.json")),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": format!("msg-{i:03}"),
+                    "role": if i % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("item-{i:03}-{big_text}")
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let mut collected = Vec::new();
+        let mut offset = 0u64;
+        let mut pages = 0usize;
+        loop {
+            let page = poll_transcript_file(VaultAgent::OpenCode, "ses_big", &json_path, offset);
+            assert!(page.bound);
+            let encoded = Reply::AgentHistory(Response::ChatPolled(page.clone()))
+                .encode()
+                .expect("OpenCode JSON page must encode under ipc::MAX_FRAME");
+            assert!(encoded.len() < krill_proto::ipc::MAX_FRAME);
+            pages += 1;
+            collected.extend(page.items);
+            if page.next_offset >= OPENCODE_END {
+                break;
+            }
+            assert!(page.next_offset > offset, "cursor must strictly advance");
+            offset = page.next_offset;
+            assert!(pages < 20, "pagination must terminate");
+        }
+        assert!(
+            pages >= 2,
+            "1.5 MiB transcript must paginate across multiple frames"
+        );
+        assert_eq!(collected.len(), 100);
+
+        // latest_page must also fit under ipc::MAX_FRAME
+        let base_snap = ChatPollSnapshot {
+            agent: "opencode".into(),
+            session_id: "ses_big".into(),
+            transcript_path: json_path.display().to_string(),
+            bound: true,
+            ..Default::default()
+        };
+        let (tail, start) = latest_page(base_snap, None).unwrap();
+        assert!(start > 0);
+        let tail_encoded = Reply::AgentHistory(Response::ChatPolled(tail))
+            .encode()
+            .expect("OpenCode JSON latest_page must fit under ipc::MAX_FRAME");
+        assert!(tail_encoded.len() < krill_proto::ipc::MAX_FRAME);
+
+        // Now verify SQLite backend with 90 x 15 KiB messages (> 1.3 MiB)
+        let db_path = root.join("opencode/opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, title, time_created, time_updated) VALUES ('ses_db_big', '/tmp/big-proj', 'Big DB', 1000, 2000)",
+            [],
+        )
+        .unwrap();
+        for i in 0..90_i64 {
+            let mid = format!("m-{i:03}");
+            let pid = format!("p-{i:03}");
+            let mdata =
+                serde_json::json!({ "role": if i % 2 == 0 { "user" } else { "assistant" } })
+                    .to_string();
+            let pdata =
+                serde_json::json!({ "type": "text", "text": format!("db-{i:03}-{big_text}") })
+                    .to_string();
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, 'ses_db_big', ?2, ?3)",
+                rusqlite::params![mid, 1000 + i, mdata],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?1, ?2, 'ses_db_big', ?3, ?4)",
+                rusqlite::params![pid, mid, 1000 + i, pdata],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut db_collected = Vec::new();
+        let mut db_offset = 0u64;
+        let mut db_pages = 0usize;
+        loop {
+            let page =
+                poll_transcript_file(VaultAgent::OpenCode, "ses_db_big", &db_path, db_offset);
+            assert!(page.bound);
+            let encoded = Reply::AgentHistory(Response::ChatPolled(page.clone()))
+                .encode()
+                .expect("OpenCode SQLite page must encode under ipc::MAX_FRAME");
+            assert!(encoded.len() < krill_proto::ipc::MAX_FRAME);
+            db_pages += 1;
+            db_collected.extend(page.items);
+            if page.next_offset >= OPENCODE_END {
+                break;
+            }
+            assert_ne!(page.next_offset, db_offset);
+            db_offset = page.next_offset;
+            assert!(db_pages < 20, "SQLite pagination must terminate");
+        }
+        assert!(db_pages >= 2);
+        assert_eq!(db_collected.len(), 90);
+
+        let db_snap = ChatPollSnapshot {
+            agent: "opencode".into(),
+            session_id: "ses_db_big".into(),
+            transcript_path: db_path.display().to_string(),
+            bound: true,
+            ..Default::default()
+        };
+        let (db_tail, db_start) = latest_page(db_snap, None).unwrap();
+        assert!(db_start > 0);
+        assert!(
+            Reply::AgentHistory(Response::ChatPolled(db_tail))
+                .encode()
+                .is_ok()
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn opencode_cwd_fallback_finds_pretty_printed_nested_project_json_and_skips_symlinks() {
+        let root = std::env::temp_dir().join(format!("r2d07-oc-cwd-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let oc_root = root.join("opencode");
+        let proj_dir = oc_root.join("storage/session/proj-hash-1");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let target_cwd = root.join("my-workspace");
+        fs::create_dir_all(&target_cwd).unwrap();
+
+        let pretty_session = proj_dir.join("ses_pretty_07.json");
+        fs::write(
+            &pretty_session,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": "ses_pretty_07",
+                "directory": target_cwd.display().to_string(),
+                "messages": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside.json");
+            fs::write(
+                &outside,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "id": "ses_symlink_trap",
+                    "directory": target_cwd.display().to_string()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&outside, proj_dir.join("ses_symlink_trap.json")).unwrap();
+        }
+
+        let roots = VaultRoots {
+            opencode: vec![oc_root],
+            ..VaultRoots::default()
+        };
+        let stored = StoredLaunch {
+            profile: "opencode".into(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: target_cwd.as_os_str().as_encoded_bytes().to_vec(),
+            hibernation_blocked: false,
+            account: None,
+            bot_instructions: None,
+            launched_at: None,
+        };
+        let snap = poll_session_in(&roots, Some(&stored), &[], 0);
+        assert!(
+            snap.bound,
+            "nested pretty-printed OpenCode JSON must bind by CWD"
+        );
+        assert_eq!(snap.session_id, "ses_pretty_07");
+        assert_eq!(Path::new(&snap.transcript_path), pretty_session);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn opencode_json_fingerprint_tracks_embedded_and_mismatched_stem_part_updates() {
+        let root = std::env::temp_dir().join(format!("r2d15-oc-fp-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let storage = root.join("storage");
+        let sess_dir = storage.join("session/proj-1");
+        let msg_dir = storage.join("message/ses_fp15");
+        let emb_part_dir = storage.join("part/msg-embedded-id");
+        let ext_part_dir = storage.join("part/msg-real-json-id");
+        for d in [&sess_dir, &msg_dir, &emb_part_dir, &ext_part_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        let session_path = sess_dir.join("ses_fp15.json");
+        fs::write(
+            &session_path,
+            serde_json::json!({
+                "id": "ses_fp15",
+                "directory": "/tmp/fp15",
+                "messages": [
+                    { "id": "msg-embedded-id", "role": "user" }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // External message filename stem ("0001") deliberately differs from JSON "id" ("msg-real-json-id").
+        fs::write(
+            msg_dir.join("0001.json"),
+            serde_json::json!({ "id": "msg-real-json-id", "role": "assistant" }).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            emb_part_dir.join("p1.json"),
+            r#"{"type":"text","text":"embedded-v1"}"#,
+        )
+        .unwrap();
+        fs::write(
+            ext_part_dir.join("p1.json"),
+            r#"{"type":"text","text":"external-v1"}"#,
+        )
+        .unwrap();
+
+        let snap1 = poll_transcript_file(VaultAgent::OpenCode, "ses_fp15", &session_path, 0);
+        assert!(snap1.bound);
+        assert_eq!(snap1.items.len(), 2);
+        assert_eq!(snap1.items[0].text, "embedded-v1");
+        assert_eq!(snap1.items[1].text, "external-v1");
+
+        // Update embedded message's external part file (changing length so stamp changes immediately).
+        fs::write(
+            emb_part_dir.join("p1.json"),
+            r#"{"type":"text","text":"embedded-v2-updated"}"#,
+        )
+        .unwrap();
+        let snap2 = poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_fp15",
+            &session_path,
+            snap1.next_offset,
+        );
+        assert_ne!(
+            snap2.next_offset, snap1.next_offset,
+            "embedded part update must invalidate OpenCode fingerprint"
+        );
+        assert!(snap2.reset);
+        assert_eq!(snap2.items[0].text, "embedded-v2-updated");
+
+        // Update external message's part file whose directory matches JSON "id" (not file stem).
+        fs::write(
+            ext_part_dir.join("p1.json"),
+            r#"{"type":"text","text":"external-v2-updated-longer"}"#,
+        )
+        .unwrap();
+        let snap3 = poll_transcript_file(
+            VaultAgent::OpenCode,
+            "ses_fp15",
+            &session_path,
+            snap2.next_offset,
+        );
+        assert_ne!(
+            snap3.next_offset, snap2.next_offset,
+            "mismatched-stem external part update must invalidate OpenCode fingerprint"
+        );
+        assert!(snap3.reset);
+        assert_eq!(snap3.items[1].text, "external-v2-updated-longer");
+
         fs::remove_dir_all(root).ok();
     }
 }

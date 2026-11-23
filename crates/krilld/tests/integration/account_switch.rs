@@ -288,7 +288,7 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
         .unwrap();
     let daemon_pid = Pid::from_raw(i32::try_from(first_generation).unwrap()).unwrap();
     kill_process(daemon_pid, Signal::KILL).unwrap();
-    let (mut stream, resumed_generation) =
+    let (_, resumed_generation) =
         wait_for(|| connect(&socket).filter(|(_, pid)| *pid != first_generation));
     daemon.generations.push(resumed_generation);
     fs::remove_file(wait_ready).unwrap();
@@ -321,6 +321,9 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
         fs::read_to_string(source.join("auth.json")).unwrap(),
         "source-fixture-only"
     );
+    // Open a fresh control connection after the recovery wait so an idle pre-frame socket cannot
+    // time out on `ATTACH_TIMEOUT` (5s) under heavy CPU load (`V1-01`).
+    let (mut stream, _) = wait_for(|| connect(&socket));
     let snapshot = control(&mut stream, &Request::List);
     let Reply::Sessions(sessions) = snapshot else {
         panic!("session list failed");
@@ -328,7 +331,7 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
     let new_pid = sessions.iter().find(|s| s.session == new).unwrap().pid;
     let daemon_pid = Pid::from_raw(i32::try_from(resumed_generation).unwrap()).unwrap();
     kill_process(daemon_pid, Signal::KILL).unwrap();
-    let (mut stream, next_generation) =
+    let (_, next_generation) =
         wait_for(|| connect(&socket).filter(|(_, pid)| *pid != resumed_generation));
     daemon.generations.push(next_generation);
     let snapshot = usage(&socket, &UsageRequest::ListAccounts);
@@ -341,6 +344,7 @@ fn switch_survives_daemon_sigkill(provider: ProviderKind, without_hooks: bool) {
             .and_then(|h| h.to),
         Some(new)
     );
+    let (mut stream, _) = wait_for(|| connect(&socket));
     let Reply::Sessions(sessions) = control(&mut stream, &Request::List) else {
         panic!("session list failed");
     };

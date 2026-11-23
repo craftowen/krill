@@ -74,6 +74,21 @@ unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
 exec "${SHELL:-/bin/zsh}" -l
 "#;
 
+#[cfg(unix)]
+const PROBE_PREFLIGHT: &str = r#"
+command -v "$1" >/dev/null 2>&1 || exit 127
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
+exec "$@"
+"#;
+
+pub(super) fn env_key_eq(a: &[u8], b: &[u8]) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 /// 이 프로세스의 환경과 passwd로 에이전트 실행 argv·env를 만든다.
 /// 프로그램 파일명이 `claude`면 `UUIDv4`를 사전 발급하고 버전 게이트된 세션별 설정을 주입한다.
 /// 파일 준비에 실패하면 holder spawn 전에 오류를 반환한다.
@@ -341,14 +356,14 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
             !provider
                 .credential_overrides()
                 .iter()
-                .any(|name| key.as_slice() == name.as_bytes())
+                .any(|name| env_key_eq(key, name.as_bytes()))
         });
         if provider == ProviderKind::OpenCode {
             login.env.retain(|(k, _)| {
-                !matches!(
-                    k.as_slice(),
-                    b"OPENCODE_DB" | b"XDG_DATA_HOME" | b"XDG_STATE_HOME" | b"OPENCODE_CONFIG_DIR"
-                )
+                !env_key_eq(k, b"OPENCODE_DB")
+                    && !env_key_eq(k, b"XDG_DATA_HOME")
+                    && !env_key_eq(k, b"XDG_STATE_HOME")
+                    && !env_key_eq(k, b"OPENCODE_CONFIG_DIR")
             });
             login
                 .env
@@ -365,7 +380,7 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
             }
         } else {
             let key = provider.env_var().as_bytes();
-            login.env.retain(|(k, _)| k.as_slice() != key);
+            login.env.retain(|(k, _)| !env_key_eq(k, key));
             login.env.push((key.to_vec(), dir.as_bytes().to_vec()));
         }
     }
@@ -944,11 +959,8 @@ pub(crate) fn resume_in_with_bot_mcp(
         let state = state.ok_or(io::ErrorKind::NotFound)?;
         let krill = mk_bin()?;
         let version = claude::probe(profile, &login);
-        let settings = if kept_id.is_some() {
-            claude::Settings::create(state, &krill, session, version.as_deref())?
-        } else {
-            claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?
-        };
+        let settings =
+            claude::Settings::create_for_resume(state, &krill, session, version.as_deref())?;
         if let Some(home) = bot_mcp.and_then(|m| m.bot_home.as_deref())
             && cwd.is_none_or(|c| !same_workspace_dir(c, home))
         {
@@ -2460,9 +2472,10 @@ fn apply_account_env(
             }
         }
         if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
-            login
-                .env
-                .retain(|(key, _)| key != b"KRILL_ACCOUNT_PROVIDER" && key != b"KRILL_ACCOUNT_DIR");
+            login.env.retain(|(key, _)| {
+                !env_key_eq(key, b"KRILL_ACCOUNT_PROVIDER")
+                    && !env_key_eq(key, b"KRILL_ACCOUNT_DIR")
+            });
             login.env.push((
                 b"KRILL_ACCOUNT_PROVIDER".to_vec(),
                 provider.as_str().as_bytes().to_vec(),
@@ -2475,7 +2488,7 @@ fn apply_account_env(
                 !provider
                     .credential_overrides()
                     .iter()
-                    .any(|name| key.as_slice() == name.as_bytes())
+                    .any(|name| env_key_eq(key, name.as_bytes()))
             });
         }
         // OWE-699: 켜져 있을 때만 실행 전 멱등 프로비저닝. 실패해도 실행은 그대로 간다(경고만).
@@ -2492,11 +2505,12 @@ fn apply_account_env(
             );
         }
         if is(profile, "opencode") && !account.dir.is_empty() {
+            login.env.retain(|(k, _)| !env_key_eq(k, b"OPENCODE_DB"));
             login
                 .env
                 .push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
             for (key, suffix) in [("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state")] {
-                login.env.retain(|(k, _)| k.as_slice() != key.as_bytes());
+                login.env.retain(|(k, _)| !env_key_eq(k, key.as_bytes()));
                 login.env.push((
                     key.as_bytes().to_vec(),
                     Path::new(&account.dir)
@@ -2508,10 +2522,10 @@ fn apply_account_env(
             }
             login
                 .env
-                .retain(|(k, _)| k.as_slice() != b"OPENCODE_CONFIG_DIR");
+                .retain(|(k, _)| !env_key_eq(k, b"OPENCODE_CONFIG_DIR"));
         } else if !is(profile, "agy") && !is(profile, "antigravity") {
             let key = account.env_key.as_bytes();
-            login.env.retain(|(k, _)| k.as_slice() != key);
+            login.env.retain(|(k, _)| !env_key_eq(k, key));
             if !account.dir.is_empty() {
                 login
                     .env
@@ -2524,22 +2538,29 @@ fn apply_account_env(
         if key.eq_ignore_ascii_case("KRILL_OPENCODE_INSTRUCTIONS_DIR") {
             continue;
         }
+        let key_bytes = key.as_bytes();
         if let Some(provider) = account
             .as_ref()
             .and_then(|a| ProviderKind::from_env_var(&a.env_key))
-            && (key == provider.env_var()
-                || matches!(key.as_str(), "KRILL_ACCOUNT_PROVIDER" | "KRILL_ACCOUNT_DIR")
-                || provider.credential_overrides().contains(&key.as_str())
+            && (env_key_eq(key_bytes, provider.env_var().as_bytes())
+                || env_key_eq(key_bytes, b"KRILL_ACCOUNT_PROVIDER")
+                || env_key_eq(key_bytes, b"KRILL_ACCOUNT_DIR")
+                || provider
+                    .credential_overrides()
+                    .iter()
+                    .any(|name| env_key_eq(key_bytes, name.as_bytes()))
                 || account.as_ref().is_some_and(|a| !a.dir.is_empty())
                     && provider == ProviderKind::OpenCode
-                    && matches!(key.as_str(), "XDG_DATA_HOME" | "XDG_STATE_HOME"))
+                    && (env_key_eq(key_bytes, b"XDG_DATA_HOME")
+                        || env_key_eq(key_bytes, b"XDG_STATE_HOME")
+                        || env_key_eq(key_bytes, b"OPENCODE_DB")))
         {
             continue;
         }
-        login.env.retain(|(k, _)| k.as_slice() != key.as_bytes());
+        login.env.retain(|(k, _)| !env_key_eq(k, key_bytes));
         login
             .env
-            .push((key.as_bytes().to_vec(), value.as_bytes().to_vec()));
+            .push((key_bytes.to_vec(), value.as_bytes().to_vec()));
     }
     if let Some(state) = state {
         inject_zsh_env(login, state);
@@ -2839,6 +2860,26 @@ enum ProbedLoginEnv {
     Ready(Vec<(Vec<u8>, Vec<u8>)>),
     /// Login shell environment probe failed or timed out; try standard fallback PATH before `-l -i -c`.
     Unavailable,
+}
+
+/// Runs a short probe command (`--version`) in the user's login/interactive shell PATH without
+/// `PREFLIGHT`'s fallback `exec "$SHELL" -l`, so non-zero exit statuses propagate directly.
+#[cfg(unix)]
+fn wrap_probe(profile: &Profile, login: Launch) -> Launch {
+    let Launch { mut argv, env } = login;
+    argv.truncate(1);
+    argv.extend(
+        ["-l", "-i", "-c", PROBE_PREFLIGHT, WRAPPER_ARG0]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec()),
+    );
+    argv.extend(
+        profile
+            .argv(Permission::Manual)
+            .into_iter()
+            .map(String::into_bytes),
+    );
+    Launch { argv, env }
 }
 
 fn wrap_account(

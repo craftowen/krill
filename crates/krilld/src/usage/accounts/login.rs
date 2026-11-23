@@ -45,11 +45,14 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
         .accounts
         .into_iter()
         .filter_map(|a| {
-            Some((
-                ProviderKind::parse(&a.provider)?,
-                PathBuf::from(a.profile_dir),
-                false,
-            ))
+            let provider = ProviderKind::parse(&a.provider)?;
+            let raw_dir = PathBuf::from(&a.profile_dir);
+            let dir = if provider == ProviderKind::Codex {
+                super::resolve_codex_dir(home, &a.id, &raw_dir)
+            } else {
+                raw_dir
+            };
+            Some((provider, dir, false))
         })
         .collect();
     for provider in ProviderKind::ALL {

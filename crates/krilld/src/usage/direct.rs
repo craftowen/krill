@@ -203,11 +203,14 @@ fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bo
     .into_iter()
     .map(|p| (p, accounts::host_default_dir(home, p), true))
     .chain(file.accounts.iter().filter_map(|a| {
-        Some((
-            ProviderKind::parse(&a.provider)?,
-            PathBuf::from(&a.profile_dir),
-            false,
-        ))
+        let provider = ProviderKind::parse(&a.provider)?;
+        let raw_dir = PathBuf::from(&a.profile_dir);
+        let dir = if provider == ProviderKind::Codex {
+            accounts::resolve_codex_dir(home, &a.id, &raw_dir)
+        } else {
+            raw_dir
+        };
+        Some((provider, dir, false))
     }));
     for (provider, dir, host) in profiles {
         if !matches!(
@@ -1609,6 +1612,53 @@ pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
     ))
 }
 
+/// Decodes `/usr/bin/security find-generic-password -w` stdout on macOS.
+///
+/// Apple's `security` tool prints the entire secret as lowercase ASCII hex whenever the stored
+/// value contains any byte outside printable ASCII `0x20..=0x7e` (such as newlines or UTF-8
+/// Korean/CJK/accented text). Decode hex back to raw bytes when that round-trips into valid
+/// UTF-8/UTF-16 containing at least one non-printable-ASCII byte.
+#[cfg(any(not(windows), test))]
+pub(crate) fn decode_macos_security_password(raw: &[u8]) -> Zeroizing<Vec<u8>> {
+    let trimmed = raw.strip_suffix(b"\n").unwrap_or(raw);
+    if !trimmed.is_empty()
+        && trimmed.len().is_multiple_of(2)
+        && trimmed
+            .iter()
+            .all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        let mut decoded = Zeroizing::new(Vec::with_capacity(trimmed.len() / 2));
+        let mut ok = true;
+        for pair in trimmed.as_chunks::<2>().0 {
+            if let Ok(text) = std::str::from_utf8(pair)
+                && let Ok(byte) = u8::from_str_radix(text, 16)
+            {
+                decoded.push(byte);
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok
+            && decoded.iter().any(|&b| !(0x20..=0x7e).contains(&b))
+            && (std::str::from_utf8(&decoded).is_ok()
+                || ((decoded.starts_with(&[0xfe, 0xff]) || decoded.starts_with(&[0xff, 0xfe]))
+                    && credential_utf8(&decoded).is_some())
+                || is_json_object_credential(&decoded))
+        {
+            return decoded;
+        }
+    }
+    Zeroizing::new(trimmed.to_vec())
+}
+
+#[cfg(any(not(windows), test))]
+pub(crate) fn is_json_object_credential(raw: &[u8]) -> bool {
+    credential_utf8(raw).is_some_and(|text| {
+        serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| v.is_object())
+    })
+}
+
 // Claude Code·agy(go-keyring)는 `/usr/bin/security`로 항목을 만들어 ACL이 그 도구만 믿는다.
 // krilld가 SecItem으로 직접 읽으면 macOS가 매번 로그인 키체인 암호를 묻는다 — Orca처럼 같은 도구로 읽는다.
 #[cfg(all(not(test), not(windows)))]
@@ -1622,7 +1672,9 @@ fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
         MAX_BYTES,
         accounts::agy_native::KEYCHAIN_TIMEOUT,
     )?;
-    status.success().then_some(stdout)
+    status
+        .success()
+        .then(|| decode_macos_security_password(&stdout))
 }
 // Windows 자격 증명 관리자: go-keyring(`service:account`), keytar/Bun(`service/account`), keyring-rs(`account.service`) 순으로 찾는다.
 #[cfg(all(not(test), windows))]
@@ -4247,5 +4299,56 @@ mod tests {
 
         evict_profile(&home, ProviderKind::Codex, &profile);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn decode_macos_security_password_handles_hex_encoded_utf8_and_multiline_json() {
+        let to_hex = |bytes: &[u8]| -> Vec<u8> {
+            use std::fmt::Write as _;
+            let mut s = String::with_capacity(bytes.len() * 2 + 1);
+            for b in bytes {
+                write!(s, "{b:02x}").ok();
+            }
+            s.push('\n');
+            s.into_bytes()
+        };
+
+        // 1. Non-ASCII Korean UTF-8 JSON hex-encoded by macOS `security find-generic-password -w`
+        let korean_json =
+            r#"{"claudeAiOauth":{"accessToken":"tok-ko","org":"김철수 조직"}}"#.as_bytes();
+        let hex_korean = to_hex(korean_json);
+        let decoded = decode_macos_security_password(&hex_korean);
+        assert_eq!(decoded.as_slice(), korean_json);
+        assert!(is_json_object_credential(&decoded));
+        let parsed = parse_credentials(ProviderKind::Claude, &decoded).expect("parse Korean JSON");
+        assert_eq!(parsed.0.as_str(), "tok-ko");
+
+        // 2. Pretty-printed multiline JSON with `\n` hex-encoded by `security -w`
+        let multiline_json = b"{\n  \"claudeAiOauth\": {\n    \"accessToken\": \"tok-nl\"\n  }\n}";
+        let hex_multiline = to_hex(multiline_json);
+        let decoded_nl = decode_macos_security_password(&hex_multiline);
+        assert_eq!(decoded_nl.as_slice(), multiline_json);
+        assert_eq!(
+            parse_credentials(ProviderKind::Claude, &decoded_nl)
+                .unwrap()
+                .0
+                .as_str(),
+            "tok-nl"
+        );
+
+        // 3. Plain single-line ASCII JSON passes through untouched (trailing `\n` stripped).
+        let plain_json = br#"{"claudeAiOauth":{"accessToken":"tok-ascii"}}"#;
+        let mut with_nl = plain_json.to_vec();
+        with_nl.push(b'\n');
+        assert_eq!(
+            decode_macos_security_password(&with_nl).as_slice(),
+            plain_json
+        );
+
+        // 4. Pure ASCII hex literal whose decoded bytes are invalid UTF-8 is not falsely decoded.
+        assert_eq!(
+            decode_macos_security_password(b"deadbeef\n").as_slice(),
+            b"deadbeef"
+        );
     }
 }

@@ -629,3 +629,34 @@ fn unsupported_symlink_in_non_unix_link_helper_does_not_abort_or_delete_empty_di
 
     std::fs::remove_dir_all(home).ok();
 }
+
+#[test]
+fn provision_opencode_preserves_empty_dir_and_continues_on_unsupported_symlink() {
+    let home = root("opencode-unsupported");
+    let host_data = home.join(".local/share/opencode");
+    let profile = home.join("opencode-profile");
+    let prof_data = profile.join("data/opencode");
+    std::fs::create_dir_all(host_data.join("snapshot")).unwrap();
+    std::fs::create_dir_all(host_data.join("repos")).unwrap();
+    std::fs::create_dir_all(prof_data.join("snapshot")).unwrap();
+
+    let mut attempts = Vec::new();
+    let report = provision_opencode_with(&home, &profile, |src, _dst| {
+        let name = src.file_name().unwrap().to_string_lossy().into_owned();
+        attempts.push(name);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    })
+    .expect("Unsupported symlink must not abort provision_opencode");
+
+    assert!(report.changed.is_empty());
+    assert!(report.conflicts.is_empty());
+    assert!(
+        prof_data.join("snapshot").is_dir(),
+        "existing empty directory must be preserved when symlink creation is Unsupported"
+    );
+    assert!(
+        attempts.iter().any(|n| n == "snapshot") && attempts.iter().any(|n| n == "repos"),
+        "provisioning must continue to remaining entries after Unsupported: {attempts:?}"
+    );
+    std::fs::remove_dir_all(home).ok();
+}

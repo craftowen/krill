@@ -3768,12 +3768,7 @@ impl Registry {
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
             framed.extend_from_slice(b"\x1b[200~");
-            let mut rest = payload;
-            while let Some(pos) = rest.windows(6).position(|w| w == b"\x1b[201~") {
-                framed.extend_from_slice(rest.get(..pos).unwrap_or_default());
-                rest = rest.get(pos + 6..).unwrap_or_default();
-            }
-            framed.extend_from_slice(rest);
+            Self::strip_bracketed_paste_end(payload, &mut framed);
             framed.extend_from_slice(b"\x1b[201~");
             if !write_checked(&framed)? {
                 return Ok(false);
@@ -3793,6 +3788,19 @@ impl Registry {
             }
         }
         Ok(true)
+    }
+
+    /// Strips `ESC [ 201 ~` (bracketed-paste end) to a fixed point in linear time so nested
+    /// sequences like `\x1b[\x1b[201~201~` cannot splice back into a literal terminator.
+    fn strip_bracketed_paste_end(payload: &[u8], out: &mut Vec<u8>) {
+        const PASTE_END: &[u8] = b"\x1b[201~";
+        let body_start = out.len();
+        for &byte in payload {
+            out.push(byte);
+            while out.len() >= body_start + PASTE_END.len() && out.ends_with(PASTE_END) {
+                out.truncate(out.len() - PASTE_END.len());
+            }
+        }
     }
 
     fn flatten_unbracketed_submit_lines(payload: &[u8]) -> Vec<u8> {
@@ -5240,11 +5248,13 @@ impl Registry {
                         Ok((delivery, messages)) => {
                             let now = Instant::now();
                             if delivery_id.is_some() || !messages.is_empty() || now >= deadline {
-                                break Ok(if !v2 || (ack && delivery_id.is_none()) {
-                                    OrchResponse::Messages(messages)
-                                } else {
-                                    OrchResponse::Delivery { delivery, messages }
-                                });
+                                break Ok(
+                                    if !v2 || (ack && delivery_id.is_none() && delivery.is_none()) {
+                                        OrchResponse::Messages(messages)
+                                    } else {
+                                        OrchResponse::Delivery { delivery, messages }
+                                    },
+                                );
                             }
                             let rem = deadline.saturating_duration_since(now);
                             if rem.is_zero() {

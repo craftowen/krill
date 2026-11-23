@@ -201,9 +201,41 @@ fn copy_accounts(
     Ok(copied_any)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn build_security_interactive_write_line(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Option<Zeroizing<String>> {
+    use std::fmt::Write as _;
+    let safe_arg = |s: &str| {
+        !s.is_empty()
+            && !s
+                .bytes()
+                .any(|b| matches!(b, b'"' | b'\\' | b'\r' | b'\n' | b'\0'))
+    };
+    if !safe_arg(service) || !safe_arg(account) {
+        return None;
+    }
+    let prefix = format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X ");
+    let line_len = prefix
+        .len()
+        .checked_add(secret.len().checked_mul(2)?)?
+        .checked_add(1)?;
+    if line_len > crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE {
+        return None;
+    }
+    let mut script = Zeroizing::new(String::with_capacity(line_len));
+    script.push_str(&prefix);
+    for b in secret {
+        write!(script, "{b:02x}").ok();
+    }
+    script.push('\n');
+    Some(script)
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::fmt::Write as _;
     use std::io;
     use std::process::Command;
 
@@ -216,6 +248,7 @@ mod macos {
 
     // Claude Code는 `/usr/bin/security`로 항목을 만들어 ACL이 그 도구만 믿는다(direct.rs와 같은 이유).
     // 비밀은 인자가 아니라 `security -i`의 표준 입력으로 넘겨 프로세스 목록에 드러나지 않게 한다.
+    // 4095바이트 `fgets` 한도를 넘는 큰 항목은 Security.framework(`SecItemAdd`/`SecItemUpdate`)로 쓴다.
     pub(super) fn copy(from: &str, to: &str) -> io::Result<bool> {
         let user = crate::usage::direct::claude_keychain_user();
         let accounts: &[&str] = if user == "claude-code-user" {
@@ -227,13 +260,19 @@ mod macos {
     }
 
     fn write(service: &str, account: &str, secret: &[u8]) -> io::Result<()> {
-        let mut script = Zeroizing::new(format!(
-            "add-generic-password -U -a \"{account}\" -s \"{service}\" -X "
-        ));
-        for b in secret {
-            write!(script, "{b:02x}").ok();
+        if !u64::try_from(secret.len()).is_ok_and(|len| len <= MAX_KEYCHAIN_BYTES)
+            || !crate::usage::direct::is_json_object_credential(secret)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid keychain credential payload",
+            ));
         }
-        script.push('\n');
+        let Some(script) = super::build_security_interactive_write_line(service, account, secret)
+        else {
+            return security_framework::passwords::set_generic_password(service, account, secret)
+                .map_err(|_| io::Error::other("keychain write failed"));
+        };
         let mut cmd = Command::new(SECURITY);
         cmd.arg("-i");
         let (status, _) = crate::usage::accounts::agy_native::run_command_with_timeout(
@@ -258,11 +297,11 @@ mod macos {
     fn read(service: &str, user: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
         let mut cmd = Command::new(SECURITY);
         cmd.args(["find-generic-password", "-s", service, "-a", user, "-w"]);
-        let (status, mut secret) = crate::usage::accounts::agy_native::run_command_with_timeout(
+        let (status, secret) = crate::usage::accounts::agy_native::run_command_with_timeout(
             &mut cmd,
             None,
             true,
-            MAX_KEYCHAIN_BYTES,
+            MAX_KEYCHAIN_BYTES.saturating_mul(2).saturating_add(1),
             crate::usage::accounts::agy_native::KEYCHAIN_TIMEOUT,
         )
         .ok_or_else(|| {
@@ -270,10 +309,14 @@ mod macos {
         })?;
         match status.code() {
             Some(0) => {
-                if secret.last() == Some(&b'\n') {
-                    secret.pop();
+                let decoded = crate::usage::direct::decode_macos_security_password(&secret);
+                if !crate::usage::direct::is_json_object_credential(&decoded) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "keychain credential is not valid JSON",
+                    ));
                 }
-                Ok(Some(secret))
+                Ok(Some(decoded))
             }
             Some(NOT_FOUND) => Ok(None),
             _ => Err(io::Error::other("keychain read failed")),
@@ -555,5 +598,32 @@ mod tests {
         assert!(adopt_email_dirs(&home, Some(&state), &[], &vault).unwrap());
         assert!(old.with_file_name("busy-example-com").is_dir());
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn security_interactive_write_line_enforces_4095_byte_limit_and_safe_quoting() {
+        let small = r#"{"claudeAiOauth":{"accessToken":"small","name":"한글"}}"#.as_bytes();
+        let line = build_security_interactive_write_line("Claude Code-credentials", "owen", small)
+            .expect("small JSON fits security -i");
+        assert!(line.len() <= crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE);
+
+        // 2100 raw bytes -> 4200 hex chars + command prefix > 4095 fgets buffer limit
+        let large = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{}"}}}}"#,
+            "x".repeat(2100)
+        );
+        assert!(
+            build_security_interactive_write_line(
+                "Claude Code-credentials",
+                "owen",
+                large.as_bytes()
+            )
+            .is_none(),
+            "lines exceeding 4095 bytes must bypass security -i fgets limit"
+        );
+        assert!(
+            build_security_interactive_write_line("svc\"bad", "owen", small).is_none(),
+            "quotes in service name must bypass security -i"
+        );
     }
 }

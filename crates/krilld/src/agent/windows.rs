@@ -149,9 +149,19 @@ fn fallback_shell_command(login: &Launch) -> Option<Command> {
     Some(shell)
 }
 
+fn dedupe_env_ci(env: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut seen = std::collections::HashSet::new();
+    env.reverse();
+    env.retain(|(k, _)| seen.insert(k.to_ascii_uppercase()));
+    env.reverse();
+}
+
 pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Option<Command> {
+    // Windows env keys are case-insensitive; normalize to last-wins before reading markers or PATH.
+    dedupe_env_ci(&mut env);
     let value = |key: &[u8]| {
         env.iter()
+            .rev()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
@@ -180,6 +190,7 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                     env.retain(|(key, _)| {
                         !key.eq_ignore_ascii_case(b"XDG_DATA_HOME")
                             && !key.eq_ignore_ascii_case(b"XDG_STATE_HOME")
+                            && !key.eq_ignore_ascii_case(b"OPENCODE_DB")
                     });
                     for (key, suffix) in [
                         (b"XDG_DATA_HOME".as_slice(), "data"),
@@ -219,8 +230,10 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
             && !key.eq_ignore_ascii_case(b"KRILL_ACCOUNT_DIR")
             && !key.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
     });
+    dedupe_env_ci(&mut env);
     let path = env
         .iter()
+        .rev()
         .find(|(key, _)| key.eq_ignore_ascii_case(b"PATH"))
         .map(|(_, v)| OsStr::from_bytes(v))?;
     let executable = krill_proto::agent::which(program.to_str()?, path)?;

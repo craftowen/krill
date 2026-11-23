@@ -337,13 +337,24 @@ mod tests {
         let mut output = std::fs::File::from(pty.user);
         let tap = session.tap();
 
-        let mut payload = Vec::new();
-        for i in 0..1050_u32 {
-            payload.extend_from_slice(format!("hv-{i:04}\r\n").as_bytes());
+        let mut chunk1 = Vec::new();
+        for i in 0..525_u32 {
+            chunk1.extend_from_slice(format!("hv-{i:04}\r\n").as_bytes());
         }
-        output.write_all(&payload).unwrap();
-        let pulse = tap.wait_timeout(Duration::from_secs(5), |p| p.end >= payload.len() as u64);
-        assert_eq!(pulse.end, payload.len() as u64);
+        let mut chunk2 = Vec::new();
+        for i in 525..1050_u32 {
+            chunk2.extend_from_slice(format!("hv-{i:04}\r\n").as_bytes());
+        }
+        let total_len = (chunk1.len() + chunk2.len()) as u64;
+        output.write_all(&chunk1).unwrap();
+        let first_pulse =
+            tap.wait_timeout(Duration::from_secs(5), |p| p.end >= chunk1.len() as u64);
+        assert_eq!(first_pulse.end, chunk1.len() as u64);
+        let first_segs = store.history(id).unwrap().len();
+        assert!(first_segs > 0);
+        output.write_all(&chunk2).unwrap();
+        let pulse = tap.wait_timeout(Duration::from_secs(5), |p| p.end >= total_len);
+        assert_eq!(pulse.end, total_len);
         assert!(store.history(id).unwrap().len() >= 2);
 
         let mut service = Service::default();

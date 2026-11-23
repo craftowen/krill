@@ -59,7 +59,7 @@ pub fn remove_with_state(
     let main = initial_entries
         .first()
         .ok_or("repository has no worktrees")?;
-    let path = fs::canonicalize(Path::new(OsStr::from_bytes(&req.path)))
+    let path = krill_proto::os::canonicalize(Path::new(OsStr::from_bytes(&req.path)))
         .map_err(|e| format!("cannot resolve worktree: {e}"))?;
     if path == main.path {
         return Err("cannot remove the main worktree".to_owned());
@@ -833,7 +833,7 @@ fn entries(q: &GitQueue, repo: &Path) -> Result<Vec<Entry>, String> {
     }
     let mut listed = parse_entries(&out.stdout)?;
     for entry in &mut listed {
-        match fs::canonicalize(&entry.path) {
+        match krill_proto::os::canonicalize(&entry.path) {
             Ok(real) => entry.path = real,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot resolve registered worktree: {e}")),
@@ -849,7 +849,7 @@ fn parse_entries(bytes: &[u8]) -> Result<Vec<Entry>, String> {
             entries.push(Entry {
                 path: {
                     let path = PathBuf::from(OsString::from_vec(path.to_vec()));
-                    fs::canonicalize(&path).unwrap_or(path)
+                    krill_proto::os::canonicalize(&path).unwrap_or(path)
                 },
                 branch: None,
                 locked: false,

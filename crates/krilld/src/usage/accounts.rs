@@ -1535,7 +1535,7 @@ pub fn switch_account(
         return Ok(refresh_accounts(home, state_dir));
     }
     if provider == ProviderKind::Codex {
-        codex_home::migrate(home, state_dir)?;
+        codex_home::migrate_for_switch(home, state_dir, account_id)?;
     }
     let snap = refresh_accounts(home, state_dir);
     let Some(target) = snap
@@ -1569,7 +1569,7 @@ pub fn switch_account(
     Ok(refresh_accounts(home, state_dir))
 }
 
-fn redacted_account_id(account_id: &str) -> String {
+pub(crate) fn redacted_account_id(account_id: &str) -> String {
     use sha2::{Digest as _, Sha256};
     crate::mobile::devices::hex(&Sha256::digest(account_id.as_bytes()))
         .chars()
