@@ -312,7 +312,9 @@ impl Shell {
         use krill_app::ui::icons;
 
         let p = krill_app::ui::palette(cx);
-        let show_automations = krill_app::settings::current(cx).show_automations_button;
+        let current_settings = krill_app::settings::current(cx);
+        let show_automations = current_settings.show_automations_button;
+        let show_mobile = current_settings.show_mobile_button;
         let settings = self.agents.clone();
         let accounts = self.accounts_for_host(&self.launch_host);
         let permission = settings.as_ref().map(|a| a.permission).unwrap_or_default();
@@ -599,21 +601,77 @@ impl Shell {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
             )
-            .child(
-                Self::nav_row(
-                    p,
-                    "nav-mobile",
-                    icons::SMARTPHONE_SVG,
-                    sb_text::NAV_MOBILE.get(),
+            .when(show_mobile, |d| {
+                let mobile_open = self.mobile_page_open(cx);
+                let hide_icon_color = if mobile_open {
+                    p.sidebar_accent_foreground
+                } else {
+                    p.muted_foreground
+                };
+                d.child(
+                    Self::nav_row(
+                        p,
+                        "nav-mobile",
+                        icons::SMARTPHONE_SVG,
+                        sb_text::NAV_MOBILE.get(),
+                    )
+                    .group("nav-mobile")
+                    .when(mobile_open, |d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .child(
+                        div()
+                            .id("nav-mobile-hide")
+                            .debug_selector(|| "nav-mobile-hide".into())
+                            .role(gpui::Role::Button)
+                            .aria_label(sb_text::HIDE_FROM_SIDEBAR.get())
+                            .flex_none()
+                            .size(gpui::px(20.))
+                            .rounded(krill_app::ui::RADIUS_XS)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .opacity(0.)
+                            .group_hover("nav-mobile", |d| d.opacity(1.))
+                            .text_color(hide_icon_color)
+                            .hover(|d| d.bg(p.sidebar_accent).text_color(p.sidebar_foreground))
+                            .tooltip(|window, cx| {
+                                krill_app::ui::tooltip_view(
+                                    "nav-mobile-hide",
+                                    sb_text::HIDE_FROM_SIDEBAR.get(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(|_, _, cx| {
+                                cx.stop_propagation();
+                                krill_app::settings::set_show_mobile_button(false, cx);
+                            })
+                            .child(icons::svg_icon(
+                                icons::EYE_OFF_SVG,
+                                krill_app::ui::ICON_XS,
+                                hide_icon_color,
+                            )),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_mobile_page(Some(window), cx);
+                    }))
+                    .context_menu(|menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::new(sb_text::HIDE_FROM_SIDEBAR.get()).on_click(
+                                |_, _, cx| {
+                                    krill_app::settings::set_show_mobile_button(false, cx);
+                                },
+                            ),
+                        )
+                    }),
                 )
-                .when(self.mobile_page_open(cx), |d| {
-                    d.bg(p.sidebar_accent)
-                        .text_color(p.sidebar_accent_foreground)
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_mobile_page(Some(window), cx);
-                })),
-            )
+            })
     }
 }
 

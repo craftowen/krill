@@ -7159,6 +7159,63 @@ fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn nav_mobile_can_be_hidden_from_hover_button_toolbar_and_opened_from_palette_without_restoring(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("nav-mobile-hide"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("nav-mobile").is_some());
+    let hide = cx
+        .debug_bounds("nav-mobile-hide")
+        .expect("nav-mobile-hide button must exist");
+    // 오른쪽 숨기기 버튼 클릭 시 모바일 모달이 열리지 않고 사이드바 항목만 숨겨진다.
+    cx.simulate_click(hide.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(!krill_app::settings::current(cx).show_mobile_button));
+    assert!(cx.debug_bounds("mobile-page").is_none());
+    assert!(cx.debug_bounds("nav-mobile").is_none());
+
+    // 명령 팔레트의 'Krill 모바일 열기'는 숨겨둔 설정을 강제로 true로 되돌리지 않고 페이지만 연다.
+    cx.update(|window, cx| {
+        let (actions, _) = Shell::palette_entries(cx);
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.kind == jump::ActionKind::OpenMobile)
+        );
+        view.update(cx, |s, cx| {
+            s.run_palette_action(jump::ActionKind::OpenMobile, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_some());
+    assert!(cx.debug_bounds("nav-mobile").is_none());
+    cx.update(|_, cx| assert!(!krill_app::settings::current(cx).show_mobile_button));
+
+    // 모바일 페이지 우상단 툴바 토글 버튼으로 사이드바에 다시 표시한다.
+    let toggle = cx
+        .debug_bounds("mobile-page-sidebar-toggle")
+        .expect("mobile-page-sidebar-toggle must exist");
+    cx.simulate_click(toggle.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(krill_app::settings::current(cx).show_mobile_button));
+    assert!(cx.debug_bounds("nav-mobile").is_some());
+
+    // 모달을 닫고 nav-mobile 가운데를 누르면 기존처럼 모바일 페이지가 열린다.
+    let close = cx.debug_bounds("mobile-page-close").unwrap();
+    cx.simulate_click(close.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_none());
+
+    let mobile = cx.debug_bounds("nav-mobile").unwrap();
+    cx.simulate_click(mobile.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("mobile-page").is_some());
+}
+
+#[gpui::test]
 fn artifacts_open_the_library_by_default_and_back_preserves_the_workspace(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("artifacts-default"));
     cx.simulate_resize(gpui::size(px(1400.), px(900.)));

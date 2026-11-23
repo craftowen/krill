@@ -812,6 +812,28 @@ impl SettingsView {
                     .debug_selector(|| "mobile-error-banner".into()),
             );
         }
+        let show_mobile_button = super::current(cx).show_mobile_button;
+        root = root.child(crate::ui::group(
+            p,
+            [crate::ui::group_row()
+                .child(self.search_focus.label(
+                    p,
+                    text::SHOW_MOBILE_BUTTON.get(),
+                    Some(text::SHOW_MOBILE_BUTTON_DESC.get()),
+                ))
+                .child(
+                    layout::controls().child(
+                        layout::switch(
+                            p,
+                            "mobile-show-sidebar-toggle",
+                            show_mobile_button,
+                            false,
+                            |next, _, cx| super::set_show_mobile_button(next, cx),
+                        )
+                        .aria_label(text::SHOW_MOBILE_BUTTON.get()),
+                    ),
+                )],
+        ));
 
         let busy = self.mobile.pending || self.mobile.pairing_pending();
         let new_device = if open {
@@ -1393,6 +1415,34 @@ impl SettingsView {
                     .child(devices),
             );
 
+        let show_mobile = super::current(cx).show_mobile_button;
+        let sidebar_toggle_tooltip = if show_mobile {
+            text::PAGE_HIDE_SIDEBAR_TOOLTIP.get()
+        } else {
+            text::PAGE_SHOW_SIDEBAR_TOOLTIP.get()
+        };
+        let mut sidebar_toggle = crate::ui::button_with_reserved_label(
+            "mobile-page-sidebar-toggle",
+            text::PAGE_HIDE_SIDEBAR.get(),
+            text::PAGE_SHOW_SIDEBAR.get(),
+            !show_mobile,
+        )
+        .small()
+        .outline()
+        .debug_selector(|| "mobile-page-sidebar-toggle".into())
+        .on_click(|_, _, cx| {
+            super::toggle_mobile_button(cx);
+        });
+        sidebar_toggle.interactivity().tooltip(move |window, cx| {
+            crate::ui::tooltip_view(
+                "mobile-page-sidebar-toggle",
+                sidebar_toggle_tooltip,
+                window,
+                cx,
+            )
+        });
+        let sidebar_toggle = sidebar_toggle.tooltip(sidebar_toggle_tooltip);
+
         div()
             .id("mobile-page")
             .debug_selector(|| "mobile-page".into())
@@ -1414,7 +1464,8 @@ impl SettingsView {
                 div()
                     .min_h_full()
                     .px(crate::ui::SPACE_4)
-                    .py_8()
+                    .pt_12()
+                    .pb_8()
                     .flex()
                     .flex_wrap()
                     .items_center()
@@ -1425,17 +1476,27 @@ impl SettingsView {
                     .child(phone),
             )
             .child(
-                div().absolute().top_3().right_3().child(
-                    Button::new("mobile-page-close")
-                        .icon(IconName::Close)
-                        .ghost()
-                        .small()
-                        .tooltip(text::PAGE_CLOSE.get())
-                        .debug_selector(|| "mobile-page-close".into())
-                        .on_click(cx.listener(|_, _, window, cx| {
-                            super::close_settings_page_for(Some(cx.entity_id()), window, cx);
-                        })),
-                ),
+                div()
+                    .id("mobile-page-toolbar")
+                    .debug_selector(|| "mobile-page-toolbar".into())
+                    .absolute()
+                    .top_3()
+                    .right_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(sidebar_toggle)
+                    .child(
+                        Button::new("mobile-page-close")
+                            .icon(IconName::Close)
+                            .ghost()
+                            .small()
+                            .tooltip(text::PAGE_CLOSE.get())
+                            .debug_selector(|| "mobile-page-close".into())
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                super::close_settings_page_for(Some(cx.entity_id()), window, cx);
+                            })),
+                    ),
             )
     }
 }

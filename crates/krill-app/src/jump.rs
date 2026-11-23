@@ -597,6 +597,7 @@ pub enum ActionKind {
     OpenChecks,
     OpenDisk,
     OpenAutomations,
+    OpenMobile,
     EditQuickCommands,
     QuickCommand(usize),
 }

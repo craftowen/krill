@@ -503,14 +503,27 @@ fn init(cx: &mut App) {
             });
         }
     });
+    krill_app::settings::init_actions(cx);
     set_menus(&krill_app::security::State::default(), cx);
     cx.observe_global::<krill_app::i18n::Locale>(|cx| cx.defer(refresh_menus))
         .detach();
+    cx.observe_global::<krill_app::settings::Config>(|cx| {
+        let show_mobile = krill_app::settings::current(cx).show_mobile_button;
+        if cx.try_global::<MenuShowMobile>().map(|state| state.0) != Some(show_mobile) {
+            cx.set_global(MenuShowMobile(show_mobile));
+            cx.defer(refresh_menus);
+        }
+    })
+    .detach();
 }
 
 #[derive(Default)]
 struct MenuSecurity(bool);
 impl gpui::Global for MenuSecurity {}
+
+#[derive(Default)]
+struct MenuShowMobile(bool);
+impl gpui::Global for MenuShowMobile {}
 
 pub(crate) fn set_menus(security: &krill_app::security::State, cx: &mut App) {
     cx.set_global(MenuSecurity(security.is_secure_keyboard_enabled()));
@@ -519,6 +532,8 @@ pub(crate) fn set_menus(security: &krill_app::security::State, cx: &mut App) {
 
 fn refresh_menus(cx: &mut App) {
     let secure = cx.try_global::<MenuSecurity>().is_some_and(|state| state.0);
+    let show_mobile = krill_app::settings::current(cx).show_mobile_button;
+    cx.set_global(MenuShowMobile(show_mobile));
     let mut app_items = vec![
         MenuItem::action(
             krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
@@ -634,6 +649,11 @@ fn refresh_menus(cx: &mut App) {
                 krill_app::i18n::catalog::shell::TOGGLE_CHAT_VIEW.get(),
                 shell::ToggleChatView,
             ),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::SHOW_MOBILE_BUTTON.get(),
+                krill_app::settings::ToggleMobileButton,
+            )
+            .checked(show_mobile),
             MenuItem::separator(),
             MenuItem::action(
                 krill_app::i18n::catalog::general::ZOOM_IN_ITEM.get(),

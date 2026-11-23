@@ -39,7 +39,14 @@ use crate::i18n::catalog::settings as text;
 
 actions!(
     settings,
-    [OpenSettings, ZoomIn, ZoomOut, ZoomReset, FocusSearch]
+    [
+        OpenSettings,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        FocusSearch,
+        ToggleMobileButton
+    ]
 );
 
 /// 테마 선택. 기본값은 Orca와 동일한 `System`이며, `System`은 적용 시점의 macOS 모양을 따른다.
@@ -192,6 +199,9 @@ pub struct Settings {
     /// 사이드바 자동화 진입점 표시. 명령 팔레트의 '자동화 열기'가 다시 켠다.
     #[serde(default = "default_true")]
     pub show_automations_button: bool,
+    /// 사이드바 'Krill 모바일' 진입점 표시(Orca `showMobileButton`).
+    #[serde(default = "default_true")]
+    pub show_mobile_button: bool,
     /// 기본 계정 전환 시 실행 중 세션 처리(기본 `ask`).
     #[serde(default)]
     pub running_session_switch_policy: RunningSessionSwitchPolicy,
@@ -330,6 +340,7 @@ impl Default for Settings {
             terminal_theme_light: default_terminal_theme_light(),
             terminal_use_separate_light_theme: true,
             show_automations_button: true,
+            show_mobile_button: true,
             running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
             chat_auto_continue_after_rate_limit: false,
             bot_sidebar_sort: crate::bots::sidebar_view::BotSidebarSort::Manual,
@@ -1101,6 +1112,29 @@ pub fn take_pending_notice(cx: &mut App) -> Option<String> {
     cx.global_mut::<Config>().pending_notice.take()
 }
 
+#[derive(Default)]
+struct MobileButtonActionRegistered;
+impl Global for MobileButtonActionRegistered {}
+
+/// 사이드바 'Krill 모바일' 버튼 표시 여부를 설정하고 저장한다.
+pub fn set_show_mobile_button(show: bool, cx: &mut App) {
+    edit_or_in_memory(cx, move |s| s.show_mobile_button = show);
+}
+
+/// 사이드바 'Krill 모바일' 버튼 표시 여부를 반전하고 저장한다.
+pub fn toggle_mobile_button(cx: &mut App) {
+    edit_or_in_memory(cx, |s| s.show_mobile_button = !s.show_mobile_button);
+}
+
+/// 전역 설정 메뉴 액션(`ToggleMobileButton`)을 한 번만 등록한다.
+pub fn init_actions(cx: &mut App) {
+    if cx.has_global::<MobileButtonActionRegistered>() {
+        return;
+    }
+    cx.set_global(MobileButtonActionRegistered);
+    cx.on_action(|_: &ToggleMobileButton, cx| toggle_mobile_button(cx));
+}
+
 /// 설정을 읽어 적용하고, 1초마다 파일 변경을 보는 태스크를 띄운다. 앱 기본 키를 모두 묶은 뒤에
 /// 부른다(그때의 키맵이 재정의의 바탕이 된다). 첫 창 전에도 언어를 적용하고, 줌은 열린 창에 적용한다.
 /// `ZoomIn`/`ZoomOut`/`ZoomReset`은 전역 UI 배율이 아니라 `Shell`이 포커스된 터미널·에디터 글꼴 크기를
@@ -1136,6 +1170,7 @@ pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
 }
 
 fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App) {
+    init_actions(cx);
     let settings = Settings {
         language,
         ..Settings::default()
@@ -7065,6 +7100,27 @@ impl SettingsView {
                 .into_any_element(),
         ];
         rows.extend(terminal_rows);
+        rows.push(
+            crate::ui::group_row()
+                .child(search_focus.label(
+                    p,
+                    crate::i18n::catalog::mobile::SHOW_MOBILE_BUTTON.get(),
+                    Some(crate::i18n::catalog::mobile::SHOW_MOBILE_BUTTON_APPEARANCE_DESC.get()),
+                ))
+                .child(
+                    layout::controls().child(
+                        layout::switch(
+                            p,
+                            "appearance-show-mobile-toggle",
+                            s.show_mobile_button,
+                            false,
+                            |next, _, cx| set_show_mobile_button(next, cx),
+                        )
+                        .aria_label(crate::i18n::catalog::mobile::SHOW_MOBILE_BUTTON.get()),
+                    ),
+                )
+                .into_any_element(),
+        );
         div()
             .flex()
             .flex_col()
