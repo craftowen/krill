@@ -2378,3 +2378,69 @@ fn status_bar_provider_visibility_toggle_hides_and_restores_pill(cx: &mut TestAp
     );
     assert!(vcx.debug_bounds("status-provider-pill-opencode").is_some());
 }
+
+#[gpui::test]
+fn open_floating_registers_remote_target_and_distinguishes_hosts(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+    use std::path::PathBuf;
+
+    cx.update(gpui_component::init);
+    cx.update(super::super::bind_keys);
+    let remote_a = HostId::Remote("box-a".into());
+    let remote_b = HostId::Remote("box-b".into());
+    let target_a = krill_app::hosts::HostTarget::remote("box-a", PathBuf::from("/tmp/box-a.sock"));
+    let target_b = krill_app::hosts::HostTarget::remote("box-b", PathBuf::from("/tmp/box-b.sock"));
+
+    cx.update(|cx| {
+        super::open_floating(
+            SessionId(1),
+            Some(target_a.clone()),
+            krill_proto::theme::DEFAULT,
+            cx,
+        )
+        .unwrap();
+    });
+    cx.run_until_parked();
+
+    let floating = cx
+        .update(|cx| super::existing::<super::Floating>(cx))
+        .expect("floating window must open");
+    cx.update(|cx| {
+        floating
+            .read_with(cx, |f, cx| {
+                let shell = f.shell.read(cx);
+                let pane = shell.layout.focused().unwrap();
+                assert_eq!(shell.layout.host(pane), &remote_a);
+                assert_eq!(shell.layout.session(pane), Some(SessionId(1)));
+                assert!(
+                    shell.host_targets.contains_key(&remote_a),
+                    "remote target must be registered in floating shell host_targets"
+                );
+            })
+            .unwrap();
+    });
+
+    // Floating same numeric SessionId(1) on a different remote host must switch host & target.
+    cx.update(|cx| {
+        super::open_floating(
+            SessionId(1),
+            Some(target_b.clone()),
+            krill_proto::theme::DEFAULT,
+            cx,
+        )
+        .unwrap();
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        floating
+            .read_with(cx, |f, cx| {
+                let shell = f.shell.read(cx);
+                let pane = shell.layout.focused().unwrap();
+                assert_eq!(shell.layout.host(pane), &remote_b);
+                assert_eq!(shell.layout.session(pane), Some(SessionId(1)));
+                assert!(shell.host_targets.contains_key(&remote_b));
+                assert!(!shell.host_targets.contains_key(&remote_a));
+            })
+            .unwrap();
+    });
+}

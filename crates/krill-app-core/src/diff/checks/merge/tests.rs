@@ -705,3 +705,86 @@ fn hiding_panel_or_refreshing_during_toggle_pr_draft_keeps_mutation_and_invalida
         );
     });
 }
+
+#[gpui::test]
+fn hiding_and_showing_panel_preserves_in_flight_merge_state_and_error(
+    cx: &mut gpui::TestAppContext,
+) {
+    let fake = Fake::new(true);
+    let (view, cx) = setup(cx, &fake);
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    *fake.mutation_gate.lock().unwrap() = Some(MutationGate {
+        entered,
+        release: wait,
+        executor: cx.executor(),
+    });
+    let mut toggle_cx = cx.clone();
+    let toggle_view = view.clone();
+    let toggler = cx.spawn(async move |_| {
+        entry.await.unwrap();
+        toggle_cx.update(|_, cx| {
+            toggle_view.update(cx, |panel, cx| {
+                panel.set_visible(false, cx);
+                assert!(
+                    panel.checks.loading,
+                    "hiding during an in-flight merge must preserve checks.loading"
+                );
+                assert!(panel.checks.merging);
+                panel.set_visible(true, cx);
+                assert!(panel.checks.loading);
+                assert!(panel.checks.merging);
+            });
+        });
+        release.send(()).unwrap();
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |panel, cx| {
+            panel.merge_pr(PrMergeMethod::Squash, window, cx);
+            panel.confirm_merge(cx);
+        });
+    });
+    cx.run_until_parked();
+    drop(toggler);
+    view.read_with(cx, |panel, _| {
+        assert!(!panel.checks.merging);
+        assert!(!panel.checks.loading);
+        assert!(
+            panel
+                .checks
+                .action_error
+                .as_deref()
+                .is_some_and(|err| err.contains("fake: permission denied")),
+            "merge error must still be surfaced after hide/show while merging"
+        );
+    });
+}
+
+#[gpui::test]
+fn showing_checks_tab_after_hide_restarts_canceled_refresh(cx: &mut gpui::TestAppContext) {
+    let fake = Fake::new(false);
+    let (view, cx) = setup(cx, &fake);
+    let before = fake.inspections.lock().unwrap().len();
+    cx.update(|_, cx| {
+        view.update(cx, |panel, cx| {
+            panel.checks.inspection = None;
+            panel.checks.loading = true;
+            panel.checks.task = Some(cx.spawn(async move |_, _| {
+                std::future::pending::<()>().await;
+            }));
+            panel.set_visible(false, cx);
+            assert!(!panel.checks.loading);
+            assert!(panel.checks.task.is_none());
+            panel.set_visible(true, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        fake.inspections.lock().unwrap().len() > before,
+        "showing Checks tab with no inspection must restart refresh_checks"
+    );
+    view.read_with(cx, |panel, _| {
+        assert!(panel.checks.inspection.is_some());
+        assert!(!panel.checks.loading);
+    });
+}

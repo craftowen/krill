@@ -40,6 +40,14 @@ fn should_reconnect_ipc(err: &io::Error) -> bool {
 }
 
 pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
+    workflow_call_with_timeouts(target, Duration::from_secs(15), Duration::from_secs(5))
+}
+
+fn workflow_call_with_timeouts(
+    target: Option<HostTarget>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> WorkflowCall {
     #[cfg(test)]
     if target.is_none() {
         return Arc::new(|_| {
@@ -67,31 +75,28 @@ pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
                 if conn.negotiated.features & krill_proto::mobile::FEAT_MOBILE == 0 {
                     return Err(io::ErrorKind::Unsupported.into());
                 }
-                conn.stream
-                    .set_read_timeout(Some(Duration::from_secs(15)))?;
-                conn.stream
-                    .set_write_timeout(Some(Duration::from_secs(5)))?;
+                conn.stream.set_read_timeout(Some(read_timeout))?;
+                conn.stream.set_write_timeout(Some(write_timeout))?;
                 *guard = Some(conn);
             }
-            let result = (|| -> io::Result<String> {
+            let result = (|| -> io::Result<Result<String, String>> {
                 let conn = guard.as_mut().ok_or(io::ErrorKind::NotConnected)?;
                 conn.stream.write_all(&req.encode()?)?;
                 let (kind, body) =
                     ipc::read_frame(&mut conn.stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
                 match krill_proto::mobile::MobileReply::decode(kind, &body)? {
-                    krill_proto::mobile::MobileReply::Workflow(out) => Ok(out),
-                    krill_proto::mobile::MobileReply::Failed(err) => Err(io::Error::other(err)),
+                    krill_proto::mobile::MobileReply::Workflow(out) => Ok(Ok(out)),
+                    krill_proto::mobile::MobileReply::Failed(err) => Ok(Err(err)),
                     _ => Err(io::ErrorKind::InvalidData.into()),
                 }
             })();
             match result {
-                Ok(out) => return Ok(out),
-                Err(err) if attempt == 0 && should_reconnect_ipc(&err) => {
-                    *guard = None;
-                }
+                Ok(Ok(out)) => return Ok(out),
+                Ok(Err(err)) => return Err(io::Error::other(err)),
                 Err(err) => {
-                    if should_reconnect_ipc(&err) {
-                        *guard = None;
+                    *guard = None;
+                    if attempt == 0 && should_reconnect_ipc(&err) {
+                        continue;
                     }
                     return Err(err);
                 }
@@ -102,6 +107,14 @@ pub fn workflow_call_for(target: Option<HostTarget>) -> WorkflowCall {
 }
 
 pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
+    daemon_call_with_timeouts(target, Duration::from_secs(10), Duration::from_secs(2))
+}
+
+fn daemon_call_with_timeouts(
+    target: Option<HostTarget>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Call {
     #[cfg(test)]
     if target.is_none() {
         return Arc::new(|_| {
@@ -124,10 +137,8 @@ pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
                     None => HostTarget::local_dev()?,
                 };
                 let conn = resolved.connect(&hello).map_err(io::Error::other)?;
-                conn.stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))?;
-                conn.stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))?;
+                conn.stream.set_read_timeout(Some(read_timeout))?;
+                conn.stream.set_write_timeout(Some(write_timeout))?;
                 *guard = Some(conn);
             }
             let result = {
@@ -137,12 +148,10 @@ pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
             };
             match result {
                 Ok(reply) => return Ok(reply),
-                Err(err) if attempt == 0 && should_reconnect_ipc(&err) => {
-                    *guard = None;
-                }
                 Err(err) => {
-                    if should_reconnect_ipc(&err) {
-                        *guard = None;
+                    *guard = None;
+                    if attempt == 0 && should_reconnect_ipc(&err) {
+                        continue;
                     }
                     return Err(err);
                 }
@@ -1089,3 +1098,203 @@ impl Render for Panel {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod reconnect_tests {
+    use super::*;
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::os::net::UnixListener;
+
+    fn handshake(stream: &mut (impl Read + Write), features: u64) -> io::Result<()> {
+        let hello = ServerHello {
+            proto_min: ipc::PROTO_MIN,
+            proto_max: ipc::PROTO_MAX,
+            features,
+            build: "reconnect-test".into(),
+            instance_id: 1,
+        }
+        .encode()?;
+        stream.write_all(&hello)?;
+        let (kind, body) = ipc::read_frame(stream)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let _client = ClientHello::decode(kind, &body)?;
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_call_drops_cached_connection_after_timeout_and_invalid_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-history-drop-conn-daemon-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let features = FEAT_CONTROL | FEAT_AGENT_HISTORY;
+
+        let server = std::thread::spawn(move || {
+            // Connection 1: delay past read timeout, then send a stale reply so reusing conn 1 would desync.
+            let (mut s1, _) = listener.accept().unwrap();
+            s1.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s1, features).unwrap();
+            let _ = ipc::read_frame(&mut s1).unwrap().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).ok();
+            s1.write_all(
+                &Reply::AgentHistory(Response::Resumed {
+                    session: SessionId(111),
+                })
+                .encode()
+                .unwrap(),
+            )
+            .ok();
+
+            // Connection 2: return an invalid/unexpected frame kind (triggers InvalidData), keep open.
+            let (mut s2, _) = listener.accept().unwrap();
+            s2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s2, features).unwrap();
+            let _ = ipc::read_frame(&mut s2).unwrap().unwrap();
+            s2.write_all(
+                &ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features,
+                    build: "wrong-frame".into(),
+                    instance_id: 2,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Connection 3: valid response proves both TimedOut and InvalidData dropped the cached stream.
+            let (mut s3, _) = listener.accept().unwrap();
+            s3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s3, features).unwrap();
+            let _ = ipc::read_frame(&mut s3).unwrap().unwrap();
+            s3.write_all(
+                &Reply::AgentHistory(Response::Resumed {
+                    session: SessionId(333),
+                })
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        });
+
+        let call = daemon_call_with_timeouts(
+            Some(HostTarget::remote("studio", socket)),
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+        let req = Request::AgentHistory(Action::Scan);
+
+        let err1 = call(&req).unwrap_err();
+        assert!(
+            matches!(
+                err1.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "expected timeout, got {err1:?}"
+        );
+        release_tx.send(()).ok();
+
+        let err2 = call(&req).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+
+        let reply3 = call(&req).unwrap();
+        assert_eq!(
+            reply3,
+            Reply::AgentHistory(Response::Resumed {
+                session: SessionId(333),
+            })
+        );
+
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workflow_call_drops_cached_connection_after_timeout_and_invalid_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-history-drop-conn-workflow-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("workflow.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let features = krill_proto::mobile::FEAT_MOBILE;
+
+        let server = std::thread::spawn(move || {
+            // Connection 1: time out, then write a stale Workflow reply.
+            let (mut s1, _) = listener.accept().unwrap();
+            s1.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s1, features).unwrap();
+            let _ = ipc::read_frame(&mut s1).unwrap().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).ok();
+            s1.write_all(
+                &krill_proto::mobile::MobileReply::Workflow("stale".into())
+                    .encode()
+                    .unwrap(),
+            )
+            .ok();
+
+            // Connection 2: write an unexpected frame kind (InvalidData), keep open.
+            let (mut s2, _) = listener.accept().unwrap();
+            s2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s2, features).unwrap();
+            let _ = ipc::read_frame(&mut s2).unwrap().unwrap();
+            s2.write_all(
+                &ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features,
+                    build: "wrong-frame".into(),
+                    instance_id: 2,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Connection 3: fresh valid reply.
+            let (mut s3, _) = listener.accept().unwrap();
+            s3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            handshake(&mut s3, features).unwrap();
+            let _ = ipc::read_frame(&mut s3).unwrap().unwrap();
+            s3.write_all(
+                &krill_proto::mobile::MobileReply::Workflow("fresh".into())
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+        });
+
+        let call = workflow_call_with_timeouts(
+            Some(HostTarget::remote("studio", socket)),
+            Duration::from_millis(60),
+            Duration::from_secs(1),
+        );
+
+        let err1 = call("{}").unwrap_err();
+        assert!(
+            matches!(
+                err1.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "expected timeout, got {err1:?}"
+        );
+        release_tx.send(()).ok();
+
+        let err2 = call("{}").unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(call("{}").unwrap(), "fresh");
+
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

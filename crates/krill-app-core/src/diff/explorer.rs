@@ -551,6 +551,14 @@ impl Explorer {
         }
     }
 
+    pub(crate) fn is_dir_expanded(&self, path: &Path) -> bool {
+        if self.filter_query.trim().is_empty() {
+            self.expanded.contains(path)
+        } else {
+            !self.filter_collapsed.contains(path)
+        }
+    }
+
     fn path_is_dir(&self, path: &Path) -> bool {
         path == self.repo
             || self.rows.iter().any(|row| row.path == path && row.is_dir)
@@ -585,7 +593,7 @@ impl Explorer {
                         "target directory is outside worktree",
                     )
                 })?;
-                if !canon_parent.starts_with(&canon_repo) {
+                if !canonical_within_repo_without_git(&canon_repo, &canon_parent) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target directory is outside worktree",
@@ -637,7 +645,7 @@ impl Explorer {
                         "target directory is outside worktree",
                     )
                 })?;
-                if !canon_parent.starts_with(&canon_repo) {
+                if !canonical_within_repo_without_git(&canon_repo, &canon_parent) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target directory is outside worktree",
@@ -692,41 +700,23 @@ impl Explorer {
             if clean.is_empty()
                 || clean == "."
                 || clean == ".."
-                || clean == ".git"
                 || clean.contains('/')
                 || clean.contains('\\')
+                || is_forbidden_git_segment(OsStr::new(clean))
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "invalid file or folder name",
                 ));
             }
-            let canon_repo = self.repo.canonicalize().map_err(|_| denied())?;
-            let parent_rel = parent.strip_prefix(&self.repo).map_err(|_| denied())?;
-            let mut cur = self.repo.clone();
-            for comp in parent_rel.components() {
-                let Component::Normal(part) = comp else {
-                    return Err(denied());
-                };
-                if part == OsStr::new(".git") {
-                    return Err(denied());
-                }
-                cur.push(part);
-                let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                if !canon_cur.starts_with(&canon_repo) {
-                    return Err(denied());
-                }
-            }
-            let canon_parent = parent.canonicalize().map_err(|_| denied())?;
-            if !canon_parent.starts_with(&canon_repo) {
-                return Err(denied());
-            }
-            target.symlink_metadata()?;
+            ensure_worktree_target_path(&self.repo, target, "cannot rename outside worktree root")?;
             let new_path = parent.join(clean);
             if new_path == target {
                 return Ok(new_path);
             }
-            if new_path.exists() || fs::symlink_metadata(&new_path).is_ok() {
+            if (new_path.exists() || fs::symlink_metadata(&new_path).is_ok())
+                && !is_case_only_same_entry(parent, target, &new_path)?
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "target name already exists",
@@ -787,7 +777,14 @@ impl Explorer {
                 },
             )
         } else {
-            krill_proto::usage::profiles::move_path_to_trash(&self.home, &self.repo, target)
+            ensure_worktree_target_path(
+                &self.repo,
+                target,
+                "cannot delete worktree root, .git, or outside path",
+            )
+            .and_then(|()| {
+                krill_proto::usage::profiles::move_path_to_trash(&self.home, &self.repo, target)
+            })
         };
         let trashed = match res {
             Ok(path) => path,
@@ -965,6 +962,130 @@ impl Explorer {
     }
 }
 
+fn is_forbidden_git_segment(part: &OsStr) -> bool {
+    let lossy = part.to_string_lossy();
+    let base = lossy
+        .split_once(':')
+        .map_or(lossy.as_ref(), |(head, _)| head);
+    let trimmed = base.trim_end_matches(['.', ' ']);
+    trimmed.eq_ignore_ascii_case(".git")
+        || (cfg!(windows) && (lossy.contains(':') || lossy.ends_with(['.', ' '])))
+}
+
+fn target_has_forbidden_git_segment(repo: &Path, target: &Path) -> bool {
+    target.strip_prefix(repo).is_ok_and(|rel| {
+        rel.components().any(|comp| match comp {
+            Component::Normal(part) => is_forbidden_git_segment(part),
+            _ => true,
+        })
+    })
+}
+
+fn canonical_within_repo_without_git(canon_repo: &Path, canon_path: &Path) -> bool {
+    let Ok(rel) = canon_path.strip_prefix(canon_repo) else {
+        return false;
+    };
+    !rel.components().any(|comp| match comp {
+        Component::Normal(part) => is_forbidden_git_segment(part),
+        _ => true,
+    })
+}
+
+fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
+    let is_symlink = meta.file_type().is_symlink();
+    #[cfg(windows)]
+    let is_symlink = {
+        use std::os::windows::fs::MetadataExt as _;
+        is_symlink
+            || (meta.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                != 0)
+    };
+    is_symlink
+}
+
+fn ensure_worktree_target_path(
+    repo: &Path,
+    target: &Path,
+    denied_msg: &'static str,
+) -> io::Result<()> {
+    let denied = || io::Error::new(io::ErrorKind::PermissionDenied, denied_msg);
+    if !target.starts_with(repo)
+        || target == repo
+        || target
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(denied());
+    }
+    let rel = target.strip_prefix(repo).map_err(|_| denied())?;
+    let canon_repo = repo.canonicalize().map_err(|_| denied())?;
+    let mut cur = repo.to_path_buf();
+    let mut comps = rel.components().peekable();
+    if comps.peek().is_none() {
+        return Err(denied());
+    }
+    while let Some(comp) = comps.next() {
+        let Component::Normal(part) = comp else {
+            return Err(denied());
+        };
+        if is_forbidden_git_segment(part) {
+            return Err(denied());
+        }
+        cur.push(part);
+        if comps.peek().is_some() {
+            let canon_cur = cur.canonicalize().map_err(|_| denied())?;
+            if !canonical_within_repo_without_git(&canon_repo, &canon_cur) {
+                return Err(denied());
+            }
+        } else {
+            let meta = fs::symlink_metadata(&cur)?;
+            if !is_symlink_or_reparse(&meta) {
+                let canon_cur = cur.canonicalize().map_err(|_| denied())?;
+                if !canonical_within_repo_without_git(&canon_repo, &canon_cur) {
+                    return Err(denied());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_case_only_same_entry(parent: &Path, target: &Path, new_path: &Path) -> io::Result<bool> {
+    let (Some(old_name), Some(new_name)) = (target.file_name(), new_path.file_name()) else {
+        return Ok(false);
+    };
+    if old_name == new_name {
+        return Ok(false);
+    }
+    if old_name.to_string_lossy().to_lowercase() != new_name.to_string_lossy().to_lowercase() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let target_meta = fs::symlink_metadata(target)?;
+        let Ok(new_meta) = fs::symlink_metadata(new_path) else {
+            return Ok(false);
+        };
+        if target_meta.dev() != new_meta.dev() || target_meta.ino() != new_meta.ino() {
+            return Ok(false);
+        }
+    }
+    let mut saw_target = false;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == new_name {
+            return Ok(false);
+        }
+        if name == old_name {
+            saw_target = true;
+        }
+    }
+    Ok(saw_target)
+}
+
 fn ensure_worktree_create_path(
     repo: &Path,
     parent_dir: &Path,
@@ -991,14 +1112,14 @@ fn ensure_worktree_create_path(
         let Component::Normal(part) = comp else {
             return Err(denied());
         };
-        if part == OsStr::new(".git") {
+        if is_forbidden_git_segment(part) {
             return Err(denied());
         }
         cur.push(part);
         match fs::symlink_metadata(&cur) {
             Ok(_) => {
                 let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                if !canon_cur.starts_with(&canon_repo) {
+                if !canonical_within_repo_without_git(&canon_repo, &canon_cur) {
                     return Err(denied());
                 }
             }
@@ -1027,7 +1148,7 @@ fn validate_relative_input(raw: &str) -> io::Result<PathBuf> {
     let mut clean = PathBuf::new();
     for comp in path.components() {
         match comp {
-            Component::Normal(part) if part != OsStr::new(".git") => clean.push(part),
+            Component::Normal(part) if !is_forbidden_git_segment(part) => clean.push(part),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1085,16 +1206,33 @@ fn sort_entries(entries: &mut [DirEntry]) {
 }
 
 fn read_dir_entries(repo: &Path, dir: &Path) -> Vec<DirEntry> {
+    if !dir.starts_with(repo)
+        || dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || target_has_forbidden_git_segment(repo, dir)
+    {
+        return Vec::new();
+    }
+    let Ok(canon_repo) = repo.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(canon_dir) = dir.canonicalize() else {
+        return Vec::new();
+    };
+    if !canonical_within_repo_without_git(&canon_repo, &canon_dir) {
+        return Vec::new();
+    }
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let file_name = entry.file_name();
-        let name = file_name.to_string_lossy().into_owned();
-        if name == ".git" {
+        if is_forbidden_git_segment(&file_name) {
             continue;
         }
+        let name = file_name.to_string_lossy().into_owned();
         let path = entry.path();
         let (is_dir, is_symlink) = entry.file_type().map_or((false, false), |ft| {
             let is_symlink = ft.is_symlink();
@@ -1660,8 +1798,12 @@ impl Panel {
         cx: &mut Context<Self>,
     ) {
         self.ensure_explorer_loaded_async(cx);
-        if !target.starts_with(&self.explorer.repo) || target == self.explorer.repo {
-            self.explorer.error = Some("cannot delete worktree root or outside path".to_owned());
+        if !target.starts_with(&self.explorer.repo)
+            || target == self.explorer.repo
+            || target_has_forbidden_git_segment(&self.explorer.repo, target)
+        {
+            self.explorer.error =
+                Some("cannot delete worktree root, .git, or outside path".to_owned());
             cx.notify();
             return;
         }
@@ -1977,10 +2119,10 @@ impl Panel {
                 div()
                     .id("explorer-tree-container")
                     .track_focus(&tree_focus)
-                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
                         if this.explorer.editing.is_some() {
                             if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
-                                this.on_explorer_tree_key("escape", cx);
+                                this.on_explorer_tree_key("escape", window, cx);
                             }
                             return;
                         }
@@ -2011,7 +2153,7 @@ impl Panel {
                             cx.stop_propagation();
                             cx.notify();
                         } else {
-                            this.on_explorer_tree_key(ev.keystroke.key.as_str(), cx);
+                            this.on_explorer_tree_key(ev.keystroke.key.as_str(), window, cx);
                         }
                         if let Some(index) = this.explorer.selected_index() {
                             this.explorer
@@ -2045,8 +2187,15 @@ impl Panel {
             .children(confirm_dialog)
     }
 
+    fn explorer_edit_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.explorer
+            .editing
+            .as_ref()
+            .is_some_and(|(_, input, _)| crate::jump::entity_input_is_composing(input, window, cx))
+    }
+
     /// 트리 화살표 키 탐색(OWE-849): `↑/↓` 이동, `→` 펼치기, `←` 접기/부모로, `Enter` 고정 열기.
-    fn on_explorer_tree_key(&mut self, key: &str, cx: &mut Context<Self>) {
+    fn on_explorer_tree_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.explorer.editing.is_some() && key != "escape" {
             return;
         }
@@ -2065,7 +2214,7 @@ impl Panel {
                 cx.stop_propagation();
                 if let Some(selected) = self.explorer.selected.clone()
                     && self.explorer.path_is_dir(&selected)
-                    && !self.explorer.expanded.contains(&selected)
+                    && !self.explorer.is_dir_expanded(&selected)
                 {
                     self.toggle_explorer_dir(&selected, cx);
                 }
@@ -2074,7 +2223,7 @@ impl Panel {
                 cx.stop_propagation();
                 if let Some(selected) = self.explorer.selected.clone() {
                     if self.explorer.path_is_dir(&selected)
-                        && self.explorer.expanded.contains(&selected)
+                        && self.explorer.is_dir_expanded(&selected)
                     {
                         self.toggle_explorer_dir(&selected, cx);
                     } else {
@@ -2083,7 +2232,7 @@ impl Panel {
                     }
                 }
             }
-            "enter" => {
+            "enter" if self.explorer.editing.is_none() => {
                 cx.stop_propagation();
                 if let Some(selected) = self.explorer.selected.clone() {
                     if self.explorer.path_is_dir(&selected) {
@@ -2095,6 +2244,9 @@ impl Panel {
                 }
             }
             "escape" if self.explorer.editing.is_some() => {
+                if window.default_prevented() || self.explorer_edit_is_composing(window, cx) {
+                    return;
+                }
                 cx.stop_propagation();
                 self.cancel_explorer_edit(cx);
             }
@@ -2448,6 +2600,8 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let indent_px = f32::from(u16::try_from(depth).unwrap_or(16).min(16)) * 14.0 + 8.0;
+        let escape_input = input.clone();
+        let keydown_input = input.clone();
         div()
             .id("explorer-edit-inline")
             .debug_selector(|| "explorer-edit-inline".into())
@@ -2469,12 +2623,33 @@ impl Panel {
                 .text_color(ui::palette(cx).foreground),
             )
             .child(div().flex_1().min_w_0().child(Input::new(input).xsmall()))
-            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                if ev.keystroke.key.as_str() == "escape" {
-                    cx.stop_propagation();
-                    this.cancel_explorer_edit(cx);
-                }
-            }))
+            .capture_action(
+                cx.listener(move |_, _: &gpui_component::input::Escape, window, cx| {
+                    if crate::jump::entity_input_is_composing(&escape_input, window, cx) {
+                        window.prevent_default();
+                    }
+                }),
+            )
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Enter, window, cx| {
+                    if this.explorer_edit_is_composing(window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_key_down(
+                cx.listener(move |this, ev: &gpui::KeyDownEvent, window, cx| {
+                    if ev.keystroke.key.as_str() == "escape" && !ev.keystroke.modifiers.modified() {
+                        if window.default_prevented()
+                            || crate::jump::entity_input_is_composing(&keydown_input, window, cx)
+                        {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.cancel_explorer_edit(cx);
+                    }
+                }),
+            )
             .into_any_element()
     }
 }
@@ -3129,6 +3304,240 @@ mod external_open_tests {
             assert!(
                 panel.explorer.filter_generation > gen_before,
                 "plain enter should still trigger apply_explorer_filter_now"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "krill-explorer-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::remove_dir_all(&dir).ok();
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir.canonicalize().unwrap())
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn case_only_rename_succeeds_without_false_collision() {
+        let dir = TempDir::new("case-rename");
+        let root = dir.0.clone();
+        fs::write(root.join("readme.md"), "hello").unwrap();
+        fs::write(root.join("other.md"), "keep").unwrap();
+
+        let mut ex = Explorer::new(root.clone());
+        ex.ensure_loaded();
+
+        let renamed = ex
+            .rename_path(&root.join("readme.md"), "README.md")
+            .unwrap();
+        assert_eq!(renamed, root.join("README.md"));
+        let names: Vec<OsString> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.iter().any(|name| name == OsStr::new("README.md")));
+        assert!(!names.iter().any(|name| name == OsStr::new("readme.md")));
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "hello");
+
+        let collision = ex.rename_path(&renamed, "other.md").unwrap_err();
+        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(root.join("other.md")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn local_explorer_guards_git_aliases_and_symlinks_across_all_ops() {
+        let outer = TempDir::new("git-guard");
+        let repo = outer.0.join("repo");
+        let home = outer.0.join("home");
+        fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(repo.join("ok.txt"), "ok\n").unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        let mut ex = Explorer::new(repo.clone());
+        ex.set_home(home);
+        ex.ensure_loaded();
+
+        for bad in [".git", ".GIT", ".git.", ".GIT. ", ".git::$DATA"] {
+            assert!(ex.create_file(&repo, bad).is_err(), "create_file {bad:?}");
+            assert!(
+                ex.create_folder(&repo, bad).is_err(),
+                "create_folder {bad:?}"
+            );
+            assert!(
+                ex.rename_path(&repo.join("ok.txt"), bad).is_err(),
+                "rename to {bad:?}"
+            );
+        }
+
+        for protected in [repo.join(".git"), repo.join(".GIT"), repo.join(".git/HEAD")] {
+            assert!(
+                ex.rename_path(&protected, "moved").is_err(),
+                "rename {protected:?}"
+            );
+            assert!(ex.delete_path(&protected).is_err(), "delete {protected:?}");
+        }
+
+        #[cfg(unix)]
+        {
+            let git_link = repo.join("git_link");
+            std::os::unix::fs::symlink(repo.join(".git"), &git_link).unwrap();
+            assert!(ex.create_file(&git_link, "hook").is_err());
+            assert!(ex.create_folder(&git_link, "hook_dir").is_err());
+            assert!(ex.rename_path(&git_link.join("HEAD"), "HEAD2").is_err());
+            assert!(ex.delete_path(&git_link.join("HEAD")).is_err());
+            assert!(read_dir_entries(&repo, &git_link).is_empty());
+        }
+
+        assert!(read_dir_entries(&repo, &repo.join(".git")).is_empty());
+        assert!(repo.join(".git/HEAD").is_file());
+    }
+
+    #[gpui::test]
+    fn explorer_tree_arrows_respect_filter_mode_expansion(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = TempDir::new("filter-arrows");
+        let root = dir.0.clone();
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/nested/deep.rs"), "fn deep() {}\n").unwrap();
+        let src = root.join("src");
+
+        let panel_root = root.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut panel = Panel::unconnected(panel_root, cx);
+            panel.tab = super::super::PanelTab::Files;
+            panel.explorer.ensure_loaded();
+            panel.explorer.set_filter_query("deep");
+            panel.explorer.selected = Some(src.clone());
+            panel
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let focus = view.read(cx).explorer.tree_focus.clone().unwrap();
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |panel, _| {
+            assert!(panel.explorer.is_dir_expanded(&src));
+            assert_eq!(panel.explorer.rows.len(), 3);
+        });
+
+        // Right arrow on an already-expanded filtered folder must NOT collapse it.
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.explorer.is_dir_expanded(&src));
+            assert_eq!(panel.explorer.rows.len(), 3);
+        });
+
+        // Left arrow collapses the filtered folder via filter_collapsed.
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(!panel.explorer.is_dir_expanded(&src));
+            assert!(panel.explorer.filter_collapsed.contains(&src));
+            assert_eq!(panel.explorer.rows.len(), 1);
+        });
+
+        // Right arrow re-expands the filtered folder.
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(panel.explorer.is_dir_expanded(&src));
+            assert!(!panel.explorer.filter_collapsed.contains(&src));
+            assert_eq!(panel.explorer.rows.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    fn explorer_inline_edit_respects_ime_composition_on_enter_and_escape(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let dir = TempDir::new("inline-ime");
+        let root = dir.0.clone();
+        fs::write(root.join("existing.txt"), "ok\n").unwrap();
+
+        let panel_root = root.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = Panel::unconnected(panel_root.clone(), cx);
+            panel.tab = super::super::PanelTab::Files;
+            panel.explorer.ensure_loaded();
+            panel.start_explorer_edit(EditKind::NewFile { parent: panel_root }, window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| {
+                let input = panel.explorer.editing.as_ref().unwrap().1.clone();
+                input.update(cx, |state, cx| {
+                    gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                        state, None, "한", None, window, cx,
+                    );
+                });
+                assert!(panel.explorer_edit_is_composing(window, cx));
+            });
+        });
+
+        // Enter while composing must not submit or close the inline editor.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.explorer.editing.is_some(),
+                "PressEnter during IME composition must not submit inline edit"
+            );
+        });
+        assert!(!root.join("한").exists());
+
+        // Re-mark IME composition and verify Escape cancels composition only, keeping inline edit open.
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| {
+                let input = panel.explorer.editing.as_ref().unwrap().1.clone();
+                input.update(cx, |state, cx| {
+                    gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                        state, None, "한", None, window, cx,
+                    );
+                });
+                assert!(panel.explorer_edit_is_composing(window, cx));
+            });
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.explorer.editing.is_some(),
+                "Escape during IME composition must not cancel inline edit"
+            );
+        });
+
+        // A second Escape (no longer composing) cancels the inline edit.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |panel, _| {
+            assert!(
+                panel.explorer.editing.is_none(),
+                "Escape after IME composition ends must cancel inline edit"
             );
         });
     }

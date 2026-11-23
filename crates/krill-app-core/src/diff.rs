@@ -55,7 +55,8 @@ pub use search::{
 pub const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 mod edit;
 pub use edit::{
-    apply_git_patch, build_hunk_patch, build_line_patch, extract_patch_header_and_hunks,
+    apply_git_patch, build_hunk_patch, build_line_patch, build_line_patch_for_sides,
+    extract_patch_header_and_hunks,
 };
 const TIMEOUT: Duration = Duration::from_secs(5);
 const WATCH_POLL: Duration = Duration::from_millis(100);

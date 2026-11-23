@@ -6,9 +6,10 @@ impl SettingsView {
         if !self.workflow_hooks_ready(cx) {
             return;
         }
-        let Some(form) = &self.workflow_form else {
+        let Some(form) = &mut self.workflow_form else {
             return;
         };
+        form.location_status = None;
         let repo = form.repo_path.read(cx).value().trim().to_owned();
         let saving_repo = repo.clone();
         let saved = raw.trim().to_owned();
@@ -26,6 +27,7 @@ impl SettingsView {
                         // 저장한 값이 새 기준이다. 결과 문구는 저장 버튼 옆에 나오되 훅 실패를 덮지 않는다.
                         Ok(()) => {
                             form.loaded_location = saved;
+                            form.location_status = None;
                             if !form.status.as_ref().is_some_and(|(_, error)| *error) {
                                 form.status = Some((text::HOOKS_SAVED.get().into(), false));
                             }
@@ -112,5 +114,71 @@ impl SettingsView {
             );
         }
         section.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn save_worktree_location_clears_prior_error_on_default_reset(cx: &mut gpui::TestAppContext) {
+        let dir =
+            std::env::temp_dir().join(format!("krill-location-clear-err-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().into_owned();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.services
+                    .aliases
+                    .insert(repo_str.clone(), repo_str.clone());
+                let mk = |val: &str, window: &mut Window, cx: &mut Context<SettingsView>| {
+                    let s = val.to_owned();
+                    cx.new(|cx| gpui_component::input::InputState::new(window, cx).default_value(s))
+                };
+                v.workflow_form = Some(WorkflowRepoForm {
+                    repo_path: mk(&repo_str, window, cx),
+                    symlink_path: mk("", window, cx),
+                    setup_script: mk("", window, cx),
+                    archive_script: mk("", window, cx),
+                    pending_repo_path: None,
+                    loaded_repo: Some(repo_str.clone()),
+                    loaded_setup: String::new(),
+                    loaded_archive: String::new(),
+                    worktree_location: mk("", window, cx),
+                    loaded_location: "/bad".into(),
+                    location_status: Some(("invalid location".into(), true)),
+                    symlink_status: None,
+                    refresh_hooks: false,
+                    status: None,
+                    _subs: Vec::new(),
+                });
+                v.save_worktree_location(String::new(), cx);
+                assert!(
+                    v.workflow_form.as_ref().unwrap().location_status.is_none(),
+                    "prior location_status error must be cleared when starting save"
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, _| {
+            let form = v.workflow_form.as_ref().unwrap();
+            assert!(
+                form.location_status.is_none(),
+                "location_status error must remain cleared after Ok(())"
+            );
+            assert!(form.loaded_location.is_empty());
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

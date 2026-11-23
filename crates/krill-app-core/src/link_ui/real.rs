@@ -204,46 +204,12 @@ impl LinkBackend for RealLinkBackend {
     }
 
     fn update_host(&self, id: &str) -> Result<(), String> {
-        use krill_proto::control::{Create, FEAT_CLI, FEAT_CONTROL, Program, Reply, Request};
-        use krill_proto::screen::Msg as _;
-        use std::io::Write as _;
-
-        let err = || text::ERR_UPDATE.get().to_owned();
-        let hello = krill_proto::daemon::client_hello(
-            krill_proto::ipc::ClientRole::App,
-            "krill-app-remote-update",
-        );
-        let mut conn = self.remote_target(id)?.connect(&hello).map_err(|_| err())?;
-        let need = FEAT_CONTROL | FEAT_CLI;
-        if conn.negotiated.features & need != need {
-            return Err(text::ERR_UPDATE_UNSUPPORTED.get().to_owned());
+        let target = self.remote_target(id)?;
+        send_remote_update(&target, Duration::from_secs(10), Duration::from_secs(5))?;
+        if let Ok(mut cache) = self.versions.lock() {
+            cache.remove(id);
         }
-        let create = Request::Create(Create {
-            account: None,
-            program: Program::Custom {
-                program: b"/bin/sh".to_vec(),
-                args: vec![b"-c".to_vec(), REMOTE_UPDATE_SCRIPT.as_bytes().to_vec()],
-            },
-            cwd: b"/tmp".to_vec(),
-            cols: 120,
-            rows: 24,
-        });
-        conn.stream
-            .write_all(&create.encode().map_err(|_| err())?)
-            .map_err(|_| err())?;
-        let (kind, body) = krill_proto::ipc::read_frame(&mut conn.stream)
-            .ok()
-            .flatten()
-            .ok_or_else(err)?;
-        match Reply::decode(kind, &body) {
-            Ok(Reply::Created { .. }) => {
-                if let Ok(mut cache) = self.versions.lock() {
-                    cache.remove(id);
-                }
-                Ok(())
-            }
-            _ => Err(err()),
-        }
+        Ok(())
     }
 
     fn disconnect_host(&self, id: &str) -> Result<Vec<PairedHost>, String> {
@@ -305,5 +271,117 @@ pub fn classify_pair_error(err: &krill_link_core::Error) -> PairFailure {
             PairFailure::RateLimited
         }
         _ => PairFailure::Unavailable,
+    }
+}
+
+fn send_remote_update(
+    target: &krill_hosts::HostTarget,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), String> {
+    use krill_proto::control::{Create, FEAT_CLI, FEAT_CONTROL, Program, Reply, Request};
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+
+    let err = || text::ERR_UPDATE.get().to_owned();
+    let hello = krill_proto::daemon::client_hello(
+        krill_proto::ipc::ClientRole::App,
+        "krill-app-remote-update",
+    );
+    let mut conn = target.connect(&hello).map_err(|_| err())?;
+    conn.stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|_| err())?;
+    conn.stream
+        .set_write_timeout(Some(write_timeout))
+        .map_err(|_| err())?;
+    let need = FEAT_CONTROL | FEAT_CLI;
+    if conn.negotiated.features & need != need {
+        return Err(text::ERR_UPDATE_UNSUPPORTED.get().to_owned());
+    }
+    let create = Request::Create(Create {
+        account: None,
+        program: Program::Custom {
+            program: b"/bin/sh".to_vec(),
+            args: vec![b"-c".to_vec(), REMOTE_UPDATE_SCRIPT.as_bytes().to_vec()],
+        },
+        cwd: b"/tmp".to_vec(),
+        cols: 120,
+        rows: 24,
+    });
+    conn.stream
+        .write_all(&create.encode().map_err(|_| err())?)
+        .map_err(|_| err())?;
+    let (kind, body) = krill_proto::ipc::read_frame(&mut conn.stream)
+        .ok()
+        .flatten()
+        .ok_or_else(err)?;
+    match Reply::decode(kind, &body) {
+        Ok(Reply::Created { .. }) => Ok(()),
+        _ => Err(err()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_update_times_out_instead_of_hanging_when_daemon_stalls() {
+        use krill_proto::control::{FEAT_CLI, FEAT_CONTROL};
+        use krill_proto::ipc::{self, ClientHello, ServerHello};
+        use krill_proto::os::net::UnixListener;
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        let dir =
+            std::env::temp_dir().join(format!("krill-link-update-timeout-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("remote.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(
+                    &ServerHello {
+                        proto_min: ipc::PROTO_MIN,
+                        proto_max: ipc::PROTO_MAX,
+                        features: FEAT_CONTROL | FEAT_CLI,
+                        build: "test".into(),
+                        instance_id: 1,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+            ClientHello::decode(kind, &body).unwrap();
+            // Read the Create request, then intentionally withhold any reply until released.
+            ipc::read_frame(&mut stream).ok();
+            done_rx.recv_timeout(Duration::from_secs(3)).ok();
+        });
+
+        let target = krill_hosts::HostTarget::remote("stalled-host", socket);
+        let started = Instant::now();
+        let res = send_remote_update(
+            &target,
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+        );
+        let elapsed = started.elapsed();
+        done_tx.send(()).ok();
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(res.is_err(), "stalled remote update must fail with timeout");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "remote update hung for {elapsed:?} instead of respecting timeout"
+        );
     }
 }

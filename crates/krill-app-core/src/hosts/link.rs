@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::i18n::link_ui as text;
 use krill_hosts::{ExternalHost, HostConnectionInfo, HostStatus, RemoteConnector, RemoteHostSpec};
@@ -31,6 +31,7 @@ pub struct LinkHosts {
     children: Arc<OwnedChildren>,
     closed: Arc<AtomicBool>,
     repaired: Mutex<BTreeSet<String>>,
+    paired_at: Mutex<BTreeMap<String, u64>>,
     /// 사용자가 사이드바에서 '연결 해제'를 눌러 수동으로 끊은 호스트.
     /// `paired`(재연결)로만 풀리며, 그 전까지 자식 기동·자동 재접속을 하지 않는다.
     suspended: Arc<Mutex<BTreeSet<String>>>,
@@ -69,7 +70,8 @@ struct Slot {
     removed: AtomicBool,
     revoked: AtomicBool,
     restart: AtomicBool,
-    starting: AtomicBool,
+    starting: AtomicUsize,
+    paired_at_ms: AtomicU64,
     owned: Mutex<BTreeSet<u32>>,
     children: Arc<OwnedChildren>,
     suspended: Arc<Mutex<BTreeSet<String>>>,
@@ -99,6 +101,7 @@ impl LinkHosts {
                 children: Arc::new(OwnedChildren::default()),
                 closed: Arc::new(AtomicBool::new(false)),
                 repaired: Mutex::new(BTreeSet::new()),
+                paired_at: Mutex::new(BTreeMap::new()),
                 suspended: Arc::new(Mutex::new(BTreeSet::new())),
             });
             map.insert(state_dir, Arc::downgrade(&service));
@@ -111,6 +114,7 @@ impl LinkHosts {
             children: Arc::new(OwnedChildren::default()),
             closed: Arc::new(AtomicBool::new(false)),
             repaired: Mutex::new(BTreeSet::new()),
+            paired_at: Mutex::new(BTreeMap::new()),
             suspended: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
@@ -128,6 +132,12 @@ impl LinkHosts {
             let slot = slots
                 .entry(host.id.clone())
                 .or_insert_with(|| {
+                    let paired_at = self
+                        .paired_at
+                        .lock()
+                        .ok()
+                        .and_then(|times| times.get(&host.id).copied())
+                        .unwrap_or(0);
                     let slot = Arc::new(Slot {
                         state_dir: self.state_dir.clone(),
                         executable: self.executable.clone(),
@@ -138,7 +148,8 @@ impl LinkHosts {
                         removed: AtomicBool::new(false),
                         revoked: AtomicBool::new(false),
                         restart: AtomicBool::new(false),
-                        starting: AtomicBool::new(false),
+                        starting: AtomicUsize::new(0),
+                        paired_at_ms: AtomicU64::new(paired_at),
                         owned: Mutex::new(BTreeSet::new()),
                         children: self.children.clone(),
                         suspended: self.suspended.clone(),
@@ -164,7 +175,11 @@ impl LinkHosts {
             {
                 lease.stop();
             }
-            let mut info = connection_info(&self.state_dir, &host.id)?;
+            let mut info = connection_info_since(
+                &self.state_dir,
+                &host.id,
+                slot.paired_at_ms.load(Ordering::Acquire),
+            )?;
             if suspended {
                 info.status = HostStatus::Disconnected;
                 info.error = None;
@@ -178,20 +193,17 @@ impl LinkHosts {
                 slot.restart.store(true, Ordering::Release);
             } else if info.error.is_some()
                 && !slot.restart.load(Ordering::Acquire)
-                && !slot.starting.load(Ordering::Acquire)
+                && slot.starting.load(Ordering::Acquire) == 0
             {
                 slot.revoked.store(true, Ordering::Release);
                 if let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade()) {
                     lease.stop();
                 }
             }
-            if repaired
-                || slot.restart.load(Ordering::Acquire)
-                || slot.starting.load(Ordering::Acquire)
-            {
+            let starting = slot.starting.load(Ordering::Acquire) > 0;
+            if repaired || slot.restart.load(Ordering::Acquire) || starting {
                 info.error = None;
-                if slot.starting.load(Ordering::Acquire) && info.status == HostStatus::Disconnected
-                {
+                if starting && info.status == HostStatus::Disconnected {
                     info.status = HostStatus::Connecting;
                 }
             }
@@ -247,18 +259,24 @@ impl LinkHosts {
 
     /// 새 초대로 페어링한 경우 이전 권한 해제 상태의 연결만 새로 시작한다.
     pub fn paired(&self, id: &str) {
+        let paired_at = now_unix_ms();
         if let Ok(mut ids) = self.suspended.lock() {
             ids.remove(id);
+        }
+        if let Ok(mut times) = self.paired_at.lock() {
+            times.insert(id.to_owned(), paired_at);
         }
         if let Ok(mut repaired) = self.repaired.lock() {
             repaired.insert(id.to_owned());
         }
+        clear_status_file(&self.state_dir, id);
         let slot = self
             .slots
             .lock()
             .ok()
             .and_then(|slots| slots.get(id).cloned());
         if let Some(slot) = slot {
+            slot.paired_at_ms.store(paired_at, Ordering::Release);
             slot.revoked.store(false, Ordering::Release);
             slot.restart.store(true, Ordering::Release);
             if let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade()) {
@@ -286,6 +304,9 @@ impl LinkHosts {
             if let Ok(mut repaired) = self.repaired.lock() {
                 repaired.remove(id);
             }
+            if let Ok(mut times) = self.paired_at.lock() {
+                times.remove(id);
+            }
             slot
         };
         if let Some(slot) = slot
@@ -296,8 +317,7 @@ impl LinkHosts {
         Ok(())
     }
 
-    /// 앱 종료 훅의 백그라운드 작업에서 호출한다.
-    pub fn shutdown(&self) {
+    fn take_owned_children_for_shutdown(&self, out: &mut Vec<(Arc<Slot>, Child)>) {
         self.closed.store(true, Ordering::Release);
         // A connector can keep a removed registration alive. Track weak slots
         // independently of the visible registry so every owned lease is stopped.
@@ -313,10 +333,33 @@ impl LinkHosts {
             let lease = slot.lease.lock().ok().and_then(|lease| lease.upgrade());
             if let Some(lease) = lease {
                 lease.generation.fetch_add(1, Ordering::AcqRel);
-                lease.stop_blocking();
+                if let Some(child) = lease
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    out.push((Arc::clone(&lease.slot), child));
+                }
             }
             // A Lease may already be dropping, or a detached stop worker may
             // have taken its Child. Ownership ends only after wait(), not take().
+        }
+    }
+
+    /// 종료가 시작되었는지 돌려준다.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// 앱 종료 훅의 백그라운드 작업에서 호출한다.
+    pub fn shutdown(&self) {
+        let mut children = Vec::new();
+        self.take_owned_children_for_shutdown(&mut children);
+        terminate_tunnel_children(&mut children, SHUTDOWN_TERM_GRACE);
+        for (slot, child) in children {
+            slot.forget_child(child.id());
         }
         self.children.wait();
     }
@@ -333,6 +376,22 @@ pub fn begin_shutdown() -> Vec<Arc<LinkHosts>> {
         service.closed.store(true, Ordering::Release);
     }
     services
+}
+
+/// 여러 [`LinkHosts`] 인스턴스의 터널 자식을 한 번의 병렬 종료 단계로 정리한다.
+/// GPUI `app_will_quit`의 200ms 예산 안에서도 직렬 300ms×N 대기로 타임아웃되지 않게 한다.
+pub fn shutdown_services(services: &[Arc<LinkHosts>]) {
+    let mut children = Vec::new();
+    for service in services {
+        service.take_owned_children_for_shutdown(&mut children);
+    }
+    terminate_tunnel_children(&mut children, SHUTDOWN_TERM_GRACE);
+    for (slot, child) in children {
+        slot.forget_child(child.id());
+    }
+    for service in services {
+        service.children.wait();
+    }
 }
 
 pub fn host_id(id: &str) -> String {
@@ -403,6 +462,7 @@ impl Lease {
         Ok(())
     }
 
+    #[cfg(test)]
     fn stop_blocking(&self) {
         let child = self.child.lock().ok().and_then(|mut guard| guard.take());
         if let Some(mut child) = child {
@@ -413,10 +473,14 @@ impl Lease {
     }
 
     fn user_error(&self, err: &io::Error) -> io::Error {
-        if connection_info(&self.slot.state_dir, &self.slot.host.id)
-            .ok()
-            .and_then(|s| s.error)
-            .is_some()
+        if connection_info_since(
+            &self.slot.state_dir,
+            &self.slot.host.id,
+            self.slot.paired_at_ms.load(Ordering::Acquire),
+        )
+        .ok()
+        .and_then(|s| s.error)
+        .is_some()
         {
             return io::Error::new(io::ErrorKind::PermissionDenied, text::ERR_REVOKED.get());
         }
@@ -449,8 +513,7 @@ impl Lease {
         }
         let socket = krill_link_core::host_socket_path(&self.slot.state_dir, &self.slot.host.id)
             .map_err(io::Error::other)?;
-        let status = krill_link_core::host_status(&self.slot.state_dir, &self.slot.host.id)
-            .map_err(io::Error::other)?;
+        let _starting = Starting::enter(&self.slot.starting);
         let restart = self.slot.restart.swap(false, Ordering::AcqRel);
         if !restart && self.slot.revoked.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -462,7 +525,9 @@ impl Lease {
             .child
             .lock()
             .map_err(|_| io::Error::other(text::ERR_UNAVAILABLE.get()))?;
-        if self.generation.load(Ordering::Acquire) != generation {
+        if self.slot.closed.load(Ordering::Acquire)
+            || self.generation.load(Ordering::Acquire) != generation
+        {
             return Err(io::ErrorKind::Interrupted.into());
         }
         if (restart || self.child_generation.load(Ordering::Acquire) != generation)
@@ -471,6 +536,7 @@ impl Lease {
             let pid = process.id();
             terminate_tunnel_child(&mut process);
             self.slot.forget_child(pid);
+            clear_status_file(&self.slot.state_dir, &self.slot.host.id);
         }
         if let Some(process) = child.as_mut() {
             if process.try_wait()?.is_none() && socket.exists() {
@@ -481,12 +547,22 @@ impl Lease {
                 *child = None;
             }
         }
+        let status = krill_link_core::host_status(&self.slot.state_dir, &self.slot.host.id)
+            .map_err(io::Error::other)?;
+        let paired_at = self.slot.paired_at_ms.load(Ordering::Acquire);
         // 이미 실행 중인 외부 CLI 연결은 빌려 쓰되 소유하거나 종료하지 않는다.
         let owned = status
             .pid
             .is_some_and(|pid| self.slot.owned.lock().is_ok_and(|pids| pids.contains(&pid)));
-        if child.is_none() && status.pid.is_some() && !owned {
+        if child.is_none()
+            && status.pid.is_some()
+            && !owned
+            && (paired_at == 0 || status.updated_at_ms >= paired_at)
+        {
             return Ok(socket);
+        }
+        if restart {
+            clear_status_file(&self.slot.state_dir, &self.slot.host.id);
         }
         if child.is_none() {
             // Serialize admission with the shutdown barrier, including leases
@@ -519,8 +595,6 @@ impl Lease {
             *child = Some(process);
             self.child_generation.store(generation, Ordering::Release);
         }
-        self.slot.starting.store(true, Ordering::Release);
-        let _starting = Starting(&self.slot.starting);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if self.slot.closed.load(Ordering::Acquire)
@@ -580,10 +654,16 @@ impl Lease {
     }
 }
 
-struct Starting<'a>(&'a AtomicBool);
+struct Starting<'a>(&'a AtomicUsize);
+impl<'a> Starting<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
 impl Drop for Starting<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -609,6 +689,56 @@ impl Drop for Lease {
                 // Exceptional OS thread exhaustion must not orphan an owned child.
                 reap_child(&self.slot, &process);
             }
+        }
+    }
+}
+
+/// App shutdown grace before SIGKILL: stays under GPUI's 200ms `SHUTDOWN_TIMEOUT`
+/// even when quit bypasses `quit_now` (e.g., OS Dock Quit).
+const SHUTDOWN_TERM_GRACE: Duration = Duration::from_millis(100);
+
+fn terminate_tunnel_children(children: &mut [(Arc<Slot>, Child)], grace: Duration) {
+    if children.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let mut live_pids = Vec::new();
+        for (_, child) in children.iter_mut() {
+            if child.try_wait().ok().flatten().is_none() {
+                live_pids.push(child.id().to_string());
+            }
+        }
+        if live_pids.is_empty() {
+            return;
+        }
+        let mut cmd = crate::platform::background_command("/bin/kill");
+        cmd.arg("-TERM");
+        for pid in &live_pids {
+            cmd.arg(pid);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if children
+                .iter_mut()
+                .all(|(_, child)| child.try_wait().ok().flatten().is_some())
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = grace;
+    for (_, child) in children.iter_mut() {
+        if child.try_wait().ok().flatten().is_none() {
+            child.kill().ok();
+            child.wait().ok();
         }
     }
 }
@@ -650,9 +780,39 @@ fn reap_child(slot: &Slot, pending: &Mutex<Option<Child>>) {
     }
 }
 
+fn now_unix_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn clear_status_file(state_dir: &Path, id: &str) {
+    if let Ok(path) = krill_link_core::host_status_path(state_dir, id) {
+        std::fs::remove_file(path).ok();
+    }
+}
+
 /// 공개 상태의 선택적 오류 분류를 읽고, 없는 버전에서는 명시적인 거부 사유만 대체 판별한다.
 pub fn connection_info(state_dir: &Path, id: &str) -> io::Result<HostConnectionInfo> {
+    connection_info_since(state_dir, id, 0)
+}
+
+fn connection_info_since(
+    state_dir: &Path,
+    id: &str,
+    min_updated_at_ms: u64,
+) -> io::Result<HostConnectionInfo> {
     let status = krill_link_core::host_status(state_dir, id).map_err(io::Error::other)?;
+    if min_updated_at_ms > 0 && status.updated_at_ms < min_updated_at_ms {
+        return Ok(HostConnectionInfo {
+            status: HostStatus::Disconnected,
+            detail: None,
+            error: None,
+        });
+    }
     let serialized = serde_json::to_value(&status).map_err(io::Error::other)?;
     let kind = serialized
         .get("last_error_kind")
@@ -708,7 +868,8 @@ mod tests {
             closed: Arc::new(AtomicBool::new(false)),
             revoked: AtomicBool::new(false),
             restart: AtomicBool::new(false),
-            starting: AtomicBool::new(false),
+            starting: AtomicUsize::new(0),
+            paired_at_ms: AtomicU64::new(0),
             owned: Mutex::new(BTreeSet::new()),
             children: Arc::new(OwnedChildren::default()),
             suspended: Arc::new(Mutex::new(BTreeSet::new())),
@@ -759,6 +920,7 @@ mod tests {
             children: Arc::clone(&slot.children),
             closed: Arc::clone(&slot.closed),
             repaired: Mutex::new(BTreeSet::new()),
+            paired_at: Mutex::new(BTreeMap::new()),
             suspended: Arc::clone(&slot.suspended),
         });
         let (sent, received) = std::sync::mpsc::channel();
@@ -795,6 +957,7 @@ mod tests {
             children: Arc::clone(&lease.slot.children),
             closed: Arc::clone(&lease.slot.closed),
             repaired: Mutex::new(BTreeSet::new()),
+            paired_at: Mutex::new(BTreeMap::new()),
             suspended: Arc::clone(&lease.slot.suspended),
         };
         service.shutdown();
@@ -865,6 +1028,228 @@ mod tests {
         lease.stop_blocking();
         assert_eq!(std::fs::read_to_string(&cleaned).unwrap(), "term");
         assert_eq!(*lease.slot.children.pending.lock().unwrap(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paired_handoff_prevents_stale_revocation_and_ignores_old_status_files() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-link-paired-handoff-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let node_id = krill_link_core::DeviceIdentity::load_or_create(&dir)
+            .unwrap()
+            .node_id()
+            .to_string();
+        let host = krill_link_core::RemoteHost {
+            id: "peer-1".into(),
+            name: "Peer".into(),
+            node_id,
+            relay_url: None,
+            addr_hints: Vec::new(),
+            added_at: 1,
+        };
+        krill_link_core::save_hosts(&dir, std::slice::from_ref(&host)).unwrap();
+        let status_path = krill_link_core::host_status_path(&dir, &host.id).unwrap();
+        let socket_path = krill_link_core::host_socket_path(&dir, &host.id).unwrap();
+        std::fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+
+        let write_revoked = |updated_at_ms: u64| {
+            let status = krill_link_core::HostTunnelStatus {
+                host_id: host.id.clone(),
+                host_name: host.name.clone(),
+                node_id: host.node_id.clone(),
+                socket_path: socket_path.clone(),
+                state: krill_link_core::TunnelState::Disconnected,
+                route: krill_link_core::RouteKind::None,
+                remote_addr: None,
+                rtt_ms: None,
+                reconnect_attempt: 1,
+                updated_at_ms,
+                pid: None,
+                last_error: Some("unauthorized device".into()),
+                last_error_kind: Some(krill_link_core::TunnelErrorKind::Unauthorized),
+                streams: Vec::new(),
+            };
+            std::fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+        };
+
+        // 1. Before re-pairing, an unauthorized status file marks the slot revoked.
+        write_revoked(1_000);
+        let service = Arc::new(LinkHosts {
+            state_dir: dir.clone(),
+            executable: PathBuf::new(),
+            slots: Mutex::new(BTreeMap::new()),
+            children: Arc::new(OwnedChildren::default()),
+            closed: Arc::new(AtomicBool::new(false)),
+            repaired: Mutex::new(BTreeSet::new()),
+            paired_at: Mutex::new(BTreeMap::new()),
+            suspended: Arc::new(Mutex::new(BTreeSet::new())),
+        });
+        let regs = service.registrations().unwrap();
+        assert!(regs[0].info.error.is_some());
+        let slot = service.slots.lock().unwrap().get("peer-1").unwrap().clone();
+        assert!(slot.revoked.load(Ordering::Acquire));
+
+        // 2. Re-pairing clears the stale status file and ignores any status predating paired().
+        service.paired("peer-1");
+        assert!(
+            !status_path.exists(),
+            "paired() must clear stale status file on disk"
+        );
+        // Consume the one-shot `repaired` flag while a pre-paired status file reappears.
+        write_revoked(1_000);
+        let regs = service.registrations().unwrap();
+        assert!(regs[0].info.error.is_none());
+        assert!(!slot.revoked.load(Ordering::Acquire));
+
+        // 3. Even with a fresh unauthorized status file on disk, registrations() called during the
+        //    restart -> child termination/spawn handoff window must NOT re-revoke or stop the lease.
+        let lease = Arc::new(Lease {
+            slot: Arc::clone(&slot),
+            child: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            child_generation: AtomicU64::new(0),
+            stop_pending: AtomicBool::new(false),
+        });
+        *slot.lease.lock().unwrap() = Arc::downgrade(&lease);
+        slot.restart.store(true, Ordering::Release);
+        write_revoked(now_unix_ms().saturating_add(10_000));
+
+        let held = lease.child.lock().unwrap();
+        let ensure_lease = Arc::clone(&lease);
+        let worker = std::thread::spawn(move || ensure_lease.ensure());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while slot.restart.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !slot.restart.load(Ordering::Acquire),
+            "ensure() should have swapped restart to false"
+        );
+        assert!(
+            slot.starting.load(Ordering::Acquire) > 0,
+            "starting guard must already be active before restart is swapped false"
+        );
+
+        let gen_before = lease.generation.load(Ordering::Acquire);
+        let regs = service.registrations().unwrap();
+        assert!(
+            regs[0].info.error.is_none(),
+            "registrations() must not surface revoked error during starting handoff"
+        );
+        assert_eq!(regs[0].info.status, HostStatus::Connecting);
+        assert!(
+            !slot.revoked.load(Ordering::Acquire),
+            "registrations() must not re-revoke slot during starting handoff"
+        );
+        assert_eq!(
+            lease.generation.load(Ordering::Acquire),
+            gen_before,
+            "registrations() must not stop the lease during starting handoff"
+        );
+
+        slot.closed.store(true, Ordering::Release);
+        drop(held);
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(slot.starting.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_services_terminates_multiple_children_in_parallel() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-link-parallel-shutdown-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let service = Arc::new(LinkHosts {
+            state_dir: dir.clone(),
+            executable: PathBuf::new(),
+            slots: Mutex::new(BTreeMap::new()),
+            children: Arc::new(OwnedChildren::default()),
+            closed: Arc::new(AtomicBool::new(false)),
+            repaired: Mutex::new(BTreeSet::new()),
+            paired_at: Mutex::new(BTreeMap::new()),
+            suspended: Arc::new(Mutex::new(BTreeSet::new())),
+        });
+
+        // Two children that ignore SIGTERM so serial 300ms waits would take >= 600ms.
+        let mut leases = Vec::new();
+        for idx in 0..2 {
+            let slot = Arc::new(Slot {
+                host: krill_link_core::RemoteHost {
+                    id: format!("peer-{idx}"),
+                    name: format!("Peer {idx}"),
+                    node_id: format!("node-{idx}"),
+                    relay_url: None,
+                    addr_hints: Vec::new(),
+                    added_at: 1,
+                },
+                state_dir: dir.clone(),
+                executable: PathBuf::new(),
+                identity: Arc::new(()),
+                lease: Mutex::new(Weak::new()),
+                owned: Mutex::new(BTreeSet::new()),
+                children: Arc::clone(&service.children),
+                closed: Arc::clone(&service.closed),
+                revoked: AtomicBool::new(false),
+                removed: AtomicBool::new(false),
+                restart: AtomicBool::new(false),
+                starting: AtomicUsize::new(0),
+                paired_at_ms: AtomicU64::new(0),
+                suspended: Arc::clone(&service.suspended),
+            });
+            service
+                .children
+                .slots
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(&slot));
+            let child = std::process::Command::new("/bin/sh")
+                .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            slot.owned.lock().unwrap().insert(pid);
+            *service.children.pending.lock().unwrap() += 1;
+            let lease = Arc::new(Lease {
+                slot: Arc::clone(&slot),
+                child: Mutex::new(Some(child)),
+                generation: AtomicU64::new(0),
+                child_generation: AtomicU64::new(0),
+                stop_pending: AtomicBool::new(false),
+            });
+            *slot.lease.lock().unwrap() = Arc::downgrade(&lease);
+            service
+                .slots
+                .lock()
+                .unwrap()
+                .insert(format!("peer-{idx}"), slot);
+            leases.push(lease);
+        }
+
+        let started = Instant::now();
+        shutdown_services(&[Arc::clone(&service)]);
+        let elapsed = started.elapsed();
+
+        assert!(service.closed.load(Ordering::Acquire));
+        assert_eq!(*service.children.pending.lock().unwrap(), 0);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "parallel shutdown of 2 SIGTERM-ignoring children took {elapsed:?} (serial 2x300ms would be >=600ms)"
+        );
+        for lease in &leases {
+            assert!(lease.child.lock().unwrap().is_none());
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

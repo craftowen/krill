@@ -43,6 +43,18 @@ pub struct CliRunner(Arc<RunFn>);
 
 type RunFn = dyn Fn(&[OsString]) -> io::Result<Vec<u8>> + Send + Sync;
 
+fn krill_exe_name() -> String {
+    format!("krill{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn krill_bin_in_target_dir(target_dir: &Path) -> Option<std::path::PathBuf> {
+    let exe_name = krill_exe_name();
+    ["debug", "release"]
+        .into_iter()
+        .map(|profile| target_dir.join(profile).join(&exe_name))
+        .find(|candidate| candidate.is_file())
+}
+
 /// 함께 설치된 `krill` CLI: 번들·설치 경로의 형제 실행 파일, 테스트 실행 파일이면 한 단계 위
 /// (`target/debug/deps` → `target/debug`), 그다음 `CARGO_TARGET_DIR/{debug,release}`.
 #[must_use]
@@ -51,20 +63,18 @@ pub fn krill_bin() -> Option<std::path::PathBuf> {
         if sib.is_file() {
             return Some(sib);
         }
+        let exe_name = krill_exe_name();
         if let Some(parent_bin) = sib
             .parent()
             .and_then(std::path::Path::parent)
-            .map(|p| p.join("krill"))
+            .map(|p| p.join(&exe_name))
             .filter(|p| p.is_file())
         {
             return Some(parent_bin);
         }
     }
     let target_dir = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR")?);
-    ["debug", "release"]
-        .into_iter()
-        .map(|profile| target_dir.join(profile).join("krill"))
-        .find(|candidate| candidate.is_file())
+    krill_bin_in_target_dir(&target_dir)
 }
 
 impl CliRunner {
@@ -720,7 +730,8 @@ impl SettingsView {
         let list = crate::ui::group(
             p,
             rows.iter()
-                .map(|row| self.render_disk_row(p, row, max_bytes, small, cx)),
+                .enumerate()
+                .map(|(index, row)| self.render_disk_row(p, index, row, max_bytes, small, cx)),
         )
         .id("admin-space-worktree-list")
         .debug_selector(|| "admin-space-worktree-list".into());
@@ -978,6 +989,7 @@ impl SettingsView {
     fn render_disk_row(
         &self,
         p: &crate::ui::Palette,
+        index: usize,
         row: &DiskRow<'_>,
         max_bytes: u64,
         small: bool,
@@ -986,6 +998,7 @@ impl SettingsView {
         let kind = self.space.row_kind(row);
         let removable = kind == RowKind::Removable;
         let name = row.name;
+        let row_key = format!("{index}-{}", row.path.display());
         let selected = self.space.selected.contains(row.path);
         let open = self.space.expanded.contains(row.path);
         let pct = row
@@ -997,7 +1010,7 @@ impl SettingsView {
         let bar_ratio = u8::try_from(pct).map_or(1.0_f32, f32::from) / 100.0_f32;
 
         let select_id = format!("admin-cleanup-select-{name}");
-        let check_id = gpui::ElementId::Name(select_id.clone().into());
+        let check_id = gpui::ElementId::Name(format!("admin-cleanup-select-{row_key}").into());
         let select_path = row.path.to_path_buf();
         let slot = div()
             .debug_selector(move || select_id.clone())
@@ -1022,10 +1035,11 @@ impl SettingsView {
             });
 
         let toggle_id = format!("admin-space-toggle-{name}");
+        let toggle_elem_id = SharedString::from(format!("admin-space-toggle-{row_key}"));
         let name_id = format!("admin-space-name-{name}");
         let toggle_path = row.path.to_path_buf();
         let hit = div()
-            .id(SharedString::from(toggle_id.clone()))
+            .id(toggle_elem_id)
             .debug_selector(move || toggle_id.clone())
             .role(gpui::Role::Button)
             .aria_label(SharedString::from(name.to_owned()))
@@ -1112,7 +1126,7 @@ impl SettingsView {
         let reason_id = format!("admin-cleanup-reason-{name}");
         let indent = gpui::rems(1.5);
         div()
-            .id(SharedString::from(format!("admin-space-wt-{name}")))
+            .id(SharedString::from(format!("admin-space-wt-{row_key}")))
             .debug_selector({
                 let name = name.to_owned();
                 move || format!("admin-space-wt-{name}")
@@ -1190,7 +1204,7 @@ impl SettingsView {
                                 .when(!removable, |d| {
                                     d.children(self.render_row_badges(p, row, selected))
                                 })
-                                .children(Self::render_row_artifacts(p, row)),
+                                .children(Self::render_row_artifacts(p, index, row)),
                         )
                         .child(
                             div()
@@ -1264,7 +1278,11 @@ impl SettingsView {
         badges
     }
 
-    fn render_row_artifacts(p: &crate::ui::Palette, row: &DiskRow<'_>) -> Vec<gpui::AnyElement> {
+    fn render_row_artifacts(
+        p: &crate::ui::Palette,
+        row_index: usize,
+        row: &DiskRow<'_>,
+    ) -> Vec<gpui::AnyElement> {
         let artifacts = row.space.map_or(&[][..], |space| &space.artifacts);
         if artifacts.is_empty() {
             return vec![
@@ -1277,15 +1295,21 @@ impl SettingsView {
         }
         artifacts
             .iter()
-            .map(|art| {
-                let art_id = format!("admin-space-wt-art-{}-{}", row.name, art.name);
+            .enumerate()
+            .map(|(art_index, art)| {
+                let art_selector = format!("admin-space-wt-art-{}-{}", row.name, art.name);
+                let art_elem_id = format!(
+                    "admin-space-wt-art-{row_index}-{art_index}-{}-{}",
+                    row.path.display(),
+                    art.name
+                );
                 crate::ui::badge(
                     p,
                     BadgeTone::Warning,
                     format!("{} {}", art.name, format_bytes(art.bytes)),
                 )
-                .id(SharedString::from(art_id.clone()))
-                .debug_selector(move || art_id.clone())
+                .id(SharedString::from(art_elem_id))
+                .debug_selector(move || art_selector.clone())
                 .into_any_element()
             })
             .collect()
@@ -1582,4 +1606,136 @@ fn disclosure_icon(open: bool) -> Icon {
         IconName::ChevronRight
     })
     .xsmall()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn krill_bin_fallback_uses_platform_exe_suffix() {
+        let exe_name = krill_exe_name();
+        assert_eq!(exe_name, format!("krill{}", std::env::consts::EXE_SUFFIX));
+
+        let dir =
+            std::env::temp_dir().join(format!("krill-space-exe-suffix-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let debug = dir.join("debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        let bin = debug.join(&exe_name);
+        std::fs::write(&bin, b"bin").unwrap();
+        assert_eq!(krill_bin_in_target_dir(&dir), Some(bin));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn duplicate_worktree_names_across_repos_render_and_toggle_independently(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use krill_proto::worktree_space::ArtifactUsage;
+
+        let dir =
+            std::env::temp_dir().join(format!("krill-space-dup-names-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::super::init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let repo_a = dir.join("repo-a");
+        let repo_b = dir.join("repo-b");
+        let path_a = repo_a.join("feature");
+        let path_b = repo_b.join("feature");
+
+        let make_entry =
+            |repo: &Path, repo_name: &str, path: &Path, bytes: u64| WorktreeSpaceEntry {
+                repo: repo.to_path_buf(),
+                repo_name: repo_name.to_owned(),
+                path: path.to_path_buf(),
+                name: "feature".into(),
+                branch: Some("feat/shared".into()),
+                is_main: false,
+                total_bytes: bytes,
+                artifact_bytes: 1024,
+                artifacts: vec![ArtifactUsage {
+                    name: "target".into(),
+                    rel_path: "target".into(),
+                    bytes: 1024,
+                    count: 1,
+                }],
+            };
+        let make_cand =
+            |repo: &Path, repo_name: &str, path: &Path, bytes: u64| WorktreeCleanupCandidate {
+                repo: repo.to_path_buf(),
+                repo_name: repo_name.to_owned(),
+                path: path.to_path_buf(),
+                name: "feature".into(),
+                branch: Some("feat/shared".into()),
+                is_main: false,
+                locked: false,
+                dirty: false,
+                dirty_count: 0,
+                merged_into_main: true,
+                pr_state: CleanupPrState::Merged,
+                pr_number: Some(1),
+                last_active_secs: 0,
+                idle_days: 30,
+                disk_bytes: bytes,
+                artifact_bytes: 1024,
+            };
+
+        let (view, vcx) = cx.add_window_view(|_, cx| super::super::SettingsView::new(cx));
+        vcx.simulate_resize(gpui::size(px(1200.), px(1600.)));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.space.report = Some(SpaceReport {
+                    scanned_at: 1,
+                    total_bytes: 30_000,
+                    total_artifact_bytes: 2048,
+                    artifacts: vec![ArtifactUsage {
+                        name: "target".into(),
+                        rel_path: "target".into(),
+                        bytes: 2048,
+                        count: 2,
+                    }],
+                    worktrees: vec![
+                        make_entry(&repo_a, "repo-a", &path_a, 20_000),
+                        make_entry(&repo_b, "repo-b", &path_b, 10_000),
+                    ],
+                });
+                v.space.candidates = vec![
+                    make_cand(&repo_a, "repo-a", &path_a, 20_000),
+                    make_cand(&repo_b, "repo-b", &path_b, 10_000),
+                ];
+                v.set_tab(super::super::AdminTab::Disk, cx);
+                v.space.expanded.insert(path_a.clone());
+                v.space.expanded.insert(path_b.clone());
+                v.space.selected.insert(path_a.clone());
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+
+        assert!(vcx.debug_bounds("admin-space-wt-feature").is_some());
+        assert!(vcx.debug_bounds("admin-space-toggle-feature").is_some());
+        assert!(vcx.debug_bounds("admin-cleanup-select-feature").is_some());
+        assert!(
+            vcx.debug_bounds("admin-space-wt-art-feature-target")
+                .is_some()
+        );
+
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                assert!(v.space.selected.contains(&path_a));
+                assert!(!v.space.selected.contains(&path_b));
+                v.toggle_cleanup_candidate(&path_b, cx);
+                assert!(v.space.selected.contains(&path_a));
+                assert!(v.space.selected.contains(&path_b));
+            });
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

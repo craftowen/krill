@@ -2831,4 +2831,24 @@ mod projection_tests {
             );
         }
     }
+
+    #[test]
+    fn is_automation_worktree_path_handles_posix_and_windows_separators() {
+        assert!(is_automation_worktree_path(Path::new(
+            "/Users/me/.orca/automations/job-1"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            "/work/automations/nightly"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            r"C:\Users\me\.orca\automations\job-1"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            r"D:\work\automations\nightly"
+        )));
+        assert!(!is_automation_worktree_path(Path::new(
+            "/work/my-automations/job-1"
+        )));
+        assert!(!is_automation_worktree_path(Path::new("/work/automations")));
+    }
 }

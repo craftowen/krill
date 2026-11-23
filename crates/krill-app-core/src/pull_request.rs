@@ -1659,3 +1659,59 @@ mod local_agent_stdin_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod windows_executable_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn windows_executable_discovery_probes_extensions_and_rejects_extensionless_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-pr-win-exe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canon_dir = std::fs::canonicalize(&dir).unwrap();
+
+        // npm on Windows installs both an extensionless POSIX shim (`claude`) and `claude.cmd`.
+        let bare = dir.join("claude");
+        let cmd = dir.join("claude.cmd");
+        let bat = dir.join("gemini.bat");
+        let exe = dir.join("gh.exe");
+        std::fs::write(&bare, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, b"@echo off\r\n").unwrap();
+        std::fs::write(&bat, b"@echo off\r\n").unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+
+        assert!(!executable_for(&bare, true));
+        assert!(executable_for(&cmd, true));
+        assert!(executable_for(&bat, true));
+        assert!(executable_for(&exe, true));
+
+        let path_env = std::env::join_paths([&dir]).unwrap();
+        assert_eq!(
+            find_executable_in_for("claude", Some(&path_env), &[], true),
+            canon_dir.join("claude.cmd")
+        );
+        assert_eq!(
+            find_executable_in_for("gemini", Some(&path_env), &[], true),
+            canon_dir.join("gemini.bat")
+        );
+        assert_eq!(
+            find_executable_in_for("gh", Some(&path_env), &[], true),
+            canon_dir.join("gh.exe")
+        );
+        // If only an extensionless file exists, Windows discovery must not return it as executable.
+        let bare_only = dir.join("codex");
+        std::fs::write(&bare_only, b"#!/bin/sh\n").unwrap();
+        let found = find_executable_in_for("codex", Some(&path_env), &[], true);
+        assert_eq!(found, PathBuf::from("codex"));
+        assert!(!executable_for(&found, true));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

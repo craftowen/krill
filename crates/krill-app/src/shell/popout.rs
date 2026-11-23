@@ -261,6 +261,9 @@ fn open_floating(
     theme: krill_proto::theme::Theme,
     cx: &mut App,
 ) -> Result<(), String> {
+    let want_host = target
+        .as_ref()
+        .map_or(krill_app::hosts::HostId::Local, |t| t.host().clone());
     if let Some(handle) = existing::<Floating>(cx) {
         cx.defer(move |cx| {
             handle
@@ -272,12 +275,24 @@ fn open_floating(
                         let Some(pane) = shell.layout.focused() else {
                             return;
                         };
-                        if shell.layout.session(pane) != Some(session) {
+                        let host_changed = shell.layout.host(pane) != &want_host;
+                        let target_missing =
+                            want_host.is_remote() && !shell.host_targets.contains_key(&want_host);
+                        if shell.layout.session(pane) != Some(session)
+                            || host_changed
+                            || target_missing
+                        {
                             shell.commit_ime(pane, Some(window), cx);
                             shell.live.clear();
+                            shell.host_targets.clear();
                             if let Some(t) = &target {
                                 shell.layout.set_host(pane, t.host().clone());
                                 shell.paths = t.local_paths().cloned();
+                                if t.host().is_remote() {
+                                    shell.host_targets.insert(t.host().clone(), t.clone());
+                                }
+                            } else {
+                                shell.layout.set_host(pane, krill_app::hosts::HostId::Local);
                             }
                             shell.layout.set_session(pane, session);
                             shell.sync(cx);
@@ -308,6 +323,9 @@ fn open_floating(
                 if let Some(t) = &target {
                     shell.layout.set_host(pane, t.host().clone());
                     shell.paths = t.local_paths().cloned();
+                    if t.host().is_remote() {
+                        shell.host_targets.insert(t.host().clone(), t.clone());
+                    }
                 }
                 shell.layout.set_session(pane, session);
             }

@@ -156,11 +156,11 @@ impl Shell {
         let active = self.layout.active();
         let focused = self.layout.focused();
         let mut imported = false;
-        let mut imported_primary = false;
+        let mut imported_primary_tab = None;
         for workspace in &targets {
             let added = self.import_missing_workspace_sessions(workspace, cx);
             if added && primary.as_ref() == Some(workspace) {
-                imported_primary = true;
+                imported_primary_tab = Some(self.layout.active());
             }
             imported |= added;
         }
@@ -178,7 +178,8 @@ impl Shell {
         if let Some(focused) = focused {
             self.layout.activate(active);
             self.layout.focus(focused);
-        } else if imported_primary {
+        } else if let Some(tab) = imported_primary_tab {
+            self.layout.activate(tab);
             self.sync(cx);
         } else {
             self.layout.deactivate();

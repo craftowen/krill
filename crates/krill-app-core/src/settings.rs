@@ -4587,6 +4587,7 @@ impl SettingsView {
             self.opencode_api_key_input.as_ref(),
             self.rename.as_ref().map(|(_, input)| input),
             self.search.as_ref().map(|(input, _)| input),
+            self.shortcuts.search.as_ref().map(|(input, _)| input),
         ]
         .into_iter()
         .flatten()
@@ -4595,11 +4596,24 @@ impl SettingsView {
                 return true;
             }
         }
+        if self
+            .feedback_input
+            .as_ref()
+            .is_some_and(|input| textarea_is_composing(input, window, app))
+        {
+            return true;
+        }
+        if self.install.any_alias_input_is_composing(window, app) {
+            return true;
+        }
         for edit in self.agent_edits.values() {
             for input in [&edit.cmd, &edit.args] {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&edit.env, window, app) {
+                return true;
             }
         }
         if let Some((search, _)) = &self.agent_preset_search
@@ -4612,6 +4626,9 @@ impl SettingsView {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&form.env, window, app) {
+                return true;
             }
         }
         if let Some(form) = &self.ssh_form {
@@ -4656,6 +4673,9 @@ impl SettingsView {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&modal.prompt, window, app) {
+                return true;
             }
         }
         false
@@ -13777,6 +13797,161 @@ mod host_fence_tests {
         });
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[gpui::test]
+    fn settings_ime_preedit_covers_shortcuts_search_and_all_textareas(cx: &mut TestAppContext) {
+        let dir =
+            std::env::temp_dir().join(format!("krill-settings-ime-all-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+
+        // 1. Shortcuts search input: composing must be detected and Escape must not clear search.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_tab(AdminTab::Shortcuts, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let search_input = v.shortcuts.search.as_ref().unwrap().0.clone();
+                search_input.update(cx, |input, cx| {
+                    input.set_value("zoom", window, cx);
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "shortcuts.search preedit must be detected"
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, cx| {
+            assert!(
+                !v.shortcuts.search_query(cx).is_empty(),
+                "IME preedit Escape in shortcuts search must not clear query"
+            );
+        });
+
+        // 2-5. All four TextareaState fields must be checked by input_is_composing.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                if let Some((search_input, _)) = &v.shortcuts.search {
+                    search_input.update(cx, |input, cx| input.unmark_text(window, cx));
+                }
+                let mk_input = |window: &mut Window, cx: &mut Context<SettingsView>| {
+                    cx.new(|cx| gpui_component::input::InputState::new(window, cx))
+                };
+                let mk_textarea = |window: &mut Window, cx: &mut Context<SettingsView>| {
+                    cx.new(|cx| gpui_component::input::TextareaState::new(window, cx))
+                };
+
+                // feedback_input
+                let fb = mk_textarea(window, cx);
+                v.feedback_input = Some(fb.clone());
+                fb.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "feedback_input preedit must be detected"
+                );
+                fb.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // agent_edits[*].env
+                let agent_env = mk_textarea(window, cx);
+                v.agent_edits.insert(
+                    "claude".into(),
+                    AgentEdit {
+                        cmd: mk_input(window, cx),
+                        args: mk_input(window, cx),
+                        env: agent_env.clone(),
+                        status: None,
+                    },
+                );
+                agent_env.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "agent_edits.env preedit must be detected"
+                );
+                agent_env.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // custom_agent_form.env
+                let custom_env = mk_textarea(window, cx);
+                v.custom_agent_form = Some(CustomAgentForm {
+                    id: mk_input(window, cx),
+                    name: mk_input(window, cx),
+                    command: mk_input(window, cx),
+                    env: custom_env.clone(),
+                    status: None,
+                });
+                custom_env.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "custom_agent_form.env preedit must be detected"
+                );
+                custom_env.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // schedule_modal.prompt
+                let prompt = mk_textarea(window, cx);
+                v.schedule_modal = Some(schedules::ScheduleModal {
+                    editing_id: None,
+                    id: mk_input(window, cx),
+                    cron: mk_input(window, cx),
+                    cwd: mk_input(window, cx),
+                    command: mk_input(window, cx),
+                    prompt: prompt.clone(),
+                    name: mk_input(window, cx),
+                    extra_args: mk_input(window, cx),
+                    precheck_timeout: mk_input(window, cx),
+                    base_branch: mk_input(window, cx),
+                    grace: mk_input(window, cx),
+                    agent: None,
+                    reuse_session: false,
+                    preset: krill_proto::schedule::classify_schedule("0 9 * * *").preset,
+                    subscriptions: Vec::new(),
+                    precheck: mk_input(window, cx),
+                    workspace_mode: krill_proto::schedule::WorkspaceMode::Reuse,
+                    enabled: true,
+                    error: None,
+                });
+                prompt.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "schedule_modal.prompt preedit must be detected"
+                );
+                prompt.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+            });
+        });
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
 mod updates;
 
@@ -13805,6 +13980,18 @@ pub fn usage_tone(pct: u8) -> UsageTone {
     } else {
         UsageTone::Normal
     }
+}
+
+fn textarea_is_composing(
+    input: &gpui::Entity<gpui_component::input::TextareaState>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> bool {
+    use gpui::Focusable as _;
+    input.update(cx, |input, cx| {
+        input.focus_handle(cx).is_focused(window)
+            && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+    })
 }
 
 fn accept_account_mutation_reply(

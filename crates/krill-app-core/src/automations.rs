@@ -56,13 +56,25 @@ fn apply_schedule_edit(
     } else {
         Schedule::default()
     };
+    let reuse_session = if edited.workspace_mode == WorkspaceMode::Isolate {
+        false
+    } else {
+        existing.reuse_session
+    };
+    let agent = if edited.agent.is_some() || edited.command != existing.command {
+        edited.agent
+    } else {
+        existing.agent
+    };
     schedules.schedule.push(Schedule {
         id: edited.id,
         cron: edited.cron,
         cwd: edited.cwd,
         command: edited.command,
+        agent,
         prompt: edited.prompt,
         precheck: edited.precheck,
+        reuse_session,
         workspace_mode: edited.workspace_mode,
         enabled: edited.enabled,
         ..existing
@@ -3794,6 +3806,80 @@ mod tests {
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(schedules, before);
+    }
+
+    #[test]
+    fn editor_clears_incompatible_reuse_session_and_stale_agent_on_edit() {
+        let original = Schedule {
+            id: "audit".into(),
+            cron: "0 9 * * *".into(),
+            cwd: "/tmp".into(),
+            command: vec!["claude".into(), "-p".into()],
+            agent: Some("claude".into()),
+            reuse_session: true,
+            workspace_mode: WorkspaceMode::Reuse,
+            enabled: true,
+            ..Schedule::default()
+        };
+        let mut schedules = Schedules {
+            schedule: vec![original.clone()],
+        };
+
+        // Keeping Reuse + unchanged command preserves both hidden reuse_session and agent.
+        let keep_edit = Schedule {
+            prompt: "updated prompt".into(),
+            ..original.clone()
+        };
+        apply_schedule_edit(
+            &mut schedules,
+            Some("audit"),
+            Schedule {
+                agent: None,
+                reuse_session: false,
+                ..keep_edit
+            },
+        )
+        .unwrap();
+        let kept = schedules.schedule.last().unwrap();
+        assert!(kept.reuse_session);
+        assert_eq!(kept.agent.as_deref(), Some("claude"));
+        kept.validate().unwrap();
+
+        // Switching to Isolate clears reuse_session; changing command clears stale agent.
+        let isolate_codex = Schedule {
+            id: "audit".into(),
+            cron: "0 9 * * *".into(),
+            cwd: "/tmp".into(),
+            command: vec!["codex".into(), "exec".into()],
+            prompt: "updated prompt".into(),
+            workspace_mode: WorkspaceMode::Isolate,
+            enabled: true,
+            ..Schedule::default()
+        };
+        apply_schedule_edit(&mut schedules, Some("audit"), isolate_codex).unwrap();
+        let switched = schedules.schedule.last().unwrap();
+        assert!(!switched.reuse_session);
+        assert_eq!(switched.workspace_mode, WorkspaceMode::Isolate);
+        assert_eq!(switched.agent, None);
+        assert_eq!(switched.resolved_agent(), Some("codex"));
+        switched.validate().unwrap();
+
+        // Changing command to a non-agent shell command clears agent so resolved_agent is None.
+        let non_agent = Schedule {
+            id: "audit".into(),
+            cron: "0 9 * * *".into(),
+            cwd: "/tmp".into(),
+            command: vec!["/usr/bin/make".into(), "test".into()],
+            prompt: String::new(),
+            workspace_mode: WorkspaceMode::Isolate,
+            enabled: true,
+            ..Schedule::default()
+        };
+        apply_schedule_edit(&mut schedules, Some("audit"), non_agent).unwrap();
+        let shell_cmd = schedules.schedule.last().unwrap();
+        assert_eq!(shell_cmd.agent, None);
+        assert_eq!(shell_cmd.resolved_agent(), None);
+        shell_cmd.validate().unwrap();
     }
 
     #[gpui::test]

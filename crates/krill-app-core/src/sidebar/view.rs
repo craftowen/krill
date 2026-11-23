@@ -238,39 +238,41 @@ fn row_menu(
         }
     }
     if let Some(meta) = tree {
-        let (pin, edit) = (meta.path.clone(), meta.path.clone());
-        let (a, b) = (this.clone(), this.clone());
-        let (creator, create_path) = (this.clone(), meta.path.clone());
-        menu = menu
-            .item(
-                PopupMenuItem::new(
-                    pr.and_then(crate::pull_request::Status::guidance)
-                        .unwrap_or(crate::pull_request::CREATE.get()),
-                )
-                .disabled(pr.and_then(crate::pull_request::Status::guidance).is_some())
-                .on_click(move |_, _, cx| {
-                    creator
-                        .update(cx, |s, cx| s.create_pr(create_path.clone(), cx))
-                        .ok();
-                }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new(text::PIN.get())
-                    .icon(IconName::Star)
-                    .checked(meta.pinned)
+        if host.is_local() {
+            let (pin, edit) = (meta.path.clone(), meta.path.clone());
+            let (a, b) = (this.clone(), this.clone());
+            let (creator, create_path) = (this.clone(), meta.path.clone());
+            menu = menu
+                .item(
+                    PopupMenuItem::new(
+                        pr.and_then(crate::pull_request::Status::guidance)
+                            .unwrap_or(crate::pull_request::CREATE.get()),
+                    )
+                    .disabled(pr.and_then(crate::pull_request::Status::guidance).is_some())
                     .on_click(move |_, _, cx| {
-                        a.update(cx, |s, cx| s.toggle_pin(pin.clone(), cx)).ok();
-                    }),
-            )
-            .item(
-                PopupMenuItem::new(text::RENAME.get())
-                    .icon(Icon::default().data(ui::icons::PENCIL_SVG))
-                    .on_click(move |_, window, cx| {
-                        b.update(cx, |s, cx| s.rename(edit.clone(), window, cx))
+                        creator
+                            .update(cx, |s, cx| s.create_pr(create_path.clone(), cx))
                             .ok();
                     }),
-            );
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(text::PIN.get())
+                        .icon(IconName::Star)
+                        .checked(meta.pinned)
+                        .on_click(move |_, _, cx| {
+                            a.update(cx, |s, cx| s.toggle_pin(pin.clone(), cx)).ok();
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(text::RENAME.get())
+                        .icon(Icon::default().data(ui::icons::PENCIL_SVG))
+                        .on_click(move |_, window, cx| {
+                            b.update(cx, |s, cx| s.rename(edit.clone(), window, cx))
+                                .ok();
+                        }),
+                );
+        }
 
         if meta.can_manage_worktrees {
             let (child_this, child_host, child_parent) =
@@ -610,9 +612,12 @@ impl Sidebar {
     }
 
     pub(super) fn is_session_focused(&self, index: usize, id: krill_proto::SessionId) -> bool {
-        self.row_host(index).is_local()
+        let host = self.row_host(index);
+        self.same_machine_host(host, &self.focused_host)
             && self.focused == Some(id)
-            && self.cursor.is_none_or(|c| self.row_host(c).is_local())
+            && self
+                .cursor
+                .is_none_or(|c| self.same_machine_host(self.row_host(c), host))
             && !matches!(self.cursor_row(), Some(Row::PendingWorktree { .. }))
     }
 
@@ -2287,7 +2292,8 @@ impl Sidebar {
             .then(|| self.lineage_toggle_element(index, path, cx))
             .flatten();
 
-        let is_editing_this = self.editing.as_ref().is_some_and(|(p, _)| p == path);
+        let is_editing_this =
+            row_host.is_local() && self.editing.as_ref().is_some_and(|(p, _)| p == path);
         // Card headers and session rows have separate list entries at every size.
         if self.options.card_layout == super::CardLayout::Compact {
             let compact_path = card_path.clone();
@@ -2435,10 +2441,12 @@ impl Sidebar {
                                         .h_5()
                                         .flex()
                                         .items_center()
+                                        .justify_end()
                                         .gap_0p5()
                                         .child(new_session_btn)
-                                        .child(rename_btn)
-                                        .child(pin_btn),
+                                        .when(row_host.is_local(), |d| {
+                                            d.child(rename_btn).child(pin_btn)
+                                        }),
                                 )
                             }),
                         cx,
@@ -2566,8 +2574,7 @@ impl Sidebar {
                                     })
                                 })
                                 .child(new_session_btn)
-                                .child(rename_btn)
-                                .child(pin_btn),
+                                .when(row_host.is_local(), |d| d.child(rename_btn).child(pin_btn)),
                         )
                     }),
             )

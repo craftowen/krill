@@ -809,6 +809,9 @@ impl Shell {
         for entry in &mut self.paste_queue.entries {
             if matches!(entry.kind, QueuedKind::Paste(request, _) if request == id) {
                 entry.attachment = attachment;
+                if !entry.files && !attachment {
+                    entry.drop_policy = None;
+                }
             }
         }
         self.complete_clipboard_paste(id, payload, window, cx);
@@ -882,30 +885,35 @@ impl Shell {
                     {
                         continue;
                     }
-                    let current = self.drop_policy_for(entry.pane, cx);
-                    if entry.drop_policy.is_some_and(|policy| policy != current) {
-                        // 에이전트가 명령을 돌리면 포그라운드가 잠깐 셸로 바뀐다. 로컬 파일은 지금 정책으로 다시 맞춘다.
-                        use krill_proto::os::ffi::OsStrExt as _;
-                        let again = (!entry.paths.is_empty())
-                            .then(|| {
-                                krill_term::paste::dropped_with_policy(
-                                    entry.paths.iter().map(|p| p.as_os_str().as_bytes()),
-                                    current,
-                                )
-                            })
-                            .flatten();
-                        let Some(again) = again else {
-                            if entry.files {
-                                self.notice = Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
-                                cx.notify();
-                            }
-                            continue;
-                        };
-                        bytes = again;
-                        entry.attachment = current.image_attachments
-                            && entry.paths.iter().all(|p| {
-                                krill_term::paste::is_image_path(p.as_os_str().as_bytes())
-                            });
+                    if (entry.files || entry.attachment)
+                        && let Some(policy) = entry.drop_policy
+                    {
+                        let current = self.drop_policy_for(entry.pane, cx);
+                        if policy != current {
+                            // 에이전트가 명령을 돌리면 포그라운드가 잠깐 셸로 바뀐다. 로컬 파일은 지금 정책으로 다시 맞춘다.
+                            use krill_proto::os::ffi::OsStrExt as _;
+                            let again = (!entry.paths.is_empty())
+                                .then(|| {
+                                    krill_term::paste::dropped_with_policy(
+                                        entry.paths.iter().map(|p| p.as_os_str().as_bytes()),
+                                        current,
+                                    )
+                                })
+                                .flatten();
+                            let Some(again) = again else {
+                                if entry.files {
+                                    self.notice =
+                                        Some(sec_text::FILE_PASTE_FAILED.get().to_owned());
+                                    cx.notify();
+                                }
+                                continue;
+                            };
+                            bytes = again;
+                            entry.attachment = current.image_attachments
+                                && entry.paths.iter().all(|p| {
+                                    krill_term::paste::is_image_path(p.as_os_str().as_bytes())
+                                });
+                        }
                     }
                     let mut modes = modes;
                     if entry.attachment {
@@ -2232,6 +2240,33 @@ fn upload_clipboard_image(
     let filename = format!("clipboard-{:016x}.{}", img.id, ext);
     let remote_path = upload_bytes_to_remote_target(target, &filename, &payload)?;
     krill_term::paste::dropped_with_policy([remote_path.as_bytes()], policy)
+}
+
+#[cfg(all(test, unix))]
+impl Shell {
+    pub(super) fn begin_plain_paste_with_policy_for_test(
+        &mut self,
+        policy: DropPolicy,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let id = self.begin_clipboard_paste(window, cx)?;
+        if let Some(entry) = self.paste_queue.entries.back_mut() {
+            entry.drop_policy = Some(policy);
+        }
+        Some(id)
+    }
+
+    pub(super) fn complete_attachment_paste_for_test(
+        &mut self,
+        id: u64,
+        payload: Option<Vec<u8>>,
+        attachment: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.complete_attachment_paste(id, payload, attachment, window, cx);
+    }
 }
 
 pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::path::PathBuf> {

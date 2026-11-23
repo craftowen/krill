@@ -369,7 +369,8 @@ pub(super) fn set_key(
     keys.bindings.retain(|k, _| !same(k, key));
     enable_default(keys, action, key);
     if let Some(old) = old.filter(|o| !same(o, key)) {
-        keys.bindings.retain(|k, _| !same(k, old));
+        keys.bindings
+            .retain(|k, v| !(same(k, old) && v.as_str() == Some(action)));
         if is_default(defaults, action, old) {
             disable_default(keys, action, old);
         }
@@ -389,7 +390,8 @@ pub(super) fn reset_action(keys: &mut Keys, defaults: &[Pair], action: &str) {
 
 /// `action`의 바인딩 하나만 지운다(OWE-863). 기본 키면 그 액션의 기본 키만 끈다(같은 키의 다른 액션은 유지).
 pub(super) fn remove_key(keys: &mut Keys, defaults: &[Pair], action: &str, key: &str) {
-    keys.bindings.retain(|k, _| !same(k, key));
+    keys.bindings
+        .retain(|k, v| !(same(k, key) && v.as_str() == Some(action)));
     if is_default(defaults, action, key) {
         disable_default(keys, action, key);
     }
@@ -1203,6 +1205,10 @@ impl SettingsView {
                     .min_w(px(140.))
                     .capture_action(cx.listener(
                         |this, _: &gpui_component::input::Escape, window, cx| {
+                            if this.input_is_composing(window, cx) {
+                                window.prevent_default();
+                                return;
+                            }
                             cx.stop_propagation();
                             if !this.shortcuts.search_query(cx).is_empty() {
                                 this.shortcuts.clear_search(window, cx);
@@ -1293,5 +1299,52 @@ mod platform_tests {
         assert_eq!(super::keycap_text("ctrl-shift-t"), "Ctrl+Shift+T");
         assert_eq!(super::keycap_text("ctrl-alt-shift-w"), "Ctrl+Alt+Shift+W");
         assert_eq!(super::keycap_text("ctrl-alt-left"), "Ctrl+Alt+←");
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn set_key_and_remove_key_only_remove_bindings_for_target_action() {
+        let defaults = vec![
+            ("settings::ZoomIn", norm("cmd-=").unwrap()),
+            ("shell::NewAgent1", norm("alt-cmd-1").unwrap()),
+        ];
+        let mut keys = Keys::parse(
+            "[bindings]\n\"cmd-=\" = \"shell::Jump\"\n\"cmd-alt-1\" = \"shell::NewAgent1\"\n",
+        )
+        .unwrap();
+
+        // Removing ZoomIn's default key must disable ZoomIn's default without deleting Jump's binding.
+        remove_key(&mut keys, &defaults, "settings::ZoomIn", "cmd-=");
+        assert_eq!(
+            keys.bindings.get("cmd-=").and_then(toml::Value::as_str),
+            Some("shell::Jump")
+        );
+        assert_eq!(keys.disabled["settings::ZoomIn"], ["cmd-="]);
+
+        // Rebinding ZoomIn away from its default key must also preserve Jump's custom binding on cmd-=.
+        set_key(
+            &mut keys,
+            &defaults,
+            "settings::ZoomIn",
+            Some("cmd-="),
+            "cmd-y",
+        );
+        assert_eq!(
+            keys.bindings.get("cmd-=").and_then(toml::Value::as_str),
+            Some("shell::Jump")
+        );
+        assert_eq!(
+            keys.bindings.get("cmd-y").and_then(toml::Value::as_str),
+            Some("settings::ZoomIn")
+        );
+
+        // Removing a binding owned by the target action (even with different modifier order) removes it.
+        remove_key(&mut keys, &defaults, "shell::NewAgent1", "alt-cmd-1");
+        assert!(!keys.bindings.contains_key("cmd-alt-1"));
+        assert_eq!(keys.disabled["shell::NewAgent1"], ["alt-cmd-1"]);
     }
 }

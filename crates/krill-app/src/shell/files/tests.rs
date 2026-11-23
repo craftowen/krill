@@ -1049,6 +1049,34 @@ fn quit_preflush_materializes_latest_layout_before_shutdown_waits(cx: &mut TestA
     });
 }
 
+#[gpui::test]
+fn quit_preflush_shuts_down_link_hosts_before_platform_quit(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-quit-link-preflush-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let link_hosts = krill_app::hosts::link::LinkHosts::shared(dir.clone(), PathBuf::new());
+    let path = state_path("quit-link-preflush");
+    let (_view, visual) = open(cx, path);
+    let quitting = std::rc::Rc::new(std::cell::Cell::new(false));
+    visual.update(|_, cx| {
+        cx.set_global(QuitObserved(quitting.clone()));
+        quit_app(cx);
+    });
+    visual.run_until_parked();
+    assert!(quitting.get(), "quit must complete after link preflush");
+    assert!(
+        link_hosts.is_closed(),
+        "quit_now must close and shut down LinkHosts before cx.quit()"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn show_wrapped_path(
     view: &Entity<Shell>,
     cx: &mut VisualTestContext,
