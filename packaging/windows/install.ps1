@@ -339,8 +339,28 @@ if (-not $alreadyInstalled) {
 
 
         Start-KrillStep '05' ((Get-KrillMsg '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 ({0})' 'Installing app files ({0})') -f $Dest) 4
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dest) | Out-Null
-        Move-Item -LiteralPath (Join-Path $unpacked 'Krill') -Destination $Dest
+        $destFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dest)
+        $destParent = Split-Path -Parent $destFull
+        if ($destParent) {
+            New-Item -ItemType Directory -Force -Path $destParent | Out-Null
+        }
+        $srcDir = Join-Path $unpacked 'Krill'
+        $srcFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($srcDir)
+        $srcRoot = [IO.Path]::GetPathRoot($srcFull)
+        $destRoot = [IO.Path]::GetPathRoot($destFull)
+        if ($srcRoot -and $destRoot -and ($srcRoot -ieq $destRoot)) {
+            Move-Item -LiteralPath $srcDir -Destination $Dest
+        } else {
+            $stageBase = if ($destParent) { $destParent } else { $destRoot }
+            $stageDest = Join-Path $stageBase ('.krill-install-stage-' + [guid]::NewGuid().ToString('N'))
+            try {
+                Copy-Item -LiteralPath $srcDir -Destination $stageDest -Recurse -Force
+                Move-Item -LiteralPath $stageDest -Destination $Dest
+            } catch {
+                Remove-Item -LiteralPath $stageDest -Recurse -Force -ErrorAction SilentlyContinue
+                throw
+            }
+        }
         Complete-KrillStep '05' (Get-KrillMsg '\uC124\uCE58' 'Installed') ((Get-KrillMsg '{0} \uC124\uCE58 \uC644\uB8CC' 'Installed to {0}') -f $Dest)
     } catch {
         Fail-KrillStep $_.Exception.Message

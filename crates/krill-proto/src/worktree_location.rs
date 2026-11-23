@@ -3,11 +3,9 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-fn is_dot_git_segment(part: &std::ffi::OsStr) -> bool {
-    part.to_str().is_none_or(|s| {
-        let trimmed = s.trim_end_matches(['.', ' ']);
-        trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case("git~1")
-    })
+fn is_dot_git_segment(s: &str) -> bool {
+    let trimmed = s.trim_end_matches(['.', ' ']);
+    trimmed.eq_ignore_ascii_case(".git") || trimmed.eq_ignore_ascii_case("git~1")
 }
 
 pub fn normalize(raw: &str) -> io::Result<Option<String>> {
@@ -18,9 +16,10 @@ pub fn normalize(raw: &str) -> io::Result<Option<String>> {
     if raw.len() > 4096
         || raw.chars().any(char::is_control)
         || (raw.starts_with('~') && raw != "~" && !raw.starts_with("~/") && !raw.starts_with("~\\"))
-        || Path::new(raw)
-            .components()
-            .any(|part| matches!(part, Component::Normal(s) if is_dot_git_segment(s)))
+        || raw.split(['/', '\\']).any(is_dot_git_segment)
+        || Path::new(raw).components().any(|part| {
+            matches!(part, Component::Normal(s) if s.to_str().is_none_or(is_dot_git_segment))
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -79,6 +78,11 @@ mod tests {
             "/repo/.git",
             "/repo/.GIT.",
             "GIT~1/tasks",
+            r"~\.git",
+            r"~\.git/tasks",
+            r"~\.GIT.\tasks",
+            r"~\GIT~1\tasks",
+            r"foo\.git\bar",
             "bad\0path",
             "bad\npath",
         ] {

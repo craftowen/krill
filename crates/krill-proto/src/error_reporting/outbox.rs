@@ -221,10 +221,7 @@ pub fn record_with_consent(state: &Path, mut event: Event, expected: &Consent) -
     if event.install_hash.is_none() {
         let salt = install_salt(&dir)?;
         event.install_hash = Some(super::install_hash_with_salt(expected, &salt));
-    }
-    let now = now_ms();
-    if !super::rate::admit(&dir, expected, &event, now)? {
-        return Ok(false);
+        event.validate()?;
     }
     let outbox = dir.join(OUTBOX);
     DirBuilder::new()
@@ -238,6 +235,7 @@ pub fn record_with_consent(state: &Path, mut event: Event, expected: &Consent) -
     if fs::symlink_metadata(outbox.join(&name)).is_ok() {
         return Ok(false);
     }
+    let now = now_ms();
     if count(&outbox) >= MAX_PENDING
         && sweep(&outbox, &expected.generation, now)?.entries.len() >= MAX_PENDING
     {
@@ -255,8 +253,22 @@ pub fn record_with_consent(state: &Path, mut event: Event, expected: &Consent) -
         return Ok(false);
     }
     write_atomic(&outbox, &name, &bytes)?;
-    drop(lock);
-    Ok(true)
+    match super::rate::admit(&dir, expected, &entry.event, now) {
+        Ok(true) => {
+            drop(lock);
+            Ok(true)
+        }
+        Ok(false) => {
+            fs::remove_file(outbox.join(&name)).ok();
+            drop(lock);
+            Ok(false)
+        }
+        Err(error) => {
+            fs::remove_file(outbox.join(&name)).ok();
+            drop(lock);
+            Err(error)
+        }
+    }
 }
 
 fn install_salt(dir: &Path) -> io::Result<String> {

@@ -87,6 +87,12 @@ fn exclusive(path: &Path, text: &str, mode: u32) -> io::Result<()> {
         .create_new(true)
         .mode(mode)
         .open(path)?;
+    // `mode` above is masked by the umask; preserve the exact requested bits.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
     f.write_all(text.as_bytes())?;
     f.sync_all()
 }

@@ -1987,6 +1987,33 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
     );
 
     // Bounded deserialization on UploadBotAvatar and ImportBotZipV2
+    let max_avatar_req = BotRpcRequest::UploadBotAvatar {
+        bot_id: bot_id.clone(),
+        png_bytes: vec![0u8; MAX_AVATAR_PNG_BYTES],
+    };
+    let max_avatar_frame = max_avatar_req
+        .encode()
+        .expect("max-size UploadBotAvatar must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_frame.len() <= crate::ipc::MAX_FRAME + 5);
+    let max_avatar_ctrl = crate::control::Request::Bot(max_avatar_req)
+        .encode()
+        .expect("max-size control Request::Bot(UploadBotAvatar) must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_ctrl.len() <= crate::ipc::MAX_FRAME + 5);
+
+    let max_avatar_resp = BotRpcResponse::BotAvatar(BotAvatarData {
+        bot_id: bot_id.clone(),
+        mime: "image/png".to_owned(),
+        png_bytes: vec![0u8; MAX_AVATAR_PNG_BYTES],
+    });
+    let max_avatar_resp_frame = max_avatar_resp
+        .encode()
+        .expect("max-size BotAvatar reply must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_resp_frame.len() <= crate::ipc::MAX_FRAME + 5);
+    let max_avatar_ctrl_reply = crate::control::Reply::Bot(max_avatar_resp)
+        .encode()
+        .expect("max-size control Reply::Bot(BotAvatar) must fit in ipc::MAX_FRAME");
+    assert!(max_avatar_ctrl_reply.len() <= crate::ipc::MAX_FRAME + 5);
+
     let oversize_avatar = BotRpcRequest::UploadBotAvatar {
         bot_id,
         png_bytes: vec![0u8; MAX_RPC_AVATAR_PNG_BYTES.saturating_add(1)],

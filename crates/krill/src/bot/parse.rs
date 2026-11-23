@@ -2043,9 +2043,10 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                 } else if let Some(val) = take_opt(tail, &mut idx, "--snooze")? {
                     out.snooze = Some(val.to_owned());
                     any_field = true;
-                } else if let Some(val) =
-                    take_opt(tail, &mut idx, "--ask")?.or(take_opt(tail, &mut idx, "--question")?)
-                {
+                } else if let Some(val) = match take_opt(tail, &mut idx, "--ask")? {
+                    Some(v) => Some(v),
+                    None => take_opt(tail, &mut idx, "--question")?,
+                } {
                     let trimmed = val.trim();
                     if trimmed.is_empty() {
                         return Err(CliError::usage(
@@ -2139,11 +2140,10 @@ fn parse_items(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
                     bot = Some(val.to_owned());
                 } else if let Some(val) = take_opt(tail, &mut idx, "--text")? {
                     text = Some(val.to_owned());
-                } else if let Some(val) = take_opt(tail, &mut idx, "--option")?.or(take_opt(
-                    tail,
-                    &mut idx,
-                    "--option-index",
-                )?) {
+                } else if let Some(val) = match take_opt(tail, &mut idx, "--option")? {
+                    Some(v) => Some(v),
+                    None => take_opt(tail, &mut idx, "--option-index")?,
+                } {
                     let n = val
                         .parse::<u32>()
                         .map_err(|_| CliError::usage("--option must be a non-negative integer"))?;
@@ -2476,9 +2476,12 @@ fn parse_reply(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
         idx = idx.saturating_add(1);
     }
 
+    let has_non_text = reaction.is_some() || !files.is_empty();
     match (bot.is_some(), text.is_some(), positionals.as_slice()) {
         (_, true, []) => {}
+        (_, false, []) if has_non_text => {}
         (false, true, [b]) => bot = Some(b.clone()),
+        (false, false, [b]) if default_bot.is_none() && has_non_text => bot = Some(b.clone()),
         (true, false, [t]) => text = Some(t.clone()),
         (false, false, [b, t]) => {
             bot = Some(b.clone());
@@ -2489,7 +2492,7 @@ fn parse_reply(args: &[String], default_bot: Option<&str>) -> Result<BotCommand,
         }
         _ => {
             return Err(CliError::usage(
-                "reply requires <bot> <text> (or --text <text> with KRILL_BOT_ID)",
+                "reply requires <bot> <text> (or --text <text> / --file / --react with KRILL_BOT_ID)",
             ));
         }
     }

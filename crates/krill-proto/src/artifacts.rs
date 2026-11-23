@@ -13,7 +13,6 @@ use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
-use std::io::Write as _;
 use std::path::Path;
 
 /// 공개 허용 표시 파일(상태 디렉터리 바로 아래, 0600). 있으면 허용, 없으면 거부(기본값).
@@ -72,17 +71,7 @@ pub fn set_default_retention_days(state: &Path, days: u16) -> io::Result<()> {
             "invalid artifact retention days",
         ));
     }
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state)?;
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(state.join(RETENTION_FILE))?
-        .write_all(days.to_string().as_bytes())
+    crate::os::write_atomic_0600(&state.join(RETENTION_FILE), days.to_string().as_bytes())
 }
 
 /// 공개 공유가 허용됐는가.
@@ -380,11 +369,34 @@ mod tests {
         }
         assert!(set_default_retention_days(&dir, MAX_RETENTION_DAYS + 1).is_err());
         assert_eq!(default_retention_days(&dir).unwrap(), MAX_RETENTION_DAYS);
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from(RETENTION_FILE)]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(dir.join(RETENTION_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         fs::write(dir.join(RETENTION_FILE), "invalid").unwrap();
         assert_eq!(
             default_retention_days(&dir).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        // Atomic replacement cleans up its temp file if the destination cannot be replaced.
+        fs::remove_file(dir.join(RETENTION_FILE)).unwrap();
+        fs::create_dir_all(dir.join(RETENTION_FILE).join("occupied")).unwrap();
+        assert!(set_default_retention_days(&dir, 7).is_err());
+        let after_fail: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(after_fail, [std::ffi::OsString::from(RETENTION_FILE)]);
         fs::remove_dir_all(dir).unwrap();
     }
 

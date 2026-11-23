@@ -166,6 +166,7 @@ fn watch_for_with(
             Err(e)
                 if e.kind() == io::ErrorKind::TimedOut
                     && pending
+                    && consumed == 0
                     && missed.saturating_add(1) < MISSES =>
             {
                 missed = missed.saturating_add(1);
@@ -565,7 +566,11 @@ fn allow_installed_apps_for_paths(exe: &Path, home: Option<&Path>) -> bool {
 /// 없으면 진단 메시지가 기대 위치를 가리키도록 `<실행 파일 디렉터리>/<name>`을 돌려준다.
 pub fn sibling_exe(name: &str) -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    sibling_exe_from(&exe, name)
+}
+
+fn sibling_exe_from(exe: &Path, name: &str) -> io::Result<PathBuf> {
+    let exe = crate::os::canonicalize(exe).unwrap_or_else(|_| crate::os::shell_path(exe));
     let bin = exe.parent().ok_or(io::ErrorKind::NotFound)?;
     Ok(find_exe(bin, &[], name))
 }

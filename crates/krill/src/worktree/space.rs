@@ -754,16 +754,23 @@ pub fn remove_worktree_git(
     }
 
     // 삭제 전 krill.toml / orca.yaml / 상태 디렉터리의 공유 심볼릭 링크를 먼저 해제한다.
-    unlink_worktree_symlinks(&path, &symlinks);
+    let removed_symlinks = unlink_worktree_symlinks(repo, &path, &symlinks);
 
     let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
     if req.force {
         args.push("--force".into());
     }
     args.push("--".into());
-    args.push(path.into_os_string());
-    let rm_out = run_git(repo, args)?;
+    args.push(krill_proto::os::shell_path(&path).into_os_string());
+    let rm_out = match run_git(repo, args) {
+        Ok(out) => out,
+        Err(err) => {
+            restore_worktree_symlinks(&path, &removed_symlinks);
+            return Err(err);
+        }
+    };
     if !rm_out.status.success() {
+        restore_worktree_symlinks(&path, &removed_symlinks);
         return Err(git_err(&rm_out, "git worktree remove failed"));
     }
 
@@ -851,12 +858,13 @@ fn list_repo_worktrees(repo: &Path) -> Vec<GitWorktreeEntry> {
 
 fn parse_porcelain_worktrees(bytes: &[u8]) -> Vec<GitWorktreeEntry> {
     let mut entries = Vec::new();
+    let mut skip_current = false;
     for field in bytes.split(|b| *b == 0) {
         if let Some(raw_path) = field.strip_prefix(b"worktree ") {
-            if raw_path
-                .split(|b| *b == b'/')
-                .any(|part| part == b".krill-preparing")
-            {
+            skip_current = raw_path
+                .split(|b| *b == b'/' || *b == b'\\')
+                .any(|part| part == b".krill-preparing");
+            if skip_current {
                 continue;
             }
             let raw = PathBuf::from(OsString::from_vec(raw_path.to_vec()));
@@ -866,7 +874,7 @@ fn parse_porcelain_worktrees(bytes: &[u8]) -> Vec<GitWorktreeEntry> {
                 branch: None,
                 locked: false,
             });
-        } else if let Some(last) = entries.last_mut() {
+        } else if !skip_current && let Some(last) = entries.last_mut() {
             if let Some(branch) = field.strip_prefix(b"branch refs/heads/") {
                 if let Ok(b) = String::from_utf8(branch.to_vec()) {
                     last.branch = Some(b);
@@ -934,6 +942,16 @@ fn is_valid_worktree_symlink(wt_real: &Path, raw: &str) -> bool {
     fs::symlink_metadata(wt_real.join(rel)).is_ok_and(|m| m.file_type().is_symlink())
 }
 
+fn normalize_rel_slashes(path: &Path) -> Option<String> {
+    let raw = path.to_str()?;
+    let trimmed = raw.trim_end_matches(['/', '\\']);
+    if trimmed.contains('\\') {
+        Some(trimmed.replace('\\', "/"))
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 fn dir_contains_only_active_symlinks(
     wt_real: &Path,
     rel_dir: &Path,
@@ -944,9 +962,8 @@ fn dir_contains_only_active_symlinks(
         return false;
     };
     if meta.file_type().is_symlink() {
-        return rel_dir
-            .to_str()
-            .is_some_and(|s| active_symlinks.contains(&s.trim_end_matches('/')));
+        return normalize_rel_slashes(rel_dir)
+            .is_some_and(|s| active_symlinks.contains(&s.as_str()));
     }
     if !meta.is_dir() {
         return false;
@@ -961,10 +978,10 @@ fn dir_contains_only_active_symlinks(
         };
         has_entry = true;
         let child_rel = rel_dir.join(entry.file_name());
-        let Some(child_str) = child_rel.to_str() else {
+        let Some(child_str) = normalize_rel_slashes(&child_rel) else {
             return false;
         };
-        if active_symlinks.contains(&child_str) {
+        if active_symlinks.contains(&child_str.as_str()) {
             continue;
         }
         if !dir_contains_only_active_symlinks(wt_real, &child_rel, active_symlinks) {
@@ -974,21 +991,103 @@ fn dir_contains_only_active_symlinks(
     has_entry
 }
 
-fn unlink_worktree_symlinks(wt_real: &Path, symlinks: &[String]) {
-    for raw in symlinks {
-        if is_valid_worktree_symlink(wt_real, raw) {
-            let trimmed = raw.trim().trim_end_matches('/');
-            let rel = Path::new(trimmed);
-            fs::remove_file(wt_real.join(rel)).ok();
-            let mut parent = rel.parent();
-            while let Some(p) = parent {
-                if p.as_os_str().is_empty() {
-                    break;
-                }
-                if fs::remove_dir(wt_real.join(p)).is_err() {
-                    break;
-                }
-                parent = p.parent();
+fn remove_symlink_path(link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt as _;
+        if fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink_dir()) {
+            return fs::remove_dir(link);
+        }
+        fs::remove_file(link).or_else(|_| fs::remove_dir(link))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(link)
+    }
+}
+
+fn unlink_worktree_symlinks(
+    repo: &Path,
+    wt_real: &Path,
+    symlinks: &[String],
+) -> Vec<(PathBuf, PathBuf, bool)> {
+    let links: Vec<&str> = symlinks
+        .iter()
+        .map(|raw| raw.trim().trim_end_matches('/'))
+        .filter(|rel| is_valid_worktree_symlink(wt_real, rel))
+        .collect();
+    if links.is_empty() {
+        return Vec::new();
+    }
+    let mut args: Vec<OsString> = vec![
+        OsString::from("--literal-pathspecs"),
+        OsString::from("-C"),
+        krill_proto::os::shell_path(wt_real).into_os_string(),
+        OsString::from("ls-files"),
+        OsString::from("-z"),
+        OsString::from("--"),
+    ];
+    args.extend(links.iter().map(OsString::from));
+    let Ok(out) = run_git(repo, args) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let tracked: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let mut removed = Vec::new();
+    for trimmed in links
+        .into_iter()
+        .filter(|rel| !tracked.contains(&rel.as_bytes()))
+    {
+        let rel = Path::new(trimmed);
+        let link = wt_real.join(rel);
+        let target = fs::read_link(&link).ok();
+        #[cfg(windows)]
+        let is_dir_link = {
+            use std::os::windows::fs::FileTypeExt as _;
+            fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink_dir())
+        };
+        #[cfg(not(windows))]
+        let is_dir_link = false;
+        if remove_symlink_path(&link).is_ok()
+            && let Some(target) = target
+        {
+            removed.push((link, target, is_dir_link));
+        }
+        let mut parent = rel.parent();
+        while let Some(p) = parent {
+            if p.as_os_str().is_empty() {
+                break;
+            }
+            if fs::remove_dir(wt_real.join(p)).is_err() {
+                break;
+            }
+            parent = p.parent();
+        }
+    }
+    removed
+}
+
+fn restore_worktree_symlinks(wt_real: &Path, removed: &[(PathBuf, PathBuf, bool)]) {
+    if !wt_real.is_dir() {
+        return;
+    }
+    for (link, target, is_dir_link) in removed {
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        #[cfg(unix)]
+        {
+            let _ = is_dir_link;
+            std::os::unix::fs::symlink(target, link).ok();
+        }
+        #[cfg(windows)]
+        {
+            if *is_dir_link || target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link).ok();
+            } else {
+                std::os::windows::fs::symlink_file(target, link).ok();
             }
         }
     }
@@ -1011,7 +1110,7 @@ fn check_worktree_dirty_status(
     }
     let args = [
         OsString::from("-C"),
-        worktree.as_os_str().to_owned(),
+        krill_proto::os::shell_path(worktree).into_os_string(),
         OsString::from("status"),
         OsString::from("--porcelain"),
         OsString::from("-z"),
@@ -1198,8 +1297,9 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let cwd = krill_proto::os::shell_path(cwd);
     Command::new("git")
-        .current_dir(cwd)
+        .current_dir(&cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
@@ -1924,6 +2024,132 @@ mod tests {
             fs::read_to_string(repo.join("shared-dir/cache.txt")).unwrap(),
             "shared-cache"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn parse_porcelain_worktrees_ignores_preparing_branch_and_locked_fields() {
+        let raw = concat!(
+            "worktree /tmp/repo\0",
+            "HEAD 1111111111111111111111111111111111111111\0",
+            "branch refs/heads/main\0",
+            "\0",
+            "worktree /tmp/repo-wt-feat\0",
+            "HEAD 2222222222222222222222222222222222222222\0",
+            "branch refs/heads/feat-unmerged\0",
+            "\0",
+            "worktree /tmp/.krill-preparing/slot-1\0",
+            "HEAD 1111111111111111111111111111111111111111\0",
+            "branch refs/heads/main\0",
+            "locked pool slot\0",
+            "\0",
+            "worktree C:\\worktrees\\.krill-preparing\\slot-2\0",
+            "HEAD 1111111111111111111111111111111111111111\0",
+            "branch refs/heads/main\0",
+            "locked\0",
+            "\0",
+            "worktree /tmp/repo-wt-after\0",
+            "HEAD 3333333333333333333333333333333333333333\0",
+            "branch refs/heads/feat-after\0",
+            "locked user reason\0",
+            "\0",
+        );
+        let parsed = parse_porcelain_worktrees(raw.as_bytes());
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].branch.as_deref(), Some("main"));
+        assert!(!parsed[0].locked);
+        assert_eq!(parsed[1].branch.as_deref(), Some("feat-unmerged"));
+        assert!(!parsed[1].locked);
+        assert_eq!(parsed[2].branch.as_deref(), Some("feat-after"));
+        assert!(parsed[2].locked);
+    }
+
+    #[test]
+    fn normalize_rel_slashes_converts_windows_separators() {
+        assert_eq!(
+            normalize_rel_slashes(Path::new(r"apps\web\.env")),
+            Some("apps/web/.env".to_owned())
+        );
+        assert_eq!(
+            normalize_rel_slashes(Path::new("shared-dir/")),
+            Some("shared-dir".to_owned())
+        );
+        assert_eq!(
+            normalize_rel_slashes(Path::new(r"shared-dir\")),
+            Some("shared-dir".to_owned())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_worktree_git_preserves_tracked_symlink_and_rolls_back_on_failure() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("pc16-tracked-and-rollback");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("target.txt"), "tracked target\n").unwrap();
+        symlink("target.txt", repo.join("tracked-link")).unwrap();
+        fs::write(repo.join(".gitignore"), ".env\n").unwrap();
+        fs::write(
+            repo.join("krill.toml"),
+            "[worktree]\nsymlinks = [\"tracked-link\", \".env\"]\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "init with tracked symlink"]);
+
+        let repo_canon = fs::canonicalize(&repo).unwrap();
+        fs::write(repo.join(".env"), "SECRET=1\n").unwrap();
+
+        let wt = root.join("wt-tracked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat-tracked",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let wt_canon = fs::canonicalize(&wt).unwrap();
+        symlink(repo_canon.join(".env"), wt_canon.join(".env")).unwrap();
+
+        // Rollback check: if `git worktree remove` fails after unlinking `.env`, `.env` is restored.
+        let removed = unlink_worktree_symlinks(
+            &repo_canon,
+            &wt_canon,
+            &["tracked-link".to_owned(), ".env".to_owned()],
+        );
+        assert_eq!(removed.len(), 1, "tracked symlink must not be unlinked");
+        assert!(
+            fs::symlink_metadata(wt_canon.join("tracked-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(fs::symlink_metadata(wt_canon.join(".env")).is_err());
+        restore_worktree_symlinks(&wt_canon, &removed);
+        assert!(
+            fs::symlink_metadata(wt_canon.join(".env"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Full non-force removal succeeds even though `tracked-link` is in `krill.toml` symlinks.
+        let req = RemoveWorktree {
+            repo: repo_canon.as_os_str().as_bytes().to_vec(),
+            path: wt_canon.as_os_str().as_bytes().to_vec(),
+            force: false,
+        };
+        let res = remove_worktree_git(&req, None).unwrap();
+        assert_eq!(res.branch.as_deref(), Some("feat-tracked"));
+        assert!(!wt.exists());
+        assert_eq!(fs::read_to_string(repo.join(".env")).unwrap(), "SECRET=1\n");
 
         fs::remove_dir_all(&root).ok();
     }

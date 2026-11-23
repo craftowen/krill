@@ -429,9 +429,10 @@ where
                 let BotRpcResponse::Items(mut items) = resp else {
                     return Err(CliError::fail("unexpected reply for ListItems"));
                 };
-                if let Some(filter) = status {
-                    items.retain(|i| i.status == filter);
-                }
+                items.retain(|i| {
+                    i.snoozed_until_ms.is_none_or(|until| until <= now_ms)
+                        && status.is_none_or(|filter| i.status == filter)
+                });
                 format::format_items(&items, json)
             } else if let Some(filter) = status {
                 let page_resp = list_filtered_items_page(
@@ -1505,6 +1506,12 @@ where
                 png_bytes,
             })?;
             match resp {
+                BotRpcResponse::BotAvatar(data) => format::format_avatar_updated(
+                    &data.bot_id,
+                    &data.mime,
+                    data.png_bytes.len(),
+                    json,
+                ),
                 BotRpcResponse::Bot(cfg) => format::format_bot_detail(&cfg, json),
                 BotRpcResponse::Ok => {
                     format::format_ok(&format!("updated avatar for {bot_id}"), json)

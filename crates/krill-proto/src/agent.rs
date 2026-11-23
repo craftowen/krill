@@ -296,6 +296,16 @@ pub fn preset_profiles() -> &'static BTreeMap<String, Profile> {
 #[must_use]
 pub fn canonical_id(id: &str) -> &str {
     let trimmed = id.trim();
+    for builtin in ["claude", "codex", "agy", "cursor", "opencode"] {
+        if trimmed.eq_ignore_ascii_case(builtin) {
+            return builtin;
+        }
+    }
+    for &preset in PRESET_ORDER {
+        if trimmed.eq_ignore_ascii_case(preset) {
+            return preset;
+        }
+    }
     if trimmed.eq_ignore_ascii_case("antigravity") {
         "agy"
     } else if trimmed.eq_ignore_ascii_case("cursor-agent") {
@@ -1102,8 +1112,11 @@ fn run_version(cmd: Command) -> Option<String> {
         .map(str::to_owned)
 }
 
+const MAX_CAPTURE_BYTES: u64 = 64 * 1024;
+
 /// 명령의 표준 출력 전체(stderr 버림). 실패하거나 `timeout` 안에 끝나지 않으면 `None`이고 자식은 죽인다.
 pub fn capture(mut cmd: Command, timeout: Duration) -> Option<String> {
+    let deadline = std::time::Instant::now().checked_add(timeout)?;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1114,19 +1127,37 @@ pub fn capture(mut cmd: Command, timeout: Duration) -> Option<String> {
     // 손자 프로세스가 파이프를 쥐고 있으면 읽기가 끝나지 않으므로 읽기를 따로 돌리고 시간으로 끊는다.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut text = String::new();
-        tx.send(stdout.read_to_string(&mut text).map(|_| text)).ok();
+        let mut buf = Vec::new();
+        let result = stdout
+            .by_ref()
+            .take(MAX_CAPTURE_BYTES)
+            .read_to_end(&mut buf)
+            .map(|_| {
+                std::io::copy(&mut stdout, &mut std::io::sink()).ok();
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+        tx.send(result).ok();
     });
-    let out = rx.recv_timeout(timeout);
-    if out.is_err() {
-        // 시간 초과: Windows `.cmd` shim의 손자(node)까지 끝낸다.
+    let Ok(Ok(out)) =
+        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    else {
+        // 시간 초과 또는 읽기 오류: Windows `.cmd` shim의 손자(node)까지 끝낸다.
         crate::os::kill_tree(&mut child);
-    } else {
-        // 이미 끝났으면 좀비라 kill은 무해하다.
-        child.kill().ok();
-        child.wait().ok();
-    }
-    out.ok()?.ok()
+        return None;
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                crate::os::kill_tree(&mut child);
+                return None;
+            }
+        }
+    };
+    status.success().then_some(out)
 }
 
 #[cfg(test)]

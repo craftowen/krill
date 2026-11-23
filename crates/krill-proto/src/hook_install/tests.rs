@@ -403,3 +403,100 @@ fn legacy_agy_receipt_upgrades_in_place_preserving_later_user_edits() {
         "orca-v2"
     );
 }
+
+#[test]
+fn codex_same_config_path_matches_verbatim_and_noncanonical_spellings() {
+    assert!(codex::same_config_path(
+        Path::new(r"\\?\C:\Users\me\.codex\config.toml"),
+        Path::new(r"C:\Users\me\.codex\config.toml"),
+    ));
+    assert!(codex::same_config_path(
+        Path::new(r"\\?\C:\Users\me\.codex\config.toml"),
+        Path::new("c:/users/me/.codex/config.toml"),
+    ));
+    assert!(!codex::same_config_path(
+        Path::new(r"C:\Users\me\.codex\config.toml"),
+        Path::new(r"C:\Users\other\.codex\config.toml"),
+    ));
+
+    let home = Home::new();
+    let sub = home.0.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let canonical = home.0.join("config.toml");
+    let non_canonical = home.0.join("sub/../config.toml");
+    assert_ne!(canonical, non_canonical);
+    assert!(codex::same_config_path(&non_canonical, &canonical));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_codex_powershell_receipt_supersedes_equivalent_config_path() {
+    let home = Home::new();
+    let bin = home.0.join("bin");
+    let codex_home = home.0.join("codex");
+    let sub = codex_home.join("sub");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&sub).unwrap();
+
+    let codex_exe = bin.join("codex");
+    fs::write(
+        &codex_exe,
+        include_str!("../../../krill/tests/fixtures/mk413-codex.py"),
+    )
+    .unwrap();
+    fs::set_permissions(&codex_exe, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config = codex_home.join("config.toml");
+    let legacy_path = codex_home.join("sub/../config.toml");
+    assert_ne!(legacy_path, config);
+    let legacy_command = format!("{}AAAA", hooks::POWERSHELL_CODEX_PREFIX);
+    let legacy_receipt = Receipt {
+        agent: "codex".to_owned(),
+        complete: true,
+        changes: Vec::new(),
+        codex: Some(CodexRecord {
+            path: legacy_path,
+            command: legacy_command.clone(),
+            added: std::collections::BTreeMap::new(),
+            replaced: std::collections::BTreeMap::new(),
+        }),
+    };
+    let receipt_path = hooks::receipt(&home.state(), Agent::Codex);
+    store::directory(receipt_path.parent().unwrap()).unwrap();
+    fs::write(
+        &receipt_path,
+        serde_json::to_string_pretty(&legacy_receipt).unwrap() + "\n",
+    )
+    .unwrap();
+
+    let plan = Plan::prepare_with_trust(
+        Action::Install,
+        TargetAgent::Other(Agent::Codex),
+        &config,
+        &home.state(),
+        Path::new("/example/krill"),
+        Some(bin.as_os_str()),
+        CodexTrust::Preserve,
+    )
+    .unwrap()
+    .expect("legacy PowerShell Codex receipt with equivalent path must be superseded");
+    let updated = plan.apply().unwrap();
+    assert!(updated.complete);
+    let codex = updated.codex.unwrap();
+    assert_ne!(codex.command, legacy_command);
+    assert_eq!(codex.path, config);
+}
+
+#[cfg(unix)]
+#[test]
+fn store_replace_preserves_group_writable_mode_past_umask() {
+    let home = Home::new();
+    let path = home.0.join("group-writable.json");
+    fs::write(&path, "{\"a\":1}\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    store::replace(&path, Some("{\"a\":1}\n"), Some("{\"a\":2}\n")).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o664
+    );
+}
