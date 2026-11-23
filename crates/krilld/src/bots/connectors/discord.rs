@@ -940,20 +940,29 @@ fn handle_message_create(
     }
 
     let mut channel_type = data.get("channel_type").and_then(Value::as_u64);
-    let mut parent_id = data
+    let thread_obj_parent_id = data
         .get("thread")
         .and_then(|t| t.get("parent_id"))
-        .or_else(|| data.get("parent_id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let mut parent_id = thread_obj_parent_id.clone().or_else(|| {
+        data.get("parent_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
 
-    if guild_id.is_some() && channel_type.is_none() && parent_id.is_none() {
+    // Regular guild text channels under a category also carry `parent_id`, so resolve channel
+    // metadata whenever `channel_type` is absent and no explicit `thread` object exists (MB-12).
+    if guild_id.is_some() && channel_type.is_none() && thread_obj_parent_id.is_none() {
         let (fetched_type, fetched_parent) = sender.resolve_channel_meta(channel_id);
         channel_type = fetched_type;
-        parent_id = fetched_parent;
+        if fetched_parent.is_some() {
+            parent_id = fetched_parent;
+        }
     }
 
-    let is_thread = matches!(channel_type, Some(10..=12)) || parent_id.is_some();
+    let is_thread = matches!(channel_type, Some(10..=12))
+        || (channel_type.is_none() && thread_obj_parent_id.is_some());
     let gate_channel_id = if is_thread {
         parent_id.as_deref().unwrap_or(channel_id)
     } else {
@@ -1071,19 +1080,31 @@ fn handle_interaction_create(
         .and_then(|c| c.get("type"))
         .or_else(|| data.get("channel_type"))
         .and_then(Value::as_u64);
-    let mut parent_id = data
-        .get("channel")
-        .and_then(|c| c.get("parent_id"))
-        .or_else(|| data.get("parent_id"))
+    let thread_obj_parent_id = data
+        .get("thread")
+        .and_then(|t| t.get("parent_id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    if guild_id.is_some() && !channel_id.is_empty() && channel_type.is_none() && parent_id.is_none()
+    let mut parent_id = thread_obj_parent_id.clone().or_else(|| {
+        data.get("channel")
+            .and_then(|c| c.get("parent_id"))
+            .or_else(|| data.get("parent_id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    if guild_id.is_some()
+        && !channel_id.is_empty()
+        && channel_type.is_none()
+        && thread_obj_parent_id.is_none()
     {
         let (fetched_type, fetched_parent) = sender.resolve_channel_meta(channel_id);
         channel_type = fetched_type;
-        parent_id = fetched_parent;
+        if fetched_parent.is_some() {
+            parent_id = fetched_parent;
+        }
     }
-    let is_thread = matches!(channel_type, Some(10..=12)) || parent_id.is_some();
+    let is_thread = matches!(channel_type, Some(10..=12))
+        || (channel_type.is_none() && thread_obj_parent_id.is_some());
     let gate_channel_id = if is_thread {
         parent_id.as_deref().unwrap_or(channel_id)
     } else {
@@ -1936,5 +1957,181 @@ mod tests {
             &mut participated,
         );
         assert!(participated.is_empty());
+    }
+
+    #[test]
+    fn discord_categorized_guild_channel_is_not_misclassified_as_thread() {
+        // MB-12: A standard guild text channel (`type: 0`) inside a category has `parent_id = cat-1`.
+        // It must NOT be treated as a thread, must keep `channel_id = "ch-general"` (not "cat-1"),
+        // must have `thread_id = None`, and must NOT enter `participated_threads`.
+        struct CaptureBridge {
+            bot: BotConfig,
+            dispatched: Mutex<Vec<InboundExternalMessage>>,
+        }
+        impl ConnectorBridge for CaptureBridge {
+            fn dispatch_external_message(
+                &self,
+                msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                let link = krill_proto::bots::ExternalConversationLink {
+                    id: "link-dc-cat".to_owned(),
+                    bot_id: msg.bot_id.clone(),
+                    source: msg.source,
+                    workspace_id: msg.workspace_id.clone(),
+                    channel_id: msg.channel_id.clone(),
+                    thread_id: msg.thread_id.clone(),
+                    session_id: Some(SessionId(55)),
+                    acts_for: msg.acts_for.clone(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                };
+                lock(&self.dispatched).push(msg);
+                Ok(DispatchOutcome {
+                    link,
+                    session_id: SessionId(55),
+                    started_new_session: false,
+                })
+            }
+            fn check_or_request_access(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Allowed)
+            }
+            fn resolve_secret(
+                &self,
+                _: &BotId,
+                _: Option<&str>,
+                _: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                bot_id: &BotId,
+                source: ExternalSource,
+                workspace_id: Option<&str>,
+                channel_id: &str,
+                thread_id: Option<&str>,
+                acts_for: krill_proto::bots::ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Ok(krill_proto::bots::ExternalConversationLink {
+                    id: "link-dc-cat".to_owned(),
+                    bot_id: bot_id.clone(),
+                    source,
+                    workspace_id: workspace_id.map(ToOwned::to_owned),
+                    channel_id: channel_id.to_owned(),
+                    thread_id: thread_id.map(ToOwned::to_owned),
+                    session_id: Some(SessionId(55)),
+                    acts_for,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+                _: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.bot.id == bot_id).then(|| self.bot.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.bot.clone()]
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            assert!(n > 0);
+            let body = r#"{"id":"ch-general","type":0,"parent_id":"cat-999"}"#;
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(wire.as_bytes()).unwrap();
+        });
+
+        let bot_id = BotId::new("dc-cat").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "DcCat", "claude", 1_000).unwrap();
+        bot.connectors.discord.enabled = true;
+        bot.connectors.discord.allowed_guild_ids = vec!["g-1".to_owned()];
+        bot.connectors.discord.allowed_channel_ids = vec!["ch-general".to_owned()];
+
+        let bridge = Arc::new(CaptureBridge {
+            bot,
+            dispatched: Mutex::new(Vec::new()),
+        });
+        let bridge_dyn: Arc<dyn ConnectorBridge> = bridge.clone();
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge_dyn)));
+        let sender = Arc::new(DiscordSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("tok".to_owned()),
+        ));
+
+        let mut participated = BTreeSet::new();
+        // Payload omits `channel_type`, so DiscordSender fetches `GET /channels/ch-general`
+        // returning `type: 0, parent_id: "cat-999"`.
+        let mention_ev = json!({
+            "id": "m-cat-1",
+            "guild_id": "g-1",
+            "channel_id": "ch-general",
+            "content": "<@900> hello channel",
+            "author": { "id": "u-1", "username": "alice" },
+            "mentions": [{ "id": "900" }]
+        });
+        handle_message_create(
+            &bot_id,
+            Some("900"),
+            &mention_ev,
+            &sender,
+            &bridge_dyn,
+            &router,
+            &mut participated,
+        );
+        srv.join().unwrap();
+
+        let dispatched = lock(&bridge.dispatched);
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].channel_id, "ch-general");
+        assert_eq!(dispatched[0].thread_id, None);
+        assert!(
+            participated.is_empty(),
+            "regular guild text channel must NOT be added to participated_threads"
+        );
+        drop(dispatched);
+
+        // Follow-up unmentioned message in the same regular channel MUST be ignored.
+        let unmentioned_ev = json!({
+            "id": "m-cat-2",
+            "guild_id": "g-1",
+            "channel_id": "ch-general",
+            "content": "random chatter without mention",
+            "author": { "id": "u-1", "username": "alice" },
+            "mentions": []
+        });
+        handle_message_create(
+            &bot_id,
+            Some("900"),
+            &unmentioned_ev,
+            &sender,
+            &bridge_dyn,
+            &router,
+            &mut participated,
+        );
+        assert_eq!(lock(&bridge.dispatched).len(), 1);
     }
 }

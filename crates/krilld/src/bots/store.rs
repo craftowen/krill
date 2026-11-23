@@ -307,6 +307,7 @@ impl BotStore {
             Vec::new()
         };
 
+        validate_mcp_tools(&cfg.mcp_tools)?;
         cfg.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
@@ -560,6 +561,7 @@ impl BotStore {
             bot.memory_tidy = memory_tidy;
         }
         if let Some(mcp_tools) = params.mcp_tools {
+            validate_mcp_tools(&mcp_tools)?;
             bot.mcp_tools = mcp_tools;
         }
         bot.updated_at_ms = now_ms;
@@ -1745,6 +1747,7 @@ impl BotStore {
                 enabled: false,
             })
             .collect();
+        validate_mcp_tools(&cfg.mcp_tools)?;
         cfg.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
@@ -2426,6 +2429,20 @@ fn is_sender_allowed_with_workspace(
         | ExternalSource::Linear
         | ExternalSource::Composio => true,
     }
+}
+
+fn validate_mcp_tools(tools: &[BotMcpToolConfig]) -> io::Result<()> {
+    for tool in tools {
+        let id = tool.id.as_str();
+        if id.trim().is_empty() || id.len() > 128 || id.chars().any(|c| c.is_control() || c == '\0')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MCP tool id must be 1..=128 non-control characters",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Redacts pairing tokens from [`BotAccessRequest`] records for read-only Observer peers.

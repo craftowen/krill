@@ -234,8 +234,9 @@ impl McpOAuthManager {
         let tool_bg = tool.clone();
         let resource_bg = metadata.resource.clone();
 
+        let thread_token = sanitize_thread_name_token(&tool.id);
         if let Err(err) = thread::Builder::new()
-            .name(format!("mcp-oauth-{}", tool.id))
+            .name(format!("mcp-oauth-{thread_token}"))
             .stack_size(STACK_SIZE)
             .spawn(move || {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -495,7 +496,31 @@ fn persist_oauth_credentials(
     Ok(())
 }
 
+fn sanitize_thread_name_token(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    if clean.is_empty() {
+        "tool".to_owned()
+    } else {
+        clean
+    }
+}
+
+fn validate_mcp_tool_id(tool_id: &str) -> Result<(), String> {
+    if tool_id.trim().is_empty()
+        || tool_id.len() > 128
+        || tool_id.chars().any(|c| c.is_control() || c == '\0')
+    {
+        return Err("MCP tool id must be 1..=128 non-control characters".to_owned());
+    }
+    Ok(())
+}
+
 fn find_oauth_tool<'a>(bot: &'a BotConfig, tool_id: &str) -> Result<&'a BotMcpToolConfig, String> {
+    validate_mcp_tool_id(tool_id)?;
     let tool = bot
         .mcp_tools
         .iter()
@@ -506,6 +531,7 @@ fn find_oauth_tool<'a>(bot: &'a BotConfig, tool_id: &str) -> Result<&'a BotMcpTo
                 bot.id.as_str()
             )
         })?;
+    validate_mcp_tool_id(&tool.id)?;
     if tool.auth_kind != BotMcpAuthKind::BrowserOAuth {
         return Err(format!(
             "MCP tool '{}' uses {:?} auth, not BrowserOAuth",
@@ -1525,6 +1551,35 @@ mod tests {
 
         stop.store(true, Ordering::Release);
         srv.join().ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mcp_oauth_rejects_nul_tool_id_and_sanitizes_thread_names() {
+        let dir = temp_dir("nul-id");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x51; 32]));
+        let mgr = McpOAuthManager::new(secrets);
+        let bot_id = BotId::new("bot-nul").unwrap();
+        let mut bot = BotConfig::new(bot_id, "Nul Bot", "claude", 1_000).unwrap();
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "evil\0tool".to_owned(),
+            name: "Evil".to_owned(),
+            endpoint_url: Some("https://mcp.example.com".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BrowserOAuth,
+            header_names: Vec::new(),
+            secret_ref: None,
+            enabled: true,
+        });
+
+        let err = mgr.start_oauth(&bot, "evil\0tool").unwrap_err();
+        assert!(err.contains("non-control"), "{err}");
+
+        let clean = sanitize_thread_name_token("my\0weird/tool name!!");
+        assert_eq!(clean, "myweirdtoolname");
+        assert!(!clean.contains('\0'));
+        assert_eq!(sanitize_thread_name_token("\0\n"), "tool");
+
         fs::remove_dir_all(&dir).ok();
     }
 }

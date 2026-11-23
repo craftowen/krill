@@ -13,7 +13,7 @@
 //!   text into PTYs).
 //! - Mapping internal failures into user-safe messages using [`BotErrorCategory`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -146,11 +146,13 @@ struct ActiveTurnState {
     last_activity_text: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+type DeferredInboundLoader = Box<dyn FnOnce(&mut InboundExternalMessage) -> bool + Send + 'static>;
+
 struct HeldInboundMessage {
     msg: InboundExternalMessage,
     target: DeliveryTarget,
     created_at_ms: u64,
+    on_allowed: Option<DeferredInboundLoader>,
 }
 
 type SenderMap = BTreeMap<(BotId, ExternalSource), Arc<dyn PlatformSender>>;
@@ -160,7 +162,7 @@ type ThrottleKey = (BotId, ExternalSource, String, String);
 pub struct ConversationRouter {
     bridge: Arc<dyn ConnectorBridge>,
     senders: Arc<Mutex<SenderMap>>,
-    active_turns: Mutex<BTreeMap<(BotId, SessionId), ActiveTurnState>>,
+    active_turns: Mutex<BTreeMap<(BotId, SessionId), VecDeque<ActiveTurnState>>>,
     link_last_inbound: Mutex<BTreeMap<String, String>>,
     pending_notice_throttle: Mutex<BTreeMap<ThrottleKey, u64>>,
     held_messages: Mutex<BTreeMap<String, HeldInboundMessage>>,
@@ -232,6 +234,8 @@ impl ConversationRouter {
 
     /// Routes an inbound message and invokes `on_allowed` ONLY after `paused`, channel/guild,
     /// workspace, and user access checks all pass (e.g. for deferred attachment downloads).
+    /// When access is `Pending`, `on_allowed` is retained with the held message and runs upon
+    /// approval so attachments are never lost on replay yet never downloaded before approval (MB-45).
     /// Returns `None` if `on_allowed` decides there is nothing left to dispatch.
     pub fn handle_inbound_message_with_loader<F>(
         &self,
@@ -241,7 +245,7 @@ impl ConversationRouter {
         on_allowed: F,
     ) -> Option<InboundRouteOutcome>
     where
-        F: FnOnce(&mut InboundExternalMessage) -> bool,
+        F: FnOnce(&mut InboundExternalMessage) -> bool + Send + 'static,
     {
         self.handle_inbound_message_at_with_loader(msg, target, sender, now_ms(), on_allowed)
     }
@@ -267,7 +271,7 @@ impl ConversationRouter {
         on_allowed: F,
     ) -> Option<InboundRouteOutcome>
     where
-        F: FnOnce(&mut InboundExternalMessage) -> bool,
+        F: FnOnce(&mut InboundExternalMessage) -> bool + Send + 'static,
     {
         let Some(bot) = self.bridge.get_bot_config(&msg.bot_id) else {
             return Some(InboundRouteOutcome::Error(BotErrorCategory::NotSetUp));
@@ -309,7 +313,13 @@ impl ConversationRouter {
                 }
             }
             Ok(AccessDecision::Pending(req)) => {
-                self.record_held_message(&req.token, &msg, &target, ts_ms);
+                self.record_held_message(
+                    &req.token,
+                    &msg,
+                    &target,
+                    ts_ms,
+                    Some(Box::new(on_allowed)),
+                );
                 let throttle_key = (
                     msg.bot_id.clone(),
                     msg.source,
@@ -375,6 +385,7 @@ impl ConversationRouter {
         msg: &InboundExternalMessage,
         target: &DeliveryTarget,
         ts_ms: u64,
+        on_allowed: Option<DeferredInboundLoader>,
     ) {
         let mut held_msg = msg.clone();
         if held_msg.text.len() > MAX_HELD_TEXT_BYTES {
@@ -411,6 +422,7 @@ impl ConversationRouter {
                 msg: held_msg,
                 target: target.clone(),
                 created_at_ms: ts_ms,
+                on_allowed,
             },
         );
     }
@@ -448,14 +460,20 @@ impl ConversationRouter {
             );
             send_chunked(sender.as_ref(), &target, &notice).ok();
         }
-        if let Some(held) = held {
-            self.dispatch_allowed_message(
-                held.msg,
-                held.target,
-                sender_opt.as_deref(),
-                &bot.name,
-                bot.notifications.could_not_finish,
-            );
+        if let Some(mut held) = held {
+            let should_dispatch = match held.on_allowed.take() {
+                Some(loader) => loader(&mut held.msg),
+                None => true,
+            };
+            if should_dispatch {
+                self.dispatch_allowed_message(
+                    held.msg,
+                    held.target,
+                    sender_opt.as_deref(),
+                    &bot.name,
+                    bot.notifications.could_not_finish,
+                );
+            }
         }
     }
 
@@ -504,17 +522,19 @@ impl ConversationRouter {
                     }
                     links.insert(outcome.link.id.clone(), ext_id.clone());
                 }
-                lock(&self.active_turns).insert(
-                    (bot_id, outcome.session_id),
-                    ActiveTurnState {
-                        source,
-                        target,
-                        last_inbound_message_id: inbound_msg_id,
-                        status_message_id: None,
-                        last_activity_at_ms: None,
-                        last_activity_text: None,
-                    },
-                );
+                let mut turns = lock(&self.active_turns);
+                let queue = turns.entry((bot_id, outcome.session_id)).or_default();
+                if queue.len() >= 64 {
+                    queue.pop_front();
+                }
+                queue.push_back(ActiveTurnState {
+                    source,
+                    target,
+                    last_inbound_message_id: inbound_msg_id,
+                    status_message_id: None,
+                    last_activity_at_ms: None,
+                    last_activity_text: None,
+                });
                 InboundRouteOutcome::Dispatched(outcome)
             }
             Err(err) => {
@@ -643,7 +663,7 @@ impl ConversationRouter {
         let key = (bot_id.clone(), session_id);
         let plan = {
             let mut turns = lock(&self.active_turns);
-            let Some(state) = turns.get_mut(&key) else {
+            let Some(state) = turns.get_mut(&key).and_then(VecDeque::front_mut) else {
                 return;
             };
             if let Some(last_ts) = state.last_activity_at_ms
@@ -680,12 +700,17 @@ impl ConversationRouter {
             }
         } else if let Ok(new_msg_id) = sender.send_message(&target, &status_text) {
             let mut turns = lock(&self.active_turns);
-            if let Some(state) = turns.get_mut(&key)
+            if let Some(state) = turns.get_mut(&key).and_then(VecDeque::front_mut)
                 && state.status_message_id.is_none()
             {
                 state.status_message_id = Some(new_msg_id);
             }
         }
+    }
+
+    /// Cleans up queued active turn states when a bot session exits or is killed (MB-10).
+    pub fn on_session_removed(&self, session_id: SessionId) {
+        lock(&self.active_turns).retain(|(_, sid), _| *sid != session_id);
     }
 
     /// Posts the final chunked reply for `(bot_id, session_id)` on turn completion.
@@ -697,7 +722,14 @@ impl ConversationRouter {
         final_reply: Option<&str>,
     ) {
         let key = (bot_id.clone(), session_id);
-        let active = lock(&self.active_turns).remove(&key);
+        let active = {
+            let mut turns = lock(&self.active_turns);
+            let popped = turns.get_mut(&key).and_then(VecDeque::pop_front);
+            if turns.get(&key).is_some_and(VecDeque::is_empty) {
+                turns.remove(&key);
+            }
+            popped
+        };
 
         let Some(raw_text) = final_reply.map(str::trim).filter(|s| !s.is_empty()) else {
             return;
@@ -840,6 +872,14 @@ fn passes_independent_channel_gate(
     thread_id: Option<&str>,
 ) -> bool {
     match source {
+        ExternalSource::Telegram => {
+            if bot.connectors.telegram.allowed_chat_ids.is_empty() {
+                return true;
+            }
+            channel_id
+                .parse::<i64>()
+                .is_ok_and(|cid| bot.connectors.telegram.allowed_chat_ids.contains(&cid))
+        }
         ExternalSource::Slack => {
             if bot.connectors.slack.allowed_channel_ids.is_empty() || channel_id.starts_with('D') {
                 return true;
@@ -903,6 +943,13 @@ fn passes_independent_user_gate(
         return true;
     }
     match source {
+        ExternalSource::Telegram => {
+            bot.connectors.telegram.acts_for == krill_proto::bots::ActsFor::Anyone
+                || bot.connectors.telegram.allowed_user_ids.is_empty()
+                || sender_id
+                    .parse::<i64>()
+                    .is_ok_and(|uid| bot.connectors.telegram.allowed_user_ids.contains(&uid))
+        }
         ExternalSource::Slack => {
             bot.connectors.slack.acts_for == krill_proto::bots::ActsFor::Anyone
                 || bot.connectors.slack.allowed_user_ids.is_empty()
@@ -932,6 +979,7 @@ fn has_channel_or_bypass_overlap(
     source: ExternalSource,
 ) -> bool {
     match source {
+        ExternalSource::Telegram => !bot.connectors.telegram.allowed_chat_ids.is_empty(),
         ExternalSource::Slack => !bot.connectors.slack.allowed_channel_ids.is_empty(),
         ExternalSource::Discord => !bot.connectors.discord.allowed_channel_ids.is_empty(),
         _ => false,
@@ -1980,5 +2028,155 @@ mod tests {
             InboundRouteOutcome::Dispatched(_)
         ));
         assert_eq!(lock(&bridge.dispatched).len(), 1);
+    }
+
+    #[test]
+    fn telegram_gates_overlap_deferred_attachment_replay_and_queued_turns_work() {
+        let bot_id = BotId::new("bot-tg-mb").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "TgBot", "claude", 1_000).unwrap();
+        bot.connectors.telegram.enabled = true;
+        bot.connectors.telegram.allowed_chat_ids = vec![1001];
+        bot.connectors.telegram.allowed_user_ids = vec![2001];
+
+        let bridge = Arc::new(MockBridge {
+            bot: Mutex::new(bot),
+            decision: Mutex::new(AccessDecision::Allowed),
+            dispatched: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+        });
+        let sender = Arc::new(MockSender::default());
+        let router = ConversationRouter::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+        router.register_sender(
+            bot_id.clone(),
+            ExternalSource::Telegram,
+            Arc::clone(&sender) as Arc<dyn PlatformSender>,
+        );
+
+        // MB-13: Telegram unauthorized chat is denied for gate callbacks & inbound messages.
+        assert_eq!(
+            router.handle_gate_callback_with_context(
+                &bot_id,
+                ExternalSource::Telegram,
+                None,
+                "2001",
+                "Admin",
+                "9999",
+                None,
+                "gate:g1:approve",
+            ),
+            GateCallbackOutcome::Denied
+        );
+        // MB-13: Allowed chat + unauthorized user (overlap bypass) is denied even when bridge returns Allowed.
+        assert_eq!(
+            router.handle_gate_callback_with_context(
+                &bot_id,
+                ExternalSource::Telegram,
+                None,
+                "8888",
+                "Stranger",
+                "1001",
+                None,
+                "gate:g1:approve",
+            ),
+            GateCallbackOutcome::Denied
+        );
+        let mk_tg = |sender_id: &str, text: &str, msg_id: &str| {
+            (
+                InboundExternalMessage {
+                    bot_id: bot_id.clone(),
+                    source: ExternalSource::Telegram,
+                    workspace_id: None,
+                    channel_id: "1001".to_owned(),
+                    thread_id: None,
+                    sender_id: sender_id.to_owned(),
+                    sender_name: "User".to_owned(),
+                    text: text.to_owned(),
+                    attachments: Vec::new(),
+                    external_message_id: Some(msg_id.to_owned()),
+                    acts_for: ActsFor::Owner,
+                },
+                DeliveryTarget {
+                    source: ExternalSource::Telegram,
+                    workspace_id: None,
+                    channel_id: "1001".to_owned(),
+                    thread_id: None,
+                    reply_to_message_id: Some(msg_id.to_owned()),
+                },
+            )
+        };
+        let (bad_user_msg, bad_user_target) = mk_tg("8888", "sneak", "m-bad");
+        assert_eq!(
+            router.handle_inbound_message(bad_user_msg, bad_user_target, sender.as_ref()),
+            InboundRouteOutcome::Denied
+        );
+
+        // MB-10: Two queued turns on the SAME `(bot_id, SessionId(9))` both deliver replies!
+        let (m1, t1) = mk_tg("2001", "first", "m-1");
+        let (m2, t2) = mk_tg("2001", "second", "m-2");
+        assert!(matches!(
+            router.handle_inbound_message(m1, t1, sender.as_ref()),
+            InboundRouteOutcome::Dispatched(_)
+        ));
+        assert!(matches!(
+            router.handle_inbound_message(m2, t2, sender.as_ref()),
+            InboundRouteOutcome::Dispatched(_)
+        ));
+        let before_count = lock(&sender.sent).len();
+        router.on_turn_complete(&bot_id, SessionId(9), Some("Reply One"));
+        router.on_turn_complete(&bot_id, SessionId(9), Some("Reply Two"));
+        let sent_now = lock(&sender.sent).clone();
+        assert_eq!(sent_now.len(), before_count + 2);
+        assert_eq!(sent_now[before_count].1, "Reply One");
+        assert_eq!(sent_now[before_count + 1].1, "Reply Two");
+
+        // MB-45: Pending access holds deferred attachment loader (does NOT run before approval),
+        // and runs it upon `on_access_approved`, attaching the file to the replayed message!
+        let req = BotAccessRequest {
+            token: "tok-att-45".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Telegram,
+            sender_id: "3001".to_owned(),
+            sender_name: "Newbie".to_owned(),
+            channel_id: "1001".to_owned(),
+            status: krill_proto::bots::BotAccessRequestStatus::Pending,
+            created_at: 5_000,
+            decided_at: None,
+        };
+        *lock(&bridge.decision) = AccessDecision::Pending(req.clone());
+        let loaded_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded_bg = Arc::clone(&loaded_flag);
+        let (att_only_msg, att_target) = mk_tg("3001", "", "m-att");
+        let outcome = router.handle_inbound_message_with_loader(
+            att_only_msg,
+            att_target,
+            sender.as_ref(),
+            move |allowed_msg| {
+                loaded_bg.store(true, std::sync::atomic::Ordering::Release);
+                allowed_msg
+                    .attachments
+                    .push("/tmp/inbox/doc.pdf".to_owned());
+                true
+            },
+        );
+        assert!(matches!(
+            outcome,
+            Some(InboundRouteOutcome::PendingAccess(_))
+        ));
+        assert!(
+            !loaded_flag.load(std::sync::atomic::Ordering::Acquire),
+            "loader must NOT run while pending approval"
+        );
+        let dispatched_before = lock(&bridge.dispatched).len();
+        router.on_access_approved(&req);
+        assert!(
+            loaded_flag.load(std::sync::atomic::Ordering::Acquire),
+            "loader MUST run upon access approval"
+        );
+        let dispatched_after = lock(&bridge.dispatched);
+        assert_eq!(dispatched_after.len(), dispatched_before + 1);
+        assert_eq!(
+            dispatched_after.last().unwrap().attachments,
+            vec!["/tmp/inbox/doc.pdf".to_owned()]
+        );
     }
 }

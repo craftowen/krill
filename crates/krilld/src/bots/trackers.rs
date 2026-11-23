@@ -85,6 +85,11 @@ pub fn poll_github_bot(
     };
     let mut created = 0usize;
 
+    let token = token.and_then(|t| {
+        let trimmed = t.trim();
+        (!trimmed.is_empty()).then(|| zeroize::Zeroizing::new(trimmed.to_owned()))
+    });
+
     if let Some(token) = token {
         let auth = format!("Bearer {}", *token);
         let base = endpoints.github_api_base.trim_end_matches('/');
@@ -651,16 +656,18 @@ fn create_dedup_item(
     {
         return false;
     }
-    let clean_title: String = title.trim().chars().take(180).collect();
-    if clean_title.is_empty() {
+    let trimmed_title = title.trim();
+    if trimmed_title.is_empty() {
         return false;
     }
+    let clean_title = crate::bots::items::clamp_item_title(trimmed_title);
+    let clean_desc = description.and_then(|d| crate::bots::items::clamp_item_description(&d));
     items
         .create_item(
             &CreateBotItemParams {
                 bot_id: bot_id.clone(),
                 title: clean_title,
-                description,
+                description: clean_desc,
                 done_means: None,
                 status: Some(status),
                 links: vec![link],
@@ -754,11 +761,19 @@ pub fn test_github(
     secrets: &SecretVault,
     endpoints: &TrackerEndpoints,
 ) -> BotConnectorTestResult {
-    match secrets.resolve_secret(
-        &bot.id,
-        bot.connectors.github.token_secret_ref.as_deref(),
-        "github_token",
-    ) {
+    let resolved = secrets
+        .resolve_secret(
+            &bot.id,
+            bot.connectors.github.token_secret_ref.as_deref(),
+            "github_token",
+        )
+        .map(|opt| {
+            opt.and_then(|t| {
+                let trimmed = t.trim();
+                (!trimmed.is_empty()).then(|| zeroize::Zeroizing::new(trimmed.to_owned()))
+            })
+        });
+    match resolved {
         Ok(Some(token)) => {
             let base = endpoints.github_api_base.trim_end_matches('/');
             let url = format!("{base}/user");
@@ -938,6 +953,11 @@ struct TrackerWakeState {
     wake_now: bool,
 }
 
+struct RunningTrackerPoller {
+    stop: Arc<(Mutex<TrackerWakeState>, Condvar)>,
+    handle: JoinHandle<()>,
+}
+
 /// Strictly-lazy 60s background poller for GitHub & Linear trackers.
 pub struct TrackerPoller {
     store: Arc<BotStore>,
@@ -946,9 +966,8 @@ pub struct TrackerPoller {
     endpoints: TrackerEndpoints,
     statuses: Arc<Mutex<BTreeMap<(BotId, ExternalSource), BotConnectorStatus>>>,
     on_new_items: Arc<Mutex<Option<TrackerNewItemsCallback>>>,
-    stop: Arc<(Mutex<TrackerWakeState>, Condvar)>,
     running: AtomicBool,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    lifecycle: Mutex<Option<RunningTrackerPoller>>,
 }
 
 impl fmt::Debug for TrackerPoller {
@@ -981,9 +1000,8 @@ impl TrackerPoller {
             endpoints,
             statuses: Arc::new(Mutex::new(BTreeMap::new())),
             on_new_items: Arc::new(Mutex::new(None)),
-            stop: Arc::new((Mutex::new(TrackerWakeState::default()), Condvar::new())),
             running: AtomicBool::new(false),
-            thread: Mutex::new(None),
+            lifecycle: Mutex::new(None),
         }
     }
 
@@ -994,19 +1012,34 @@ impl TrackerPoller {
 
     /// Starts the poller thread if ≥1 bot enables GitHub or Linear and wakes immediately; stops it otherwise.
     pub fn reconcile(&self) {
-        let has_enabled = self
-            .store
-            .list_bots()
-            .unwrap_or_default()
+        let bots = self.store.list_bots().unwrap_or_default();
+        let active_keys: std::collections::BTreeSet<(BotId, ExternalSource)> = bots
             .iter()
-            .any(|b| !b.paused && (b.connectors.github.enabled || b.connectors.linear.enabled));
-        if has_enabled {
-            self.ensure_started();
-            let mut st = lock(&self.stop.0);
-            st.wake_now = true;
-            self.stop.1.notify_all();
-        } else {
+            .filter(|b| !b.paused)
+            .flat_map(|b| {
+                let mut keys = Vec::new();
+                if b.connectors.github.enabled {
+                    keys.push((b.id.clone(), ExternalSource::GitHub));
+                }
+                if b.connectors.linear.enabled {
+                    keys.push((b.id.clone(), ExternalSource::Linear));
+                }
+                keys
+            })
+            .collect();
+        // Prune disabled, paused, or deleted tracker status entries (MB-41).
+        lock(&self.statuses).retain(|k, _| active_keys.contains(k));
+        if active_keys.is_empty() {
             self.stop();
+        } else {
+            let mut guard = lock(&self.lifecycle);
+            if let Some(ref running) = *guard {
+                let mut st = lock(&running.stop.0);
+                st.wake_now = true;
+                running.stop.1.notify_all();
+            } else {
+                self.spawn_locked(&mut guard);
+            }
         }
     }
 
@@ -1092,23 +1125,25 @@ impl TrackerPoller {
         self.running.load(Ordering::Acquire)
     }
 
-    fn ensure_started(&self) {
-        let mut handle_guard = lock(&self.thread);
-        if handle_guard.is_some() {
+    fn spawn_locked(&self, lifecycle_guard: &mut Option<RunningTrackerPoller>) {
+        if lifecycle_guard.is_some() {
             return;
         }
-        {
-            let mut st = lock(&self.stop.0);
-            st.stop = false;
-            st.wake_now = true;
-        }
+        // Fresh per-generation stop/condvar state prevents stop/restart races (MB-17).
+        let stop = Arc::new((
+            Mutex::new(TrackerWakeState {
+                stop: false,
+                wake_now: true,
+            }),
+            Condvar::new(),
+        ));
         let store = Arc::clone(&self.store);
         let secrets = Arc::clone(&self.secrets);
         let items = Arc::clone(&self.items);
         let endpoints = self.endpoints.clone();
         let statuses = Arc::clone(&self.statuses);
         let on_new_items = Arc::clone(&self.on_new_items);
-        let stop = Arc::clone(&self.stop);
+        let stop_bg = Arc::clone(&stop);
 
         if let Ok(handle) = thread::Builder::new()
             .name("bot-tracker-poll".to_owned())
@@ -1141,7 +1176,7 @@ impl TrackerPoller {
                         .min()
                         .unwrap_or(DEFAULT_POLL_SECS);
                     let stopped = {
-                        let mut guard = lock(&stop.0);
+                        let mut guard = lock(&stop_bg.0);
                         if guard.stop {
                             break;
                         }
@@ -1149,7 +1184,7 @@ impl TrackerPoller {
                             guard.wake_now = false;
                             false
                         } else {
-                            let (mut guard, _) = stop
+                            let (mut guard, _) = stop_bg
                                 .1
                                 .wait_timeout_while(
                                     guard,
@@ -1265,18 +1300,24 @@ impl TrackerPoller {
             })
         {
             self.running.store(true, Ordering::Release);
-            *handle_guard = Some(handle);
+            *lifecycle_guard = Some(RunningTrackerPoller { stop, handle });
         }
     }
 
     /// Stops the background tracker poller thread cleanly.
     pub fn stop(&self) {
-        let handle = lock(&self.thread).take();
-        if let Some(h) = handle {
-            lock(&self.stop.0).stop = true;
-            self.stop.1.notify_all();
-            h.join().ok();
+        let running = {
+            let mut guard = lock(&self.lifecycle);
+            let taken = guard.take();
+            if let Some(ref r) = taken {
+                lock(&r.stop.0).stop = true;
+                r.stop.1.notify_all();
+            }
             self.running.store(false, Ordering::Release);
+            taken
+        };
+        if let Some(r) = running {
+            r.handle.join().ok();
         }
     }
 }
@@ -1585,6 +1626,113 @@ mod tests {
         assert!(e502.message.contains("502"));
 
         srv.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tracker_trims_github_token_clamps_cjk_and_prunes_disabled_statuses() {
+        let dir = temp_dir("mb17-39-41-44");
+        let store = Arc::new(BotStore::new(dir.clone()));
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x44; 32]));
+        let items = Arc::new(BotItemsStore::new(dir.join("items.db")));
+
+        let bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Tracker Regression".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        // MB-39: >200B CJK title + >20KB description must succeed via UTF-8 byte clamping.
+        let cjk_title = "이슈제목".repeat(40); // 480 bytes
+        let huge_desc = "설".repeat(8_000); // 24,000 bytes
+        let created = create_dedup_item(
+            &items,
+            &bot.id,
+            &cjk_title,
+            Some(huge_desc),
+            BotItemStatus::Planned,
+            BotItemLink::Url("https://github.com/acme/repo/issues/99".to_owned()),
+            &BotItemActor::System {
+                reason: "test".to_owned(),
+            },
+            1_000,
+        );
+        assert!(created, "clamped CJK title/desc item must be created");
+
+        // MB-44: GitHub token with surrounding CRLF/whitespace must be trimmed before HTTP header.
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = mock.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+            assert!(
+                req.contains("Authorization: Bearer ghp_trimmed_tok\r\n"),
+                "token was not trimmed cleanly: {req}"
+            );
+            let body = r#"{"login":"trimuser"}"#;
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(wire.as_bytes()).unwrap();
+        });
+        secrets
+            .set_secret(
+                &bot.id,
+                "github_token",
+                Zeroizing::new("  ghp_trimmed_tok\r\n ".to_owned()),
+            )
+            .unwrap();
+        let ep = TrackerEndpoints {
+            github_api_base: format!("http://{addr}"),
+            linear_graphql_url: format!("http://{addr}/graphql"),
+        };
+        let res = test_github(&bot, &secrets, &ep);
+        assert!(res.ok, "{res:?}");
+        srv.join().unwrap();
+
+        // MB-17 & MB-41: reconcile prunes disabled statuses and cleanly handles stop/restart cycles.
+        let poller = TrackerPoller::new(Arc::clone(&store), secrets, items, ep);
+        lock(&poller.statuses).insert(
+            (bot.id.clone(), ExternalSource::GitHub),
+            ok_status(&bot.id, ExternalSource::GitHub, None, 1_000),
+        );
+        assert_eq!(poller.statuses(None).len(), 1);
+        poller.reconcile();
+        assert!(
+            poller.statuses(None).is_empty(),
+            "disabled tracker status must be pruned on reconcile"
+        );
+        assert!(!poller.is_running());
+
+        // Enable, start, reconcile/stop rapidly to ensure zero stop/restart race.
+        let mut conn = bot.connectors.clone();
+        conn.github.enabled = true;
+        store.set_connector_config(&bot.id, conn, 2_000).unwrap();
+        poller.reconcile();
+        assert!(poller.is_running());
+        poller.stop();
+        assert!(!poller.is_running());
+        poller.reconcile();
+        assert!(poller.is_running());
+        poller.stop();
+        assert!(!poller.is_running());
+
         fs::remove_dir_all(&dir).ok();
     }
 }

@@ -294,10 +294,13 @@ fn run_memory_tidy_inner(
         ensure_no_symlink_path(&archive_path)?;
         let mut archive_body = std::fs::read_to_string(&archive_path)
             .unwrap_or_else(|_| format!("# Archived Memory ({ym})\n\n"));
+        if !archive_body.is_empty() && !archive_body.ends_with('\n') {
+            archive_body.push('\n');
+        }
         for fact in overflow {
             archived_winners.insert(fact.winning_idx);
             let line = format_fact(fact.date.as_deref(), &fact.text, fact.source.as_deref());
-            if !archive_body.contains(line.as_str()) {
+            if !archive_body.lines().any(|existing| existing == line) {
                 archive_body.push_str(&line);
                 archive_body.push('\n');
             }
@@ -675,6 +678,67 @@ mod tests {
         assert!(cleaned.contains("Never drop user headings"), "{cleaned}");
         assert!(cleaned.contains("Target dir is external SSD"), "{cleaned}");
         assert_eq!(parse_memory_facts(&cleaned).len(), 3);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn memory_tidy_archive_uses_exact_line_dedup_and_trailing_newline() {
+        use std::fmt::Write as _;
+        let root = temp_dir("archive-exact");
+        let store = BotStore::new(root.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Archive Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let now_ms = 1_795_000_000_000_u64;
+        let ym = format_utc_ym(now_ms / 1_000);
+        let home = store.bot_home(&bot);
+        let mem_dir = home.join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        let archive_path = mem_dir.join(format!("archive-{ym}.md"));
+        // Seed archive WITHOUT trailing newline and containing a longer fact whose prefix is "- 2020-01-01 foo".
+        fs::write(
+            &archive_path,
+            "# Archived Memory\n\n- 2020-01-01 foo bar baz",
+        )
+        .unwrap();
+
+        let mut content = String::from("# Memory\n\n");
+        for i in 0..220 {
+            writeln!(content, "- 2026-11-10 Newer fact #{i}").unwrap();
+        }
+        content.push_str("- 2020-01-01 foo\n");
+        store.update_memory(&bot.id, &content, true).unwrap();
+
+        let (_, changes) = run_memory_tidy_tracked(&store, None, &bot.id, now_ms).unwrap();
+        assert!(changes >= 1);
+
+        let archived = fs::read_to_string(&archive_path).unwrap();
+        let lines: Vec<&str> = archived.lines().collect();
+        assert!(
+            lines.contains(&"- 2020-01-01 foo bar baz"),
+            "existing line must not be glued: {archived}"
+        );
+        assert!(
+            lines.contains(&"- 2020-01-01 foo"),
+            "substring match must not drop shorter distinct fact: {archived}"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

@@ -947,22 +947,31 @@ fn handle_update(
         external_message_id: Some(msg.message_id.to_string()),
         acts_for,
     };
-    // Download inbound attachments ONLY after `paused` and allowlist/access checks pass (D-17).
-    router.handle_inbound_message_with_loader(inbound, target, sender.as_ref(), |allowed_msg| {
-        if let Some(att) = pending_attachment
-            && let Some(bot_home) = bridge.bot_home_dir(bot_id)
-            && let Some(path) = sender.download_attachment_to_inbox(
-                &att.file_id,
-                &att.suggested_name,
-                att.mime_type.as_deref(),
-                att.file_size,
-                &bot_home,
-            )
-        {
-            allowed_msg.attachments.push(path);
-        }
-        has_explicit_text || !allowed_msg.attachments.is_empty()
-    });
+    // Download inbound attachments ONLY after `paused` and allowlist/access checks pass (D-17),
+    // retaining the deferred loader on `Pending` so approved messages replay WITH their file (MB-45).
+    let bot_id_owned = bot_id.clone();
+    let bridge_owned = Arc::clone(bridge);
+    let sender_owned = Arc::clone(sender);
+    router.handle_inbound_message_with_loader(
+        inbound,
+        target,
+        sender.as_ref(),
+        move |allowed_msg| {
+            if let Some(att) = pending_attachment
+                && let Some(bot_home) = bridge_owned.bot_home_dir(&bot_id_owned)
+                && let Some(path) = sender_owned.download_attachment_to_inbox(
+                    &att.file_id,
+                    &att.suggested_name,
+                    att.mime_type.as_deref(),
+                    att.file_size,
+                    &bot_home,
+                )
+            {
+                allowed_msg.attachments.push(path);
+            }
+            has_explicit_text || !allowed_msg.attachments.is_empty()
+        },
+    );
 }
 
 fn format_tg_user_name(user: &TgUser) -> String {
