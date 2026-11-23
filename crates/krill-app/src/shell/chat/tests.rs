@@ -196,7 +196,7 @@ fn slow_chat_poll_is_coalesced_and_rejects_changed_host(cx: &mut gpui::TestAppCo
     cx.run_until_parked();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     view.read_with(cx, |shell, _| {
-        assert!(shell.chat.task.is_none());
+        assert!(shell.chat.poll_tasks.is_empty());
         assert!(!shell.chat.logs.contains_key(&local_key(SessionId(321))));
     });
 }

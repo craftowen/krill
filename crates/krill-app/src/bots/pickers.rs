@@ -121,7 +121,7 @@ pub struct BotAgentSetup {
 impl BotAgentSetup {
     pub fn from_hosts<E: 'static>(
         hosts: Vec<HostChoice>,
-        lens: fn(&mut E) -> &mut Self,
+        lens: fn(&mut E) -> Option<&mut Self>,
         cx: &mut Context<E>,
     ) -> Self {
         let local_label: SharedString = text::HOST_LOCAL
@@ -166,7 +166,11 @@ impl BotAgentSetup {
         me
     }
 
-    pub fn probe_hosts<E: 'static>(&mut self, lens: fn(&mut E) -> &mut Self, cx: &mut Context<E>) {
+    pub fn probe_hosts<E: 'static>(
+        &mut self,
+        lens: fn(&mut E) -> Option<&mut Self>,
+        cx: &mut Context<E>,
+    ) {
         self.probe_tasks.clear();
         for host in self.hosts.clone() {
             let task = cx.spawn(async move |this, cx| {
@@ -175,7 +179,9 @@ impl BotAgentSetup {
                     .spawn(async move { probe_host(&host.rpc) })
                     .await;
                 this.update(cx, |this, cx| {
-                    let s = lens(this);
+                    let Some(s) = lens(this) else {
+                        return;
+                    };
                     if let Some(reason) = blocked {
                         s.blocked.insert(host.id.clone(), reason);
                         if s.host_id == host.id
@@ -201,7 +207,7 @@ impl BotAgentSetup {
     pub fn select_host<E: 'static>(
         &mut self,
         id: &HostId,
-        lens: fn(&mut E) -> &mut Self,
+        lens: fn(&mut E) -> Option<&mut Self>,
         cx: &mut Context<E>,
     ) {
         if self.blocked.contains_key(id) {
@@ -230,7 +236,7 @@ impl BotAgentSetup {
     pub fn set_runtime<E: 'static>(
         &mut self,
         runtime: &'static str,
-        lens: fn(&mut E) -> &mut Self,
+        lens: fn(&mut E) -> Option<&mut Self>,
         cx: &mut Context<E>,
     ) {
         if self.runtime != runtime {
@@ -276,7 +282,11 @@ impl BotAgentSetup {
         cx.notify();
     }
 
-    pub fn load_models<E: 'static>(&mut self, lens: fn(&mut E) -> &mut Self, cx: &mut Context<E>) {
+    pub fn load_models<E: 'static>(
+        &mut self,
+        lens: fn(&mut E) -> Option<&mut Self>,
+        cx: &mut Context<E>,
+    ) {
         let rpc = self.rpc.clone();
         let agent_id = self.runtime.to_owned();
         let expected_runtime = self.runtime;
@@ -289,7 +299,9 @@ impl BotAgentSetup {
                 )
                 .await;
             this.update(cx, |this, cx| {
-                let setup = lens(this);
+                let Some(setup) = lens(this) else {
+                    return;
+                };
                 if setup.runtime != expected_runtime {
                     return;
                 }
@@ -471,7 +483,7 @@ fn host_icon(is_local: bool, p: &ui::Palette) -> gpui_component::Icon {
 pub fn render_computer_picker<E: 'static>(
     prefix: &'static str,
     setup: &BotAgentSetup,
-    lens: fn(&mut E) -> &mut BotAgentSetup,
+    lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     on_update_host: fn(&mut E, &mut Context<E>),
     p: &ui::Palette,
     cx: &mut Context<E>,
@@ -528,8 +540,12 @@ pub fn render_computer_picker<E: 'static>(
                     None => PopupMenuItem::new(host.label.clone())
                         .checked(id == current_id)
                         .on_click(move |_, _, cx| {
-                            this.update(cx, |v, cx| lens(v).select_host(&id, lens, cx))
-                                .ok();
+                            this.update(cx, |v, cx| {
+                                if let Some(s) = lens(v) {
+                                    s.select_host(&id, lens, cx);
+                                }
+                            })
+                            .ok();
                         }),
                     Some(blocked) => {
                         let update = matches!(blocked, Blocked::NoBots(_));
@@ -554,7 +570,7 @@ pub fn render_agent_launch_picker<E: 'static>(
     prefix: &'static str,
     setup: &BotAgentSetup,
     show_chat_default_hint: bool,
-    lens: fn(&mut E) -> &mut BotAgentSetup,
+    lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     p: &ui::Palette,
     cx: &mut Context<E>,
 ) -> gpui::Div {
@@ -624,15 +640,18 @@ pub fn render_agent_launch_picker<E: 'static>(
         .open(setup.agent_popover_open && !no_agents)
         .appearance(false)
         .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
-            let s = lens(this);
-            s.agent_popover_open = *open;
-            cx.notify();
+            if let Some(s) = lens(this) {
+                s.agent_popover_open = *open;
+                cx.notify();
+            }
         }))
         .trigger(PopoverTrigger(trigger, false))
         .content(move |_, _, cx| {
             entity.update(cx, |this, cx| {
                 let palette = ui::palette(cx);
-                let s = lens(this);
+                let Some(s) = lens(this) else {
+                    return div().into_any_element();
+                };
                 render_agent_popover_body(prefix, s, lens, palette, cx)
             })
         });
@@ -677,7 +696,9 @@ pub fn render_agent_launch_picker<E: 'static>(
                             .underline()
                             .hover(|d| d.text_color(p.foreground))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                lens(this).reset_chat_defaults(cx);
+                                if let Some(s) = lens(this) {
+                                    s.reset_chat_defaults(cx);
+                                }
                             }))
                             .child(text::NB_USE_CHAT_DEFAULTS.get()),
                     )
@@ -688,7 +709,7 @@ pub fn render_agent_launch_picker<E: 'static>(
 fn render_agent_popover_body<E: 'static>(
     prefix: &'static str,
     setup: &BotAgentSetup,
-    lens: fn(&mut E) -> &mut BotAgentSetup,
+    lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     p: &ui::Palette,
     cx: &mut Context<E>,
 ) -> AnyElement {
@@ -732,7 +753,9 @@ fn render_agent_popover_body<E: 'static>(
                 .text_size(ui::TEXT_SM)
                 .text_color(p.foreground)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    lens(this).set_runtime(rt_id, lens, cx);
+                    if let Some(s) = lens(this) {
+                        s.set_runtime(rt_id, lens, cx);
+                    }
                 }))
                 .child(ui::icons::agent_brand_icon(
                     rt_id,
@@ -765,7 +788,11 @@ fn render_agent_popover_body<E: 'static>(
                 .items_center()
                 .justify_between()
                 .text_size(ui::TEXT_SM)
-                .on_click(cx.listener(move |this, _, _, cx| lens(this).set_model(None, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(s) = lens(this) {
+                        s.set_model(None, cx);
+                    }
+                }))
                 .child(text::MODEL_DEFAULT.get())
                 .when(current_model.is_none(), |d| {
                     d.child(Icon::new(IconName::Check).size(px(ui::ICON_XS)))
@@ -791,7 +818,9 @@ fn render_agent_popover_body<E: 'static>(
                 .gap_1p5()
                 .text_size(ui::TEXT_SM)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    lens(this).set_model(Some(mid.clone()), cx);
+                    if let Some(s) = lens(this) {
+                        s.set_model(Some(mid.clone()), cx);
+                    }
                 }))
                 .child(div().flex_1().truncate().child(m.label))
                 .when(checked, |d| {
@@ -828,7 +857,9 @@ fn render_agent_popover_body<E: 'static>(
                 ui::segment(p, id, effort_label(eff), active).on_click(cx.listener(
                     move |this, _, _, cx| {
                         let next = (!eff_owned.is_empty()).then_some(eff_owned.clone());
-                        lens(this).set_effort(next, cx);
+                        if let Some(s) = lens(this) {
+                            s.set_effort(next, cx);
+                        }
                     },
                 )),
             );
@@ -863,7 +894,9 @@ fn render_agent_popover_body<E: 'static>(
         let id: SharedString = format!("{prefix}-perm-{key}").into();
         ui::segment(p, id, permission_label(mode), active).on_click(cx.listener(
             move |this, _, _, cx| {
-                lens(this).set_permission(mode, cx);
+                if let Some(s) = lens(this) {
+                    s.set_permission(mode, cx);
+                }
             },
         ))
     });
@@ -930,7 +963,7 @@ pub fn render_runs_on_picker<E: 'static>(
     setup: &BotAgentSetup,
     bot_name: Option<&str>,
     taken_names: &[String],
-    lens: fn(&mut E) -> &mut BotAgentSetup,
+    lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     on_update_host: fn(&mut E, &mut Context<E>),
     p: &ui::Palette,
     cx: &mut Context<E>,
@@ -1040,9 +1073,10 @@ pub fn render_runs_on_picker<E: 'static>(
                 .justify_between()
                 .gap_2()
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let s = lens(this);
-                    s.runs_on_expanded = !s.runs_on_expanded;
-                    cx.notify();
+                    if let Some(s) = lens(this) {
+                        s.runs_on_expanded = !s.runs_on_expanded;
+                        cx.notify();
+                    }
                 }))
                 .child(
                     div()
@@ -1176,17 +1210,18 @@ pub fn render_bot_name_suggestion<E: 'static>(
 
 /// Matches a picked external bot path against `ListImportedSources` (`(canonical_path, BotId)`) rows
 /// to show whether an earlier active Krill bot was already created from that source.
+///
+/// `canonical_path` should be precomputed off the UI thread (and only for local hosts) so rendering
+/// never performs synchronous filesystem syscalls.
 #[must_use]
 pub fn find_imported_bot<'a>(
     bots: &'a [BotConfig],
     imported_sources: &[(String, krill_proto::bots::BotId)],
     candidate_path: &str,
+    canonical_path: Option<&str>,
 ) -> Option<&'a BotConfig> {
-    let canonical = std::fs::canonicalize(candidate_path)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
     imported_sources.iter().find_map(|(src, id)| {
-        let same = src == candidate_path || canonical.as_deref().is_some_and(|c| c == src);
+        let same = src == candidate_path || canonical_path.is_some_and(|c| c == src);
         same.then(|| bots.iter().find(|b| &b.id == id)).flatten()
     })
 }

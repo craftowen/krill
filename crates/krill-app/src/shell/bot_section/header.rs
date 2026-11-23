@@ -210,7 +210,7 @@ impl Shell {
                     PopupMenuItem::new(text::SB_IMPORT.get())
                         .icon(gpui_component::Icon::default().data(ui::icons::DOWNLOAD_SVG))
                         .on_click(act(|s, window, cx| {
-                            s.open_bots_screen(BotsScreen::Import, window, cx);
+                            s.open_bots_screen(BotsScreen::Import, Some(window), cx);
                         })),
                 )
                 .separator()

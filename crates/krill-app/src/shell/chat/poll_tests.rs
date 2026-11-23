@@ -564,3 +564,73 @@ fn active_chat_poll_interval_adapts_to_session_state(cx: &mut gpui::TestAppConte
         );
     });
 }
+
+#[gpui::test]
+fn split_unfocused_chat_pane_keeps_polling_while_other_pane_focused(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = open(cx, state_path("chat-split-poll"));
+    let polled_sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&polled_sessions);
+    let (chat_pane, term_pane) = view.update(cx, |shell, cx| {
+        let chat_pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(chat_pane, SessionId(996));
+        shell.layout.set_chat_view(chat_pane, true);
+        shell.layout.split(krill_app::layout::Axis::Horizontal);
+        let term_pane = shell.layout.focused().unwrap();
+        shell.layout.set_session(term_pane, SessionId(997));
+        shell.layout.set_chat_view(term_pane, false);
+        shell.paths = Some(krill_proto::daemon::Paths {
+            socket: "/unused".into(),
+            holder: "/unused".into(),
+            krilld: "/unused".into(),
+        });
+        shell.chat.poll_call = Some(Arc::new(move |request| {
+            let Request::AgentHistory(Action::ChatPoll { session, .. }) = request else {
+                panic!("expected ChatPoll");
+            };
+            recorded.lock().unwrap().push(*session);
+            Ok(Reply::AgentHistory(Response::ChatPolled(
+                ChatPollSnapshot {
+                    agent: "claude".into(),
+                    session_id: format!("split-{}", session.0),
+                    transcript_path: "/fake/split.jsonl".into(),
+                    bound: true,
+                    next_offset: 32,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "streamed while unfocused".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )))
+        }));
+        shell.poll_visible_chats(cx);
+        (chat_pane, term_pane)
+    });
+    cx.run_until_parked();
+    assert_ne!(chat_pane, term_pane);
+    assert_eq!(
+        view.read_with(cx, |s, _| s.layout.focused()),
+        Some(term_pane)
+    );
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell.chat.poll_timer.is_some(),
+            "poll timer must stay active while an unfocused split Chat pane is visible"
+        );
+        let log = &shell.chat.logs[&local_key(SessionId(996))];
+        assert_eq!(log.items[0].text, "streamed while unfocused");
+    });
+    cx.executor().advance_clock(Duration::from_millis(800));
+    cx.run_until_parked();
+    assert!(
+        polled_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&sid| sid == SessionId(996))
+            .count()
+            >= 2,
+        "unfocused split Chat pane must keep polling on timer ticks"
+    );
+}

@@ -248,7 +248,11 @@ impl Shell {
             return loaded.clone();
         }
         if self.chat.images.thumbs.len() >= MAX_CACHED_THUMBS {
-            self.chat.images.thumbs.clear();
+            for (_, loaded) in self.chat.images.thumbs.drain() {
+                if let Loaded::Ready(image) = loaded {
+                    cx.drop_image(image, None);
+                }
+            }
         }
         self.chat
             .images
@@ -263,7 +267,9 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 let loaded = decoded.map_or(Loaded::Failed, |image| Loaded::Ready(Arc::new(image)));
-                this.chat.images.thumbs.insert(owned, loaded);
+                if let Some(Loaded::Ready(old)) = this.chat.images.thumbs.insert(owned, loaded) {
+                    cx.drop_image(old, None);
+                }
                 cx.notify();
             })
             .ok();
@@ -409,6 +415,7 @@ impl Shell {
             cx.drop_image(image, Some(window));
         }
         viewer.index = to;
+        viewer.copied_at = None;
         viewer.fit();
         self.load_chat_viewer_image(cx);
         cx.notify();
@@ -430,23 +437,48 @@ impl Shell {
                 .background_executor()
                 .spawn(async move { png_bytes(&path) })
                 .await;
-            this.update(cx, |this, cx| {
-                if let Some(bytes) = bytes {
+            let stamped = this
+                .update(cx, |this, cx| {
+                    let bytes = bytes?;
                     cx.write_to_clipboard(gpui::ClipboardItem::new_image(
                         &gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
                     ));
+                    let stamped = std::time::Instant::now();
                     if let Some(viewer) = this.chat.images.viewer.as_mut() {
-                        viewer.copied_at = Some(std::time::Instant::now());
+                        viewer.copied_at = Some(stamped);
                     }
                     cx.notify();
-                }
-            })
-            .ok();
+                    Some(stamped)
+                })
+                .ok()
+                .flatten();
+            if let Some(stamped) = stamped {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Some(viewer) = this.chat.images.viewer.as_mut()
+                        && viewer.copied_at == Some(stamped)
+                    {
+                        viewer.copied_at = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
         })
         .detach();
     }
 
-    pub(super) fn close_chat_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::shell) fn has_chat_image_viewer(&self) -> bool {
+        self.chat.images.viewer.is_some()
+    }
+
+    pub(in crate::shell) fn close_chat_image_viewer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(viewer) = self.chat.images.viewer.take() else {
             return;
         };

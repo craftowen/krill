@@ -5696,7 +5696,7 @@ impl Shell {
             }
             return;
         }
-        if self.page_open() || !self.focus.is_focused(window) {
+        if self.has_blocking_overlay() || !self.focus.is_focused(window) {
             return;
         }
         if self.confirm_close_tab.is_some() {
@@ -5884,7 +5884,7 @@ impl Shell {
         }
         // AS-12: `on_key_down`과 같이 포커스를 검사한다. 검색 바·Jump·사이드바 입력 중에
         // 올라온 Release가 버블링돼 터미널 PTY로 새는 것을 막는다(kitty 플래그 2 보고 모드).
-        if self.page_open()
+        if self.has_blocking_overlay()
             || self.dashboard.is_some()
             || !self.focus.is_focused(window)
             || self
@@ -6232,7 +6232,7 @@ impl Shell {
     }
 
     fn copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page_open() || self.dashboard.is_some() {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
             return;
         }
         if self.is_active_chat_view_in(cx) {
@@ -6252,7 +6252,7 @@ impl Shell {
     }
 
     fn copy_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page_open() || self.dashboard.is_some() {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
             return;
         }
         if self.is_active_chat_view_in(cx) {
@@ -6273,7 +6273,7 @@ impl Shell {
     }
 
     fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page_open() || self.dashboard.is_some() {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
             return;
         }
         if self.is_active_chat_view_in(cx)
@@ -6730,6 +6730,9 @@ impl Shell {
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
         // OWE-860: 설정에서 ⌘B를 누르면 설정을 닫고 사이드바를 전환한다.
         if self.page_open() {
             self.close_settings(None, cx);
@@ -6743,6 +6746,9 @@ impl Shell {
     }
 
     fn toggle_history(&mut self, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
         if self.page_open() {
             self.close_settings(None, cx);
         }
@@ -6764,6 +6770,9 @@ impl Shell {
     }
 
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
         // OWE-860: 설정에서 ⌘L 등을 누르면 설정을 닫고 패널을 전환한다.
         if self.page_open() {
             self.close_settings(None, cx);
@@ -6779,7 +6788,10 @@ impl Shell {
 
     fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A bot page or group page has no Changes tab (Orca hides it there).
-        if self.page_open() || self.focused_bot().is_some() || self.focused_bot_group().is_some() {
+        if self.has_blocking_overlay()
+            || self.focused_bot().is_some()
+            || self.focused_bot_group().is_some()
+        {
             return;
         }
         if self.panel_collapsed {
@@ -6805,6 +6817,9 @@ impl Shell {
     }
 
     fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
         // OWE-860: 설정에서 ⌘⇧E를 누르면 설정을 닫고 탐색기로 전환한다.
         if self.page_open() {
             self.close_settings(Some(&mut *window), cx);
@@ -6849,6 +6864,9 @@ impl Shell {
     }
 
     fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_dialog_or_viewer_overlay() {
+            return;
+        }
         // A bot page or group page has no Search tab (Orca hides it there).
         if !self.page_open() && (self.focused_bot().is_some() || self.focused_bot_group().is_some())
         {
@@ -8497,6 +8515,9 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .on_action(
                 cx.listener(|this, _: &krill_app::settings::OpenSettings, window, cx| {
+                    if this.has_dialog_or_viewer_overlay() {
+                        return;
+                    }
                     // OWE-860: ⌘,는 설정 토글이다. 이미 열려 있으면 닫고(현재 탭 초기화 없음),
                     // 닫혀 있을 때만 일반 탭으로 연다.
                     if this.settings().is_some() {
@@ -8511,50 +8532,77 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.on_new_tab_shortcut(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
-                if this.page_open() || this.dashboard.is_some() {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 this.request_close_tab(this.layout.active(), cx);
             }))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.cycle_workspace_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.cycle_workspace_tab(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &NextSameTypeTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 let editor = this.layout.is_editor_tab(this.layout.active());
                 this.cycle_workspace_tab_matching(1, Some(editor), cx);
             }))
             .on_action(cx.listener(|this, _: &PrevSameTypeTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 let editor = this.layout.is_editor_tab(this.layout.active());
                 this.cycle_workspace_tab_matching(-1, Some(editor), cx);
             }))
             .on_action(cx.listener(|this, _: &NextTerminalTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.cycle_workspace_tab_matching(1, Some(false), cx);
             }))
             .on_action(cx.listener(|this, _: &PrevTerminalTab, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.cycle_workspace_tab_matching(-1, Some(false), cx);
             }))
             .on_action(cx.listener(|this, _: &NextRecentTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.on_recent_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevRecentTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
@@ -8571,8 +8619,7 @@ impl Render for Shell {
                     this.close_dashboard(Some(window), cx);
                     return;
                 }
-                if this.page_open() {
-                    this.close_settings(Some(window), cx);
+                if this.close_topmost_blocking_overlay(window, cx) {
                     return;
                 }
                 if this.diff.read(cx).has_center_diff() {
@@ -8595,20 +8642,20 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
-                if this.page_open() || this.dashboard.is_some() {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(1));
             }))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| {
-                if this.page_open() || this.dashboard.is_some() {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(-1));
             }))
             // OWE-871: 2차원 분할에서 상하좌우 기하 방향으로 포커스를 옮긴다.
             .on_action(cx.listener(|this, _: &FocusPaneLeft, _, cx| {
-                if this.page_open() {
+                if this.has_blocking_overlay() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -8616,7 +8663,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusPaneRight, _, cx| {
-                if this.page_open() {
+                if this.has_blocking_overlay() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -8624,7 +8671,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusPaneUp, _, cx| {
-                if this.page_open() {
+                if this.has_blocking_overlay() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -8632,7 +8679,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusPaneDown, _, cx| {
-                if this.page_open() {
+                if this.has_blocking_overlay() {
                     return;
                 }
                 this.change(true, cx, |l| {
@@ -8640,7 +8687,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &ToggleZoomPane, _, cx| {
-                if this.page_open() || this.dashboard.is_some() {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 let Some(focused) = this.layout.focused() else {
@@ -8657,7 +8704,10 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearPane, _, cx| {
-                if this.page_open() || this.dashboard.is_some() || this.is_active_chat_view_in(cx) {
+                if this.has_blocking_overlay()
+                    || this.dashboard.is_some()
+                    || this.is_active_chat_view_in(cx)
+                {
                     return;
                 }
                 let unlinked_session = this.layout.focused().and_then(|pane| {
@@ -8683,7 +8733,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, window, cx| {
-                if this.page_open() || this.dashboard.is_some() {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 if this.is_active_chat_view_in(cx) {
@@ -8715,34 +8765,55 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewAgentTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.on_new_agent_tab_shortcut(cx);
             }))
             .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if this.page_open() {
                     this.close_settings(None, cx);
                 }
                 this.reopen_closed_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &PrevSession, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.cycle_session_focus(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &NextSession, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.cycle_session_focus(1, cx);
             }))
             .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.navigate_back(Some(window), cx);
             }))
             .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.navigate_forward(Some(window), cx);
             }))
             .on_action(cx.listener(|this, _: &NewWorktree, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.open_new_worktree_dialog(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ScrollTop, _, cx| {
-                if !this.page_open() && this.dashboard.is_none() {
+                if !this.has_blocking_overlay() && this.dashboard.is_none() {
                     if this.is_active_chat_view_in(cx) {
                         this.scroll_chat_overlay_home(cx);
                         return;
@@ -8755,16 +8826,20 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ScrollBottom, _, cx| {
-                if !this.page_open() && this.dashboard.is_none() && this.is_active_chat_view_in(cx)
-                {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
                     this.scroll_chat_overlay_end(cx);
                     return;
                 }
                 this.scroll_terminal(isize::MIN, cx);
             }))
             .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| {
-                if !this.page_open() && this.dashboard.is_none() && this.is_active_chat_view_in(cx)
-                {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
                     this.scroll_chat_overlay_page(-1, cx);
                     return;
                 }
@@ -8774,8 +8849,10 @@ impl Render for Shell {
                 this.scroll_terminal(isize::try_from(rows).unwrap_or(isize::MAX), cx);
             }))
             .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| {
-                if !this.page_open() && this.dashboard.is_none() && this.is_active_chat_view_in(cx)
-                {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if this.is_active_chat_view_in(cx) {
                     this.scroll_chat_overlay_page(1, cx);
                     return;
                 }
@@ -8784,93 +8861,158 @@ impl Render for Shell {
                     .map_or(1, |l| l.pane.screen().rows.len());
                 this.scroll_terminal(-isize::try_from(rows).unwrap_or(isize::MAX), cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseEditors, _, cx| this.close_all_editor_tabs(cx)))
+            .on_action(cx.listener(|this, _: &CloseEditors, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                this.close_all_editor_tabs(cx);
+            }))
             .on_action(cx.listener(|this, _: &RenameTab, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.begin_tab_rename(this.layout.active(), window, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace1, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(0, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(0, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace2, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(1, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(1, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace3, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(2, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(2, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace4, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(3, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(3, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace5, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(4, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(4, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace6, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(5, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(5, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace7, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(6, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(6, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace8, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(7, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(7, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateWorkspace9, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 if !this.jump_to_palette_row(8, cx) {
                     this.sidebar
                         .update(cx, |s, cx| s.activate_workspace_index(8, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(0, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(1, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(2, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab4, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(3, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab5, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(4, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab6, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(5, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(6, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(7, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.activate_tab_index(8, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 // OWE-860: 설정에서 호출하면 설정을 닫고 사이드바에 포커스를 둔다.
                 if this.page_open() {
                     this.close_settings(Some(&mut *window), cx);
@@ -8882,9 +9024,15 @@ impl Render for Shell {
             .map(|d| Self::file_actions(d, cx))
             .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
             .on_action(cx.listener(|this, _: &ToggleChatView, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.toggle_chat_view_with_focus(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 if this.search.is_some()
                     || (this.is_active_chat_view_in(cx) && this.chat_find_is_open(cx))
                 {
@@ -8905,29 +9053,57 @@ impl Render for Shell {
                     this.toggle_workspace_search(window, cx);
                 }),
             )
-            .on_action(cx.listener(|this, _: &Jump, window, cx| this.toggle_jump(window, cx)))
+            .on_action(cx.listener(|this, _: &Jump, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.toggle_jump(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &CommandPalette, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.toggle_command_palette(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &Find, window, cx| this.toggle_search(window, cx)))
+            .on_action(cx.listener(|this, _: &Find, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
+                this.toggle_search(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &FindNext, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.step_search(krill_proto::search::Direction::Next, cx);
             }))
             .on_action(cx.listener(|this, _: &FindPrev, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.step_search(krill_proto::search::Direction::Previous, cx);
             }))
             .on_action(cx.listener(|this, _: &Copy, window, cx| this.copy(window, cx)))
             .on_action(cx.listener(|this, _: &CopyClean, window, cx| this.copy_clean(window, cx)))
             .on_action(cx.listener(|this, _: &QuoteChat, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 this.quote_chat_selection(window, cx);
             }))
             .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste(window, cx)))
             .on_action(cx.listener(|this, _: &ForkSession, _, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 if let Some(pane) = this.layout.focused() {
                     this.fork_pane_session(pane, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ContinueInNewSession, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
                 if let Some(pane) = this.layout.focused() {
                     this.open_continue_session(pane, window, cx);
                 }
@@ -8936,6 +9112,9 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_float_terminal))
             .on_action(cx.listener(Self::on_dashboard))
             .on_action(cx.listener(|this, _: &OpenBots, window, cx| {
+                if this.has_dialog_or_viewer_overlay() {
+                    return;
+                }
                 this.open_bots(Some(window), cx);
             }))
             .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
@@ -8952,7 +9131,7 @@ impl Render for Shell {
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_link_modifiers))
             .when(
-                !self.page_open()
+                !self.has_blocking_overlay()
                     && self.dashboard.is_none()
                     && !self.diff.read(cx).has_center_diff(),
                 |d| d.child(input),
@@ -9183,8 +9362,65 @@ impl Render for Shell {
 }
 
 impl Shell {
+    pub(super) fn has_dialog_or_viewer_overlay(&self) -> bool {
+        self.bot_ui.new_bot.is_some()
+            || self.bot_ui.templates.is_some()
+            || self.bot_ui.group_dialog.is_some()
+            || self.bot_ui.delete.is_some()
+            || self.bot_ui.delete_group.is_some()
+            || self.has_chat_image_viewer()
+    }
+
+    pub(super) fn has_blocking_overlay(&self) -> bool {
+        self.page_open() || self.has_dialog_or_viewer_overlay()
+    }
+
+    fn close_topmost_blocking_overlay(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.has_chat_image_viewer() {
+            self.close_chat_image_viewer(window, cx);
+            return true;
+        }
+        if self.bot_ui.delete_group.is_some() {
+            self.bot_ui.delete_group = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.delete.is_some() {
+            self.bot_ui.delete = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.group_dialog.is_some() {
+            self.bot_ui.group_dialog = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.templates.is_some() {
+            self.bot_ui.templates = None;
+            cx.notify();
+            return true;
+        }
+        if self.bot_ui.new_bot.is_some() {
+            self.bot_ui.new_bot = None;
+            if std::mem::take(&mut self.bot_ui.back_to_templates) {
+                self.request_bot_templates(cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if self.page_open() {
+            self.close_settings(Some(window), cx);
+            return true;
+        }
+        false
+    }
+
     pub(super) fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
-        if self.page_open() || self.dashboard.is_some() {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
             return;
         }
         self.layout.set_zoomed_pane(None);

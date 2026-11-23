@@ -62,6 +62,9 @@ impl Shell {
             .map(|t| t.thread_id.clone())
             .collect();
 
+        // Switching the shared panel view to a group clears single-bot tracking so returning
+        // to the previously shown bot always invokes `show_in_panel` again.
+        self.bot_ui.panel.shown = None;
         let view = self.bot_panel_view(cx).inspect(|view| {
             if std::mem::take(&mut self.bot_ui.panel.stale) {
                 view.update(cx, krill_app::bots::View::reload);
@@ -195,8 +198,10 @@ impl Shell {
             .map(|b| {
                 let st = if b.paused {
                     text::PAUSED_BADGE.get().to_owned()
-                } else if b.attention > 0 {
-                    text::SB_NEEDS_YOU_ONE.format(&[("n", &b.attention.to_string())])
+                } else if b.attention == 1 {
+                    text::SB_NEEDS_YOU_ONE.format(&[("n", "1")])
+                } else if b.attention > 1 {
+                    text::SB_NEEDS_YOU_MANY.format(&[("n", &b.attention.to_string())])
                 } else if b.working() > 0 {
                     text::SB_WORKING.format(&[("n", &b.working().to_string())])
                 } else {

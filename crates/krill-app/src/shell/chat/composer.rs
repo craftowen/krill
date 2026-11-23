@@ -84,13 +84,17 @@ fn effort_bars(effort: &str) -> Option<usize> {
     }
 }
 
-fn effort_text(effort: &str) -> String {
+pub(super) fn effort_text(effort: &str) -> String {
     match effort {
+        "minimal" => ctext::EFFORT_MINIMAL.get().to_owned(),
         "low" => ctext::EFFORT_LOW.get().to_owned(),
         "medium" => ctext::EFFORT_MEDIUM.get().to_owned(),
         "high" => ctext::EFFORT_HIGH.get().to_owned(),
         "xhigh" => ctext::EFFORT_XHIGH.get().to_owned(),
         "max" => ctext::EFFORT_MAX.get().to_owned(),
+        "ultra" => ctext::EFFORT_ULTRA.get().to_owned(),
+        "none" => ctext::EFFORT_NONE.get().to_owned(),
+        "off" => ctext::EFFORT_OFF.get().to_owned(),
         other => other.to_owned(),
     }
 }
@@ -896,7 +900,13 @@ impl Shell {
                     let q_id = queued.id;
                     let preview: String = queued.display_text.trim().chars().take(72).collect();
                     let label = if preview.is_empty() {
-                        format!("+{} attachment", queued.attachments.len())
+                        let n = queued.attachments.len();
+                        let msg = if n == 1 {
+                            ctext::QUEUED_ATTACHMENT_ONE
+                        } else {
+                            ctext::QUEUED_ATTACHMENT_MANY
+                        };
+                        msg.format(&[("n", &n.to_string())])
                     } else {
                         preview
                     };
@@ -964,7 +974,7 @@ impl Shell {
                 .workspace
                 .as_deref()
                 .map(std::path::PathBuf::from)
-                .or_else(|| self.bot_folder(bot));
+                .or_else(|| Self::bot_folder_on(&key.0, bot));
             let folder = bot.workspace.as_deref().map_or_else(
                 || bot.name.clone(),
                 |w| {
@@ -1009,6 +1019,56 @@ impl Shell {
         });
         let workspace_footer = bot.map(|(_, _, folder, path)| {
             let path_text = path.map(|p| p.display().to_string()).unwrap_or_default();
+            let folder_label = format!("{folder} · {}", ctext::WORKSPACE_FOLDER.get());
+            let host_label = self.chat_host_label(&key.0, cx);
+            let folder_el = if path_text.is_empty() {
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-composer-folder-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-composer-folder".into())
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(muted_fg)
+                    .child(
+                        Icon::default()
+                            .data(ui::icons::FOLDER_SVG)
+                            .size(px(ui::ICON_XS)),
+                    )
+                    .child(div().truncate().child(folder_label))
+                    .into_any_element()
+            } else {
+                ui::button_with_tooltip(
+                    Button::new(SharedString::from(format!(
+                        "chat-composer-folder-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-composer-folder".into())
+                    .icon(
+                        Icon::default()
+                            .data(ui::icons::FOLDER_SVG)
+                            .size(px(ui::ICON_XS)),
+                    )
+                    .label(folder_label)
+                    .ghost()
+                    .xsmall()
+                    .on_click({
+                        let path_text = path_text.clone();
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                path_text.clone(),
+                            ));
+                        }
+                    }),
+                    format!("chat-composer-folder-tip-{}", pane.get()),
+                    path_text,
+                )
+                .into_any_element()
+            };
             div()
                 .id(SharedString::from(format!(
                     "chat-composer-workspace-{}",
@@ -1038,33 +1098,9 @@ impl Shell {
                                 .data(ui::icons::SERVER_SVG)
                                 .size(px(ui::ICON_XS)),
                         )
-                        .child(div().truncate().child(self.bot_host_label(cx))),
+                        .child(div().truncate().child(host_label)),
                 )
-                .child(ui::button_with_tooltip(
-                    Button::new(SharedString::from(format!(
-                        "chat-composer-folder-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-composer-folder".into())
-                    .icon(
-                        Icon::default()
-                            .data(ui::icons::FOLDER_SVG)
-                            .size(px(ui::ICON_XS)),
-                    )
-                    .label(format!("{folder} · {}", ctext::WORKSPACE_FOLDER.get()))
-                    .ghost()
-                    .xsmall()
-                    .on_click({
-                        let path_text = path_text.clone();
-                        move |_, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                path_text.clone(),
-                            ));
-                        }
-                    }),
-                    format!("chat-composer-folder-tip-{}", pane.get()),
-                    path_text,
-                ))
+                .child(folder_el)
         });
         let inner_card = div()
             .id("desktop-chat-composer")
@@ -1567,18 +1603,54 @@ impl Shell {
             );
         }
         if self.chat.prompt_failed.contains(key) {
+            let dismiss_key = key.clone();
             notices.push(
                 ui::error_banner(palette, ctext::PROMPT_FAILED.get())
                     .id("chat-prompt-error")
                     .debug_selector(|| "chat-prompt-error".into())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        Button::new("chat-prompt-error-dismiss")
+                            .debug_selector(|| "chat-prompt-error-dismiss".into())
+                            .icon(IconName::Close)
+                            .tooltip(ctext::DISMISS_ERROR.get())
+                            .accessibility_label(ctext::DISMISS_ERROR.get())
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.chat.prompt_failed.remove(&dismiss_key);
+                                cx.notify();
+                            })),
+                    )
                     .into_any_element(),
             );
         }
         if self.chat.multiline_blocked.contains(key) {
+            let dismiss_key = key.clone();
             notices.push(
                 ui::error_banner(palette, ctext::MULTILINE_BLOCKED.get())
                     .id("chat-multiline-error")
                     .debug_selector(|| "chat-multiline-error".into())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        Button::new("chat-multiline-error-dismiss")
+                            .debug_selector(|| "chat-multiline-error-dismiss".into())
+                            .icon(IconName::Close)
+                            .tooltip(ctext::DISMISS_ERROR.get())
+                            .accessibility_label(ctext::DISMISS_ERROR.get())
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.chat.multiline_blocked.remove(&dismiss_key);
+                                cx.notify();
+                            })),
+                    )
                     .into_any_element(),
             );
         }

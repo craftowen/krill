@@ -203,7 +203,7 @@ impl View {
 
     pub fn refresh_tool_relay_status(&mut self, cx: &mut Context<Self>) {
         let rpc = self.rpc.clone();
-        self.tools_task = Some(cx.spawn(async move |this, cx| {
+        self.tools_status_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move { call_checked(&rpc, &BotRpcRequest::ToolRelayStatus) })
@@ -471,7 +471,7 @@ impl View {
         let rpc = self.rpc.clone();
         let bid_bg = bot_id.clone();
         let tid_bg = tool_id.clone();
-        self.tools_task = Some(cx.spawn(async move |this, cx| {
+        self.tools_status_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -508,7 +508,7 @@ impl View {
         let rpc = self.rpc.clone();
         let bid_bg = bot_id.clone();
         let tid_bg = tool_id.clone();
-        self.tools_task = Some(cx.spawn(async move |this, cx| {
+        self.tools_cancel_oauth_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -611,7 +611,7 @@ impl View {
         self.busy = true;
         self.error = None;
         self.notice = None;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        self.export_task = Some(cx.spawn(async move |this, cx| {
             let chosen = save_dialog.await;
             let Ok(Ok(Some(dest_path))) = chosen else {
                 this.update(cx, |this, cx| {
@@ -763,13 +763,22 @@ impl View {
                             cx,
                         );
                         this.upsert_bot_config(*imported);
-                        this.selected_bot_id = Some(id.clone());
-                        this.screen = Screen::Detail;
-                        this.detail_tab = DetailTab::Items;
-                        this.notice = Some(SharedString::from(
-                            text::IMPORT_SUCCESS.format(&[("n", "1")]),
-                        ));
-                        this.load_selected_bot_detail(id, cx);
+                        this.emit_badge(cx);
+                        if this.mode == super::Mode::Panel {
+                            cx.emit(super::OpenBotHome {
+                                bot_id: id,
+                                kickoff: None,
+                                host: this.host.clone(),
+                            });
+                        } else {
+                            this.selected_bot_id = Some(id.clone());
+                            this.screen = Screen::Detail;
+                            this.detail_tab = DetailTab::Items;
+                            this.notice = Some(SharedString::from(
+                                text::IMPORT_SUCCESS.format(&[("n", "1")]),
+                            ));
+                            this.load_selected_bot_detail(id, cx);
+                        }
                     }
                     Ok(other) => {
                         this.error = Some(SharedString::from(format!(
@@ -872,12 +881,21 @@ impl View {
                             for b in imported {
                                 this.upsert_bot_config(b);
                             }
+                            this.emit_badge(cx);
                             let msg = text::IMPORT_SUCCESS.format(&[("n", &count.to_string())]);
                             this.notice = Some(SharedString::from(msg));
                             if let Some(id) = first_id {
-                                this.selected_bot_id = Some(id.clone());
-                                this.screen = Screen::Detail;
-                                this.load_selected_bot_detail(id, cx);
+                                if this.mode == super::Mode::Panel {
+                                    cx.emit(super::OpenBotHome {
+                                        bot_id: id,
+                                        kickoff: None,
+                                        host: this.host.clone(),
+                                    });
+                                } else {
+                                    this.selected_bot_id = Some(id.clone());
+                                    this.screen = Screen::Detail;
+                                    this.load_selected_bot_detail(id, cx);
+                                }
                             }
                         }
                     }

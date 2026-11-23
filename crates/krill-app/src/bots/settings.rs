@@ -117,6 +117,8 @@ impl SettingsState {
             || opt_input_composing(self.sched_name_input.as_ref(), window, app)
             || opt_input_composing(self.sched_cron_input.as_ref(), window, app)
             || opt_input_composing(self.sched_prompt_input.as_ref(), window, app)
+            || opt_input_composing(self.look_focus_input.as_ref(), window, app)
+            || opt_input_composing(self.memory_add_input.as_ref(), window, app)
     }
 
     pub(super) fn refresh_placeholders(&self, window: &mut Window, cx: &mut Context<View>) {
@@ -271,6 +273,7 @@ impl View {
         });
         let rpc = self.rpc.clone();
         self.error = None;
+        self.notice = None;
         self.avatar_task = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = chosen.await else {
                 return;
@@ -337,7 +340,8 @@ impl View {
         let rpc = self.rpc.clone();
         self.settings.saving = true;
         self.error = None;
-        self.avatar_task = Some(cx.spawn(async move |this, cx| {
+        self.notice = None;
+        self.settings_save_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
                 .background_executor()
@@ -466,6 +470,7 @@ impl View {
             memory_tidy: None,
             mcp_tools: None,
         };
+        let has_extras_change = avatar_color_patch != FieldPatch::Unchanged;
         let extras = UpdateBotExtrasParams {
             bot_id,
             avatar_color: avatar_color_patch,
@@ -482,26 +487,29 @@ impl View {
         self.settings.saving = true;
         self.error = None;
         self.notice = None;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        self.settings_save_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
                     let first = call_checked(&rpc, &BotRpcRequest::UpdateBot(Box::new(params)))?;
-                    let second =
-                        call_checked(&rpc, &BotRpcRequest::UpdateBotExtras(Box::new(extras)))?;
-                    Ok::<_, String>(match second {
+                    let first_bot = match first {
                         BotRpcResponse::Bot(b) => Some(*b),
-                        _ => match first {
-                            BotRpcResponse::Bot(b) => Some(*b),
-                            _ => None,
-                        },
-                    })
+                        _ => None,
+                    };
+                    if !has_extras_change {
+                        return Ok::<_, String>((first_bot, None));
+                    }
+                    match call_checked(&rpc, &BotRpcRequest::UpdateBotExtras(Box::new(extras))) {
+                        Ok(BotRpcResponse::Bot(b)) => Ok((Some(*b), None)),
+                        Ok(_) => Ok((first_bot, None)),
+                        Err(extras_err) => Ok((first_bot, Some(extras_err))),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.settings.saving = false;
                 match res {
-                    Ok(Some(updated)) => {
+                    Ok((Some(updated), extras_err)) => {
                         let provider_changed = prev_agent.as_deref().is_some_and(|prev| {
                             prev != krill_proto::agent::canonical_id(&updated.agent_id)
                         });
@@ -515,10 +523,18 @@ impl View {
                         this.upsert_bot_config(updated);
                         this.emit_badge(cx);
                         this.emit_sessions_changed(cx);
-                        this.notice = Some(SharedString::from(text::SAVED.get()));
+                        if let Some(err) = extras_err {
+                            this.error = Some(SharedString::from(err));
+                        } else {
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        }
                     }
-                    Ok(None) => {
-                        this.notice = Some(SharedString::from(text::SAVED.get()));
+                    Ok((None, extras_err)) => {
+                        if let Some(err) = extras_err {
+                            this.error = Some(SharedString::from(err));
+                        } else {
+                            this.notice = Some(SharedString::from(text::SAVED.get()));
+                        }
                     }
                     Err(err) => {
                         this.error = Some(SharedString::from(err));
@@ -622,7 +638,8 @@ impl View {
         let rpc = self.rpc.clone();
         self.settings.saving = true;
         self.error = None;
-        self.mutation_task = Some(cx.spawn(async move |this, cx| {
+        self.notice = None;
+        self.settings_save_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(

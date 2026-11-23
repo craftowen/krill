@@ -282,10 +282,33 @@ impl Shell {
             if ev.host != this.launch_host {
                 this.set_launch_host(ev.host.clone(), cx);
                 this.sidebar_bots.clear();
+                this.sidebar_groups.clear();
+                this.bot_ui.avatars.clear();
+                this.bot_ui.renaming = None;
+                this.bot_ui.renaming_group = None;
+                this.bot_ui.panel.shown = None;
+                this.bot_ui.panel.settings = None;
             }
             this.refresh_bots_badge(cx);
             this.open_bot_home(ev.bot_id.clone(), ev.kickoff.clone(), cx);
         })
+        .detach();
+        cx.subscribe(view, |this, _, _: &krill_app::bots::RequestImport, cx| {
+            this.open_bots_screen(bot_section::BotsScreen::Import, None, cx);
+        })
+        .detach();
+        cx.subscribe(
+            view,
+            |this, _, ev: &krill_app::bots::OpenBotConnectors, cx| {
+                this.open_bot_home(ev.0.clone(), None, cx);
+                this.bot_ui.panel.tab = bot_panel::BotPanelTab::Connectors;
+                this.bot_ui.panel.settings = None;
+                if this.panel_collapsed {
+                    this.toggle_panel(cx);
+                }
+                cx.notify();
+            },
+        )
         .detach();
         cx.subscribe(view, |this, _, _: &krill_app::bots::RequestNewBot, cx| {
             this.request_new_bot(None, None, cx);

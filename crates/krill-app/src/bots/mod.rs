@@ -84,6 +84,15 @@ pub struct OpenRemoteSettings;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestNewBot;
 
+/// Request the host `Shell` to open the Import bot modal (used from Panel mode Settings > Sharing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestImport;
+
+/// Request the host `Shell` to navigate to a specific bot's page and open its Connectors tab
+/// (used when clicking a member bot's connector/access need from a Group panel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenBotConnectors(pub BotId);
+
 /// Request the host `Shell` to open/focus a bot's live session in a workspace `[Chat | Term]` tab.
 #[derive(Debug, Clone)]
 pub struct OpenSession {
@@ -194,12 +203,21 @@ pub struct View {
     tidy_task: Option<Task<()>>,
     look_task: Option<Task<()>>,
     import_task: Option<Task<()>>,
+    import_create_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
+    export_task: Option<Task<()>>,
+    settings_save_task: Option<Task<()>>,
+    patch_task: Option<Task<()>>,
     sessions_task: Option<Task<()>>,
     item_task: Option<Task<()>>,
+    mark_items_seen_task: Option<Task<()>>,
     memory_task: Option<Task<()>>,
+    topic_read_task: Option<Task<()>>,
     connector_task: Option<Task<()>>,
+    oauth_file_task: Option<Task<()>>,
     tools_task: Option<Task<()>>,
+    tools_status_task: Option<Task<()>>,
+    tools_cancel_oauth_task: Option<Task<()>>,
     oauth_poll_task: Option<Task<()>>,
     avatar_task: Option<Task<()>>,
     language: crate::i18n::Language,
@@ -215,6 +233,8 @@ enum Mode {
 
 impl EventEmitter<Close> for View {}
 impl EventEmitter<RequestNewBot> for View {}
+impl EventEmitter<RequestImport> for View {}
+impl EventEmitter<OpenBotConnectors> for View {}
 impl EventEmitter<OpenRemoteSettings> for View {}
 impl EventEmitter<OpenSession> for View {}
 impl EventEmitter<DraftInHomeChat> for View {}
@@ -322,12 +342,21 @@ impl View {
             tidy_task: None,
             look_task: None,
             import_task: None,
+            import_create_task: None,
             mutation_task: None,
+            export_task: None,
+            settings_save_task: None,
+            patch_task: None,
             sessions_task: None,
             item_task: None,
+            mark_items_seen_task: None,
             memory_task: None,
+            topic_read_task: None,
             connector_task: None,
+            oauth_file_task: None,
             tools_task: None,
+            tools_status_task: None,
+            tools_cancel_oauth_task: None,
             oauth_poll_task: None,
             avatar_task: None,
             language: crate::i18n::language(),
@@ -398,7 +427,31 @@ impl View {
             self.bots.clear();
             self.bots_loaded_at_ms = None;
             self.bot_sessions.clear();
+            self.all_open_items.clear();
+            self.all_connector_statuses.clear();
+            self.all_access_requests.clear();
+            self.items.clear_items();
+            self.items.open_uid = None;
+            self.items.look_error = None;
+            self.items.snooze_pick = None;
+            self.items.cancel_ask = None;
+            self.items.stale_confirm = None;
+            self.items.selected.clear();
+            self.items.upcoming = None;
+            self.connectors.bot_statuses.clear();
+            self.connectors.bot_access_requests.clear();
+            self.connectors.page = None;
+            self.connectors.adding = None;
+            self.connectors.add_rail = 0;
+            clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
+            self.soul_memory.set_loaded(String::new(), String::new());
+            self.soul_memory.suggestions.clear();
+            self.soul_memory.selected_topic = None;
             self.settings.avatar_cache.clear();
+            self.settings.extras.clear();
+            self.settings.reset_pages();
+            self.group_panel.all_items.clear();
+            self.group_panel.closed_loaded_key = None;
             self.reload(cx);
         } else {
             cx.notify();
@@ -412,7 +465,12 @@ impl View {
             .find(|(id, _, _)| id == &self.host)
             .map(|(_, label, _)| label.clone())
             .or_else(|| self.host.remote_id().map(str::to_owned))
-            .unwrap_or_else(|| text::HOST_LOCAL.get().to_owned())
+            .unwrap_or_else(|| {
+                text::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned()
+            })
     }
 
     /// Banner text for failed loads: each message once, naming the host when there are several.
@@ -435,6 +493,7 @@ impl View {
         self.soul_memory.armed_forget = None;
         self.pending_switch_bot = None;
         self.oauth_poll_task = None;
+        self.import_dialog.picture.cancel_running_generation();
         cx.notify();
     }
 
@@ -503,6 +562,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.loading = true;
         self.error = None;
+        self.notice = None;
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
@@ -656,11 +716,20 @@ impl View {
         self.error = None;
         self.notice = None;
         if self.selected_bot_id.as_ref() != Some(&bot_id) {
-            // Home's open item, filter and folds are the last bot's.
+            // Home's open item, filter, folds, dialogs and look error belong to the last bot.
             self.items.open_uid = None;
             self.items.needs_you_only = false;
             self.items.folds.clear();
             self.items.group_shown.clear();
+            self.items.look_error = None;
+            self.items.snooze_pick = None;
+            self.items.cancel_ask = None;
+            self.items.stale_confirm = None;
+            self.items.selected.clear();
+            self.items.upcoming = None;
+            self.connectors.adding = None;
+            self.connectors.add_rail = 0;
+            clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
         }
         self.selected_bot_id = Some(bot_id.clone());
         self.screen = Screen::Detail;
@@ -699,6 +768,10 @@ impl View {
     }
 
     pub fn open_import(&mut self, cx: &mut Context<Self>) {
+        if self.mode == Mode::Panel {
+            cx.emit(RequestImport);
+            return;
+        }
         self.armed_delete_bot = None;
         self.pending_switch_bot = None;
         self.error = None;
@@ -1003,7 +1076,7 @@ impl View {
     pub(super) fn sync_open_items_for_bot(&mut self, bot_id: &BotId) {
         self.all_open_items.retain(|i| &i.owner_bot_id != bot_id);
         for item in &self.items.items {
-            if item.status.is_open() {
+            if &item.owner_bot_id == bot_id && item.status.is_open() {
                 self.all_open_items.push(item.clone());
             }
         }
@@ -1052,6 +1125,7 @@ impl View {
         let host_name = self.refusal_host_name();
         self.chats.opening = true;
         self.error = None;
+        self.notice = None;
         self.open_chat_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
@@ -1219,13 +1293,15 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let host_name = self.refusal_host_name();
         self.chats.loading = true;
         self.error = None;
+        self.notice = None;
         self.sessions_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move {
-                    let reply = call_checked(&rpc, &req)?;
+                    let reply = rpc::call_checked_on(&rpc, &req, host_name.as_deref())?;
                     let sessions = match call_checked(
                         &rpc,
                         &BotRpcRequest::ListBotSessions { bot_id: None },
@@ -1278,6 +1354,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.busy = true;
         self.error = None;
+        self.notice = None;
         self.mutation_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1347,6 +1424,7 @@ impl View {
         let rpc = self.rpc.clone();
         self.busy = true;
         self.error = None;
+        self.notice = None;
         self.mutation_task = Some(cx.spawn(async move |this, cx| {
             let bot_id_bg = bot_id.clone();
             let res = cx
@@ -1371,13 +1449,31 @@ impl View {
                         this.all_connector_statuses.retain(|s| s.bot_id != bot_id);
                         this.bot_sessions.retain(|s| s.bot_id != bot_id);
                         this.settings.avatar_cache.remove(&bot_id);
+                        this.settings.extras.remove(&bot_id);
                         if this.selected_bot_id.as_ref() == Some(&bot_id) {
+                            this.items.open_uid = None;
+                            this.items.look_error = None;
+                            this.items.snooze_pick = None;
+                            this.items.cancel_ask = None;
+                            this.items.stale_confirm = None;
+                            this.items.selected.clear();
+                            this.items.upcoming = None;
+                            this.connectors.adding = None;
+                            this.connectors.add_rail = 0;
+                            clear_input_on_window(
+                                &mut this.connectors.add_search,
+                                this.window_handle,
+                                cx,
+                            );
                             this.selected_bot_id = this.bots.first().map(|b| b.id.clone());
                             if let Some(next_id) = this.selected_bot_id.clone() {
                                 this.load_selected_bot_detail(next_id, cx);
                             } else {
                                 this.items.clear_items();
                                 this.soul_memory.set_loaded(String::new(), String::new());
+                                this.soul_memory.suggestions.clear();
+                                this.connectors.bot_statuses.clear();
+                                this.connectors.bot_access_requests.clear();
                             }
                         }
                         this.emit_badge(cx);
@@ -1406,10 +1502,30 @@ impl View {
             || self.connectors.input_is_composing(window, app)
             || self.tools.input_is_composing(window, app)
             || self.import_state.input_is_composing(window, app)
+            || self.import_dialog.input_is_composing(window, app)
             || self.settings.input_is_composing(window, app)
     }
 
     pub fn handle_escape(&mut self, cx: &mut Context<Self>) {
+        if self.settings.tidy_review {
+            self.settings.tidy_review = false;
+            cx.notify();
+            return;
+        }
+        if self.items.snooze_pick.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.items.cancel_ask.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.connectors.adding.take().is_some() {
+            self.connectors.add_rail = 0;
+            clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
+            cx.notify();
+            return;
+        }
         if self.pending_switch_bot.take().is_some() {
             cx.notify();
             return;
@@ -1424,13 +1540,18 @@ impl View {
         }
         // Import is its own dialog (Orca): Esc goes back from its second step, else closes it.
         if self.screen == Screen::Import {
+            if self.import_dialog.creating {
+                return;
+            }
             if self.import_dialog.view == import_dialog::ImportView::Export
-                && !self.import_state.candidates.is_empty()
+                && !self.import_dialog.candidates.is_empty()
             {
                 self.import_dialog.view = import_dialog::ImportView::Pick;
+                self.import_dialog.typed = None;
                 cx.notify();
                 return;
             }
+            self.import_dialog.picture.cancel_running_generation();
             cx.emit(Close);
             return;
         }
@@ -1481,7 +1602,11 @@ impl View {
                         .disabled(self.loading)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.error = None;
-                            if let Some(bid) = selected.clone() {
+                            if this.bots.is_empty() || this.bots_loaded_at_ms.is_none() {
+                                this.reload(cx);
+                            } else if this.group_panel.active {
+                                this.retry_group_panel_items(cx);
+                            } else if let Some(bid) = selected.clone() {
                                 this.load_selected_bot_detail(bid, cx);
                             } else {
                                 this.reload(cx);
@@ -1993,7 +2118,7 @@ impl View {
                 let bid_take = bot.id.clone();
                 let bid_reset = bot.id.clone();
                 let label = if sess.label.trim().is_empty() {
-                    format!("Session #{}", sid.0)
+                    text::SESSION_NUMBER.format(&[("id", &sid.0.to_string())])
                 } else {
                     sess.label.clone()
                 };

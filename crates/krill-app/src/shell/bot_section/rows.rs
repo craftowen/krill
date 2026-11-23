@@ -164,7 +164,7 @@ impl Shell {
                     .unwrap_or_else(|| d.agent.clone()),
                 state: session.map_or(AgentState::Unknown, |s| s.status.state),
                 live,
-                unread: session.is_some_and(|s| sidebar.is_unread(s.id)),
+                unread: session.is_some_and(|s| sidebar.is_unread_on(host, s.id)),
                 active: session.is_some_and(|s| focused == Some(s.id)),
                 at_ms: session
                     .map(|s| ms_of_ns(s.status.since_unix_ns))
@@ -205,7 +205,7 @@ impl Shell {
                     title: crate::shell::bot_panel::chat_title(bot, s),
                     working,
                     needs_you,
-                    unread: sidebar.is_unread(s.session_id),
+                    unread: sidebar.is_unread_on(host, s.session_id),
                     active: focused == Some(s.session_id),
                     at_ms: session
                         .map(|x| ms_of_ns(x.status.since_unix_ns))
@@ -835,6 +835,7 @@ impl Shell {
     + 'static {
         let menu_bot = bot.clone();
         let folder = self.bot_folder(bot);
+        let local = self.launch_host.is_local();
         let unread = facts.unread;
         let sessions: Vec<SessionId> = facts.chats.iter().map(|c| c.session).collect();
         move |menu, _, _| {
@@ -914,18 +915,19 @@ impl Shell {
                         }),
                 );
             }
-            menu.item(
-                PopupMenuItem::new(if unread {
-                    text::SB_MARK_READ.get()
-                } else {
-                    text::SB_MARK_UNREAD.get()
-                })
-                .icon(gpui_component::Icon::default().data(ui::icons::BELL_SVG))
-                .disabled(sessions.is_empty())
-                .on_click(read),
-            )
-            .separator()
-            .item(
+            if local {
+                menu = menu.item(
+                    PopupMenuItem::new(if unread {
+                        text::SB_MARK_READ.get()
+                    } else {
+                        text::SB_MARK_UNREAD.get()
+                    })
+                    .icon(gpui_component::Icon::default().data(ui::icons::BELL_SVG))
+                    .disabled(sessions.is_empty())
+                    .on_click(read),
+                );
+            }
+            menu.separator().item(
                 PopupMenuItem::new(text::SB_DELETE.get())
                     .icon(IconName::Delete)
                     .on_click(delete),
@@ -949,8 +951,14 @@ impl Shell {
         let sub = cx.subscribe_in(
             &input,
             window,
-            move |this, input, ev: &InputEvent, _, cx| match ev {
+            move |this, input, ev: &InputEvent, window, cx| match ev {
                 InputEvent::PressEnter { .. } => {
+                    let composing = input.update(cx, |s, cx| {
+                        gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
+                    });
+                    if composing {
+                        return;
+                    }
                     let name = input.read(cx).value().trim().to_owned();
                     this.bot_ui.renaming = None;
                     this.rename_bot(id.clone(), name, cx);
@@ -1036,6 +1044,11 @@ impl Shell {
         cx: &gpui::App,
     ) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + 'static {
         let bot = bot.clone();
+        let avatar_img = self
+            .bot_ui
+            .avatars
+            .get(&bot.id)
+            .and_then(|(_, img)| img.clone());
         let host_label = (!self.launch_host.is_local()).then(|| self.bot_host_label(cx));
         let state: String = if bot.paused {
             text::PAUSED_BADGE.get().to_owned()
@@ -1110,6 +1123,7 @@ impl Shell {
         let home_id = bot.id.clone();
         move |window, cx| {
             let bot = bot.clone();
+            let avatar_img = avatar_img.clone();
             let host_label = host_label.clone();
             let state = state.clone();
             let latest = latest.clone();
@@ -1138,7 +1152,7 @@ impl Shell {
                             .flex()
                             .items_start()
                             .gap_3()
-                            .child(avatar_tile(&bot, cx))
+                            .child(avatar_tile(&bot, avatar_img.clone(), cx))
                             .child(
                                 div()
                                     .flex_1()
@@ -1367,10 +1381,14 @@ impl Shell {
 }
 
 /// The 56 px picture of the hover card (`size-14 rounded-lg`).
-fn avatar_tile(bot: &SidebarBot, cx: &gpui::App) -> AnyElement {
+fn avatar_tile(
+    bot: &SidebarBot,
+    upload: Option<std::sync::Arc<gpui::Image>>,
+    cx: &gpui::App,
+) -> AnyElement {
     krill_app::bots::avatar::render(
         &bot.avatar,
-        None,
+        upload,
         &bot.name,
         px(56.),
         ui::RADIUS_LG,

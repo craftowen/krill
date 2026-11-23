@@ -3321,7 +3321,7 @@ fn bot_chat_draws_orca_rows_and_they_open_on_press(cx: &mut TestAppContext) {
         s.sidebar_bots = vec![bot_for(SESSION, true)];
         let bot = s.sidebar_bots[0].id.clone();
         s.chat.bot_notes.insert(
-            bot,
+            (krill_app::hosts::HostId::Local, bot),
             (
                 std::time::Instant::now(),
                 memory_notes(&[krill_proto::bots::BotMemoryHistoryEntry {
@@ -3438,7 +3438,7 @@ fn bot_create_offer_card_offers_create_and_not_now_until_answered(cx: &mut TestA
             s.sidebar_bots = vec![bot_for(SESSION, false)];
             let bot = s.sidebar_bots[0].id.clone();
             s.chat.bot_notes.insert(
-                bot,
+                (krill_app::hosts::HostId::Local, bot),
                 (
                     std::time::Instant::now(),
                     offer_notes(vec![offer(dismissed)]),
@@ -3455,4 +3455,277 @@ fn bot_create_offer_card_offers_create_and_not_now_until_answered(cx: &mut TestA
     show(&shell, cx, true);
     assert!(cx.debug_bounds("chat-create-offer").is_some());
     assert!(cx.debug_bounds("chat-offer-create").is_none());
+}
+
+#[gpui::test]
+fn memory_note_toggle_bumps_log_revision_for_list_remeasure(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(
+        cx,
+        "chat-memory-revision",
+        vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: "remember".into(),
+            at: "2026-11-22T01:00:00Z".into(),
+            ..Default::default()
+        }],
+    );
+    shell.update(cx, |s, cx| {
+        s.sidebar_bots = vec![bot_for(SESSION, false)];
+        let bot = s.sidebar_bots[0].id.clone();
+        s.chat.bot_notes.insert(
+            (krill_app::hosts::HostId::Local, bot),
+            (
+                std::time::Instant::now(),
+                memory_notes(&[krill_proto::bots::BotMemoryHistoryEntry {
+                    entry_id: format!("turn-s{}-1-1", SESSION.0),
+                    bot_id: krill_proto::bots::BotId::new("orca-like").unwrap(),
+                    timestamp_ms: 1_795_314_062_000,
+                    actor: "bot:orca-like".into(),
+                    action: "turn".into(),
+                    added: vec!["Prefers dark mode".into()],
+                    removed: Vec::new(),
+                    before_content: String::new(),
+                    after_content: String::new(),
+                    undoable: true,
+                    undone: false,
+                }]),
+            ),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let before = shell.read_with(cx, |s, _| s.chat.logs[&local_key(SESSION)].revision);
+    let memory = cx.debug_bounds("chat-memory-note").unwrap();
+    cx.simulate_click(memory.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let after = shell.read_with(cx, |s, _| s.chat.logs[&local_key(SESSION)].revision);
+    assert_ne!(
+        before, after,
+        "toggling open_memory_notes must increment log.revision so ChatList::sync remeasures"
+    );
+}
+
+#[gpui::test]
+fn image_viewer_blocks_workspace_shortcuts_and_cmd_w_closes_viewer_first(cx: &mut TestAppContext) {
+    let dir = state_path("chat-viewer-cmd-w");
+    std::fs::create_dir_all(&dir).unwrap();
+    let png_a = dir.join("a.png");
+    let png_b = dir.join("b.png");
+    image::RgbaImage::from_pixel(20, 20, image::Rgba([10, 20, 30, 255]))
+        .save(&png_a)
+        .unwrap();
+    image::RgbaImage::from_pixel(20, 20, image::Rgba([40, 50, 60, 255]))
+        .save(&png_b)
+        .unwrap();
+    let (shell, cx) = fixture(cx, "chat-viewer-overlay", vec![]);
+    let pane = shell.read_with(cx, |s, _| s.layout.focused().unwrap());
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.open_chat_image_viewer(
+                vec![png_a.clone(), png_b.clone()],
+                vec![1, 2],
+                0,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.has_blocking_overlay()));
+
+    // Copy PNG sets copied_at and clears after 1500ms; stepping clears immediately.
+    let copy_btn = cx.debug_bounds("chat-image-viewer-copy").unwrap();
+    cx.simulate_click(copy_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(1600));
+    cx.run_until_parked();
+
+    // SplitRight and ToggleChatView are blocked while the viewer is open.
+    cx.dispatch_action(crate::shell::SplitRight);
+    cx.dispatch_action(crate::shell::ToggleChatView);
+    cx.run_until_parked();
+    assert_eq!(shell.read_with(cx, |s, _| s.layout.visible().len()), 1);
+    assert!(shell.read_with(cx, |s, cx| s.is_pane_chat_view(pane, cx)));
+
+    // ClosePane (Cmd+W) closes the image viewer instead of closing the pane behind it.
+    cx.dispatch_action(crate::shell::ClosePane);
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| !s.has_chat_image_viewer()));
+    assert!(shell.read_with(cx, |s, _| s.layout.pane_exists(pane)));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn bot_offer_create_guard_and_host_switch_preserve_open_bot_chat(cx: &mut TestAppContext) {
+    use krill_proto::bots::{BotConfig, BotId, BotOffer, BotRpcRequest, BotRpcResponse};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-bot-offer-host-guard",
+        vec![ChatItem {
+            kind: ChatItemKind::User,
+            text: "hi".into(),
+            ..Default::default()
+        }],
+    );
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let calls_ref = Arc::clone(&create_calls);
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::CreateBot(params) => {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            let id = BotId::new("ledger").unwrap();
+            let cfg = BotConfig::new(id, &params.name, &params.agent_id, 1).unwrap();
+            Ok(BotRpcResponse::Bot(Box::new(cfg)))
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+    let offer = BotOffer {
+        offer_id: "offer-dup".into(),
+        bot_id: BotId::new("orca-like").unwrap(),
+        session_id: Some(SESSION.0),
+        name: "Ledger".into(),
+        purpose: "Tracks budget.".into(),
+        offered_at_ms: 1,
+        created: None,
+        dismissed: false,
+    };
+    shell.update(cx, |s, cx| {
+        s.bot_rpc_override = Some(rpc);
+        s.sidebar_bots = vec![bot_for(SESSION, false)];
+        let bot_id = s.sidebar_bots[0].id.clone();
+        s.chat.bot_souls.insert(
+            (krill_app::hosts::HostId::Local, bot_id),
+            "Local soul".into(),
+        );
+        s.sync_bot_item_notes(&local_key(SESSION), cx);
+        // Double click create_offered_bot synchronously must fire only once.
+        s.create_offered_bot(&local_key(SESSION), &offer, cx);
+        s.create_offered_bot(&local_key(SESSION), &offer, cx);
+        assert!(s.chat.creating_offers.contains("offer-dup"));
+        // Switching launch_host to remote keeps the open local bot chat metadata intact.
+        s.launch_host = krill_app::hosts::HostId::Remote("other".into());
+        s.sidebar_bots.clear();
+        assert!(s.chat_bot(&local_key(SESSION)).is_some());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        create_calls.load(Ordering::SeqCst),
+        1,
+        "creating_offers must block duplicate CreateBot RPCs"
+    );
+    shell.read_with(cx, |s, _| {
+        assert!(!s.chat.creating_offers.contains("offer-dup"));
+    });
+}
+
+#[gpui::test]
+fn chat_error_banners_dismiss_on_click_and_input_change(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(cx, "chat-error-dismiss", vec![]);
+    let key = local_key(SESSION);
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            s.chat.prompt_failed.insert(key.clone());
+            s.chat.multiline_blocked.insert(key.clone());
+            cx.notify();
+            input
+        })
+    });
+    cx.run_until_parked();
+    let dismiss_prompt = cx.debug_bounds("chat-prompt-error-dismiss").unwrap();
+    let dismiss_multiline = cx.debug_bounds("chat-multiline-error-dismiss").unwrap();
+    cx.simulate_click(dismiss_prompt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| !s.chat.prompt_failed.contains(&key)));
+    cx.simulate_click(dismiss_multiline.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| !s.chat.multiline_blocked.contains(&key)));
+
+    // Typing (InputEvent::Change) also clears both flags.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, _cx| {
+            s.chat.prompt_failed.insert(key.clone());
+            s.chat.multiline_blocked.insert(key.clone());
+        });
+        input.update(cx, |st, cx| st.focus(window, cx));
+    });
+    cx.simulate_input("edited");
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(!s.chat.prompt_failed.contains(&key));
+        assert!(!s.chat.multiline_blocked.contains(&key));
+    });
+}
+
+#[gpui::test]
+fn prune_chat_sessions_drops_cooldown_history_tokens_and_other_inputs(cx: &mut TestAppContext) {
+    let (shell, cx) = fixture(cx, "chat-prune-leaks", vec![]);
+    let stale_key = local_key(SessionId(9999));
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.chat.stop_cooldown_since.insert(stale_key.clone(), 42);
+            s.chat
+                .sent_history
+                .insert(stale_key.clone(), vec!["old".into()]);
+            s.chat.history_cursor.insert(stale_key.clone(), 0);
+            s.chat
+                .history_saved_draft
+                .insert(stale_key.clone(), "saved".into());
+            s.chat
+                .image_tokens
+                .entry(stale_key.clone())
+                .or_default()
+                .insert(std::path::PathBuf::from("/tmp/a.png"));
+            s.ensure_question_other_input(&stale_key, "tool:1", window, cx);
+            s.prune_chat_sessions();
+            assert!(!s.chat.stop_cooldown_since.contains_key(&stale_key));
+            assert!(!s.chat.sent_history.contains_key(&stale_key));
+            assert!(!s.chat.history_cursor.contains_key(&stale_key));
+            assert!(!s.chat.history_saved_draft.contains_key(&stale_key));
+            assert!(!s.chat.image_tokens.contains_key(&stale_key));
+            assert!(
+                !s.chat
+                    .question_other_inputs
+                    .contains_key(&(stale_key.clone(), "tool:1".into()))
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn remote_bot_without_workspace_footer_does_not_overwrite_clipboard_and_efforts_localize(
+    cx: &mut TestAppContext,
+) {
+    assert_eq!(
+        composer::effort_text("minimal"),
+        ctext::EFFORT_MINIMAL.get()
+    );
+    assert_eq!(composer::effort_text("ultra"), ctext::EFFORT_ULTRA.get());
+    assert_eq!(composer::effort_text("none"), ctext::EFFORT_NONE.get());
+    assert_eq!(composer::effort_text("off"), ctext::EFFORT_OFF.get());
+
+    let (shell, cx) = fixture(cx, "chat-remote-no-workspace", vec![]);
+    let remote = krill_app::hosts::HostId::Remote("box".into());
+    shell.update(cx, |s, cx| {
+        let pane = s.layout.focused().unwrap();
+        s.launch_host = remote.clone();
+        s.layout.set_host(pane, remote.clone());
+        let mut bot = bot_for(SESSION, false);
+        bot.workspace = None;
+        s.sidebar_bots = vec![bot];
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("keep-me".into()));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let folder = cx.debug_bounds("chat-composer-folder").unwrap();
+    cx.simulate_click(folder.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let clip = cx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text()));
+    assert_eq!(
+        clip.as_deref(),
+        Some("keep-me"),
+        "clicking static folder label for remote bot without workspace must not overwrite clipboard"
+    );
 }

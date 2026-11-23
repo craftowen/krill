@@ -101,12 +101,17 @@ impl View {
                 open: NeedOpen::Session(s.session_id),
             });
         }
+        let mut seen_sources = std::collections::BTreeSet::new();
         for c in self
             .connectors
             .bot_statuses
             .iter()
+            .chain(self.all_connector_statuses.iter())
             .filter(|c| c.bot_id == bot.id)
         {
+            if !seen_sources.insert(c.source) {
+                continue;
+            }
             let signed_out = c.error_category == Some(BotErrorCategory::SignedOut);
             if !c.enabled || !(c.state == ConnectorHealthState::Error || signed_out) {
                 continue;
@@ -121,12 +126,17 @@ impl View {
                 open: NeedOpen::Connectors,
             });
         }
+        let mut seen_tokens = std::collections::BTreeSet::new();
         for r in self
             .connectors
             .bot_access_requests
             .iter()
+            .chain(self.all_access_requests.iter())
             .filter(|r| r.bot_id == bot.id && r.status == BotAccessRequestStatus::Pending)
         {
+            if !seen_tokens.insert(r.token.as_str()) {
+                continue;
+            }
             let person = if r.sender_name.trim().is_empty() {
                 r.sender_id.clone()
             } else {
@@ -189,11 +199,15 @@ impl View {
         };
         let open = need.open.clone();
         let bot_id = bot.id.clone();
+        let in_group = self.group_panel.active;
         let go = move |_this: &mut Self, cx: &mut Context<Self>| match &open {
             NeedOpen::Session(session_id) => cx.emit(OpenSession {
                 bot_id: bot_id.clone(),
                 session_id: *session_id,
             }),
+            NeedOpen::Connectors if in_group => {
+                cx.emit(super::OpenBotConnectors(bot_id.clone()));
+            }
             NeedOpen::Connectors => cx.emit(super::settings_root::OpenSettingsPage(
                 DetailTab::Connectors,
             )),

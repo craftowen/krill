@@ -199,16 +199,22 @@ impl BotGroupMembersDialog {
         });
         let filter_input = cx
             .new(|cx| InputState::new(window, cx).placeholder(text::GRP_FILTER_PLACEHOLDER.get()));
-        let sub_name = cx.subscribe(&name_input, |this, input, ev: &InputEvent, cx| match ev {
-            InputEvent::Change => {
-                this.name_value = input.read(cx).value().to_string();
-                cx.notify();
-            }
-            InputEvent::PressEnter { .. } => {
-                this.submit(cx);
-            }
-            _ => {}
-        });
+        let sub_name = cx.subscribe_in(
+            &name_input,
+            window,
+            |this, input, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => {
+                    this.name_value = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. }
+                    if !crate::jump::entity_input_is_composing(input, window, cx) =>
+                {
+                    this.submit(cx);
+                }
+                _ => {}
+            },
+        );
         let sub_filter = cx.subscribe(&filter_input, |this, input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
                 this.filter_value = input.read(cx).value().to_string();
@@ -298,6 +304,11 @@ impl BotGroupMembersDialog {
 
     fn can_submit(&self) -> bool {
         self.picked.len() >= min_members(self.is_create()) && self.effective_name().is_some()
+    }
+
+    fn input_is_composing(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
+        crate::jump::entity_input_is_composing(&self.name_input, window, cx)
+            || crate::jump::entity_input_is_composing(&self.filter_input, window, cx)
     }
 
     pub fn submit(&mut self, cx: &mut Context<Self>) {
@@ -403,6 +414,9 @@ impl Render for BotGroupMembersDialog {
             .gap_4()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if this.input_is_composing(window, cx) {
+                    return;
+                }
                 if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
                     cx.stop_propagation();
                     cx.emit(Event::Close);

@@ -1012,13 +1012,14 @@ impl View {
         }
         let screen = Self::settings_screen("bot-settings-tidy-up-page").child(section);
         match last.filter(|_| self.settings.tidy_review) {
-            Some(run) => screen.child(Self::render_tidy_review(bot, &run, p, window, cx)),
+            Some(run) => screen.child(self.render_tidy_review(bot, &run, p, window, cx)),
             None => screen,
         }
     }
 
     /// Orca's "Last night's tidy-up" dialog: what it changed, and Undo for the whole run.
     fn render_tidy_review(
+        &self,
         bot: &BotConfig,
         run: &TidyRun,
         p: &ui::Palette,
@@ -1156,18 +1157,28 @@ impl View {
             );
         ui::modal_backdrop(
             window.viewport_size(),
-            div()
-                .id("bot-tidy-review-backdrop")
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.settings.tidy_review = false;
-                    cx.notify();
-                }))
-                .child(dialog),
+            ui::modal_focus_scope(
+                div()
+                    .id("bot-tidy-review-backdrop")
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                        if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
+                            this.settings.tidy_review = false;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings.tidy_review = false;
+                        cx.notify();
+                    }))
+                    .child(dialog),
+                &self.focus,
+            ),
         )
         .into_any_element()
     }
@@ -1179,12 +1190,9 @@ impl View {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let mut screen = Self::settings_screen("bot-settings-who-can-ask-page");
-        if self
-            .connectors
-            .bot_access_requests
-            .iter()
-            .any(|r| r.status == krill_proto::bots::BotAccessRequestStatus::Pending)
-        {
+        if self.connectors.bot_access_requests.iter().any(|r| {
+            r.bot_id == bot.id && r.status == krill_proto::bots::BotAccessRequestStatus::Pending
+        }) {
             screen = screen.child(self.render_access_requests_card(&bot.id, p, cx));
         }
         // One list per place people reach the bot: each Slack workspace, Telegram, Discord….
@@ -1227,7 +1235,7 @@ impl View {
                 cx,
             ));
         }
-        for (source, workspace) in places {
+        for (place_idx, (source, workspace)) in places.into_iter().enumerate() {
             let people: Vec<&BotMember> = bot
                 .members
                 .iter()
@@ -1237,7 +1245,7 @@ impl View {
                 || source_label(source).to_owned(),
                 |w| format!("{} · {w}", source_label(source)),
             );
-            let list = Self::who_can_ask_card(bot, &people, p, cx);
+            let list = Self::who_can_ask_card(bot, place_idx, &people, p, cx);
             screen = screen.child(
                 div()
                     .min_w_0()
@@ -1271,6 +1279,7 @@ impl View {
     /// Before you share (Keep only me, Ask for approval).
     fn who_can_ask_card(
         bot: &BotConfig,
+        place_idx: usize,
         people: &[&BotMember],
         p: &ui::Palette,
         cx: &mut Context<Self>,
@@ -1331,7 +1340,7 @@ impl View {
         };
         let mut chips = div().flex().flex_wrap().gap_2().child(
             chip(
-                "bot-who-you".into(),
+                SharedString::from(format!("bot-who-you-{place_idx}")),
                 div()
                     .size(px(20.))
                     .flex()
@@ -1351,7 +1360,7 @@ impl View {
                     .child(format!("· {}", text::SV_WHO_OWNER.get())),
             ),
         );
-        for m in people {
+        for (member_idx, m) in people.iter().enumerate() {
             let initials: String = name(m)
                 .split_whitespace()
                 .filter_map(|w| w.chars().next())
@@ -1362,13 +1371,13 @@ impl View {
             let member = (*m).clone();
             chips = chips.child(
                 chip(
-                    SharedString::from(format!("bot-who-{}", m.id)),
+                    SharedString::from(format!("bot-who-{place_idx}-{member_idx}-{}", m.id)),
                     face(initials),
                     name(m),
                 )
                 .child(
                     Button::new(SharedString::from(format!(
-                        "bot-who-can-ask-remove-{}",
+                        "bot-who-can-ask-remove-{place_idx}-{member_idx}-{}",
                         m.id
                     )))
                     .ghost()
@@ -1423,7 +1432,7 @@ impl View {
                 text::SV_WHO_FIX_ONLY_ME.format(&[("name", &bot.name)]),
                 text::SV_WHO_FIX_ONLY_ME_DETAIL.get().to_owned(),
                 ui::secondary(
-                    "bot-who-keep-only-me",
+                    SharedString::from(format!("bot-who-keep-only-me-{place_idx}")),
                     text::SV_WHO_FIX_ONLY_ME_ACTION.get(),
                 )
                 .small()
@@ -1439,16 +1448,19 @@ impl View {
                 ui::icons::HAND_SVG,
                 text::SV_WHO_FIX_ASK.get().to_owned(),
                 text::SV_WHO_FIX_ASK_DETAIL.format(&[("name", &bot.name)]),
-                ui::secondary("bot-who-switch-ask", text::SV_WHO_FIX_ASK_ACTION.get())
-                    .small()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let params = UpdateBotParams {
-                            permission_mode: Some(Permission::Manual),
-                            ..patch(&ask_bot)
-                        };
-                        this.patch_bot(params, cx);
-                    }))
-                    .into_any_element(),
+                ui::secondary(
+                    SharedString::from(format!("bot-who-switch-ask-{place_idx}")),
+                    text::SV_WHO_FIX_ASK_ACTION.get(),
+                )
+                .small()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let params = UpdateBotParams {
+                        permission_mode: Some(Permission::Manual),
+                        ..patch(&ask_bot)
+                    };
+                    this.patch_bot(params, cx);
+                }))
+                .into_any_element(),
             ));
         }
         div()
@@ -1560,7 +1572,7 @@ impl View {
                 ui::secondary("bots-sharing-export", text::SV_SHARE_BOT.get())
                     .debug_selector(|| "bots-sharing-export".into())
                     .small()
-                    .disabled(self.tools.busy)
+                    .disabled(self.busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.export_bot_zip(export_bot.clone(), cx);
                     })),

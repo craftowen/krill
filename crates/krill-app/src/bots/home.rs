@@ -151,6 +151,10 @@ enum HomeRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent Home cache invalidation flags"
+)]
 struct HomeCacheKey {
     bot_id: BotId,
     items_rev: u64,
@@ -166,6 +170,7 @@ struct HomeCacheKey {
     live_working_sessions: Vec<SessionId>,
     seen_mark: u64,
     has_suggestions: bool,
+    look_around_running: bool,
     minute_bucket: u64,
 }
 
@@ -345,17 +350,17 @@ pub(super) fn grouped<'a>(
 pub(super) fn short_age(ts_ms: u64, now_ms: u64) -> String {
     let delta = now_ms.saturating_sub(ts_ms);
     if delta < 60_000 {
-        return "now".to_owned();
+        return text::SHORT_AGE_NOW.get().to_owned();
     }
     let minutes = delta / 60_000;
     if minutes < 60 {
-        return format!("{minutes}m");
+        return text::SHORT_AGE_MIN.format(&[("n", &minutes.to_string())]);
     }
     let hours = minutes / 60;
     if hours < 24 {
-        return format!("{hours}h");
+        return text::SHORT_AGE_HOUR.format(&[("n", &hours.to_string())]);
     }
-    format!("{}d", hours / 24)
+    text::SHORT_AGE_DAY.format(&[("n", &(hours / 24).to_string())])
 }
 
 /// Orca's snooze presets: Later today (6 PM, or three hours out after 5 PM), Tomorrow 9 AM and
@@ -623,6 +628,7 @@ impl View {
             live_working_sessions,
             seen_mark,
             has_suggestions: !self.soul_memory.suggestions.is_empty(),
+            look_around_running: self.soul_memory.look_around_running,
             minute_bucket: now / 60_000,
         };
         let upcoming_seen = self.items.upcoming.as_ref().map(|u| u.items_seen_event_id);
@@ -759,16 +765,15 @@ impl View {
                 row_keys.push(RowAnchor::ShowMore(group as u8));
             }
         }
-        let note = if self.items.items.is_empty() {
+        let note = if self.items.items.is_empty() && needs.is_empty() {
             Some(HomeNoteKind::Empty)
         } else if filter_on {
-            grouped_indices
-                .iter()
-                .all(Vec::is_empty)
+            (grouped_indices.iter().all(Vec::is_empty) && needs.is_empty())
                 .then_some(HomeNoteKind::FilteredEmpty)
         } else {
             (grouped_indices[Group::NeedsYou as usize].is_empty()
-                && grouped_indices[Group::Working as usize].is_empty())
+                && grouped_indices[Group::Working as usize].is_empty()
+                && needs.is_empty())
             .then_some(HomeNoteKind::AllClear)
         };
         if let Some(kind) = note {
@@ -777,7 +782,7 @@ impl View {
         }
         rows.push(HomeRow::Automations);
         row_keys.push(RowAnchor::Automations);
-        if !self.soul_memory.suggestions.is_empty() {
+        if !self.soul_memory.suggestions.is_empty() || self.soul_memory.look_around_running {
             rows.push(HomeRow::Suggestions);
             row_keys.push(RowAnchor::Suggestions);
         }
@@ -1052,7 +1057,7 @@ impl View {
             if let Some(up) = self.items.upcoming.as_mut() {
                 up.items_seen_event_id = newest;
             }
-            self.mark_bot_items_opened(bot.id.clone(), cx);
+            self.mark_bot_items_opened_silently(bot.id.clone(), cx);
         }
     }
 

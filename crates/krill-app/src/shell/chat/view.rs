@@ -388,7 +388,7 @@ impl Shell {
             }
             work_run::DisplayRow::ItemNote { note, .. } => match &note.action {
                 work_run::NoteAction::Memory(receipt) => {
-                    self.render_memory_note(pane, row_ix, note.at_ms, receipt, cx)
+                    self.render_memory_note(pane, session, row_ix, note.at_ms, receipt, cx)
                 }
                 work_run::NoteAction::CreateOffer(offer) => {
                     self.render_create_offer(pane, session, offer, cx)
@@ -858,6 +858,7 @@ impl Shell {
             .gap_1p5()
             .child(toggle)
             .children((!file_path.is_empty()).then(|| {
+                let open_host = self.layout.host(pane).clone();
                 let file_path_owned = file_path.to_owned();
                 let raw_path = std::path::PathBuf::from(&file_path_owned);
                 let path = if raw_path.is_relative() {
@@ -891,7 +892,7 @@ impl Shell {
                         .xsmall()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.open_file_at(path.clone(), 1, 1, cx);
+                            this.open_file_on_at(open_host.clone(), path.clone(), 1, 1, cx);
                         })),
                     )
             }))
@@ -1890,7 +1891,11 @@ impl Shell {
                 .options
                 .iter()
                 .position(|opt| is_other_option_label(&opt.label))
-                && let Some(other_input) = self.chat.question_other_inputs.get(&answer_key).cloned()
+                && let Some(other_input) = self
+                    .chat
+                    .question_other_inputs
+                    .get(&(key.clone(), answer_key.clone()))
+                    .cloned()
             {
                 let req_other = request.clone();
                 let send_input = other_input.clone();
@@ -2557,8 +2562,9 @@ impl Shell {
                                 .child(bot.name.clone()),
                         )
                         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            // The chat is on its bot's page, so this opens that bot's panel.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // Focus this pane first so its bot panel opens even in split view.
+                            this.change(false, cx, |l| l.focus(pane));
                             if this.panel_collapsed {
                                 this.toggle_panel(cx);
                             }
@@ -2900,8 +2906,9 @@ impl Shell {
         } else if offer.dismissed {
             None
         } else {
-            let (create_offer, dismiss_id, create_key) =
-                (offer.clone(), offer_id.clone(), key.clone());
+            let creating = self.chat.creating_offers.contains(&offer.offer_id);
+            let (create_offer, dismiss_id, dismiss_key, create_key) =
+                (offer.clone(), offer_id.clone(), key.clone(), key.clone());
             Some(
                 div()
                     .flex()
@@ -2914,8 +2921,9 @@ impl Shell {
                             .label(ctext::OFFER_NOT_NOW.get())
                             .outline()
                             .small()
+                            .disabled(creating)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.resolve_bot_offer(&dismiss_id, None, cx);
+                                this.resolve_bot_offer(&dismiss_key, &dismiss_id, None, cx);
                             })),
                     )
                     .child(
@@ -2924,6 +2932,7 @@ impl Shell {
                             .label(ctext::OFFER_CREATE.get())
                             .primary()
                             .small()
+                            .disabled(creating)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.create_offered_bot(&create_key, &create_offer, cx);
                             })),
@@ -3018,6 +3027,7 @@ impl Shell {
     fn render_memory_note(
         &mut self,
         pane: super::super::PaneId,
+        session: SessionId,
         row_ix: usize,
         at_ms: u64,
         receipt: &work_run::MemoryReceipt,
@@ -3081,6 +3091,10 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.chat.open_memory_notes.remove(&at_ms) {
                     this.chat.open_memory_notes.insert(at_ms);
+                }
+                let key = (this.layout.host(pane).clone(), session);
+                if let Some(log) = this.chat.logs.get_mut(&key) {
+                    log.revision = log.revision.wrapping_add(1);
                 }
                 cx.notify();
             }));
@@ -3430,7 +3444,7 @@ impl Shell {
             }
         }
         for answer_key in other_keys {
-            self.ensure_question_other_input(&answer_key, window, cx);
+            self.ensure_question_other_input(&key, &answer_key, window, cx);
         }
 
         let home_pill = self
@@ -3488,7 +3502,7 @@ impl Shell {
                 let subtitle = self
                     .chat
                     .bot_souls
-                    .get(&bot.id)
+                    .get(&(host.clone(), bot.id.clone()))
                     .cloned()
                     .unwrap_or_else(|| ctext::BOT_EMPTY_SUBTITLE.format(&name));
                 (avatar, ctext::BOT_EMPTY_TITLE.format(&name), subtitle)

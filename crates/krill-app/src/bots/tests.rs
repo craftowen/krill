@@ -1820,17 +1820,13 @@ fn saving_bot_settings_leaves_an_orca_background_alone(cx: &mut TestAppContext) 
     vcx.update(|_, cx| view.update(cx, |v, cx| v.save_bot_settings(bot_id.clone(), cx)));
     vcx.run_until_parked();
     let st = state.lock().unwrap();
-    let extras = st
+    let sent_extras = st
         .requests
         .iter()
-        .find_map(|r| match r {
-            BotRpcRequest::UpdateBotExtras(p) => Some(p.clone()),
-            _ => None,
-        })
-        .expect("settings save sends extras");
-    assert_eq!(
-        extras.avatar_color,
-        krill_proto::bots::FieldPatch::Unchanged
+        .any(|r| matches!(r, BotRpcRequest::UpdateBotExtras(_)));
+    assert!(
+        !sent_extras,
+        "unchanged avatar_color should skip redundant UpdateBotExtras RPC"
     );
     assert_eq!(st.bots[0].avatar_color.as_deref(), Some("#c9b8e8"));
 }
@@ -1838,6 +1834,7 @@ fn saving_bot_settings_leaves_an_orca_background_alone(cx: &mut TestAppContext) 
 #[test]
 fn home_groups_items_as_orca_does() {
     use super::home::{Group, group_of, grouped, short_age, snooze_presets};
+    use crate::i18n::catalog::bots as text;
     let now = 1_795_341_600_000; // Sun 2026-11-22 10:00 UTC
     let at = |uid: &str, n: u64, status: BotItemStatus, ago_min: u64| {
         let mut item = sample_item("bot-1", uid, n, status);
@@ -1869,10 +1866,19 @@ fn home_groups_items_as_orca_does() {
     assert_eq!(uids(Group::Working), ["b"]);
     assert_eq!(uids(Group::Closed), ["f", "e"], "latest change first");
 
-    assert_eq!(short_age(now - 30_000, now), "now");
-    assert_eq!(short_age(now - 6 * 60_000, now), "6m");
-    assert_eq!(short_age(now - 22 * 3_600_000, now), "22h");
-    assert_eq!(short_age(now - 50 * 3_600_000, now), "2d");
+    assert_eq!(short_age(now - 30_000, now), text::SHORT_AGE_NOW.get());
+    assert_eq!(
+        short_age(now - 6 * 60_000, now),
+        text::SHORT_AGE_MIN.format(&[("n", "6")])
+    );
+    assert_eq!(
+        short_age(now - 22 * 3_600_000, now),
+        text::SHORT_AGE_HOUR.format(&[("n", "22")])
+    );
+    assert_eq!(
+        short_age(now - 50 * 3_600_000, now),
+        text::SHORT_AGE_DAY.format(&[("n", "2")])
+    );
 
     // Sunday 10:00: later is 6 PM, then Monday 9 AM twice.
     let at_ms = |p: &[(String, u64); 3]| p.iter().map(|(_, at)| *at).collect::<Vec<_>>();
@@ -3151,4 +3157,230 @@ fn bot_refusal_text_and_automation_rows_surface_specific_reasons() {
     assert!(failed.contains("Build Server"), "{failed}");
     assert!(failed.contains("0.20.5"), "{failed}");
     assert!(failed.contains("0.23.0"), "{failed}");
+}
+
+#[gpui::test]
+fn u01_panel_soul_settings_syncs_input_when_switching_bots(cx: &mut TestAppContext) {
+    let mut mock = MockState::default();
+    let bot_a = sample_bot("bot-a", "Bot A");
+    let bot_b = sample_bot("bot-b", "Bot B");
+    let id_a = bot_a.id.clone();
+    let id_b = bot_b.id.clone();
+    mock.bots.push(bot_a);
+    mock.bots.push(bot_b);
+    mock.soul = "Soul of A".to_owned();
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.simulate_resize(gpui::size(px(1040.), px(720.)));
+    vcx.run_until_parked();
+
+    // Open Bot A Settings > Soul so soul_input & memory_input are created.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&id_a, DetailTab::Settings, cx);
+            v.settings.page = super::settings_root::SettingsPage::Soul;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        let inp = v
+            .soul_memory
+            .soul_input
+            .as_ref()
+            .expect("soul input created");
+        assert_eq!(inp.read(cx).value().as_ref(), "Soul of A");
+    });
+
+    // Switch to Bot B Settings > Soul: existing soul_input MUST sync to Bot B's SOUL.
+    state.lock().unwrap().soul = "Soul of B".to_owned();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&id_b, DetailTab::Settings, cx);
+            v.settings.page = super::settings_root::SettingsPage::Soul;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        let inp = v
+            .soul_memory
+            .soul_input
+            .as_ref()
+            .expect("soul input reused");
+        assert_eq!(
+            inp.read(cx).value().as_ref(),
+            "Soul of B",
+            "switching bots in panel Settings > Soul must sync existing input to new bot's SOUL"
+        );
+    });
+}
+
+#[gpui::test]
+fn u03_u04_group_panel_upsert_updates_backing_and_panel_return_reloads_single_bot(
+    cx: &mut TestAppContext,
+) {
+    let mut mock = MockState::default();
+    let bot_a = sample_bot("bot-a", "Bot A");
+    let bot_b = sample_bot("bot-b", "Bot B");
+    let id_a = bot_a.id.clone();
+    let id_b = bot_b.id.clone();
+    mock.bots.push(bot_a);
+    mock.bots.push(bot_b);
+    let item_a = sample_item("bot-a", "uid-a1", 1, BotItemStatus::NeedsYou);
+    let item_b = sample_item("bot-b", "uid-b1", 2, BotItemStatus::Planned);
+    mock.items.push(item_a.clone());
+    mock.items.push(item_b.clone());
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state);
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&id_a, DetailTab::Items, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    // Enter group panel covering both bot A and bot B.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_group_in_panel("grp-1", &[id_a.clone(), id_b.clone()], &[], cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    // U-03: Upserting an updated item must update group_panel.all_items and NOT duplicate
+    // bot_b's item into all_open_items under bot_a.
+    let mut done_a = item_a;
+    done_a.status = BotItemStatus::Done;
+    done_a.version += 1;
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.upsert_item(done_a.clone(), &id_a);
+            let in_group = v
+                .group_panel
+                .all_items
+                .iter()
+                .find(|i| i.uid == "uid-a1")
+                .expect("updated item in group backing");
+            assert_eq!(in_group.status, BotItemStatus::Done);
+            let b_copies = v
+                .all_open_items
+                .iter()
+                .filter(|i| i.uid == "uid-b1")
+                .count();
+            assert_eq!(
+                b_copies, 1,
+                "sync_open_items_for_bot must not duplicate other bots' items"
+            );
+        });
+    });
+
+    // U-04: Returning to bot_a (same selected_bot_id!) must exit group panel and reload bot_a's
+    // single-bot items so bot_b's item does not leak.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_in_panel(&id_a, DetailTab::Items, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(!v.group_panel.active);
+        assert!(
+            v.items.items.iter().all(|i| i.owner_bot_id == id_a),
+            "returning from group panel to same bot must not leak other bots' items"
+        );
+    });
+}
+
+#[gpui::test]
+fn u16_u26_panel_open_import_emits_event_and_silent_mark_seen_sets_no_notice(
+    cx: &mut TestAppContext,
+) {
+    let mut mock = MockState::default();
+    let bot = sample_bot("bot-1", "Bot One");
+    let bot_id = bot.id.clone();
+    mock.bots.push(bot);
+    let state = Arc::new(Mutex::new(mock));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state);
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+    vcx.run_until_parked();
+
+    let import_requested = Arc::new(Mutex::new(false));
+    let flag = import_requested.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, _: &super::RequestImport, _| {
+            *flag.lock().unwrap() = true;
+        })
+        .detach();
+        view.update(cx, |v, cx| {
+            v.open_import(cx);
+            assert_eq!(
+                v.screen(),
+                Screen::Detail,
+                "Panel mode must not switch internal screen to Import"
+            );
+            v.mark_bot_items_opened_silently(bot_id.clone(), cx);
+            assert!(
+                !v.items.busy,
+                "silent mark_bot_items_opened must not set items.busy"
+            );
+        });
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        *import_requested.lock().unwrap(),
+        "Panel mode open_import must emit RequestImport"
+    );
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(
+            v.notice.is_none(),
+            "silent mark_bot_items_opened must not flash a Saved notice banner"
+        );
+    });
+}
+
+#[test]
+fn u47_find_imported_bot_matches_direct_and_precomputed_canonical_without_fs() {
+    let bot = sample_bot("imp-1", "Imported Bot");
+    let sources = vec![("/real/path/agent".to_owned(), bot.id.clone())];
+    assert_eq!(
+        super::pickers::find_imported_bot(
+            std::slice::from_ref(&bot),
+            &sources,
+            "/symlink/agent",
+            Some("/real/path/agent"),
+        )
+        .map(|b| &b.id),
+        Some(&bot.id)
+    );
+    assert!(
+        super::pickers::find_imported_bot(
+            std::slice::from_ref(&bot),
+            &sources,
+            "/symlink/agent",
+            None,
+        )
+        .is_none()
+    );
 }

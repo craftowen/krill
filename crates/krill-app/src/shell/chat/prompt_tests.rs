@@ -1103,3 +1103,318 @@ fn agy_normal_submit_while_busy_confirms_queued_without_sending_alt_m(cx: &mut T
         );
     });
 }
+
+#[gpui::test]
+fn working_state_transition_confirms_prompt_without_transcript_echo(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus};
+    use krill_proto::input::Delivery;
+
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let snap = |state: AgentState, since_unix_ns: u64| krill_app::sidebar::Snapshot {
+        sessions: vec![krill_app::sidebar::Session {
+            id: SESSION,
+            status: AgentStatus {
+                state,
+                since_unix_ns,
+                agent: "agy".into(),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        }],
+        trees: BTreeMap::new(),
+    };
+
+    let (view, cx, _, sent) = fixture(cx, "chat-working-confirm", &permission(), "ready");
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.focused().unwrap();
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.sidebar.update(cx, |sb, cx| {
+                sb.connect_source(Arc::new(StateSource(snap(AgentState::Done, 100))), cx);
+            });
+            // Poll returns no user echo at all.
+            shell.chat.poll_call = Some(Arc::new(|_| {
+                Ok(Reply::AgentHistory(Response::ChatPolled(
+                    krill_proto::agent_history::ChatPollSnapshot {
+                        agent: "agy".into(),
+                        bound: true,
+                        ..Default::default()
+                    },
+                )))
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value("turn started without echo", window, cx);
+            });
+            input
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(40));
+    cx.run_until_parked();
+    assert_eq!(sent.lock().unwrap().len(), 2);
+
+    // Transition session state to Working; prompt must confirm without transcript echo.
+    view.update(cx, |shell, cx| {
+        shell.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(StateSource(snap(AgentState::Working, 200))), cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(40));
+    cx.run_until_parked();
+    assert!(input.read_with(cx, |state, _| state.value().is_empty()));
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.chat.prompt_review.contains(&local_key(SESSION)));
+        assert!(
+            shell
+                .chat
+                .pending_prompts
+                .get(&local_key(SESSION))
+                .is_none_or(Vec::is_empty)
+        );
+    });
+}
+
+#[gpui::test]
+fn switching_to_terminal_or_tab_after_delivery_does_not_trigger_prompt_review(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Delivery;
+
+    let (view, cx, _, _) = fixture(cx, "chat-view-switch-no-review", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.chat.poll_call = Some(Arc::new(|_| {
+                Ok(Reply::AgentHistory(Response::ChatPolled(
+                    krill_proto::agent_history::ChatPollSnapshot {
+                        agent: "agy".into(),
+                        bound: true,
+                        ..Default::default()
+                    },
+                )))
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value("sent before switching to term", window, cx);
+            });
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+            input
+        })
+    });
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(40));
+    cx.run_until_parked();
+    // User switches to Term while provider has not echoed yet.
+    view.update(cx, |shell, cx| {
+        shell.set_pane_chat_view(pane, false, cx);
+    });
+    cx.executor().advance_clock(Duration::from_millis(60));
+    cx.run_until_parked();
+    assert!(
+        input.read_with(cx, |state, _| state.value().is_empty()),
+        "switching to Term must not restore already-sent draft"
+    );
+    view.read_with(cx, |shell, _| {
+        assert!(
+            !shell.chat.prompt_review.contains(&local_key(SESSION)),
+            "switching to Term must not trigger PROMPT_REVIEW"
+        );
+        assert!(
+            !shell.chat.prompt_tasks.contains_key(&local_key(SESSION)),
+            "switching to Term must not leave prompt send locked"
+        );
+    });
+}
+
+#[gpui::test]
+fn flush_queued_prompt_preserves_failures_and_handles_bracketed_and_slash(cx: &mut TestAppContext) {
+    use krill_proto::control::{AgentState, AgentStatus};
+    use krill_proto::input::Delivery;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StaticState(AgentState);
+    impl krill_app::sidebar::Source for StaticState {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(krill_app::sidebar::Snapshot {
+                sessions: vec![krill_app::sidebar::Session {
+                    id: SESSION,
+                    status: AgentStatus {
+                        state: self.0,
+                        agent: "claude".into(),
+                        ..AgentStatus::UNKNOWN
+                    },
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                }],
+                trees: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+    let set_state =
+        |view: &gpui::Entity<Shell>, vcx: &mut gpui::VisualTestContext, state: AgentState| {
+            view.update(vcx, |shell, cx| {
+                shell.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.connect_source(Arc::new(StaticState(state)), cx);
+                });
+            });
+            vcx.run_until_parked();
+        };
+
+    // 1. Immediate send failure preserves draft and marks prompt_failed instead of dropping.
+    let (view, cx, _, _) = fixture(cx, "chat-queue-fail-first", &permission(), "ready");
+    set_state(&view, cx, AgentState::Done);
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            shell
+                .chat
+                .logs
+                .entry(local_key(SESSION))
+                .or_default()
+                .queued_prompts
+                .push_back(QueuedChatPrompt {
+                    id: 77,
+                    display_text: "queued failure draft".into(),
+                    submitted_payload: "queued failure draft".into(),
+                    attachments: Vec::new(),
+                });
+            shell.chat.send_input = Some(Box::new(|_| false));
+            shell.flush_queued_chat_prompt_if_ready(&local_key(SESSION), cx);
+            input
+        })
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |shell, cx| {
+        assert!(shell.chat.prompt_failed.contains(&local_key(SESSION)));
+        let preserved_in_pending = shell
+            .chat
+            .pending_prompts
+            .get(&local_key(SESSION))
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|p| p.id == 77 && p.status == PendingStatus::ReviewRequired)
+            });
+        let preserved_in_input = input.read(cx).value().as_ref() == "queued failure draft";
+        assert!(
+            preserved_in_pending || preserved_in_input,
+            "failed queued send must preserve prompt for review instead of dropping it"
+        );
+    });
+
+    // 2. Bracketed `\r` failure transitions out of PendingStatus::Sending (never wedges).
+    let (view2, cx2, _, _) = fixture(cx, "chat-queue-fail-enter", &permission(), "ready");
+    set_state(&view2, cx2, AgentState::Done);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_ref = Arc::clone(&calls);
+    view2.update(cx2, |shell, cx| {
+        let pane = shell.layout.focused().unwrap();
+        shell.on_frame(
+            pane,
+            krill_proto::term_modes::TERM_MODES,
+            &postcard::to_stdvec(&Modes {
+                flags: Modes::BRACKETED_PASTE,
+                kitty: 0,
+            })
+            .unwrap(),
+            cx,
+        );
+        shell.chat.prompt_delivery = Some(Delivery::Applied);
+        shell.chat.send_input = Some(Box::new(move |_| {
+            calls_ref.fetch_add(1, Ordering::SeqCst) == 0
+        }));
+        shell
+            .chat
+            .logs
+            .entry(local_key(SESSION))
+            .or_default()
+            .queued_prompts
+            .push_back(QueuedChatPrompt {
+                id: 88,
+                display_text: "queued\nmultiline".into(),
+                submitted_payload: "queued\nmultiline".into(),
+                attachments: Vec::new(),
+            });
+        shell.flush_queued_chat_prompt_if_ready(&local_key(SESSION), cx);
+    });
+    cx2.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(60));
+    cx2.run_until_parked();
+    view2.read_with(cx2, |shell, _| {
+        assert!(
+            !shell.chat.prompt_tasks.contains_key(&local_key(SESSION)),
+            "bracketed enter failure must clear prompt_tasks"
+        );
+        let stuck_sending = shell
+            .chat
+            .pending_prompts
+            .get(&local_key(SESSION))
+            .is_some_and(|list| list.iter().any(|p| p.status == PendingStatus::Sending));
+        assert!(
+            !stuck_sending,
+            "bracketed enter failure must not wedge queued prompt in Sending"
+        );
+    });
+
+    // 3. Queued TUI-opening slash command switches pane to terminal.
+    let (view3, cx3, _, _) = fixture(cx, "chat-queue-slash-tui", &permission(), "ready");
+    set_state(&view3, cx3, AgentState::Done);
+    let pane3 = view3.read_with(cx3, |shell, _| shell.layout.focused().unwrap());
+    view3.update(cx3, |shell, cx| {
+        shell.chat.prompt_delivery = Some(Delivery::Applied);
+        shell
+            .chat
+            .logs
+            .entry(local_key(SESSION))
+            .or_default()
+            .queued_prompts
+            .push_back(QueuedChatPrompt {
+                id: 99,
+                display_text: "/config".into(),
+                submitted_payload: "/config".into(),
+                attachments: Vec::new(),
+            });
+        shell.flush_queued_chat_prompt_if_ready(&local_key(SESSION), cx);
+    });
+    cx3.run_until_parked();
+    assert!(
+        !view3.read_with(cx3, |shell, app_cx| shell.is_pane_chat_view(pane3, app_cx)),
+        "queued TUI-opening slash command must switch pane to terminal"
+    );
+}

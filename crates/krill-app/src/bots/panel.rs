@@ -25,10 +25,12 @@ impl View {
         tab: DetailTab,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.group_panel.active = false;
-        if self.selected_bot_id.as_ref() != Some(bot_id) {
+        let was_group = std::mem::replace(&mut self.group_panel.active, false);
+        if was_group || self.selected_bot_id.as_ref() != Some(bot_id) {
             self.connectors.page = None;
             self.connectors.adding = None;
+            self.connectors.add_rail = 0;
+            super::clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
             // Another bot opens Settings on its list, with its own field values.
             self.settings.reset_pages();
             self.select_bot(bot_id.clone(), cx);

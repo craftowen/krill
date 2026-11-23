@@ -56,12 +56,14 @@ struct GroupCacheKey {
     group_id: String,
     items_rev: u64,
     items_len: usize,
+    bots_sig: Vec<(BotId, String)>,
     member_ids: Vec<BotId>,
     thread_ids: Vec<String>,
     filter: GroupItemsFilter,
     folds: Vec<&'static str>,
     group_shown: Vec<(&'static str, usize)>,
     needs_keys: Vec<(BotId, String)>,
+    live_working_sessions: Vec<krill_proto::SessionId>,
     minute_bucket: u64,
 }
 
@@ -157,6 +159,7 @@ impl GroupPanelState {
         self.thread_ids = thread_ids;
         if !same_group {
             self.filter = GroupItemsFilter::default();
+            self.all_items.clear();
             self.closed_loaded_key = None;
         }
     }
@@ -306,6 +309,18 @@ impl View {
         self.sync_group_items_backing();
     }
 
+    pub(super) fn retry_group_panel_items(&mut self, cx: &mut Context<Self>) {
+        if !self.group_panel.active {
+            return;
+        }
+        let key = (
+            self.group_panel.group_id.clone(),
+            self.group_panel.member_ids.clone(),
+        );
+        self.group_panel.closed_loaded_key = None;
+        self.load_group_panel_items(key, cx);
+    }
+
     fn load_group_panel_items(&mut self, key: (String, Vec<BotId>), cx: &mut Context<Self>) {
         self.group_panel.gen_seq = self.group_panel.gen_seq.wrapping_add(1);
         let seq = self.group_panel.gen_seq;
@@ -328,15 +343,27 @@ impl View {
                 if this.group_panel.gen_seq != seq {
                     return;
                 }
-                if let Ok(BotRpcResponse::Items(list)) = loaded {
-                    this.group_panel.all_items = list
-                        .into_iter()
-                        .filter(|i| member_set.contains(&i.owner_bot_id))
-                        .collect();
-                    this.group_panel.closed_loaded_key = Some(key);
-                    this.sync_group_items_backing();
-                    cx.notify();
+                match loaded {
+                    Ok(BotRpcResponse::Items(list)) => {
+                        this.group_panel.all_items = list
+                            .into_iter()
+                            .filter(|i| member_set.contains(&i.owner_bot_id))
+                            .collect();
+                        this.group_panel.closed_loaded_key = Some(key);
+                        this.sync_group_items_backing();
+                    }
+                    Ok(other) => {
+                        this.error = Some(SharedString::from(format!(
+                            "unexpected ListItems response: {other:?}"
+                        )));
+                        this.notice = None;
+                    }
+                    Err(err) => {
+                        this.error = Some(SharedString::from(err));
+                        this.notice = None;
+                    }
                 }
+                cx.notify();
             })
             .ok();
         })
@@ -395,10 +422,23 @@ impl View {
                 group_needs.push((bot.id.clone(), need));
             }
         }
+        let bots_sig: Vec<(BotId, String)> = self
+            .bots
+            .iter()
+            .filter(|b| self.group_panel.member_ids.contains(&b.id))
+            .map(|b| (b.id.clone(), b.name.clone()))
+            .collect();
+        let live_working_sessions: Vec<krill_proto::SessionId> = self
+            .bot_sessions
+            .iter()
+            .filter(|s| self.group_panel.member_ids.contains(&s.bot_id) && s.live && s.working)
+            .map(|s| s.session_id)
+            .collect();
         let next_key = GroupCacheKey {
             group_id: self.group_panel.group_id.clone(),
             items_rev: self.items.items_rev,
             items_len: self.items.items.len(),
+            bots_sig,
             member_ids: self.group_panel.member_ids.clone(),
             thread_ids: self.group_panel.thread_ids.clone(),
             filter: filter.clone(),
@@ -413,6 +453,7 @@ impl View {
                 .iter()
                 .map(|(bid, n)| (bid.clone(), n.key.clone()))
                 .collect(),
+            live_working_sessions,
             minute_bucket: now / 60_000,
         };
         if self.group_panel.list_cache.key.as_ref() == Some(&next_key) {

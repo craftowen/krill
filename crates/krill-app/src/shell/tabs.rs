@@ -246,10 +246,17 @@ impl Shell {
                 } else {
                     format!(" · {agent}")
                 };
+                let turn_error = session
+                    .and_then(|s| s.status.turn_error.as_deref())
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty());
                 let state_text = format!("{} {inferred}", state_label(state));
+                let state_display = match turn_error {
+                    Some(err) => format!("{} · {err}", state_text.trim_end()),
+                    None => state_text.trim_end().to_owned(),
+                };
                 let description = format!(
-                    "{label}{agent_segment} · {}{}{}",
-                    state_text.trim_end(),
+                    "{label}{agent_segment} · {state_display}{}{}",
                     account_label
                         .map(|l| {
                             krill_app::i18n::catalog::sidebar::SESSION_ACCOUNT
@@ -329,11 +336,15 @@ impl Shell {
                     } else {
                         state_text.trim_end().to_owned()
                     };
+                    let state_line = match turn_error {
+                        Some(err) => format!("{state_with_age} · {err}"),
+                        None => state_with_age,
+                    };
                     Some(ui::SessionHoverCardSpec {
                         id: format!("tab-hover-{i}").into(),
                         title: label.clone().into(),
                         agent: agent.to_owned().into(),
-                        state_line: state_with_age.into(),
+                        state_line: state_line.into(),
                         total_turns: prompt_history.map_or(0, |h| h.total_turns),
                         last_prompt: prompt_history
                             .and_then(krill_proto::git::SessionPromptHistory::display_last_prompt)
@@ -430,12 +441,21 @@ impl Shell {
                                     .items_center()
                                     .gap(ui::SPACE_1)
                                     .child(
-                                        ui::status::status_glyph(
-                                            state,
-                                            unread,
-                                            ui::status::Size::Md,
-                                            cx,
-                                        )
+                                        match session {
+                                            Some(session) => ui::status::status_glyph_for(
+                                                &session.status,
+                                                unread,
+                                                ui::status::Size::Md,
+                                                None,
+                                                cx,
+                                            ),
+                                            None => ui::status::status_glyph(
+                                                state,
+                                                unread,
+                                                ui::status::Size::Md,
+                                                cx,
+                                            ),
+                                        }
                                         .debug_selector(move || format!("tab-state-{i}")),
                                     )
                                     .children(tab_bot_meta.map(|meta| {

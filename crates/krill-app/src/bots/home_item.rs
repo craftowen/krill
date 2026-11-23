@@ -98,10 +98,20 @@ impl View {
         input: Option<gpui::Entity<gpui_component::input::InputState>>,
         cx: &mut Context<Self>,
     ) {
+        if self.items.busy {
+            return;
+        }
         // Attached files go in as their paths, which the bot reads on this computer.
-        let files = self.items.attachments.remove(&uid).unwrap_or_default();
+        // Keep them until RPC succeeds so busy/network failures do not drop attachments.
+        let files = self
+            .items
+            .attachments
+            .get(&uid)
+            .cloned()
+            .unwrap_or_default();
+        let has_files = !files.is_empty();
         let mut body = body.trim().to_owned();
-        if !files.is_empty() {
+        if has_files {
             let list = files
                 .iter()
                 .map(|f| format!("- {}", f.display()))
@@ -132,7 +142,7 @@ impl View {
                 let reply_hidden = self.items.reply_hidden.get(&uid) == Some(&ask.id);
                 if reply_hidden {
                     if state.kept.iter().any(Option::is_some) {
-                        self.send_held_answers(
+                        self.send_held_answers_with_attachments(
                             uid,
                             &key,
                             &ask.decisions,
@@ -140,13 +150,14 @@ impl View {
                             None,
                             Some(body),
                             input,
+                            has_files,
                             cx,
                         );
                     } else {
-                        self.submit_item_comment(uid, &body, input, cx);
+                        self.submit_item_comment_with_attachments(uid, &body, input, has_files, cx);
                     }
                 } else {
-                    self.send_held_answers(
+                    self.send_held_answers_with_attachments(
                         uid,
                         &key,
                         &ask.decisions,
@@ -154,18 +165,29 @@ impl View {
                         Some((state.current, body)),
                         None,
                         input,
+                        has_files,
                         cx,
                     );
                 }
             }
             (_, Some(ask)) => {
                 if self.items.reply_hidden.get(&uid) == Some(&ask.id) {
-                    self.submit_item_comment(uid, &body, input, cx);
+                    self.submit_item_comment_with_attachments(uid, &body, input, has_files, cx);
                 } else {
-                    self.answer_item_decision(uid, Some(body), None, input, cx);
+                    self.answer_item_decision_with_cleanup(
+                        uid,
+                        Some(body),
+                        None,
+                        input,
+                        has_files,
+                        None,
+                        cx,
+                    );
                 }
             }
-            (_, None) => self.submit_item_comment(uid, &body, input, cx),
+            (_, None) => {
+                self.submit_item_comment_with_attachments(uid, &body, input, has_files, cx);
+            }
         }
     }
 
@@ -968,6 +990,7 @@ impl View {
                 .child(div().size(px(6.)).rounded_full().bg(p.agent_question))
                 .child(text::HM_STATUS_NEEDS_YOU.get())
         });
+        let has_needs_you_tag = needs_you_tag.is_some();
         div()
             .relative()
             .mx(px(-8.))
@@ -1014,7 +1037,7 @@ impl View {
                             .children(needs_you_tag)
                             .child(
                                 div()
-                                    .when(!waiting, gpui::Styled::ml_auto)
+                                    .when(!has_needs_you_tag, gpui::Styled::ml_auto)
                                     .flex_none()
                                     .text_size(ui::TEXT_XS)
                                     .text_color(p.muted_foreground)

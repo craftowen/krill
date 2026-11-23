@@ -338,10 +338,9 @@ impl View {
     }
 
     fn ensure_soul_inputs(&mut self, bot: &BotConfig, window: &mut Window, cx: &mut Context<Self>) {
-        if self.soul_memory.soul_input.is_none() || self.soul_memory.memory_input.is_none() {
-            // The tab's editors double as the page's; build them the same way.
-            self.ensure_soul_memory_inputs(bot, window, cx);
-        }
+        // Always delegate so pending SYNC_SOUL / SYNC_MEMORY / SYNC_TOPIC flags are
+        // applied even after the inputs have already been created.
+        self.ensure_soul_memory_inputs(bot, window, cx);
     }
 
     fn ensure_memory_add_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -615,7 +614,6 @@ impl View {
                                                 &val,
                                                 cx,
                                             );
-                                            this.soul_memory.editing_fact = None;
                                         })),
                                 ),
                         ),
@@ -742,7 +740,6 @@ impl View {
                 {
                     let val = ent.read(cx).value().to_string();
                     this.edit_memory_fact(bid, old.clone(), &val, cx);
-                    this.soul_memory.editing_fact = None;
                 }
             },
         ));
