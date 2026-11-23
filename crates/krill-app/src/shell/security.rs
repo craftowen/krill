@@ -2172,6 +2172,29 @@ fn upload_bytes_with_program(
     Some(path)
 }
 
+pub(super) fn upload_local_file_to_remote(
+    target: &RemoteUploadTarget,
+    path: &std::path::Path,
+) -> Option<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let max_bytes = u64::try_from(MAX_CLIPBOARD_IMAGE_BYTES).ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "pasted-file".to_owned(), sanitize_remote_filename);
+    upload_bytes_to_remote_target(target, &filename, &bytes)
+}
+
 fn upload_local_paths(
     target: &RemoteUploadTarget,
     paths: &[&std::path::PathBuf],
@@ -2179,24 +2202,7 @@ fn upload_local_paths(
 ) -> Option<Vec<u8>> {
     let mut remote_paths: Vec<String> = Vec::new();
     for path in paths {
-        use std::io::Read as _;
-        let file = std::fs::File::open(path).ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        file.take(64 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
-            return None;
-        }
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map_or_else(|| "pasted-file".to_owned(), sanitize_remote_filename);
-        remote_paths.push(upload_bytes_to_remote_target(target, &filename, &bytes)?);
+        remote_paths.push(upload_local_file_to_remote(target, path)?);
     }
     if remote_paths.is_empty() {
         return None;

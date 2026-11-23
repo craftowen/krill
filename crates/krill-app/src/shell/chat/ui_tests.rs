@@ -3823,3 +3823,471 @@ fn chat_activity_rows_even_spacing_wide_chips_and_expandable_agent_message(
         chip.size.width
     );
 }
+
+#[gpui::test]
+fn chat_inline_image_token_submit_reconciles_without_duplicate_or_timeout(cx: &mut TestAppContext) {
+    use krill_proto::input::Delivery;
+    use krill_proto::term_modes::Modes;
+
+    let dir = TestTempDir::new("chat-inline-image-reconcile");
+    let png = dir.path().join("shot.png");
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([20, 120, 220, 255]))
+        .save(&png)
+        .unwrap();
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-inline-image-reconcile",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    let pane = shell.read_with(cx, |s, _| s.layout.focused().unwrap());
+    let key = local_key(SESSION);
+    let polled_items = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ChatItem>::new()));
+    let poll_source = polled_items.clone();
+
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            shell.paths = Some(krill_proto::daemon::Paths {
+                socket: "/fake/socket".into(),
+                holder: "/fake/holder".into(),
+                krilld: "/fake/krilld".into(),
+            });
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            shell.chat.poll_call = Some(std::sync::Arc::new(move |_| {
+                let items = std::mem::take(&mut *poll_source.lock().unwrap());
+                Ok(krill_proto::control::Reply::AgentHistory(
+                    krill_proto::agent_history::Response::ChatPolled(ChatPollSnapshot {
+                        agent: "claude".into(),
+                        bound: true,
+                        items,
+                        session_id: "chat-ui-test".into(),
+                        transcript_path: "/fake/chat-ui.jsonl".into(),
+                        ..Default::default()
+                    }),
+                ))
+            }));
+            shell.attach_dropped_paths_to_chat(
+                &key,
+                &gpui::ExternalPaths(vec![png.clone()].into()),
+                window,
+                cx,
+            );
+            shell.ensure_chat_input(key.clone(), window, cx)
+        })
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-attachment-image-pill-1").is_some());
+    assert_eq!(input.read_with(cx, |s, _| s.tokens().len()), 1);
+
+    // Type directly after `[Image #1]` with no space (`[Image #1]이거 봐`) and submit.
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            gpui::EntityInputHandler::replace_text_in_range(state, None, "이거 봐", window, cx);
+        });
+        shell.update(cx, |shell, cx| {
+            shell.submit_chat_prompt(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let first_payload = sent_text(&sent);
+    assert!(
+        first_payload.contains(&format!("{} 이거 봐", png.display()))
+            || first_payload.contains(&format!("'{}' 이거 봐", png.display())),
+        "submitted payload must separate image path from text, got {first_payload:?}"
+    );
+    shell.read_with(cx, |s, _| {
+        let pending = &s.chat.pending_prompts[&key];
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].display_text, "이거 봐",
+            "pending display_text must strip inline image token span"
+        );
+    });
+    assert!(cx.debug_bounds("chat-pending-card").is_some());
+
+    // Poll back the krilld-stripped user item (`item.text = "이거 봐"`, `item.file_path = png`).
+    polled_items.lock().unwrap().push(ChatItem {
+        kind: ChatItemKind::User,
+        text: "이거 봐".into(),
+        file_path: png.display().to_string(),
+        ..Default::default()
+    });
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_secs(16));
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("chat-pending-card").is_none(),
+        "reconciled prompt must not leave a duplicate pending card"
+    );
+    shell.read_with(cx, |s, cx| {
+        assert!(s.chat.pending_prompts.get(&key).is_none_or(Vec::is_empty));
+        assert!(
+            !s.chat.prompt_review.contains(&key),
+            "reconciled inline image prompt must not time out into PROMPT_REVIEW"
+        );
+        assert!(
+            s.chat.draft_attachments.get(&key).is_none_or(Vec::is_empty),
+            "reconciled prompt must not restore draft attachments"
+        );
+        assert!(
+            input.read(cx).value().is_empty(),
+            "composer must stay empty without false draft restore, got {:?}",
+            input.read(cx).value()
+        );
+        assert!(
+            s.chat.logs[&key]
+                .items
+                .iter()
+                .any(|item| item.kind == ChatItemKind::User && item.text == "이거 봐"),
+            "polled user item must be present in transcript"
+        );
+    });
+
+    // Image-only submit (`[Image #1]`) reconciles when krilld strips the path into `file_path`.
+    sent.lock().unwrap().clear();
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.attach_dropped_paths_to_chat(
+                &key,
+                &gpui::ExternalPaths(vec![png.clone()].into()),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.submit_chat_prompt(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(s.chat.pending_prompts[&key][0].display_text, "");
+    });
+    polled_items.lock().unwrap().push(ChatItem {
+        kind: ChatItemKind::User,
+        text: String::new(),
+        file_path: png.display().to_string(),
+        ..Default::default()
+    });
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_secs(16));
+    cx.run_until_parked();
+    shell.read_with(cx, |s, cx| {
+        assert!(s.chat.pending_prompts.get(&key).is_none_or(Vec::is_empty));
+        assert!(!s.chat.prompt_review.contains(&key));
+        assert!(s.chat.draft_attachments.get(&key).is_none_or(Vec::is_empty));
+        assert!(input.read(cx).value().is_empty());
+    });
+}
+
+#[gpui::test]
+fn chat_failed_submit_with_image_restores_draft_without_duplicate_image_marker(
+    cx: &mut TestAppContext,
+) {
+    let dir = TestTempDir::new("chat-failed-image-restore");
+    let png = dir.path().join("shot.png");
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([40, 180, 90, 255]))
+        .save(&png)
+        .unwrap();
+
+    let (shell, cx) = fixture(
+        cx,
+        "chat-failed-image-restore",
+        vec![ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: "Ready.".into(),
+            ..Default::default()
+        }],
+    );
+    let pane = shell.read_with(cx, |s, _| s.layout.focused().unwrap());
+    let key = local_key(SESSION);
+    let input = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            attach_live_test_pane(shell, pane, SESSION, cx);
+            shell.chat.send_input = Some(Box::new(|_| false));
+            shell.attach_dropped_paths_to_chat(
+                &key,
+                &gpui::ExternalPaths(vec![png.clone()].into()),
+                window,
+                cx,
+            );
+            shell.ensure_chat_input(key.clone(), window, cx)
+        })
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            gpui::EntityInputHandler::replace_text_in_range(state, None, "이거 봐", window, cx);
+        });
+        shell.update(cx, |shell, cx| {
+            shell.submit_chat_prompt(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-attachment-image-pill-1").is_some());
+    assert!(cx.debug_bounds("chat-pending-card").is_none());
+    shell.read_with(cx, |s, cx| {
+        assert_eq!(s.chat.draft_attachments[&key].len(), 1);
+        let state = input.read(cx);
+        assert_eq!(state.tokens().len(), 1);
+        assert_eq!(
+            state.value().matches("[Image #1]").count(),
+            1,
+            "restored draft must not duplicate raw [Image #1] text, got {:?}",
+            state.value()
+        );
+        assert_eq!(
+            strip_image_token_spans(&state.value(), state.tokens()),
+            "이거 봐"
+        );
+    });
+}
+
+#[gpui::test]
+fn remote_chat_attachments_refuse_local_fallback_and_render_uploaded_preview(
+    cx: &mut TestAppContext,
+) {
+    let dir = TestTempDir::new("chat-remote-attach");
+    let local_png = dir.path().join("remote-shot.png");
+    image::RgbaImage::from_pixel(24, 24, image::Rgba([220, 60, 40, 255]))
+        .save(&local_png)
+        .unwrap();
+    let png_bytes = std::fs::read(&local_png).unwrap();
+
+    let (shell, cx) = open(cx, state_path("chat-remote-attach-ui"));
+    let remote_host = krill_app::hosts::HostId::Remote("mac-mini".into());
+    let remote_session = SessionId(901);
+    let remote_key = (remote_host.clone(), remote_session);
+    let pane = shell.read_with(cx, |s, _| s.layout.focused().unwrap());
+
+    shell.update(cx, |shell, cx| {
+        shell.sidebar_collapsed = true;
+        shell.panel_collapsed = true;
+        shell.layout.set_host(pane, remote_host.clone());
+        shell.layout.set_session(pane, remote_session);
+        shell.layout.set_chat_view(pane, true);
+        shell.apply_chat_poll_for_host(
+            remote_session,
+            remote_host.clone(),
+            snapshot(vec![ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Remote ready.".into(),
+                ..Default::default()
+            }]),
+            None,
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // 1. Disconnected remote refuses clipboard image paste without staging local paths.
+    let clip_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png_bytes);
+    cx.write_to_clipboard(gpui::ClipboardItem::new_image(&clip_img));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.intercept_chat_clipboard_paste(&remote_key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(
+            s.chat
+                .draft_attachments
+                .get(&remote_key)
+                .is_none_or(Vec::is_empty),
+            "disconnected remote must never stage local clipboard image paths"
+        );
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(ctext::ATTACH_REMOTE_UPLOAD_FAILED.get())
+        );
+    });
+
+    // 2. Disconnected remote refuses dropped files without staging local paths.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.notice = None;
+            shell.attach_dropped_paths_to_chat(
+                &remote_key,
+                &gpui::ExternalPaths(vec![local_png.clone()].into()),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(
+            s.chat
+                .draft_attachments
+                .get(&remote_key)
+                .is_none_or(Vec::is_empty),
+            "disconnected remote must never stage local dropped file paths"
+        );
+        assert_eq!(
+            s.notice.as_deref(),
+            Some(ctext::ATTACH_REMOTE_UPLOAD_FAILED.get())
+        );
+    });
+
+    // 3. Plain text paste still works normally on a disconnected remote pane.
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string("hello remote".into()));
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.notice = None;
+            shell.intercept_chat_clipboard_paste(&remote_key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.read_with(cx, |s, cx| {
+        assert_eq!(s.notice, None);
+        assert_eq!(
+            s.chat.inputs[&remote_key].0.read(cx).value().as_ref(),
+            "hello remote"
+        );
+    });
+
+    // 4. Successful remote upload keeps remote path for payload, local preview for thumbnails/viewer,
+    //    and renders settled remote user bubbles with local preview while unknown remote paths stay icons.
+    let remote_uploaded_path = "/var/folders/remote/krill-paste.test/remote-shot.png";
+    let local_att = DraftAttachment::from_path(local_png.clone()).unwrap();
+    let uploaded =
+        upload_chat_attachments_with(vec![local_att], |_| Some(remote_uploaded_path.to_owned()))
+            .unwrap();
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            attach_live_test_pane(shell, pane, remote_session, cx);
+            if let Some(live) = shell.live.get_mut(&pane) {
+                live.target = Some(krill_app::hosts::HostTarget::remote(
+                    "mac-mini",
+                    std::path::PathBuf::from("/fake/remote.sock"),
+                ));
+            }
+            shell.chat.send_input = Some(Box::new(move |bytes| {
+                recorded.lock().unwrap().push(bytes);
+                true
+            }));
+            shell.chat.inputs[&remote_key]
+                .0
+                .update(cx, |state, cx| state.set_value(String::new(), window, cx));
+            shell.stage_chat_attachments(&remote_key, uploaded, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-attachment-image-pill-1").is_some());
+    let composer_thumb = cx.debug_bounds("chat-attachment-image-0").unwrap();
+    shell.read_with(cx, |s, _| {
+        assert_eq!(
+            s.chat
+                .images
+                .resolve_remote_preview(std::path::Path::new(remote_uploaded_path)),
+            Some(local_png.as_path())
+        );
+        assert!(matches!(
+            s.chat.images.thumbs_for_test(&local_png),
+            Some(super::images::Loaded::Ready(_))
+        ));
+    });
+    cx.simulate_click(composer_thumb.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        let viewer = s.chat.images.viewer.as_ref().unwrap();
+        assert_eq!(viewer.paths, vec![local_png.clone()]);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Submit with text: payload uses the REMOTE path, never the local path.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            let input = shell.chat.inputs[&remote_key].0.clone();
+            input.update(cx, |state, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    state,
+                    None,
+                    "원격 확인",
+                    window,
+                    cx,
+                );
+            });
+            shell.submit_chat_prompt(&remote_key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let payload = sent_text(&sent);
+    assert!(
+        payload.contains(&format!("{remote_uploaded_path} 원격 확인")),
+        "remote submit must send uploaded remote path, got {payload:?}"
+    );
+    assert!(
+        !payload.contains(&local_png.display().to_string()),
+        "remote submit must not leak local path, got {payload:?}"
+    );
+
+    // Poll settled remote user bubble with 1 uploaded image + 1 unknown remote-only image.
+    shell.update(cx, |shell, cx| {
+        shell.apply_chat_poll_for_host(
+            remote_session,
+            remote_host.clone(),
+            snapshot(vec![ChatItem {
+                kind: ChatItemKind::User,
+                text: "원격 확인".into(),
+                file_path: format!("{remote_uploaded_path}\n/remote/only/unknown.png"),
+                ..Default::default()
+            }]),
+            None,
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("chat-pending-card").is_none());
+    let uploaded_tile = cx.debug_bounds("chat-message-image-0").unwrap();
+    let unknown_tile = cx.debug_bounds("chat-message-image-1").unwrap();
+
+    // Unknown remote image stays non-readable and does not open the viewer.
+    cx.simulate_click(unknown_tile.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_none());
+
+    // Locally-uploaded remote image opens the viewer using its local preview path.
+    cx.simulate_click(uploaded_tile.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-image-viewer").is_some());
+    shell.read_with(cx, |s, _| {
+        let viewer = s.chat.images.viewer.as_ref().unwrap();
+        assert_eq!(viewer.paths, vec![local_png.clone()]);
+        assert_eq!(viewer.numbers, vec![1]);
+    });
+}

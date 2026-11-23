@@ -3056,6 +3056,7 @@ catalog! {
         QUEUED_ATTACHMENT_ONE => ("+첨부 {n}개", "+{n} attachment"),
         QUEUED_ATTACHMENT_MANY => ("+첨부 {n}개", "+{n} attachments"),
         DISMISS_ERROR => ("닫기", "Dismiss"),
+        ATTACH_REMOTE_UPLOAD_FAILED => ("원격 호스트로 첨부 파일을 올리지 못했습니다.", "Could not upload attachment to the remote host."),
         IMAGE_NUMBER => ("이미지 #{number}", "Image #{number}"),
         IMAGE_VIEW => ("이미지 보기", "View image"),
         IMAGE_PREVIEW_UNAVAILABLE => ("미리보기를 사용할 수 없습니다.", "Preview unavailable"),

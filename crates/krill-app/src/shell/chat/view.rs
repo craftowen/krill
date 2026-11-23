@@ -1147,13 +1147,25 @@ impl Shell {
                 let item_text = item.text.as_str();
                 let image_paths = super::images::item_image_paths(item);
                 let image_numbers = super::images::image_numbers(&item.text, image_paths.len());
-                let readable = !self.layout.host(pane).is_remote();
+                let is_remote = self.layout.host(pane).is_remote();
+                let resolved_paths: Vec<Option<std::path::PathBuf>> = image_paths
+                    .into_iter()
+                    .map(|path| {
+                        if is_remote {
+                            self.chat
+                                .images
+                                .resolve_remote_preview(&path)
+                                .map(std::path::Path::to_path_buf)
+                        } else {
+                            Some(path)
+                        }
+                    })
+                    .collect();
                 let images = self
                     .chat_message_images(
                         &format!("chat-item-{}-{abs_idx}", pane.get()),
-                        &image_paths,
+                        &resolved_paths,
                         &image_numbers,
-                        readable,
                         cx,
                     )
                     .map(gpui::Styled::mb_0p5);
@@ -3361,11 +3373,11 @@ impl Shell {
                     *copied_key == key && *copied_id == pending_id
                 });
 
-        let pending_images: Vec<std::path::PathBuf> = pending
+        let pending_images: Vec<Option<std::path::PathBuf>> = pending
             .attachments
             .iter()
             .filter(|a| a.is_image)
-            .map(|a| a.path.clone())
+            .map(|a| Some(a.preview_path().to_path_buf()))
             .collect();
         let pending_numbers: Vec<usize> = (1..=pending_images.len()).collect();
         let image_strip = self
@@ -3373,7 +3385,6 @@ impl Shell {
                 &format!("chat-pending-{pending_id}-{}", pane.get()),
                 &pending_images,
                 &pending_numbers,
-                true,
                 cx,
             )
             .map(gpui::Styled::mb_0p5);

@@ -91,12 +91,17 @@ pub(crate) struct ComposerMeta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DraftAttachment {
     pub path: std::path::PathBuf,
+    pub preview_path: Option<std::path::PathBuf>,
     pub display_name: String,
     pub byte_len: u64,
     pub is_image: bool,
 }
 
 impl DraftAttachment {
+    pub(super) fn preview_path(&self) -> &std::path::Path {
+        self.preview_path.as_deref().unwrap_or(&self.path)
+    }
+
     pub(super) fn from_path(path: std::path::PathBuf) -> Option<Self> {
         use krill_proto::os::ffi::OsStrExt as _;
         let raw_bytes = path.as_os_str().as_bytes();
@@ -127,6 +132,7 @@ impl DraftAttachment {
         let is_image = krill_term::paste::is_image_path(raw_bytes);
         Some(Self {
             path,
+            preview_path: None,
             display_name,
             byte_len,
             is_image,
@@ -2749,26 +2755,29 @@ impl Shell {
             if Self::chat_input_is_composing(&input, window, cx) {
                 return;
             }
-            let display_text = input.read(cx).value().to_string();
+            let (raw_text, tokens) = {
+                let state = input.read(cx);
+                (state.value().to_string(), state.tokens().to_vec())
+            };
             let attachments = self
                 .chat
                 .draft_attachments
                 .get(key)
                 .cloned()
                 .unwrap_or_default();
-            let Some(submitted_payload) = build_chat_payload_with_tokens(
-                &display_text,
-                input.read(cx).tokens(),
-                &attachments,
-            ) else {
+            let Some(submitted_payload) =
+                build_chat_payload_with_tokens(&raw_text, &tokens, &attachments)
+            else {
                 return;
             };
+            let display_text = strip_image_token_spans(&raw_text, &tokens);
             self.cancel_auto_continue(key, cx);
             self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
             let queued_id = self.chat.next_pending_id;
             self.record_chat_prompt_history(key, &display_text);
             input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
             self.chat.draft_attachments.remove(key);
+            self.chat.image_tokens.remove(key);
             if let Some(ac) = self.chat.autocomplete.get_mut(key) {
                 ac.close();
                 ac.dismissed = None;
@@ -2804,7 +2813,10 @@ impl Shell {
         if Self::chat_input_is_composing(&input, window, cx) {
             return;
         }
-        let display_text = input.read(cx).value().to_string();
+        let (raw_text, tokens) = {
+            let state = input.read(cx);
+            (state.value().to_string(), state.tokens().to_vec())
+        };
         let attachments = self
             .chat
             .draft_attachments
@@ -2812,10 +2824,11 @@ impl Shell {
             .cloned()
             .unwrap_or_default();
         let Some(submitted_payload) =
-            build_chat_payload_with_tokens(&display_text, input.read(cx).tokens(), &attachments)
+            build_chat_payload_with_tokens(&raw_text, &tokens, &attachments)
         else {
             return;
         };
+        let display_text = strip_image_token_spans(&raw_text, &tokens);
         let Some(pane) = self.chat_pane(key) else {
             return;
         };
@@ -2842,6 +2855,7 @@ impl Shell {
         self.record_chat_prompt_history(key, &display_text);
         input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
         self.chat.draft_attachments.remove(key);
+        self.chat.image_tokens.remove(key);
         if let Some(ac) = self.chat.autocomplete.get_mut(key) {
             ac.close();
             ac.dismissed = None;
@@ -3220,7 +3234,39 @@ impl Shell {
 enum ChatClipboardContent {
     Attachments(Vec<DraftAttachment>),
     Text(String),
+    UploadFailed,
     None,
+}
+
+pub(super) fn upload_chat_attachments_with(
+    attachments: Vec<DraftAttachment>,
+    mut upload: impl FnMut(&std::path::Path) -> Option<String>,
+) -> Option<Vec<DraftAttachment>> {
+    let mut uploaded = Vec::with_capacity(attachments.len());
+    for mut att in attachments {
+        let local_path = att.path.clone();
+        let remote_path = upload(&local_path)?;
+        if remote_path.is_empty() || remote_path.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return None;
+        }
+        att.path = std::path::PathBuf::from(remote_path);
+        att.preview_path = att.is_image.then_some(local_path);
+        uploaded.push(att);
+    }
+    Some(uploaded)
+}
+
+fn upload_chat_attachments_to_remote(
+    target: Option<&super::security::RemoteUploadTarget>,
+    attachments: Vec<DraftAttachment>,
+) -> Option<Vec<DraftAttachment>> {
+    if attachments.is_empty() {
+        return Some(Vec::new());
+    }
+    let target = target?;
+    upload_chat_attachments_with(attachments, |path| {
+        super::security::upload_local_file_to_remote(target, path)
+    })
 }
 
 fn classify_chat_clipboard_item(item: &gpui::ClipboardItem) -> ChatClipboardContent {
@@ -3348,6 +3394,117 @@ pub(super) fn image_token_pill(
         .into_any_element()
 }
 
+fn strip_ranges_cleanly(text: &str, ranges: &[std::ops::Range<usize>]) -> String {
+    if ranges.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    let mut removed_since_output = false;
+
+    let append_slice = |out: &mut String, slice: &str, removed_since_output: &mut bool| {
+        if slice.is_empty() {
+            return;
+        }
+        let slice = if *removed_since_output {
+            if out.is_empty() {
+                slice.trim_start()
+            } else if out.chars().next_back().is_some_and(char::is_whitespace) {
+                slice.trim_start_matches([' ', '\t'])
+            } else {
+                slice
+            }
+        } else {
+            slice
+        };
+        if slice.is_empty() {
+            return;
+        }
+        if *removed_since_output {
+            if slice.starts_with(['\n', '\r']) {
+                let trimmed_len = out.trim_end_matches([' ', '\t']).len();
+                out.truncate(trimmed_len);
+            } else if !out.is_empty()
+                && out.chars().next_back().is_some_and(|c| !c.is_whitespace())
+                && slice.chars().next().is_some_and(|c| !c.is_whitespace())
+            {
+                out.push(' ');
+            }
+        }
+        out.push_str(slice);
+        *removed_since_output = false;
+    };
+
+    for range in ranges {
+        if range.start < at
+            || range.end < range.start
+            || range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
+            continue;
+        }
+        if let Some(before) = text.get(at..range.start) {
+            append_slice(&mut out, before, &mut removed_since_output);
+        }
+        if out.trim().is_empty() {
+            out.clear();
+        }
+        removed_since_output = true;
+        at = range.end;
+    }
+    if let Some(tail) = text.get(at..)
+        && !(removed_since_output && tail.trim().is_empty())
+    {
+        append_slice(&mut out, tail, &mut removed_since_output);
+    }
+    if removed_since_output {
+        let trimmed_len = out.trim_end().len();
+        out.truncate(trimmed_len);
+    }
+    out
+}
+
+pub(super) fn strip_image_token_spans(
+    text: &str,
+    tokens: &[gpui_component::input::InlineTokenSpan],
+) -> String {
+    let ranges: Vec<std::ops::Range<usize>> = tokens
+        .iter()
+        .filter(|span| span.token().id().starts_with(IMAGE_TOKEN_PREFIX))
+        .map(gpui_component::input::InlineTokenSpan::range)
+        .collect();
+    strip_ranges_cleanly(text, &ranges)
+}
+
+fn find_chat_image_marker_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    const PREFIX: &[u8] = b"[image #";
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while let Some(head) = bytes.get(i..i + PREFIX.len()) {
+        if head.eq_ignore_ascii_case(PREFIX) {
+            let digits_start = i + PREFIX.len();
+            let mut j = digits_start;
+            while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                j += 1;
+            }
+            if j > digits_start && bytes.get(j) == Some(&b']') {
+                ranges.push(i..j + 1);
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    ranges
+}
+
+pub(super) fn strip_chat_image_markers(text: &str) -> String {
+    let ranges = find_chat_image_marker_ranges(text);
+    strip_ranges_cleanly(text, &ranges)
+}
+
 /// Orca places a pasted image where its chip sits: each image chip becomes that image's quoted
 /// path in place, a chip whose image was removed drops out, and images without a chip (or other
 /// files) lead the prompt as before.
@@ -3360,6 +3517,7 @@ pub(super) fn build_chat_payload_with_tokens(
     let mut text = String::with_capacity(display_text.len());
     let mut used: Vec<&std::path::Path> = Vec::new();
     let mut at = 0;
+    let mut just_inserted_path = false;
     for span in tokens {
         let Some(path) = span.token().id().strip_prefix(IMAGE_TOKEN_PREFIX) else {
             continue;
@@ -3368,18 +3526,34 @@ pub(super) fn build_chat_payload_with_tokens(
         let (Some(before), true) = (display_text.get(at..range.start), range.end >= at) else {
             continue;
         };
-        text.push_str(before);
+        if !before.is_empty() {
+            if just_inserted_path && before.chars().next().is_some_and(|c| !c.is_whitespace()) {
+                text.push(' ');
+            }
+            text.push_str(before);
+            just_inserted_path = false;
+        }
         if let Some(att) = attachments
             .iter()
             .find(|a| a.is_image && a.path.as_os_str() == std::ffi::OsStr::new(path))
         {
+            if text.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+                text.push(' ');
+            }
             let quoted = krill_term::paste::shell_quote(att.path.as_os_str().as_bytes());
             text.push_str(&String::from_utf8_lossy(&quoted));
             used.push(&att.path);
+            just_inserted_path = true;
         }
         at = range.end;
     }
-    text.push_str(display_text.get(at..).unwrap_or_default());
+    let tail = display_text.get(at..).unwrap_or_default();
+    if !tail.is_empty() {
+        if just_inserted_path && tail.chars().next().is_some_and(|c| !c.is_whitespace()) {
+            text.push(' ');
+        }
+        text.push_str(tail);
+    }
     let rest: Vec<DraftAttachment> = attachments
         .iter()
         .filter(|a| !used.contains(&a.path.as_path()))
@@ -4160,6 +4334,8 @@ impl Shell {
                     }
                     normalized(entry.submitted_payload.get(..end).unwrap_or_default())
                 });
+            let clean_display = (!entry.attachments.is_empty())
+                .then(|| normalized(&strip_chat_image_markers(&entry.display_text)));
             let found_abs = log.items.iter().enumerate().find_map(|(i, item)| {
                 let abs_idx = log.base_index.saturating_add(i);
                 let item_norm = (abs_idx >= entry.origin_item
@@ -4172,9 +4348,18 @@ impl Shell {
                             || target_bounded.as_ref().is_some_and(|b| norm == *b)
                             // Agents rewrite attached image paths (`[Image #1] …`, or krilld lifts
                             // them into `file_path`); match on the typed text then.
-                            || (!entry.attachments.is_empty()
-                                && normalized(&krill_proto::git::clean_user_prompt(&item.text))
-                                    == normalized(&entry.display_text))
+                            || clean_display.as_deref().is_some_and(|clean_display| {
+                                let clean_item = normalized(&strip_chat_image_markers(
+                                    &krill_proto::git::clean_user_prompt(&item.text),
+                                ));
+                                (!clean_display.is_empty() && clean_item == clean_display)
+                                    || (clean_display.is_empty()
+                                        && clean_item.is_empty()
+                                        && (!item.file_path.is_empty()
+                                            || !find_chat_image_marker_ranges(&item.text)
+                                                .is_empty()
+                                            || item.text.contains("[Image #")))
+                            })
                     })
                     .then_some(abs_idx)
             });
@@ -4251,6 +4436,7 @@ impl Shell {
             self.chat.pending_epochs.remove(&(key.clone(), pending_id));
             if let Some(entry) = removed {
                 if !entry.attachments.is_empty() {
+                    self.chat.image_tokens.remove(key);
                     self.chat
                         .draft_attachments
                         .insert(key.clone(), entry.attachments);
@@ -4374,6 +4560,13 @@ impl Shell {
         self.chat.prompt_review.remove(key);
         let list = self.chat.draft_attachments.entry(key.clone()).or_default();
         for att in attachments {
+            if att.is_image
+                && let Some(local) = &att.preview_path
+            {
+                self.chat
+                    .images
+                    .register_remote_preview(att.path.clone(), local.clone());
+            }
             if !list.iter().any(|existing| existing.path == att.path) {
                 list.push(att);
             }
@@ -4551,15 +4744,57 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let staged: Vec<DraftAttachment> = paths
-            .paths()
-            .iter()
-            .cloned()
-            .filter_map(DraftAttachment::from_path)
-            .collect();
-        self.stage_chat_attachments(key, staged, cx);
-        let input = self.ensure_chat_input(key.clone(), window, cx);
-        input.update(cx, |state, cx| state.focus(window, cx));
+        if !key.0.is_remote() {
+            let staged: Vec<DraftAttachment> = paths
+                .paths()
+                .iter()
+                .cloned()
+                .filter_map(DraftAttachment::from_path)
+                .collect();
+            self.stage_chat_attachments(key, staged, cx);
+            let input = self.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |state, cx| state.focus(window, cx));
+            return;
+        }
+        let remote_target = self
+            .chat_pane(key)
+            .and_then(|pane| self.remote_upload_target_for_pane(pane, cx));
+        let paths = paths.paths().to_vec();
+        self.chat.next_attach_id = self.chat.next_attach_id.wrapping_add(1);
+        let attach_id = self.chat.next_attach_id;
+        let task_key = key.clone();
+        let entry_key = (task_key.clone(), attach_id);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let uploaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let staged: Vec<DraftAttachment> = paths
+                        .into_iter()
+                        .filter_map(DraftAttachment::from_path)
+                        .collect();
+                    upload_chat_attachments_to_remote(remote_target.as_ref(), staged)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.chat
+                    .attach_tasks
+                    .remove(&(task_key.clone(), attach_id));
+                match uploaded {
+                    Some(staged) if !staged.is_empty() => {
+                        this.stage_chat_attachments(&task_key, staged, cx);
+                        let input = this.ensure_chat_input(task_key.clone(), window, cx);
+                        input.update(cx, |state, cx| state.focus(window, cx));
+                    }
+                    Some(_) => {}
+                    None => {
+                        this.notice = Some(ctext::ATTACH_REMOTE_UPLOAD_FAILED.get().to_owned());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        });
+        self.chat.attach_tasks.insert(entry_key, task);
     }
 
     pub(super) fn prompt_for_chat_attachments(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
@@ -4569,6 +4804,13 @@ impl Shell {
             multiple: true,
             prompt: Some(ctext::ATTACH_FILE.get().into()),
         });
+        let is_remote = key.0.is_remote();
+        let remote_target = is_remote
+            .then(|| {
+                self.chat_pane(key)
+                    .and_then(|pane| self.remote_upload_target_for_pane(pane, cx))
+            })
+            .flatten();
         self.chat.next_attach_id = self.chat.next_attach_id.wrapping_add(1);
         let attach_id = self.chat.next_attach_id;
         let task_key = key.clone();
@@ -4584,17 +4826,27 @@ impl Shell {
             let staged = cx
                 .background_executor()
                 .spawn(async move {
-                    paths
+                    let staged: Vec<DraftAttachment> = paths
                         .into_iter()
                         .filter_map(DraftAttachment::from_path)
-                        .collect::<Vec<_>>()
+                        .collect();
+                    if is_remote {
+                        upload_chat_attachments_to_remote(remote_target.as_ref(), staged)
+                    } else {
+                        Some(staged)
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.chat
                     .attach_tasks
                     .remove(&(task_key.clone(), attach_id));
-                this.stage_chat_attachments(&task_key, staged, cx);
+                if let Some(staged) = staged {
+                    this.stage_chat_attachments(&task_key, staged, cx);
+                } else {
+                    this.notice = Some(ctext::ATTACH_REMOTE_UPLOAD_FAILED.get().to_owned());
+                    cx.notify();
+                }
             })
             .ok();
         });
@@ -4607,6 +4859,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let is_remote = key.0.is_remote();
+        let remote_target = is_remote
+            .then(|| {
+                self.chat_pane(key)
+                    .and_then(|pane| self.remote_upload_target_for_pane(pane, cx))
+            })
+            .flatten();
         let read = cx.read_from_clipboard_async();
         self.chat.next_attach_id = self.chat.next_attach_id.wrapping_add(1);
         let attach_id = self.chat.next_attach_id;
@@ -4625,7 +4884,17 @@ impl Shell {
             };
             let classified = cx
                 .background_executor()
-                .spawn(async move { classify_chat_clipboard_item(&item) })
+                .spawn(async move {
+                    match classify_chat_clipboard_item(&item) {
+                        ChatClipboardContent::Attachments(atts) if is_remote => {
+                            match upload_chat_attachments_to_remote(remote_target.as_ref(), atts) {
+                                Some(uploaded) => ChatClipboardContent::Attachments(uploaded),
+                                None => ChatClipboardContent::UploadFailed,
+                            }
+                        }
+                        other => other,
+                    }
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.chat
@@ -4645,6 +4914,10 @@ impl Shell {
                                 state, None, &text, window, cx,
                             );
                         });
+                    }
+                    ChatClipboardContent::UploadFailed => {
+                        this.notice = Some(ctext::ATTACH_REMOTE_UPLOAD_FAILED.get().to_owned());
+                        cx.notify();
                     }
                     ChatClipboardContent::None => {}
                 }

@@ -699,14 +699,20 @@ impl Shell {
 
         // Orca NativeChatComposerField: numbered image thumbnails above the prompt, the
         // matching `Image #n` pills, then any other files as chips.
-        let image_slots: Vec<(usize, std::path::PathBuf)> = attachments
+        let image_slots: Vec<(usize, std::path::PathBuf, std::path::PathBuf)> = attachments
             .iter()
             .enumerate()
             .filter(|(_, a)| a.is_image)
-            .map(|(idx, a)| (idx, a.path.clone()))
+            .map(|(idx, a)| (idx, a.path.clone(), a.preview_path().to_path_buf()))
             .collect();
-        let image_paths: Vec<std::path::PathBuf> =
-            image_slots.iter().map(|(_, path)| path.clone()).collect();
+        let image_paths: Vec<std::path::PathBuf> = image_slots
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        let preview_paths: Vec<std::path::PathBuf> = image_slots
+            .iter()
+            .map(|(_, _, preview)| preview.clone())
+            .collect();
         let image_numbers: Vec<usize> = (1..=image_paths.len()).collect();
         let file_attachments: Vec<(usize, DraftAttachment)> = attachments
             .iter()
@@ -727,12 +733,12 @@ impl Shell {
                 .px_1()
                 .pt_1p5()
                 .mb_2();
-            for (n, (idx, path)) in image_slots.iter().enumerate() {
+            for (n, (idx, _, preview_path)) in image_slots.iter().enumerate() {
                 let idx = *idx;
-                let loaded = self.chat_thumbnail(path, cx);
+                let loaded = self.chat_thumbnail(preview_path, cx);
                 let number = n + 1;
                 let remove_key = key.clone();
-                let open_paths = image_paths.clone();
+                let open_paths = preview_paths.clone();
                 let open_numbers = image_numbers.clone();
                 let label = format!(
                     "{}: {}",
