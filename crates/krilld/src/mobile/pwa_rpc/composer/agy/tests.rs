@@ -757,3 +757,24 @@ fn fold_listed_family_maps_multi_level_ids_and_keeps_standalone_ids() {
         None
     );
 }
+
+#[test]
+fn classify_version_output_handles_leading_v_and_ignores_filenames() {
+    assert_eq!(classify_version_output("agy v1.4.12\n"), VerifiedExe::Ok);
+    assert_eq!(
+        classify_version_output("Antigravity CLI V1.5.14\n"),
+        VerifiedExe::Ok
+    );
+    assert_eq!(
+        classify_version_output("agy.exe (flow.google.com) v1.5.0\n"),
+        VerifiedExe::Ok
+    );
+    assert_eq!(
+        classify_version_output("agy v1.3.9\n"),
+        VerifiedExe::TooOld("1.3.9".to_owned())
+    );
+    assert_eq!(
+        classify_version_output("agy.exe flow.google.com\n"),
+        VerifiedExe::Failed(UNVERIFIED)
+    );
+}

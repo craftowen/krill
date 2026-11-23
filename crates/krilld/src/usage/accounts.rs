@@ -323,15 +323,18 @@ pub fn load_file(home: &Path, state_dir: Option<&Path>) -> AccountsFile {
 }
 
 pub fn save_file(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io::Result<()> {
-    let _guard = lock(&SAVE_LOCK);
-    save_inner(home, state_dir, file)
+    {
+        let _guard = lock(&SAVE_LOCK);
+        save_inner(home, state_dir, file)?;
+    }
+    agy_native::sync_active_from_disk(home, state_dir);
+    Ok(())
 }
 
 fn save_inner(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io::Result<()> {
     let path = config_path(home, state_dir);
     let text = krill_proto::config_document::save_toml(&path, file)?;
     write_atomic_0600(&path, text.as_bytes())?;
-    agy_native::sync_active(home, file);
     if let Err(error) = write_active_env(home, state_dir, file) {
         // accounts.toml은 이미 커밋됐다. env 내보내기 실패를 기록하되 저장 성공은 유지한다.
         tracing::warn!(kind = ?error.kind(), "active account env export failed");
@@ -962,7 +965,7 @@ fn refresh_accounts_authenticated(
     trigger: RefreshTrigger,
     auth: &login::Statuses,
 ) -> AccountsSnapshot {
-    let _guard = lock(&SAVE_LOCK);
+    let save_guard = lock(&SAVE_LOCK);
     // 한도 기록은 잎 잠금이라 여기서 통째로 복사한다(중첩 역전 없음).
     let mut limited: BTreeMap<(String, String), u64> = lock(&RATE_LIMITED).clone();
     // K-03: 손상된 파일은 기본값 스냅샷만 내보내고 저장하지 않는다(계정·규칙 소실 방지).
@@ -1428,18 +1431,21 @@ fn refresh_accounts_authenticated(
 
     // K-03: 손상된 파일(`writable=false`)에서는 저장하지 않는다. `SAVE_LOCK`을 쥐고 있어
     // `save_file`이 아니라 `save_inner`를 쓴다.
-    if dirty && (!writable || save_inner(home, state_dir, &file).is_err()) {
-        // 저장하지 못한 전환을 UI·틱·실행 경로에 성공으로 돌려주지 않는다.
-        tracing::warn!("automatic account switch save failed");
-        for event in &switched {
-            for account in all.iter_mut().filter(|a| a.provider == event.provider) {
-                account.active = account.id == event.from_id;
+    let mut saved_dirty = false;
+    if dirty {
+        if !writable || save_inner(home, state_dir, &file).is_err() {
+            // 저장하지 못한 전환을 UI·틱·실행 경로에 성공으로 돌려주지 않는다.
+            tracing::warn!("automatic account switch save failed");
+            for event in &switched {
+                for account in all.iter_mut().filter(|a| a.provider == event.provider) {
+                    account.active = account.id == event.from_id;
+                }
             }
+            switched.clear();
+        } else {
+            saved_dirty = true;
         }
-        switched.clear();
     }
-
-    switch_work::notify(home, state_dir, &switched);
 
     for event in &switched {
         runtime.record(
@@ -1455,6 +1461,12 @@ fn refresh_accounts_authenticated(
     {
         tracing::warn!(kind = ?error.kind(), "account policy state save failed");
     }
+    // `agy_native` 키체인/토큰 동기화와 전환 알림은 `SAVE_LOCK` 밖에서 수행한다.
+    drop(save_guard);
+    if saved_dirty {
+        agy_native::sync_active_from_disk(home, state_dir);
+    }
+    switch_work::notify(home, state_dir, &switched);
     let advanced = runtime.snapshot(
         file.advanced_policy,
         now_secs,
@@ -1788,6 +1800,7 @@ pub fn switch_account(
         save_inner(home, state_dir, &file)?;
         set_manual_pin(home, state_dir, provider, account_id, pinned_usage, &file);
     }
+    agy_native::sync_active_from_disk(home, state_dir);
     // 사용자가 한도 계정을 직접 고르면(예: 모델별 한도라 다른 모델로 쓰려 할 때) 이전 한도 기록이
     // 고정을 풀고 바로 다른 계정으로 되돌리지 않게 지운다. 다시 한도에 걸리면 훅이 새로 기록한다.
     clear_rate_limited(provider, account_id);
@@ -1931,6 +1944,7 @@ pub fn add_account(
         save_inner(home, state_dir, &file)?;
         resolved_dir
     };
+    agy_native::sync_active_from_disk(home, state_dir);
     // OWE-699: 켜져 있으면 추가 직후 프로비저닝한다(실패는 경고만). 잠금 밖에서 프로필 폴더만 쓴다.
     if let Some(dir) = resolved.to_str() {
         super::provision::provision_if_enabled(home, state_dir, provider, dir);
@@ -1968,6 +1982,7 @@ pub fn remove_account(
         }
         save_inner(home, state_dir, &file)?;
     }
+    agy_native::sync_active_from_disk(home, state_dir);
     Ok(refresh_accounts(home, state_dir))
 }
 
@@ -2007,6 +2022,7 @@ pub fn rename_account(
         }
         save_inner(home, state_dir, &file)?;
     }
+    agy_native::sync_active_from_disk(home, state_dir);
     Ok(refresh_accounts(home, state_dir))
 }
 
@@ -2055,6 +2071,7 @@ pub fn delete_account(
         save_inner(home, state_dir, &file)?;
         dir
     };
+    agy_native::sync_active_from_disk(home, state_dir);
     if krill_proto::usage::profiles::is_managed(home, &dir)
         && let Err(e) = krill_proto::usage::profiles::move_to_trash(home, &dir)
     {
@@ -2074,15 +2091,19 @@ fn hide_orca_account(
     provider: ProviderKind,
     account_id: &str,
 ) -> io::Result<()> {
-    let _guard = lock(&SAVE_LOCK);
-    let mut file = load_writable(home, state_dir)?;
-    if !file.hidden_accounts.iter().any(|id| id == account_id) {
-        file.hidden_accounts.push(account_id.to_owned());
+    {
+        let _guard = lock(&SAVE_LOCK);
+        let mut file = load_writable(home, state_dir)?;
+        if !file.hidden_accounts.iter().any(|id| id == account_id) {
+            file.hidden_accounts.push(account_id.to_owned());
+        }
+        if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
+            file.active.remove(provider.as_str());
+        }
+        save_inner(home, state_dir, &file)?;
     }
-    if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
-        file.active.remove(provider.as_str());
-    }
-    save_inner(home, state_dir, &file)
+    agy_native::sync_active_from_disk(home, state_dir);
+    Ok(())
 }
 
 // 세션이 같은 폴더를 symlink·정규화된 경로로 기록했어도 보호한다.

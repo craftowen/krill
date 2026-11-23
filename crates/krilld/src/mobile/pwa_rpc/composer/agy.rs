@@ -255,12 +255,7 @@ fn verify_exe_status(
         Err(direct::agy::RunAgyError::Failed) => return Ok(VerifiedExe::Failed(LIST_FAILED)),
     };
     let text = String::from_utf8_lossy(&version);
-    let found_version = text.split_whitespace().find(|word| word.contains('.'));
-    let result = match found_version {
-        Some(word) if native::at_least(word, FLOOR) => VerifiedExe::Ok,
-        Some(word) => VerifiedExe::TooOld(word.trim_start_matches('v').to_owned()),
-        None => VerifiedExe::Failed(UNVERIFIED),
-    };
+    let result = classify_version_output(&text);
     if let Some(key) = stamp {
         let mut verified = lock(&VERIFIED_EXE);
         if verified.len() >= 16 && !verified.contains_key(&key) {
@@ -269,6 +264,35 @@ fn verify_exe_status(
         verified.insert(key, result.clone());
     }
     Ok(result)
+}
+
+fn extract_version_token(text: &str) -> Option<&str> {
+    text.split_whitespace().find_map(|raw| {
+        let trimmed = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+        let stripped = trimmed
+            .strip_prefix('v')
+            .or_else(|| trimmed.strip_prefix('V'))
+            .unwrap_or(trimmed);
+        let mut parts = stripped.split('.');
+        let major = parts.next()?;
+        let minor = parts.next()?;
+        if !major.is_empty()
+            && major.bytes().all(|b| b.is_ascii_digit())
+            && minor.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        {
+            Some(stripped)
+        } else {
+            None
+        }
+    })
+}
+
+fn classify_version_output(text: &str) -> VerifiedExe {
+    match extract_version_token(text) {
+        Some(ver) if native::at_least(ver, FLOOR) => VerifiedExe::Ok,
+        Some(ver) => VerifiedExe::TooOld(ver.to_owned()),
+        None => VerifiedExe::Failed(UNVERIFIED),
+    }
 }
 
 #[cfg(all(test, unix))]

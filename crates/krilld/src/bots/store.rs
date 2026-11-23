@@ -209,7 +209,7 @@ impl BotStore {
         let agent_id = if base.agent_id.trim().is_empty() {
             "claude".to_owned()
         } else {
-            krill_proto::agent::canonical_id(base.agent_id.trim()).to_owned()
+            self.validate_agent_id(&base.agent_id)?
         };
 
         let mut cfg = BotConfig::new(id, &name, &agent_id, now_ms)
@@ -521,10 +521,10 @@ impl BotStore {
         params.avatar.apply(&mut bot.avatar);
         let mut agent_changed = false;
         if let Some(agent_id) = params.agent_id {
-            let next = krill_proto::agent::canonical_id(agent_id.trim());
+            let next = self.validate_agent_id(&agent_id)?;
             let prev = krill_proto::agent::canonical_id(&bot.agent_id);
-            agent_changed = !next.is_empty() && next != prev;
-            next.clone_into(&mut bot.agent_id);
+            agent_changed = next != prev;
+            bot.agent_id = next;
         }
         if agent_changed {
             // Clear stale provider-specific model/effort unless the caller explicitly sets new ones.
@@ -615,6 +615,17 @@ impl BotStore {
 
     /// Deletes a bot from the registry, cleans up links/access requests/groups, and optionally removes its home.
     pub fn delete_bot(&self, bot_id: &BotId, delete_home: bool) -> io::Result<BotConfig> {
+        let (removed, _) = self.delete_bot_with_cleanup(bot_id, delete_home)?;
+        Ok(removed)
+    }
+
+    /// Deletes a bot from the registry, cleans up links, access requests/meta, offers, settings
+    /// extras, and groups (pruning 0-member groups and returning their IDs).
+    pub(crate) fn delete_bot_with_cleanup(
+        &self,
+        bot_id: &BotId,
+        delete_home: bool,
+    ) -> io::Result<(BotConfig, Vec<String>)> {
         let _guard = lock(&self.io_lock);
         let mut bots: Vec<BotConfig> = self.read_bots()?;
         let Some(pos) = bots.iter().position(|b| &b.id == bot_id) else {
@@ -631,14 +642,41 @@ impl BotStore {
         }
 
         let mut reqs: Vec<BotAccessRequest> = self.read_json_or_default(ACCESS_REQUESTS_FILE)?;
-        let prev_reqs = reqs.len();
-        reqs.retain(|r| &r.bot_id != bot_id);
-        if reqs.len() != prev_reqs {
+        let removed_tokens: Vec<String> = reqs
+            .iter()
+            .filter(|r| &r.bot_id == bot_id)
+            .map(|r| r.token.clone())
+            .collect();
+        if !removed_tokens.is_empty() {
+            reqs.retain(|r| &r.bot_id != bot_id);
             self.write_json(ACCESS_REQUESTS_FILE, &reqs)?;
+            let mut meta_map: BTreeMap<String, AccessMetaEntry> =
+                self.read_json_or_default(ACCESS_META_FILE)?;
+            let prev_meta = meta_map.len();
+            for token in &removed_tokens {
+                meta_map.remove(token);
+            }
+            if meta_map.len() != prev_meta {
+                self.write_json(ACCESS_META_FILE, &meta_map)?;
+            }
+        }
+
+        let mut offers: Vec<BotOffer> = self.read_json_or_default(BOT_OFFERS_FILE)?;
+        let prev_offers = offers.len();
+        offers.retain(|o| &o.bot_id != bot_id);
+        if offers.len() != prev_offers {
+            self.write_json(BOT_OFFERS_FILE, &offers)?;
+        }
+
+        let mut extras: BTreeMap<String, BotSettingsExtras> =
+            self.read_json_or_default(SETTINGS_EXTRAS_FILE)?;
+        if extras.remove(bot_id.as_str()).is_some() {
+            self.write_json(SETTINGS_EXTRAS_FILE, &extras)?;
         }
 
         let mut groups: Vec<BotGroupChat> = self.read_json_or_default(GROUPS_FILE)?;
         let mut groups_changed = false;
+        let mut removed_group_ids = Vec::new();
         for group in &mut groups {
             let before = group.bot_ids.len();
             group.bot_ids.retain(|id| id != bot_id);
@@ -646,6 +684,15 @@ impl BotStore {
                 groups_changed = true;
             }
         }
+        groups.retain(|group| {
+            if group.bot_ids.is_empty() {
+                removed_group_ids.push(group.id.clone());
+                groups_changed = true;
+                false
+            } else {
+                true
+            }
+        });
         if groups_changed {
             self.write_json(GROUPS_FILE, &groups)?;
         }
@@ -685,7 +732,7 @@ impl BotStore {
             }
         }
 
-        Ok(removed)
+        Ok((removed, removed_group_ids))
     }
 
     // ---------- Soul & Memory ----------
@@ -1438,9 +1485,18 @@ impl BotStore {
         }
 
         let mut groups: Vec<BotGroupChat> = self.read_json_or_default(GROUPS_FILE)?;
-        let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+        let slug = bot_slug_from_name(&name);
+        let mut group_id = format!(
+            "grp-{}-{now_ms}-{}",
+            slug.as_str(),
+            ID_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        while groups.iter().any(|g| g.id == group_id) {
+            let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+            group_id = format!("grp-{}-{now_ms}-{seq}", slug.as_str());
+        }
         let group = BotGroupChat {
-            id: format!("grp-{}-{seq}", bot_slug_from_name(&name).as_str()),
+            id: group_id,
             name,
             bot_ids: unique_ids,
             description,
@@ -1647,11 +1703,13 @@ impl BotStore {
             allocate_unique_slug(&bots, &base_slug)?
         };
         let id = allocate_unique_id(&bots, slug.as_str())?;
+        let manifest_agent = krill_proto::agent::canonical_id(pkg.manifest.agent_id.trim());
         let raw_agent_id = agent_override
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(&pkg.manifest.agent_id);
-        let agent_id = krill_proto::agent::canonical_id(raw_agent_id.trim()).to_owned();
+        let agent_id = self.validate_agent_id(raw_agent_id)?;
+        let provider_changed = agent_id != manifest_agent;
 
         let mut cfg = BotConfig::new(id, &final_name, &agent_id, now_ms)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
@@ -1661,8 +1719,10 @@ impl BotStore {
         cfg.emoji = pkg.manifest.emoji;
         cfg.avatar = pkg.manifest.avatar;
         cfg.avatar_color = pkg.manifest.avatar_color;
-        cfg.model = pkg.manifest.model;
-        cfg.effort = pkg.manifest.effort;
+        if !provider_changed {
+            cfg.model = pkg.manifest.model;
+            cfg.effort = pkg.manifest.effort;
+        }
         cfg.permission_mode = pkg.manifest.permission_mode;
         cfg.template_id = pkg.manifest.template_id;
         cfg.notifications = pkg.manifest.notifications;
@@ -1909,6 +1969,14 @@ impl BotStore {
             .and_then(|raw| BotId::new(raw).ok())
             .filter(|bid| !bots.iter().any(|b| &b.id == bid))
             .map_or_else(|| allocate_unique_id(bots, slug.as_str()), Ok)?;
+        let cand_agent = {
+            let trimmed = cand.agent.trim();
+            if trimmed.is_empty() {
+                "claude"
+            } else {
+                krill_proto::agent::canonical_id(trimmed)
+            }
+        };
         let raw_agent = params
             .as_ref()
             .map(|p| p.base.agent_id.trim())
@@ -1916,9 +1984,15 @@ impl BotStore {
             .unwrap_or_else(|| cand.agent.trim());
         let agent_id = if raw_agent.is_empty() {
             "claude".to_owned()
+        } else if params
+            .as_ref()
+            .is_some_and(|p| !p.base.agent_id.trim().is_empty())
+        {
+            self.validate_agent_id(raw_agent)?
         } else {
             krill_proto::agent::canonical_id(raw_agent).to_owned()
         };
+        let provider_changed = agent_id != cand_agent;
 
         let mut cfg = BotConfig::new(id, &clean_name, &agent_id, now_ms)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
@@ -1928,7 +2002,9 @@ impl BotStore {
             .description
             .unwrap_or_else(|| soul_description(&soul).unwrap_or_default());
         cfg.emoji = manifest.emoji;
-        cfg.model = manifest.model;
+        if !provider_changed {
+            cfg.model = manifest.model;
+        }
         cfg.avatar_color = manifest.avatar_color;
         cfg.members = manifest.members;
         cfg.skills = manifest.skill_projects;
@@ -2061,6 +2137,8 @@ impl BotStore {
     }
 
     /// Takes `member` off the bot's Who can ask; people join only by an approved request.
+    /// Also revokes any persisted `Approved` access requests for that member so they cannot bypass
+    /// removal on their next inbound message.
     pub fn remove_member(
         &self,
         bot_id: &BotId,
@@ -2078,7 +2156,68 @@ impl BotStore {
         let updated = bot.clone();
         init_bot_home(&self.root, &updated, None)?;
         self.write_json(BOTS_INDEX_FILE, &bots)?;
+
+        let mut reqs: Vec<BotAccessRequest> = self.read_json_or_default(ACCESS_REQUESTS_FILE)?;
+        let mut meta_map: BTreeMap<String, AccessMetaEntry> =
+            self.read_json_or_default(ACCESS_META_FILE)?;
+        let mut removed_tokens = Vec::new();
+        reqs.retain(|r| {
+            let matches_member = &r.bot_id == bot_id
+                && r.source == member.source
+                && r.sender_id == member.id
+                && r.status == BotAccessRequestStatus::Approved
+                && match (
+                    &member.workspace_id,
+                    meta_map.get(&r.token).and_then(|m| m.workspace_id.as_ref()),
+                ) {
+                    (Some(want), Some(stored)) => want == stored,
+                    _ => true,
+                };
+            if matches_member {
+                removed_tokens.push(r.token.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !removed_tokens.is_empty() {
+            self.write_json(ACCESS_REQUESTS_FILE, &reqs)?;
+            let prev_meta = meta_map.len();
+            for token in &removed_tokens {
+                meta_map.remove(token);
+            }
+            if meta_map.len() != prev_meta {
+                self.write_json(ACCESS_META_FILE, &meta_map)?;
+            }
+        }
         Ok(updated)
+    }
+
+    /// Validates `raw_agent_id` against built-in, preset, and `<state_dir>/agents.toml` profiles,
+    /// returning the canonical ID or `InvalidInput` if unknown.
+    pub fn validate_agent_id(&self, raw_agent_id: &str) -> io::Result<String> {
+        let trimmed = raw_agent_id.trim();
+        if trimmed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent_id cannot be empty",
+            ));
+        }
+        let user_toml = self
+            .root
+            .parent()
+            .map(|state_dir| state_dir.join("agents.toml"))
+            .and_then(|path| fs::read_to_string(path).ok());
+        let agents = krill_proto::agent::Agents::load(user_toml.as_deref())
+            .or_else(|_| krill_proto::agent::Agents::load(None))
+            .map_err(io::Error::other)?;
+        if let Some((resolved, _)) = agents.resolve(trimmed) {
+            return Ok(krill_proto::agent::canonical_id(resolved).to_owned());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown agent profile: {trimmed}"),
+        ))
     }
 
     // ---------- Internal JSON Helpers ----------
@@ -3099,6 +3238,135 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported.agent_id, "agy");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_member_revokes_approved_access_and_create_group_avoids_id_collision() {
+        let root = std::env::temp_dir().join(format!("krilld-d03-d16-d31-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let store = BotStore::new(root.clone());
+
+        // S-02: unknown agent rejected.
+        let bad = store.create_bot(
+            CreateBotParams {
+                name: "Bad".to_owned(),
+                agent_id: "nonexistent-agent".to_owned(),
+                description: String::new(),
+                emoji: None,
+                avatar: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                workspace: None,
+                template_id: None,
+                initial_soul: None,
+            },
+            1_000,
+        );
+        assert!(bad.is_err());
+
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Gate Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: Some("claude-sonnet-4".to_owned()),
+                    effort: Some("high".to_owned()),
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        // D-03: approve access -> allowed -> remove_member -> no longer allowed.
+        let pending = store
+            .check_or_request_access_with_workspace(
+                &bot.id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U42",
+                "Alice",
+                "C1",
+                1_100,
+            )
+            .unwrap();
+        let AccessDecision::Pending(req) = pending else {
+            panic!("expected pending");
+        };
+        store
+            .decide_access_request(&req.token, true, 1_200)
+            .unwrap();
+        assert_eq!(
+            store
+                .check_or_request_access_with_workspace(
+                    &bot.id,
+                    ExternalSource::Slack,
+                    Some("T1"),
+                    "U42",
+                    "Alice",
+                    "C1",
+                    1_300,
+                )
+                .unwrap(),
+            AccessDecision::Allowed
+        );
+        let member = BotMember {
+            id: "U42".to_owned(),
+            name: "Alice".to_owned(),
+            source: ExternalSource::Slack,
+            workspace_id: Some("T1".to_owned()),
+        };
+        store.remove_member(&bot.id, &member, 1_400).unwrap();
+        let after_remove = store
+            .check_or_request_access_with_workspace(
+                &bot.id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U42",
+                "Alice",
+                "C1",
+                1_500,
+            )
+            .unwrap();
+        assert!(
+            matches!(after_remove, AccessDecision::Pending(_)),
+            "removed member must NOT remain Allowed via stale Approved record: {after_remove:?}"
+        );
+
+        // D-16: create_group produces distinct IDs even with identical names/timestamps.
+        let g1 = store
+            .create_group("Team", vec![bot.id.clone()], String::new(), 2_000)
+            .unwrap();
+        let g2 = store
+            .create_group("Team", vec![bot.id.clone()], String::new(), 2_000)
+            .unwrap();
+        assert_ne!(g1.id, g2.id);
+
+        // D-31: import_bot_zip_v2 overriding provider clears old provider's model & effort.
+        let (_, zip) = store
+            .export_bot_zip(&bot.id, BotPackageExportOptions::default())
+            .unwrap();
+        let imported = store
+            .import_bot_zip_v2(
+                &zip,
+                Some("codex-copy"),
+                Some("Codex Copy"),
+                Some("codex"),
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(imported.agent_id, "codex");
+        assert_eq!(imported.model, None);
+        assert_eq!(imported.effort, None);
 
         fs::remove_dir_all(&root).ok();
     }

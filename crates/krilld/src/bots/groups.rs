@@ -41,6 +41,8 @@ pub(crate) struct ActiveGroupTurn {
     pub session_id: SessionId,
     pub placeholder_message_id: String,
     pub started_at_ms: u64,
+    #[serde(default)]
+    pub turn_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -486,8 +488,20 @@ impl GroupCoordinator {
                 None => effective_audience(data.audiences.get(&group.id), &group.bot_ids),
             }
         };
+        let sender_bot_id = member_bots
+            .iter()
+            .find(|b| {
+                sender_name == b.id.as_str()
+                    || sender_name == format!("bot:{}", b.id.as_str())
+                    || sender_name == format!("bot:{}", b.slug.as_str())
+            })
+            .map(|b| b.id.clone());
         let target_ids: Vec<BotId> = match resolved_audience {
-            BotGroupReplyAudience::All => member_bots.iter().map(|b| b.id.clone()).collect(),
+            BotGroupReplyAudience::All => member_bots
+                .iter()
+                .filter(|b| sender_bot_id.as_ref() != Some(&b.id))
+                .map(|b| b.id.clone())
+                .collect(),
             BotGroupReplyAudience::Mentions => mentioned_ids.clone(),
             BotGroupReplyAudience::Bot { bot_id } => {
                 if mentioned_ids.is_empty() {
@@ -599,6 +613,7 @@ impl GroupCoordinator {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn record_turn_started(
         &self,
         group_id: &str,
@@ -607,12 +622,46 @@ impl GroupCoordinator {
         session_id: SessionId,
         now_ms: u64,
     ) -> io::Result<()> {
+        self.record_turn_started_seq(group_id, thread_id, bot, session_id, None, now_ms)
+    }
+
+    pub(crate) fn record_turn_started_seq(
+        &self,
+        group_id: &str,
+        thread_id: &str,
+        bot: &BotConfig,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        now_ms: u64,
+    ) -> io::Result<()> {
         let _io = lock(&self.io_lock);
         self.ensure_loaded_locked()?;
         let mut guard = lock(&self.state);
         let data = guard
             .as_mut()
             .ok_or_else(|| io::Error::other("missing state"))?;
+
+        let mut replaced_placeholders = Vec::new();
+        data.turns.retain(|t| {
+            let replacing =
+                t.group_id == group_id && t.thread_id == thread_id && t.bot_id == bot.id;
+            if replacing {
+                replaced_placeholders.push(t.placeholder_message_id.clone());
+            }
+            !replacing
+        });
+        if !replaced_placeholders.is_empty() {
+            data.messages.retain(|m| {
+                !(replaced_placeholders.contains(&m.message_id)
+                    && m.in_progress
+                    && m.body.trim().is_empty())
+            });
+            for msg in &mut data.messages {
+                if replaced_placeholders.contains(&msg.message_id) && msg.in_progress {
+                    msg.in_progress = false;
+                }
+            }
+        }
 
         let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
         let placeholder_id = format!("gmsg-{now_ms}-{seq}");
@@ -627,9 +676,6 @@ impl GroupCoordinator {
             created_at_ms: now_ms,
             in_progress: true,
         });
-        data.turns.retain(|t| {
-            !(t.group_id == group_id && t.thread_id == thread_id && t.bot_id == bot.id)
-        });
         data.turns.push(ActiveGroupTurn {
             group_id: group_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -637,17 +683,75 @@ impl GroupCoordinator {
             session_id,
             placeholder_message_id: placeholder_id,
             started_at_ms: now_ms,
+            turn_seq,
         });
         prune_thread_messages(&mut data.messages, group_id, thread_id);
         self.persist_locked(data)?;
         Ok(())
     }
 
+    /// Records a visible dispatch failure note in a group thread when a targeted bot could not
+    /// be started or woken (e.g., missing CLI, unknown agent, or spawn error).
+    pub(crate) fn record_dispatch_failure(
+        &self,
+        group_id: &str,
+        thread_id: &str,
+        bot: &BotConfig,
+        error: &str,
+        now_ms: u64,
+    ) -> io::Result<BotGroupMessage> {
+        let _io = lock(&self.io_lock);
+        self.ensure_loaded_locked()?;
+        let mut guard = lock(&self.state);
+        let data = guard
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing state"))?;
+
+        let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+        let msg = BotGroupMessage {
+            message_id: format!("gmsg-{now_ms}-{seq}"),
+            group_id: group_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            sender_id: bot.id.as_str().to_owned(),
+            sender_name: bot.name.clone(),
+            body: format!("[dispatch failed: {}]", error.trim()),
+            mentions: Vec::new(),
+            created_at_ms: now_ms,
+            in_progress: false,
+        };
+        data.messages.push(msg.clone());
+        if let Some(t) = data
+            .threads
+            .iter_mut()
+            .find(|t| t.group_id == group_id && t.thread_id == thread_id)
+        {
+            t.updated_at_ms = now_ms;
+        }
+        prune_thread_messages(&mut data.messages, group_id, thread_id);
+        self.persist_locked(data)?;
+        Ok(msg)
+    }
+
     /// Relays a finished bot turn's output into any matching active group chat turn.
+    #[cfg(test)]
     pub(crate) fn on_bot_turn_finished(
         &self,
         bot_id: &BotId,
         session_id: SessionId,
+        reply_text: &str,
+        now_ms: u64,
+    ) -> io::Result<Option<BotGroupMessage>> {
+        self.on_bot_turn_finished_seq(bot_id, session_id, None, reply_text, now_ms)
+    }
+
+    /// Relays a finished bot turn's output into a matching active group chat turn, enforcing
+    /// `turn_seq` correlation when both sides supply a sequence number so an earlier non-group
+    /// turn cannot hijack or leak into a later group placeholder.
+    pub(crate) fn on_bot_turn_finished_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
         reply_text: &str,
         now_ms: u64,
     ) -> io::Result<Option<BotGroupMessage>> {
@@ -658,11 +762,14 @@ impl GroupCoordinator {
             .as_mut()
             .ok_or_else(|| io::Error::other("missing state"))?;
 
-        let Some(turn_idx) = data
-            .turns
-            .iter()
-            .position(|t| &t.bot_id == bot_id && t.session_id == session_id)
-        else {
+        let Some(turn_idx) = data.turns.iter().position(|t| {
+            &t.bot_id == bot_id
+                && t.session_id == session_id
+                && match (t.turn_seq, turn_seq) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    _ => true,
+                }
+        }) else {
             return Ok(None);
         };
         let turn = data.turns.remove(turn_idx);
@@ -788,16 +895,85 @@ impl GroupCoordinator {
         }
         let mut guard = lock(&self.state);
         if let Some(data) = guard.as_mut() {
-            let before = data.turns.len();
-            data.turns.retain(|t| t.session_id != session_id);
-            if data.turns.len() != before {
+            let mut removed_placeholders = Vec::new();
+            data.turns.retain(|t| {
+                if t.session_id == session_id {
+                    removed_placeholders.push(t.placeholder_message_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if !removed_placeholders.is_empty() {
+                data.messages.retain(|m| {
+                    !(removed_placeholders.contains(&m.message_id)
+                        && m.in_progress
+                        && m.body.trim().is_empty())
+                });
                 for msg in &mut data.messages {
-                    if msg.in_progress && msg.body.trim().is_empty() {
+                    if removed_placeholders.contains(&msg.message_id) && msg.in_progress {
                         msg.in_progress = false;
                     }
                 }
+                self.persist_locked(data).ok();
+            }
+        }
+    }
+
+    /// Cleans up active turns, placeholders, audiences, and pruned 0-member groups when a bot is deleted.
+    pub(crate) fn on_bot_deleted(&self, bot_id: &BotId, removed_group_ids: &[String]) {
+        let _io = lock(&self.io_lock);
+        if self.ensure_loaded_locked().is_err() {
+            return;
+        }
+        let mut guard = lock(&self.state);
+        if let Some(data) = guard.as_mut() {
+            let mut changed = false;
+            let mut removed_placeholders = Vec::new();
+            data.turns.retain(|t| {
+                let drop_turn =
+                    &t.bot_id == bot_id || removed_group_ids.iter().any(|gid| gid == &t.group_id);
+                if drop_turn {
+                    removed_placeholders.push(t.placeholder_message_id.clone());
+                    changed = true;
+                }
+                !drop_turn
+            });
+            if !removed_placeholders.is_empty() {
+                data.messages.retain(|m| {
+                    !(removed_placeholders.contains(&m.message_id)
+                        && m.in_progress
+                        && m.body.trim().is_empty())
+                });
+                for msg in &mut data.messages {
+                    if removed_placeholders.contains(&msg.message_id) && msg.in_progress {
+                        msg.in_progress = false;
+                    }
+                }
+            }
+            if !removed_group_ids.is_empty() {
+                let prev_t = data.threads.len();
+                let prev_m = data.messages.len();
+                data.threads
+                    .retain(|t| !removed_group_ids.iter().any(|gid| gid == &t.group_id));
                 data.messages
-                    .retain(|m| !m.body.is_empty() || m.in_progress);
+                    .retain(|m| !removed_group_ids.iter().any(|gid| gid == &m.group_id));
+                for gid in removed_group_ids {
+                    if data.audiences.remove(gid).is_some() {
+                        changed = true;
+                    }
+                }
+                if data.threads.len() != prev_t || data.messages.len() != prev_m {
+                    changed = true;
+                }
+            }
+            for audience in data.audiences.values_mut() {
+                if matches!(audience, BotGroupReplyAudience::Bot { bot_id: b } if b == bot_id) {
+                    *audience = BotGroupReplyAudience::Mentions;
+                    changed = true;
+                }
+            }
+            if changed {
                 self.persist_locked(data).ok();
             }
         }
@@ -1152,6 +1328,139 @@ mod tests {
             2_300,
         )
         .unwrap();
+        assert_eq!(updated.bot_ids, vec![alice.id.clone()]);
+
+        // D-07(a): on_session_removed only cleans placeholders for that exact session_id.
+        groups
+            .record_turn_started_seq(
+                &grp3.id,
+                &plan_default.thread.thread_id,
+                &alice,
+                SessionId(201),
+                Some(1),
+                2_400,
+            )
+            .unwrap();
+        groups
+            .record_turn_started_seq(
+                &grp3.id,
+                &plan_default.thread.thread_id,
+                &bob,
+                SessionId(202),
+                Some(1),
+                2_410,
+            )
+            .unwrap();
+        groups.on_session_removed(SessionId(201));
+        let room_after_remove = groups
+            .read_group_room(
+                &store,
+                &grp3.id,
+                Some(&plan_default.thread.thread_id),
+                None,
+                Some(50),
+            )
+            .unwrap();
+        assert_eq!(room_after_remove.active_turns.len(), 1);
+        assert_eq!(room_after_remove.active_turns[0].bot_id, bob.id);
+        assert!(
+            room_after_remove
+                .messages
+                .iter()
+                .any(|m| m.sender_id == bob.id.as_str() && m.in_progress),
+            "bob's in_progress placeholder must remain untouched when alice's session is removed"
+        );
+
+        // S-01: turn_seq mismatch must NOT consume bob's active group placeholder.
+        let wrong_seq = groups
+            .on_bot_turn_finished_seq(
+                &bob.id,
+                SessionId(202),
+                Some(999),
+                "Private reply leak",
+                2_420,
+            )
+            .unwrap();
+        assert!(wrong_seq.is_none());
+        let right_seq = groups
+            .on_bot_turn_finished_seq(&bob.id, SessionId(202), Some(1), "Real group reply", 2_430)
+            .unwrap()
+            .unwrap();
+        assert_eq!(right_seq.body, "Real group reply");
+
+        // D-07(d): All reply mode excludes the sending bot itself.
+        let grp_both = store
+            .create_group(
+                "Both",
+                vec![alice.id.clone(), bob.id.clone()],
+                String::new(),
+                2_500,
+            )
+            .unwrap();
+        let self_plan = groups
+            .prepare_message_dispatch(
+                &store,
+                &grp_both.id,
+                None,
+                alice.id.as_str(),
+                "Broadcast from alice",
+                Some(BotGroupReplyMode::All),
+                2_510,
+            )
+            .unwrap();
+        assert_eq!(self_plan.target_bots.len(), 1);
+        assert_eq!(self_plan.target_bots[0].id, bob.id);
+
+        // D-07(c): replacing an active turn removes the old empty placeholder.
+        groups
+            .record_turn_started_seq(
+                &grp_both.id,
+                &self_plan.thread.thread_id,
+                &bob,
+                SessionId(301),
+                Some(1),
+                2_520,
+            )
+            .unwrap();
+        groups
+            .record_turn_started_seq(
+                &grp_both.id,
+                &self_plan.thread.thread_id,
+                &bob,
+                SessionId(301),
+                Some(2),
+                2_530,
+            )
+            .unwrap();
+        let room_replaced = groups
+            .read_group_room(
+                &store,
+                &grp_both.id,
+                Some(&self_plan.thread.thread_id),
+                None,
+                Some(50),
+            )
+            .unwrap();
+        let in_prog_count = room_replaced
+            .messages
+            .iter()
+            .filter(|m| m.in_progress)
+            .count();
+        assert_eq!(in_prog_count, 1);
+
+        // D-07(b): empty reply cleans active turn and placeholder.
+        groups
+            .on_bot_turn_finished_seq(&bob.id, SessionId(301), Some(2), "", 2_540)
+            .unwrap();
+        let view_clean = groups
+            .read_group(
+                &store,
+                &grp_both.id,
+                Some(&self_plan.thread.thread_id),
+                Some(50),
+            )
+            .unwrap();
+        assert!(!view_clean.active_run);
         groups.prune_audience_for_updated_group(&updated);
         let summaries = groups.list_group_summaries(&store).unwrap();
         let summary3 = summaries.iter().find(|s| s.group.id == grp3.id).unwrap();

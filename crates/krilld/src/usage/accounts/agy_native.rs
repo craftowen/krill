@@ -9,11 +9,16 @@
 //! - 예전 Krill은 활성 Codex 토큰을 `~/.codex/auth.json`에 복사했다. 그때 기본 경로에서 갱신된 토큰은
 //!   같은 신원의 프로필로 한 번만 옮긴다(Orca `legacy-shared-auth-migration`).
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
+use std::io::Read as _;
+#[cfg(any(target_os = "macos", test))]
 use std::io::Write as _;
 use std::path::Path;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+#[cfg(any(target_os = "macos", test))]
+use std::time::{Duration, Instant};
 
 use krill_proto::usage::ProviderKind;
 use zeroize::Zeroizing;
@@ -21,6 +26,12 @@ use zeroize::Zeroizing;
 use super::{AccountsFile, StoredAccount, identity_from_credentials, write_atomic_0600};
 
 const MAX_TOKEN_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `agy` 호스트 토큰 파일(`~/.gemini/antigravity-cli/antigravity-oauth-token`) 및
+/// macOS 키체인 읽기·교체·삭제를 직렬화하는 전용 잠금. `SAVE_LOCK` 밖에서 잡는다.
+static SYNC_LOCK: Mutex<()> = Mutex::new(());
 
 fn active_dir_for(file: &AccountsFile, provider: ProviderKind) -> Option<&Path> {
     file.active
@@ -36,12 +47,31 @@ fn active_dir_for(file: &AccountsFile, provider: ProviderKind) -> Option<&Path> 
 }
 
 /// `accounts.toml` 저장 시 활성 agy 계정의 자격증명을 호스트 기본 경로에 반영한다.
+#[cfg(test)]
 pub(crate) fn sync_active(home: &Path, file: &AccountsFile) {
     sync_account(
         home,
         &file.accounts,
         active_dir_for(file, ProviderKind::Antigravity),
     );
+}
+
+/// `SAVE_LOCK` 해제 뒤 최신 `accounts.toml`을 다시 읽어 활성 agy 계정을 호스트에 반영한다.
+/// 동시 저장 경쟁이 있어도 직렬화 락 안에서 최신 디스크 상태를 읽어 역전 덮어쓰기를 막는다.
+pub(crate) fn sync_active_from_disk(home: &Path, state_dir: Option<&Path>) {
+    if home.as_os_str().is_empty() {
+        return;
+    }
+    let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    crate::usage::direct::agy::run_account_op(|| {
+        let _sync_guard = crate::session::lock(&SYNC_LOCK);
+        let file = super::load_file(home, state_dir);
+        let target_dir = active_dir_for(&file, ProviderKind::Antigravity);
+        if target_dir.is_some_and(|dir| is_host_target(home, &host_token_path, dir)) {
+            return;
+        }
+        sync_account_gated(home, &host_token_path, &file.accounts, target_dir);
+    });
 }
 
 /// 명시된 Antigravity 계정 프로필 폴더(`dir`)의 자격증명을 호스트 `~/.gemini`로 활성화한다.
@@ -61,8 +91,18 @@ pub(crate) fn sync_provider_account_dir(
     }
     match provider {
         ProviderKind::Antigravity => {
-            let file = super::load_file(home, state_dir);
-            sync_account(home, &file.accounts, Some(dir));
+            if home.as_os_str().is_empty() {
+                return;
+            }
+            let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            if is_host_target(home, &host_token_path, dir) {
+                return;
+            }
+            crate::usage::direct::agy::run_account_op(|| {
+                let _sync_guard = crate::session::lock(&SYNC_LOCK);
+                let file = super::load_file(home, state_dir);
+                sync_account_gated(home, &host_token_path, &file.accounts, Some(dir));
+            });
         }
         ProviderKind::Claude
         | ProviderKind::Codex
@@ -71,9 +111,26 @@ pub(crate) fn sync_provider_account_dir(
     }
 }
 
-/// 호스트 기본 경로(및 macOS 키체인)에서 갱신된 agy 토큰을 동일 신원의 프로필 슬롯으로 되돌린다.
-pub(crate) fn reconcile_host_to_profiles(home: &Path, accounts: &[StoredAccount]) {
-    sync_account(home, accounts, None);
+/// 호스트 기본 경로(및 macOS 키체인)에서 갱신된 agy 토큰을 동일 신원의 프로필 슬롯으로 되돌린 뒤,
+/// 같은 직렬화 락 안에서 후속 검사(`after`)를 실행한다.
+pub(crate) fn reconcile_host_to_profiles_then<T>(
+    home: &Path,
+    accounts: &[StoredAccount],
+    after: impl FnOnce() -> T,
+) -> T {
+    if home.as_os_str().is_empty() {
+        return after();
+    }
+    let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    crate::usage::direct::agy::run_account_op(|| {
+        let _sync_guard = crate::session::lock(&SYNC_LOCK);
+        sync_account_gated(home, &host_token_path, accounts, None);
+        after()
+    })
+}
+
+fn is_host_target(home: &Path, host_token_path: &Path, dir: &Path) -> bool {
+    dir == home || dir.join(".gemini/antigravity-cli/antigravity-oauth-token") == host_token_path
 }
 
 const CODEX_MIGRATION_MARKER: &str = "codex-host-auth-migrated-v1";
@@ -154,18 +211,17 @@ fn preserve_codex_host(home: &Path, accounts: &[StoredAccount]) {
     }
 }
 
+#[cfg(test)]
 fn sync_account(home: &Path, accounts: &[StoredAccount], target_dir: Option<&Path>) {
     if home.as_os_str().is_empty() {
         return;
     }
     let host_token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
-    if target_dir.is_some_and(|dir| {
-        dir == home
-            || dir.join(".gemini/antigravity-cli/antigravity-oauth-token") == host_token_path
-    }) {
+    if target_dir.is_some_and(|dir| is_host_target(home, &host_token_path, dir)) {
         return;
     }
     crate::usage::direct::agy::run_account_op(|| {
+        let _sync_guard = crate::session::lock(&SYNC_LOCK);
         sync_account_gated(home, &host_token_path, accounts, target_dir);
     });
 }
@@ -250,21 +306,30 @@ fn sync_account_gated(
     }
 
     // 2. 선택된 프로필의 토큰을 호스트 파일 및 macOS 키체인에 반영한다.
+    //    대상 프로필이 미로그인 상태면 이전 계정의 호스트 토큰·키체인을 정리해 오실행을 막는다.
     let Some(target) = target_dir.filter(|d| !d.as_os_str().is_empty()) else {
         return;
     };
     let target_token_path = target.join(".gemini/antigravity-cli/antigravity-oauth-token");
-    let Some(target_raw) = read_token_file(&target_token_path) else {
-        return;
-    };
     let mut host_changed = false;
-    if current_file.as_ref() != Some(&target_raw) {
-        write_atomic_0600(host_token_path, &target_raw).ok();
-        host_changed = true;
-    }
-    if real_keychain && current_keychain.as_ref() != Some(&target_raw) {
-        write_keychain(&target_raw);
-        host_changed = true;
+    if let Some(target_raw) = read_token_file(&target_token_path) {
+        if current_file.as_ref() != Some(&target_raw) {
+            write_atomic_0600(host_token_path, &target_raw).ok();
+            host_changed = true;
+        }
+        if real_keychain && current_keychain.as_ref() != Some(&target_raw) {
+            write_keychain(&target_raw);
+            host_changed = true;
+        }
+    } else {
+        if std::fs::symlink_metadata(host_token_path).is_ok()
+            && std::fs::remove_file(host_token_path).is_ok()
+        {
+            host_changed = true;
+        }
+        if real_keychain && current_keychain.is_some() && delete_keychain() {
+            host_changed = true;
+        }
     }
     if host_changed {
         let host_dir = super::host_default_dir(home, ProviderKind::Antigravity);
@@ -458,6 +523,86 @@ fn valid_token(raw: &[u8]) -> bool {
         && serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|v| v.is_object())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn run_command_with_timeout(
+    cmd: &mut Command,
+    stdin_bytes: Option<&[u8]>,
+    capture_stdout: bool,
+    max_stdout: u64,
+    timeout: Duration,
+) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    cmd.stdin(if stdin_bytes.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(if capture_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let reader = if capture_stdout {
+        let stdout = child.stdout.take()?;
+        let handle = std::thread::Builder::new()
+            .name("agy-keychain-read".into())
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let limit = max_stdout.saturating_add(1);
+                stdout.take(limit).read_to_end(&mut buf).ok()?;
+                (u64::try_from(buf.len()).ok()? <= max_stdout).then_some(buf)
+            })
+            .ok();
+        let Some(handle) = handle else {
+            child.kill().ok();
+            child.wait().ok();
+            return None;
+        };
+        Some(handle)
+    } else {
+        None
+    };
+    if let Some(bytes) = stdin_bytes {
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(bytes).is_ok());
+        if !wrote {
+            child.kill().ok();
+            child.wait().ok();
+            if let Some(handle) = reader {
+                drop(handle.join());
+            }
+            return None;
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+        }
+    };
+    let stdout = match reader {
+        Some(handle) => handle.join().ok().flatten(),
+        None => Some(Vec::new()),
+    };
+    let status = status?;
+    let stdout = stdout?;
+    Some((status, stdout))
+}
+
 #[cfg(target_os = "macos")]
 fn read_keychain() -> Option<Zeroizing<Vec<u8>>> {
     let mut cmd = Command::new("/usr/bin/security");
@@ -468,15 +613,13 @@ fn read_keychain() -> Option<Zeroizing<Vec<u8>>> {
         "-a",
         "antigravity",
         "-w",
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
-    let output = cmd.output().ok()?;
-    if !output.status.success() || u64::try_from(output.stdout.len()).ok()? > MAX_TOKEN_BYTES {
+    ]);
+    let (status, stdout) =
+        run_command_with_timeout(&mut cmd, None, true, MAX_TOKEN_BYTES, KEYCHAIN_TIMEOUT)?;
+    if !status.success() || u64::try_from(stdout.len()).ok()? > MAX_TOKEN_BYTES {
         return None;
     }
-    let text = std::str::from_utf8(&output.stdout).ok()?.trim();
+    let text = std::str::from_utf8(&stdout).ok()?.trim();
     let decoded = if let Some(b64) = text.strip_prefix("go-keyring-base64:") {
         Zeroizing::new(base64_decode(b64)?)
     } else if let Some(hex) = text.strip_prefix("go-keyring-encoded:") {
@@ -510,27 +653,32 @@ fn write_keychain(raw: &[u8]) -> bool {
         return false;
     }
     let mut cmd = Command::new("/usr/bin/security");
-    cmd.arg("-i")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(mut child) = cmd.spawn() else {
-        return false;
-    };
-    let wrote = child
-        .stdin
-        .take()
-        .is_some_and(|mut stdin| stdin.write_all(line.as_bytes()).is_ok());
-    if !wrote {
-        child.kill().ok();
-        child.wait().ok();
-        return false;
-    }
-    child.wait().is_ok_and(|s| s.success())
+    cmd.arg("-i");
+    run_command_with_timeout(&mut cmd, Some(line.as_bytes()), false, 0, KEYCHAIN_TIMEOUT)
+        .is_some_and(|(status, _)| status.success())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn write_keychain(_raw: &[u8]) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn delete_keychain() -> bool {
+    let mut cmd = Command::new("/usr/bin/security");
+    cmd.args([
+        "delete-generic-password",
+        "-s",
+        "gemini",
+        "-a",
+        "antigravity",
+    ]);
+    run_command_with_timeout(&mut cmd, None, false, 0, KEYCHAIN_TIMEOUT)
+        .is_some_and(|(status, _)| status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_keychain() -> bool {
     false
 }
 
@@ -840,5 +988,78 @@ mod tests {
         assert_eq!(read(&prof.join("auth.json")), newer.as_bytes());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn switching_to_unauthenticated_agy_profile_clears_host_token_and_preserves_previous() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-agy-native-unauth-clear-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        let prof1 = root.join("prof1");
+        let prof2 = root.join("prof2");
+        for dir in [&home, &prof1, &prof2] {
+            std::fs::create_dir_all(dir.join(".gemini/antigravity-cli")).unwrap();
+        }
+        std::fs::create_dir_all(&state).unwrap();
+        let tok1_old = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-old"}}"#;
+        let tok1_refreshed = br#"{"auth_method":"consumer","id_token_email":"one@example.test","token":{"access_token":"tok1-refreshed"}}"#;
+        std::fs::write(
+            prof1.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            tok1_old,
+        )
+        .unwrap();
+        let host_tok = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::write(&host_tok, tok1_refreshed).unwrap();
+
+        let mut file = AccountsFile {
+            accounts: vec![
+                StoredAccount {
+                    id: "agy-1".into(),
+                    provider: "agy".into(),
+                    label: "One".into(),
+                    email: Some("one@example.test".into()),
+                    profile_dir: prof1.display().to_string(),
+                },
+                StoredAccount {
+                    id: "agy-2".into(),
+                    provider: "agy".into(),
+                    label: "Two".into(),
+                    email: None,
+                    profile_dir: prof2.display().to_string(),
+                },
+            ],
+            ..AccountsFile::default()
+        };
+        file.active.insert("agy".into(), "agy-2".into());
+        super::super::save_file(&home, Some(&state), &file).unwrap();
+
+        assert_eq!(
+            std::fs::read(prof1.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+            tok1_refreshed,
+            "previous account's refreshed host token must be backed up before clearing"
+        );
+        assert!(
+            !host_tok.exists(),
+            "switching to an unauthenticated agy profile must clear the previous host token"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn keychain_command_timeout_kills_hanging_process() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let out = run_command_with_timeout(&mut cmd, None, true, 1024, Duration::from_millis(80));
+        assert!(out.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hanging helper must be killed promptly on timeout"
+        );
     }
 }

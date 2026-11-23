@@ -744,34 +744,151 @@ fn reuse_live_session_delivers_prompt_and_reaps_all_runs_after_exit() {
 }
 
 #[test]
-fn agent_extra_args_keep_prompt_out_of_argv_and_resolve_profile_executable() {
+fn agent_extra_args_stay_on_agent_pipeline_and_keep_prompt_out_of_argv() {
     let resolved = (
         "cursor".into(),
         krill_proto::agent::Profile {
             name: "Cursor".into(),
             launch: vec!["cursor-agent".into(), "--interactive".into()],
-            yolo_args: Vec::new(),
+            yolo_args: vec!["--yolo".into()],
             install: String::new(),
             install_windows: String::new(),
             env: std::collections::BTreeMap::default(),
         },
     );
-    let program = schedule_program(
+    let target = schedule_target(
         "cursor",
         vec!["--model".into(), "two words".into()],
         "literal prompt",
         true,
         Some(&resolved),
     );
-    assert!(
-        matches!(program, Program::Custom { program, args } if program == b"cursor-agent" && args == [b"--interactive".to_vec(), b"--model".to_vec(), b"two words".to_vec()])
+    match target {
+        ScheduleTarget::Agent { canonical, profile } => {
+            assert_eq!(canonical, "cursor");
+            assert_eq!(
+                profile.launch,
+                vec!["cursor-agent", "--interactive", "--model", "two words"]
+            );
+            assert_eq!(profile.yolo_args, vec!["--yolo"]);
+        }
+        ScheduleTarget::Custom(_) => {
+            panic!("agent schedule with extra args must not downgrade to Program::Custom")
+        }
+    }
+    assert!(matches!(
+        schedule_target("cursor", vec![], "prompt", true, Some(&resolved)),
+        ScheduleTarget::Agent { canonical, .. } if canonical == "cursor"
+    ));
+    assert!(matches!(
+        schedule_target("/bin/echo", vec!["hello".into()], "literal prompt", false, None),
+        ScheduleTarget::Custom(Program::Custom { args, .. }) if args == [b"hello".to_vec(), b"literal prompt".to_vec()]
+    ));
+}
+
+#[test]
+fn normalize_agy_schedule_args_recognizes_equals_and_separate_flags() {
+    let fold = |model: &str, effort: Option<&str>| -> Option<(String, String)> {
+        let family = model.strip_suffix("-high")?;
+        Some((family.to_owned(), effort.unwrap_or("high").to_owned()))
+    };
+
+    let mut inline_only = vec!["agy".to_owned(), "--model=gemini-4-carbon-high".to_owned()];
+    normalize_agy_schedule_args_with(&mut inline_only, fold);
+    assert_eq!(
+        inline_only,
+        vec![
+            "agy".to_owned(),
+            "--model=gemini-4-carbon".to_owned(),
+            "--effort".to_owned(),
+            "high".to_owned(),
+        ]
     );
-    assert!(
-        matches!(schedule_program("cursor", vec![], "prompt", true, Some(&resolved)), Program::Agent { id } if id == "cursor")
+
+    let mut both_inline = vec![
+        "agy".to_owned(),
+        "--model=gemini-4-carbon-high".to_owned(),
+        "--effort=low".to_owned(),
+    ];
+    normalize_agy_schedule_args_with(&mut both_inline, fold);
+    assert_eq!(
+        both_inline,
+        vec![
+            "agy".to_owned(),
+            "--model=gemini-4-carbon".to_owned(),
+            "--effort=low".to_owned(),
+        ]
     );
-    assert!(
-        matches!(schedule_program("/bin/echo", vec!["hello".into()], "literal prompt", false, None), Program::Custom { args, .. } if args == [b"hello".to_vec(), b"literal prompt".to_vec()])
+
+    let mut mixed = vec![
+        "agy".to_owned(),
+        "--model".to_owned(),
+        "gemini-4-carbon-high".to_owned(),
+        "--effort=medium".to_owned(),
+    ];
+    normalize_agy_schedule_args_with(&mut mixed, fold);
+    assert_eq!(
+        mixed,
+        vec![
+            "agy".to_owned(),
+            "--model".to_owned(),
+            "gemini-4-carbon".to_owned(),
+            "--effort=medium".to_owned(),
+        ]
     );
+}
+
+#[test]
+fn poll_schedules_does_not_hold_upgrading_lock_during_precheck() {
+    use std::sync::Arc;
+
+    let dir = Temp::new("precheck-upgrading-unlocked");
+    let started_marker = dir.0.join("precheck-started");
+    let release_marker = dir.0.join("precheck-release");
+    let precheck = format!(
+        "touch '{}' && while [ ! -f '{}' ]; do sleep 0.01; done && exit 1",
+        started_marker.display(),
+        release_marker.display()
+    );
+    let entry = krill_proto::schedule::Schedule {
+        id: "slow-precheck".into(),
+        cron: "* * * * *".into(),
+        cwd: "/tmp".into(),
+        command: vec!["/bin/echo".into()],
+        precheck: Some(precheck),
+        precheck_timeout_secs: Some(5),
+        ..Default::default()
+    };
+    Schedules {
+        schedule: vec![entry],
+    }
+    .save(&dir.0)
+    .unwrap();
+
+    let reg = Arc::new(Registry::new(None, Some(&dir.0)));
+    let reg_poll = Arc::clone(&reg);
+    let poller =
+        std::thread::spawn(move || reg_poll.poll_schedules(UNIX_EPOCH + Duration::from_mins(50)));
+
+    let wait_start = Instant::now();
+    while !started_marker.exists() {
+        assert!(wait_start.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // `self.upgrading` must be immediately acquirable while precheck is running.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reg_probe = Arc::clone(&reg);
+    let prober = std::thread::spawn(move || {
+        let _guard = lock(&reg_probe.upgrading);
+        tx.send(()).ok();
+    });
+    rx.recv_timeout(Duration::from_millis(300))
+        .expect("Registry::upgrading must not be held during schedule precheck");
+    prober.join().unwrap();
+
+    fs::write(&release_marker, b"go").unwrap();
+    poller.join().unwrap().unwrap();
 }
 
 #[test]

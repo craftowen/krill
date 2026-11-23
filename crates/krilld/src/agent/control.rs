@@ -40,6 +40,9 @@ pub(crate) struct StoredLaunch {
     /// 시스템 프롬프트로 넘긴 봇 지침. 재개 때 다시 넘긴다(대화 기록에 없어서).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_instructions: Option<String>,
+    /// 최초 실행 시각(epoch 초). 원자적 재기록으로 파일 inode가 바뀌어도 유지한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_at: Option<u64>,
 }
 
 /// 실행 당시 적용한 계정 프로필(OWE-698). 재개·휴면 깨우기는 지금 활성 계정이 아니라 이 프로필로 이어 간다.
@@ -277,9 +280,25 @@ impl Control {
             hibernation_blocked: false,
             account,
             bot_instructions: None,
+            launched_at: now_epoch_secs(),
         };
         let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
         write_atomic_0600(&self.launch_path(session)?, &bytes)
+    }
+
+    /// 기존 파일의 불변 `launched_at`을 보존하며 원자적으로 기록한다. 구버전 파일에 필드가 없으면
+    /// 교체 전에 기존 파일의 생성/수정 시각을 채워 넣어 `write_atomic_0600`에 의한 리셋을 막는다.
+    fn write_stored_preserving_launched_at(
+        &self,
+        session: SessionId,
+        stored: &mut StoredLaunch,
+    ) -> io::Result<()> {
+        let path = self.launch_path(session)?;
+        if stored.launched_at.is_none() {
+            stored.launched_at = file_launched_at(&path);
+        }
+        let bytes = serde_json::to_vec(stored).map_err(io::Error::other)?;
+        write_atomic_0600(&path, &bytes)
     }
 
     /// 이 세션이 시스템 프롬프트로 받은 봇 지침을 실행 기록에 남긴다.
@@ -289,8 +308,7 @@ impl Control {
             return Ok(());
         };
         stored.bot_instructions = Some(text.to_owned());
-        let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-        write_atomic_0600(&self.launch_path(session)?, &bytes)
+        self.write_stored_preserving_launched_at(session, &mut stored)
     }
 
     pub fn stored(&self, session: SessionId) -> io::Result<Option<StoredLaunch>> {
@@ -305,9 +323,8 @@ impl Control {
         discovered: &StoredLaunch,
     ) -> io::Result<StoredLaunch> {
         let _guard = lock(&self.config);
-        let mut stored = self
-            .read_stored(session)?
-            .unwrap_or_else(|| discovered.clone());
+        let existing = self.read_stored(session)?;
+        let mut stored = existing.clone().unwrap_or_else(|| discovered.clone());
         if stored.profile != discovered.profile
             || (stored.session_id.is_some() && stored.session_id != discovered.session_id)
         {
@@ -334,9 +351,11 @@ impl Control {
         if stored.permission == Permission::Manual && discovered.permission == Permission::Yolo {
             stored.permission = Permission::Yolo;
         }
-        if self.read_stored(session)?.as_ref() != Some(&stored) {
-            let bytes = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-            write_atomic_0600(&self.launch_path(session)?, &bytes)?;
+        if stored.launched_at.is_none() {
+            stored.launched_at = discovered.launched_at;
+        }
+        if existing.as_ref() != Some(&stored) {
+            self.write_stored_preserving_launched_at(session, &mut stored)?;
         }
         Ok(stored)
     }
@@ -513,6 +532,7 @@ impl Control {
                     hibernation_blocked: true,
                     account: None,
                     bot_instructions: None,
+                    launched_at: now_epoch_secs(),
                 };
                 if let Ok(path) = self.launch_path(session)
                     && let Ok(bytes) = serde_json::to_vec(&bound)
@@ -574,11 +594,8 @@ impl Control {
             stored.account = None;
             stored.hibernation_blocked = true;
             self.block_hibernation(session);
-            if let Ok(path) = self.launch_path(session)
-                && let Ok(bytes) = serde_json::to_vec(&stored)
-            {
-                write_atomic_0600(&path, &bytes).ok();
-            }
+            self.write_stored_preserving_launched_at(session, &mut stored)
+                .ok();
             return false;
         }
         // A matching ID alone cannot authenticate a different provider's hook, nor
@@ -647,11 +664,8 @@ impl Control {
             stored.transcript_path = None;
         }
         stored.hibernation_blocked |= next_blocked;
-        if let Ok(path) = self.launch_path(session)
-            && let Ok(bytes) = serde_json::to_vec(&stored)
-        {
-            write_atomic_0600(&path, &bytes).ok();
-        }
+        self.write_stored_preserving_launched_at(session, &mut stored)
+            .ok();
         is_subagent_or_foreign
     }
 
@@ -699,23 +713,21 @@ impl Control {
         if !changed {
             return;
         }
-        if let Ok(path) = self.launch_path(session)
-            && let Ok(bytes) = serde_json::to_vec(&stored)
-        {
-            write_atomic_0600(&path, &bytes).ok();
-        }
+        self.write_stored_preserving_launched_at(session, &mut stored)
+            .ok();
     }
 
-    /// 세션 실행 기록(`agent-launches/<id>.json`)이 생성된 시각(epoch 초).
+    /// 세션 실행 기록(`agent-launches/<id>.json`)의 최초 생성 시각(epoch 초).
+    /// JSON의 불변 `launched_at` 필드를 우선 반환하고, 구버전 파일만 파일 메타데이터로 폴백한다.
     pub fn launched_at(&self, session: SessionId) -> Option<u64> {
+        let _guard = lock(&self.config);
+        if let Ok(Some(stored)) = self.read_stored(session)
+            && let Some(launched) = stored.launched_at
+        {
+            return Some(launched);
+        }
         let path = self.launch_path(session).ok()?;
-        let meta = fs::metadata(path).ok()?;
-        meta.created()
-            .or_else(|_| meta.modified())
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
+        file_launched_at(&path)
     }
 
     /// 다른 세션(`exclude` 제외)이 이미 바인딩한 `session_id`와 `transcript_path` 집합을 반환한다.
@@ -853,6 +865,23 @@ enum HookBinding {
 
 fn unknown_roster() -> bool {
     true
+}
+
+fn now_epoch_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn file_launched_at(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    meta.created()
+        .or_else(|_| meta.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn extract_hook_session_id(p: &serde_json::Value) -> Option<&str> {

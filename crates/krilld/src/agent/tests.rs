@@ -1665,6 +1665,7 @@ fn account_for_stored_in_prefers_transcript_path_and_detects_agy_conversations_d
         hibernation_blocked: false,
         account: None,
         bot_instructions: None,
+        launched_at: None,
     };
     let resolved = super::account_for_stored_in(&home, &agy, Some(&state), &stored_in_profile)
         .expect("resolved from transcript_path");
@@ -1775,6 +1776,7 @@ fn codex_no_daemon_probe_and_zsh_wrapper_isolate_sessions() {
         hibernation_blocked: false,
         account: None,
         bot_instructions: None,
+        launched_at: None,
     };
     let resolved = super::account_for_stored_in(&home, &codex_prof, Some(&state), &stored)
         .expect("resolved symlinked codex sessions dir");
@@ -2364,5 +2366,103 @@ fn resume_passes_bot_instructions_again_and_plain_resume_is_unchanged() {
     .unwrap();
     assert_eq!(plain, argv_of(&before));
     assert!(!plain.iter().any(|a| a.contains("append-system-prompt")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resume_opencode_bot_instructions_reads_custom_config_dir_from_login_env() {
+    let dir =
+        std::env::temp_dir().join(format!("krill-opencode-resume-env-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let custom_cfg = dir.join("custom-opencode-cfg");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&custom_cfg).unwrap();
+    std::fs::write(custom_cfg.join("AGENTS.md"), "User base rules").unwrap();
+    std::fs::write(custom_cfg.join("opencode.jsonc"), r#"{"theme":"dark"}"#).unwrap();
+
+    let mut oc = profile(&["opencode"]);
+    oc.env.insert(
+        "OPENCODE_CONFIG_DIR".into(),
+        custom_cfg.display().to_string(),
+    );
+    let (launch, _, _) = resume_in_with_bot_instructions(
+        &oc,
+        Permission::Manual,
+        krill_proto::SessionId(941),
+        Some(&state),
+        Some("ses_resume_1"),
+        None,
+        Some("Bot resume instructions"),
+    )
+    .unwrap();
+
+    let resumed_cfg = launch
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"OPENCODE_CONFIG_DIR")
+        .map(|(_, v)| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
+        .expect("OPENCODE_CONFIG_DIR set on resume");
+    assert_ne!(resumed_cfg, custom_cfg);
+    let agents_md = std::fs::read_to_string(resumed_cfg.join("AGENTS.md")).unwrap();
+    assert!(agents_md.contains("User base rules"), "{agents_md}");
+    assert!(agents_md.contains("Bot resume instructions"), "{agents_md}");
+    assert!(
+        resumed_cfg.join("opencode.jsonc").exists(),
+        "sibling config files from custom OPENCODE_CONFIG_DIR must be linked"
+    );
+    claude::discard(&state, krill_proto::SessionId(941));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn launch_selected_in_with_bot_mcp_cleans_up_claude_files_on_intermediate_failure() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-claude-launch-cleanup-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let claude_exe = dir.join("claude");
+    std::fs::write(&claude_exe, "#!/bin/sh\nprintf '2.1.299\\n'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&claude_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // A conflicting `--settings` flag causes `settings.launch(...)` to fail after `Settings::create`
+    // and `add_directories` have already written the settings file.
+    let bad_claude = profile(&[
+        claude_exe.to_str().unwrap(),
+        "--settings",
+        "/tmp/other.json",
+    ]);
+    let session = krill_proto::SessionId(942);
+    let bot_mcp = BotMcpLaunchConfig {
+        bot_home: Some(dir.join("bot-home")),
+        instructions: Some("bot instructions".into()),
+        ..BotMcpLaunchConfig::default()
+    };
+    let err = launch_selected_in_with_bot_mcp(
+        &bad_claude,
+        Permission::Manual,
+        session,
+        Some(&state),
+        None,
+        Some(&dir),
+        Some(&bot_mcp),
+    );
+    assert!(err.is_err());
+    let leftovers: Vec<_> = std::fs::read_dir(state.join("claude-settings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed launch must not leak claude settings/mcp/instruction files: {leftovers:?}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

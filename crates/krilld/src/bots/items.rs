@@ -28,6 +28,32 @@ const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
 static ITEM_UID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Status or virtual bucket filter for paginated bot item queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotItemsStatusFilter {
+    Status(BotItemStatus),
+    Closed,
+    Snoozed,
+}
+
+impl BotItemsStatusFilter {
+    /// Parses a mobile/CLI status filter token (`needs_you`, `working`, `planned`, `done`,
+    /// `canceled`/`cancelled`, `closed`, `snoozed`).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "planned" => Some(Self::Status(BotItemStatus::Planned)),
+            "working" => Some(Self::Status(BotItemStatus::Working)),
+            "needs_you" => Some(Self::Status(BotItemStatus::NeedsYou)),
+            "done" => Some(Self::Status(BotItemStatus::Done)),
+            "canceled" | "cancelled" => Some(Self::Status(BotItemStatus::Canceled)),
+            "closed" => Some(Self::Closed),
+            "snoozed" => Some(Self::Snoozed),
+            _ => None,
+        }
+    }
+}
+
 /// Result of [`BotItemsStore::answer_item`] indicating whether a bot session should wake up.
 #[derive(Debug, Clone)]
 pub struct AnswerItemOutcome {
@@ -126,6 +152,29 @@ impl BotItemsStore {
         cursor: Option<&str>,
         now_ms: u64,
     ) -> io::Result<BotItemsPage> {
+        self.list_items_page_filtered(
+            bot_id,
+            None,
+            include_closed,
+            include_snoozed,
+            limit,
+            cursor,
+            now_ms,
+        )
+    }
+
+    /// Paginated item list with optional status/bucket filter (`needs_you`, `closed`, `snoozed`, etc.).
+    #[expect(clippy::too_many_arguments, reason = "paginated filtered item query")]
+    pub fn list_items_page_filtered(
+        &self,
+        bot_id: Option<&BotId>,
+        status_filter: Option<BotItemsStatusFilter>,
+        include_closed: bool,
+        include_snoozed: bool,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+        now_ms: u64,
+    ) -> io::Result<BotItemsPage> {
         if !self.db_path.exists() && !self.is_open() {
             return Ok(BotItemsPage::default());
         }
@@ -145,12 +194,37 @@ impl BotItemsStore {
                 where_clause.push_str(" AND owner_bot_id = ?");
                 base_bind.push(rusqlite::types::Value::Text(bid.as_str().to_owned()));
             }
-            if !include_closed {
-                where_clause.push_str(" AND status NOT IN ('done', 'canceled')");
-            }
-            if !include_snoozed {
-                where_clause.push_str(" AND (snoozed_until_ms IS NULL OR snoozed_until_ms <= ?)");
-                base_bind.push(rusqlite::types::Value::Integer(u64_to_i64(now_ms)));
+            match status_filter {
+                Some(BotItemsStatusFilter::Status(st)) => {
+                    where_clause.push_str(" AND status = ?");
+                    base_bind.push(rusqlite::types::Value::Text(st.as_str().to_owned()));
+                    if st.is_open() && !include_snoozed {
+                        where_clause
+                            .push_str(" AND (snoozed_until_ms IS NULL OR snoozed_until_ms <= ?)");
+                        base_bind.push(rusqlite::types::Value::Integer(u64_to_i64(now_ms)));
+                    }
+                }
+                Some(BotItemsStatusFilter::Closed) => {
+                    where_clause.push_str(" AND status IN ('done', 'canceled')");
+                }
+                Some(BotItemsStatusFilter::Snoozed) => {
+                    if !include_closed {
+                        where_clause.push_str(" AND status NOT IN ('done', 'canceled')");
+                    }
+                    where_clause
+                        .push_str(" AND snoozed_until_ms IS NOT NULL AND snoozed_until_ms > ?");
+                    base_bind.push(rusqlite::types::Value::Integer(u64_to_i64(now_ms)));
+                }
+                None => {
+                    if !include_closed {
+                        where_clause.push_str(" AND status NOT IN ('done', 'canceled')");
+                    }
+                    if !include_snoozed {
+                        where_clause
+                            .push_str(" AND (snoozed_until_ms IS NULL OR snoozed_until_ms <= ?)");
+                        base_bind.push(rusqlite::types::Value::Integer(u64_to_i64(now_ms)));
+                    }
+                }
             }
 
             let count_sql = format!("SELECT COUNT(*) FROM items{where_clause}");
@@ -668,8 +742,15 @@ impl BotItemsStore {
                 )?;
                 tx.execute(
                     "UPDATE items SET snoozed_until_ms = NULL, version = version + 1, \
-                     last_activity_at_ms = ?1, updated_at_ms = ?1 WHERE uid = ?2",
-                    params![u64_to_i64(now_ms), uid],
+                     last_activity_at_ms = ?1, updated_at_ms = ?1, \
+                     others_last_event_id = CASE WHEN ?3 THEN ?2 ELSE others_last_event_id END \
+                     WHERE uid = ?4",
+                    params![
+                        u64_to_i64(now_ms),
+                        event_row_id,
+                        !matches!(actor, BotItemActor::Bot { .. }),
+                        uid
+                    ],
                 )
                 .map_err(sql_err)?;
             } else {
@@ -933,6 +1014,9 @@ impl BotItemsStore {
 
     /// The newest item event the owner has seen for `bot_id` (0 before the first open).
     pub fn items_seen_event_id(&self, bot_id: &BotId) -> io::Result<u64> {
+        if !self.db_path.exists() && !self.is_open() {
+            return Ok(0);
+        }
         self.with_conn(|conn| {
             let id: Option<i64> = conn
                 .query_row(
@@ -997,17 +1081,26 @@ impl BotItemsStore {
         })
     }
 
-    /// Deletes all items (and cascaded links/events) owned by `bot_id`.
+    /// Deletes all items (and cascaded links/events) plus `items_seen` rows owned by `bot_id`.
     pub fn delete_bot_items(&self, bot_id: &BotId) -> io::Result<usize> {
         if !self.db_path.exists() && !self.is_open() {
             return Ok(0);
         }
         self.with_conn(|conn| {
-            conn.execute(
-                "DELETE FROM items WHERE owner_bot_id = ?1",
+            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM items WHERE owner_bot_id = ?1",
+                    params![bot_id.as_str()],
+                )
+                .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM items_seen WHERE bot_id = ?1",
                 params![bot_id.as_str()],
             )
-            .map_err(sql_err)
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(deleted)
         })
     }
 
@@ -1936,6 +2029,100 @@ mod tests {
             .list_items_page(Some(&bot_a), true, true, Some(10), None, 4_200)
             .unwrap();
         assert_eq!(after_seen.unseen_count, 0);
+
+        // D-32: auto-unsnooze on owner comment updates others_last_event_id, and delete_bot_items
+        // removes items_seen rows too.
+        let snoozed = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_a.clone(),
+                    title: "Snoozed item".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Working),
+                    links: Vec::new(),
+                },
+                &owner,
+                5_000,
+            )
+            .unwrap();
+        store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: snoozed.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: None,
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Set(999_999),
+                },
+                &owner,
+                5_100,
+            )
+            .unwrap();
+        let unsnoozed = store
+            .add_comment(&snoozed.uid, &owner, "Wake up now", &[], 5_200)
+            .unwrap();
+        assert!(unsnoozed.snoozed_until_ms.is_none());
+        let others_event_id: Option<i64> = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT others_last_event_id FROM items WHERE uid = ?1",
+                    params![snoozed.uid],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)
+            })
+            .unwrap();
+        assert!(
+            others_event_id.is_some(),
+            "auto_unsnooze comment must update others_last_event_id"
+        );
+
+        // M-07: filtered pagination by status (needs_you / closed / snoozed).
+        let needs_you_item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_a.clone(),
+                    title: "Approve release".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &owner,
+                5_300,
+            )
+            .unwrap();
+        let ny_page = store
+            .list_items_page_filtered(
+                Some(&bot_a),
+                Some(BotItemsStatusFilter::Status(BotItemStatus::NeedsYou)),
+                false,
+                false,
+                Some(10),
+                None,
+                5_400,
+            )
+            .unwrap();
+        assert_eq!(ny_page.total_count, 1);
+        assert_eq!(ny_page.items.len(), 1);
+        assert_eq!(ny_page.items[0].uid, needs_you_item.uid);
+
+        // delete_bot_items also cleans items_seen.
+        assert!(store.items_seen_event_id(&bot_a).unwrap() > 0);
+        store.delete_bot_items(&bot_a).unwrap();
+        assert_eq!(store.items_seen_event_id(&bot_a).unwrap(), 0);
+
+        // D-32a: items_seen_event_id on a fresh path must NOT create the SQLite file.
+        let untouched_db = dir.join("never-opened.db");
+        let lazy_store = BotItemsStore::new(untouched_db.clone());
+        assert_eq!(lazy_store.items_seen_event_id(&bot_a).unwrap(), 0);
+        assert!(!untouched_db.exists());
+        assert!(!lazy_store.is_open());
 
         fs::remove_dir_all(&dir).ok();
     }

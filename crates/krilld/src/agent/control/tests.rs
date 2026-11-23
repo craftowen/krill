@@ -79,6 +79,7 @@ fn switch_identity_merge_keeps_late_hook_and_source_account_across_restart() {
             dir: "/source".into(),
         }),
         bot_instructions: None,
+        launched_at: None,
     };
     let first = c.bind_switch_identity(session, &discovered).unwrap();
     assert_eq!(first, discovered);
@@ -955,5 +956,106 @@ fn foreground_rotation_preserves_account_and_unexpected_resume_cannot_confirm_ha
         None
     ));
     assert!(control.account_resume_observed(session, "rotated"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launched_at_stays_immutable_across_all_atomic_rewrites_and_backfills_legacy_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-launched-at-immutable-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    let session = SessionId(77);
+    control
+        .remember_session(
+            session,
+            &AgentLaunch {
+                profile: "claude".into(),
+                permission: Permission::Manual,
+            },
+            None,
+            b"/work".to_vec(),
+            None,
+        )
+        .unwrap();
+    let initial = control.launched_at(session).expect("initial launched_at");
+    assert_eq!(
+        control.stored(session).unwrap().unwrap().launched_at,
+        Some(initial)
+    );
+
+    // Backdate JSON `launched_at` by 200 seconds so any reset to NOW is immediately detectable.
+    let backdated = initial.saturating_sub(200);
+    let path = dir.join("agent-launches/77.json");
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    raw["launched_at"] = serde_json::json!(backdated);
+    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(control.launched_at(session), Some(backdated));
+
+    // 1. remember_bot_instructions rewrite preserves launched_at
+    control
+        .remember_bot_instructions(session, "bot system prompt")
+        .unwrap();
+    assert_eq!(control.launched_at(session), Some(backdated));
+
+    // 2. record_hook_identity (hibernation_blocked / subagent update) preserves launched_at
+    control.record_hook_session(
+        session,
+        br#"{"hook_event_name":"PreToolUse","tool_name":"Task"}"#,
+    );
+    assert_eq!(control.launched_at(session), Some(backdated));
+
+    // 3. bind_discovered_session preserves launched_at
+    control.bind_discovered_session(
+        session,
+        "conv-immutable-1",
+        Some(Path::new("/tmp/conv-immutable-1.jsonl")),
+    );
+    assert_eq!(control.launched_at(session), Some(backdated));
+
+    // 4. bind_switch_identity preserves launched_at
+    let discovered = StoredLaunch {
+        profile: "claude".into(),
+        permission: Permission::Yolo,
+        session_id: Some("conv-immutable-1".into()),
+        transcript_path: Some("/tmp/conv-immutable-1.jsonl".into()),
+        cwd: b"/work".to_vec(),
+        hibernation_blocked: true,
+        account: None,
+        bot_instructions: None,
+        launched_at: Some(initial + 999),
+    };
+    let merged = control.bind_switch_identity(session, &discovered).unwrap();
+    assert_eq!(merged.launched_at, Some(backdated));
+    assert_eq!(control.launched_at(session), Some(backdated));
+
+    // 5. Foreground rebind also preserves launched_at
+    let rebind_payload = br#"{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-rebound","transcript_path":"/tmp/rebound.jsonl","cwd":"/work"}"#;
+    assert!(!control.record_foreground_hook_session(session, rebind_payload, "codex", None));
+    assert_eq!(control.launched_at(session), Some(backdated));
+
+    // 6. Legacy JSON file without `launched_at` falls back to file metadata and backfills on rewrite
+    let legacy_session = SessionId(78);
+    let legacy_path = dir.join("agent-launches/78.json");
+    fs::write(
+        &legacy_path,
+        br#"{"profile":"claude","permission":"manual","cwd":[]}"#,
+    )
+    .unwrap();
+    let legacy_meta_ts = control
+        .launched_at(legacy_session)
+        .expect("legacy fallback");
+    control
+        .remember_bot_instructions(legacy_session, "legacy rewrite")
+        .unwrap();
+    assert_eq!(
+        control.stored(legacy_session).unwrap().unwrap().launched_at,
+        Some(legacy_meta_ts)
+    );
+    assert_eq!(control.launched_at(legacy_session), Some(legacy_meta_ts));
+
     fs::remove_dir_all(dir).unwrap();
 }
