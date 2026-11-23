@@ -265,12 +265,14 @@ impl Shell {
                                     .gap_1p5()
                                     .child(name)
                                     .when_some(age, |d, age| {
+                                        let age_sel = format!("bot-group-row-age-{gid}");
                                         d.child(
                                             div()
+                                                .debug_selector(move || age_sel.clone())
                                                 .ml_auto()
                                                 .flex_none()
-                                                .text_size(ui::TEXT_SM)
-                                                .line_height(px(16.))
+                                                .text_size(ui::TEXT_2XS)
+                                                .line_height(gpui::relative(1.))
                                                 .text_color(p.muted_foreground)
                                                 .child(age),
                                         )

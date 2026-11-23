@@ -10,7 +10,7 @@ use gpui::{
     AnyElement, Context, ListAlignment, ListState, SharedString, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemStatus, BotRpcRequest, BotRpcResponse};
 
 use super::home::{
@@ -28,6 +28,7 @@ const GROUP_ROWS: usize = 5;
 #[derive(Debug, Clone)]
 enum GroupListRow {
     FilterChips,
+    AllClear,
     BucketHeader {
         bucket: Group,
         first_bucket: bool,
@@ -58,6 +59,7 @@ struct GroupCacheKey {
     items_len: usize,
     bots_sig: Vec<(BotId, String)>,
     member_ids: Vec<BotId>,
+    all_members_paused: bool,
     thread_ids: Vec<String>,
     filter: GroupItemsFilter,
     folds: Vec<&'static str>,
@@ -434,12 +436,14 @@ impl View {
             .filter(|s| self.group_panel.member_ids.contains(&s.bot_id) && s.live && s.working)
             .map(|s| s.session_id)
             .collect();
+        let all_members_paused = !active_bots.is_empty() && active_bots.iter().all(|b| b.paused);
         let next_key = GroupCacheKey {
             group_id: self.group_panel.group_id.clone(),
             items_rev: self.items.items_rev,
             items_len: self.items.items.len(),
             bots_sig,
             member_ids: self.group_panel.member_ids.clone(),
+            all_members_paused,
             thread_ids: self.group_panel.thread_ids.clone(),
             filter: filter.clone(),
             folds: self.items.folds.iter().copied().collect(),
@@ -533,6 +537,18 @@ impl View {
         if has_chips {
             rows.push(GroupListRow::FilterChips);
             row_keys.push(RowAnchor::FilterChip);
+        }
+        // Orca `eefd93a3` / `#46740`: show the greyed group faces above folded buckets when
+        // nothing needs attention, nothing is running, and at least one member bot isn't paused.
+        let all_clear = shown_count > 0
+            && !filter.has_non_default_filters()
+            && !all_members_paused
+            && group_needs.is_empty()
+            && grouped_indices[Group::NeedsYou as usize].is_empty()
+            && grouped_indices[Group::Working as usize].is_empty();
+        if all_clear {
+            rows.push(GroupListRow::AllClear);
+            row_keys.push(RowAnchor::AllClear);
         }
         let mut first_bucket = true;
         for bucket in Group::ALL {
@@ -634,6 +650,46 @@ impl View {
                     .gap_1()
                     .px_2()
                     .children(chips)
+                    .into_any_element()
+            }
+            GroupListRow::AllClear => {
+                let dark = cx.theme().mode.is_dark();
+                let members: Vec<(&BotConfig, Option<std::sync::Arc<gpui::Image>>)> = self
+                    .group_panel
+                    .member_ids
+                    .iter()
+                    .filter_map(|bid| {
+                        self.bots
+                            .iter()
+                            .find(|b| &b.id == bid)
+                            .map(|bot| (bot, self.settings.avatar_cache.get(&bot.id).cloned()))
+                    })
+                    .collect();
+                let faces = super::group_faces::render_group_config_faces_grayscale(
+                    &members, 40., p.sidebar, dark, p,
+                );
+                div()
+                    .id("bot-group-all-clear")
+                    .debug_selector(|| "bot-group-all-clear".into())
+                    .role(gpui::Role::Status)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_3()
+                    .text_center()
+                    .child(
+                        div()
+                            .debug_selector(|| "bot-group-all-clear-avatar".into())
+                            .child(faces),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .child(text::HM_ALL_CLEAR.get()),
+                    )
                     .into_any_element()
             }
             GroupListRow::BucketHeader {

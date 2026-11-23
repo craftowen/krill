@@ -471,6 +471,19 @@ pub fn unread_dot() -> gpui::Div {
     div().size(STATE_DOT).rounded_full().bg(AGENT_UNREAD)
 }
 
+/// Projects 및 접힌 Bots 아바타에 쓰는 파란 안 읽음 점 (Orca `#47122` `unreadAlertDotClassName`:
+/// `size-[6px] rounded-full bg-unread ring-2 ring-worktree-sidebar`).
+/// GPUI는 `border_2()`가 박스 안쪽에 그려지므로 10px 박스에 2px 링을 둘러 6px 점을 만든다.
+pub fn unread_alert_dot(ring_bg: Hsla, cx: &App) -> gpui::Div {
+    div()
+        .size(px(10.))
+        .flex_none()
+        .rounded_full()
+        .border_2()
+        .border_color(ring_bg)
+        .bg(palette(cx).unread)
+}
+
 /// OWE-707: 계정 라벨 축약(배지용, 최대 2자).
 /// - 두 단어 이상이면 각 첫 글자 2개(예: "Work Max" → "WM", "claude-host" → "CH").
 /// - 한 단어면 앞 2자(예: "작업용" → "작업", "Host" → "Ho").

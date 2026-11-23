@@ -834,3 +834,111 @@ fn collapsed_bot_preview_stays_next_to_bots_label(cx: &mut TestAppContext) {
         preview.size.width
     );
 }
+
+#[gpui::test]
+fn bot_sidebar_times_match_projects_size_and_folded_avatars_show_blue_unread_dot(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::bots::{
+        BotGroupChat, BotGroupMessage, BotGroupReplyAudience, BotGroupSummary,
+    };
+
+    let (view, cx) = setup(cx, "bot-sidebar-time-and-unread-dot");
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let activity_ms = now_ms.saturating_sub(60_000);
+    let group_summary = BotGroupSummary {
+        group: BotGroupChat {
+            id: "grp-time".into(),
+            name: "Ops Team".into(),
+            bot_ids: vec![BotId::new("krill").unwrap()],
+            description: String::new(),
+            created_at_ms: now_ms.saturating_sub(120_000),
+            updated_at_ms: activity_ms,
+        },
+        reply_audience: BotGroupReplyAudience::Mentions,
+        threads: Vec::new(),
+        latest_message: Some(BotGroupMessage {
+            message_id: "m-time-1".into(),
+            group_id: "grp-time".into(),
+            thread_id: "thr-main".into(),
+            sender_id: "owner".into(),
+            sender_name: "Owner".into(),
+            body: "Checking status".into(),
+            mentions: Vec::new(),
+            created_at_ms: activity_ms,
+            in_progress: false,
+        }),
+        active_turns: Vec::new(),
+    };
+    let mut sess = session(
+        10,
+        AgentState::Done,
+        Some("Checked nightly"),
+        Some("/repo/krill"),
+    );
+    sess.status.since_unix_ns = activity_ms.saturating_mul(1_000_000);
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![sess],
+        trees: std::collections::BTreeMap::new(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar.update(cx, |sb, cx| {
+                sb.connect_source(Arc::new(Memory(snapshot)), cx);
+            });
+            let mut c = chat("krill", 10, "");
+            c.created_at_ms = activity_ms;
+            let mut b = bot("krill", "Krill", "Watches builds", vec![c]);
+            b.updated_at_ms = activity_ms;
+            s.apply_sidebar_state(0, vec![b], vec![group_summary], cx);
+            // Mark session 10 unread via Sidebar unread state.
+            s.sidebar.update(cx, |sb, cx| {
+                sb.mark_session_unread(&krill_app::hosts::HostId::Local, SessionId(10), cx);
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    // Commit 8 (096a87bc): bot row, group row, and chat row times render at TEXT_2XS (<= 14px tall).
+    let bot_age = cx.debug_bounds("bot-row-age-krill").expect("bot row age");
+    let group_age = cx
+        .debug_bounds("bot-group-row-age-grp-time")
+        .expect("group row age");
+    let chat_age = cx.debug_bounds("bot-chat-age-10").expect("chat row age");
+    assert!(
+        bot_age.size.height <= px(14.),
+        "bot row age should use TEXT_2XS height, got {:?}",
+        bot_age.size.height
+    );
+    assert!(
+        group_age.size.height <= px(14.),
+        "group row age should use TEXT_2XS height, got {:?}",
+        group_age.size.height
+    );
+    assert!(
+        chat_age.size.height <= px(14.),
+        "bot chat row age should use TEXT_2XS height, got {:?}",
+        chat_age.size.height
+    );
+
+    // Commit 9 (490ec49b): collapsing Bots shows the blue unread alert dot on the unread avatar.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_ui.collapsed = true;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let dot = cx
+        .debug_bounds("bots-collapsed-unread-krill")
+        .expect("folded bot avatar must display unread dot");
+    assert_eq!(dot.size.width, px(10.), "6px dot + 2px ring on each side");
+    assert_eq!(dot.size.height, px(10.), "6px dot + 2px ring on each side");
+}

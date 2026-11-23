@@ -100,6 +100,7 @@ pub struct NewBot {
     nudge: Option<BotImportNudgeInfo>,
     nudge_dismissed: bool,
     nudge_task: Option<Task<()>>,
+    submitted: bool,
     submitting: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
@@ -226,6 +227,7 @@ impl NewBot {
             nudge: None,
             nudge_dismissed,
             nudge_task: None,
+            submitted: false,
             submitting: false,
             error: None,
             task: None,
@@ -351,9 +353,7 @@ impl NewBot {
             InputEvent::PressEnter { .. }
                 if !crate::jump::entity_input_is_composing(input, window, cx) =>
             {
-                if self.can_submit(cx) {
-                    self.submit(cx);
-                }
+                self.try_submit(Some(window), cx);
             }
             InputEvent::Change if !crate::jump::entity_input_is_composing(input, window, cx) => {
                 let value = input.read(cx).value().to_string();
@@ -406,14 +406,6 @@ impl NewBot {
         };
         let cur = self.purpose.read(cx).value().trim().to_owned();
         cur != *pre && cur.chars().count() > PURPOSE_MAX
-    }
-
-    fn can_submit(&self, cx: &App) -> bool {
-        !self.submitting
-            && !self.setup.is_blocked()
-            && !available_runtimes(self.setup.host_is_local, cx).is_empty()
-            && !self.identity_too_long(cx)
-            && !self.name.read(cx).value().trim().is_empty()
     }
 
     pub fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -584,8 +576,37 @@ impl NewBot {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn is_submitted(&self) -> bool {
+        self.submitted
+    }
+
     pub fn submit(&mut self, cx: &mut Context<Self>) {
-        if self.submitting || self.setup.is_blocked() || self.identity_too_long(cx) {
+        self.try_submit(None, cx);
+    }
+
+    /// Orca `22927c89` / `#47144`: Create stays enabled; pressing it with missing or invalid
+    /// inputs reveals inline validation messages and focuses the first invalid field instead
+    /// of silently disabling the primary action.
+    pub fn try_submit(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.submitting {
+            return;
+        }
+        let name_missing = self.name.read(cx).value().trim().is_empty();
+        let identity_too_long = self.identity_too_long(cx);
+        let host_blocked = self.setup.is_blocked();
+        let no_agents = available_runtimes(self.setup.host_is_local, cx).is_empty();
+        let picture_reading = self.picture.is_reading();
+        if name_missing || identity_too_long || host_blocked || no_agents || picture_reading {
+            self.submitted = true;
+            if let Some(window) = window {
+                if name_missing {
+                    self.name.update(cx, |s, cx| s.focus(window, cx));
+                } else if identity_too_long {
+                    self.purpose.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }
+            cx.notify();
             return;
         }
         let params = self.params(cx);
@@ -672,12 +693,13 @@ impl NewBot {
                 self.close(cx);
             }
             "enter"
-                if keys.modifiers.secondary() && !keys.modifiers.shift && !keys.modifiers.alt =>
+                if !e.is_held
+                    && keys.modifiers.secondary()
+                    && !keys.modifiers.shift
+                    && !keys.modifiers.alt =>
             {
                 cx.stop_propagation();
-                if self.can_submit(cx) {
-                    self.submit(cx);
-                }
+                self.try_submit(Some(window), cx);
             }
             _ => {}
         }
@@ -1173,7 +1195,6 @@ impl NewBot {
 
     fn render_footer(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
         let show_templates = self.form_is_empty(cx);
-        let can_submit = self.can_submit(cx);
         let chord = if cfg!(target_os = "macos") {
             "⌘ ↵"
         } else {
@@ -1216,8 +1237,10 @@ impl NewBot {
                 div().ml_auto().child(
                     ui::primary("new-bot-create", text::NB_CREATE_SHORT.get())
                         .debug_selector(|| "new-bot-create".into())
-                        .disabled(!can_submit)
-                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))
+                        .disabled(self.submitting)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.try_submit(Some(window), cx);
+                        }))
                         .child(
                             div()
                                 .ml_1()
@@ -1272,6 +1295,10 @@ impl Render for NewBot {
                 .is_none_or(|pre| purpose_text.trim() != pre);
         let too_long = self.identity_too_long(cx);
 
+        let name_invalid = self.submitted && self.name.read(cx).value().trim().is_empty();
+        let identity_invalid = self.submitted && too_long;
+        let picture_loading_hint = self.submitted && self.picture.is_reading();
+
         let name_row = div()
             .flex()
             .items_center()
@@ -1288,10 +1315,39 @@ impl Render for NewBot {
                     .flex_col()
                     .child(
                         div()
+                            .when(name_invalid, |d| {
+                                d.rounded(ui::RADIUS_SM)
+                                    .border_b_1()
+                                    .border_color(p.destructive)
+                            })
                             .text_size(ui::TEXT_2XL)
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(Input::new(&self.name).appearance(false)),
                     )
+                    .when(name_invalid, |d| {
+                        d.child(
+                            div()
+                                .id("new-bot-name-error")
+                                .debug_selector(|| "new-bot-name-error".into())
+                                .role(gpui::Role::Alert)
+                                .mt_1()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.destructive)
+                                .child(text::NB_VAL_ADD_NAME.get()),
+                        )
+                    })
+                    .when(picture_loading_hint, |d| {
+                        d.child(
+                            div()
+                                .id("new-bot-picture-loading")
+                                .debug_selector(|| "new-bot-picture-loading".into())
+                                .role(gpui::Role::Status)
+                                .mt_1()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::NB_VAL_PICTURE_LOADING.get()),
+                        )
+                    })
                     .children(self.picture.intake_error().map(|err| {
                         div()
                             .mt_1()
@@ -1317,14 +1373,32 @@ impl Render for NewBot {
                 div()
                     .rounded(ui::RADIUS_SM)
                     .border_1()
-                    .border_color(p.border)
+                    .border_color(if identity_invalid {
+                        p.destructive
+                    } else {
+                        p.border
+                    })
                     .bg(p.background)
                     .px_3()
                     .py_2()
                     .text_size(ui::TEXT_SM)
                     .child(Textarea::new(&self.purpose).appearance(false)),
             )
-            .when(show_counter, |d| {
+            .when(identity_invalid, |d| {
+                d.child(
+                    div()
+                        .id("new-bot-purpose-error")
+                        .debug_selector(|| "new-bot-purpose-error".into())
+                        .role(gpui::Role::Alert)
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.destructive)
+                        .child(text::NB_VAL_TOO_LONG.format(&[
+                            ("count", &purpose_len.to_string()),
+                            ("max", &PURPOSE_MAX.to_string()),
+                        ])),
+                )
+            })
+            .when(!identity_invalid && show_counter, |d| {
                 d.child(
                     div()
                         .text_right()
@@ -1345,6 +1419,7 @@ impl Render for NewBot {
             &self.setup,
             None,
             &taken,
+            self.submitted,
             Self::setup_mut,
             Self::on_update_host,
             p,

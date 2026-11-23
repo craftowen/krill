@@ -281,24 +281,99 @@ impl Shell {
             })
     }
 
-    /// Collapsed section: up to five round avatars, then `+N` (attention first, like Orca),
-    /// kept flush next to the `Bots` label (`justify-start`, Orca #45567).
+    /// Collapsed section: up to five round avatars, then `+N` (attention, working, then unread
+    /// first, like Orca), kept flush next to the `Bots` label (`justify-start`, Orca #45567).
+    /// Unread bots carry the blue Projects unread dot (`490ec49b` / `#47122`).
     fn render_collapsed_faces(
         &self,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let mut bots: Vec<&SidebarBot> = self.sidebar_bots.iter().collect();
-        bots.sort_by_key(|b| (b.attention == 0, b.working() == 0));
+        let focused = self
+            .focused_session()
+            .and_then(|(h, id)| (h == self.launch_host).then_some(id));
+        let mut bots: Vec<(&SidebarBot, super::rows::BotFacts)> = self
+            .sidebar_bots
+            .iter()
+            .map(|b| (b, self.bot_facts(b, focused, cx)))
+            .collect();
+        bots.sort_by_key(|(b, f)| {
+            let needs_you = f.needs_you || b.attention > 0;
+            let working =
+                !b.paused && (f.status == super::rows::RowStatus::Working || b.working() > 0);
+            (!needs_you, !working, !f.unread)
+        });
         let shown = bots.len().min(5);
         let mut inner = div().flex().items_center();
-        for (i, bot) in bots.iter().take(shown).enumerate() {
+        for (i, (bot, facts)) in bots.iter().take(shown).enumerate() {
             let id = bot.id.clone();
             let sel = format!("bots-collapsed-{}", bot.id.as_str());
+            let needs_you = facts.needs_you || bot.attention > 0;
+            let working = !bot.paused
+                && (facts.status == super::rows::RowStatus::Working || bot.working() > 0);
+            let pip: Option<gpui::AnyElement> = if needs_you {
+                let pip_sel = format!("bots-collapsed-waiting-{}", bot.id.as_str());
+                Some(
+                    div()
+                        .debug_selector(move || pip_sel.clone())
+                        .absolute()
+                        .right(px(-2.))
+                        .bottom(px(-2.))
+                        .size(px(12.))
+                        .rounded_full()
+                        .bg(p.worktree_sidebar)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(ui::status::status_glyph(
+                            krill_proto::control::AgentState::Waiting,
+                            false,
+                            ui::status::Size::Sm,
+                            cx,
+                        ))
+                        .into_any_element(),
+                )
+            } else if working {
+                let pip_sel = format!("bots-collapsed-working-{}", bot.id.as_str());
+                Some(
+                    div()
+                        .debug_selector(move || pip_sel.clone())
+                        .absolute()
+                        .right(px(-2.))
+                        .bottom(px(-2.))
+                        .size(px(12.))
+                        .rounded_full()
+                        .bg(p.worktree_sidebar)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(ui::status::status_glyph_slot(
+                            krill_proto::control::AgentState::Working,
+                            false,
+                            ui::status::Size::Sm,
+                            Some(&self.bot_ui.spinners),
+                            cx,
+                        ))
+                        .into_any_element(),
+                )
+            } else if facts.unread {
+                let pip_sel = format!("bots-collapsed-unread-{}", bot.id.as_str());
+                Some(
+                    ui::status::unread_alert_dot(p.worktree_sidebar, cx)
+                        .debug_selector(move || pip_sel.clone())
+                        .absolute()
+                        .right(px(-2.))
+                        .bottom(px(-2.))
+                        .into_any_element(),
+                )
+            } else {
+                None
+            };
             inner = inner.child(
                 div()
                     .id(SharedString::from(sel.clone()))
                     .debug_selector(move || sel.clone())
+                    .relative()
                     .when(i > 0, |d| d.ml(px(-4.)))
                     .rounded_full()
                     .border_2()
@@ -308,7 +383,8 @@ impl Shell {
                         this.bot_ui.collapsed = false;
                         this.open_bot_home(id.clone(), None, cx);
                     }))
-                    .child(self.bot_avatar(bot, 20., px(10.), p)),
+                    .child(self.bot_avatar(bot, 20., px(10.), p))
+                    .children(pip),
             );
         }
         if bots.len() > shown {

@@ -219,6 +219,409 @@ impl DisplayRow {
             Self::TurnBar { user_abs_idx, .. } => RawSpan::single(*user_abs_idx),
         }
     }
+
+    /// Which vertical edges of a display row join tightly (`4px`) with an adjacent activity row
+    /// (Orca `6edf9f05` / `#46659`, `NATIVE_CHAT_ACTIVITY_ROW_GAP_PX = 4`).
+    pub(super) fn activity_edges(&self) -> (bool, bool) {
+        match self {
+            Self::Notice { .. } => (true, true),
+            Self::ItemNote { note, .. } => match note.action {
+                NoteAction::Memory(_) | NoteAction::CreateOffer(_) => (false, false),
+                _ => (true, true),
+            },
+            Self::Item { .. }
+            | Self::WorkRun(_)
+            | Self::UnreadDivider { .. }
+            | Self::TurnBar { .. } => (false, false),
+        }
+    }
+}
+
+/// First plain-text preview line of an agent message row (Orca `dcde358a` / `#46739`,
+/// `agent-message-preview-line.ts`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AgentMessagePreviewLine {
+    pub line: String,
+    pub more: bool,
+}
+
+const PREVIEW_MAX_CHARS: usize = 200;
+
+/// Extracts the first readable plain-text line from an agent message body and reports whether
+/// there is more content behind it (additional lines, fenced blocks, bare URLs, or clipping).
+pub(super) fn agent_message_preview_line(body: &str) -> AgentMessagePreviewLine {
+    let mut fence: Option<(char, usize)> = None;
+    let mut skipped_before = false;
+    let mut found: Option<(String, bool)> = None;
+    let mut has_after = false;
+
+    for raw_line in body.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let trimmed = line.trim();
+        if let Some((ch, min_len)) = fence {
+            if is_closing_fence(trimmed, ch, min_len) {
+                fence = None;
+            } else if !trimmed.is_empty() {
+                if found.is_some() {
+                    has_after = true;
+                    break;
+                }
+                skipped_before = true;
+            }
+            continue;
+        }
+        if let Some((ch, len)) = opening_fence(trimmed) {
+            fence = Some((ch, len));
+            if found.is_some() {
+                has_after = true;
+                break;
+            }
+            skipped_before = true;
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if found.is_some() {
+            has_after = true;
+            break;
+        }
+        let plain = plain_markdown_line(trimmed);
+        if plain.is_empty() {
+            skipped_before = true;
+            continue;
+        }
+        let has_bare_url = contains_bare_url(trimmed);
+        found = Some((plain, has_bare_url));
+    }
+
+    let Some((plain, has_bare_url)) = found else {
+        return AgentMessagePreviewLine {
+            line: String::new(),
+            more: skipped_before || !body.trim().is_empty(),
+        };
+    };
+
+    let (line, clipped) = cut_at_code_point(&plain, PREVIEW_MAX_CHARS);
+    AgentMessagePreviewLine {
+        line,
+        more: skipped_before || has_after || has_bare_url || clipped,
+    }
+}
+
+fn opening_fence(trimmed: &str) -> Option<(char, usize)> {
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == first).count();
+    if count < 3 {
+        return None;
+    }
+    // CommonMark: backtick info strings cannot contain backticks.
+    if first == '`' && trimmed.get(count..).is_some_and(|rest| rest.contains('`')) {
+        return None;
+    }
+    Some((first, count))
+}
+
+fn is_closing_fence(trimmed: &str, ch: char, min_len: usize) -> bool {
+    let count = trimmed.chars().take_while(|&c| c == ch).count();
+    count >= min_len
+        && trimmed
+            .get(count..)
+            .is_some_and(|rest| rest.trim().is_empty())
+}
+
+fn contains_bare_url(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    for (idx, _) in raw
+        .match_indices("https://")
+        .chain(raw.match_indices("http://"))
+        .chain(raw.match_indices("www."))
+    {
+        // Ignore URLs already wrapped as markdown link targets `](url)`.
+        if idx >= 2 && bytes.get(idx - 2..idx) == Some(b"](") {
+            continue;
+        }
+        if idx == 0 || !bytes.get(idx - 1).is_some_and(u8::is_ascii_alphanumeric) {
+            return true;
+        }
+    }
+    false
+}
+
+fn cut_at_code_point(text: &str, max_chars: usize) -> (String, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => (
+            text.get(..byte_idx).unwrap_or(text).trim_end().to_owned(),
+            true,
+        ),
+        None => (text.to_owned(), false),
+    }
+}
+
+fn strip_block_prefixes(mut s: &str) -> &str {
+    loop {
+        let before = s;
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix('>') {
+            s = rest.strip_prefix(' ').unwrap_or(rest);
+            continue;
+        }
+        // ATX heading `#{1,6} `
+        let hashes = s.bytes().take_while(|&b| b == b'#').count();
+        if (1..=6).contains(&hashes)
+            && let Some(rest) = s.get(hashes..).and_then(|r| r.strip_prefix(' '))
+        {
+            s = rest;
+            continue;
+        }
+        // Unordered list bullet `- `, `* `, `+ `
+        if matches!(s.as_bytes().first(), Some(b'-' | b'*' | b'+'))
+            && s.as_bytes().get(1) == Some(&b' ')
+            && let Some(rest) = s.get(2..)
+        {
+            s = rest;
+            continue;
+        }
+        // Ordered list prefix `1. ` or `1) `
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0
+            && matches!(s.as_bytes().get(digits), Some(b'.' | b')'))
+            && s.as_bytes().get(digits + 1) == Some(&b' ')
+            && let Some(rest) = s.get(digits + 2..)
+        {
+            s = rest;
+            continue;
+        }
+        // Task list checkbox `[ ] `, `[x] `, `[X] `
+        if let Some(rest) = s
+            .strip_prefix("[ ] ")
+            .or_else(|| s.strip_prefix("[x] "))
+            .or_else(|| s.strip_prefix("[X] "))
+        {
+            s = rest;
+            continue;
+        }
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
+fn plain_markdown_line(raw: &str) -> String {
+    let stripped = strip_block_prefixes(raw);
+    let no_links = strip_markdown_links(stripped);
+    let no_code_and_emph = strip_code_and_emphasis(&no_links);
+    no_code_and_emph
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Replaces `[label](url)` and `![alt](url)` with `label`/`alt`, handling balanced parentheses
+/// inside `url` (e.g. Wikipedia links).
+fn strip_markdown_links(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0;
+    while let Some(rest) = input.get(idx..) {
+        if rest.is_empty() {
+            break;
+        }
+        let is_image = rest.starts_with("![");
+        let bracket_start = if is_image {
+            idx + 1
+        } else if rest.starts_with('[') {
+            idx
+        } else {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            out.push(ch);
+            idx += ch.len_utf8();
+            continue;
+        };
+        if let Some((label, after_link)) = parse_link_at(input, bracket_start) {
+            out.push_str(label);
+            idx = after_link;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+fn parse_link_at(input: &str, open_bracket: usize) -> Option<(&str, usize)> {
+    let after_open = open_bracket + 1;
+    let mut depth = 1usize;
+    let mut close_bracket = None;
+    for (rel, ch) in input.get(after_open..)?.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_bracket = Some(after_open + rel);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_bracket = close_bracket?;
+    if !input.get(close_bracket + 1..)?.starts_with('(') {
+        return None;
+    }
+    let url_start = close_bracket + 2;
+    let mut paren_depth = 1usize;
+    let mut close_paren = None;
+    for (rel, ch) in input.get(url_start..)?.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    close_paren = Some(url_start + rel);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_paren = close_paren?;
+    Some((input.get(after_open..close_bracket)?, close_paren + 1))
+}
+
+/// Strips inline code backticks while keeping code content untouched by emphasis stripping
+/// (so `` `src/**/*.ts` `` and `` `foo_bar` `` survive verbatim), and strips markdown emphasis
+/// from non-code text around them.
+fn strip_code_and_emphasis(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut text_start = 0;
+    let mut idx = 0;
+    while let Some(rest) = input.get(idx..) {
+        if rest.is_empty() {
+            break;
+        }
+        if rest.starts_with('`') {
+            let ticks = rest.bytes().take_while(|&b| b == b'`').count();
+            let body_start = idx + ticks;
+            if let (Some(delim), Some(after_delim)) = (rest.get(..ticks), input.get(body_start..))
+                && let Some(rel_end) = after_delim.find(delim)
+                && let Some(inner) = after_delim.get(..rel_end)
+            {
+                if let Some(before) = input.get(text_start..idx) {
+                    out.push_str(&strip_inline_emphasis(before));
+                }
+                out.push_str(inner);
+                idx = body_start + rel_end + ticks;
+                text_start = idx;
+                continue;
+            }
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        idx += ch.len_utf8();
+    }
+    if let Some(tail) = input.get(text_start..) {
+        out.push_str(&strip_inline_emphasis(tail));
+    }
+    out
+}
+
+fn is_word_char(ch: Option<char>) -> bool {
+    ch.is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn strip_inline_emphasis(input: &str) -> String {
+    // Strip paired `**`, `__`, `~~`, then single `*`, `_` while preserving glob stars
+    // (`src/**/*.ts`), math (`5 * 3`), and snake_case (`term_0`, `snake_case_name`).
+    let s = strip_paired_delim(input, "**", true, false);
+    let s = strip_paired_delim(&s, "__", false, true);
+    let s = strip_paired_delim(&s, "~~", false, false);
+    let s = strip_paired_delim(&s, "*", true, false);
+    strip_paired_delim(&s, "_", false, true)
+}
+
+fn strip_paired_delim(
+    input: &str,
+    delim: &str,
+    forbid_glob_slash: bool,
+    word_boundary_only: bool,
+) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0;
+    let dlen = delim.len();
+    let dchar = delim.chars().next().unwrap_or('*');
+    while let Some(rest) = input.get(idx..) {
+        if rest.is_empty() {
+            break;
+        }
+        if rest.starts_with(delim) {
+            let prev = input.get(..idx).and_then(|s| s.chars().next_back());
+            let after_open = idx + dlen;
+            let next_after_open = input.get(after_open..).and_then(|s| s.chars().next());
+            let open_ok = next_after_open.is_some_and(|c| !c.is_whitespace() && c != dchar)
+                && (!forbid_glob_slash || (prev != Some('/') && prev != Some(dchar)))
+                && (!word_boundary_only || !is_word_char(prev));
+            if open_ok
+                && let Some(close_idx) = find_closing_delim(
+                    input,
+                    after_open,
+                    delim,
+                    forbid_glob_slash,
+                    word_boundary_only,
+                )
+                && let Some(inner) = input.get(after_open..close_idx)
+            {
+                out.push_str(inner);
+                idx = close_idx + dlen;
+                continue;
+            }
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+fn find_closing_delim(
+    input: &str,
+    start: usize,
+    delim: &str,
+    forbid_glob_slash: bool,
+    word_boundary_only: bool,
+) -> Option<usize> {
+    let dlen = delim.len();
+    let dchar = delim.chars().next().unwrap_or('*');
+    let mut search = start;
+    while let Some(rel) = input.get(search..).and_then(|s| s.find(delim)) {
+        let pos = search + rel;
+        if pos > start {
+            let prev = input.get(start..pos).and_then(|s| s.chars().next_back());
+            let after_close = pos + dlen;
+            let next = input.get(after_close..).and_then(|s| s.chars().next());
+            let close_ok = prev.is_some_and(|c| !c.is_whitespace() && c != dchar)
+                && next != Some(dchar)
+                && (!forbid_glob_slash || next != Some('/'))
+                && (!word_boundary_only || !is_word_char(next));
+            if close_ok {
+                return Some(pos);
+            }
+        }
+        search = pos + dlen;
+    }
+    None
 }
 
 /// Who changed a bot item, as its chat line says it.
@@ -1573,5 +1976,182 @@ fn orphan_result_detail(result: &ChatItem) -> &str {
         first_non_empty_line(&result.text)
     } else {
         path
+    }
+}
+
+#[cfg(test)]
+mod preview_and_spacing_tests {
+    use super::*;
+
+    #[test]
+    fn activity_edges_only_join_notices_and_one_line_item_notes() {
+        let notice = DisplayRow::Notice {
+            abs_idx: 0,
+            notice: Arc::new(InboundNotice {
+                kind: NoticeKind::Message,
+                from: vec!["Scout".into()],
+                detail: "hello".into(),
+            }),
+        };
+        assert_eq!(notice.activity_edges(), (true, true));
+
+        let started_note = DisplayRow::ItemNote {
+            anchor_abs_idx: 0,
+            note: Arc::new(ItemNote {
+                at_ms: 1,
+                actor: NoteActor::Bot,
+                action: NoteAction::Status(krill_proto::bots::BotItemStatus::Working),
+                status: krill_proto::bots::BotItemStatus::Working,
+                title: "Audit".into(),
+                detail: String::new(),
+            }),
+        };
+        assert_eq!(started_note.activity_edges(), (true, true));
+
+        let memory_note = DisplayRow::ItemNote {
+            anchor_abs_idx: 0,
+            note: Arc::new(ItemNote {
+                at_ms: 1,
+                actor: NoteActor::Bot,
+                action: NoteAction::Memory(MemoryReceipt {
+                    added: vec!["fact".into()],
+                    removed: vec![],
+                    other_changes: false,
+                }),
+                status: krill_proto::bots::BotItemStatus::Done,
+                title: String::new(),
+                detail: String::new(),
+            }),
+        };
+        assert_eq!(memory_note.activity_edges(), (false, false));
+
+        let msg = DisplayRow::Item {
+            abs_idx: 1,
+            item: Arc::new(ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Done".into(),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(msg.activity_edges(), (false, false));
+    }
+
+    #[test]
+    fn agent_message_preview_line_matches_orca_spec() {
+        // 1. Plain single line -> no `more`
+        assert_eq!(
+            agent_message_preview_line("All green on main."),
+            AgentMessagePreviewLine {
+                line: "All green on main.".into(),
+                more: false,
+            }
+        );
+
+        // 2. Multiple lines -> first line + `more: true`
+        assert_eq!(
+            agent_message_preview_line("First line\nSecond line"),
+            AgentMessagePreviewLine {
+                line: "First line".into(),
+                more: true,
+            }
+        );
+
+        // 3. Strips headings, quotes, bullets, numbered lists, checkboxes
+        assert_eq!(
+            agent_message_preview_line("> ## - [x] Ship release"),
+            AgentMessagePreviewLine {
+                line: "Ship release".into(),
+                more: false,
+            }
+        );
+        assert_eq!(
+            agent_message_preview_line("1. First step"),
+            AgentMessagePreviewLine {
+                line: "First step".into(),
+                more: false,
+            }
+        );
+
+        // 4. Strips markdown links & images, including nested parens in URLs
+        assert_eq!(
+            agent_message_preview_line(
+                "See [Rust (lang)](https://en.wikipedia.org/wiki/Rust_(programming_language)) and ![shot](https://example.com/a.png)"
+            ),
+            AgentMessagePreviewLine {
+                line: "See Rust (lang) and shot".into(),
+                more: false,
+            }
+        );
+
+        // 5. Strips paired **, __, ~~, inline code while keeping glob stars `src/**/*.ts`
+        assert_eq!(
+            agent_message_preview_line(
+                "Updated **auth** and __core__ with `src/**/*.ts` and ~~old~~"
+            ),
+            AgentMessagePreviewLine {
+                line: "Updated auth and core with src/**/*.ts and old".into(),
+                more: false,
+            }
+        );
+
+        // 6. Keeps math `5 * 3` and snake_case `term_0`, `snake_case_name`
+        assert_eq!(
+            agent_message_preview_line(
+                "Check *now* and 5 * 3 on term_0 and snake_case_name with _italics_"
+            ),
+            AgentMessagePreviewLine {
+                line: "Check now and 5 * 3 on term_0 and snake_case_name with italics".into(),
+                more: false,
+            }
+        );
+
+        // 7. Bare URL forces `more: true`
+        assert_eq!(
+            agent_message_preview_line("Check https://example.com/logs"),
+            AgentMessagePreviewLine {
+                line: "Check https://example.com/logs".into(),
+                more: true,
+            }
+        );
+        assert_eq!(
+            agent_message_preview_line("Visit www.example.com"),
+            AgentMessagePreviewLine {
+                line: "Visit www.example.com".into(),
+                more: true,
+            }
+        );
+
+        // 8. Skips leading fenced code block and marks `more: true`
+        assert_eq!(
+            agent_message_preview_line("```rust\nlet x = 1;\n```\nSummary here"),
+            AgentMessagePreviewLine {
+                line: "Summary here".into(),
+                more: true,
+            }
+        );
+
+        // 9. Only fenced code -> empty preview line + `more: true`
+        assert_eq!(
+            agent_message_preview_line("```\nonly code\n```"),
+            AgentMessagePreviewLine {
+                line: String::new(),
+                more: true,
+            }
+        );
+
+        // 10. Clips at 200 code points safely on multibyte chars
+        let long_kr = "가".repeat(220);
+        let clipped = agent_message_preview_line(&long_kr);
+        assert_eq!(clipped.line.chars().count(), 200);
+        assert!(clipped.more);
+
+        // 11. Empty/whitespace body
+        assert_eq!(
+            agent_message_preview_line("   \n  "),
+            AgentMessagePreviewLine {
+                line: String::new(),
+                more: false,
+            }
+        );
     }
 }

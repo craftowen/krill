@@ -134,14 +134,17 @@ impl Shell {
                     .items_center()
                     .justify_end()
                     .gap_1()
-                    .child(
+                    .child({
+                        let age_sel = format!("bot-chat-age-{}", chat.session.0);
                         div()
+                            .debug_selector(move || age_sel.clone())
                             .min_w(px(24.))
                             .truncate()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_2XS)
+                            .line_height(gpui::relative(1.))
                             .text_color(p.muted_foreground)
-                            .children(trailing),
-                    )
+                            .children(trailing)
+                    })
                     .when(foldable, |d| {
                         let fold = chat.session;
                         let name = chat.title.to_string();

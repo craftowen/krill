@@ -171,6 +171,7 @@ pub(crate) struct SessionChatLog {
     expanded_runs: BTreeSet<usize>,
     expanded_steps: BTreeSet<usize>,
     expanded_user_messages: BTreeSet<usize>,
+    expanded_notices: BTreeSet<usize>,
     wrapped_code: BTreeSet<(usize, usize)>,
     timing: work_run::WorkRunTimingState,
     cached_feed: Option<Arc<work_run::DisplayFeed>>,
@@ -301,6 +302,17 @@ impl SessionChatLog {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    pub(super) fn is_notice_expanded(&self, abs_idx: usize) -> bool {
+        self.expanded_notices.contains(&abs_idx)
+    }
+
+    pub(super) fn toggle_notice(&mut self, abs_idx: usize) {
+        if !self.expanded_notices.remove(&abs_idx) {
+            self.expanded_notices.insert(abs_idx);
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub(super) fn is_code_wrapped(&self, abs_idx: usize, code_idx: usize) -> bool {
         self.wrapped_code.contains(&(abs_idx, code_idx))
     }
@@ -324,6 +336,7 @@ impl SessionChatLog {
         self.expanded_runs.clear();
         self.expanded_steps.clear();
         self.expanded_user_messages.clear();
+        self.expanded_notices.clear();
         self.wrapped_code.clear();
         self.timing.clear();
         self.cached_feed = None;
@@ -372,6 +385,7 @@ impl SessionChatLog {
             self.expanded_runs.retain(|index| *index >= base);
             self.expanded_steps.retain(|index| *index >= base);
             self.expanded_user_messages.retain(|index| *index >= base);
+            self.expanded_notices.retain(|index| *index >= base);
             self.wrapped_code.retain(|(index, _)| *index >= base);
             self.consumed_user_indices.retain(|index| *index >= base);
             self.timing.migrate_head_drain(old_run_abs_start, base);

@@ -65,6 +65,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | `success` | `#15803d` | `#86efac` | 에이전트 완료(`Done`), Git 추가(`A`/`??`), 정상 연결 상태 | 일반 장식 |
 | `warning` / `warning_foreground` | `#ca8a04` / `#fafafa` | `#eab308` / `#171717` | 에이전트 작업 중(`Working` 노란 스피너), 주의 배너, Git 수정(`M`) | 질문 대기(`agent_question` 사용) |
 | `agent_question` | `#ea580c` | `#f97316` | 에이전트가 사용자에게 질문/입력 대기 중(`Waiting`, 주황색 — 작업 중 노란색과 한눈에 구분) | 일반 경고 |
+| `unread` | `#3b82f6` | `#60a5fa` | Projects와 접힌 Bots 아바타의 파란 안 읽음 표시 점(`ui::status::unread_alert_dot`, Orca `--unread`) | 에이전트 작업/질문 상태 |
 | `preserve` | `#0369a1` | `#7dd3fc` | **Krill 고유.** 세션이 안전하게 보존·이어지는 중: 데몬 재연결 중(세션은 krill-holder가 보관), 탭 밖 분리 세션. 배경 틴트는 `.opacity(0.12)`, 테두리 `.opacity(0.3)` | 에이전트 상태(작업/질문/차단/완료), 조치가 필요한 경고·실패(`warning`·`destructive` 유지), 정상 연결(`success`) |
 | `split_divider` / `split_divider_strong` | `#868690` / `#71717a` | `#71717a` / `#a1a1aa` | 터미널 분할선 기본 상태(`card` 대비 3:1 이상) 및 호버/드래그 강조 상태 | 일반 카드 테두리(`border` 사용) |
 

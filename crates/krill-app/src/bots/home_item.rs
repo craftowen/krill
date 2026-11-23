@@ -89,6 +89,12 @@ fn clamps(text: &str) -> bool {
     text.chars().count() > 180 || text.lines().count() > 3
 }
 
+/// Orca `BotItemCommentCard` clamps settled comments at 8 lines (`152px`), while showing the
+/// agent's asking comment whole while it waits on an open question (`d6cc2684` / `#47076`).
+fn clamps_comment(text: &str) -> bool {
+    text.chars().count() > 480 || text.lines().count() > 8
+}
+
 impl View {
     /// A comment from the box: the waiting question's answer while it needs you, else a comment.
     pub(super) fn send_item_comment(
@@ -916,15 +922,62 @@ impl View {
         let words = (event.kind == BotItemEventKind::Commented)
             .then(|| event.text.trim().to_owned())
             .filter(|t| !t.is_empty());
+        let event_id = event.id;
+        let comment_open = self.items.open_comments.contains(&event_id);
         let mut body = div().pl_7().flex().flex_col().children(words.map(|w| {
-            div()
+            // Orca `d6cc2684` / `#47076`: while waiting on an open question, show the agent's
+            // asking comment whole; once answered or for regular comments, clamp past 8 lines.
+            let clamped = !waiting && clamps_comment(&w);
+            let md = div()
+                .when(waiting, |d| {
+                    d.debug_selector(|| "bot-item-comment-whole".into())
+                })
+                .when(clamped && !comment_open, |d| {
+                    d.debug_selector(|| "bot-item-comment-clamped".into())
+                        .max_h(px(152.))
+                        .overflow_hidden()
+                })
                 .text_size(ui::TEXT_MD)
                 .line_height(px(19.))
                 .text_color(p.foreground)
                 .child(super::home_item_parts::markdown(
-                    format!("bot-item-comment-md-{}", event.id),
+                    format!("bot-item-comment-md-{event_id}"),
                     &w,
-                ))
+                ));
+            if clamped {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(md)
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "bot-item-comment-toggle-{event_id}"
+                            )))
+                            .debug_selector(move || format!("bot-item-comment-toggle-{event_id}"))
+                            .self_start()
+                            .cursor_pointer()
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .hover(gpui::Styled::underline)
+                            .child(if comment_open {
+                                text::HM_SHOW_LESS.get()
+                            } else {
+                                text::HM_SHOW_MORE_TEXT.get()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.items.open_comments.remove(&event_id) {
+                                    this.items.open_comments.insert(event_id);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                md.into_any_element()
+            }
         }));
         let several = event.decisions.len() > 1;
         let answered = (!(event.decisions.is_empty() || (waiting && several)))

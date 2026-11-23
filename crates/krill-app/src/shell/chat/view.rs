@@ -364,6 +364,7 @@ impl Shell {
         row: &work_run::DisplayRow,
         row_ix: usize,
         total_rows: usize,
+        joins_activity_below: bool,
         list_state: &gpui::ListState,
         agent_state: krill_proto::control::AgentState,
         cx: &mut Context<Self>,
@@ -393,7 +394,7 @@ impl Shell {
                 work_run::NoteAction::CreateOffer(offer) => {
                     self.render_create_offer(pane, session, offer, cx)
                 }
-                _ => Self::render_item_note(pane, row_ix, note, cx),
+                _ => Self::render_item_note(pane, row_ix, note, joins_activity_below, cx),
             },
             work_run::DisplayRow::TurnBar {
                 user_abs_idx,
@@ -409,9 +410,15 @@ impl Shell {
                 *expanded,
                 cx,
             ),
-            work_run::DisplayRow::Notice { notice, .. } => {
-                Self::render_inbound_notice(pane, row_ix, notice, cx)
-            }
+            work_run::DisplayRow::Notice { abs_idx, notice } => self.render_inbound_notice(
+                pane,
+                session,
+                *abs_idx,
+                row_ix,
+                notice,
+                joins_activity_below,
+                cx,
+            ),
             work_run::DisplayRow::UnreadDivider { first_abs_idx } => {
                 let palette = ui::palette(cx);
                 div()
@@ -2041,43 +2048,255 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Orca's "Update from"/"Message from" row: the item note row's look with each sender as a
-    /// chip, and the mail's words under it.
+    /// Orca's `NativeChatAgentMessageRow` (`dcde358a` / `#46739`, `028100ad` / `#47084`,
+    /// `6edf9f05` / `#46659`): plain medium sender name (`+N` if multiple), first-line plain
+    /// preview, always-visible chevron when expandable, and a quiet details box on click.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "notice rendering needs pane/session/row coordinates and adjacency spacing"
+    )]
     fn render_inbound_notice(
+        &mut self,
         pane: super::super::PaneId,
+        session: SessionId,
+        abs_idx: usize,
         row_ix: usize,
         notice: &work_run::InboundNotice,
+        joins_activity_below: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = ui::palette(cx);
         let muted = palette.muted_foreground;
-        let (line, icon) = match notice.kind {
-            work_run::NoticeKind::Update => (ctext::NOTICE_UPDATE.get(), ui::icons::ACTIVITY_SVG),
-            work_run::NoticeKind::Message => {
-                (ctext::NOTICE_MESSAGE.get(), ui::icons::MESSAGE_SQUARE_SVG)
-            }
+        let key = (self.layout.host(pane).clone(), session);
+        let icon = match notice.kind {
+            work_run::NoticeKind::Update => ui::icons::ACTIVITY_SVG,
+            work_run::NoticeKind::Message => ui::icons::MESSAGE_SQUARE_SVG,
         };
-        let (lead, tail) = line.split_once("{name}").unwrap_or((line, ""));
-        let chips = notice.from.iter().map(|name| {
+        let preview = work_run::agent_message_preview_line(&notice.detail);
+        let has_body = !notice.detail.trim().is_empty();
+        let expandable = has_body || notice.from.len() > 1;
+        let open = expandable
+            && self
+                .chat
+                .logs
+                .get(&key)
+                .is_some_and(|log| log.is_notice_expanded(abs_idx));
+        let toggles = expandable
+            && (preview.more
+                || preview.line.is_empty()
+                || preview.line.chars().count() > 48
+                || open);
+
+        let first_sender = notice
+            .from
+            .first()
+            .map_or_else(|| ctext::ASSISTANT.get().to_owned(), Clone::clone);
+        let extra_senders = notice.from.len().saturating_sub(1);
+        let sender_summary = if extra_senders > 0 {
+            format!("{first_sender} +{extra_senders}")
+        } else {
+            first_sender.clone()
+        };
+        let aria_line = match notice.kind {
+            work_run::NoticeKind::Update => ctext::NOTICE_UPDATE
+                .get()
+                .replace("{name}", &sender_summary),
+            work_run::NoticeKind::Message => ctext::NOTICE_MESSAGE
+                .get()
+                .replace("{name}", &sender_summary),
+        };
+
+        let sender_el = div()
+            .debug_selector(|| "chat-notice-sender".into())
+            .when(first_sender.chars().count() <= 10, gpui::Styled::flex_none)
+            .when(first_sender.chars().count() > 10, |d| {
+                d.flex_shrink(1.).min_w(gpui::px(96.))
+            })
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_hidden()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(palette.foreground)
+                    .child(first_sender),
+            )
+            .when(extra_senders > 0, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(muted)
+                        .child(format!("+{extra_senders}")),
+                )
+            });
+
+        let chevron: AnyElement = if toggles {
             div()
-                .debug_selector(|| "chat-notice-chip".into())
+                .debug_selector(|| "chat-notice-chevron".into())
                 .flex_none()
-                .max_w(gpui::px(256.))
-                .min_w_0()
-                .px_1p5()
-                .rounded(ui::RADIUS_SM)
-                .bg(palette.foreground.opacity(0.07))
-                .text_size(ui::TEXT_XS)
-                .text_color(palette.foreground)
-                .child(div().min_w_0().truncate().child(name.clone()))
+                .flex()
+                .items_center()
+                .child(
+                    gpui_component::Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .with_size(ui::ICON_SM)
+                    .text_color(muted),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .size(gpui::px(ui::ICON_SM))
+                .into_any_element()
+        };
+
+        let has_preview = !open && !preview.line.is_empty();
+        let preview_line = preview.line;
+
+        let header = div()
+            .id(SharedString::from(format!(
+                "chat-notice-toggle-{}-{abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-notice-toggle".into())
+            .w_full()
+            .min_w_0()
+            .min_h(gpui::px(24.))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_size(ui::TEXT_SM)
+            .text_color(muted)
+            .when(toggles, |d| {
+                d.role(gpui::Role::Button)
+                    .aria_label(aria_line)
+                    .aria_expanded(open)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .rounded(ui::RADIUS_XS)
+                    .hover(|s| s.text_color(palette.foreground))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(log) = this
+                            .chat
+                            .logs
+                            .get_mut(&(this.layout.host(pane).clone(), session))
+                        {
+                            log.toggle_notice(abs_idx);
+                        }
+                        cx.notify();
+                    }))
+            })
+            .child(
+                div().flex_none().flex().items_center().child(
+                    gpui_component::Icon::default()
+                        .data(icon)
+                        .with_size(ui::ICON_MD)
+                        .text_color(muted),
+                ),
+            )
+            .child(sender_el)
+            .when(has_preview, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "chat-notice-preview".into())
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(muted)
+                        .child(preview_line),
+                )
+            })
+            .when(!has_preview, |d| d.child(div().flex_1().min_w_0()))
+            .child(chevron);
+
+        let is_copied = self
+            .chat
+            .copied_item
+            .as_ref()
+            .is_some_and(|(copied_key, idx, at)| {
+                *copied_key == key && *idx == abs_idx && at.elapsed() < Duration::from_secs(2)
+            });
+        let detail_for_copy = notice.detail.clone();
+        let copy_key = key.clone();
+
+        let details = open.then(|| {
+            div()
+                .debug_selector(|| "chat-notice-details".into())
+                .ml_5()
+                .mt_1()
+                .rounded(ui::RADIUS_MD)
+                .bg(palette.muted.opacity(0.6))
+                .px_3()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .when(notice.from.len() > 1, |d| {
+                    d.child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(muted)
+                            .child(notice.from.join(", ")),
+                    )
+                })
+                .when(has_body, |d| {
+                    d.child(
+                        div()
+                            .min_w_0()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(palette.foreground)
+                            .child(gpui_component::SelectableText::new(
+                                SharedString::from(format!(
+                                    "chat-notice-body-{}-{abs_idx}",
+                                    pane.get()
+                                )),
+                                notice.detail.clone(),
+                            )),
+                    )
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new(SharedString::from(format!(
+                                "chat-notice-copy-{}-{abs_idx}",
+                                pane.get()
+                            )))
+                            .ghost()
+                            .xsmall()
+                            .label(if is_copied {
+                                ctext::COPIED.get()
+                            } else {
+                                ctext::COPY.get()
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        detail_for_copy.clone(),
+                                    ));
+                                    this.mark_chat_item_copied(copy_key.clone(), abs_idx, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                    )
+                })
         });
+
         div()
             .id(SharedString::from(format!(
                 "chat-notice-{}-{row_ix}",
                 pane.get()
             )))
             .debug_selector(|| "chat-notice".into())
-            .when(!notice.detail.is_empty(), gpui::Styled::pb_2)
+            .when(joins_activity_below, gpui::Styled::pb_1)
+            .when(!joins_activity_below, gpui::Styled::pb_4)
             .w_full()
             .min_w_0()
             .flex()
@@ -2087,68 +2306,22 @@ impl Shell {
                     .w_full()
                     .min_w_0()
                     .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                    .min_h(gpui::px(24.))
                     .flex()
-                    .items_start()
-                    .gap_1p5()
-                    .text_size(ui::TEXT_SM)
-                    .text_color(muted)
-                    .child(
-                        div().flex_none().mt(gpui::px(4.)).child(
-                            gpui_component::Icon::default()
-                                .data(icon)
-                                .with_size(ui::ICON_MD)
-                                .text_color(muted),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .min_h(gpui::px(24.))
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap_1()
-                                    .when(!lead.trim().is_empty(), |d| {
-                                        d.child(lead.trim().to_owned())
-                                    })
-                                    // The tail hugs the last chip so a Korean particle
-                                    // ("의 업데이트") reads as one word with the name.
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .child(div().flex().gap_1().children(chips))
-                                            .when(!tail.is_empty(), |d| {
-                                                d.child(tail.trim_end().to_owned())
-                                            }),
-                                    ),
-                            )
-                            .when(!notice.detail.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .min_w_0()
-                                        .text_color(palette.foreground)
-                                        .child(notice.detail.clone()),
-                                )
-                            }),
-                    ),
+                    .flex_col()
+                    .child(header)
+                    .children(details),
             )
             .into_any_element()
     }
 
-    /// Orca's bot item note row: a list mark, then the change with the item as a chip that
-    /// opens the bot's items, and a comment's words after it.
+    /// Orca's bot item note row (`6edf9f05`, `c9e22e23`, `028100ad`): a list mark, then the
+    /// change with the item chip using full available row width before truncating while keeping
+    /// at least `6rem` (`96px`) readable on narrow rows, and any comment/detail yielding first.
     fn render_item_note(
         pane: super::super::PaneId,
         row_ix: usize,
         note: &work_run::ItemNote,
+        joins_activity_below: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use krill_proto::bots::BotItemStatus;
@@ -2204,15 +2377,16 @@ impl Shell {
             BotItemStatus::Done => (ui::icons::CIRCLE_CHECK_SVG, palette.success),
             BotItemStatus::Canceled => (ui::icons::CIRCLE_X_SVG, palette.muted_foreground),
         };
+        let short_chip = note.title.chars().count() <= 10;
         let chip = div()
             .id(SharedString::from(format!(
                 "chat-item-note-chip-{}-{row_ix}",
                 pane.get()
             )))
             .debug_selector(|| "chat-item-note-chip".into())
-            .flex_none()
-            .max_w(gpui::px(256.))
-            .min_w_0()
+            .when(short_chip, gpui::Styled::flex_none)
+            .when(!short_chip, |d| d.flex_shrink(1.).min_w(gpui::px(96.)))
+            .overflow_hidden()
             .px_1p5()
             .rounded(ui::RADIUS_SM)
             .bg(palette.foreground.opacity(0.07))
@@ -2224,10 +2398,12 @@ impl Shell {
             .text_size(ui::TEXT_XS)
             .text_color(palette.foreground)
             .child(
-                gpui_component::Icon::default()
-                    .data(glyph)
-                    .with_size(ui::ICON_XS)
-                    .text_color(glyph_color),
+                div().flex_none().flex().items_center().child(
+                    gpui_component::Icon::default()
+                        .data(glyph)
+                        .with_size(ui::ICON_XS)
+                        .text_color(glyph_color),
+                ),
             )
             .child(div().min_w_0().truncate().child(note.title.clone()))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -2246,6 +2422,8 @@ impl Shell {
                 pane.get()
             )))
             .debug_selector(|| "chat-item-note".into())
+            .when(joins_activity_below, gpui::Styled::pb_1)
+            .when(!joins_activity_below, gpui::Styled::pb_4)
             .w_full()
             .min_w_0()
             .flex()
@@ -2257,12 +2435,12 @@ impl Shell {
                     .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
                     .min_h(gpui::px(24.))
                     .flex()
-                    .items_start()
+                    .items_center()
                     .gap_1p5()
                     .text_size(ui::TEXT_SM)
                     .text_color(muted)
                     .child(
-                        div().flex_none().mt(gpui::px(4.)).child(
+                        div().flex_none().flex().items_center().child(
                             gpui_component::Icon::default()
                                 .data(ui::icons::LIST_TODO_SVG)
                                 .with_size(ui::ICON_MD)
@@ -2274,30 +2452,25 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .min_h(gpui::px(24.))
+                            .overflow_hidden()
                             .flex()
-                            .flex_wrap()
                             .items_center()
                             .gap_1()
-                            .when(!lead.trim().is_empty(), |d| d.child(lead.trim().to_owned()))
+                            .when(!lead.trim().is_empty(), |d| {
+                                d.child(div().flex_none().child(lead.trim().to_owned()))
+                            })
                             .child(chip)
-                            .when(!tail.trim().is_empty() || !note.detail.is_empty(), |d| {
+                            .when(!tail.trim().is_empty(), |d| {
+                                d.child(div().flex_none().child(tail.trim().to_owned()))
+                            })
+                            .when(!note.detail.is_empty(), |d| {
                                 d.child(
                                     div()
                                         .min_w_0()
                                         .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .child(div().flex_none().child(tail.trim().to_owned()))
-                                        .when(!note.detail.is_empty(), |d| {
-                                            d.child(
-                                                div()
-                                                    .min_w_0()
-                                                    .flex_1()
-                                                    .truncate()
-                                                    .text_color(palette.foreground)
-                                                    .child(format!(": {}", note.detail)),
-                                            )
-                                        }),
+                                        .truncate()
+                                        .text_color(palette.foreground)
+                                        .child(format!(": {}", note.detail)),
                                 )
                             }),
                     ),
@@ -3672,6 +3845,9 @@ impl Shell {
                     let Some(row) = rows.get(row_ix) else {
                         return div().into_any_element();
                     };
+                    let joins_activity_below = rows
+                        .get(row_ix + 1)
+                        .is_some_and(|next| next.activity_edges().0);
                     owner
                         .update(cx, |this, cx| {
                             this.render_display_row(
@@ -3680,6 +3856,7 @@ impl Shell {
                                 row,
                                 row_ix,
                                 total_rows,
+                                joins_activity_below,
                                 &list_state_for_rows,
                                 agent_state,
                                 cx,

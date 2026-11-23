@@ -479,10 +479,21 @@ fn host_icon(is_local: bool, p: &ui::Palette) -> gpui_component::Icon {
     )
 }
 
+/// Inline error message for a blocked computer when the user tries to Create (`22927c89`).
+#[must_use]
+fn blocked_computer_error(blocked: Option<&Blocked>) -> Option<&'static str> {
+    match blocked {
+        Some(Blocked::Unreachable) => Some(text::NB_VAL_OFFLINE.get()),
+        Some(Blocked::NoBots(_)) => Some(text::NB_VAL_UPDATE_KRILL.get()),
+        None => None,
+    }
+}
+
 /// Renders Orca `BotComputerPicker`.
 pub fn render_computer_picker<E: 'static>(
     prefix: &'static str,
     setup: &BotAgentSetup,
+    invalid: bool,
     lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     on_update_host: fn(&mut E, &mut Context<E>),
     p: &ui::Palette,
@@ -505,7 +516,7 @@ pub fn render_computer_picker<E: 'static>(
             .px_2p5()
             .rounded(ui::RADIUS_SM)
             .border_1()
-            .border_color(p.border)
+            .border_color(if invalid { p.destructive } else { p.border })
             .bg(p.background)
             .flex()
             .items_center()
@@ -524,7 +535,7 @@ pub fn render_computer_picker<E: 'static>(
     rows.sort_by_key(|(_, blocked)| blocked.is_some());
     let current_id = setup.host_id.clone();
 
-    Button::new(host_id_sel.clone())
+    let button = Button::new(host_id_sel.clone())
         .outline()
         .small()
         .w_full()
@@ -561,8 +572,19 @@ pub fn render_computer_picker<E: 'static>(
                 menu = menu.item(item);
             }
             menu
-        })
-        .into_any_element()
+        });
+
+    if invalid {
+        div()
+            .w_full()
+            .rounded(ui::RADIUS_SM)
+            .border_1()
+            .border_color(p.destructive)
+            .child(button)
+            .into_any_element()
+    } else {
+        button.into_any_element()
+    }
 }
 
 /// Renders Orca `BotAgentLaunchPicker` (trigger + Popover with Agent / Model / Effort / Permission + chat default hint & reset link).
@@ -570,6 +592,7 @@ pub fn render_agent_launch_picker<E: 'static>(
     prefix: &'static str,
     setup: &BotAgentSetup,
     show_chat_default_hint: bool,
+    invalid: bool,
     lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     p: &ui::Palette,
     cx: &mut Context<E>,
@@ -617,7 +640,7 @@ pub fn render_agent_launch_picker<E: 'static>(
         .px_2p5()
         .rounded(ui::RADIUS_SM)
         .border_1()
-        .border_color(p.border)
+        .border_color(if invalid { p.destructive } else { p.border })
         .bg(p.background)
         .when(!no_agents, |d| {
             d.cursor_pointer().hover(|d| d.bg(p.accent.opacity(0.4)))
@@ -658,6 +681,7 @@ pub fn render_agent_launch_picker<E: 'static>(
 
     let has_overrides = setup.has_overrides();
     let reset_id: SharedString = format!("{prefix}-use-chat-defaults").into();
+    let err_sel = format!("{prefix}-agent-error");
 
     div()
         .min_w_0()
@@ -667,10 +691,38 @@ pub fn render_agent_launch_picker<E: 'static>(
         .when(no_agents, |d| {
             d.child(
                 div()
-                    .text_size(ui::TEXT_XS)
+                    .w_full()
+                    .h(px(28.))
+                    .px_2p5()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(if invalid { p.destructive } else { p.border })
+                    .bg(p.background)
+                    .flex()
+                    .items_center()
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
-                    .child(text::NB_NO_AGENTS.get()),
+                    .child(text::NB_VAL_NO_AGENTS_SHORT.get()),
             )
+            .when(invalid, |d| {
+                d.child(
+                    div()
+                        .id(SharedString::from(err_sel.clone()))
+                        .debug_selector(move || err_sel.clone())
+                        .role(gpui::Role::Alert)
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.destructive)
+                        .child(text::NB_VAL_NO_AGENTS_AVAILABLE.get()),
+                )
+            })
+            .when(!invalid && show_chat_default_hint, |d| {
+                d.child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::NB_NO_AGENTS.get()),
+                )
+            })
         })
         .when(!no_agents, |d| {
             d.child(picker)
@@ -963,6 +1015,7 @@ pub fn render_runs_on_picker<E: 'static>(
     setup: &BotAgentSetup,
     bot_name: Option<&str>,
     taken_names: &[String],
+    show_submit_feedback: bool,
     lens: fn(&mut E) -> Option<&mut BotAgentSetup>,
     on_update_host: fn(&mut E, &mut Context<E>),
     p: &ui::Palette,
@@ -982,11 +1035,17 @@ pub fn render_runs_on_picker<E: 'static>(
     };
 
     let fields = variant == RunsOnVariant::Fields;
-    let computer_hint = if fields {
+    let computer_error = show_submit_feedback
+        .then(|| blocked_computer_error(setup.current_blocked()))
+        .flatten();
+    let agent_invalid =
+        show_submit_feedback && available_runtimes(setup.host_is_local, cx).is_empty();
+    let computer_hint = if fields || computer_error.is_some() {
         None
     } else {
         Some(text::NB_COMPUTER_HINT.get())
     };
+    let computer_err_sel = format!("{prefix}-computer-error");
     let computer_col = div()
         .min_w_0()
         .when(fields, gpui::Styled::flex_1)
@@ -997,11 +1056,21 @@ pub fn render_runs_on_picker<E: 'static>(
         .child(render_computer_picker(
             prefix,
             setup,
+            computer_error.is_some(),
             lens,
             on_update_host,
             p,
             cx,
         ))
+        .children(computer_error.map(|err| {
+            div()
+                .id(SharedString::from(computer_err_sel.clone()))
+                .debug_selector(move || computer_err_sel.clone())
+                .role(gpui::Role::Alert)
+                .text_size(ui::TEXT_XS)
+                .text_color(p.destructive)
+                .child(err)
+        }))
         .children(computer_hint.map(|h| {
             div()
                 .text_size(ui::TEXT_XS)
@@ -1017,7 +1086,13 @@ pub fn render_runs_on_picker<E: 'static>(
         .gap_1()
         .child(field_label(text::NB_AGENT.get(), fields))
         .child(render_agent_launch_picker(
-            prefix, setup, !fields, lens, p, cx,
+            prefix,
+            setup,
+            !fields,
+            agent_invalid,
+            lens,
+            p,
+            cx,
         ));
 
     let folder_line = bot_name.map(|name| {

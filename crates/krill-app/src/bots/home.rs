@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Icon, Sizable as _};
+use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::SessionId;
 use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemActor, BotItemLink, BotItemStatus};
@@ -45,6 +45,7 @@ pub(super) fn number_column_chars(max_number: u64) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RowAnchor {
     FilterChip,
+    AllClear,
     GroupHeader(u8),
     StaleConfirm,
     Need(String),
@@ -117,12 +118,12 @@ pub(super) fn reconcile_list_state(
 enum HomeNoteKind {
     Empty,
     FilteredEmpty,
-    AllClear,
 }
 
 #[derive(Debug, Clone)]
 enum HomeRow {
     FilterChip,
+    AllClear,
     GroupHeader {
         group: Group,
         first_group: bool,
@@ -157,6 +158,7 @@ enum HomeRow {
 )]
 struct HomeCacheKey {
     bot_id: BotId,
+    paused: bool,
     items_rev: u64,
     items_len: usize,
     first_sig: Option<(String, u64)>,
@@ -571,6 +573,7 @@ impl View {
     pub fn open_home_item(&mut self, uid: String, cx: &mut Context<Self>) {
         self.items.open_uid = Some(uid);
         self.items.desc_open = false;
+        self.items.open_comments.clear();
         self.items.hover_uid = None;
         cx.notify();
     }
@@ -610,6 +613,7 @@ impl View {
         let last_sig = self.items.items.last().map(|i| (i.uid.clone(), i.version));
         let next_key = HomeCacheKey {
             bot_id: bot.id.clone(),
+            paused: bot.paused,
             items_rev: self.items.items_rev,
             items_len: self.items.items.len(),
             first_sig,
@@ -700,6 +704,18 @@ impl View {
             rows.push(HomeRow::FilterChip);
             row_keys.push(RowAnchor::FilterChip);
         }
+        // Orca `eefd93a3` / `#46740`: show the greyed bot avatar above folded groups when nothing
+        // needs attention, nothing is running, and the bot isn't paused.
+        let all_clear = !self.items.items.is_empty()
+            && !filter_on
+            && !bot.paused
+            && needs.is_empty()
+            && grouped_indices[Group::NeedsYou as usize].is_empty()
+            && grouped_indices[Group::Working as usize].is_empty();
+        if all_clear {
+            rows.push(HomeRow::AllClear);
+            row_keys.push(RowAnchor::AllClear);
+        }
         let mut first_group = true;
         for group in Group::ALL {
             let indices = &grouped_indices[group as usize];
@@ -771,10 +787,7 @@ impl View {
             (grouped_indices.iter().all(Vec::is_empty) && needs.is_empty())
                 .then_some(HomeNoteKind::FilteredEmpty)
         } else {
-            (grouped_indices[Group::NeedsYou as usize].is_empty()
-                && grouped_indices[Group::Working as usize].is_empty()
-                && needs.is_empty())
-            .then_some(HomeNoteKind::AllClear)
+            None
         };
         if let Some(kind) = note {
             rows.push(HomeRow::HomeNote(kind));
@@ -812,6 +825,42 @@ impl View {
                 .pb(px(14.))
                 .child(Self::render_filter_chip(p, cx))
                 .into_any_element(),
+            HomeRow::AllClear => {
+                let dark = cx.theme().mode.is_dark();
+                let upload = self.settings.avatar_cache.get(&bot.id).cloned();
+                let face = super::avatar::render_grayscale(
+                    &super::avatar::Avatar::of(bot),
+                    upload,
+                    &bot.name,
+                    px(40.),
+                    px(9.),
+                    dark,
+                    p,
+                );
+                div()
+                    .id("bot-home-all-clear")
+                    .debug_selector(|| "bot-home-all-clear".into())
+                    .role(gpui::Role::Status)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_3()
+                    .text_center()
+                    .child(
+                        div()
+                            .debug_selector(|| "bot-home-all-clear-avatar".into())
+                            .child(face),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .child(text::HM_ALL_CLEAR.get()),
+                    )
+                    .into_any_element()
+            }
             HomeRow::GroupHeader {
                 group,
                 first_group,
@@ -1152,15 +1201,6 @@ impl View {
                         .xsmall()
                         .on_click(cx.listener(|this, _, _, cx| this.set_needs_you_only(false, cx))),
                 )
-                .into_any_element(),
-            HomeNoteKind::AllClear => div()
-                .debug_selector(|| "bot-home-all-clear".into())
-                .px_6()
-                .py_6()
-                .text_center()
-                .text_size(ui::TEXT_SM)
-                .text_color(p.muted_foreground)
-                .child(text::HM_ALL_CLEAR.get())
                 .into_any_element(),
         }
     }

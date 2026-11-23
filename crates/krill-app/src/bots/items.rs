@@ -125,6 +125,8 @@ pub(super) struct ItemsState {
     pub(super) hover_uid: Option<String>,
     /// Home: the open item's description is unclamped.
     pub(super) desc_open: bool,
+    /// Home: comment event IDs the reader explicitly expanded past the 8-line clamp.
+    pub(super) open_comments: std::collections::BTreeSet<u64>,
     /// Home: when the bot's automations ran and run next.
     pub(super) upcoming: Option<krill_proto::bots::BotUpcoming>,
     /// Home: why the last Look now failed.

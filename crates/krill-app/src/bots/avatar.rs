@@ -336,6 +336,62 @@ pub fn mascot_image(id: &'static str, background: u32) -> Option<Arc<Image>> {
     Some(image)
 }
 
+/// Desaturates all `#rrggbb` colors in an SVG string using Rec. 601 luma, for Orca's
+/// `grayscale` all-clear avatar (`eefd93a3` / `#46740`).
+fn desaturate_svg_hex_colors(svg: &str) -> String {
+    let bytes = svg.as_bytes();
+    let mut out = String::with_capacity(svg.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'#'
+            && idx + 7 <= bytes.len()
+            && bytes[idx + 1..idx + 7].iter().all(u8::is_ascii_hexdigit)
+            && !bytes.get(idx + 7).is_some_and(u8::is_ascii_hexdigit)
+            && let Some(hex) = svg.get(idx + 1..idx + 7)
+            && let Ok(rgb) = u32::from_str_radix(hex, 16)
+        {
+            let red = (rgb >> 16) & 0xff;
+            let green = (rgb >> 8) & 0xff;
+            let blue = rgb & 0xff;
+            let luma = (299 * red + 587 * green + 114 * blue + 500) / 1000;
+            out.push_str(&format_color((luma << 16) | (luma << 8) | luma));
+            idx += 7;
+            continue;
+        }
+        let Some(ch) = svg.get(idx..).and_then(|s| s.chars().next()) else {
+            break;
+        };
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+/// Grayscale mascot image, cached per mascot and background.
+#[must_use]
+pub fn mascot_image_grayscale(id: &'static str, background: u32) -> Option<Arc<Image>> {
+    type Cache = Mutex<HashMap<(&'static str, u32), Arc<Image>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Cache::default);
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(image) = cache.get(&(id, background)) {
+        return Some(image.clone());
+    }
+    let svg = desaturate_svg_hex_colors(&mascot_svg(id, background)?);
+    let image = Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()));
+    cache.insert((id, background), image.clone());
+    Some(image)
+}
+
+fn grayscale_upload_image(upload: &Arc<Image>) -> Option<Arc<Image>> {
+    let img = image::load_from_memory(upload.bytes()).ok()?.grayscale();
+    let mut png = Vec::new();
+    img.to_rgba8()
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(Arc::new(Image::from_bytes(ImageFormat::Png, png)))
+}
+
 /// What a bot's avatar shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Avatar {
@@ -403,18 +459,77 @@ pub fn render(
     radius: Pixels,
     p: &ui::Palette,
 ) -> AnyElement {
+    render_inner(avatar, upload, fallback_name, size, radius, false, false, p)
+}
+
+/// Draws `avatar` desaturated and dimmed (`grayscale opacity-50 dark:opacity-40`) for Orca's
+/// `BotItemsAllClear` (`eefd93a3` / `#46740`).
+#[must_use]
+pub fn render_grayscale(
+    avatar: &Avatar,
+    upload: Option<Arc<Image>>,
+    fallback_name: &str,
+    size: Pixels,
+    radius: Pixels,
+    dark: bool,
+    p: &ui::Palette,
+) -> AnyElement {
+    render_inner(avatar, upload, fallback_name, size, radius, true, dark, p)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared color and grayscale avatar renderer"
+)]
+fn render_inner(
+    avatar: &Avatar,
+    upload: Option<Arc<Image>>,
+    fallback_name: &str,
+    size: Pixels,
+    radius: Pixels,
+    grayscale: bool,
+    dark: bool,
+    p: &ui::Palette,
+) -> AnyElement {
+    let alpha = if !grayscale {
+        1.0
+    } else if dark {
+        0.4
+    } else {
+        0.5
+    };
     let image = match avatar {
-        Avatar::Mascot { id, background } => mascot_image(id, *background),
-        Avatar::Upload => upload,
+        Avatar::Mascot { id, background } => {
+            if grayscale {
+                mascot_image_grayscale(id, *background)
+            } else {
+                mascot_image(id, *background)
+            }
+        }
+        Avatar::Upload => {
+            if grayscale {
+                upload.and_then(|img| grayscale_upload_image(&img).or(Some(img)))
+            } else {
+                upload
+            }
+        }
         Avatar::Emoji(_) | Avatar::Initial(_) => None,
     };
     if let Some(image) = image {
-        return gpui::img(image)
+        let el = gpui::img(image)
             .flex_none()
             .size(size)
             .rounded(radius)
-            .object_fit(ObjectFit::Cover)
-            .into_any_element();
+            .object_fit(ObjectFit::Cover);
+        return if grayscale {
+            div()
+                .flex_none()
+                .opacity(alpha)
+                .child(el)
+                .into_any_element()
+        } else {
+            el.into_any_element()
+        };
     }
     let glyph = match avatar {
         Avatar::Emoji(g) | Avatar::Initial(g) => g.clone(),
@@ -434,13 +549,18 @@ pub fn render(
         .bg(p.muted)
         .border_1()
         .border_color(p.border)
+        .when(grayscale, |d| d.opacity(alpha))
         .flex()
         .items_center()
         .justify_center()
         .text_size(text)
         // Orca BotAvatarTile: `font-semibold text-foreground` on the muted tile.
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(p.foreground)
+        .text_color(if grayscale {
+            p.muted_foreground
+        } else {
+            p.foreground
+        })
         .child(glyph)
         .into_any_element()
 }

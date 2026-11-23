@@ -1780,8 +1780,9 @@ fn new_bot_dialog_lists_the_agents_own_models_and_launches_the_pick(cx: &mut Tes
         });
     });
     vcx.run_until_parked();
-    vcx.update(|_, cx| {
+    vcx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
+            d.set_name_for_test("Agy Bot", window, cx);
             d.set_model(Some("gemini-4-neon-high".to_owned()), cx);
             d.set_effort(Some("high".to_owned()), cx);
             d.set_permission(Some(Permission::Yolo), cx);
@@ -2152,13 +2153,14 @@ fn new_bot_makes_the_bot_on_the_picked_computer_and_greys_out_old_ones(cx: &mut 
         .detach();
     });
     vcx.run_until_parked();
-    vcx.update(|_, cx| {
+    vcx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
             // Krill on "Old" predates bots: it can't be picked.
             d.select_host(&old_id, cx);
             assert_eq!(d.host(), &HostId::Local);
             d.select_host(&studio_id, cx);
             assert_eq!(d.host(), &studio_id);
+            d.set_name_for_test("Studio Bot", window, cx);
             d.submit(cx);
         });
     });
@@ -3382,5 +3384,292 @@ fn u47_find_imported_bot_matches_direct_and_precomputed_canonical_without_fs() {
             None,
         )
         .is_none()
+    );
+}
+
+/// Commit 5 (`eefd93a3`): Bot Home and Group panels show the greyed 40px bot/group avatar above
+/// folded groups when nothing needs attention and nothing is running, and hide it when paused.
+#[gpui::test]
+fn bot_home_and_group_all_clear_show_avatar_above_folded_groups_and_hide_when_paused(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut bot = sample_bot("clear-bot", "Clear Bot");
+    bot.avatar = Some("B1".into());
+    let now = super::now_unix_ms();
+    let planned = krill_proto::bots::BotItem {
+        uid: "item-planned".into(),
+        number: 1,
+        owner_bot_id: bot.id.clone(),
+        title: "Backlog cleanup".into(),
+        description: None,
+        done_means: None,
+        status: BotItemStatus::Planned,
+        snoozed_until_ms: None,
+        close_note: None,
+        closed_at_ms: None,
+        links: Vec::new(),
+        events: Vec::new(),
+        version: 1,
+        created_at_ms: now,
+        updated_at_ms: now,
+        last_activity_at_ms: now,
+    };
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot.clone()],
+        items: vec![planned.clone()],
+        ..MockState::default()
+    }));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut v = View::with_rpc(rpc, None, cx).into_panel();
+        v.bots = vec![bot.clone()];
+        v.selected_bot_id = Some(bot.id.clone());
+        v.items.set_items(vec![planned.clone()]);
+        v
+    });
+    vcx.run_until_parked();
+
+    // All clear avatar appears above the folded Planned group.
+    let all_clear = vcx
+        .debug_bounds("bot-home-all-clear")
+        .expect("BotItemsAllClear should render when only Planned items exist");
+    let avatar_bounds = vcx
+        .debug_bounds("bot-home-all-clear-avatar")
+        .expect("40px greyed bot avatar should render in AllClear");
+    let planned_header = vcx
+        .debug_bounds("bot-home-group-planned")
+        .expect("Planned group header");
+    assert!(
+        all_clear.top() < planned_header.top(),
+        "AllClear must sit above folded groups: all_clear={:?} planned={:?}",
+        all_clear.top(),
+        planned_header.top()
+    );
+    assert_eq!(avatar_bounds.size.width, px(40.));
+    assert_eq!(avatar_bounds.size.height, px(40.));
+
+    // Pausing the bot hides AllClear.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.bots[0].paused = true;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("bot-home-all-clear").is_none(),
+        "Paused bot must not show AllClear"
+    );
+
+    // Group panel AllClear shows 40px group faces when active and hides when all members paused.
+    let mut grp_item = planned.clone();
+    grp_item.uid = "item-grp-planned".into();
+    grp_item.description = Some("grp-clear".into());
+    state.lock().unwrap().items = vec![grp_item.clone()];
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.bots[0].paused = false;
+            v.group_panel.all_items = vec![grp_item];
+            v.show_group_in_panel("grp-clear", &[bot.id.clone()], &[], cx);
+            v.clear_group_filters(cx);
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("bot-group-all-clear").is_some(),
+        "Group panel should render AllClear with default filters and only Planned items"
+    );
+    let grp_avatar = vcx
+        .debug_bounds("bot-group-all-clear-avatar")
+        .expect("group AllClear avatar");
+    assert_eq!(grp_avatar.size.width, px(40.));
+    assert_eq!(grp_avatar.size.height, px(40.));
+}
+
+/// Commit 6 (`d6cc2684`): an agent's long asking comment above an open question is shown whole
+/// while waiting, and regular/answered long comments clamp at 8 lines with a Show more toggle.
+#[gpui::test]
+fn waiting_question_comment_is_shown_whole_and_settled_comment_clamps(
+    cx: &mut gpui::TestAppContext,
+) {
+    use krill_proto::bots::{BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind};
+
+    let bot = sample_bot("ask-bot", "Ask Bot");
+    let long_body = (1..=14)
+        .map(|i| format!("Line {i}: detailed explanation of the choice."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let settled_comment = BotItemEvent {
+        id: 1,
+        item_uid: "item-ask".into(),
+        kind: BotItemEventKind::Commented,
+        actor: BotItemActor::Bot {
+            bot_id: bot.id.clone(),
+            session_id: None,
+        },
+        text: long_body.clone(),
+        decisions: Vec::new(),
+        created_at_ms: 1_000,
+    };
+    let asking_comment = BotItemEvent {
+        id: 2,
+        item_uid: "item-ask".into(),
+        kind: BotItemEventKind::Commented,
+        actor: BotItemActor::Bot {
+            bot_id: bot.id.clone(),
+            session_id: None,
+        },
+        text: long_body,
+        decisions: vec![BotItemDecision {
+            question: "Proceed with option A?".into(),
+            options: vec!["Yes".into(), "No".into()],
+            recommended: Some(0),
+        }],
+        created_at_ms: 2_000,
+    };
+    let item = krill_proto::bots::BotItem {
+        uid: "item-ask".into(),
+        number: 7,
+        owner_bot_id: bot.id.clone(),
+        title: "Choose migration strategy".into(),
+        description: None,
+        done_means: None,
+        status: BotItemStatus::NeedsYou,
+        snoozed_until_ms: None,
+        close_note: None,
+        closed_at_ms: None,
+        links: Vec::new(),
+        events: vec![settled_comment, asking_comment],
+        version: 1,
+        created_at_ms: 1_000,
+        updated_at_ms: 2_000,
+        last_activity_at_ms: 2_000,
+    };
+    let state = Arc::new(Mutex::new(MockState {
+        bots: vec![bot.clone()],
+        items: vec![item.clone()],
+        ..MockState::default()
+    }));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let rpc = make_mock_rpc(state);
+    let (_view, vcx) = cx.add_window_view(|_, cx| {
+        let mut v = View::with_rpc(rpc, None, cx).into_panel();
+        v.bots = vec![bot.clone()];
+        v.selected_bot_id = Some(bot.id.clone());
+        v.items.set_items(vec![item.clone()]);
+        v.open_home_item(item.uid.clone(), cx);
+        v
+    });
+    vcx.run_until_parked();
+
+    // Event 2 (waiting open question) is rendered whole with NO Show more toggle.
+    assert!(
+        vcx.debug_bounds("bot-item-comment-whole").is_some(),
+        "Waiting question comment must render whole"
+    );
+    assert!(
+        vcx.debug_bounds("bot-item-comment-toggle-2").is_none(),
+        "Waiting question comment must not have a clamp toggle"
+    );
+    // Event 1 (settled long comment) IS clamped at 8 lines with a toggle button.
+    let clamped = vcx
+        .debug_bounds("bot-item-comment-clamped")
+        .expect("Settled long comment must clamp");
+    assert!(
+        clamped.size.height <= px(154.),
+        "Clamped comment height should be capped around 152px, got {:?}",
+        clamped.size.height
+    );
+    let toggle = vcx
+        .debug_bounds("bot-item-comment-toggle-1")
+        .expect("Settled long comment should have Show more toggle");
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("bot-item-comment-clamped").is_none(),
+        "Clicking Show more must unclamp the settled comment"
+    );
+}
+
+/// Commit 7 (`22927c89`): Create stays enabled on New bot, reveals inline validation on empty
+/// submit without calling `CreateBotV2`, clears error when typed, and waits while a picture loads.
+#[gpui::test]
+fn new_bot_keeps_create_available_and_validates_inline(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let rpc = make_mock_rpc(state.clone());
+    let (dialog, vcx) = cx.add_window_view(|window, cx| {
+        super::new_bot::NewBot::new(
+            vec![super::new_bot::HostChoice {
+                id: crate::hosts::HostId::Local,
+                label: "This Mac".into(),
+                rpc,
+            }],
+            Vec::new(),
+            None,
+            window,
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    // No error before first submit attempt.
+    assert!(vcx.debug_bounds("new-bot-name-error").is_none());
+
+    // Clicking Create on an empty form shows inline "Add a name" without sending CreateBotV2.
+    let create_btn = vcx
+        .debug_bounds("new-bot-create")
+        .expect("Create button must be rendered");
+    vcx.simulate_click(create_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| dialog.read(cx).is_submitted()));
+    assert!(
+        vcx.debug_bounds("new-bot-name-error").is_some(),
+        "Empty submit must display inline Add a name error"
+    );
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| !matches!(r, BotRpcRequest::CreateBotV2(_))),
+        "Invalid submit must not call CreateBotV2"
+    );
+
+    // Typing a name clears the inline error and allows Create to succeed.
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_name_for_test("Scout", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("new-bot-name-error").is_none(),
+        "Typing a name must clear the inline error"
+    );
+
+    let create_btn = vcx.debug_bounds("new-bot-create").expect("Create button");
+    vcx.simulate_click(create_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| matches!(r, BotRpcRequest::CreateBotV2(p) if p.base.name == "Scout")),
+        "Valid submit must call CreateBotV2 with the entered name"
     );
 }
