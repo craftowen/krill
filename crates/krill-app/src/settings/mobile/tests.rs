@@ -733,49 +733,61 @@ fn relay_click_starts_desktop_sign_in_and_resumes_pairing_once(cx: &mut gpui::Te
 #[gpui::test]
 fn mobile_page_sidebar_toggle_fits_without_overlap_or_shift(cx: &mut gpui::TestAppContext) {
     let (_view, vcx) = offer_view(cx, true);
-    for width in [360., 480., 720., 959., 1100.] {
-        for scale in [1., 1.25, 1.5, 2.] {
-            redraw(vcx, width, scale);
-            let toggle = vcx
-                .debug_bounds("mobile-page-sidebar-toggle")
-                .expect("sidebar toggle");
-            let close = vcx.debug_bounds("mobile-page-close").expect("close");
-            let card = vcx.debug_bounds("mobile-page-card").expect("card");
-            assert!(
-                inside(span(toggle), (0., width)) && inside(span(close), (0., width)),
-                "toolbar clipped at w={width} @{scale}x: toggle={toggle:?} close={close:?}"
-            );
-            assert!(
-                toggle.right() <= close.left(),
-                "toggle overlaps close at w={width} @{scale}x: toggle={toggle:?} close={close:?}"
-            );
-            assert!(
-                toggle.bottom() <= card.top() && close.bottom() <= card.top(),
-                "toolbar overlaps card at w={width} @{scale}x: toggle={toggle:?} close={close:?} card={card:?}"
-            );
+    // 실제 앱처럼 초기 설정·언어를 먼저 적용해 첫 클릭에서 시스템 로캘 전환으로 인한
+    // 일회성 폭 변화가 섞이지 않게 하고, 한·영 양쪽에서 겹침·잘림·레이아웃 이동 없음을 검증한다.
+    for language in [crate::i18n::Language::En, crate::i18n::Language::Ko] {
+        vcx.update(|_, cx| {
+            super::super::edit_or_in_memory(cx, move |s| {
+                s.language = language;
+                s.show_mobile_button = true;
+            });
+        });
+        vcx.run_until_parked();
+
+        for width in [360., 480., 720., 959., 1100.] {
+            for scale in [1., 1.25, 1.5, 2.] {
+                redraw(vcx, width, scale);
+                let toggle = vcx
+                    .debug_bounds("mobile-page-sidebar-toggle")
+                    .expect("sidebar toggle");
+                let close = vcx.debug_bounds("mobile-page-close").expect("close");
+                let card = vcx.debug_bounds("mobile-page-card").expect("card");
+                assert!(
+                    inside(span(toggle), (0., width)) && inside(span(close), (0., width)),
+                    "toolbar clipped ({language:?}) at w={width} @{scale}x: toggle={toggle:?} close={close:?}"
+                );
+                assert!(
+                    toggle.right() <= close.left(),
+                    "toggle overlaps close ({language:?}) at w={width} @{scale}x: toggle={toggle:?} close={close:?}"
+                );
+                assert!(
+                    toggle.bottom() <= card.top() && close.bottom() <= card.top(),
+                    "toolbar overlaps card ({language:?}) at w={width} @{scale}x: toggle={toggle:?} close={close:?} card={card:?}"
+                );
+            }
         }
+
+        redraw(vcx, 959., 1.);
+        let before_toggle = vcx.debug_bounds("mobile-page-sidebar-toggle").unwrap();
+        let before_close = vcx.debug_bounds("mobile-page-close").unwrap();
+        vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
+
+        vcx.simulate_click(before_toggle.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert!(!super::super::current(cx).show_mobile_button));
+        assert_eq!(
+            vcx.debug_bounds("mobile-page-sidebar-toggle").unwrap(),
+            before_toggle,
+            "reserved label must prevent toggle button layout shift ({language:?})"
+        );
+        assert_eq!(
+            vcx.debug_bounds("mobile-page-close").unwrap(),
+            before_close,
+            "close button must not shift when sidebar toggle label changes ({language:?})"
+        );
+
+        vcx.simulate_click(before_toggle.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
     }
-
-    redraw(vcx, 959., 1.);
-    let before_toggle = vcx.debug_bounds("mobile-page-sidebar-toggle").unwrap();
-    let before_close = vcx.debug_bounds("mobile-page-close").unwrap();
-    vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
-
-    vcx.simulate_click(before_toggle.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert!(!super::super::current(cx).show_mobile_button));
-    assert_eq!(
-        vcx.debug_bounds("mobile-page-sidebar-toggle").unwrap(),
-        before_toggle,
-        "reserved label must prevent toggle button layout shift"
-    );
-    assert_eq!(
-        vcx.debug_bounds("mobile-page-close").unwrap(),
-        before_close,
-        "close button must not shift when sidebar toggle label changes"
-    );
-
-    vcx.simulate_click(before_toggle.center(), gpui::Modifiers::default());
-    vcx.run_until_parked();
-    vcx.update(|_, cx| assert!(super::super::current(cx).show_mobile_button));
 }
