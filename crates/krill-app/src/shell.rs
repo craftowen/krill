@@ -8795,13 +8795,13 @@ impl Render for Shell {
                 this.cycle_session_focus(1, cx);
             }))
             .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
-                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                if this.has_dialog_or_viewer_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 this.navigate_back(Some(window), cx);
             }))
             .on_action(cx.listener(|this, _: &NavigateForward, window, cx| {
-                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                if this.has_dialog_or_viewer_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 this.navigate_forward(Some(window), cx);

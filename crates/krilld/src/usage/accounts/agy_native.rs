@@ -9,15 +9,15 @@
 //! - 예전 Krill은 활성 Codex 토큰을 `~/.codex/auth.json`에 복사했다. 그때 기본 경로에서 갱신된 토큰은
 //!   같은 신원의 프로필로 한 번만 옮긴다(Orca `legacy-shared-auth-migration`).
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::io::Read as _;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::io::Write as _;
 use std::path::Path;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 use std::time::{Duration, Instant};
 
 use krill_proto::usage::ProviderKind;
@@ -523,7 +523,7 @@ fn valid_token(raw: &[u8]) -> bool {
         && serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|v| v.is_object())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn run_command_with_timeout(
     cmd: &mut Command,
     stdin_bytes: Option<&[u8]>,
