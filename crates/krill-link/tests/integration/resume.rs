@@ -658,3 +658,253 @@ async fn shorter_peer_grace_expires_the_local_socket_without_a_network_resume() 
     assert!(matches!(result, Ok(0) | Err(_)));
     fixture.shutdown().await;
 }
+
+/// LL-06: dropping the QUIC connection after the `[0]` status byte and before the 54-byte
+/// `Hello` reply must be treated as a transport failure and retried, not fatal protocol closure.
+#[tokio::test]
+async fn mid_handshake_connection_loss_after_status_byte_retries_and_resumes() {
+    let base = tmp().join(format!("m134-ll06-{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    LinkConfig {
+        relay: RelaySetting::Off,
+        resume_grace_ms: 5000,
+        ..LinkConfig::default()
+    }
+    .save(&base)
+    .unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(vec![krill_link::ALPN_LINK.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
+        .clear_ip_transports()
+        .bind_addr(("127.0.0.1", 0))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    upsert_host(
+        &base,
+        RemoteHost::from_endpoint_addr("flaky".to_owned(), "flaky", &endpoint.addr(), 0),
+    )
+    .unwrap();
+    let peer = endpoint.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let fake_server = tokio::spawn(async move {
+        // Attempt 1: send `[0]` then immediately drop the QUIC connection before the 54-byte Hello.
+        let conn1 = peer
+            .accept()
+            .await
+            .unwrap()
+            .accept()
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send1, mut recv1) = conn1.accept_bi().await.unwrap();
+        let mut preamble1 = [0; 54];
+        recv1.read_exact(&mut preamble1).await.unwrap();
+        send1.write_all(&[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        conn1.close(0u32.into(), b"drop mid-hello");
+
+        // Attempt 2: client retries with Resume on the reconnected QUIC session and succeeds.
+        let conn2 = peer
+            .accept()
+            .await
+            .unwrap()
+            .accept()
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send2, mut recv2) = conn2.accept_bi().await.unwrap();
+        let mut preamble2 = [0; 54];
+        recv2.read_exact(&mut preamble2).await.unwrap();
+        assert_eq!(&preamble2[5..21], &preamble1[5..21]);
+        assert_eq!(
+            preamble2[4] & 1,
+            1,
+            "retry after ambiguous Open must set resume=1"
+        );
+        let mut reply = preamble2;
+        reply[29..37].fill(0);
+        reply[46..54].copy_from_slice(&4u64.to_le_bytes());
+        send2.write_all(&[0]).await.unwrap();
+        send2.write_all(&reply).await.unwrap();
+        let (offset, payload) = raw_read_data(&mut recv2).await;
+        assert_eq!(offset, 0);
+        assert_eq!(payload, b"ping");
+        let mut ack = [0; 14];
+        ack[0] = 2;
+        ack[2..10].copy_from_slice(&4u64.to_le_bytes());
+        send2.write_all(&ack).await.unwrap();
+        raw_data(&mut send2, 0, b"pong").await;
+        done_rx.await.unwrap();
+    });
+
+    let tunnel = start_tunnel(ConnectOptions::new(base.clone(), "flaky"))
+        .await
+        .unwrap();
+    let mut app = UnixStream::connect(tunnel.socket_path()).await.unwrap();
+    app.write_all(b"ping").await.unwrap();
+    let mut got = [0; 4];
+    tokio::time::timeout(WAIT, app.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got, b"pong");
+    done_tx.send(()).unwrap();
+    fake_server.await.unwrap();
+    tunnel.shutdown().await;
+    endpoint.close().await;
+    fs::remove_dir_all(base).ok();
+}
+
+/// LL-07: a QUIC `RESET_STREAM` on generation N arriving while generation N is still attached
+/// must not destroy the client logical stream; generation N+1 takes over cleanly.
+#[tokio::test]
+async fn stream_reset_on_active_generation_survives_and_resumes_on_reconnect() {
+    let base = tmp().join(format!("m134-ll07-{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    LinkConfig {
+        relay: RelaySetting::Off,
+        resume_grace_ms: 5000,
+        ..LinkConfig::default()
+    }
+    .save(&base)
+    .unwrap();
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(vec![krill_link::ALPN_LINK.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
+        .clear_ip_transports()
+        .bind_addr(("127.0.0.1", 0))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    upsert_host(
+        &base,
+        RemoteHost::from_endpoint_addr("reset".to_owned(), "reset", &endpoint.addr(), 0),
+    )
+    .unwrap();
+    let peer = endpoint.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let fake_server = tokio::spawn(async move {
+        let conn1 = peer
+            .accept()
+            .await
+            .unwrap()
+            .accept()
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send1, mut recv1) = conn1.accept_bi().await.unwrap();
+        let mut preamble1 = [0; 54];
+        recv1.read_exact(&mut preamble1).await.unwrap();
+        let mut reply1 = preamble1;
+        reply1[29..37].fill(0);
+        reply1[46..54].fill(0);
+        send1.write_all(&[0]).await.unwrap();
+        send1.write_all(&reply1).await.unwrap();
+        let (offset, first) = raw_read_data(&mut recv1).await;
+        assert_eq!((offset, first.as_slice()), (0, b"one".as_slice()));
+        // Emit QUIC RESET_STREAM on gen 1 while conn1 is still open, then close conn1 so client reconnects.
+        send1.reset(0u32.into()).ok();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        conn1.close(0u32.into(), b"takeover");
+
+        let conn2 = peer
+            .accept()
+            .await
+            .unwrap()
+            .accept()
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send2, mut recv2) = conn2.accept_bi().await.unwrap();
+        let mut preamble2 = [0; 54];
+        recv2.read_exact(&mut preamble2).await.unwrap();
+        assert_eq!(&preamble2[5..21], &preamble1[5..21]);
+        let mut reply2 = preamble2;
+        reply2[29..37].copy_from_slice(&3u64.to_le_bytes());
+        reply2[46..54].copy_from_slice(&2u64.to_le_bytes());
+        send2.write_all(&[0]).await.unwrap();
+        send2.write_all(&reply2).await.unwrap();
+        raw_data(&mut send2, 0, b"ok").await;
+        done_rx.await.unwrap();
+    });
+
+    let tunnel = start_tunnel(ConnectOptions::new(base.clone(), "reset"))
+        .await
+        .unwrap();
+    let mut app = UnixStream::connect(tunnel.socket_path()).await.unwrap();
+    app.write_all(b"one").await.unwrap();
+    let mut got = [0; 2];
+    tokio::time::timeout(WAIT, app.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got, b"ok");
+    done_tx.send(()).unwrap();
+    fake_server.await.unwrap();
+    tunnel.shutdown().await;
+    endpoint.close().await;
+    fs::remove_dir_all(base).ok();
+}
+
+/// LL-11: half-closed RPC survives an outage+resume without duplicate FIN killing the response,
+/// and a duplicate raw `Kind::Fin` at the committed offset is idempotent.
+#[tokio::test]
+async fn half_closed_rpc_survives_outage_and_duplicate_fin_is_idempotent() {
+    let f = Fixture::new(5000, 1024 * 1024).await;
+    let (mut app, mut upstream) = f.pair().await;
+    app.write_all(b"req").await.unwrap();
+    app.shutdown().await.unwrap();
+    let mut req = Vec::new();
+    tokio::time::timeout(WAIT, upstream.read_to_end(&mut req))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(req, b"req");
+
+    // Outage after client's FIN is already acknowledged, while response is still pending.
+    f.tunnel.set_transport_offline(true);
+    f.wait_for(|s| s.state == StreamPhase::Suspended && s.disconnect_count >= 1)
+        .await;
+    f.tunnel.set_transport_offline(false);
+    f.wait_for(|s| s.state == StreamPhase::Normal).await;
+
+    upstream.write_all(b"resp-after-outage").await.unwrap();
+    upstream.shutdown().await.unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(WAIT, app.read_to_end(&mut resp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp, b"resp-after-outage");
+
+    // Also verify raw duplicate Kind::Fin frame at committed offset is idempotent on server.
+    let endpoint = raw_endpoint(&f.base.join("c")).await;
+    let conn = endpoint
+        .connect(f.server.endpoint_addr(), krill_link::ALPN_LINK)
+        .await
+        .unwrap();
+    let id = krill_link::StreamId([23; 16]);
+    let (mut send, mut recv, _) = open_raw(&conn, hello(id, 1, 0, false)).await;
+    let (mut upstream2, _) = f.listener.accept().await.unwrap();
+    let mut fin = [0; 14];
+    fin[0] = 3; // Kind::Fin at offset 0
+    send.write_all(&fin).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(WAIT, upstream2.read_to_end(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(buf.is_empty());
+    // Send a duplicate Kind::Fin at the same offset 0.
+    send.write_all(&fin).await.unwrap();
+    upstream2.write_all(b"still-open").await.unwrap();
+    let (offset, data) = raw_read_data(&mut recv).await;
+    assert_eq!((offset, data.as_slice()), (0, b"still-open".as_slice()));
+    endpoint.close().await;
+    f.shutdown().await;
+}

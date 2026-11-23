@@ -128,13 +128,17 @@ fn raise_nofile() {
 
 impl Holder {
     fn event_loop(&mut self) -> io::Result<()> {
-        let mut changes: Vec<Event> = [Signal::CHILD, Signal::TERM, Signal::HUP, Signal::INT]
-            .map(|signal| {
-                let filter = EventFilter::Signal { signal, times: 0 };
-                Event::new(filter, EventFlags::ADD, std::ptr::null_mut())
-            })
-            .into();
+        let null = std::ptr::null_mut();
+        let signals = [Signal::CHILD, Signal::TERM, Signal::HUP, Signal::INT].map(|signal| {
+            let filter = EventFilter::Signal { signal, times: 0 };
+            Event::new(filter, EventFlags::ADD | EventFlags::RECEIPT, null)
+        });
         let mut events = Vec::with_capacity(8);
+        sys::wait(self.kq.as_fd(), &signals, &mut events, Some(Duration::ZERO))?;
+        let err = |e: &Event| i32::try_from(e.data()).ok().filter(|&n| n != 0);
+        if let Some(code) = events.iter().find_map(err) {
+            return Err(io::Error::from_raw_os_error(code));
+        }
         self.reap();
         loop {
             if self.krilld.is_none()
@@ -171,20 +175,13 @@ impl Holder {
             self.teardowns.retain(|t| t.due().is_some());
             let link = self.krilld.as_ref().and_then(|k| k.link.as_ref());
             let link = link.map(|l| l.as_fd().as_raw_fd());
-            if let Some(fd) = link {
-                changes.push(Event::new(
-                    EventFilter::Read(fd),
-                    EventFlags::ADD,
-                    std::ptr::null_mut(),
-                ));
-            }
+            let read = link.map(|fd| Event::new(EventFilter::Read(fd), EventFlags::ADD, null));
             let next = self.teardowns.iter().filter_map(Teardown::due);
             let timeout = next
                 .chain(self.restart_at)
                 .min()
                 .map(|at| at.saturating_duration_since(Instant::now()));
-            sys::wait(self.kq.as_fd(), &changes, &mut events, timeout)?;
-            changes.clear();
+            sys::wait(self.kq.as_fd(), read.as_slice(), &mut events, timeout)?;
             // 읽기를 먼저 처리한다. 이 묶음 안에서 링크는 닫힐 수만 있고 새로 생기지 않는다.
             if events
                 .iter()
@@ -380,11 +377,13 @@ impl Holder {
                 } else {
                     self.on_krilld_exit(code == Some(KRILLD_HANDOVER_FAILED));
                 }
-            } else if let Some(s) = Self::reap_target(&mut self.sessions, pid) {
-                s.status = Some(status);
-                let id = s.id;
-                self.send(&FromHolder::Exited { id, status });
+            } else {
                 self.teardowns.iter_mut().for_each(|t| t.exited(pid));
+                if let Some(s) = Self::reap_target(&mut self.sessions, pid) {
+                    s.status = Some(status);
+                    let id = s.id;
+                    self.send(&FromHolder::Exited { id, status });
+                }
             }
         }
     }
@@ -409,6 +408,7 @@ impl Holder {
 
     /// `Adopt`한 세션이 끝났다. 자식이 아니라 상태를 거둘 수 없다 → [`STATUS_UNKNOWN`].
     fn on_adopted_exit(&mut self, pid: Pid) {
+        self.teardowns.iter_mut().for_each(|t| t.exited(pid));
         let mut live = self
             .sessions
             .iter_mut()
@@ -417,7 +417,6 @@ impl Holder {
             let (id, status) = (s.id, STATUS_UNKNOWN);
             s.status = Some(status);
             self.send(&FromHolder::Exited { id, status });
-            self.teardowns.iter_mut().for_each(|t| t.exited(pid));
         }
     }
 
@@ -585,7 +584,7 @@ impl Holder {
         let adopted: Vec<Pid> = self
             .sessions
             .iter()
-            .filter(|s| s.adopted)
+            .filter(|s| s.adopted && s.status.is_none())
             .map(|s| s.pid)
             .collect();
         for p in adopted {

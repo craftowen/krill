@@ -190,6 +190,14 @@ fn accept(
     }
 }
 
+fn prepare_accepted_socket(socket: &UnixStream) -> io::Result<UnixStream> {
+    // Winsock2 accept() inherits FIONBIO from the non-blocking listener.
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(READ_POLL))?;
+    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    socket.try_clone()
+}
+
 fn bridge(
     mut socket: UnixStream,
     opts: &SshOptions,
@@ -197,9 +205,7 @@ fn bridge(
     program: &OsStr,
     stopped: &AtomicBool,
 ) -> io::Result<()> {
-    socket.set_read_timeout(Some(READ_POLL))?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let mut back = socket.try_clone()?;
+    let mut back = prepare_accepted_socket(&socket)?;
     let mut args = opts.common_args(10);
     args.extend([
         "-T".into(),
@@ -278,6 +284,34 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn accepted_socket_from_nonblocking_listener_becomes_blocking_with_timeout() {
+        let path = std::env::temp_dir().join(format!("kh915-nb-{}.sock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        let _back = prepare_accepted_socket(&accepted).unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let err = accepted.read(&mut buf).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ),
+            "unexpected read error: {err:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "accepted socket remained non-blocking: elapsed {:?}",
+            started.elapsed()
+        );
+        drop((accepted, client, listener));
+        std::fs::remove_file(&path).ok();
     }
 
     // 외부 네트워크를 쓰는 실측은 명시 실행한다. 일반 테스트는 네트워크에 접속하지 않는다.

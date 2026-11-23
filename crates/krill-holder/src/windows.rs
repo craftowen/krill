@@ -49,7 +49,7 @@ impl Session {
         size: Option<WinSize>,
         mut handles: Vec<OwnedHandle>,
     ) -> io::Result<Self> {
-        if handles.len() != 8 {
+        if handles.len() != 8 && !(api.inbox() && handles.len() == 6) {
             return Err(io::ErrorKind::InvalidData.into());
         }
         let mut pop = || {
@@ -213,6 +213,12 @@ impl Holder {
                 d.target.as_handle(),
             )
     }
+    fn drop_link(&mut self) {
+        if let Some(d) = &mut self.daemon {
+            sys::terminate(&d.process).ok();
+            d.link = None;
+        }
+    }
     fn poll(&mut self) -> bool {
         if self.daemon.is_none() && !self.parked && Instant::now() >= self.restart {
             match self.start() {
@@ -251,11 +257,7 @@ impl Holder {
                     d.link = None;
                 }
             }
-            Some(Err(_)) => {
-                if let Some(d) = &mut self.daemon {
-                    d.link = None;
-                }
-            }
+            Some(Err(_)) => self.drop_link(),
             None => {}
         }
         if let Some((status, uptime)) = exited
@@ -287,8 +289,8 @@ impl Holder {
             s.console.close();
             events.push(FromHolder::Exited { id: s.id, status });
         }
-        for m in events {
-            self.send(&m, None).ok();
+        if events.iter().any(|m| self.send(m, None).is_err()) {
+            self.drop_link();
         }
         self.idle()
     }
@@ -364,21 +366,16 @@ impl Holder {
             Ok(m) => self.handle(m, packet.fds),
             Err(_) => Err(io::Error::from_raw_os_error(38)),
         };
-        match result {
-            Ok(Some(m)) => {
-                self.send(&m, None).ok();
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.send(
-                    &FromHolder::Failed {
-                        req,
-                        errno: e.raw_os_error().unwrap_or(5),
-                    },
-                    None,
-                )
-                .ok();
-            }
+        let reply = match result {
+            Ok(Some(m)) => Some(m),
+            Ok(None) => None,
+            Err(e) => Some(FromHolder::Failed {
+                req,
+                errno: e.raw_os_error().unwrap_or(5),
+            }),
+        };
+        if reply.is_some_and(|m| self.send(&m, None).is_err()) {
+            self.drop_link();
         }
         false
     }
@@ -458,11 +455,8 @@ impl Holder {
                 };
                 // 전송 실패해도 세션은 holder에 남고 다음 krilld가 받는다.
                 self.sessions.push(session);
-                if self.send(&message, self.sessions.last()).is_err()
-                    && let Some(d) = &mut self.daemon
-                {
-                    sys::terminate(&d.process).ok();
-                    d.link = None;
+                if self.send(&message, self.sessions.last()).is_err() {
+                    self.drop_link();
                 }
                 return Ok(None);
             }
@@ -1041,5 +1035,71 @@ mod tests {
 
         assert!(parse_handoff("9 4242\n7 101 live 160\n", 4 + 8).is_err());
         assert!(parse_handoff(&metadata, 4 + 8).is_err());
+    }
+
+    #[test]
+    fn framing_error_terminates_live_daemon_and_drops_link() {
+        use std::os::windows::process::CommandExt as _;
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/K"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let process = Process {
+            handle: child.as_handle().try_clone_to_owned().unwrap(),
+            pid: child.id(),
+        };
+        let (link, peer) = Link::pair().unwrap();
+        // Send an oversized invalid frame length (u32::MAX) so drain_nowait returns Err.
+        peer.send(&[1, 0, 0xff, 0xff, 0xff, 0xff], &[]).unwrap();
+        let mut h = holder();
+        h.daemon = Some(Daemon {
+            process,
+            target: sys::duplicate_target(std::process::id()).unwrap(),
+            link: Some(link),
+            started: Instant::now(),
+        });
+        assert!(!h.poll());
+        assert!(
+            h.daemon.as_ref().is_some_and(|d| d.link.is_none()),
+            "framing error must drop link"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "wedged daemon was not terminated on framing error"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!h.poll());
+        assert!(
+            h.daemon.is_none(),
+            "terminated daemon must be reaped for restart"
+        );
+        drop((h, peer));
+    }
+
+    #[test]
+    fn inbox_session_restore_accepts_six_handles_when_inbox_mode() {
+        let (read, _write) = std::io::pipe().unwrap();
+        let handles = (0..6)
+            .map(|_| read.as_handle().try_clone_to_owned())
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let api = Api::load();
+        let res = Session::restore(api, SessionId(42), std::process::id(), None, None, handles);
+        if api.inbox() {
+            let s = res.unwrap();
+            assert_eq!(s.handles().len(), 6);
+        } else {
+            assert_eq!(
+                res.err().map(|e| e.kind()),
+                Some(io::ErrorKind::InvalidData)
+            );
+        }
     }
 }
