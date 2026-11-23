@@ -111,6 +111,7 @@ pub enum GateCallbackOutcome {
     Resolved { gate_id: String, decision: String },
     PendingAccess(BotAccessRequest),
     Denied,
+    Paused,
     InvalidPayload,
     Failed(String),
 }
@@ -126,6 +127,7 @@ impl GateCallbackOutcome {
                 req.token
             ),
             Self::Denied => "You do not have permission to resolve this request.".to_owned(),
+            Self::Paused => "This bot is currently paused.".to_owned(),
             Self::InvalidPayload => "Unsupported or expired action.".to_owned(),
             Self::Failed(_) => {
                 "Could not record that decision (the request may already be closed).".to_owned()
@@ -228,6 +230,22 @@ impl ConversationRouter {
         self.handle_inbound_message_at(msg, target, sender, now_ms())
     }
 
+    /// Routes an inbound message and invokes `on_allowed` ONLY after `paused`, channel/guild,
+    /// workspace, and user access checks all pass (e.g. for deferred attachment downloads).
+    /// Returns `None` if `on_allowed` decides there is nothing left to dispatch.
+    pub fn handle_inbound_message_with_loader<F>(
+        &self,
+        msg: InboundExternalMessage,
+        target: DeliveryTarget,
+        sender: &dyn PlatformSender,
+        on_allowed: F,
+    ) -> Option<InboundRouteOutcome>
+    where
+        F: FnOnce(&mut InboundExternalMessage) -> bool,
+    {
+        self.handle_inbound_message_at_with_loader(msg, target, sender, now_ms(), on_allowed)
+    }
+
     /// Deterministic-clock version of [`Self::handle_inbound_message`] for testing throttling/replay.
     pub fn handle_inbound_message_at(
         &self,
@@ -236,19 +254,35 @@ impl ConversationRouter {
         sender: &dyn PlatformSender,
         ts_ms: u64,
     ) -> InboundRouteOutcome {
+        self.handle_inbound_message_at_with_loader(msg, target, sender, ts_ms, |_| true)
+            .unwrap_or(InboundRouteOutcome::Denied)
+    }
+
+    fn handle_inbound_message_at_with_loader<F>(
+        &self,
+        mut msg: InboundExternalMessage,
+        target: DeliveryTarget,
+        sender: &dyn PlatformSender,
+        ts_ms: u64,
+        on_allowed: F,
+    ) -> Option<InboundRouteOutcome>
+    where
+        F: FnOnce(&mut InboundExternalMessage) -> bool,
+    {
         let Some(bot) = self.bridge.get_bot_config(&msg.bot_id) else {
-            return InboundRouteOutcome::Error(BotErrorCategory::NotSetUp);
+            return Some(InboundRouteOutcome::Error(BotErrorCategory::NotSetUp));
         };
         if bot.paused {
-            return InboundRouteOutcome::Paused;
+            return Some(InboundRouteOutcome::Paused);
         }
         if !passes_independent_channel_gate(
             &bot,
             msg.source,
             msg.workspace_id.as_deref(),
             &msg.channel_id,
+            msg.thread_id.as_deref(),
         ) {
-            return InboundRouteOutcome::Denied;
+            return Some(InboundRouteOutcome::Denied);
         }
 
         let user_gate_denied = !passes_independent_user_gate(
@@ -271,7 +305,7 @@ impl ConversationRouter {
                 if user_gate_denied && bypass_possible {
                     let notice = "You do not have access to this bot. Contact the bot owner if you need access.";
                     send_chunked(sender, &target, notice).ok();
-                    return InboundRouteOutcome::Denied;
+                    return Some(InboundRouteOutcome::Denied);
                 }
             }
             Ok(AccessDecision::Pending(req)) => {
@@ -304,13 +338,13 @@ impl ConversationRouter {
                     );
                     send_chunked(sender, &target, &notice).ok();
                 }
-                return InboundRouteOutcome::PendingAccess(req);
+                return Some(InboundRouteOutcome::PendingAccess(req));
             }
             Ok(AccessDecision::Denied(_)) => {
                 let notice =
                     "You do not have access to this bot. Contact the bot owner if you need access.";
                 send_chunked(sender, &target, notice).ok();
-                return InboundRouteOutcome::Denied;
+                return Some(InboundRouteOutcome::Denied);
             }
             Err(err) => {
                 let category = classify_error(&err.to_string());
@@ -318,17 +352,21 @@ impl ConversationRouter {
                     let safe = user_safe_error_message(category, &bot.name);
                     send_chunked(sender, &target, &safe).ok();
                 }
-                return InboundRouteOutcome::Error(category);
+                return Some(InboundRouteOutcome::Error(category));
             }
         }
 
-        self.dispatch_allowed_message(
+        if !on_allowed(&mut msg) {
+            return None;
+        }
+
+        Some(self.dispatch_allowed_message(
             msg,
             target,
             Some(sender),
             &bot.name,
             bot.notifications.could_not_finish,
-        )
+        ))
     }
 
     fn record_held_message(
@@ -491,7 +529,8 @@ impl ConversationRouter {
     }
 
     /// Validates and routes a single-select approval/question callback (`gate:<gate_id>:<decision>`)
-    /// strictly AFTER verifying the sender's allowlist status.
+    /// strictly AFTER verifying bot pause state, channel/guild gates, workspace isolation, and
+    /// independent user allowlists.
     pub fn handle_gate_callback(
         &self,
         bot_id: &BotId,
@@ -501,18 +540,62 @@ impl ConversationRouter {
         channel_id: &str,
         payload: &str,
     ) -> GateCallbackOutcome {
+        self.handle_gate_callback_with_context(
+            bot_id,
+            source,
+            None,
+            sender_id,
+            sender_name,
+            channel_id,
+            None,
+            payload,
+        )
+    }
+
+    /// Context-aware gate callback handler enforcing the same `paused`, channel/guild/thread,
+    /// workspace isolation, and independent user gates as [`Self::handle_inbound_message_at`].
+    #[expect(clippy::too_many_arguments, reason = "external gate callback context")]
+    pub fn handle_gate_callback_with_context(
+        &self,
+        bot_id: &BotId,
+        source: ExternalSource,
+        workspace_id: Option<&str>,
+        sender_id: &str,
+        sender_name: &str,
+        channel_id: &str,
+        thread_id: Option<&str>,
+        payload: &str,
+    ) -> GateCallbackOutcome {
         let Some((gate_id, decision)) = parse_gate_callback(payload) else {
             return GateCallbackOutcome::InvalidPayload;
         };
 
-        match self.bridge.check_or_request_access(
+        let Some(bot) = self.bridge.get_bot_config(bot_id) else {
+            return GateCallbackOutcome::Failed("bot is not set up".to_owned());
+        };
+        if bot.paused {
+            return GateCallbackOutcome::Paused;
+        }
+        if !passes_independent_channel_gate(&bot, source, workspace_id, channel_id, thread_id) {
+            return GateCallbackOutcome::Denied;
+        }
+
+        let user_gate_denied = !passes_independent_user_gate(&bot, source, workspace_id, sender_id);
+        let bypass_possible = has_channel_or_bypass_overlap(&bot, source);
+
+        match self.bridge.check_or_request_access_with_workspace(
             bot_id,
             source,
+            workspace_id,
             sender_id,
             sender_name,
             channel_id,
         ) {
-            Ok(AccessDecision::Allowed) => {}
+            Ok(AccessDecision::Allowed) => {
+                if user_gate_denied && bypass_possible {
+                    return GateCallbackOutcome::Denied;
+                }
+            }
             Ok(AccessDecision::Pending(req)) => return GateCallbackOutcome::PendingAccess(req),
             Ok(AccessDecision::Denied(_)) => return GateCallbackOutcome::Denied,
             Err(err) => {
@@ -754,6 +837,7 @@ fn passes_independent_channel_gate(
     source: ExternalSource,
     workspace_id: Option<&str>,
     channel_id: &str,
+    thread_id: Option<&str>,
 ) -> bool {
     match source {
         ExternalSource::Slack => {
@@ -785,7 +869,7 @@ fn passes_independent_channel_gate(
                     .discord
                     .allowed_channel_ids
                     .iter()
-                    .any(|c| c == channel_id);
+                    .any(|c| c == channel_id || thread_id.is_some_and(|tid| c == tid));
             }
             true
         }
@@ -1674,5 +1758,227 @@ mod tests {
         for c in u16_chunks {
             assert!(c.encode_utf16().count() <= 4);
         }
+    }
+
+    #[test]
+    fn gate_callback_enforces_paused_workspace_channel_and_independent_user_gates_and_discord_thread_allowlist()
+     {
+        struct WorkspaceCheckingBridge {
+            bot: Mutex<BotConfig>,
+            seen_workspaces: Mutex<Vec<Option<String>>>,
+            gates: Mutex<Vec<(String, String)>>,
+            dispatched: Mutex<Vec<InboundExternalMessage>>,
+        }
+        impl ConnectorBridge for WorkspaceCheckingBridge {
+            fn dispatch_external_message(
+                &self,
+                msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                let link = ExternalConversationLink {
+                    id: "link-ws".to_owned(),
+                    bot_id: msg.bot_id.clone(),
+                    source: msg.source,
+                    workspace_id: msg.workspace_id.clone(),
+                    channel_id: msg.channel_id.clone(),
+                    thread_id: msg.thread_id.clone(),
+                    session_id: Some(SessionId(11)),
+                    acts_for: msg.acts_for.clone(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                };
+                lock(&self.dispatched).push(msg);
+                Ok(DispatchOutcome {
+                    link,
+                    session_id: SessionId(11),
+                    started_new_session: true,
+                })
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                // Must never bypass workspace check.
+                Ok(AccessDecision::Denied("missing workspace".to_owned()))
+            }
+            fn check_or_request_access_with_workspace(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                workspace_id: Option<&str>,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                lock(&self.seen_workspaces).push(workspace_id.map(ToOwned::to_owned));
+                if workspace_id == Some("G-GOOD") {
+                    Ok(AccessDecision::Allowed)
+                } else {
+                    Ok(AccessDecision::Denied("wrong workspace".to_owned()))
+                }
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                bot_id: &BotId,
+                source: ExternalSource,
+                workspace_id: Option<&str>,
+                channel_id: &str,
+                thread_id: Option<&str>,
+                acts_for: ActsFor,
+            ) -> io::Result<ExternalConversationLink> {
+                Ok(ExternalConversationLink {
+                    id: "link-ws".to_owned(),
+                    bot_id: bot_id.clone(),
+                    source,
+                    workspace_id: workspace_id.map(ToOwned::to_owned),
+                    channel_id: channel_id.to_owned(),
+                    thread_id: thread_id.map(ToOwned::to_owned),
+                    session_id: None,
+                    acts_for,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+            }
+            fn reply_orchestration_gate(
+                &self,
+                gate_id: &str,
+                decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                lock(&self.gates).push((gate_id.to_owned(), decision.to_owned()));
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                let b = lock(&self.bot);
+                (&b.id == bot_id).then(|| b.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![lock(&self.bot).clone()]
+            }
+        }
+
+        let bot_id = BotId::new("bot-gate-sec").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "GateSec", "claude", 1_000).unwrap();
+        bot.connectors.discord.allowed_guild_ids = vec!["G-GOOD".to_owned()];
+        bot.connectors.discord.allowed_channel_ids = vec!["TH-ALLOWED".to_owned()];
+        bot.connectors.discord.allowed_user_ids = vec!["U-ADMIN".to_owned()];
+        bot.connectors.discord.acts_for = ActsFor::Owner;
+
+        let bridge = Arc::new(WorkspaceCheckingBridge {
+            bot: Mutex::new(bot.clone()),
+            seen_workspaces: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+            dispatched: Mutex::new(Vec::new()),
+        });
+        let router = ConversationRouter::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+        let sender = MockSender::default();
+
+        // 1. Paused bot must reject gate callback.
+        lock(&bridge.bot).paused = true;
+        assert_eq!(
+            router.handle_gate_callback_with_context(
+                &bot_id,
+                ExternalSource::Discord,
+                Some("G-GOOD"),
+                "U-ADMIN",
+                "Admin",
+                "CH-PARENT",
+                Some("TH-ALLOWED"),
+                "gate:g1:approve",
+            ),
+            GateCallbackOutcome::Paused
+        );
+        lock(&bridge.bot).paused = false;
+
+        // 2. Wrong guild denied before reaching bridge.
+        assert_eq!(
+            router.handle_gate_callback_with_context(
+                &bot_id,
+                ExternalSource::Discord,
+                Some("G-EVIL"),
+                "U-ADMIN",
+                "Admin",
+                "CH-PARENT",
+                Some("TH-ALLOWED"),
+                "gate:g1:approve",
+            ),
+            GateCallbackOutcome::Denied
+        );
+
+        // 3. Allowed channel + unauthorized user (overlap bypass attempt) MUST be denied.
+        assert_eq!(
+            router.handle_gate_callback_with_context(
+                &bot_id,
+                ExternalSource::Discord,
+                Some("G-GOOD"),
+                "U-INTRUDER",
+                "Intruder",
+                "CH-PARENT",
+                Some("TH-ALLOWED"),
+                "gate:g1:approve",
+            ),
+            GateCallbackOutcome::Denied
+        );
+        assert!(lock(&bridge.gates).is_empty());
+
+        // 4. Allowed guild + allowed thread ID + allowed user resolves gate cleanly.
+        assert_eq!(
+            router.handle_gate_callback_with_context(
+                &bot_id,
+                ExternalSource::Discord,
+                Some("G-GOOD"),
+                "U-ADMIN",
+                "Admin",
+                "CH-PARENT",
+                Some("TH-ALLOWED"),
+                "gate:g1:approve",
+            ),
+            GateCallbackOutcome::Resolved {
+                gate_id: "g1".to_owned(),
+                decision: "approve".to_owned(),
+            }
+        );
+        assert_eq!(lock(&bridge.gates).len(), 1);
+        assert!(lock(&bridge.seen_workspaces).contains(&Some("G-GOOD".to_owned())));
+
+        // 5. D-23b: Discord inbound message with parent channel_id + allowlisted thread_id passes!
+        let inbound = InboundExternalMessage {
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Discord,
+            workspace_id: Some("G-GOOD".to_owned()),
+            channel_id: "CH-PARENT".to_owned(),
+            thread_id: Some("TH-ALLOWED".to_owned()),
+            sender_id: "U-ADMIN".to_owned(),
+            sender_name: "Admin".to_owned(),
+            text: "hello from allowlisted thread".to_owned(),
+            attachments: Vec::new(),
+            external_message_id: Some("m-1".to_owned()),
+            acts_for: ActsFor::Owner,
+        };
+        let target = DeliveryTarget {
+            source: ExternalSource::Discord,
+            workspace_id: Some("G-GOOD".to_owned()),
+            channel_id: "CH-PARENT".to_owned(),
+            thread_id: Some("TH-ALLOWED".to_owned()),
+            reply_to_message_id: Some("m-1".to_owned()),
+        };
+        assert!(matches!(
+            router.handle_inbound_message(inbound, target, &sender),
+            InboundRouteOutcome::Dispatched(_)
+        ));
+        assert_eq!(lock(&bridge.dispatched).len(), 1);
     }
 }

@@ -24,8 +24,8 @@ use zeroize::Zeroizing;
 
 use crate::bots::connectors::policy_for_api_base;
 use crate::bots::connectors::router::{
-    ConversationRouter, DeliveryTarget, PlatformSender, classify_error, now_ms,
-    sanitize_error_for_status,
+    ConversationRouter, DeliveryTarget, InboundRouteOutcome, PlatformSender, classify_error,
+    now_ms, sanitize_error_for_status,
 };
 use crate::bots::connectors::ws_client::{WsClient, WsEvent};
 use crate::bots::connectors::{ConnectorBridge, InboundExternalMessage, StopFlag};
@@ -212,7 +212,44 @@ impl SlackSender {
         Ok((bot_user_id, team))
     }
 
-    /// Runs an on-demand connectivity check for `TestConnector`.
+    /// Runs an on-demand connectivity check for `TestConnector` validating both bot (`xoxb-`) and
+    /// Socket Mode app (`xapp-`) tokens.
+    #[must_use]
+    pub fn test_connection_with_app_token(&self, app_token: &str) -> BotConnectorTestResult {
+        let team = match self.auth_test() {
+            Ok((_uid, team)) => team,
+            Err(err) => {
+                return BotConnectorTestResult {
+                    source: ExternalSource::Slack,
+                    ok: false,
+                    account_label: None,
+                    detail: sanitize_error_for_status(&err.to_string()),
+                };
+            }
+        };
+        if let Err(err) = self.open_socket_mode_url(app_token) {
+            return BotConnectorTestResult {
+                source: ExternalSource::Slack,
+                ok: false,
+                account_label: None,
+                detail: format!(
+                    "Slack Socket Mode app token (xapp-) check failed: {}",
+                    sanitize_error_for_status(&err.to_string())
+                ),
+            };
+        }
+        BotConnectorTestResult {
+            source: ExternalSource::Slack,
+            ok: true,
+            account_label: team.clone(),
+            detail: format!(
+                "Connected to Slack ({})",
+                team.unwrap_or_else(|| "auth.test ok".to_owned())
+            ),
+        }
+    }
+
+    /// Runs an on-demand connectivity check for `TestConnector` (bot token only).
     #[must_use]
     pub fn test_connection(&self) -> BotConnectorTestResult {
         match self.auth_test() {
@@ -785,14 +822,6 @@ fn handle_events_api(
             None
         }
     });
-    if let Some(ref tts) = thread_id {
-        if participated_threads.len() >= 1_024
-            && let Some(first) = participated_threads.iter().next().cloned()
-        {
-            participated_threads.remove(&first);
-        }
-        participated_threads.insert((channel_id.to_owned(), tts.clone()));
-    }
 
     let workspace_id = payload
         .get("team_id")
@@ -813,7 +842,7 @@ fn handle_events_api(
         source: ExternalSource::Slack,
         workspace_id,
         channel_id: channel_id.to_owned(),
-        thread_id,
+        thread_id: thread_id.clone(),
         sender_id: user_id.to_owned(),
         sender_name,
         text: cleaned,
@@ -821,7 +850,17 @@ fn handle_events_api(
         external_message_id: ts.map(ToOwned::to_owned),
         acts_for,
     };
-    router.handle_inbound_message(inbound, target, sender.as_ref());
+    let outcome = router.handle_inbound_message(inbound, target, sender.as_ref());
+    if matches!(outcome, InboundRouteOutcome::Dispatched(_))
+        && let Some(tts) = thread_id
+    {
+        if participated_threads.len() >= 1_024
+            && let Some(first) = participated_threads.iter().next().cloned()
+        {
+            participated_threads.remove(&first);
+        }
+        participated_threads.insert((channel_id.to_owned(), tts));
+    }
 }
 
 fn handle_interactive(
@@ -869,6 +908,7 @@ fn handle_interactive(
     let workspace_id = payload
         .get("team")
         .and_then(|t| t.get("id"))
+        .or_else(|| payload.get("team_id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
@@ -889,12 +929,14 @@ fn handle_interactive(
         let Some(gate_payload) = candidate else {
             continue;
         };
-        let outcome = router.handle_gate_callback(
+        let outcome = router.handle_gate_callback_with_context(
             bot_id,
             ExternalSource::Slack,
+            workspace_id.as_deref(),
             sender_id,
             sender_name,
             channel_id,
+            thread_ts.as_deref(),
             gate_payload,
         );
         if !channel_id.is_empty() {
@@ -1496,5 +1538,127 @@ mod tests {
 
         srv.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slack_test_connection_validates_app_token_and_threads_only_tracked_after_dispatch() {
+        struct PausedBridge(BotConfig);
+        impl ConnectorBridge for PausedBridge {
+            fn dispatch_external_message(
+                &self,
+                _msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unexpected"))
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Denied("nope".to_owned()))
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _workspace_id: Option<&str>,
+                _channel_id: &str,
+                _thread_id: Option<&str>,
+                _acts_for: ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.0.id == bot_id).then(|| self.0.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.0.clone()]
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let (path, _auth, _body) = read_http(&mut sock);
+                let resp = if idx == 0 {
+                    assert!(path.ends_with("/auth.test"));
+                    json!({"ok": true, "user_id": "U_BOT", "team": "Acme"})
+                } else {
+                    assert!(path.ends_with("/apps.connections.open"));
+                    json!({"ok": false, "error": "invalid_auth"})
+                };
+                let body = serde_json::to_vec(&resp).unwrap();
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+                sock.write_all(&body).unwrap();
+            }
+        });
+
+        let sender = Arc::new(SlackSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("xoxb-good".to_owned()),
+        ));
+        let res = sender.test_connection_with_app_token("xapp-bad");
+        assert!(!res.ok);
+        assert!(res.detail.contains("xapp-"));
+        srv.join().unwrap();
+
+        // D-23c: Paused bot mention in a Slack thread must NOT populate participated_threads.
+        let bot_id = BotId::new("sl-part").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "SlPart", "claude", 1_000).unwrap();
+        bot.paused = true;
+        let bridge: Arc<dyn ConnectorBridge> = Arc::new(PausedBridge(bot));
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge)));
+        let mut seen = VecDeque::new();
+        let mut participated = BTreeSet::new();
+        let payload = json!({
+            "team_id": "T1",
+            "event": {
+                "type": "app_mention",
+                "user": "U_EVIL",
+                "channel": "C1",
+                "ts": "100.1",
+                "thread_ts": "100.1",
+                "text": "<@U_BOT> hi"
+            }
+        });
+        handle_events_api(
+            &bot_id,
+            Some("U_BOT"),
+            &sender,
+            &bridge,
+            &router,
+            &payload,
+            &mut seen,
+            &mut participated,
+        );
+        assert!(participated.is_empty());
     }
 }

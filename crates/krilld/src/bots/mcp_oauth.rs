@@ -33,6 +33,7 @@ const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const OAUTH_ACCEPT_POLL_SLEEP: Duration = Duration::from_millis(25);
 const MAX_CALLBACK_HEAD_BYTES: usize = 16 * 1024;
 const TOKEN_REFRESH_SKEW_MS: u64 = 60_000;
+const TERMINAL_FLOW_TTL_MS: u64 = 300_000;
 
 /// Persisted MCP `BrowserOAuth` token bundle stored encrypted/protected in [`SecretVault`].
 #[derive(Clone, Serialize, Deserialize)]
@@ -201,6 +202,7 @@ impl McpOAuthManager {
             &oauth_state,
             &metadata.scopes,
             metadata.resource.as_deref(),
+            policy,
         )?;
 
         // Cancel any earlier flow for the same `(bot_id, tool_id)` key.
@@ -223,7 +225,7 @@ impl McpOAuthManager {
             state: Mutex::new(initial_state.clone()),
             cancel: Arc::clone(&cancel),
         });
-        lock(&self.flows).insert(key, Arc::clone(&flow));
+        lock(&self.flows).insert(key.clone(), Arc::clone(&flow));
 
         let flow_bg = Arc::clone(&flow);
         let cancel_bg = Arc::clone(&cancel);
@@ -232,7 +234,7 @@ impl McpOAuthManager {
         let tool_bg = tool.clone();
         let resource_bg = metadata.resource.clone();
 
-        thread::Builder::new()
+        if let Err(err) = thread::Builder::new()
             .name(format!("mcp-oauth-{}", tool.id))
             .stack_size(STACK_SIZE)
             .spawn(move || {
@@ -282,7 +284,13 @@ impl McpOAuthManager {
                     }
                 }
             })
-            .map_err(|err| format!("failed to spawn MCP OAuth thread: {err}"))?;
+        {
+            let mut flows = lock(&self.flows);
+            if flows.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &flow)) {
+                flows.remove(&key);
+            }
+            return Err(format!("failed to spawn MCP OAuth thread: {err}"));
+        }
 
         Ok(initial_state)
     }
@@ -290,17 +298,32 @@ impl McpOAuthManager {
     /// Returns the live or persisted OAuth sign-in status for `(bot_id, tool_id)`.
     #[must_use]
     pub fn status(&self, bot: &BotConfig, tool_id: &str) -> BotMcpOAuthState {
-        if let Some(flow) = lock(&self.flows)
-            .get(&(bot.id.clone(), tool_id.to_owned()))
-            .cloned()
-        {
-            return lock(&flow.state).clone();
-        }
+        let key = (bot.id.clone(), tool_id.to_owned());
         let secret_ref = bot
             .mcp_tools
             .iter()
             .find(|t| t.id == tool_id)
             .and_then(|t| t.secret_ref.as_deref());
+        let flow_opt = lock(&self.flows).get(&key).cloned();
+        if let Some(flow) = flow_opt {
+            let st = lock(&flow.state).clone();
+            if st.status == "pending" {
+                return st;
+            }
+            let has_token =
+                has_stored_oauth_credentials(&self.secrets, &bot.id, tool_id, secret_ref);
+            let stale_error_overridden = st.status != "authorized" && has_token;
+            let stale_auth_deleted = st.status == "authorized" && !has_token;
+            let expired = now_ms().saturating_sub(st.updated_at_ms) > TERMINAL_FLOW_TTL_MS;
+            if stale_error_overridden || stale_auth_deleted || expired {
+                let mut flows = lock(&self.flows);
+                if flows.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, &flow)) {
+                    flows.remove(&key);
+                }
+            } else {
+                return st;
+            }
+        }
         let has_token = has_stored_oauth_credentials(&self.secrets, &bot.id, tool_id, secret_ref);
         BotMcpOAuthState {
             bot_id: bot.id.clone(),
@@ -320,9 +343,13 @@ impl McpOAuthManager {
     #[must_use]
     pub fn cancel(&self, bot_id: &BotId, tool_id: &str) -> BotMcpOAuthState {
         let key = (bot_id.clone(), tool_id.to_owned());
-        if let Some(flow) = lock(&self.flows).get(&key).cloned() {
-            flow.cancel.store(true, Ordering::Release);
+        let flow_opt = lock(&self.flows).get(&key).cloned();
+        if let Some(flow) = flow_opt {
             let mut st = lock(&flow.state);
+            if st.status != "pending" {
+                return st.clone();
+            }
+            flow.cancel.store(true, Ordering::Release);
             "cancelled".clone_into(&mut st.status);
             st.auth_url = None;
             st.error = Some("OAuth sign-in cancelled".to_owned());
@@ -388,35 +415,53 @@ pub fn resolve_or_refresh_token(
         && let Ok(mut creds) = serde_json::from_str::<StoredMcpOAuthCredentials>(&raw_bundle)
     {
         let now = now_ms();
+        let expired = creds.expires_at_ms.is_some_and(|exp| exp <= now);
         let needs_refresh = creds
             .expires_at_ms
             .is_some_and(|exp| exp <= now.saturating_add(TOKEN_REFRESH_SKEW_MS));
-        if needs_refresh
-            && let (Some(refresh_tok), Some(token_url)) = (
+        if needs_refresh {
+            if let (Some(refresh_tok), Some(token_url)) = (
                 creds.refresh_token.as_deref().filter(|s| !s.is_empty()),
                 creds.token_endpoint.as_deref().filter(|s| !s.is_empty()),
-            )
-            && let Ok(refreshed) = exchange_refresh_token(
-                token_url,
-                refresh_tok,
-                creds.client_id.as_deref(),
-                creds.client_secret.as_deref(),
-                creds.resource.as_deref(),
-                policy,
-            )
-        {
-            creds.access_token.clone_from(&refreshed.access_token);
-            if let Some(next_rt) = refreshed.refresh_token {
-                creds.refresh_token = Some(next_rt);
+            ) {
+                match exchange_refresh_token(
+                    token_url,
+                    refresh_tok,
+                    creds.client_id.as_deref(),
+                    creds.client_secret.as_deref(),
+                    creds.resource.as_deref(),
+                    policy,
+                ) {
+                    Ok(refreshed) => {
+                        creds.access_token.clone_from(&refreshed.access_token);
+                        if let Some(next_rt) = refreshed.refresh_token {
+                            creds.refresh_token = Some(next_rt);
+                        }
+                        creds.expires_at_ms = refreshed
+                            .expires_in
+                            .map(|exp_s| now.saturating_add(exp_s.saturating_mul(1_000)));
+                        if let Some(sc) = refreshed.scope {
+                            creds.scope = Some(sc);
+                        }
+                        persist_oauth_credentials(secrets, bot_id, tool_id, secret_ref, &creds)
+                            .ok();
+                        return Ok(Some(Zeroizing::new(creds.access_token)));
+                    }
+                    Err(err) => {
+                        if expired {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!("MCP OAuth access token expired and refresh failed: {err}"),
+                            ));
+                        }
+                    }
+                }
+            } else if expired {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "MCP OAuth access token expired and no refresh token is available",
+                ));
             }
-            if let Some(exp_s) = refreshed.expires_in {
-                creds.expires_at_ms = Some(now.saturating_add(exp_s.saturating_mul(1_000)));
-            }
-            if let Some(sc) = refreshed.scope {
-                creds.scope = Some(sc);
-            }
-            persist_oauth_credentials(secrets, bot_id, tool_id, secret_ref, &creds).ok();
-            return Ok(Some(Zeroizing::new(creds.access_token)));
         }
         return Ok(Some(Zeroizing::new(creds.access_token)));
     }
@@ -561,9 +606,14 @@ fn discover_oauth_metadata(
     let authorization_endpoint = as_meta
         .authorization_endpoint
         .ok_or_else(|| "OAuth metadata missing authorization_endpoint".to_owned())?;
+    validate_oauth_endpoint_url(&authorization_endpoint, policy, "authorization_endpoint")?;
     let token_endpoint = as_meta
         .token_endpoint
         .ok_or_else(|| "OAuth metadata missing token_endpoint".to_owned())?;
+    validate_oauth_endpoint_url(&token_endpoint, policy, "token_endpoint")?;
+    if let Some(ref reg_url) = as_meta.registration_endpoint {
+        validate_oauth_endpoint_url(reg_url, policy, "registration_endpoint")?;
+    }
 
     let scopes = if prm_scopes.is_empty() {
         as_meta.scopes_supported
@@ -578,6 +628,22 @@ fn discover_oauth_metadata(
         scopes,
         resource,
     })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn validate_oauth_endpoint_url(url: &str, policy: SsrfPolicy, label: &str) -> Result<(), String> {
+    let parsed =
+        http_client::parse_url(url).map_err(|err| format!("invalid OAuth {label} URL: {err}"))?;
+    if parsed.https {
+        return Ok(());
+    }
+    if policy == SsrfPolicy::AllowLoopback && is_loopback_host(&parsed.host) {
+        return Ok(());
+    }
+    Err(format!("OAuth {label} must use https://"))
 }
 
 fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str, policy: SsrfPolicy) -> Option<T> {
@@ -681,6 +747,10 @@ fn compute_pkce_s256(verifier: &str) -> String {
     http_client::base64url_encode(sum.as_ref())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "OAuth authorize URL builder parameters"
+)]
 fn build_authorize_url(
     authorization_endpoint: &str,
     client_id: &str,
@@ -689,7 +759,9 @@ fn build_authorize_url(
     state: &str,
     scopes: &[String],
     resource: Option<&str>,
+    policy: SsrfPolicy,
 ) -> Result<String, String> {
+    validate_oauth_endpoint_url(authorization_endpoint, policy, "authorization_endpoint")?;
     let sep = if authorization_endpoint.contains('?') {
         "&"
     } else {
@@ -734,7 +806,7 @@ fn run_pkce_callback_listener(
     policy: SsrfPolicy,
 ) -> Result<(), String> {
     let deadline = Instant::now() + OAUTH_CALLBACK_TIMEOUT;
-    let code = loop {
+    let (mut callback_stream, code) = loop {
         if cancel.load(Ordering::Acquire) {
             return Err("OAuth sign-in cancelled".to_owned());
         }
@@ -757,15 +829,6 @@ fn run_pkce_callback_listener(
                     continue;
                 }
                 let params = http_client::parse_query_params(query);
-                if let Some((_, err)) = params.iter().find(|(k, _)| k == "error") {
-                    write_html_response(
-                        &mut stream,
-                        400,
-                        "Authorization Failed",
-                        "Authorization denied. You may close this tab.",
-                    );
-                    return Err(format!("MCP OAuth authorization error: {err}"));
-                }
                 let got_state = params
                     .iter()
                     .find(|(k, _)| k == "state")
@@ -774,6 +837,15 @@ fn run_pkce_callback_listener(
                 if !constant_time_eq(got_state.as_bytes(), expected_state.as_bytes()) {
                     write_html_response(&mut stream, 400, "Invalid State", "State mismatch.");
                     continue;
+                }
+                if let Some((_, err)) = params.iter().find(|(k, _)| k == "error") {
+                    write_html_response(
+                        &mut stream,
+                        400,
+                        "Authorization Failed",
+                        "Authorization denied. You may close this tab.",
+                    );
+                    return Err(format!("MCP OAuth authorization error: {err}"));
                 }
                 let Some((_, code)) = params
                     .iter()
@@ -787,13 +859,7 @@ fn run_pkce_callback_listener(
                     );
                     continue;
                 };
-                write_html_response(
-                    &mut stream,
-                    200,
-                    "Authorized",
-                    "MCP authorization complete. You may close this tab and return to Krill.",
-                );
-                break code.clone();
+                break (stream, code.clone());
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(OAUTH_ACCEPT_POLL_SLEEP);
@@ -804,63 +870,85 @@ fn run_pkce_callback_listener(
         }
     };
 
-    let mut form = vec![
-        ("grant_type", "authorization_code".to_owned()),
-        ("code", code),
-        ("redirect_uri", redirect_uri.to_owned()),
-        ("client_id", client_id.to_owned()),
-        ("code_verifier", (**code_verifier).clone()),
-    ];
-    if let Some(secret) = client_secret.filter(|s| !s.is_empty()) {
-        form.push(("client_secret", secret.to_owned()));
-    }
-    if let Some(res) = resource.filter(|r| !r.is_empty()) {
-        form.push(("resource", res.to_owned()));
-    }
-    let refs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let resp = http_client::send(
-        &HttpRequest::post_form(token_endpoint, &refs)
-            .with_header("Accept", "application/json")
-            .with_timeout(Duration::from_secs(15))
-            .with_ssrf_policy(policy),
-    )
-    .map_err(|err| format!("MCP OAuth token exchange failed: {}", err.kind()))?;
-    if !resp.is_success() {
-        return Err(format!(
-            "MCP OAuth token endpoint returned HTTP {}",
-            resp.status
-        ));
-    }
-    let tok: OAuthTokenResponse = resp
-        .json()
-        .map_err(|err| format!("invalid MCP OAuth token payload: {err}"))?;
-    if tok.access_token.trim().is_empty() {
-        return Err("MCP OAuth token response missing access_token".to_owned());
-    }
+    let finish_result: Result<(), String> = (|| {
+        let mut form = vec![
+            ("grant_type", "authorization_code".to_owned()),
+            ("code", code),
+            ("redirect_uri", redirect_uri.to_owned()),
+            ("client_id", client_id.to_owned()),
+            ("code_verifier", (**code_verifier).clone()),
+        ];
+        if let Some(secret) = client_secret.filter(|s| !s.is_empty()) {
+            form.push(("client_secret", secret.to_owned()));
+        }
+        if let Some(res) = resource.filter(|r| !r.is_empty()) {
+            form.push(("resource", res.to_owned()));
+        }
+        let refs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let resp = http_client::send(
+            &HttpRequest::post_form(token_endpoint, &refs)
+                .with_header("Accept", "application/json")
+                .with_timeout(Duration::from_secs(15))
+                .with_ssrf_policy(policy),
+        )
+        .map_err(|err| format!("MCP OAuth token exchange failed: {}", err.kind()))?;
+        if !resp.is_success() {
+            return Err(format!(
+                "MCP OAuth token endpoint returned HTTP {}",
+                resp.status
+            ));
+        }
+        let tok: OAuthTokenResponse = resp
+            .json()
+            .map_err(|err| format!("invalid MCP OAuth token payload: {err}"))?;
+        if tok.access_token.trim().is_empty() {
+            return Err("MCP OAuth token response missing access_token".to_owned());
+        }
 
-    let now = now_ms();
-    let creds = StoredMcpOAuthCredentials {
-        access_token: tok.access_token,
-        refresh_token: tok.refresh_token,
-        token_endpoint: Some(token_endpoint.to_owned()),
-        client_id: Some(client_id.to_owned()),
-        client_secret: client_secret.map(ToOwned::to_owned),
-        expires_at_ms: tok
-            .expires_in
-            .map(|s| now.saturating_add(s.saturating_mul(1_000))),
-        scope: tok.scope,
-        resource: resource.map(ToOwned::to_owned),
-    };
-    persist_oauth_credentials(
-        secrets,
-        bot_id,
-        &tool.id,
-        tool.secret_ref.as_deref(),
-        &creds,
-    )
-    .map_err(|err| format!("failed persisting MCP OAuth tokens: {err}"))?;
+        let now = now_ms();
+        let creds = StoredMcpOAuthCredentials {
+            access_token: tok.access_token,
+            refresh_token: tok.refresh_token,
+            token_endpoint: Some(token_endpoint.to_owned()),
+            client_id: Some(client_id.to_owned()),
+            client_secret: client_secret.map(ToOwned::to_owned),
+            expires_at_ms: tok
+                .expires_in
+                .map(|s| now.saturating_add(s.saturating_mul(1_000))),
+            scope: tok.scope,
+            resource: resource.map(ToOwned::to_owned),
+        };
+        persist_oauth_credentials(
+            secrets,
+            bot_id,
+            &tool.id,
+            tool.secret_ref.as_deref(),
+            &creds,
+        )
+        .map_err(|err| format!("failed persisting MCP OAuth tokens: {err}"))?;
+        Ok(())
+    })();
 
-    Ok(())
+    match finish_result {
+        Ok(()) => {
+            write_html_response(
+                &mut callback_stream,
+                200,
+                "Authorized",
+                "MCP authorization complete. You may close this tab and return to Krill.",
+            );
+            Ok(())
+        }
+        Err(err) => {
+            write_html_response(
+                &mut callback_stream,
+                502,
+                "Authorization Failed",
+                "MCP token exchange or storage failed. Please close this tab and retry in Krill.",
+            );
+            Err(err)
+        }
+    }
 }
 
 fn exchange_refresh_token(
@@ -1203,6 +1291,240 @@ mod tests {
         let bot_id = BotId::new("bot-c").unwrap();
         let st = mgr.cancel(&bot_id, "slack-mcp");
         assert_eq!(st.status, "cancelled");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oauth_validates_endpoint_schemes_state_order_exchange_status_refresh_and_cancel() {
+        // 1. Authorization endpoint scheme validation.
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "http://evil.example/authorize",
+        ] {
+            assert!(
+                validate_oauth_endpoint_url(
+                    bad,
+                    SsrfPolicy::StrictExternal,
+                    "authorization_endpoint"
+                )
+                .is_err(),
+                "must reject {bad}"
+            );
+        }
+        assert!(
+            validate_oauth_endpoint_url(
+                "https://auth.example.com/authorize",
+                SsrfPolicy::StrictExternal,
+                "authorization_endpoint"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_oauth_endpoint_url(
+                "http://127.0.0.1:9999/authorize",
+                SsrfPolicy::AllowLoopback,
+                "authorization_endpoint"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_oauth_endpoint_url(
+                "http://127.0.0.1:9999/authorize",
+                SsrfPolicy::StrictExternal,
+                "authorization_endpoint"
+            )
+            .is_err()
+        );
+
+        // 2. Callback ignores bogus `?error=` with wrong state, returns 502 on token exchange failure,
+        //    and manual vault token overrides failed flow in `status()`.
+        let dir = temp_dir("hardening");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x61; 32]));
+        let mgr = McpOAuthManager::new(Arc::clone(&secrets));
+        mgr.set_ssrf_policy(SsrfPolicy::AllowLoopback);
+
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        mock.set_nonblocking(true).unwrap();
+        let addr = mock.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let refresh_mode = Arc::new(Mutex::new("fail"));
+        let refresh_mode_bg = Arc::clone(&refresh_mode);
+        let srv = thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                let (mut sock, _) = match mock.accept() {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                sock.set_nonblocking(false).ok();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let target = raw
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, json) = if target == "/.well-known/oauth-authorization-server" {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"authorization_endpoint":"http://{addr}/authorize","token_endpoint":"http://{addr}/token","code_challenge_methods_supported":["S256"]}}"#
+                        ),
+                    )
+                } else if target == "/token" {
+                    match *lock(&refresh_mode_bg) {
+                        "fail" => ("400 Bad Request", r#"{"error":"invalid_grant"}"#.to_owned()),
+                        _ => ("200 OK", r#"{"access_token":"tok-no-exp"}"#.to_owned()),
+                    }
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+                    json.len()
+                );
+                sock.write_all(wire.as_bytes()).ok();
+            }
+        });
+
+        let bot_id = BotId::new("bot-oauth-hard").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "OAuthHard", "claude", 1_000).unwrap();
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "linear".to_owned(),
+            name: "Linear".to_owned(),
+            endpoint_url: Some(format!("http://{addr}/mcp")),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BrowserOAuth,
+            header_names: vec!["Authorization".to_owned()],
+            secret_ref: None,
+            enabled: true,
+        });
+
+        let started = mgr.start_oauth(&bot, "linear").unwrap();
+        let auth_url = started.auth_url.unwrap();
+        let q_params = http_client::parse_query_params(auth_url.split('?').nth(1).unwrap());
+        let redirect_uri = q_params
+            .iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1
+            .clone();
+        let state = q_params
+            .iter()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .clone();
+
+        // Bogus error with mismatched state must NOT abort the listener.
+        let bogus = http_client::send(
+            &HttpRequest::get(format!("{redirect_uri}?error=access_denied&state=wrong"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(bogus.status, 400);
+        assert_eq!(mgr.status(&bot, "linear").status, "pending");
+
+        // Valid state+code triggers token exchange (which returns 400) -> callback HTTP 502 (not 200!).
+        let cb = http_client::send(
+            &HttpRequest::get(format!("{redirect_uri}?code=abc&state={state}"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(cb.status, 502);
+
+        let mut st = mgr.status(&bot, "linear");
+        for _ in 0..40 {
+            if st.status == "error" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+            st = mgr.status(&bot, "linear");
+        }
+        assert_eq!(st.status, "error");
+
+        // Storing a token manually in the vault must clear the stale error and report authorized.
+        secrets
+            .set_secret(
+                &bot_id,
+                "mcp:linear",
+                Zeroizing::new("manual-tok".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(mgr.status(&bot, "linear").status, "authorized");
+
+        // `cancel()` must NOT overwrite an already-authorized flow.
+        let key = (bot_id.clone(), "linear".to_owned());
+        lock(&mgr.flows).insert(
+            key,
+            Arc::new(ActiveOAuthFlow {
+                state: Mutex::new(BotMcpOAuthState {
+                    bot_id: bot_id.clone(),
+                    tool_id: "linear".to_owned(),
+                    status: "authorized".to_owned(),
+                    auth_url: None,
+                    error: None,
+                    updated_at_ms: now_ms(),
+                }),
+                cancel: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+        assert_eq!(mgr.cancel(&bot_id, "linear").status, "authorized");
+
+        // 3. Expired token with failing refresh must return Err (NOT expired access_token).
+        let expired_creds = StoredMcpOAuthCredentials {
+            access_token: "stale-tok".to_owned(),
+            refresh_token: Some("bad-ref".to_owned()),
+            token_endpoint: Some(format!("http://{addr}/token")),
+            client_id: Some("cid".to_owned()),
+            client_secret: None,
+            expires_at_ms: Some(1),
+            scope: None,
+            resource: None,
+        };
+        persist_oauth_credentials(&secrets, &bot_id, "linear", None, &expired_creds).unwrap();
+        let err = resolve_or_refresh_token(
+            &secrets,
+            &bot_id,
+            "linear",
+            None,
+            "mcp:linear",
+            SsrfPolicy::AllowLoopback,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // 4. Successful refresh omitting `expires_in` clears stale past `expires_at_ms`.
+        *lock(&refresh_mode) = "no_exp";
+        let refreshed = resolve_or_refresh_token(
+            &secrets,
+            &bot_id,
+            "linear",
+            None,
+            "mcp:linear",
+            SsrfPolicy::AllowLoopback,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&*refreshed, "tok-no-exp");
+        let saved_raw = secrets
+            .get_secret(&bot_id, &oauth_bundle_secret_key("linear"))
+            .unwrap()
+            .unwrap();
+        let saved: StoredMcpOAuthCredentials = serde_json::from_str(&saved_raw).unwrap();
+        assert_eq!(saved.expires_at_ms, None);
+
+        stop.store(true, Ordering::Release);
+        srv.join().ok();
         fs::remove_dir_all(&dir).ok();
     }
 }

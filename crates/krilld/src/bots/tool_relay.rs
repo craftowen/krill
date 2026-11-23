@@ -355,9 +355,10 @@ impl BotToolRelay {
             return Ok(None);
         }
 
-        let addr = self.ensure_started()?;
         let token = mint_ephemeral_token()?;
-        {
+        let addr = {
+            let mut srv = lock(&self.server);
+            let addr = Self::ensure_started_locked(&mut srv, &self.state, &self.secrets)?;
             let mut st = lock(&self.state);
             let mut allowed_creds: BTreeSet<String> = cred_ids.iter().cloned().collect();
             allowed_creds.insert(BUILTIN_KRILL_CRED_ID.to_owned());
@@ -368,7 +369,8 @@ impl BotToolRelay {
                 session_id: None,
                 link_id: None,
             });
-        }
+            addr
+        };
 
         Ok(Some(BotToolLaunchGrant {
             base_url: format!("http://{addr}"),
@@ -385,9 +387,10 @@ impl BotToolRelay {
         bot_id: &BotId,
         cred_ids: Vec<String>,
     ) -> io::Result<BotToolLaunchGrant> {
-        let addr = self.ensure_started()?;
         let token = mint_ephemeral_token()?;
-        {
+        let addr = {
+            let mut srv = lock(&self.server);
+            let addr = Self::ensure_started_locked(&mut srv, &self.state, &self.secrets)?;
             let mut st = lock(&self.state);
             let mut allowed_creds: BTreeSet<String> = cred_ids.iter().cloned().collect();
             allowed_creds.insert(BUILTIN_KRILL_CRED_ID.to_owned());
@@ -398,7 +401,8 @@ impl BotToolRelay {
                 session_id: None,
                 link_id: None,
             });
-        }
+            addr
+        };
         Ok(BotToolLaunchGrant {
             base_url: format!("http://{addr}"),
             token,
@@ -472,6 +476,14 @@ impl BotToolRelay {
     /// Ensures the loopback listener is bound and serving.
     pub fn ensure_started(&self) -> io::Result<SocketAddr> {
         let mut guard = lock(&self.server);
+        Self::ensure_started_locked(&mut guard, &self.state, &self.secrets)
+    }
+
+    fn ensure_started_locked(
+        guard: &mut Option<RunningServer>,
+        state: &Arc<Mutex<RelayState>>,
+        secrets: &Arc<SecretVault>,
+    ) -> io::Result<SocketAddr> {
         if let Some(ref running) = *guard {
             return Ok(running.addr);
         }
@@ -481,8 +493,8 @@ impl BotToolRelay {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = Arc::clone(&stop);
-        let state_bg = Arc::clone(&self.state);
-        let secrets_bg = Arc::clone(&self.secrets);
+        let state_bg = Arc::clone(state);
+        let secrets_bg = Arc::clone(secrets);
 
         let handle = thread::Builder::new()
             .name("bot-tool-relay".to_owned())
@@ -501,12 +513,19 @@ impl BotToolRelay {
 
     /// Stops the listener when no active routes or launch grants remain.
     pub fn stop_if_unused(&self) {
-        let empty = {
-            let st = lock(&self.state);
-            st.routes.is_empty() && st.grants.is_empty()
+        let running = {
+            let mut srv = lock(&self.server);
+            let empty = {
+                let st = lock(&self.state);
+                st.routes.is_empty() && st.grants.is_empty()
+            };
+            if empty { srv.take() } else { None }
         };
-        if empty {
-            self.shutdown();
+        if let Some(mut srv) = running {
+            srv.stop.store(true, Ordering::Release);
+            if let Some(handle) = srv.thread.take() {
+                handle.join().ok();
+            }
         }
     }
 
@@ -576,7 +595,7 @@ impl Drop for WorkerSlotGuard {
 fn run_relay_loop(
     listener: &TcpListener,
     bound_addr: SocketAddr,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     state: &Arc<Mutex<RelayState>>,
     secrets: &Arc<SecretVault>,
 ) {
@@ -599,9 +618,7 @@ fn run_relay_loop(
                 }
                 let state_w = Arc::clone(state);
                 let secrets_w = Arc::clone(secrets);
-                let stop_w = Arc::new(AtomicBool::new(false));
-                let stop_ref = stop.load(Ordering::Acquire);
-                stop_w.store(stop_ref, Ordering::Release);
+                let stop_w = Arc::clone(stop);
                 let workers_w = Arc::clone(&active_workers);
                 let spawned = thread::Builder::new()
                     .name("bot-tool-relay-worker".to_owned())
@@ -609,7 +626,7 @@ fn run_relay_loop(
                     .spawn(move || {
                         let _slot = WorkerSlotGuard(workers_w);
                         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            handle_connection(stream, bound_addr, &state_w, &secrets_w);
+                            handle_connection(stream, bound_addr, &state_w, &secrets_w, &stop_w);
                         }));
                         if res.is_err() {
                             tracing::warn!("bot tool relay handler panicked; continuing");
@@ -667,6 +684,7 @@ fn handle_connection(
     bound_addr: SocketAddr,
     state: &Mutex<RelayState>,
     secrets: &SecretVault,
+    stop: &AtomicBool,
 ) {
     stream.set_nonblocking(false).ok();
     stream.set_read_timeout(Some(LOCAL_IO_TIMEOUT)).ok();
@@ -833,10 +851,14 @@ fn handle_connection(
                 {
                     return;
                 }
-                while let Ok(Some(chunk)) = streaming.read_next_stream_chunk(SSE_IDLE_TIMEOUT, None)
-                {
-                    if stream.write_all(&chunk).is_err() || stream.flush().is_err() {
-                        break;
+                while !stop.load(Ordering::Acquire) {
+                    match streaming.read_next_stream_chunk(SSE_IDLE_TIMEOUT, Some(stop)) {
+                        Ok(Some(chunk)) => {
+                            if stream.write_all(&chunk).is_err() || stream.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) | Err(_) => break,
                     }
                 }
                 return;
@@ -1347,33 +1369,49 @@ fn read_local_request(stream: &mut TcpStream) -> io::Result<ParsedLocalRequest> 
         }
     }
 
-    let content_len = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    if content_len > MAX_LOCAL_BODY_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "local relay request body too large",
-        ));
-    }
-
+    let is_chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding")
+            && v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+    });
     let body_start = header_end.saturating_add(4);
-    let mut body = buf.get(body_start..).unwrap_or_default().to_vec();
-    while body.len() < content_len {
-        let remaining = content_len.saturating_sub(body.len());
-        let chunk_len = remaining.min(tmp.len());
-        let n = stream.read(tmp.get_mut(..chunk_len).unwrap_or(&mut []))?;
-        if n == 0 {
+    let initial = buf.get(body_start..).unwrap_or_default().to_vec();
+
+    let body = if is_chunked {
+        read_local_chunked_body(stream, initial, MAX_LOCAL_BODY_BYTES)?
+    } else {
+        let content_len = match headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        {
+            Some((_, v)) => v.trim().parse::<usize>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid local Content-Length")
+            })?,
+            None => 0,
+        };
+        if content_len > MAX_LOCAL_BODY_BYTES {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated local relay body",
+                io::ErrorKind::InvalidData,
+                "local relay request body too large",
             ));
         }
-        body.extend_from_slice(tmp.get(..n).unwrap_or_default());
-    }
-    body.truncate(content_len);
+
+        let mut body = initial;
+        while body.len() < content_len {
+            let remaining = content_len.saturating_sub(body.len());
+            let chunk_len = remaining.min(tmp.len());
+            let n = stream.read(tmp.get_mut(..chunk_len).unwrap_or(&mut []))?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated local relay body",
+                ));
+            }
+            body.extend_from_slice(tmp.get(..n).unwrap_or_default());
+        }
+        body.truncate(content_len);
+        body
+    };
 
     Ok(ParsedLocalRequest {
         method,
@@ -1381,6 +1419,122 @@ fn read_local_request(stream: &mut TcpStream) -> io::Result<ParsedLocalRequest> 
         headers,
         body,
     })
+}
+
+fn read_local_chunked_body(
+    stream: &mut TcpStream,
+    mut raw: Vec<u8>,
+    max_body_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    const MAX_CHUNK_LINE_BYTES: usize = 1024;
+    let mut cursor = 0usize;
+    let mut out = Vec::new();
+    let mut tmp = [0u8; 4096];
+
+    loop {
+        if cursor >= 8192 {
+            raw.drain(..cursor);
+            cursor = 0;
+        }
+        let crlf_rel = loop {
+            let slice = raw.get(cursor..).unwrap_or_default();
+            if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                break pos;
+            }
+            if slice.len() > MAX_CHUNK_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk header line too long",
+                ));
+            }
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF reading local chunked request size",
+                ));
+            }
+            raw.extend_from_slice(tmp.get(..n).unwrap_or_default());
+        };
+
+        let line_bytes = raw
+            .get(cursor..cursor.saturating_add(crlf_rel))
+            .unwrap_or_default();
+        let line = std::str::from_utf8(line_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk line UTF-8"))?;
+        let hex_part = line.split(';').next().unwrap_or(line).trim();
+        let chunk_len = usize::from_str_radix(hex_part, 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size hex"))?;
+        cursor = cursor.saturating_add(crlf_rel).saturating_add(2);
+
+        if chunk_len == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let t_crlf = loop {
+                    let slice = raw.get(cursor..).unwrap_or_default();
+                    if let Some(pos) = slice.windows(2).position(|w| w == b"\r\n") {
+                        break pos;
+                    }
+                    if trailer_bytes.saturating_add(slice.len()) > MAX_LOCAL_HEADER_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "local chunked trailers exceed limit",
+                        ));
+                    }
+                    let n = stream.read(&mut tmp)?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF reading local chunked trailers",
+                        ));
+                    }
+                    raw.extend_from_slice(tmp.get(..n).unwrap_or_default());
+                };
+                cursor = cursor.saturating_add(t_crlf).saturating_add(2);
+                trailer_bytes = trailer_bytes.saturating_add(t_crlf).saturating_add(2);
+                if trailer_bytes > MAX_LOCAL_HEADER_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "local chunked trailers exceed limit",
+                    ));
+                }
+                if t_crlf == 0 {
+                    break;
+                }
+            }
+            break;
+        }
+
+        if out.len().saturating_add(chunk_len) > max_body_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local relay chunked body too large",
+            ));
+        }
+
+        let needed = chunk_len.saturating_add(2);
+        while raw.len().saturating_sub(cursor) < needed {
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated local chunked request body",
+                ));
+            }
+            raw.extend_from_slice(tmp.get(..n).unwrap_or_default());
+        }
+        let data_end = cursor.saturating_add(chunk_len);
+        out.extend_from_slice(raw.get(cursor..data_end).unwrap_or_default());
+        if raw.get(data_end..data_end.saturating_add(2)) != Some(b"\r\n".as_slice()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing CRLF after local HTTP chunk",
+            ));
+        }
+        cursor = data_end.saturating_add(2);
+    }
+
+    Ok(out)
 }
 
 fn write_simple_response(
@@ -1782,6 +1936,106 @@ mod tests {
 
         up_thread.join().unwrap();
         relay.unregister_bot(&bot_id);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_relay_accepts_chunked_post_and_shutdown_interrupts_idle_sse_worker() {
+        let dir = temp_dir("chunked-sse-stop");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x5a; 32]));
+        let relay = BotToolRelay::new(Arc::clone(&secrets));
+        relay.set_upstream_ssrf_policy(SsrfPolicy::AllowLoopback);
+
+        // Upstream that holds an SSE stream open until closed.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        let sse_connected = Arc::new(AtomicBool::new(false));
+        let sse_connected_bg = Arc::clone(&sse_connected);
+        let up_stop = Arc::new(AtomicBool::new(false));
+        let up_stop_bg = Arc::clone(&up_stop);
+        let up_thread = thread::spawn(move || {
+            let (mut sock, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            assert!(n > 0);
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .ok();
+            sock.write_all(b"b\r\ndata: init\n\r\n").ok();
+            sock.flush().ok();
+            sse_connected_bg.store(true, Ordering::Release);
+            while !up_stop_bg.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let bot_id = BotId::new("bot-chunk").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "ChunkBot", "claude", 1_000).unwrap();
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "sse".to_owned(),
+            name: "SSE".to_owned(),
+            endpoint_url: Some(format!("http://{up_addr}/mcp")),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::None,
+            header_names: Vec::new(),
+            secret_ref: None,
+            enabled: true,
+        });
+        let grant = relay.prepare_launch_for_bot(&bot).unwrap().unwrap();
+        let host = grant.base_url.trim_start_matches("http://");
+
+        // 1. Send chunked POST JSON-RPC `ping` to built-in `/bot-tools/krill/mcp`.
+        let mut client = TcpStream::connect(host).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let p1 = br#"{"jsonrpc":"2.0","id":7,"#;
+        let p2 = br#""method":"ping"}"#;
+        let wire = format!(
+            "POST /bot-tools/krill/mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            *grant.token,
+            p1.len(),
+            std::str::from_utf8(p1).unwrap(),
+            p2.len(),
+            std::str::from_utf8(p2).unwrap(),
+        );
+        client.write_all(wire.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let mut resp_bytes = Vec::new();
+        client.read_to_end(&mut resp_bytes).unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK"), "{resp_str}");
+        assert!(resp_str.contains("\"id\":7"), "{resp_str}");
+
+        // 2. Open an SSE stream to the upstream and confirm `shutdown()` cancels it promptly (<2s).
+        let cred_id = grant.cred_ids.first().unwrap().clone();
+        let mut sse_client = TcpStream::connect(host).unwrap();
+        sse_client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sse_req = format!(
+            "GET /bot-tools/{cred_id}/mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\n\r\n",
+            *grant.token
+        );
+        sse_client.write_all(sse_req.as_bytes()).unwrap();
+        sse_client.flush().unwrap();
+        let mut head_buf = [0u8; 512];
+        let n = sse_client.read(&mut head_buf).unwrap();
+        assert!(String::from_utf8_lossy(&head_buf[..n]).contains("200 OK"));
+
+        let started = std::time::Instant::now();
+        relay.shutdown();
+        let mut tail = Vec::new();
+        sse_client.read_to_end(&mut tail).ok();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "SSE worker was not interrupted promptly on shutdown: {:?}",
+            started.elapsed()
+        );
+
+        up_stop.store(true, Ordering::Release);
+        up_thread.join().ok();
         fs::remove_dir_all(&dir).ok();
     }
 }

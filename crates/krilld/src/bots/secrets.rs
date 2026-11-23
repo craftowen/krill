@@ -507,6 +507,16 @@ impl SecretVault {
                 .map_err(|_| io::Error::other("failed to serialize bot secrets vault"))?,
         );
         drop(view);
+        let projected_len = aad
+            .len()
+            .saturating_add(plain.len())
+            .saturating_add(aead::AES_256_GCM.tag_len());
+        if projected_len > MAX_VAULT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bot secrets vault exceeds size limit",
+            ));
+        }
         let aead_key = master.derive_aead(&salt)?;
         let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
         aead_key
@@ -516,6 +526,12 @@ impl SecretVault {
         let mut out = Vec::with_capacity(aad.len().saturating_add(plain.len()));
         out.extend_from_slice(&aad);
         out.extend_from_slice(&plain);
+        if out.len() > MAX_VAULT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bot secrets vault exceeds size limit",
+            ));
+        }
         write_atomic_0600(&self.vault_path, &out)
     }
 }
@@ -699,6 +715,43 @@ mod tests {
             Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"))
         })
         .unwrap();
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_rejects_vault_exceeding_max_bytes_without_corrupting_existing_vault() {
+        let dir = temp_dir("max-vault-size");
+        let vault = SecretVault::with_static_key(dir.clone(), [0x22; 32]);
+        vault
+            .set_ref("existing", Zeroizing::new("keep-me".to_owned()))
+            .unwrap();
+
+        // Fill multiple entries near MAX_VAULT_BYTES; the write that crosses the cap must fail
+        // cleanly without leaving an unreadable oversized vault on disk.
+        let big_val = "A".repeat(60 * 1024);
+        let mut hit_cap = false;
+        for idx in 0..80 {
+            let res = vault.set_ref(&format!("k-{idx}"), Zeroizing::new(big_val.clone()));
+            if let Err(err) = res {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                hit_cap = true;
+                break;
+            }
+        }
+        assert!(
+            hit_cap,
+            "expected vault write to reject exceeding MAX_VAULT_BYTES"
+        );
+        // Vault must remain readable after the rejected write.
+        assert_eq!(
+            vault
+                .get_ref("existing")
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("keep-me")
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

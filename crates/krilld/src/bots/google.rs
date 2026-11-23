@@ -62,6 +62,29 @@ fn bot_refresh_mutex(bot_id: &BotId) -> Arc<Mutex<()>> {
     )
 }
 
+fn active_google_oauth_flows() -> &'static Mutex<BTreeMap<BotId, Arc<AtomicBool>>> {
+    static FLOWS: OnceLock<Mutex<BTreeMap<BotId, Arc<AtomicBool>>>> = OnceLock::new();
+    FLOWS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Cancels any active loopback Google OAuth listener thread for `bot_id`.
+pub fn cancel_google_oauth(bot_id: &BotId) {
+    if let Some(cancel) = lock(active_google_oauth_flows()).remove(bot_id) {
+        cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Cancels all active loopback Google OAuth listener threads (e.g. on daemon shutdown).
+pub fn cancel_all_google_oauth() {
+    let drained: Vec<Arc<AtomicBool>> = {
+        let mut map = lock(active_google_oauth_flows());
+        std::mem::take(&mut *map).into_values().collect()
+    };
+    for cancel in drained {
+        cancel.store(true, Ordering::Release);
+    }
+}
+
 /// Overridable Google OAuth & Workspace API endpoints (defaults to official Google endpoints).
 #[expect(
     clippy::struct_field_names,
@@ -174,14 +197,24 @@ pub fn start_google_oauth(
         .unwrap_or_else(|| SecretVault::scoped_ref(&bot.id, "google_oauth_tokens"));
     let expected_state = state.clone();
 
-    thread::Builder::new()
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(prev) =
+        lock(active_google_oauth_flows()).insert(bot_id.clone(), Arc::clone(&cancel))
+    {
+        prev.store(true, Ordering::Release);
+    }
+    let cancel_bg = Arc::clone(&cancel);
+    let bot_id_bg = bot_id.clone();
+
+    if let Err(err) = thread::Builder::new()
         .name(format!("bot-goauth-{}", bot.slug.as_str()))
         .stack_size(STACK_SIZE)
         .spawn(move || {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_oauth_callback_listener(
                     &listener,
-                    &bot_id,
+                    &cancel_bg,
+                    &bot_id_bg,
                     &creds,
                     &redirect_uri,
                     &verifier,
@@ -191,9 +224,21 @@ pub fn start_google_oauth(
                     &secrets,
                 )
             }));
+            {
+                let mut flows = lock(active_google_oauth_flows());
+                if flows
+                    .get(&bot_id_bg)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &cancel_bg))
+                {
+                    flows.remove(&bot_id_bg);
+                }
+            }
+            if cancel_bg.load(Ordering::Acquire) {
+                return;
+            }
             let status = match res {
                 Ok(Ok(())) => BotConnectorStatus {
-                    bot_id: bot_id.clone(),
+                    bot_id: bot_id_bg.clone(),
                     source: ExternalSource::Google,
                     enabled: true,
                     connected: true,
@@ -204,7 +249,7 @@ pub fn start_google_oauth(
                     error_category: None,
                 },
                 Ok(Err(msg)) => BotConnectorStatus {
-                    bot_id: bot_id.clone(),
+                    bot_id: bot_id_bg.clone(),
                     source: ExternalSource::Google,
                     enabled: true,
                     connected: false,
@@ -215,7 +260,7 @@ pub fn start_google_oauth(
                     error_category: Some(BotErrorCategory::SignedOut),
                 },
                 Err(_) => BotConnectorStatus {
-                    bot_id: bot_id.clone(),
+                    bot_id: bot_id_bg.clone(),
                     source: ExternalSource::Google,
                     enabled: true,
                     connected: false,
@@ -230,7 +275,18 @@ pub fn start_google_oauth(
                 cb(status);
             }
         })
-        .map_err(|err| format!("failed to spawn Google OAuth listener thread: {err}"))?;
+    {
+        let mut flows = lock(active_google_oauth_flows());
+        if flows
+            .get(&bot_id)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &cancel))
+        {
+            flows.remove(&bot_id);
+        }
+        return Err(format!(
+            "failed to spawn Google OAuth listener thread: {err}"
+        ));
+    }
 
     Ok((auth_url, state))
 }
@@ -274,6 +330,7 @@ fn read_oauth_head_target(stream: &mut std::net::TcpStream) -> io::Result<String
 #[expect(clippy::too_many_arguments, reason = "OAuth callback state bundle")]
 fn run_oauth_callback_listener(
     listener: &TcpListener,
+    cancel: &AtomicBool,
     _bot_id: &BotId,
     creds: &OAuthClientCredentials,
     redirect_uri: &str,
@@ -285,6 +342,9 @@ fn run_oauth_callback_listener(
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
     let code = loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Google OAuth sign-in cancelled".to_owned());
+        }
         if std::time::Instant::now() >= deadline {
             return Err("Google OAuth callback timed out".to_owned());
         }
@@ -309,16 +369,6 @@ fn run_oauth_callback_listener(
                     continue;
                 }
                 let params = parse_query_params(query);
-                if let Some((_, err_val)) = params.iter().find(|(k, _)| k == "error") {
-                    write_html_page(
-                        &mut stream,
-                        400,
-                        "Google sign-in declined. You can close this tab.",
-                    )
-                    .ok();
-                    return Err(format!("Google OAuth denied: {err_val}"));
-                }
-
                 let state = params
                     .iter()
                     .find(|(k, _)| k == "state")
@@ -331,29 +381,50 @@ fn run_oauth_callback_listener(
                         "Invalid OAuth state parameter. Please restart from Krill.",
                     )
                     .ok();
-                    return Err("Google OAuth state mismatch".to_owned());
+                    continue;
+                }
+                if let Some((_, err_val)) = params.iter().find(|(k, _)| k == "error") {
+                    write_html_page(
+                        &mut stream,
+                        400,
+                        "Google sign-in declined. You can close this tab.",
+                    )
+                    .ok();
+                    return Err(format!("Google OAuth denied: {err_val}"));
                 }
 
-                let code = params
+                let Some(code) = params
                     .iter()
                     .find(|(k, _)| k == "code")
                     .map(|(_, v)| v.as_str())
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        write_html_page(&mut stream, 400, "Missing authorization code.").ok();
-                        "Google OAuth callback missing code".to_owned()
-                    })?
-                    .to_owned();
+                    .map(ToOwned::to_owned)
+                else {
+                    write_html_page(&mut stream, 400, "Missing authorization code.").ok();
+                    continue;
+                };
 
-                let bundle =
-                    exchange_code_for_tokens(token_url, creds, &code, redirect_uri, verifier)?;
-                let encoded = serde_json::to_string(&bundle)
-                    .map_err(|_| "failed to serialize Google OAuth token bundle".to_owned())?;
-                secrets
-                    .set_ref(token_ref, Zeroizing::new(encoded))
-                    .map_err(|err| {
-                        format!("failed to store Google OAuth tokens: {}", err.kind())
-                    })?;
+                let finish_res: Result<(), String> = (|| {
+                    let bundle =
+                        exchange_code_for_tokens(token_url, creds, &code, redirect_uri, verifier)?;
+                    let encoded = serde_json::to_string(&bundle)
+                        .map_err(|_| "failed to serialize Google OAuth token bundle".to_owned())?;
+                    secrets
+                        .set_ref(token_ref, Zeroizing::new(encoded))
+                        .map_err(|err| {
+                            format!("failed to store Google OAuth tokens: {}", err.kind())
+                        })?;
+                    Ok(())
+                })();
+                if let Err(err) = finish_res {
+                    write_html_page(
+                        &mut stream,
+                        502,
+                        "Google token exchange or storage failed. Please retry from Krill.",
+                    )
+                    .ok();
+                    return Err(err);
+                }
 
                 write_html_page(
                     &mut stream,
@@ -555,8 +626,10 @@ pub fn poll_bot_google(
                 .with_ssrf_policy(policy_for_url(&url)),
         )
         .map_err(|err| google_transport_err("Gmail", &err))?;
-        if resp.is_success()
-            && let Ok(val) = resp.json::<serde_json::Value>()
+        if !resp.is_success() {
+            return Err(google_http_error("Gmail", resp.status));
+        }
+        if let Ok(val) = resp.json::<serde_json::Value>()
             && let Some(messages) = val.get("messages").and_then(serde_json::Value::as_array)
         {
             for msg in messages {
@@ -640,13 +713,6 @@ pub fn poll_bot_google(
                     created = created.saturating_add(1);
                 }
             }
-        } else if resp.status == 401 || resp.status == 403 {
-            return Err(BotErrorDetail {
-                category: BotErrorCategory::SignedOut,
-                agent_name: None,
-                message: format!("Gmail rejected credentials (HTTP {})", resp.status),
-                resets_at_ms: None,
-            });
         }
     }
 
@@ -663,16 +729,10 @@ pub fn poll_bot_google(
                 .with_ssrf_policy(policy_for_url(&url)),
         )
         .map_err(|err| google_transport_err("Calendar", &err))?;
-        if resp.status == 401 || resp.status == 403 {
-            return Err(BotErrorDetail {
-                category: BotErrorCategory::SignedOut,
-                agent_name: None,
-                message: format!("Calendar rejected credentials (HTTP {})", resp.status),
-                resets_at_ms: None,
-            });
+        if !resp.is_success() {
+            return Err(google_http_error("Calendar", resp.status));
         }
-        if resp.is_success()
-            && let Ok(val) = resp.json::<serde_json::Value>()
+        if let Ok(val) = resp.json::<serde_json::Value>()
             && let Some(events) = val.get("items").and_then(serde_json::Value::as_array)
         {
             for ev in events {
@@ -738,16 +798,10 @@ pub fn poll_bot_google(
                 .with_ssrf_policy(policy_for_url(&url)),
         )
         .map_err(|err| google_transport_err("Drive", &err))?;
-        if resp.status == 401 || resp.status == 403 {
-            return Err(BotErrorDetail {
-                category: BotErrorCategory::SignedOut,
-                agent_name: None,
-                message: format!("Drive rejected credentials (HTTP {})", resp.status),
-                resets_at_ms: None,
-            });
+        if !resp.is_success() {
+            return Err(google_http_error("Drive", resp.status));
         }
-        if resp.is_success()
-            && let Ok(val) = resp.json::<serde_json::Value>()
+        if let Ok(val) = resp.json::<serde_json::Value>()
             && let Some(files) = val.get("files").and_then(serde_json::Value::as_array)
         {
             for file in files {
@@ -817,31 +871,77 @@ pub fn test_google(
             };
         }
     };
-    let profile_url = format!(
-        "{}/gmail/v1/users/me/profile",
-        endpoints.gmail_base_url.trim_end_matches('/')
-    );
+    let services = bot.connectors.google.services;
+    let (probe_service, probe_url) = if services.gmail {
+        (
+            "Gmail",
+            format!(
+                "{}/gmail/v1/users/me/profile",
+                endpoints.gmail_base_url.trim_end_matches('/')
+            ),
+        )
+    } else if services.calendar {
+        (
+            "Calendar",
+            format!(
+                "{}/calendar/v3/calendars/primary",
+                endpoints.calendar_base_url.trim_end_matches('/')
+            ),
+        )
+    } else if services.drive || services.docs || services.sheets {
+        (
+            "Drive",
+            format!(
+                "{}/drive/v3/about?fields=user(emailAddress,displayName)",
+                endpoints.drive_base_url.trim_end_matches('/')
+            ),
+        )
+    } else {
+        (
+            "Gmail",
+            format!(
+                "{}/gmail/v1/users/me/profile",
+                endpoints.gmail_base_url.trim_end_matches('/')
+            ),
+        )
+    };
     let auth = format!("Bearer {}", *token);
-    let mut label = Some("Google Workspace".to_owned());
-    if let Ok(resp) = http_client::send(
-        &HttpRequest::get(&profile_url)
+    let resp = match http_client::send(
+        &HttpRequest::get(&probe_url)
             .with_header("Authorization", auth)
-            .with_ssrf_policy(policy_for_url(&profile_url)),
+            .with_ssrf_policy(policy_for_url(&probe_url)),
     ) {
-        if resp.status == 401 || resp.status == 403 {
+        Ok(r) => r,
+        Err(err) => {
             return BotConnectorTestResult {
                 source: ExternalSource::Google,
                 ok: false,
                 account_label: None,
-                detail: format!("Google credentials rejected (HTTP {})", resp.status),
+                detail: format!("Google {probe_service} transport error: {}", err.kind()),
             };
         }
-        if resp.is_success()
-            && let Ok(val) = resp.json::<serde_json::Value>()
-            && let Some(email) = val.get("emailAddress").and_then(serde_json::Value::as_str)
-        {
-            label = Some(email.to_owned());
-        }
+    };
+    if !resp.is_success() {
+        let err = google_http_error(probe_service, resp.status);
+        return BotConnectorTestResult {
+            source: ExternalSource::Google,
+            ok: false,
+            account_label: None,
+            detail: err.message,
+        };
+    }
+    let mut label = Some("Google Workspace".to_owned());
+    if let Ok(val) = resp.json::<serde_json::Value>()
+        && let Some(extracted) = val
+            .get("emailAddress")
+            .or_else(|| val.get("user").and_then(|u| u.get("emailAddress")))
+            .or_else(|| val.get("summary"))
+            .or_else(|| val.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        label = Some(extracted.to_owned());
     }
     BotConnectorTestResult {
         source: ExternalSource::Google,
@@ -1112,6 +1212,7 @@ impl GoogleTriggerChecker {
 
     /// Stops the background poller thread cleanly.
     pub fn stop(&self) {
+        cancel_all_google_oauth();
         let handle = lock(&self.thread).take();
         if let Some(h) = handle {
             lock(&self.stop.0).stop = true;
@@ -1244,7 +1345,12 @@ fn write_html_page(stream: &mut std::net::TcpStream, status: u16, msg: &str) -> 
     let body = format!(
         "<!doctype html><html><body style=\"font-family:sans-serif;padding:24px\"><h3>{msg}</h3></body></html>"
     );
-    let reason = if status == 200 { "OK" } else { "Bad Request" };
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        502 => "Bad Gateway",
+        _ => "Bad Request",
+    };
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -1252,6 +1358,31 @@ fn write_html_page(stream: &mut std::net::TcpStream, status: u16, msg: &str) -> 
     );
     stream.write_all(resp.as_bytes())?;
     stream.flush()
+}
+
+fn google_http_error(service: &str, status: u16) -> BotErrorDetail {
+    if status == 401 || status == 403 {
+        return BotErrorDetail {
+            category: BotErrorCategory::SignedOut,
+            agent_name: None,
+            message: format!("{service} rejected credentials (HTTP {status})"),
+            resets_at_ms: None,
+        };
+    }
+    if status == 429 {
+        return BotErrorDetail {
+            category: BotErrorCategory::UsageLimit,
+            agent_name: None,
+            message: format!("{service} rate limited (HTTP 429)"),
+            resets_at_ms: None,
+        };
+    }
+    BotErrorDetail {
+        category: BotErrorCategory::AgentError,
+        agent_name: None,
+        message: format!("{service} API returned HTTP {status}"),
+        resets_at_ms: None,
+    }
 }
 
 fn google_transport_err(service: &str, err: &io::Error) -> BotErrorDetail {
@@ -1538,6 +1669,175 @@ mod tests {
         bot.connectors.google.services.gmail = false;
         let err = poll_bot_google(&bot, &secrets, &items, &endpoints, now_ms()).unwrap_err();
         assert_eq!(err.category, BotErrorCategory::SignedOut);
+
+        srv.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn google_test_and_poll_fail_on_transport_429_5xx_and_oauth_ignores_bad_state_and_cancels_prior()
+     {
+        let dir = temp_dir("hardening");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x88; 32]));
+        let items = BotItemsStore::new(dir.join("items.db"));
+
+        let bot_id = BotId::new("g-hard").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "GHard", "claude", 1_000).unwrap();
+        bot.connectors.google.enabled = true;
+        bot.connectors.google.services = GoogleServicesConfig {
+            gmail: true,
+            calendar: false,
+            drive: false,
+            docs: false,
+            sheets: false,
+            contacts: false,
+        };
+        secrets
+            .set_secret(
+                &bot_id,
+                "google_oauth_tokens",
+                Zeroizing::new(
+                    serde_json::json!({
+                        "access_token": "ya29.ok",
+                        "expires_at_ms": now_ms().saturating_add(3_600_000),
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        secrets
+            .set_secret(
+                &bot_id,
+                "google_oauth_client",
+                Zeroizing::new(
+                    r#"{"installed":{"client_id":"cid","client_secret":"csec"}}"#.to_owned(),
+                ),
+            )
+            .unwrap();
+
+        // 1. Transport error in test_google must return ok: false.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let dead_ep = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{dead_addr}/token"),
+            gmail_base_url: format!("http://{dead_addr}"),
+            calendar_base_url: format!("http://{dead_addr}"),
+            drive_base_url: format!("http://{dead_addr}"),
+        };
+        assert!(!test_google(&bot, &secrets, &dead_ep, now_ms()).ok);
+
+        // 2. HTTP 429 and 500 must fail in both test_google and poll_bot_google.
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let responses = [
+                ("429 Too Many Requests", r#"{"error":"rate_limit"}"#),
+                ("500 Internal Server Error", r#"{"error":"boom"}"#),
+                ("429 Too Many Requests", r#"{"error":"rate_limit"}"#),
+                ("503 Service Unavailable", r#"{"error":"down"}"#),
+                (
+                    "200 OK",
+                    r#"{"access_token":"ya29.new","refresh_token":"1//r","expires_in":3600}"#,
+                ),
+            ];
+            for (status, body) in responses {
+                let (mut sock, _) = mock.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                assert!(n > 0);
+                let wire = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+        let ep = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{addr}/token"),
+            gmail_base_url: format!("http://{addr}"),
+            calendar_base_url: format!("http://{addr}"),
+            drive_base_url: format!("http://{addr}"),
+        };
+
+        assert!(!test_google(&bot, &secrets, &ep, now_ms()).ok);
+        assert!(!test_google(&bot, &secrets, &ep, now_ms()).ok);
+        assert_eq!(
+            poll_bot_google(&bot, &secrets, &items, &ep, now_ms())
+                .unwrap_err()
+                .category,
+            BotErrorCategory::UsageLimit
+        );
+        assert_eq!(
+            poll_bot_google(&bot, &secrets, &items, &ep, now_ms())
+                .unwrap_err()
+                .category,
+            BotErrorCategory::AgentError
+        );
+
+        // 3. Starting OAuth twice cancels the first listener, and the active listener ignores
+        //    spurious `?error=` / bad `state` / missing `code` before succeeding on valid callback.
+        let first_cb_called = Arc::new(AtomicBool::new(false));
+        let first_cb_flag = Arc::clone(&first_cb_called);
+        let (first_url, _) = start_google_oauth(
+            &bot,
+            Arc::clone(&secrets),
+            ep.clone(),
+            Some(Arc::new(move |_| {
+                first_cb_flag.store(true, Ordering::Release);
+            })),
+        )
+        .unwrap();
+        let second_done = Arc::new(AtomicBool::new(false));
+        let second_done_cb = Arc::clone(&second_done);
+        let (second_url, state2) = start_google_oauth(
+            &bot,
+            Arc::clone(&secrets),
+            ep.clone(),
+            Some(Arc::new(move |st| {
+                if st.connected {
+                    second_done_cb.store(true, Ordering::Release);
+                }
+            })),
+        )
+        .unwrap();
+        assert_ne!(first_url, second_url);
+
+        let redirect2 = parse_query_params(second_url.split_once('?').unwrap().1)
+            .into_iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1;
+        // Spurious error with wrong state -> 400, listener stays alive.
+        let r_err = http_client::send(
+            &HttpRequest::get(format!("{redirect2}?error=access_denied&state=wrong"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(r_err.status, 400);
+        // Missing code with valid state -> 400, listener stays alive.
+        let r_nocode = http_client::send(
+            &HttpRequest::get(format!("{redirect2}?state={state2}"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(r_nocode.status, 400);
+        // Legitimate callback -> 200 and connects!
+        let r_ok = http_client::send(
+            &HttpRequest::get(format!("{redirect2}?code=good&state={state2}"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(r_ok.status, 200);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !second_done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(second_done.load(Ordering::Acquire));
+        assert!(!first_cb_called.load(Ordering::Acquire));
 
         srv.join().unwrap();
         fs::remove_dir_all(&dir).ok();

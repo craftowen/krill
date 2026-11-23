@@ -763,14 +763,14 @@ fn run_telegram_loop(
                     None,
                 );
                 for update in updates {
-                    let next = update.update_id.saturating_add(1);
-                    let updated_off = offset.map_or(next, |prev| prev.max(next));
-                    offset = Some(updated_off);
-                    persist_offset(state_root.as_deref(), &bot.id, updated_off);
                     if stop.is_stopped() {
                         break;
                     }
+                    let next = update.update_id.saturating_add(1);
                     handle_update(&bot.id, sender, bridge, router, update);
+                    let updated_off = offset.map_or(next, |prev| prev.max(next));
+                    offset = Some(updated_off);
+                    persist_offset(state_root.as_deref(), &bot.id, updated_off);
                 }
             }
             Err(err) => {
@@ -818,6 +818,13 @@ fn run_telegram_loop(
     );
 }
 
+struct PendingAttachment {
+    file_id: String,
+    suggested_name: String,
+    mime_type: Option<String>,
+    file_size: Option<u64>,
+}
+
 fn handle_update(
     bot_id: &BotId,
     sender: &Arc<TelegramSender>,
@@ -832,13 +839,20 @@ fn handle_update(
             .message
             .as_ref()
             .map_or_else(|| sender_id.clone(), |m| m.chat.id.to_string());
+        let thread_id = cq
+            .message
+            .as_ref()
+            .and_then(|m| m.message_thread_id)
+            .map(|id| id.to_string());
         let data = cq.data.as_deref().unwrap_or_default();
-        let outcome = router.handle_gate_callback(
+        let outcome = router.handle_gate_callback_with_context(
             bot_id,
             ExternalSource::Telegram,
+            None,
             &sender_id,
             &sender_name,
             &channel_id,
+            thread_id.as_deref(),
             data,
         );
         let notice = outcome.user_notice();
@@ -855,61 +869,55 @@ fn handle_update(
     if from.is_bot {
         return;
     }
-    let mut attachments = Vec::new();
-    if let Some(bot_home) = bridge.bot_home_dir(bot_id) {
-        if let Some(ref doc) = msg.document
-            && let Some(path) = sender.download_attachment_to_inbox(
-                &doc.file_id,
-                doc.file_name.as_deref().unwrap_or("document.bin"),
-                doc.mime_type.as_deref(),
-                doc.file_size,
-                &bot_home,
-            )
-        {
-            attachments.push(path);
-        } else if let Some(ref photos) = msg.photo
-            && let Some(largest) = photos.iter().max_by_key(|p| p.file_size.unwrap_or(0))
-            && let Some(path) = sender.download_attachment_to_inbox(
-                &largest.file_id,
-                "photo.jpg",
-                Some("image/jpeg"),
-                largest.file_size,
-                &bot_home,
-            )
-        {
-            attachments.push(path);
-        } else if let Some(ref audio) = msg.audio
-            && let Some(path) = sender.download_attachment_to_inbox(
-                &audio.file_id,
-                "audio.mp3",
-                audio.mime_type.as_deref(),
-                audio.file_size,
-                &bot_home,
-            )
-        {
-            attachments.push(path);
-        } else if let Some(ref voice) = msg.voice
-            && let Some(path) = sender.download_attachment_to_inbox(
-                &voice.file_id,
-                "voice.ogg",
-                voice.mime_type.as_deref(),
-                voice.file_size,
-                &bot_home,
-            )
-        {
-            attachments.push(path);
-        }
-    }
 
-    let text = msg
+    let pending_attachment = if let Some(ref doc) = msg.document {
+        Some(PendingAttachment {
+            file_id: doc.file_id.clone(),
+            suggested_name: doc
+                .file_name
+                .clone()
+                .unwrap_or_else(|| "document.bin".to_owned()),
+            mime_type: doc.mime_type.clone(),
+            file_size: doc.file_size,
+        })
+    } else if let Some(ref photos) = msg.photo
+        && let Some(largest) = photos.iter().max_by_key(|p| p.file_size.unwrap_or(0))
+    {
+        Some(PendingAttachment {
+            file_id: largest.file_id.clone(),
+            suggested_name: "photo.jpg".to_owned(),
+            mime_type: Some("image/jpeg".to_owned()),
+            file_size: largest.file_size,
+        })
+    } else if let Some(ref audio) = msg.audio {
+        Some(PendingAttachment {
+            file_id: audio.file_id.clone(),
+            suggested_name: "audio.mp3".to_owned(),
+            mime_type: audio.mime_type.clone(),
+            file_size: audio.file_size,
+        })
+    } else {
+        msg.voice.as_ref().map(|voice| PendingAttachment {
+            file_id: voice.file_id.clone(),
+            suggested_name: "voice.ogg".to_owned(),
+            mime_type: voice.mime_type.clone(),
+            file_size: voice.file_size,
+        })
+    };
+
+    let explicit_text = msg
         .text
         .as_deref()
         .or(msg.caption.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| (!attachments.is_empty()).then(|| "[Attachment received]".to_owned()));
-    let Some(text) = text else {
+        .map(ToOwned::to_owned);
+    let has_explicit_text = explicit_text.is_some();
+    let Some(text) = explicit_text.or_else(|| {
+        pending_attachment
+            .as_ref()
+            .map(|_| "[Attachment received]".to_owned())
+    }) else {
         return;
     };
 
@@ -935,11 +943,26 @@ fn handle_update(
         sender_id: from.id.to_string(),
         sender_name: format_tg_user_name(&from),
         text,
-        attachments,
+        attachments: Vec::new(),
         external_message_id: Some(msg.message_id.to_string()),
         acts_for,
     };
-    router.handle_inbound_message(inbound, target, sender.as_ref());
+    // Download inbound attachments ONLY after `paused` and allowlist/access checks pass (D-17).
+    router.handle_inbound_message_with_loader(inbound, target, sender.as_ref(), |allowed_msg| {
+        if let Some(att) = pending_attachment
+            && let Some(bot_home) = bridge.bot_home_dir(bot_id)
+            && let Some(path) = sender.download_attachment_to_inbox(
+                &att.file_id,
+                &att.suggested_name,
+                att.mime_type.as_deref(),
+                att.file_size,
+                &bot_home,
+            )
+        {
+            allowed_msg.attachments.push(path);
+        }
+        has_explicit_text || !allowed_msg.attachments.is_empty()
+    });
 }
 
 fn format_tg_user_name(user: &TgUser) -> String {
@@ -1500,6 +1523,211 @@ mod tests {
         assert!(reqs[2].1.contains("hello document"));
         assert!(reqs[3].0.ends_with("/setMessageReaction"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn telegram_skips_attachment_download_for_denied_or_paused_senders_and_downloads_for_allowed() {
+        struct AttBridge {
+            bot: Mutex<BotConfig>,
+            decision: Mutex<AccessDecision>,
+            home: std::path::PathBuf,
+            dispatched: Mutex<Vec<InboundExternalMessage>>,
+        }
+        impl ConnectorBridge for AttBridge {
+            fn dispatch_external_message(
+                &self,
+                msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                let link = krill_proto::bots::ExternalConversationLink {
+                    id: "l-att".to_owned(),
+                    bot_id: msg.bot_id.clone(),
+                    source: msg.source,
+                    workspace_id: None,
+                    channel_id: msg.channel_id.clone(),
+                    thread_id: None,
+                    session_id: Some(SessionId(5)),
+                    acts_for: msg.acts_for.clone(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                };
+                lock(&self.dispatched).push(msg);
+                Ok(DispatchOutcome {
+                    link,
+                    session_id: SessionId(5),
+                    started_new_session: true,
+                })
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(lock(&self.decision).clone())
+            }
+            fn bot_home_dir(&self, _bot_id: &BotId) -> Option<std::path::PathBuf> {
+                Some(self.home.clone())
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                bot_id: &BotId,
+                source: ExternalSource,
+                workspace_id: Option<&str>,
+                channel_id: &str,
+                thread_id: Option<&str>,
+                acts_for: ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Ok(krill_proto::bots::ExternalConversationLink {
+                    id: "l-att".to_owned(),
+                    bot_id: bot_id.clone(),
+                    source,
+                    workspace_id: workspace_id.map(ToOwned::to_owned),
+                    channel_id: channel_id.to_owned(),
+                    thread_id: thread_id.map(ToOwned::to_owned),
+                    session_id: None,
+                    acts_for,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                let b = lock(&self.bot);
+                (&b.id == bot_id).then(|| b.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![lock(&self.bot).clone()]
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("krill-tg-att-gate-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let get_file_hits = Arc::new(AtomicU64::new(0));
+        let hits_bg = Arc::clone(&get_file_hits);
+
+        let srv = thread::spawn(move || {
+            // Expect: 1 sendMessage (denial notice), then 1 getFile + 1 file download for allowed.
+            for _ in 0..3 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (ctype, body) = if path.ends_with("/getFile") {
+                    hits_bg.fetch_add(1, Ordering::AcqRel);
+                    (
+                        "application/json",
+                        r#"{"ok":true,"result":{"file_path":"docs/hello.txt"}}"#.as_bytes(),
+                    )
+                } else if path.contains("/file/bot") {
+                    ("application/octet-stream", b"secret-ok".as_slice())
+                } else {
+                    (
+                        "application/json",
+                        r#"{"ok":true,"result":{"message_id":1}}"#.as_bytes(),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                sock.write_all(head.as_bytes()).unwrap();
+                sock.write_all(body).unwrap();
+            }
+        });
+
+        let bot_id = BotId::new("tg-att").unwrap();
+        let bot = BotConfig::new(bot_id.clone(), "TgAtt", "claude", 1_000).unwrap();
+        let bridge = Arc::new(AttBridge {
+            bot: Mutex::new(bot),
+            decision: Mutex::new(AccessDecision::Denied("nope".to_owned())),
+            home: dir.clone(),
+            dispatched: Mutex::new(Vec::new()),
+        });
+        let bridge_dyn: Arc<dyn ConnectorBridge> = Arc::clone(&bridge) as Arc<dyn ConnectorBridge>;
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge_dyn)));
+        let sender = Arc::new(TelegramSender::new(
+            &format!("http://{addr}"),
+            Zeroizing::new("123456:tok".to_owned()),
+        ));
+
+        let make_update = |id: i64| TgUpdate {
+            update_id: id,
+            message: Some(TgMessage {
+                message_id: id,
+                message_thread_id: None,
+                from: Some(TgUser {
+                    id: 77,
+                    is_bot: false,
+                    first_name: "Mallory".to_owned(),
+                    username: None,
+                }),
+                chat: TgChat { id: 77 },
+                text: None,
+                caption: None,
+                document: Some(TgDocument {
+                    file_id: "file-abc".to_owned(),
+                    file_name: Some("hello.txt".to_owned()),
+                    mime_type: Some("text/plain".to_owned()),
+                    file_size: Some(9),
+                }),
+                photo: None,
+                audio: None,
+                voice: None,
+            }),
+            callback_query: None,
+        };
+
+        // 1. Paused bot -> zero getFile calls, zero inbox files.
+        lock(&bridge.bot).paused = true;
+        handle_update(&bot_id, &sender, &bridge_dyn, &router, make_update(1));
+        assert_eq!(get_file_hits.load(Ordering::Acquire), 0);
+        assert!(!dir.join("inbox").exists());
+
+        // 2. Denied user -> zero getFile calls, zero inbox files.
+        lock(&bridge.bot).paused = false;
+        handle_update(&bot_id, &sender, &bridge_dyn, &router, make_update(2));
+        assert_eq!(get_file_hits.load(Ordering::Acquire), 0);
+        assert!(!dir.join("inbox").exists());
+
+        // 3. Allowed user -> downloads attachment to inbox and dispatches with path!
+        *lock(&bridge.decision) = AccessDecision::Allowed;
+        handle_update(&bot_id, &sender, &bridge_dyn, &router, make_update(3));
+        assert_eq!(get_file_hits.load(Ordering::Acquire), 1);
+        let disp = lock(&bridge.dispatched);
+        assert_eq!(disp.len(), 1);
+        assert_eq!(disp[0].attachments.len(), 1);
+        assert!(std::path::Path::new(&disp[0].attachments[0]).is_file());
+
+        srv.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

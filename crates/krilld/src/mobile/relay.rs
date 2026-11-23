@@ -14,7 +14,7 @@ use krill_proto::ipc::{self, ServerHello};
 use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
 use std::process::{Command, Stdio};
@@ -497,11 +497,8 @@ fn run_once(
     hello: &ServerHello,
 ) -> io::Result<()> {
     let (tls, host_header, host, port) = parse_origin(&publication.origin)?;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "relay DNS empty"))?;
-    let tcp = TcpStream::connect_timeout(&addr, TIMEOUT)?;
+    let addrs: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs()?.collect();
+    let tcp = connect_any_addr(&addrs, TIMEOUT)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(TIMEOUT))?;
     tcp.set_write_timeout(Some(TIMEOUT))?;
@@ -658,11 +655,64 @@ fn wait_io(tcp: &TcpStream, wake_rx: &mut UnixStream, timeout: Duration) {
     while wake_rx.read(&mut drain).is_ok_and(|n| n > 0) {}
 }
 
-#[cfg(not(unix))]
-fn wait_io(_tcp: &TcpStream, wake_rx: &mut UnixStream, _timeout: Duration) {
+#[cfg(windows)]
+fn wait_io(tcp: &TcpStream, wake_rx: &mut UnixStream, timeout: Duration) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use std::os::windows::io::AsSocket as _;
+    let mut fds = [
+        PollFd::from_borrowed_fd(tcp.as_socket(), PollFlags::RDNORM),
+        PollFd::from_borrowed_fd(wake_rx.as_socket(), PollFlags::RDNORM),
+    ];
+    let ts = Timespec::try_from(timeout).ok();
+    poll(&mut fds, ts.as_ref()).ok();
     let mut drain = [0_u8; 64];
     while wake_rx.read(&mut drain).is_ok_and(|n| n > 0) {}
-    thread::sleep(Duration::from_millis(10));
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wait_io(_tcp: &TcpStream, wake_rx: &mut UnixStream, timeout: Duration) {
+    let mut drain = [0_u8; 64];
+    while wake_rx.read(&mut drain).is_ok_and(|n| n > 0) {}
+    thread::sleep(timeout.min(Duration::from_millis(50)));
+}
+
+fn connect_any_addr(addrs: &[SocketAddr], total_timeout: Duration) -> io::Result<TcpStream> {
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "relay DNS empty",
+        ));
+    }
+    let deadline = Instant::now() + total_timeout.max(Duration::from_millis(1));
+    let mut last_err: Option<io::Error> = None;
+    let total = addrs.len();
+    for (idx, addr) in addrs.iter().enumerate() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "relay connect timed out")
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let remaining_addrs = u32::try_from(total.saturating_sub(idx)).unwrap_or(1).max(1);
+        let slice = if remaining_addrs > 1 {
+            (remaining / remaining_addrs)
+                .max(Duration::from_millis(250))
+                .min(remaining)
+        } else {
+            remaining
+        };
+        match TcpStream::connect_timeout(addr, slice) {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "all relay endpoints failed",
+        )
+    }))
 }
 
 fn prune_closed_sessions(sessions: &mut HashMap<u32, MuxSession>) {
@@ -1298,5 +1348,24 @@ mod tests {
         assert_eq!(kind, MUX_CLOSE);
         assert_eq!(conn_id, 11);
         assert_eq!(payload, RETRY_CLOSE.to_be_bytes());
+    }
+
+    #[test]
+    fn connect_any_addr_falls_back_to_subsequent_dns_record() {
+        // Reserve a closed port for the first address and a live listener for the second.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = closed.local_addr().unwrap();
+        drop(closed);
+
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let accept = thread::spawn(move || live.accept().is_ok());
+
+        let tcp = connect_any_addr(&[dead_addr, live_addr], Duration::from_secs(3)).unwrap();
+        assert_eq!(tcp.peer_addr().unwrap(), live_addr);
+        assert!(accept.join().unwrap());
+
+        let empty_err = connect_any_addr(&[], Duration::from_secs(1)).unwrap_err();
+        assert_eq!(empty_err.kind(), io::ErrorKind::AddrNotAvailable);
     }
 }

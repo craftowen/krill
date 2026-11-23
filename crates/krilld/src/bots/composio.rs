@@ -12,7 +12,7 @@
 //! Registers the resolved MCP endpoint onto [`BotToolRelay`] so `x-api-key` stays inside
 //! [`SecretVault`] and is NEVER exposed to agent CLI argv, environment, or config.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -34,6 +34,7 @@ use crate::session::lock;
 pub const DEFAULT_COMPOSIO_BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
 
 const SESSIONS_FILE: &str = "composio-sessions.json";
+const MAX_SEEN_TRIGGERS: usize = 4_096;
 
 /// Resolved Composio MCP session endpoint registered on [`BotToolRelay`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +61,46 @@ fn memory_sessions() -> &'static Mutex<BTreeMap<BotId, ComposioSessionRecord>> {
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn seen_triggers() -> &'static Mutex<BTreeSet<(BotId, String)>> {
-    static SEEN: OnceLock<Mutex<BTreeSet<(BotId, String)>>> = OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn sessions_file_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Default)]
+struct SeenTriggers {
+    order: VecDeque<(BotId, String)>,
+    set: BTreeSet<(BotId, String)>,
+}
+
+impl SeenTriggers {
+    fn contains(&self, key: &(BotId, String)) -> bool {
+        self.set.contains(key)
+    }
+
+    fn insert(&mut self, key: (BotId, String)) {
+        if self.set.contains(&key) {
+            return;
+        }
+        while self.set.len() >= MAX_SEEN_TRIGGERS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.set.insert(key);
+    }
+
+    fn remove_bot(&mut self, bot_id: &BotId) {
+        self.order.retain(|(id, _)| id != bot_id);
+        self.set.retain(|(id, _)| id != bot_id);
+    }
+}
+
+fn seen_triggers() -> &'static Mutex<SeenTriggers> {
+    static SEEN: OnceLock<Mutex<SeenTriggers>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(SeenTriggers::default()))
 }
 
 fn policy_for_base_url(base_url: &str) -> SsrfPolicy {
@@ -110,6 +148,7 @@ fn load_persisted_session(
     bot_id: &BotId,
 ) -> Option<ComposioSessionRecord> {
     if let Some(root) = state_root {
+        let _file_guard = lock(sessions_file_lock());
         let path = root.join(SESSIONS_FILE);
         if let Ok(meta) = fs::symlink_metadata(&path)
             && !meta.file_type().is_symlink()
@@ -128,6 +167,7 @@ fn save_persisted_session(state_root: Option<&Path>, bot_id: &BotId, rec: Compos
     let Some(root) = state_root else {
         return;
     };
+    let _file_guard = lock(sessions_file_lock());
     let path = root.join(SESSIONS_FILE);
     let mut map: BTreeMap<BotId, ComposioSessionRecord> = fs::symlink_metadata(&path)
         .ok()
@@ -144,7 +184,9 @@ fn save_persisted_session(state_root: Option<&Path>, bot_id: &BotId, rec: Compos
 /// Removes persisted Composio session metadata and unregisters the relay route for `bot_id`.
 pub fn cleanup_composio_bot(bot_id: &BotId, state_root: Option<&Path>, relay: &BotToolRelay) {
     lock(memory_sessions()).remove(bot_id);
+    lock(seen_triggers()).remove_bot(bot_id);
     if let Some(root) = state_root {
+        let _file_guard = lock(sessions_file_lock());
         let path = root.join(SESSIONS_FILE);
         if let Ok(meta) = fs::symlink_metadata(&path)
             && !meta.file_type().is_symlink()
@@ -760,8 +802,12 @@ fn extract_explicit_mcp_url(body: &[u8]) -> Option<String> {
 }
 
 fn extract_mcp_url(body: &[u8], base_url: &str, session_id: &str) -> String {
-    extract_explicit_mcp_url(body)
-        .unwrap_or_else(|| format!("{base_url}/tool_router/session/{session_id}/mcp"))
+    extract_explicit_mcp_url(body).unwrap_or_else(|| {
+        format!(
+            "{base_url}/tool_router/session/{}/mcp",
+            http_client::percent_encode(session_id)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -940,5 +986,27 @@ mod tests {
         cleanup_composio_bot(&bot_id, Some(&dir), &relay);
         relay.unregister_bot(&bot_id);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn composio_encodes_session_id_and_bounds_and_cleans_seen_triggers() {
+        let url = extract_mcp_url(b"{}", "https://backend.composio.dev/api/v3.1", "sess/1?a=b");
+        assert_eq!(
+            url,
+            "https://backend.composio.dev/api/v3.1/tool_router/session/sess%2F1%3Fa%3Db/mcp"
+        );
+
+        let bot_id = BotId::new("bot-seen-cap").unwrap();
+        let mut seen = SeenTriggers::default();
+        for i in 0..(MAX_SEEN_TRIGGERS + 16) {
+            seen.insert((bot_id.clone(), format!("trig-{i}")));
+        }
+        assert_eq!(seen.set.len(), MAX_SEEN_TRIGGERS);
+        assert!(!seen.contains(&(bot_id.clone(), "trig-0".to_owned())));
+        assert!(seen.contains(&(bot_id.clone(), format!("trig-{}", MAX_SEEN_TRIGGERS + 15))));
+
+        seen.remove_bot(&bot_id);
+        assert!(seen.set.is_empty());
+        assert!(seen.order.is_empty());
     }
 }
