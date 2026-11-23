@@ -73,6 +73,7 @@ pub const FEAT_SCREEN: u64 = 1;
 pub const FEAT_HISTORY_VIEW: u64 = 1 << 24;
 mod history_view;
 pub use history_view::{HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+pub mod agy;
 pub mod prompt;
 pub mod url;
 pub use url::normalize_screen_links;

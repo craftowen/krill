@@ -133,9 +133,10 @@ impl DraftAttachment {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PendingStatus {
     Sending,
+    Queued,
     ReviewRequired,
 }
 
@@ -2780,6 +2781,7 @@ impl Shell {
                 modes,
                 opens_terminal,
                 local_slash,
+                steer,
             },
             window,
             cx,
@@ -3327,6 +3329,7 @@ struct PendingDispatch {
     modes: krill_proto::term_modes::Modes,
     opens_terminal: bool,
     local_slash: bool,
+    steer: bool,
 }
 
 struct UnbracketedWatch {
@@ -3334,6 +3337,10 @@ struct UnbracketedWatch {
     pane: super::PaneId,
     session: SessionId,
     pending_id: u64,
+    submitted_payload: String,
+    steer: bool,
+    is_agy: bool,
+    baseline_queued: usize,
 }
 
 impl Shell {
@@ -3582,31 +3589,71 @@ impl Shell {
         })
     }
 
+    pub(super) fn chat_is_agy(&self, key: &ChatKey, cx: &gpui::App) -> bool {
+        if let Some(agent) = self
+            .chat
+            .logs
+            .get(key)
+            .map(|l| l.agent.as_str())
+            .filter(|a| !a.is_empty())
+        {
+            return krill_proto::agent::canonical_id(agent) == "agy";
+        }
+        if let Some(bot) = self.chat_bot(key) {
+            return krill_proto::agent::canonical_id(&bot.agent_id) == "agy";
+        }
+        self.sidebar
+            .read(cx)
+            .session_on(&key.0, key.1)
+            .is_some_and(|s| krill_proto::agent::canonical_id(&s.status.agent) == "agy")
+    }
+
     fn dispatch_pending_chat_prompt(
         &mut self,
         mut dispatch: PendingDispatch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let is_agy = self.chat_is_agy(&dispatch.key, cx);
         if dispatch
             .modes
             .contains(krill_proto::term_modes::Modes::BRACKETED_PASTE)
             || dispatch.submitted_payload.contains(['\n', '\r'])
         {
+            let kind = if dispatch.opens_terminal {
+                prompt::PromptKind::OpensTerminal
+            } else if dispatch.local_slash {
+                prompt::PromptKind::LocalSlash
+            } else {
+                prompt::PromptKind::Regular
+            };
             self.start_chat_prompt(
                 prompt::ChatPrompt {
                     pane: dispatch.pane,
                     session: dispatch.session,
                     pending_id: dispatch.pending_id,
+                    submitted_payload: dispatch.submitted_payload,
                     bytes: dispatch.bytes,
-                    opens_terminal: dispatch.opens_terminal,
-                    local_slash: dispatch.local_slash,
+                    kind,
+                    steer: dispatch.steer,
+                    is_agy,
                 },
                 window,
                 cx,
             );
             return;
         }
+        let baseline_queued = if is_agy {
+            self.live.get(&dispatch.pane).map_or(0, |live| {
+                krill_proto::screen::agy::count_queued_matches(
+                    live.pane.screen(),
+                    &dispatch.submitted_payload,
+                )
+                .count
+            })
+        } else {
+            0
+        };
         dispatch.bytes.push(b'\r');
         if self.send_to_session(&dispatch.key, &dispatch.bytes, cx) {
             self.chat.prompt_failed.remove(&dispatch.key);
@@ -3674,6 +3721,10 @@ impl Shell {
                         pane: dispatch.pane,
                         session: dispatch.session,
                         pending_id: dispatch.pending_id,
+                        submitted_payload: dispatch.submitted_payload,
+                        steer: dispatch.steer,
+                        is_agy,
+                        baseline_queued,
                     },
                     window,
                     cx,
@@ -3772,6 +3823,10 @@ impl Shell {
         let pane = watch.pane;
         let session = watch.session;
         let pending_id = watch.pending_id;
+        let submitted_payload = watch.submitted_payload;
+        let steer = watch.steer;
+        let is_agy = watch.is_agy;
+        let baseline_queued = watch.baseline_queued;
         let origin_epoch = self
             .chat
             .pending_epochs
@@ -3780,36 +3835,59 @@ impl Shell {
             .unwrap_or(0);
         let map_key = (task_key.clone(), pending_id);
         let task = cx.spawn_in(window, async move |this, cx| {
+            enum Outcome {
+                Pending,
+                Confirmed,
+                Failed,
+                AgyQueued { send_immediately_hint: bool },
+            }
             for step in 0..TURN_POLLS {
                 cx.background_executor().timer(POLL).await;
                 let Ok(outcome) = this.update_in(cx, |this, _, cx| {
                     if !this.has_pending_prompt(&task_key, pending_id) {
-                        return Some(true);
+                        return Outcome::Confirmed;
                     }
                     let same_epoch =
                         this.chat.logs.get(&task_key).map_or(0, |log| log.epoch) == origin_epoch;
                     if !same_epoch || !this.is_pane_chat_view(pane, cx) {
-                        return Some(false);
+                        return Outcome::Failed;
                     }
                     #[cfg(test)]
                     {
                         if let Some(confirmed) = this.chat.prompt_confirmed {
                             if confirmed {
-                                return Some(true);
+                                return Outcome::Confirmed;
                             }
                         } else if this.chat.send_input.is_some() && this.chat.poll_call.is_none() {
-                            return Some(true);
+                            return Outcome::Confirmed;
                         }
+                    }
+                    if is_agy
+                        && let Some(qm) = this.live.get(&pane).and_then(|live| {
+                            #[cfg(test)]
+                            if this.chat.prompt_confirmed == Some(false) {
+                                return None;
+                            }
+                            krill_proto::screen::agy::queued_submission_confirmed(
+                                live.pane.screen(),
+                                &submitted_payload,
+                                baseline_queued,
+                            )
+                        })
+                    {
+                        return Outcome::AgyQueued {
+                            send_immediately_hint: qm.send_immediately_hint,
+                        };
                     }
                     if step % 5 == 0 {
                         this.poll_session_chat(pane, session, cx);
                     }
-                    None
+                    Outcome::Pending
                 }) else {
                     return;
                 };
                 match outcome {
-                    Some(true) => {
+                    Outcome::Confirmed => {
                         this.update_in(cx, |this, _, cx| {
                             this.confirm_pending_prompt(&task_key, pending_id);
                             cx.notify();
@@ -3817,8 +3895,25 @@ impl Shell {
                         .ok();
                         return;
                     }
-                    Some(false) => break,
-                    None => {}
+                    Outcome::AgyQueued {
+                        send_immediately_hint,
+                    } => {
+                        this.update_in(cx, |this, _, cx| {
+                            if steer && send_immediately_hint {
+                                let _ = this.send_chat_prompt_input(
+                                    pane,
+                                    session,
+                                    krill_proto::screen::agy::SEND_IMMEDIATELY_KEY,
+                                    cx,
+                                );
+                            }
+                            this.mark_pending_prompt_queued(&task_key, pending_id, cx);
+                        })
+                        .ok();
+                        return;
+                    }
+                    Outcome::Failed => break,
+                    Outcome::Pending => {}
                 }
             }
             this.update_in(cx, |this, window, cx| {
@@ -3835,6 +3930,25 @@ impl Shell {
             .ok();
         });
         self.chat.turn_tasks.insert(map_key, task);
+    }
+
+    pub(super) fn mark_pending_prompt_queued(
+        &mut self,
+        key: &ChatKey,
+        pending_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.prompt_tasks.remove(key);
+        self.chat.turn_tasks.remove(&(key.clone(), pending_id));
+        self.chat.prompt_failed.remove(key);
+        if let Some(entries) = self.chat.pending_prompts.get_mut(key)
+            && let Some(entry) = entries.iter_mut().find(|p| p.id == pending_id)
+            && entry.status != PendingStatus::Queued
+        {
+            entry.status = PendingStatus::Queued;
+            self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        }
+        cx.notify();
     }
 
     pub(super) fn has_pending_prompt(&self, key: &ChatKey, pending_id: u64) -> bool {
@@ -3889,18 +4003,32 @@ impl Shell {
                 continue;
             }
             let target_norm = normalized(&entry.submitted_payload);
+            let target_bounded = (entry.submitted_payload.len()
+                > krill_proto::agent_history::MAX_CHAT_TEXT)
+                .then(|| {
+                    let mut end = krill_proto::agent_history::MAX_CHAT_TEXT;
+                    while end > 0 && !entry.submitted_payload.is_char_boundary(end) {
+                        end = end.saturating_sub(1);
+                    }
+                    normalized(entry.submitted_payload.get(..end).unwrap_or_default())
+                });
             let found_abs = log.items.iter().enumerate().find_map(|(i, item)| {
                 let abs_idx = log.base_index.saturating_add(i);
-                (abs_idx >= entry.origin_item
+                let item_norm = (abs_idx >= entry.origin_item
                     && !log.consumed_user_indices.contains(&abs_idx)
-                    && item.kind == ChatItemKind::User
-                    && (normalized(&item.text) == target_norm
-                        // Agents rewrite attached image paths (`[Image #1] …`, or krilld lifts
-                        // them into `file_path`); match on the typed text then.
-                        || (!entry.attachments.is_empty()
-                            && normalized(&krill_proto::git::clean_user_prompt(&item.text))
-                                == normalized(&entry.display_text))))
-                .then_some(abs_idx)
+                    && item.kind == ChatItemKind::User)
+                    .then(|| normalized(&item.text));
+                item_norm
+                    .is_some_and(|norm| {
+                        norm == target_norm
+                            || target_bounded.as_ref().is_some_and(|b| norm == *b)
+                            // Agents rewrite attached image paths (`[Image #1] …`, or krilld lifts
+                            // them into `file_path`); match on the typed text then.
+                            || (!entry.attachments.is_empty()
+                                && normalized(&krill_proto::git::clean_user_prompt(&item.text))
+                                    == normalized(&entry.display_text))
+                    })
+                    .then_some(abs_idx)
             });
             if let Some(abs_idx) = found_abs {
                 log.consumed_user_indices.insert(abs_idx);
@@ -4111,6 +4239,7 @@ impl Shell {
                 modes,
                 opens_terminal,
                 local_slash,
+                steer: false,
             },
             window,
             cx,

@@ -3304,11 +3304,17 @@ impl Shell {
                     })),
                 )
         } else {
+            let status_label = match pending.status {
+                super::PendingStatus::Queued => ctext::PENDING_QUEUED.get(),
+                super::PendingStatus::Sending | super::PendingStatus::ReviewRequired => {
+                    ctext::PENDING_SENDING.get()
+                }
+            };
             div().w_full().flex().items_center().justify_end().child(
                 div()
                     .text_size(ui::TEXT_XS)
                     .text_color(palette.muted_foreground)
-                    .child(ctext::PENDING_SENDING.get()),
+                    .child(status_label),
             )
         };
 
@@ -3461,7 +3467,7 @@ impl Shell {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             for item in pending_slice {
                 item.id.hash(&mut hasher);
-                matches!(item.status, super::PendingStatus::ReviewRequired).hash(&mut hasher);
+                item.status.hash(&mut hasher);
                 let copied = self
                     .chat
                     .copied_pending

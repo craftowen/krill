@@ -1483,6 +1483,24 @@ impl Backend {
                         .collect();
                     format!("{} {text}", quoted.join(" "))
                 };
+                let agy_steer_baseline = if mode == PromptMode::Steer {
+                    self.registry.upgrade().and_then(|reg| {
+                        let is_agy = reg
+                            .mobile_session_status(SessionId(session))
+                            .is_some_and(|s| krill_proto::agent::canonical_id(&s.agent) == "agy");
+                        if !is_agy {
+                            return None;
+                        }
+                        let baseline =
+                            reg.session_capture(SessionId(session)).map_or(0, |screen| {
+                                krill_proto::screen::agy::count_queued_matches(&screen, &combined)
+                                    .count
+                            });
+                        Some(baseline)
+                    })
+                } else {
+                    None
+                };
                 let result = self.send_prompt(session, &combined);
                 if result.is_err() {
                     for path in saved_paths {
@@ -1490,6 +1508,9 @@ impl Backend {
                     }
                 }
                 result?;
+                if let Some(baseline) = agy_steer_baseline {
+                    self.promote_agy_steer_if_queued(session, &combined, baseline);
+                }
                 Ok(json!({"sent":true}))
             }
             Action::Interrupt { session } => {
@@ -2809,11 +2830,36 @@ impl Backend {
         if payload.len() > krill_proto::input::MAX_INPUT {
             return Err(invalid());
         }
-        self.input_paced(
-            session,
-            &[payload, b"\r".to_vec()],
-            Duration::from_millis(60),
-        )
+        let delay = if bracketed {
+            krill_proto::input::PASTE_SUBMIT_DELAY
+        } else {
+            Duration::from_millis(60)
+        };
+        self.input_paced(session, &[payload, b"\r".to_vec()], delay)
+    }
+
+    fn promote_agy_steer_if_queued(&self, session: u64, combined: &str, baseline: usize) {
+        let Some(reg) = self.registry.upgrade() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            if let Some(screen) = reg.session_capture(SessionId(session))
+                && let Some(qm) = krill_proto::screen::agy::queued_submission_confirmed(
+                    &screen, combined, baseline,
+                )
+            {
+                if qm.send_immediately_hint {
+                    self.input(
+                        session,
+                        krill_proto::screen::agy::SEND_IMMEDIATELY_KEY.to_vec(),
+                    )
+                    .ok();
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn chat_composer_status(&self, session: u64) -> io::Result<Value> {
