@@ -718,3 +718,388 @@ fn non_echoed_local_slash_command_confirms_without_prompt_review_and_attachments
     });
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn push_agy_screen(
+    shell: &mut Shell,
+    pane: super::super::PaneId,
+    rev: u64,
+    lines: &[&str],
+    cx: &mut Context<Shell>,
+) {
+    use krill_proto::screen::{Cell, Flags, Op, Revision, Seq, encode_update};
+    let mut ops = vec![Op::Reset {
+        cols: 120,
+        lines: u16::try_from(lines.len().max(6)).unwrap(),
+    }];
+    for (line, text) in lines.iter().enumerate() {
+        let mut cells = Vec::new();
+        for ch in text.chars() {
+            let wide = !ch.is_ascii() && ch != '─' && ch != '▸' && ch != '│' && ch != '…';
+            let mut flags = Flags::default();
+            if wide {
+                flags |= Flags::WIDE;
+            }
+            cells.push(Cell {
+                ch,
+                flags,
+                ..Cell::default()
+            });
+            if wide {
+                cells.push(Cell {
+                    ch: ' ',
+                    flags: Flags::SPACER,
+                    ..Cell::default()
+                });
+            }
+        }
+        ops.push(Op::Line {
+            line: u16::try_from(line).unwrap(),
+            cells,
+        });
+    }
+    for frame in encode_update(Revision(rev), Seq(rev), ops).unwrap() {
+        let (kind, body) = krill_proto::ipc::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        shell.on_frame(pane, kind, &body, cx);
+    }
+}
+
+#[gpui::test]
+fn agy_mid_turn_steer_confirms_from_queued_screen_sends_alt_m_and_avoids_prompt_review(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Delivery;
+    const BORDER: &str = "────────────────────────────────────────────────────────────────";
+    const PROMPT: &str = "다 만들고 크릴 아티팩트로 한 눈에 보이게 만들어봐라.";
+
+    let (view, cx, _, sent) = fixture(cx, "chat-agy-midturn-steer", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            push_agy_screen(
+                shell,
+                pane,
+                2,
+                &[
+                    "⣽  Running command...",
+                    BORDER,
+                    "> ",
+                    BORDER,
+                    "Gemini 4 Neon (XHigh) (1.0M) │ 144.2k/1.0M",
+                ],
+                cx,
+            );
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "agy-conv-1".into(),
+                    transcript_path: "/fake/brain/agy-conv-1/.system_generated/logs/transcript_full.jsonl".into(),
+                    bound: true,
+                    ..Default::default()
+                },
+            );
+            // Simulate a long-running mid-turn tool: transcript poll returns no new user row yet.
+            shell.chat.poll_call = Some(Arc::new(|_| {
+                Ok(krill_proto::control::Reply::AgentHistory(
+                    krill_proto::agent_history::Response::ChatPolled(
+                        krill_proto::agent_history::ChatPollSnapshot {
+                            agent: "agy".into(),
+                            session_id: "agy-conv-1".into(),
+                            transcript_path: "/fake/brain/agy-conv-1/.system_generated/logs/transcript_full.jsonl".into(),
+                            bound: true,
+                            ..Default::default()
+                        },
+                    ),
+                ))
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value(PROMPT, window, cx));
+            shell.steer_chat_prompt(&local_key(SESSION), window, cx);
+            input
+        })
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(20));
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![
+            format!("\x1b[200~{PROMPT}\x1b[201~").into_bytes(),
+            b"\r".to_vec()
+        ]
+    );
+
+    // Antigravity clears its composer and displays the queued prompt above the border.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            push_agy_screen(
+                shell,
+                pane,
+                3,
+                &[
+                    "⢿  Running command...",
+                    "▸ 다 만들고 크릴 아티팩트로 한 눈에 보이게 만들어봐라. (alt+m to send immediately)",
+                    BORDER,
+                    "> ",
+                    BORDER,
+                    "Gemini 4 Neon (XHigh) (1.0M) │ 144.2k/1.0M",
+                ],
+                cx,
+            );
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(40));
+    cx.run_until_parked();
+
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![
+            format!("\x1b[200~{PROMPT}\x1b[201~").into_bytes(),
+            b"\r".to_vec(),
+            b"\x1bm".to_vec(),
+        ],
+        "steer on agy must promote queued prompt via alt+m"
+    );
+    assert!(
+        input.read_with(cx, |state, _| state.value()).is_empty(),
+        "draft must stay cleared once agy queues the prompt"
+    );
+    view.read_with(cx, |shell, _| {
+        assert!(
+            !shell.chat.prompt_review.contains(&local_key(SESSION)),
+            "queued mid-turn agy prompt must not trigger PROMPT_REVIEW"
+        );
+        assert!(
+            !shell.chat.prompt_tasks.contains_key(&local_key(SESSION)),
+            "composer must unlock immediately once queued"
+        );
+        let pending = &shell.chat.pending_prompts[&local_key(SESSION)];
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, super::PendingStatus::Queued);
+    });
+
+    // Even after exceeding the 15s turn poll timeout, no false PROMPT_REVIEW fires.
+    cx.executor().advance_clock(Duration::from_secs(20));
+    cx.run_until_parked();
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.chat.prompt_review.contains(&local_key(SESSION)));
+    });
+
+    // Later, when agy dequeues the message and writes USER_EXPLICIT to transcript_full.jsonl,
+    // the Queued optimistic bubble reconciles and clears automatically.
+    view.update(cx, |shell, _| {
+        shell.apply_chat_poll(
+            SESSION,
+            krill_proto::agent_history::ChatPollSnapshot {
+                agent: "agy".into(),
+                session_id: "agy-conv-1".into(),
+                transcript_path:
+                    "/fake/brain/agy-conv-1/.system_generated/logs/transcript_full.jsonl".into(),
+                bound: true,
+                items: vec![krill_proto::agent_history::ChatItem {
+                    kind: krill_proto::agent_history::ChatItemKind::User,
+                    text: PROMPT.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+    });
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell
+                .chat
+                .pending_prompts
+                .get(&local_key(SESSION))
+                .is_none_or(Vec::is_empty),
+            "queued pending card must reconcile when transcript records the user turn"
+        );
+    });
+}
+
+#[gpui::test]
+fn agy_mid_turn_unsubmitted_draft_in_composer_still_triggers_prompt_review(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::input::Delivery;
+    const BORDER: &str = "────────────────────────────────────────────────────────────────";
+    const PROMPT: &str = "다 만들고 크릴 아티팩트로 한 눈에 보이게 만들어봐라.";
+
+    let (view, cx, _, sent) = fixture(cx, "chat-agy-unsubmitted-review", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    let input = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            push_agy_screen(
+                shell,
+                pane,
+                2,
+                &[
+                    "⣽  Running command...",
+                    BORDER,
+                    "> 다 만들고 크릴 아티팩트로 한 눈에 보이게 만들어봐라.",
+                    BORDER,
+                ],
+                cx,
+            );
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "agy-conv-2".into(),
+                    transcript_path: "/fake/brain/agy-conv-2/.system_generated/logs/transcript_full.jsonl".into(),
+                    bound: true,
+                    ..Default::default()
+                },
+            );
+            shell.chat.poll_call = Some(Arc::new(|_| {
+                Ok(krill_proto::control::Reply::AgentHistory(
+                    krill_proto::agent_history::Response::ChatPolled(
+                        krill_proto::agent_history::ChatPollSnapshot {
+                            agent: "agy".into(),
+                            session_id: "agy-conv-2".into(),
+                            transcript_path: "/fake/brain/agy-conv-2/.system_generated/logs/transcript_full.jsonl".into(),
+                            bound: true,
+                            ..Default::default()
+                        },
+                    ),
+                ))
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value(PROMPT, window, cx));
+            shell.steer_chat_prompt(&local_key(SESSION), window, cx);
+            input
+        })
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_secs(16));
+    cx.run_until_parked();
+
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        2,
+        "alt+m must never be sent when the draft remains unsubmitted in composer"
+    );
+    assert_eq!(input.read_with(cx, |state, _| state.value()), PROMPT);
+    view.read_with(cx, |shell, _| {
+        assert!(
+            shell.chat.prompt_review.contains(&local_key(SESSION)),
+            "unsubmitted draft stuck in composer must still require PROMPT_REVIEW"
+        );
+    });
+}
+
+#[gpui::test]
+fn agy_normal_submit_while_busy_confirms_queued_without_sending_alt_m(cx: &mut TestAppContext) {
+    use krill_proto::input::Delivery;
+    const BORDER: &str = "────────────────────────────────────────────────────────────────";
+    const PROMPT: &str = "후속 작업 부탁해";
+
+    let (view, cx, _, sent) = fixture(cx, "chat-agy-normal-queued", &permission(), "ready");
+    let pane = view.read_with(cx, |shell, _| shell.layout.focused().unwrap());
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.on_frame(
+                pane,
+                krill_proto::term_modes::TERM_MODES,
+                &postcard::to_stdvec(&Modes {
+                    flags: Modes::BRACKETED_PASTE,
+                    kitty: 0,
+                })
+                .unwrap(),
+                cx,
+            );
+            push_agy_screen(shell, pane, 2, &[BORDER, "> ", BORDER], cx);
+            shell.apply_chat_poll(
+                SESSION,
+                krill_proto::agent_history::ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "agy-conv-3".into(),
+                    transcript_path: "/fake/brain/agy-conv-3/.system_generated/logs/transcript_full.jsonl".into(),
+                    bound: true,
+                    ..Default::default()
+                },
+            );
+            shell.chat.poll_call = Some(Arc::new(|_| {
+                Ok(krill_proto::control::Reply::AgentHistory(
+                    krill_proto::agent_history::Response::ChatPolled(
+                        krill_proto::agent_history::ChatPollSnapshot {
+                            agent: "agy".into(),
+                            session_id: "agy-conv-3".into(),
+                            transcript_path: "/fake/brain/agy-conv-3/.system_generated/logs/transcript_full.jsonl".into(),
+                            bound: true,
+                            ..Default::default()
+                        },
+                    ),
+                ))
+            }));
+            shell.chat.prompt_delivery = Some(Delivery::Applied);
+            let input = shell.ensure_chat_input(local_key(SESSION), window, cx);
+            input.update(cx, |state, cx| state.set_value(PROMPT, window, cx));
+            shell.submit_chat_prompt(&local_key(SESSION), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(krill_proto::input::PASTE_SUBMIT_DELAY + Duration::from_millis(20));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            push_agy_screen(
+                shell,
+                pane,
+                3,
+                &[
+                    "▸ 후속 작업 부탁해 (alt+m to send immediately)",
+                    BORDER,
+                    "> ",
+                    BORDER,
+                ],
+                cx,
+            );
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(40));
+    cx.run_until_parked();
+
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![
+            format!("\x1b[200~{PROMPT}\x1b[201~").into_bytes(),
+            b"\r".to_vec(),
+        ],
+        "non-steer submit must not send alt+m"
+    );
+    view.read_with(cx, |shell, _| {
+        assert!(!shell.chat.prompt_review.contains(&local_key(SESSION)));
+        assert_eq!(
+            shell.chat.pending_prompts[&local_key(SESSION)][0].status,
+            super::PendingStatus::Queued
+        );
+    });
+}

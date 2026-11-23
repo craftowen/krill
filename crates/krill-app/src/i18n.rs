@@ -3045,6 +3045,7 @@ catalog! {
         IMAGE_COPY_PNG => ("PNG로 복사", "Copy as PNG"),
         IMAGE_COPIED_PNG => ("PNG로 복사했습니다", "Copied as PNG"),
         PENDING_SENDING => ("전송 중…", "Sending…"),
+        PENDING_QUEUED => ("대기열에 등록됨", "Queued"),
         PENDING_REVIEW_REQUIRED => ("전송 확인 필요", "Review required"),
         PENDING_RETRY => ("재시도", "Retry"),
         AUTOCOMPLETE_FILES => ("워크스페이스 파일", "Workspace files"),

@@ -7,13 +7,22 @@ pub(super) const POLL: Duration = Duration::from_millis(20);
 pub(super) const RECEIPT_POLLS: usize = 500;
 const TURN_POLLS: usize = 750;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PromptKind {
+    Regular,
+    OpensTerminal,
+    LocalSlash,
+}
+
 pub(super) struct ChatPrompt {
     pub pane: super::super::PaneId,
     pub session: SessionId,
     pub pending_id: u64,
+    pub submitted_payload: String,
     pub bytes: Vec<u8>,
-    pub opens_terminal: bool,
-    pub local_slash: bool,
+    pub kind: PromptKind,
+    pub steer: bool,
+    pub is_agy: bool,
 }
 
 pub(super) struct Origin {
@@ -84,6 +93,24 @@ impl Shell {
             })
     }
 
+    pub(super) fn chat_agy_queued_match(
+        &self,
+        origin: &Origin,
+        submitted_payload: &str,
+        baseline_matches: usize,
+    ) -> Option<krill_proto::screen::agy::QueuedMatch> {
+        #[cfg(test)]
+        if self.chat.prompt_confirmed == Some(false) {
+            return None;
+        }
+        let live = self.live.get(&origin.pane)?;
+        krill_proto::screen::agy::queued_submission_confirmed(
+            live.pane.screen(),
+            submitted_payload,
+            baseline_matches,
+        )
+    }
+
     fn chat_prompt_confirmed(&mut self, origin: &Origin, pending_id: u64) -> bool {
         #[cfg(test)]
         if let Some(confirmed) = self.chat.prompt_confirmed {
@@ -135,9 +162,11 @@ impl Shell {
             pane,
             session,
             pending_id,
+            submitted_payload,
             bytes,
-            opens_terminal,
-            local_slash,
+            kind,
+            steer,
+            is_agy,
         } = prompt;
         let key = (self.layout.host(pane).clone(), session);
         let log = self.chat.logs.get(&key);
@@ -147,6 +176,17 @@ impl Shell {
             host: key.0.clone(),
             target: self.live.get(&pane).and_then(|live| live.target.clone()),
             epoch: log.map_or(0, |log| log.epoch),
+        };
+        let baseline_queued = if is_agy {
+            self.live.get(&pane).map_or(0, |live| {
+                krill_proto::screen::agy::count_queued_matches(
+                    live.pane.screen(),
+                    &submitted_payload,
+                )
+                .count
+            })
+        } else {
+            0
         };
         if !self.send_to_chat_pane(pane, session, &bytes, cx) {
             self.transition_pending_to_review_required(
@@ -253,7 +293,7 @@ impl Shell {
                     Delivery::Pending => cx.background_executor().timer(POLL).await,
                 }
             }
-            if applied && opens_terminal {
+            if applied && kind == PromptKind::OpensTerminal {
                 this.update_in(cx, |this, window, cx| {
                     let current = this.chat_prompt_current(&origin, cx);
                     this.finish_chat_prompt(
@@ -272,7 +312,7 @@ impl Shell {
                 .ok();
                 return;
             }
-            if applied && local_slash {
+            if applied && kind == PromptKind::LocalSlash {
                 this.update_in(cx, |this, window, cx| {
                     this.finish_chat_prompt(
                         FinishPrompt {
@@ -288,34 +328,76 @@ impl Shell {
                 return;
             }
             if applied {
+                enum TurnCheck {
+                    Pending,
+                    Invalid,
+                    Confirmed,
+                    AgyQueued { send_immediately_hint: bool },
+                }
                 for step in 0..TURN_POLLS {
-                    let Ok((current, confirmed)) = this.update_in(cx, |this, _, cx| {
-                        let current = this.chat_prompt_current(&origin, cx);
-                        let confirmed = current && this.chat_prompt_confirmed(&origin, pending_id);
-                        if current && !confirmed && step % 5 == 0 {
+                    let Ok(check) = this.update_in(cx, |this, _, cx| {
+                        if !this.chat_prompt_current(&origin, cx) {
+                            return TurnCheck::Invalid;
+                        }
+                        if this.chat_prompt_confirmed(&origin, pending_id) {
+                            return TurnCheck::Confirmed;
+                        }
+                        if is_agy
+                            && let Some(qm) = this.chat_agy_queued_match(
+                                &origin,
+                                &submitted_payload,
+                                baseline_queued,
+                            )
+                        {
+                            return TurnCheck::AgyQueued {
+                                send_immediately_hint: qm.send_immediately_hint,
+                            };
+                        }
+                        if step % 5 == 0 {
                             this.poll_session_chat(pane, session, cx);
                         }
-                        (current, confirmed)
+                        TurnCheck::Pending
                     }) else {
                         return;
                     };
-                    if !current {
-                        break;
-                    }
-                    if confirmed {
-                        this.update_in(cx, |this, window, cx| {
-                            this.finish_chat_prompt(
-                                FinishPrompt {
-                                    key: &task_key,
-                                    pending_id,
-                                    confirmed: true,
-                                },
-                                Some(window),
-                                cx,
-                            );
-                        })
-                        .ok();
-                        return;
+                    match check {
+                        TurnCheck::Invalid => break,
+                        TurnCheck::Confirmed => {
+                            this.update_in(cx, |this, window, cx| {
+                                this.finish_chat_prompt(
+                                    FinishPrompt {
+                                        key: &task_key,
+                                        pending_id,
+                                        confirmed: true,
+                                    },
+                                    Some(window),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                            return;
+                        }
+                        TurnCheck::AgyQueued {
+                            send_immediately_hint,
+                        } => {
+                            this.update_in(cx, |this, _, cx| {
+                                if steer
+                                    && send_immediately_hint
+                                    && this.chat_prompt_current(&origin, cx)
+                                {
+                                    let _ = this.send_chat_prompt_input(
+                                        pane,
+                                        session,
+                                        krill_proto::screen::agy::SEND_IMMEDIATELY_KEY,
+                                        cx,
+                                    );
+                                }
+                                this.mark_pending_prompt_queued(&task_key, pending_id, cx);
+                            })
+                            .ok();
+                            return;
+                        }
+                        TurnCheck::Pending => {}
                     }
                     cx.background_executor().timer(POLL).await;
                 }
