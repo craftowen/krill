@@ -93,6 +93,7 @@ pub struct PictureState {
     generate_anchor: GenerateAnchor,
     pub intake: IntakeLine,
     intake_seq: u64,
+    reading: bool,
     picture_task: Option<Task<()>>,
 
     // Custom hex input
@@ -158,6 +159,7 @@ impl PictureState {
             generate_anchor: GenerateAnchor::Mascot(mascot_idx),
             intake: IntakeLine::Hint,
             intake_seq: 0,
+            reading: false,
             picture_task: None,
             hex_open: false,
             hex_input: None,
@@ -395,6 +397,7 @@ impl PictureState {
         }
         if selects_picture {
             self.intake_seq += 1;
+            self.reading = false;
         }
         match face {
             PictureFace::Mascot(id) => {
@@ -474,6 +477,11 @@ impl PictureState {
         );
     }
 
+    #[must_use]
+    pub const fn is_reading(&self) -> bool {
+        self.reading
+    }
+
     pub fn load_picture<E: 'static>(
         &mut self,
         read: impl FnOnce() -> Result<Vec<u8>, PictureError> + Send + 'static,
@@ -481,6 +489,8 @@ impl PictureState {
         cx: &mut Context<E>,
     ) {
         self.intake_seq += 1;
+        self.reading = true;
+        cx.notify();
         let turn = self.intake_seq;
         self.picture_task = Some(cx.spawn(async move |this, cx| {
             let prepared = cx
@@ -496,6 +506,7 @@ impl PictureState {
                 if state.intake_seq != turn {
                     return;
                 }
+                state.reading = false;
                 match prepared {
                     Ok((png, tint)) => {
                         let prev = state.custom.take();

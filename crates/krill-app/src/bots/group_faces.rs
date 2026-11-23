@@ -204,6 +204,38 @@ pub fn render_group_faces(
     ring_bg: gpui::Hsla,
     p: &ui::Palette,
 ) -> AnyElement {
+    let entries: Vec<(avatar::Avatar, Option<Arc<Image>>, &str)> = members
+        .iter()
+        .map(|m| (m.bot.avatar.clone(), m.upload.clone(), m.bot.name.as_str()))
+        .collect();
+    render_group_faces_raw(&entries, slot_size, ring_bg, false, false, p)
+}
+
+/// Renders clustered group faces from [`krill_proto::bots::BotConfig`]s desaturated and dimmed
+/// (`grayscale opacity-50 dark:opacity-40`) for Orca's `BotItemsAllClear` (`eefd93a3` / `#46740`).
+#[must_use]
+pub fn render_group_config_faces_grayscale(
+    members: &[(&krill_proto::bots::BotConfig, Option<Arc<Image>>)],
+    slot_size: f32,
+    ring_bg: gpui::Hsla,
+    dark: bool,
+    p: &ui::Palette,
+) -> AnyElement {
+    let entries: Vec<(avatar::Avatar, Option<Arc<Image>>, &str)> = members
+        .iter()
+        .map(|(bot, upload)| (avatar::Avatar::of(bot), upload.clone(), bot.name.as_str()))
+        .collect();
+    render_group_faces_raw(&entries, slot_size, ring_bg, true, dark, p)
+}
+
+fn render_group_faces_raw(
+    members: &[(avatar::Avatar, Option<Arc<Image>>, &str)],
+    slot_size: f32,
+    ring_bg: gpui::Hsla,
+    grayscale: bool,
+    dark: bool,
+    p: &ui::Palette,
+) -> AnyElement {
     let layout = compute_face_layout(members.len());
     let scale = slot_size / FACE_SLOT;
     let ring_px = (FACE_GAP * scale).max(1.);
@@ -231,11 +263,46 @@ pub fn render_group_faces(
     };
 
     for (idx, spot) in layout.spots.iter().take(avatar_slots).enumerate() {
-        if let Some(member) = members.get(idx) {
+        if let Some((av, upload, name)) = members.get(idx) {
             let s_px = spot.s * scale;
             let f_px = spot.font_size * scale;
             let outer_radius = px(s_px / 2. + ring_px);
-            let inner = render_tile_or_fallback(member, s_px, f_px, p);
+            let radius = px(s_px / 2.);
+            let inner = match av {
+                avatar::Avatar::Mascot { .. } | avatar::Avatar::Upload => {
+                    if grayscale {
+                        avatar::render_grayscale(
+                            av,
+                            upload.clone(),
+                            name,
+                            px(s_px),
+                            radius,
+                            dark,
+                            p,
+                        )
+                    } else {
+                        avatar::render(av, upload.clone(), name, px(s_px), radius, p)
+                    }
+                }
+                avatar::Avatar::Emoji(glyph) | avatar::Avatar::Initial(glyph) => div()
+                    .flex_none()
+                    .size(px(s_px))
+                    .rounded(radius)
+                    .bg(p.muted)
+                    .when(grayscale, |d| d.opacity(if dark { 0.4 } else { 0.5 }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(face_text_size(f_px))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if grayscale {
+                        p.muted_foreground
+                    } else {
+                        p.foreground
+                    })
+                    .child(glyph.clone())
+                    .into_any_element(),
+            };
             container = container.child(
                 div()
                     .absolute()
@@ -245,7 +312,14 @@ pub fn render_group_faces(
                     .overflow_hidden()
                     .border(ring)
                     .border_color(ring_bg)
-                    .child(inner),
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(s_px))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .child(inner),
+                    ),
             );
         }
     }
@@ -270,6 +344,7 @@ pub fn render_group_faces(
                         .size(px(s_px))
                         .rounded(px(s_px / 2.))
                         .bg(p.muted)
+                        .when(grayscale, |d| d.opacity(if dark { 0.4 } else { 0.5 }))
                         .flex()
                         .items_center()
                         .justify_center()

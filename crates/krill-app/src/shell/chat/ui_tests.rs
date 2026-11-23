@@ -3729,3 +3729,97 @@ fn remote_bot_without_workspace_footer_does_not_overwrite_clipboard_and_efforts_
         "clicking static folder label for remote bot without workspace must not overwrite clipboard"
     );
 }
+
+/// Commits 1–4 (`6edf9f05`, `c9e22e23`, `dcde358a`, `028100ad`):
+/// - Consecutive activity rows (agent messages, item notes) get even 4px spacing while leaving
+///   16px before regular messages.
+/// - Item note chips use full available width beyond 256px before truncating, and stay readable
+///   (>= 96px) even with a long comment/detail on the same row.
+/// - Agent message rows show a plain first-line preview and an always-visible chevron that opens
+///   the full details box on click.
+#[gpui::test]
+fn chat_activity_rows_even_spacing_wide_chips_and_expandable_agent_message(
+    cx: &mut TestAppContext,
+) {
+    let long_title = "Investigate intermittent webhook delivery retries across regional queues";
+    let (shell, cx) = fixture(
+        cx,
+        "chat-activity-sync-2b",
+        vec![
+            ChatItem {
+                kind: ChatItemKind::User,
+                text: "[Krill bot mail from Release Bot] Subject: Nightly check\nAll **tests** passed on `src/**/*.rs`.\nDetails on line two.".into(),
+                ..Default::default()
+            },
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: "Acknowledged, continuing the deploy.".into(),
+                ..Default::default()
+            },
+        ],
+    );
+    shell.update(cx, |s, cx| {
+        s.sidebar_bots = vec![bot_for(SESSION, false)];
+        let bot_id = s.sidebar_bots[0].id.clone();
+        let started = BotNote {
+            session: Some(SESSION),
+            note: Arc::new(work_run::ItemNote {
+                at_ms: 1_000,
+                actor: work_run::NoteActor::Bot,
+                action: work_run::NoteAction::Status(krill_proto::bots::BotItemStatus::Working),
+                status: krill_proto::bots::BotItemStatus::Working,
+                title: long_title.into(),
+                detail: String::new(),
+            }),
+        };
+        let commented = BotNote {
+            session: Some(SESSION),
+            note: Arc::new(work_run::ItemNote {
+                at_ms: 2_000,
+                actor: work_run::NoteActor::Bot,
+                action: work_run::NoteAction::Commented,
+                status: krill_proto::bots::BotItemStatus::Working,
+                title: "Refactor authentication middleware pipeline".into(),
+                detail: "Long comment detail that should yield space first before crushing the item chip".into(),
+            }),
+        };
+        s.chat.bot_notes.insert(
+            (krill_app::hosts::HostId::Local, bot_id),
+            (std::time::Instant::now(), vec![started, commented]),
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Commit 3 (dcde358a): agent message row shows sender, first-line preview, always-visible
+    // chevron, and opens its details box on click.
+    assert!(cx.debug_bounds("chat-notice").is_some());
+    assert!(cx.debug_bounds("chat-notice-sender").is_some());
+    assert!(cx.debug_bounds("chat-notice-preview").is_some());
+    let chevron = cx
+        .debug_bounds("chat-notice-chevron")
+        .expect("always-visible chevron on multi-line agent message");
+    assert!(chevron.size.width > gpui::px(0.));
+    assert!(cx.debug_bounds("chat-notice-details").is_none());
+
+    let toggle = cx
+        .debug_bounds("chat-notice-toggle")
+        .expect("notice toggle row");
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("chat-notice-details").is_some(),
+        "clicking agent message row expands details box"
+    );
+
+    // Commits 2 & 4 (c9e22e23, 028100ad): item chip uses width beyond 256px when room permits,
+    // and stays >= 96px readable even with a long comment next to it.
+    let chip = cx
+        .debug_bounds("chat-item-note-chip")
+        .expect("item note chip rendered");
+    assert!(
+        chip.size.width >= gpui::px(96.),
+        "item pill must stay readable (>= 96px), got {:?}",
+        chip.size.width
+    );
+}

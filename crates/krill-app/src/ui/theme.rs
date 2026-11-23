@@ -310,6 +310,7 @@ pub struct Palette {
     pub warning: Hsla,
     pub warning_foreground: Hsla,
     pub agent_question: Hsla,
+    pub unread: Hsla,
     pub preserve: Hsla,
     pub split_divider: Hsla,
     pub split_divider_strong: Hsla,
@@ -356,6 +357,7 @@ pub const LIGHT: Palette = Palette {
     warning: hex(0x00ca_8a04),
     warning_foreground: hex(0x00fa_fafa),
     agent_question: hex(0x00ea_580c),
+    unread: hex(0x003b_82f6),
     // Krill 고유: 세션 보존·이어짐(데몬 재연결 중, 탭 밖 분리 세션). 상태색과 섞지 않는다.
     preserve: hex(0x0003_69a1),
     split_divider: hex(0x0086_8690),
@@ -402,6 +404,7 @@ pub const DARK: Palette = Palette {
     warning: hex(0x00ea_b308),
     warning_foreground: hex(0x0017_1717),
     agent_question: hex(0x00f9_7316),
+    unread: hex(0x0060_a5fa),
     // Krill 고유: 세션 보존·이어짐(데몬 재연결 중, 탭 밖 분리 세션). 상태색과 섞지 않는다.
     preserve: hex(0x007d_d3fc),
     split_divider: hex(0x0071_717a),
@@ -446,6 +449,7 @@ pub const ABYSS: Palette = Palette {
     warning: hex(0x00ea_b308),
     warning_foreground: hex(0x0017_1717),
     agent_question: hex(0x00fb_923c),
+    unread: hex(0x0060_a5fa),
     preserve: hex(0x007d_d3fc),
     split_divider: hex(0x0052_525b),
     split_divider_strong: hex(0x00a1_a1aa),
@@ -489,6 +493,7 @@ pub const TIDEPOOL: Palette = Palette {
     warning: hex(0x00eb_cb8b),
     warning_foreground: hex(0x001d_222c),
     agent_question: hex(0x00d0_8770),
+    unread: hex(0x0060_a5fa),
     preserve: hex(0x0088_c0d0),
     split_divider: hex(0x004c_566a),
     split_divider_strong: hex(0x007b_88a1),
@@ -532,6 +537,7 @@ pub const GLOW: Palette = Palette {
     warning: hex(0x00ff_d84d),
     warning_foreground: hex(0x0004_070e),
     agent_question: hex(0x00ff_8a3d),
+    unread: hex(0x0060_a5fa),
     preserve: hex(0x007c_c4ff),
     split_divider: hex(0x001e_3a52),
     split_divider_strong: hex(0x003d_6b8a),
@@ -575,6 +581,7 @@ pub const PAPER: Palette = Palette {
     warning: hex(0x00a1_6207),
     warning_foreground: hex(0x00fa_fafa),
     agent_question: hex(0x00c2_410c),
+    unread: hex(0x003b_82f6),
     preserve: hex(0x0003_69a1),
     split_divider: hex(0x008a_8474),
     split_divider_strong: hex(0x006f_6a60),
@@ -1738,7 +1745,7 @@ mod tests {
             }
         }
         assert_eq!(
-            field_count, 39,
+            field_count, 40,
             "unexpected Palette field count: {field_count}"
         );
 
