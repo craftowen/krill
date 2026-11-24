@@ -38,7 +38,7 @@ export function checkBlinding({ workspacePaths = [], promptText = '' } = {}) {
     leaks.push({
       surface: 'prompt',
       token: promptMatch[1],
-      detail: `후보 프롬프트에 평가 메타 단서('${promptMatch[1]}')가 노출되었습니다.`
+      detail: `Candidate prompt exposes evaluation meta-cue ('${promptMatch[1]}').`
     });
   }
 
@@ -49,7 +49,7 @@ export function checkBlinding({ workspacePaths = [], promptText = '' } = {}) {
       leaks.push({
         surface: 'workspace-path',
         token: dirMatch[1],
-        detail: `작업 디렉터리 경로(${absDir})에 평가 메타 단서('${dirMatch[1]}')가 포함되어 있습니다.`
+        detail: `Workspace directory path (${absDir}) contains evaluation meta-cue ('${dirMatch[1]}').`
       });
     }
 
@@ -65,7 +65,7 @@ export function checkBlinding({ workspacePaths = [], promptText = '' } = {}) {
             leaks.push({
               surface: 'filename',
               token: nameMatch[1],
-              detail: `후보 작업 공간 내 파일명(${rel})에 평가 메타 단서('${nameMatch[1]}')가 포함되어 있습니다.`
+              detail: `Filename inside candidate workspace (${rel}) contains evaluation meta-cue ('${nameMatch[1]}').`
             });
           }
           if (entry.isDirectory()) {
@@ -101,10 +101,10 @@ function renderBar(ratio, width = 20) {
 
 export function compareAbRuns({ control = [], treatment = [], metadata = {} } = {}) {
   if (!Array.isArray(control) || !Array.isArray(treatment) || control.length === 0) {
-    throw new Error('비교를 위해 비어 있지 않은 control 및 treatment 결과 배열이 필요합니다.');
+    throw new Error('Non-empty control and treatment result arrays are required for comparison.');
   }
   if (control.length !== treatment.length) {
-    throw new Error(`대조군(${control.length}건)과 실험군(${treatment.length}건)의 과제 수가 일치하지 않습니다.`);
+    throw new Error(`Task count mismatch between control (${control.length}) and treatment (${treatment.length}).`);
   }
 
   const controlMap = new Map(control.map((r) => [r.taskId, r]));
@@ -112,7 +112,7 @@ export function compareAbRuns({ control = [], treatment = [], metadata = {} } = 
 
   for (const id of controlMap.keys()) {
     if (!treatmentMap.has(id)) {
-      throw new Error(`실험군 결과에 과제 '${id}'가 누락되었습니다(선택적 체리피킹 방지).`);
+      throw new Error(`Treatment results are missing task '${id}' (cherry-picking forbidden).`);
     }
   }
 
@@ -138,7 +138,7 @@ export function compareAbRuns({ control = [], treatment = [], metadata = {} } = 
     const cTotal = Number(c.totalAssertions ?? 0);
     const tTotal = Number(t.totalAssertions ?? 0);
     if (cTotal <= 0 || cTotal !== tTotal) {
-      throw new Error(`과제 '${taskId}'의 전체 오라클 단언 수(${cTotal} vs ${tTotal})가 일치하지 않습니다.`);
+      throw new Error(`Total oracle assertion count mismatch for task '${taskId}' (${cTotal} vs ${tTotal}).`);
     }
 
     const cPassed = Number(c.passedAssertions ?? 0);
@@ -262,9 +262,9 @@ export function formatAbScoreboard(report) {
 
 function printHelp() {
   console.log([
-    '사용법:',
-    '  node ab-eval.mjs check-blinding [--prompt "<문장>"] [--dir <경로...>] [--json]',
-    '  node ab-eval.mjs compare --control <control.json> --treatment <treatment.json> [--model "<모델명>"] [--json]'
+    'Usage:',
+    '  node ab-eval.mjs check-blinding [--prompt "<text>"] [--dir <path...>] [--json]',
+    '  node ab-eval.mjs compare --control <control.json> --treatment <treatment.json> [--model "<model_name>"] [--json]'
   ].join('\n'));
 }
 
@@ -309,7 +309,7 @@ function main() {
       if (parsed.flags.json) {
         console.log(JSON.stringify(res, null, 2));
       } else if (res.ok) {
-        console.log('OK: 후보 경로, 파일명, 프롬프트에서 블라인드 누출 단서가 없습니다.');
+        console.log('OK: no blinding leaks found in candidate paths, filenames, or prompts.');
       } else {
         for (const leak of res.leaks) {
           console.error(`[BLIND_LEAK:${leak.surface}] ${leak.detail}`);
@@ -320,7 +320,7 @@ function main() {
 
     if (sub === 'compare') {
       if (!parsed.flags.control || !parsed.flags.treatment) {
-        console.error('--control <파일> 과 --treatment <파일> 이 모두 필요합니다.');
+        console.error('Both --control <file> and --treatment <file> are required.');
         process.exit(2);
       }
       const controlData = JSON.parse(fs.readFileSync(path.resolve(parsed.flags.control), 'utf8'));

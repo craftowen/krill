@@ -127,7 +127,7 @@ export function scanFileContent(relFile, content) {
         category: 'test-double-in-prod',
         confidence: 'high',
         snippet: rawTrimmed.slice(0, 140),
-        remediation: '프로덕션 경로에서 테스트 더블을 제거하고 생성자/어댑터 주입 경계로 옮기세요.'
+        remediation: 'Remove the test double from production code and move it behind a constructor/adapter injection seam.'
       });
     }
 
@@ -142,7 +142,7 @@ export function scanFileContent(relFile, content) {
         category: 'placeholder',
         confidence: 'high',
         snippet: rawTrimmed.slice(0, 140),
-        remediation: '미구현 플레이스홀더를 실제 동작으로 구현하거나 지원하지 않는 진입점을 제거하세요.'
+        remediation: 'Replace the unimplemented placeholder with real behavior or remove the unsupported entrypoint.'
       });
     }
 
@@ -163,7 +163,7 @@ export function scanFileContent(relFile, content) {
           category: 'permissive-guard',
           confidence: 'high',
           snippet: rawTrimmed.slice(0, 140),
-          remediation: '시크릿이나 서명이 누락되면 통과(true)시키지 말고 즉시 거부 예외를 던지세요.'
+          remediation: 'Reject with an explicit error instead of returning true when a secret or signature is missing.'
         });
       }
     }
@@ -178,7 +178,7 @@ export function scanFileContent(relFile, content) {
             category: 'swallowed-error',
             confidence: 'high',
             snippet: rawTrimmed.slice(0, 140),
-            remediation: '빈 catch 블록으로 예외를 삼키지 말고 상위로 전파하거나 의도된 사유(demock: allow <사유>)를 명시하세요.'
+            remediation: 'Do not swallow exceptions in an empty catch block; propagate them or document an intentional fallback with demock: allow <reason>.'
           });
         } else if (/^return\s+(?:true|\{\s*\}|\[\s*\])\s*;?$/.test(catchBlock.body)) {
           findings.push({
@@ -187,7 +187,7 @@ export function scanFileContent(relFile, content) {
             category: 'swallowed-error',
             confidence: 'high',
             snippet: rawTrimmed.slice(0, 140),
-            remediation: '예외 발생 시 정상 성공값(true, 빈 객체/배열)으로 위장하지 말고 실패를 드러내세요.'
+            remediation: 'Do not disguise an exception as a normal success value (true, empty object/array); surface the failure.'
           });
         }
       }
@@ -230,7 +230,7 @@ export function scanFileContent(relFile, content) {
             category: 'swallowed-error',
             confidence: headerPart === 'except' ? 'high' : 'medium',
             snippet: `${headerPart}: ${bodyStmt}`.slice(0, 140),
-            remediation: '광범위 예외(except/Exception)를 pass로 삼키지 말고 구체적 예외만 잡거나 에러를 기록/전파하세요.'
+            remediation: 'Do not swallow broad exceptions (except/Exception) with pass; catch specific exceptions or log/propagate the error.'
           });
         } else if (/^return\s+(?:True|\{\s*\}|\[\s*\])(?:\s*;)?$/.test(bodyStmt)) {
           findings.push({
@@ -239,7 +239,7 @@ export function scanFileContent(relFile, content) {
             category: 'swallowed-error',
             confidence: 'high',
             snippet: `${headerPart}: ${bodyStmt}`.slice(0, 140),
-            remediation: '예외 블록에서 True나 빈 컨테이너를 반환해 가짜 성공을 만들지 마세요.'
+            remediation: 'Do not return True or an empty container from an except block to fabricate success.'
           });
         }
       }
@@ -268,7 +268,7 @@ export function scanTargets(targets) {
 }
 
 function printHelp() {
-  console.log('사용법: node scan.mjs [--json] [--repo <경로>] [<경로...>] (종료 코드: 0=후보 없음, 3=후보 발견, 2=실행 오류)');
+  console.log('Usage: node scan.mjs [--json] [--repo <path>] [<path...>] (exit codes: 0=clean, 3=findings, 2=error)');
 }
 
 function main() {
@@ -297,12 +297,12 @@ function main() {
     if (parsed.flags.json) {
       console.log(JSON.stringify(result, null, 2));
     } else if (result.findings.length === 0) {
-      console.log(`OK: 프로덕션 파일 ${result.scannedFiles}개를 스캔했으며 가짜 성공/더블 후보가 없습니다.`);
+      console.log(`OK: scanned ${result.scannedFiles} production files with no fake-success or test-double findings.`);
     } else {
       for (const f of result.findings) {
-        console.log(`${f.file}:${f.line} [${f.category}/${f.confidence}] ${f.snippet}\n  권고: ${f.remediation}`);
+        console.log(`${f.file}:${f.line} [${f.category}/${f.confidence}] ${f.snippet}\n  Fix: ${f.remediation}`);
       }
-      console.log(`발견: 프로덕션 파일 ${result.scannedFiles}개 중 후보 ${result.findings.length}건`);
+      console.log(`Found ${result.findings.length} candidate(s) across ${result.scannedFiles} production files.`);
     }
     process.exit(result.findings.length === 0 ? 0 : 3);
   } catch (err) {

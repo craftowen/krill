@@ -573,9 +573,15 @@ pub fn display_title(raw: &str) -> Option<String> {
 pub const MAX_TITLE_TEXT: usize = 256;
 
 impl AgentStatus {
+    /// True when status comes from inferred title/screen evidence rather than hooks or process exit.
+    #[must_use]
+    pub fn is_inferred(&self) -> bool {
+        matches!(self.source, Some(Source::Title | Source::Screen))
+    }
+
     /// MK-049 shared UI badge for inferred title/screen evidence.
     pub fn badge(&self) -> Option<&'static str> {
-        matches!(self.source, Some(Source::Title | Source::Screen)).then_some("추정")
+        self.is_inferred().then_some("inferred")
     }
 
     /// True when the last terminal turn ended in a provider error (e.g. quota exhaustion).

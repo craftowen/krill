@@ -408,10 +408,11 @@ fn sidebar_fixtures_and_shared_badge() {
     for (source, badge) in [
         (Source::Hook, None),
         (Source::Process, None),
-        (Source::Title, Some("추정")),
-        (Source::Screen, Some("추정")),
+        (Source::Title, Some("inferred")),
+        (Source::Screen, Some("inferred")),
     ] {
         status.source = Some(source);
+        assert_eq!(status.is_inferred(), badge.is_some());
         assert_eq!(status.badge(), badge);
     }
 }

@@ -278,6 +278,7 @@ fn bridge_transcribe_single_and_chunked_with_context_vocab_and_refine_toggle() {
             target_kind: Some(VoiceTargetKind::Session),
             target_id: Some("42"),
             refine_override: None,
+            target_lang: Some("ja_JP"),
             upload_id: None,
             chunk_index: 0,
             total_chunks: 1,
@@ -292,12 +293,13 @@ fn bridge_transcribe_single_and_chunked_with_context_vocab_and_refine_toggle() {
         other => panic!("unexpected reply: {other:?}"),
     }
 
-    // Verify request body had surrounding, app_category="code", Pipito, pwa_rpc.rs, and NOT ignoredTerm
+    // Verify request body had surrounding, app_category="code", target_lang="ja-JP", Pipito, pwa_rpc.rs, and NOT ignoredTerm
     {
         let reqs = mock.requests.lock().unwrap();
         let tr = reqs.iter().find(|r| r.path == "/local/transcribe").unwrap();
         let body: serde_json::Value = serde_json::from_str(&tr.body).unwrap();
         assert_eq!(body["app_category"], "code");
+        assert_eq!(body["target_lang"], "ja-JP");
         assert!(body["surrounding"].as_str().unwrap().contains("pwa_rpc.rs"));
         let vocab: Vec<String> = body["vocab"]
             .as_array()
@@ -310,13 +312,18 @@ fn bridge_transcribe_single_and_chunked_with_context_vocab_and_refine_toggle() {
         assert!(!vocab.iter().any(|w| w.eq_ignore_ascii_case("ignoredTerm")));
     }
 
-    // Multi-chunk transcribe with refine OFF override and bot_chat category="chat"
+    // Multi-chunk transcribe with refine OFF override, stored target_lang fallback, and bot_chat category="chat"
+    assert_eq!(
+        svc.set_target_lang(Some("ko")).unwrap().as_deref(),
+        Some("ko")
+    );
     let first = svc
         .transcribe(TranscribeInput {
             audio_wav: b"RIFF11".to_vec(),
             target_kind: Some(VoiceTargetKind::BotChat),
             target_id: Some("bot1:chat1"),
             refine_override: Some(false),
+            target_lang: None,
             upload_id: Some("upload-99"),
             chunk_index: 0,
             total_chunks: 2,
@@ -336,6 +343,7 @@ fn bridge_transcribe_single_and_chunked_with_context_vocab_and_refine_toggle() {
             target_kind: Some(VoiceTargetKind::BotChat),
             target_id: Some("bot1:chat1"),
             refine_override: Some(false),
+            target_lang: None,
             upload_id: Some("upload-99"),
             chunk_index: 1,
             total_chunks: 2,
@@ -358,6 +366,7 @@ fn bridge_transcribe_single_and_chunked_with_context_vocab_and_refine_toggle() {
         let body: serde_json::Value = serde_json::from_str(&last_tr.body).unwrap();
         assert_eq!(body["app_category"], "chat");
         assert_eq!(body["refine"], false);
+        assert_eq!(body["target_lang"], "ko");
         assert_eq!(
             bridge::base64_decode(body["audio_wav_b64"].as_str().unwrap()).unwrap(),
             b"RIFF1122WAVE"
@@ -423,6 +432,7 @@ fn bridge_rejects_bad_auth_token() {
             target_kind: None,
             target_id: None,
             refine_override: None,
+            target_lang: None,
             upload_id: None,
             chunk_index: 0,
             total_chunks: 1,
@@ -445,6 +455,91 @@ fn vocab_extractor_filters_noise_and_keeps_high_signal_tokens() {
     assert!(!tokens.iter().any(|t| t.contains("https://")));
     assert!(!tokens.iter().any(|t| t == "9f8a7b6c5d4e3f2a"));
     assert!(!tokens.iter().any(|t| t == "123456"));
+}
+
+#[test]
+fn vocab_extractor_and_corrections_support_international_unicode_scripts() {
+    // Japanese (Kanji/Katakana/Hiragana with fullwidth punctuation)
+    let ja = vocab::extract_vocab_tokens("「リファクタリング」、マイクロサービス、東京 設計書.md");
+    assert!(ja.iter().any(|t| t == "リファクタリング"), "{ja:?}");
+    assert!(ja.iter().any(|t| t == "マイクロサービス"), "{ja:?}");
+    assert!(ja.iter().any(|t| t == "東京"), "{ja:?}");
+    assert!(ja.iter().any(|t| t == "設計書.md"), "{ja:?}");
+
+    // Chinese (Simplified)
+    let zh = vocab::extract_vocab_tokens("修复登录，更新微服务配置。");
+    assert!(zh.iter().any(|t| t == "修复登录"), "{zh:?}");
+    assert!(zh.iter().any(|t| t == "更新微服务配置"), "{zh:?}");
+
+    // Cyrillic (Kazakh & Russian)
+    let cyr = vocab::extract_vocab_tokens("Алматы Қазақстан қолданушы Москва микросервис");
+    for expected in ["Алматы", "Қазақстан", "қолданушы", "Москва", "микросервис"]
+    {
+        assert!(
+            cyr.iter().any(|t| t == expected),
+            "missing {expected} in {cyr:?}"
+        );
+    }
+
+    // Accented Latin (NFC & NFD), Greek, Arabic
+    let intl =
+        vocab::extract_vocab_tokens("café über résumé naïve Zürich e\u{0301}clair Αθήνα البرمجة");
+    for expected in [
+        "café",
+        "über",
+        "résumé",
+        "naïve",
+        "Zürich",
+        "e\u{0301}clair",
+        "Αθήνα",
+        "البرمجة",
+    ] {
+        assert!(
+            intl.iter().any(|t| t == expected),
+            "missing {expected} in {intl:?}"
+        );
+    }
+
+    // Pure emoji and single CJK characters are ignored
+    let noise = vocab::extract_vocab_tokens("😀🎉 の 的 à");
+    assert!(noise.is_empty(), "expected empty noise tokens: {noise:?}");
+
+    // Correction learning works across international scripts
+    let ja_corr = vocab::extract_corrections("りふぁくた の 確認", "リファクタリング 確認");
+    assert!(
+        ja_corr.iter().any(|t| t == "リファクタリング"),
+        "{ja_corr:?}"
+    );
+
+    let kz_corr = vocab::extract_corrections("алмата қаласы", "Алматы қаласы");
+    assert!(kz_corr.iter().any(|t| t == "Алматы"), "{kz_corr:?}");
+
+    let latin_corr = vocab::extract_corrections("visit cafe and uber", "visit café and über");
+    assert!(latin_corr.iter().any(|t| t == "café"), "{latin_corr:?}");
+    assert!(latin_corr.iter().any(|t| t == "über"), "{latin_corr:?}");
+
+    // target_lang normalization & persistence roundtrip
+    let dir = temp_dir("target-lang");
+    assert_eq!(vocab::normalize_target_lang("auto"), None);
+    assert_eq!(vocab::normalize_target_lang("system"), None);
+    assert_eq!(
+        vocab::normalize_target_lang("zh_CN").as_deref(),
+        Some("zh-CN")
+    );
+    assert_eq!(
+        vocab::normalize_target_lang("kk-KZ").as_deref(),
+        Some("kk-KZ")
+    );
+    assert_eq!(vocab::normalize_target_lang("bad lang!"), None);
+    {
+        let mut store = VocabStore::load(Some(&dir));
+        assert_eq!(store.target_lang(), None);
+        store.set_target_lang(Some("ja_JP")).unwrap();
+        assert_eq!(store.target_lang(), Some("ja-JP"));
+    }
+    let reloaded = VocabStore::load(Some(&dir));
+    assert_eq!(reloaded.target_lang(), Some("ja-JP"));
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

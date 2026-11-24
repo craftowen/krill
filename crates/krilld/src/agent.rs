@@ -121,8 +121,9 @@ if [ -n "${MK_PANE_ID-}" ]; then
   export HERDR_ENV=1 PI_CLIPBOARD_OSC52=1
 fi
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
-  # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
-  # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
+  # Only isolated OpenCode profiles override XDG_DATA_HOME/XDG_STATE_HOME. Remember original
+  # values (including unset) before overriding, restore on host account/entry removal, and
+  # preserve values changed directly by the user in the meantime (daemon-01).
   __krill_opencode_xdg() {
     if [ -n "${1-}" ]; then
       if [ -z "${__krill_xdg_dir-}" ] || [ "${XDG_DATA_HOME-}" != "$__krill_xdg_dir/data" ]; then

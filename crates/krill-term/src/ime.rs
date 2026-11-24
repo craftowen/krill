@@ -215,19 +215,36 @@ impl Ime {
         })
     }
 
-    /// `firstRectForCharacterRange:` — 후보창을 붙일 셀. preedit 안 UTF-16 위치 `start`까지의 칸 수만큼 오른쪽.
-    /// 에코 대기 중인 확정 글자가 같은 줄에 있으면 그 폭만큼 더 오른쪽이다(원인 1).
-    pub fn candidate_anchor(&self, start_utf16: usize) -> CellPoint {
+    /// Active conversion clause or mid-preedit caret range in terminal columns relative to
+    /// [`Overlay::origin`]. Returns `None` when not composing or when the IME did not provide a
+    /// `selectedRange`.
+    #[must_use]
+    pub fn selected_columns(&self) -> Option<Range<usize>> {
+        if !self.is_composing() {
+            return None;
+        }
+        let range = self.selected.as_ref()?;
+        let start_utf16 = range.start.min(range.end);
+        let end_utf16 = range.start.max(range.end);
+        Some(self.columns_at_utf16(start_utf16)..self.columns_at_utf16(end_utf16))
+    }
+
+    fn columns_at_utf16(&self, target_utf16: usize) -> usize {
         let mut utf16 = 0;
-        let columns: usize = self
-            .preedit
+        self.preedit
             .chars()
             .take_while(|ch| {
                 utf16 += ch.len_utf16();
-                utf16 <= start_utf16
+                utf16 <= target_utf16
             })
             .map(char_width)
-            .sum();
+            .sum()
+    }
+
+    /// `firstRectForCharacterRange:` — 후보창을 붙일 셀. preedit 안 UTF-16 위치 `start`까지의 칸 수만큼 오른쪽.
+    /// 에코 대기 중인 확정 글자가 같은 줄에 있으면 그 폭만큼 더 오른쪽이다(원인 1).
+    pub fn candidate_anchor(&self, start_utf16: usize) -> CellPoint {
+        let columns = self.columns_at_utf16(start_utf16);
         let origin = self.shifted_origin();
         CellPoint {
             line: origin.line,
@@ -373,5 +390,34 @@ mod edge_tests {
 
         drop(ime.insert("\u{200B}"));
         assert!(ime.pending().is_none());
+    }
+
+    #[test]
+    fn selected_columns_tracks_japanese_and_chinese_multi_clause_ranges() {
+        let mut ime = Ime::default();
+        assert_eq!(ime.selected_columns(), None);
+
+        // Japanese multi-clause conversion: "日本語変換" (5 wide chars = 10 columns).
+        ime.set_marked("日本語変換", Some(0..3));
+        assert_eq!(ime.selected_columns(), Some(0..6));
+        ime.set_marked("日本語変換", Some(3..5));
+        assert_eq!(ime.selected_columns(), Some(6..10));
+
+        // Chinese Pinyin mid-preedit zero-length caret: "你好世界" at char 2 -> column 4.
+        ime.set_marked("你好世界", Some(2..2));
+        assert_eq!(ime.selected_columns(), Some(4..4));
+
+        // Mixed ASCII + CJK + surrogate-pair emoji: "a日😀b"
+        // UTF-16 offsets: a(0..1, w=1), 日(1..2, w=2), 😀(2..4, w=2), b(4..5, w=1)
+        ime.set_marked("a日😀b", Some(1..4));
+        assert_eq!(ime.selected_columns(), Some(1..5));
+
+        // Out-of-bounds and missing selections degrade safely.
+        ime.set_marked("日本語", Some(2..99));
+        assert_eq!(ime.selected_columns(), Some(4..6));
+        ime.set_marked("日本語", None);
+        assert_eq!(ime.selected_columns(), None);
+        drop(ime.commit());
+        assert_eq!(ime.selected_columns(), None);
     }
 }

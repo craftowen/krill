@@ -155,6 +155,7 @@ pub struct TranscribeInput<'a> {
     pub target_kind: Option<VoiceTargetKind>,
     pub target_id: Option<&'a str>,
     pub refine_override: Option<bool>,
+    pub target_lang: Option<&'a str>,
     pub upload_id: Option<&'a str>,
     pub chunk_index: u16,
     pub total_chunks: u16,
@@ -238,6 +239,22 @@ impl VoiceService {
             .config()
     }
 
+    #[must_use]
+    pub fn target_lang(&self) -> Option<String> {
+        self.vocab
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .target_lang()
+            .map(str::to_owned)
+    }
+
+    pub fn set_target_lang(&self, target_lang: Option<&str>) -> io::Result<Option<String>> {
+        self.vocab
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_target_lang(target_lang)
+    }
+
     pub fn config_set(&self, patch: VoiceConfigPatch) -> io::Result<VoiceConfig> {
         self.vocab
             .write()
@@ -253,6 +270,7 @@ impl VoiceService {
             target_kind,
             target_id,
             refine_override,
+            target_lang,
             upload_id,
             chunk_index,
             total_chunks,
@@ -302,14 +320,18 @@ impl VoiceService {
         // 0ms 핫 패스: 메모리 캐시에서만 문맥 스냅샷 + 병합 단어장을 읽는다.
         let snapshot = self.context.snapshot(target_kind, target_id);
         let now_ms = now_unix_ms();
-        let (refine, vocab) = {
+        let (refine, vocab, effective_target_lang) = {
             let guard = self
                 .vocab
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let refine = refine_override.unwrap_or_else(|| guard.refine_enabled());
             let vocab = guard.merged_vocab(&snapshot.session_vocab, now_ms);
-            (refine, vocab)
+            let effective_lang = match target_lang {
+                Some(raw) => vocab::normalize_target_lang(raw),
+                None => guard.target_lang().map(str::to_owned),
+            };
+            (refine, vocab, effective_lang)
         };
 
         let audio_wav_b64 = base64_encode(&wav_bytes);
@@ -317,7 +339,7 @@ impl VoiceService {
             audio_wav_b64: &audio_wav_b64,
             refine,
             mode: "refine",
-            target_lang: None,
+            target_lang: effective_target_lang.as_deref(),
             vocab: &vocab,
             surrounding: &snapshot.surrounding,
             app: "Krill",
@@ -401,6 +423,7 @@ impl VoiceService {
                 target_kind,
                 target_id: target_id.as_deref(),
                 refine_override: refine,
+                target_lang: None,
                 upload_id: upload_id.as_deref(),
                 chunk_index,
                 total_chunks,

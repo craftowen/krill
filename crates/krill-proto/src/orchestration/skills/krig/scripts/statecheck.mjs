@@ -31,7 +31,7 @@ export function canonicalizeState(value, fieldPath = 'state') {
   }
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {
-      throw new Error(`${fieldPath}에 유한하지 않은 숫자(${value})가 포함되어 있습니다.`);
+      throw new Error(`${fieldPath} contains a non-finite number (${value}).`);
     }
     return JSON.stringify(Object.is(value, -0) ? 0 : value);
   }
@@ -43,13 +43,13 @@ export function canonicalizeState(value, fieldPath = 'state') {
     const parts = [];
     for (const k of keys) {
       if (value[k] === undefined) {
-        throw new Error(`${fieldPath}.${k} 값이 undefined입니다. 명시적 null이나 리터럴 값을 사용하세요.`);
+        throw new Error(`${fieldPath}.${k} is undefined; use explicit null or a literal value.`);
       }
       parts.push(`${JSON.stringify(k)}:${canonicalizeState(value[k], `${fieldPath}.${k}`)}`);
     }
     return `{${parts.join(',')}}`;
   }
-  throw new Error(`${fieldPath}에 직렬화할 수 없는 타입(${typeof value})이 포함되어 있습니다.`);
+  throw new Error(`${fieldPath} contains a non-serializable type (${typeof value}).`);
 }
 
 function getByPath(obj, dottedKey) {
@@ -69,11 +69,11 @@ function setByPath(obj, dottedKey, val) {
     const seg = parts[i];
     if (Array.isArray(cur)) {
       if (!/^\d+$/.test(seg)) {
-        throw new Error(`배열에 숫자가 아닌 키(${seg})를 지정할 수 없습니다: ${dottedKey}`);
+        throw new Error(`Cannot use non-numeric array key (${seg}): ${dottedKey}`);
       }
       const idx = Number.parseInt(seg, 10);
       if (idx < 0 || idx >= cur.length) {
-        throw new Error(`배열 인덱스 범위를 벗어난 경로 갱신입니다: ${dottedKey}`);
+        throw new Error(`Array index out of range while updating path: ${dottedKey}`);
       }
       if (cur[idx] === null || typeof cur[idx] !== 'object') cur[idx] = {};
       cur = cur[idx];
@@ -85,11 +85,11 @@ function setByPath(obj, dottedKey, val) {
   const last = parts[parts.length - 1];
   if (Array.isArray(cur)) {
     if (!/^\d+$/.test(last)) {
-      throw new Error(`배열에 숫자가 아닌 키(${last})를 지정할 수 없습니다: ${dottedKey}`);
+      throw new Error(`Cannot use non-numeric array key (${last}): ${dottedKey}`);
     }
     const idx = Number.parseInt(last, 10);
     if (idx < 0 || idx > cur.length) {
-      throw new Error(`배열 인덱스 범위를 벗어난 경로 갱신입니다: ${dottedKey}`);
+      throw new Error(`Array index out of range while updating path: ${dottedKey}`);
     }
     cur[idx] = val;
   } else {
@@ -161,7 +161,7 @@ function evaluateFieldOperator(actual, opObj, rootState) {
         break;
       }
       default:
-        throw new Error(`알 수 없는 조건 연산자입니다: ${op}`);
+        throw new Error(`Unknown condition operator: ${op}`);
     }
   }
   return true;
@@ -172,17 +172,17 @@ export function evaluateCondition(cond, state) {
   if (typeof cond === 'boolean') return cond;
   if (typeof cond === 'function') return Boolean(cond(state));
   if (!isPlainObject(cond)) {
-    throw new Error(`유효하지 않은 조건 표현식입니다: ${JSON.stringify(cond)}`);
+    throw new Error(`Invalid condition expression: ${JSON.stringify(cond)}`);
   }
 
   for (const [key, expected] of Object.entries(cond)) {
     if (key === '$and') {
-      if (!Array.isArray(expected)) throw new Error('$and 값은 조건 배열이어야 합니다.');
+      if (!Array.isArray(expected)) throw new Error('$and value must be an array of conditions.');
       if (!expected.every((sub) => evaluateCondition(sub, state))) return false;
       continue;
     }
     if (key === '$or') {
-      if (!Array.isArray(expected)) throw new Error('$or 값은 조건 배열이어야 합니다.');
+      if (!Array.isArray(expected)) throw new Error('$or value must be an array of conditions.');
       if (!expected.some((sub) => evaluateCondition(sub, state))) return false;
       continue;
     }
@@ -192,7 +192,7 @@ export function evaluateCondition(cond, state) {
     }
     if (key === '$implies') {
       if (!Array.isArray(expected) || expected.length !== 2) {
-        throw new Error('$implies 값은 [전제조건, 결론조건] 길이 2 배열이어야 합니다.');
+        throw new Error('$implies value must be a 2-element array [premise, conclusion].');
       }
       const [premise, conclusion] = expected;
       if (evaluateCondition(premise, state) && !evaluateCondition(conclusion, state)) return false;
@@ -211,7 +211,7 @@ export function evaluateCondition(cond, state) {
 
 function applyDeclarativePatch(state, patch) {
   if (!isPlainObject(patch)) {
-    throw new Error('액션의 set 패치는 객체여야 합니다.');
+    throw new Error('Action set patch must be an object.');
   }
   const next = structuredClone(state);
   for (const [key, expr] of Object.entries(patch)) {
@@ -231,7 +231,7 @@ function applyDeclarativePatch(state, patch) {
         arr.push(structuredClone(expr.$append));
         setByPath(next, key, arr);
       } else {
-        throw new Error(`알 수 없는 상태 변경 연산자입니다: ${Object.keys(expr).join(',')}`);
+        throw new Error(`Unknown state mutation operator: ${Object.keys(expr).join(',')}`);
       }
     } else {
       setByPath(next, key, structuredClone(expr));
@@ -244,7 +244,7 @@ function normalizeActions(rawActions) {
   if (Array.isArray(rawActions)) {
     return rawActions.map((act, idx) => {
       if (!isPlainObject(act) || !act.name || !String(act.name).trim()) {
-        throw new Error(`actions[${idx}]에 유효한 name 문자열이 필요합니다.`);
+        throw new Error(`actions[${idx}] requires a non-empty name string.`);
       }
       return { ...act, name: String(act.name).trim() };
     });
@@ -252,12 +252,12 @@ function normalizeActions(rawActions) {
   if (isPlainObject(rawActions)) {
     return Object.entries(rawActions).map(([name, body]) => {
       if (!isPlainObject(body)) {
-        throw new Error(`액션 '${name}' 정의는 객체여야 합니다.`);
+        throw new Error(`Action '${name}' definition must be an object.`);
       }
       return { ...body, name };
     });
   }
-  throw new Error('모델 명세에 actions 배열 또는 객체가 필요합니다.');
+  throw new Error('Model spec requires an actions array or object.');
 }
 
 function validateTerminalSpec(terminalSpec) {
@@ -266,22 +266,22 @@ function validateTerminalSpec(terminalSpec) {
   }
   if (Array.isArray(terminalSpec)) {
     if (terminalSpec.length === 0) {
-      throw new Error('terminal 배열은 비어 있을 수 없습니다.');
+      throw new Error('terminal array cannot be empty.');
     }
     for (const item of terminalSpec) {
       if (isPlainObject(item) && Object.keys(item).length === 0) {
-        throw new Error('terminal 배열에 빈 조건 객체({})를 넣을 수 없습니다.');
+        throw new Error('terminal array cannot contain an empty condition object ({}).');
       }
     }
     return;
   }
   if (isPlainObject(terminalSpec)) {
     if (Object.keys(terminalSpec).length === 0) {
-      throw new Error('terminal 조건 객체는 최소 1개 이상의 필드를 지정해야 합니다.');
+      throw new Error('terminal condition object must specify at least one field.');
     }
     return;
   }
-  throw new Error('terminal 명세는 조건 객체, 조건 배열, 또는 함수여야 합니다.');
+  throw new Error('terminal spec must be a condition object, condition array, or function.');
 }
 
 function isTerminalState(terminalSpec, frozenState) {
@@ -297,11 +297,11 @@ function parseStrictInt(rawVal, defaultVal, minVal, label) {
   if (rawVal === undefined || rawVal === null || rawVal === '') return defaultVal;
   const str = String(rawVal).trim();
   if (!/^\d+$/.test(str)) {
-    throw new Error(`유효하지 않은 ${label} 값입니다(${minVal} 이상의 정수 필요): ${rawVal}`);
+    throw new Error(`Invalid ${label} value (integer >= ${minVal} required): ${rawVal}`);
   }
   const num = Number.parseInt(str, 10);
   if (!Number.isSafeInteger(num) || num < minVal) {
-    throw new Error(`유효하지 않은 ${label} 값입니다(${minVal} 이상의 정수 필요): ${rawVal}`);
+    throw new Error(`Invalid ${label} value (integer >= ${minVal} required): ${rawVal}`);
   }
   return num;
 }
@@ -367,19 +367,19 @@ export function renderMermaid(report) {
 
 export function verifyStateModel(spec, options = {}) {
   if (!isPlainObject(spec)) {
-    throw new Error('모델 명세는 객체여야 합니다.');
+    throw new Error('Model spec must be an object.');
   }
 
   const rawInitials = Array.isArray(spec.initial) ? spec.initial : [spec.initial];
   if (rawInitials.length === 0 || !rawInitials.every((s) => isPlainObject(s))) {
-    throw new Error('initial 상태는 비어 있지 않은 상태 객체(또는 상태 객체 배열)여야 합니다.');
+    throw new Error('initial must be a non-empty state object (or array of state objects).');
   }
 
   validateTerminalSpec(spec.terminal);
 
   const actions = normalizeActions(spec.actions);
   if (actions.length === 0) {
-    throw new Error('최소 1개 이상의 액션이 필요합니다.');
+    throw new Error('At least one action is required.');
   }
 
   const invariants = isPlainObject(spec.invariants) ? spec.invariants : {};
@@ -439,7 +439,7 @@ export function verifyStateModel(spec, options = {}) {
           name: invName,
           stateId: id,
           depth,
-          message: `상태 ${id}(깊이 ${depth})에서 불변식 '${invName}'이 깨졌습니다.`,
+          message: `Invariant '${invName}' violated at state ${id} (depth ${depth}).`,
           trace: reconstructTrace(nodesById, id)
         });
       }
@@ -476,7 +476,7 @@ export function verifyStateModel(spec, options = {}) {
         if (Array.isArray(result)) {
           result.forEach((nextState, bIdx) => {
             if (!isPlainObject(nextState)) {
-              throw new Error(`액션 '${action.name}'의 apply 배열 반환값[${bIdx}]이 객체가 아닙니다.`);
+              throw new Error(`Action '${action.name}' apply array element [${bIdx}] is not an object.`);
             }
             enabledOutcomes.push({
               label: result.length > 1 ? `${action.name}#${bIdx + 1}` : action.name,
@@ -486,7 +486,7 @@ export function verifyStateModel(spec, options = {}) {
         } else if (isPlainObject(result)) {
           enabledOutcomes.push({ label: action.name, nextState: result });
         } else {
-          throw new Error(`액션 '${action.name}'의 apply 반환값은 상태 객체 또는 배열이어야 합니다.`);
+          throw new Error(`Action '${action.name}' apply return value must be a state object or array.`);
         }
       } else if (Array.isArray(action.branches)) {
         action.branches.forEach((branch, bIdx) => {
@@ -503,7 +503,7 @@ export function verifyStateModel(spec, options = {}) {
           nextState: applyDeclarativePatch(current.state, action.set)
         });
       } else {
-        throw new Error(`액션 '${action.name}'에 set, branches, apply 중 하나가 필요합니다.`);
+        throw new Error(`Action '${action.name}' requires one of set, branches, or apply.`);
       }
     }
 
@@ -515,7 +515,7 @@ export function verifyStateModel(spec, options = {}) {
           name: 'NoDeadlock',
           stateId: current.id,
           depth: current.depth,
-          message: `비종단 상태 ${current.id}(깊이 ${current.depth})에서 실행 가능한 전이가 없어 데드락이 발생했습니다.`,
+          message: `Deadlock at non-terminal state ${current.id} (depth ${current.depth}): no enabled transitions.`,
           trace: reconstructTrace(nodesById, current.id)
         });
       }
@@ -550,8 +550,8 @@ export function verifyStateModel(spec, options = {}) {
         stateId: null,
         depth: maxDepthReached,
         message: complete
-          ? `도달 가능한 전체 상태(${nodes.length}개) 중 필수 목표 '${targetName}'에 도달하는 경로가 없습니다.`
-          : `탐색 한도(상태 ${nodes.length}개, 깊이 ${maxDepthReached}) 내에서 필수 목표 '${targetName}'에 도달하지 못했습니다.`,
+          ? `No path reaches required target '${targetName}' across all ${nodes.length} reachable states.`
+          : `Did not reach required target '${targetName}' within exploration bounds (${nodes.length} states, depth ${maxDepthReached}).`,
         trace: []
       });
     }
@@ -589,19 +589,19 @@ export function verifyStateModel(spec, options = {}) {
 async function loadSpecFromInput(filePath, useStdin) {
   if (useStdin) {
     const raw = fs.readFileSync(0, 'utf8').trim();
-    if (!raw) throw new Error('표준 입력(stdin) 모델 명세가 비어 있습니다.');
+    if (!raw) throw new Error('Model spec on stdin is empty.');
     return JSON.parse(raw);
   }
   const abs = path.resolve(filePath);
   if (!fs.existsSync(abs)) {
-    throw new Error(`모델 명세 파일을 찾을 수 없습니다: ${filePath}`);
+    throw new Error(`Model spec file not found: ${filePath}`);
   }
   const ext = path.extname(abs).toLowerCase();
   if (ext === '.mjs' || ext === '.js') {
     const mod = await import(pathToFileURL(abs).href);
     const candidate = mod.default ?? mod.spec ?? mod.model;
     if (!candidate) {
-      throw new Error(`ES 모듈(${filePath})에서 default 또는 spec 객체를 export 해야 합니다.`);
+      throw new Error(`ES module (${filePath}) must export default, spec, or model.`);
     }
     return candidate;
   }
@@ -610,9 +610,9 @@ async function loadSpecFromInput(filePath, useStdin) {
 
 function printHelp() {
   console.log([
-    '사용법: node statecheck.mjs [--json] [--mermaid] [--stdin] [--max-states <N>] [--max-depth <D>] [--require-complete] [<명세파일.json|.mjs>]',
-    '조건 연산자: $eq, $ne, $lt, $lte, $gt, $gte, $in, $nin, $eqRef~$gteRef, $and, $or, $not, $implies',
-    '변경 연산자: $inc, $dec, $ref, $toggle, $append (ESM 명세는 default, spec, 또는 model 객체 export)'
+    'Usage: node statecheck.mjs [--json] [--mermaid] [--stdin] [--max-states <N>] [--max-depth <D>] [--require-complete] [<spec.json|.mjs>]',
+    'Condition ops: $eq, $ne, $lt, $lte, $gt, $gte, $in, $nin, $eqRef..$gteRef, $and, $or, $not, $implies',
+    'Mutation ops: $inc, $dec, $ref, $toggle, $append (ESM specs export default, spec, or model)'
   ].join('\n'));
 }
 
@@ -652,18 +652,18 @@ async function main() {
       console.log(report.mermaid);
     } else {
       const statusLabel = report.ok ? 'PASS' : 'FAIL';
-      console.log(`[${statusLabel}] 탐색 상태 ${report.exploredStates}개, 전이 ${report.transitions}회, 최대 깊이 ${report.maxDepthReached}, 전수 완료=${report.complete}`);
+      console.log(`[${statusLabel}] explored=${report.exploredStates}, transitions=${report.transitions}, maxDepth=${report.maxDepthReached}, complete=${report.complete}`);
       if (report.violations.length > 0) {
         for (const v of report.violations) {
-          console.log(`위반 [${v.kind}:${v.name}] ${v.message}`);
+          console.log(`Violation [${v.kind}:${v.name}] ${v.message}`);
           for (const step of v.trace) {
-            const actLabel = step.action ? `(${step.action}) ` : '(초기 상태) ';
+            const actLabel = step.action ? `(${step.action}) ` : '(initial) ';
             console.log(`  step ${step.step}: ${actLabel}${step.stateId} ${JSON.stringify(step.state)}`);
           }
         }
       }
       if (parsed.flags['require-complete'] && !report.complete) {
-        console.log('미완료: 탐색 한도에 도달해 전체 상태 공간을 끝까지 탐색하지 못했습니다.');
+        console.log('Incomplete: reached exploration limit before covering the full state space.');
       }
     }
 

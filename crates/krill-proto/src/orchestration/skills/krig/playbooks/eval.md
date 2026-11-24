@@ -1,39 +1,39 @@
-# Eval Playbook (블라인드 A/B 정량 평가 및 스킬 효과 입증)
+# Eval Playbook (Blind A/B Quantitative Evaluation & Skill Lift Proof)
 
 ## Trigger
 
-스킬, 플레이북, 프롬프트 변형을 쓴 경우(`with-krig`)와 쓰지 않은 경우(`no-skill`)의 결과물 차이를 정량적으로 비교하거나, 두 에이전트 하네스 구성을 객관적 지표로 대조할 때 `afk` 기어로 실행한다.
+Run in `afk` gear to quantitatively compare outputs produced with a skill/playbook/prompt variant (`with-krig`) against a control (`no-skill`), or to benchmark two agent harness configurations objectively.
 
 ## Steps
 
-1. **블라인드 2군 실험 환경 구성.**
-   - 실행 엔진, 모델, 추론 강도, 허용 도구, 타임아웃을 두 군에 동일하게 고정한다.
-   - 후보 작업 공간 경로는 `/tmp/ws-alpha/<과제명>`과 `/tmp/ws-beta/<과제명>`처럼 중립적인 이름을 쓰고 동일한 초기 git 커밋에서 복제한다.
-   - 대조군(`no-skill`)에는 스킬 및 슬래시 커맨드를 비활성화한 채 실제 사용자 요청문만 전달하고, 적용군(`with-krig`)에는 동일한 요청문 앞에 `/krig` 호출만 붙여 전달한다.
-   - 실행 전 [ab-eval.mjs](../scripts/ab-eval.mjs)로 블라인드 누출을 검사한다.
+1. **Configure a blind two-arm experiment.**
+   - Lock the execution engine, model, reasoning effort, allowed tools, and timeout identically across both arms.
+   - Clone from the same initial git commit into neutral workspace paths such as `/tmp/ws-alpha/<task>` and `/tmp/ws-beta/<task>`.
+   - Pass the organic user prompt alone to the control arm (`no-skill`) with skills and slash commands disabled, and pass the identical prompt prefixed with `/krig` to the treatment arm (`with-krig`).
+   - Run [ab-eval.mjs](../scripts/ab-eval.mjs) before execution to check for blinding leaks:
      ```bash
-     node "<SKILL_DIR>/scripts/ab-eval.mjs" check-blinding --prompt "<유기적_요청문>" --dir "<작업경로_A>" --dir "<작업경로_B>"
+     node "<SKILL_DIR>/scripts/ab-eval.mjs" check-blinding --prompt "<organic_prompt>" --dir "<workspace_A>" --dir "<workspace_B>"
      ```
-2. **격리 실행 및 실제 수행 흔적 수집.**
-   - 두 군이 서로의 작업 디렉터리나 채점 코드를 읽지 못하도록 격리된 프로세스로 실행한다.
-   - 적용군이 실제로 라우팅과 검증 도구를 수행했는지는 에이전트의 자기 보고 문장이 아니라 작업 공간에 남은 `.krig/` 상태 파일, 커밋/파일 변경분, 프로세스 실행 기록으로 확인한다.
-3. **보류된 결정론적 오라클 채점.**
-   - 모든 에이전트 실행이 끝난 뒤 작업 공간 바깥에 보관된 결정론적 오라클 스크립트를 두 결과물에 동일하게 실행한다.
-   - 주관적 LLM 채점 대신 보류된 기능/경계 단언 통과 수(`passedAssertions` / `totalAssertions`), 사일런트 실패 및 상태 불변성 결함 탈출 건수(`defectEscapes`), 프로덕션 코드 줄 수(`prodLoc`), 소요 시간(`durationMs`)을 수집한다.
-4. **쌍대 비교 산출 및 누수 감사.**
-   - 전체 과제의 대조군 결과와 적용군 결과를 [ab-eval.mjs](../scripts/ab-eval.mjs)에 입력해 정량 지표를 계산한다.
+2. **Run in isolation and collect execution artifacts.**
+   - Execute both arms in isolated processes so neither can read the other's workspace or grading scripts.
+   - Verify whether the treatment arm actually ran routing and verification tools using concrete workspace artifacts (`.krig/` state files, commits/diffs, process logs) rather than agent self-reports.
+3. **Grade with held-out deterministic oracles.**
+   - After all runs finish, run held-out deterministic oracle scripts stored outside the workspaces identically against both outputs.
+   - Record objective metrics rather than subjective LLM grading: passed held-out functional/boundary assertions (`passedAssertions` / `totalAssertions`), silent-failure and invariant defect escapes (`defectEscapes`), production LOC (`prodLoc`), and wall time (`durationMs`).
+4. **Compute paired comparison and audit leakage.**
+   - Feed both arms' task results into [ab-eval.mjs](../scripts/ab-eval.mjs):
      ```bash
-     node "<SKILL_DIR>/scripts/ab-eval.mjs" compare --control "<control.json>" --treatment "<treatment.json>" --model "<모델명>"
+     node "<SKILL_DIR>/scripts/ab-eval.mjs" compare --control "<control.json>" --treatment "<treatment.json>" --model "<model_name>"
      ```
-   - [leakage-8.md](../references/leakage-8.md)의 8개 항목을 대조해 평가셋 오염, 일부 과제 체리피킹, 실행 중 크래시(`0`점 둔갑), 채점기 사후 수정이 없는지 확인한다.
+   - Audit all 8 items in [leakage-8.md](../references/leakage-8.md) for dataset contamination, cherry-picking, crash-as-zero distortion, and post-hoc grader edits.
 
 ## Rules
 
-- 후보 에이전트가 보는 디렉터리 경로, 파일명, 프롬프트에 `eval`, `benchmark`, `rubric`, `judge`, `candidate`, `treatment`, `대조군`, `실험군`, `채점` 등 평가 중임을 암시하는 단어를 절대 넣지 않는다.
-- 유리하게 나온 과제만 골라 집계하지 않고 사전에 정의된 전체 과제 세트의 쌍대 결과(승, 무, 패 및 중앙값 향상폭)를 모두 공개한다.
-- 측정 결과를 보고할 때는 과제 수, 전체 단언 수, 실행 모델명을 반드시 명시하며, 측정하지 않은 다른 저장소에 벤치마크 향상폭을 임의로 외삽해 확정 수치처럼 제시하지 않는다.
+- Never expose evaluation-hinting words (`eval`, `benchmark`, `rubric`, `judge`, `candidate`, `treatment`, `control`, `grading`) in workspace paths, filenames, or prompts visible to candidate agents.
+- Report paired results (wins, ties, losses, median lift) across the full predefined task set without cherry-picking favorable tasks.
+- Always state task count, total assertions, and model name alongside metrics, and never extrapolate benchmark lift to unmeasured repositories as proven numbers.
 
 ## Verification
 
-- `ab-eval.mjs check-blinding`이 모든 과제 프롬프트와 양쪽 작업 디렉터리에서 종료 코드 `0`(`leaks: []`)을 반환했는지 확인한다.
-- 양쪽 군의 실행 중 인프라/타임아웃 에러 건수가 `0`건인지 확인하고, `ab-eval.mjs compare`의 실제 출력 표와 JSON 수치를 검증 근거로 기록한다.
+- Confirm `ab-eval.mjs check-blinding` returns exit code `0` (`leaks: []`) for every task prompt and both workspace directories.
+- Confirm zero infrastructure or timeout errors across both arms, and attach the actual `ab-eval.mjs compare` table and JSON output as evidence.

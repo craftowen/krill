@@ -129,7 +129,7 @@ export function classifyTask(rawInput) {
     .trim();
 
   if (!strippedSlash) {
-    throw new Error('요청 문장이 비어 있습니다. 예: node route.mjs -- "PROJ-120 구현해줘"');
+    throw new Error('Request text is empty. Example: node route.mjs -- "Implement PROJ-120"');
   }
 
   const explicit = parseExplicitRoute(strippedSlash);
@@ -154,10 +154,10 @@ export function classifyTask(rawInput) {
 
     if (PATTERNS.fullAutonomy.test(restText) && PATTERNS.align.test(restText)) {
       primaryId = 'full';
-      reasons.push('전 주기 자율 실행 및 기획 신호 감지');
+      reasons.push('Detected full-cycle autonomous planning and execution signal');
     } else if (PATTERNS.eval.test(restText) && !PATTERNS.hardDefect.test(restText)) {
       primaryId = 'eval';
-      reasons.push('블라인드 A/B 정량 평가/대조 실험 신호 감지');
+      reasons.push('Detected blind A/B quantitative evaluation signal');
     } else if (
       PATTERNS.backprop.test(restText)
       && !ML_BACKPROP_RE.test(restText)
@@ -165,17 +165,17 @@ export function classifyTask(rawInput) {
       && !buildIntent
     ) {
       primaryId = 'backprop';
-      reasons.push('교훈 역전파/재발 방지 규칙화 신호 감지');
+      reasons.push('Detected lesson backprop / guardrail encoding signal');
     } else if (
       PATTERNS.resume.test(restText)
       && !PATTERNS.hardDefect.test(restText)
       && !DOMAIN_RUNTIME_RECOVERY_RE.test(restText)
     ) {
       primaryId = 'resume';
-      reasons.push('세션 복구/핸드오프/체크포인트 신호 감지');
+      reasons.push('Detected session recovery / handoff / checkpoint signal');
     } else if (shipSignal && !buildIntent && !PATTERNS.hardDefect.test(restText)) {
       primaryId = 'ship';
-      reasons.push('패치 신선도 출하 게이트/PR 브리핑 신호 감지');
+      reasons.push('Detected patch-freshness shipping gate / PR brief signal');
     } else if (
       PATTERNS.demock.test(restText)
       && !UI_PLACEHOLDER_RE.test(restText)
@@ -183,34 +183,34 @@ export function classifyTask(rawInput) {
       && !PATTERNS.hardDefect.test(restText)
     ) {
       primaryId = 'demock';
-      reasons.push('프로덕션 가짜 성공/삼킨 예외 점검 신호 감지');
+      reasons.push('Detected production fake-success / swallowed-error audit signal');
     } else if (PATTERNS.slim.test(restText) && !prReviewSignal) {
       primaryId = 'slim';
-      reasons.push('저장소 전수 군살 감사/기술 부채 원장 신호 감지');
+      reasons.push('Detected repo-wide bloat audit / tech-debt ledger signal');
     } else if (PATTERNS.model.test(restText)) {
       primaryId = 'model';
-      reasons.push('유한 상태 공간 BFS 모델 체킹/불변식 검증 신호 감지');
+      reasons.push('Detected finite state-space BFS model checking / invariant signal');
     } else if (
       PATTERNS.epicSplit.test(restText)
       || (PATTERNS.align.test(restText) && !ticketPresent && !PATTERNS.hardDefect.test(restText) && !buildIntent)
     ) {
       primaryId = 'align';
-      reasons.push('신규 범위 정렬/요구사항 감량/티켓화 신호 감지');
+      reasons.push('Detected new scope alignment / requirement reduction / ticketing signal');
     } else if (hasReconSignal && !buildIntent) {
       primaryId = 'recon';
-      reasons.push('읽기 전용 코드 구조/계보/영향도 조사 신호 감지');
+      reasons.push('Detected read-only code mechanics / lineage / blast-radius recon signal');
     } else if (PATTERNS.verify.test(restText) && !buildIntent) {
       primaryId = 'verify';
-      reasons.push('독립 리뷰/검증 전용 요청 신호 감지');
+      reasons.push('Detected independent review / verification-only signal');
     } else if (PATTERNS.design.test(restText) && !buildIntent && !PATTERNS.hardDefect.test(restText)) {
       primaryId = 'design';
-      reasons.push('모듈 경계 및 인터페이스 설계 전용 신호 감지');
+      reasons.push('Detected module boundary and interface design-only signal');
     } else {
       primaryId = 'drive';
-      reasons.push('구체적 실행/수정 요청 기본 라우트');
+      reasons.push('Default route for concrete implementation or modification request');
     }
   } else {
-    reasons.push(`명시적 라우트 지정(${primaryId})`);
+    reasons.push(`Explicit route override (${primaryId})`);
   }
 
   const driveChain = ROUTE_BY_ID.get('drive').chain;
@@ -223,26 +223,26 @@ export function classifyTask(rawInput) {
 
     if (primaryId === 'resume' && !PATTERNS.resumePauseOnly.test(restText) && PATTERNS.resumeContinueBuild.test(restText)) {
       pipelineIds = [...new Set(['resume', 'drive', ...driveChain])];
-      reasons.push('복구 후 구현 마무리 신호가 함께 있어 drive 파이프라인 연쇄');
+      reasons.push('Chained drive pipeline because recovery also requests finishing implementation');
     } else if (primaryId === 'slim' && (PATTERNS.slimApply.test(restText) || buildIntent)) {
       pipelineIds = [...new Set(['slim', 'drive', ...driveChain])];
-      reasons.push('실제 감량 코드 반영 신호가 함께 있어 drive 파이프라인 연쇄');
+      reasons.push('Chained drive pipeline because slim audit also requests applying cuts');
     } else if (primaryId === 'model' && (buildIntent || PATTERNS.hardDefect.test(restText))) {
       pipelineIds = [...new Set(['model', 'drive', ...driveChain])];
-      reasons.push('상태 모델 검증과 실제 코드 구현/수정 신호가 함께 있어 drive 파이프라인 연쇄');
+      reasons.push('Chained drive pipeline because model check also requests code implementation/fix');
     } else if (primaryId === 'drive') {
       const prefixes = [];
       if (PATTERNS.reconBlast.test(restText)) {
         prefixes.push('recon');
-        reasons.push('변경 영향도 조사 신호가 함께 있어 recon 선행 결합');
+        reasons.push('Prepended recon because change blast-radius analysis was also requested');
       }
       if (PATTERNS.design.test(restText)) {
         prefixes.push('design');
-        reasons.push('경계 설계 신호가 함께 있어 design 선행 결합');
+        reasons.push('Prepended design because boundary design was also requested');
       }
       const suffixes = shipSignal ? ['ship'] : [];
       if (suffixes.length > 0) {
-        reasons.push('구현 완료 후 출하/PR 생성 신호가 함께 있어 ship 후행 결합');
+        reasons.push('Appended ship because shipping/PR preparation was also requested');
       }
       if (prefixes.length > 0 || suffixes.length > 0) {
         pipelineIds = [...new Set([...prefixes, 'drive', ...driveChain, ...suffixes])];
@@ -252,24 +252,24 @@ export function classifyTask(rawInput) {
 
   if (pipelineIds.includes('recon')) {
     reconMode = detectReconSubMode(restText);
-    reasons.push(`조사 세부 모드(${reconMode})`);
+    reasons.push(`Recon submode (${reconMode})`);
   }
 
   if (pipelineIds.includes('slim')) {
     slimMode = PATTERNS.slimDebtFocus.test(restText) ? 'debt' : 'audit';
-    reasons.push(`감량 세부 모드(${slimMode})`);
+    reasons.push(`Slim submode (${slimMode})`);
   }
 
   if (pipelineIds.includes('drive')) {
     if (PATTERNS.hardDefect.test(restText) || (!PATTERNS.hillclimb.test(restText) && PATTERNS.bugfix.test(restText))) {
       driveMode = 'bugfix';
-      reasons.push('런타임 재현 및 이진 탐색 버그 수정(bugfix) 모드');
+      reasons.push('Runtime reproduction and binary-search bugfix mode');
     } else if (PATTERNS.hillclimb.test(restText)) {
       driveMode = 'hillclimb';
-      reasons.push('정량 지표 반복 개선(hillclimb) 모드');
+      reasons.push('Iterative quantitative optimization (hillclimb) mode');
     } else {
       driveMode = 'feature';
-      reasons.push('수직 슬라이스 기능/리팩터링(feature) 모드');
+      reasons.push('Vertical-slice feature/refactoring mode');
     }
   }
 
@@ -299,7 +299,7 @@ export function classifyTask(rawInput) {
 }
 
 function printHelp() {
-  console.log('사용법: node route.mjs [--json] [--list] [--stdin] [-- "<요청 문장>"]');
+  console.log('Usage: node route.mjs [--json] [--list] [--stdin] [-- "<request text>"]');
 }
 
 function main() {
@@ -347,17 +347,17 @@ function main() {
       return;
     }
 
-    console.log(`라우트 파이프라인: ${plan.pipeline.join(' / ')}`);
+    console.log(`Route pipeline: ${plan.pipeline.join(' / ')}`);
     if (plan.reconMode) {
-      console.log(`조사 세부 모드: ${plan.reconMode}`);
+      console.log(`Recon submode: ${plan.reconMode}`);
     }
     if (plan.slimMode) {
-      console.log(`감량 세부 모드: ${plan.slimMode}`);
+      console.log(`Slim submode: ${plan.slimMode}`);
     }
     if (plan.driveMode) {
-      console.log(`실행 세부 모드: ${plan.driveMode}`);
+      console.log(`Drive submode: ${plan.driveMode}`);
     }
-    console.log(`판별 근거: ${plan.reasons.join(', ')}`);
+    console.log(`Reasons: ${plan.reasons.join(', ')}`);
     for (const step of plan.steps) {
       console.log(`- [${step.id}] (gear=${step.gear}) ${step.playbookPath}`);
     }

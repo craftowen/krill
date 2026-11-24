@@ -376,14 +376,12 @@ fn presets_rrules_weekday_aliases_and_occurrences() {
     );
     assert!(build_preset_cron(SchedulePreset::Daily, 24, 0, 1).is_err());
     assert!(build_preset_cron(SchedulePreset::Custom, 9, 0, 1).is_err());
-    assert_eq!(
-        format_schedule_summary("30 9 * * 1-5", true),
-        "평일 09:30 (UTC)"
-    );
-    assert_eq!(
-        format_schedule_summary("30 9 * * 7", false),
-        "Weekly on Sun at 09:30 (UTC)"
-    );
+    let weekdays = classify_schedule("30 9 * * 1-5");
+    assert_eq!(weekdays.preset, SchedulePreset::Weekdays);
+    assert_eq!((weekdays.hour, weekdays.minute), (9, 30));
+    let sunday = classify_schedule("30 9 * * 7");
+    assert_eq!(sunday.preset, SchedulePreset::Weekly);
+    assert_eq!(sunday.day_of_week, 0);
     assert_eq!(utc_calendar_from_epoch_minute(0), (1970, 1, 1, 0, 0, 4));
     assert_eq!(
         utc_calendar_from_epoch_minute(28_486_834),

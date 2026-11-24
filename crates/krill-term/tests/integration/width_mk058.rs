@@ -158,13 +158,31 @@ fn mismatch_list_is_empty() {
 
 #[test]
 fn unaffected_rows_keep_segments() {
-    // 국기·결합·한글: 묶음 규칙 밖이라 예전 그대로다.
-    // 엔진 행은 끝 빈칸을 잘라낸다. 빈칸 없는 행으로 검사한다.
+    // Regional Indicator flag pairs now cluster pairwise into standalone 2-cell wide segments,
+    // preventing adjacent flags or following ASCII from collapsing into one narrow run.
     let flag = vec![narrow('🇰', &[]), narrow('🇷', &[])];
     let plan = plan_row(&flag, &DEFAULT);
     assert_eq!(plan.segments.len(), 1);
     assert_eq!(plan.segments[0].text, "🇰🇷");
-    assert!(!plan.segments[0].wide && !plan.segments[0].overflow);
+    assert!(plan.segments[0].wide && !plan.segments[0].overflow);
+
+    let flags_and_ascii = vec![
+        narrow('🇰', &[]),
+        narrow('🇷', &[]),
+        narrow('🇺', &[]),
+        narrow('🇸', &[]),
+        narrow('a', &[]),
+    ];
+    let plan = plan_row(&flags_and_ascii, &DEFAULT);
+    let flag_segs: Vec<_> = plan
+        .segments
+        .iter()
+        .map(|s| (s.column, s.wide, s.text.as_str()))
+        .collect();
+    assert_eq!(
+        flag_segs,
+        [(0, true, "🇰🇷"), (2, true, "🇺🇸"), (4, false, "a")]
+    );
 
     let combining = vec![narrow('a', &['\u{301}']), narrow('b', &[])];
     let plan = plan_row(&combining, &DEFAULT);

@@ -13,7 +13,7 @@ export function readLedgerEvents(ledgerPath) {
     try {
       return JSON.parse(line);
     } catch {
-      throw new Error(`원장 JSON 파싱 실패 (${ledgerPath}:${index + 1})`);
+      throw new Error(`Failed to parse ledger JSON (${ledgerPath}:${index + 1})`);
     }
   });
 }
@@ -88,10 +88,10 @@ export function recordLedgerEvent(ledgerPath, entry) {
   const reason = String(entry?.reason ?? '').trim();
 
   if (!VALID_KINDS.has(kind)) {
-    throw new Error(`유효하지 않은 kind(${kind})입니다. 허용값: deleted, kept, restored`);
+    throw new Error(`Invalid kind (${kind}). Allowed: deleted, kept, restored`);
   }
   if (!id || !reason) {
-    throw new Error('공백이 아닌 id와 reason은 필수입니다.');
+    throw new Error('Non-empty id and reason are required.');
   }
 
   const events = readLedgerEvents(ledgerPath);
@@ -99,7 +99,7 @@ export function recordLedgerEvent(ledgerPath, entry) {
   const current = states.get(id);
 
   if (kind === 'restored' && (!current || !current.wasDeleted)) {
-    throw new Error(`삭제된 이력이 없는 항목(${id})은 restored로 복구할 수 없습니다.`);
+    throw new Error(`Item (${id}) cannot be marked restored without a prior deleted record.`);
   }
 
   const lastForId = [...events].reverse().find((e) => String(e?.id ?? '').trim() === id);
@@ -126,7 +126,7 @@ export function recordLedgerEvent(ledgerPath, entry) {
 }
 
 function printHelp() {
-  console.log('사용법:\n  node ledger.mjs record <ledger.jsonl> --kind deleted|kept|restored --id <id> --title "<제목>" --source "<출처>" --reason "<사유>" [--json]\n  node ledger.mjs summary <ledger.jsonl> [--json]');
+  console.log('Usage:\n  node ledger.mjs record <ledger.jsonl> --kind deleted|kept|restored --id <id> --title "<title>" --source "<source>" --reason "<reason>" [--json]\n  node ledger.mjs summary <ledger.jsonl> [--json]');
 }
 
 function main() {
@@ -149,7 +149,7 @@ function main() {
 
   const ledgerPath = parsed.positional[1];
   if (!ledgerPath) {
-    console.error('원장 파일 경로(<ledger.jsonl>)가 필요합니다.');
+    console.error('Ledger file path (<ledger.jsonl>) is required.');
     process.exit(2);
   }
 
@@ -159,7 +159,7 @@ function main() {
       if (parsed.flags.json) {
         console.log(JSON.stringify(result, null, 2));
       } else {
-        console.log(`기록 완료(appended=${result.appended}): 삭제=${result.summary.deletedCount}, 복구=${result.summary.restoredCount}, 복구율=${result.summary.addBackRate}`);
+        console.log(`Recorded (appended=${result.appended}): deleted=${result.summary.deletedCount}, restored=${result.summary.restoredCount}, addBackRate=${result.summary.addBackRate}`);
       }
       return;
     }
@@ -169,12 +169,12 @@ function main() {
       if (parsed.flags.json) {
         console.log(JSON.stringify(summary, null, 2));
       } else {
-        console.log(`총 항목=${summary.totalItems}, 삭제=${summary.deletedCount}, 유지=${summary.keptCount}, 복구=${summary.restoredCount}, 복구율=${summary.addBackRate}, 과소삭제경고=${summary.underDeletionWarning}`);
+        console.log(`total=${summary.totalItems}, deleted=${summary.deletedCount}, kept=${summary.keptCount}, restored=${summary.restoredCount}, addBackRate=${summary.addBackRate}, underDeletionWarning=${summary.underDeletionWarning}`);
       }
       return;
     }
 
-    console.error(`알 수 없는 하위 명령: ${subcmd}`);
+    console.error(`Unknown subcommand: ${subcmd}`);
     process.exit(2);
   } catch (err) {
     console.error(err.message);

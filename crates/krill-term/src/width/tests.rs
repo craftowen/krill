@@ -98,11 +98,28 @@ fn vs16_single_overflows_only_into_blank() {
 }
 
 #[test]
-fn flags_and_plain_text_do_not_join() {
-    // 🇰🇷: 잇는 표시가 없어 따로 둔다(서체에서 낱글자로 보일 수 있음, 범위 밖).
-    let row = [narrow('🇰', &[]), narrow('🇷', &[])];
-    let row2 = [row[0].clone(), row[1].clone(), narrow('a', &[])];
-    assert_eq!(plan(&row2), [(0, 1, false), (1, 2, false), (2, 3, false)]);
+fn regional_indicator_flags_pair_pairwise_and_stop_at_plain_text() {
+    // 🇰🇷 + 'a': Regional Indicators pair into one 2-cell flag cluster without swallowing 'a'.
+    let kr_a = [narrow('🇰', &[]), narrow('🇷', &[]), narrow('a', &[])];
+    assert_eq!(plan(&kr_a), [(0, 2, false), (2, 3, false)]);
+
+    // 🇰🇷🇺🇸🇰🇿: adjacent flag pairs form separate 2-cell clusters, not one 6-cell cluster.
+    let multi = [
+        narrow('🇰', &[]),
+        narrow('🇷', &[]),
+        narrow('🇺', &[]),
+        narrow('🇸', &[]),
+        narrow('🇰', &[]),
+        narrow('🇿', &[]),
+    ];
+    assert_eq!(plan(&multi), [(0, 2, false), (2, 4, false), (4, 6, false)]);
+
+    // Unpaired trailing RI and space-separated RIs stay single cells.
+    let odd = [narrow('🇰', &[]), narrow('🇷', &[]), narrow('🇺', &[])];
+    assert_eq!(plan(&odd), [(0, 2, false), (2, 3, false)]);
+
+    let spaced = [narrow('🇰', &[]), narrow(' ', &[]), narrow('🇷', &[])];
+    assert_eq!(plan(&spaced), [(0, 1, false), (1, 2, false), (2, 3, false)]);
 }
 
 #[test]

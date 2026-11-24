@@ -561,58 +561,15 @@ fn account_status_tail_is_n1_bidirectionally_compatible() {
     assert!(UsageReply::decode(kind::USAGE_REPLY, &truncated).is_err());
 }
 
-/// OWE-703 1단계: 2단계 UI가 쓸 공개 API(상태 라벨·갱신 시각·창 표기).
+/// OWE-703 1단계: 상태 기본값·갱신 시각·조회 헬퍼.
 #[test]
 fn account_status_display_helpers_for_step_two_ui() {
-    for (status, label, describe) in [
-        (AccountStatus::Unknown, "모름", "사용량을 알 수 없음"),
-        (AccountStatus::Stale, "오래됨", "오래된 사용량 값"),
-        (AccountStatus::NeedsLogin, "로그인 필요", "다시 로그인 필요"),
-        (AccountStatus::Error, "오류", "사용량 조회 오류"),
-        (AccountStatus::Ok, "정상", "정상"),
-    ] {
-        assert_eq!(status.label_ko(), label);
-        assert_eq!(status.describe_ko(), describe);
-    }
     assert_eq!(AccountStatus::default(), AccountStatus::Unknown);
 
     let now = 1_792_123_200_u64;
     assert!(!is_updated_stale(Some(now - 60), now));
     assert!(is_updated_stale(Some(now - 1_801), now));
     assert!(is_updated_stale(None, now));
-
-    let now_i64 = 1_792_123_200_i64;
-    assert_eq!(format_window_percent_ko(None, now_i64), "—");
-    assert_eq!(
-        format_window_percent_ko(
-            Some(&Window {
-                percent: 42,
-                resets_at: None
-            }),
-            now_i64
-        ),
-        "42%"
-    );
-    assert_eq!(
-        format_window_percent_ko(
-            Some(&Window {
-                percent: 95,
-                resets_at: Some("2001-01-01T00:00:00Z".into())
-            }),
-            now_i64
-        ),
-        "리셋됨"
-    );
-    assert_eq!(
-        format_window_percent_ko(
-            Some(&Window {
-                percent: 95,
-                resets_at: Some("2099-01-01T00:00:00Z".into())
-            }),
-            now_i64
-        ),
-        "95%"
-    );
 
     let snap = AccountsSnapshot {
         statuses: vec![AccountStatusInfo {

@@ -40,9 +40,11 @@ impl Selection {
         }
     }
 
-    /// Orca/xterm 단어 경계: 공백·괄호·따옴표만 구분해 경로·URL·하이픈을 함께 선택한다.
+    /// Orca/xterm 단어 경계: 공백·괄호·따옴표 및 CJK 전각 구두점만 구분해 경로·URL·하이픈을 함께 선택한다.
     pub fn is_word_char(ch: char) -> bool {
-        !ch.is_whitespace() && !"()[]{}'\",`".contains(ch)
+        !ch.is_whitespace()
+            && !"()[]{}'\",`".contains(ch)
+            && !krill_proto::screen::url::is_fullwidth_punct(ch)
     }
 
     /// 화면 `at` 칸의 글자. 2칸 글자의 둘째 칸(`SPACER`)이면 앞 칸(`WIDE`)의 글자로 푼다.
@@ -1120,6 +1122,85 @@ mod tests {
             let word = Selection::word_at(&s, Point { line: 0, column });
             assert_eq!(word.text(&s), "한", "column {column}");
         }
+    }
+
+    #[test]
+    fn word_at_stops_at_cjk_fullwidth_punctuation_and_typographic_quotes() {
+        for punct in ['「', '」', '（', '）', '“', '”', '‘', '’', '、', '。'] {
+            assert!(!Selection::is_word_char(punct), "punct {punct:?}");
+        }
+        let s = screen(&["「hello」（foo）“bar”"], 20);
+        assert_eq!(
+            Selection::word_at(&s, Point { line: 0, column: 2 }).text(&s),
+            "hello"
+        );
+        assert_eq!(
+            Selection::word_at(&s, Point { line: 0, column: 9 }).text(&s),
+            "foo"
+        );
+        assert_eq!(
+            Selection::word_at(
+                &s,
+                Point {
+                    line: 0,
+                    column: 15
+                }
+            )
+            .text(&s),
+            "bar"
+        );
+
+        let mut cjk = screen(&["            "], 12);
+        cjk.rows[0] = vec![
+            Cell {
+                ch: '日',
+                flags: Flags::WIDE,
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                flags: Flags::SPACER,
+                ..Cell::default()
+            },
+            Cell {
+                ch: '本',
+                flags: Flags::WIDE,
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                flags: Flags::SPACER,
+                ..Cell::default()
+            },
+            Cell {
+                ch: '。',
+                flags: Flags::WIDE,
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                flags: Flags::SPACER,
+                ..Cell::default()
+            },
+            Cell {
+                ch: '次',
+                flags: Flags::WIDE,
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                flags: Flags::SPACER,
+                ..Cell::default()
+            },
+        ];
+        assert_eq!(
+            Selection::word_at(&cjk, Point { line: 0, column: 0 }).text(&cjk),
+            "日本"
+        );
+        assert_eq!(
+            Selection::word_at(&cjk, Point { line: 0, column: 6 }).text(&cjk),
+            "次"
+        );
     }
 
     #[test]

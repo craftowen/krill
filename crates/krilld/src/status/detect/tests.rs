@@ -71,19 +71,19 @@ fn recorded_agents_golden() {
         assert_eq!(
             replay(claude, chunk),
             concat!(
-                "Done/Some(Title)/Medium badge=Some(\"추정\")\n",
-                "Working/Some(Title)/Medium badge=Some(\"추정\")\n",
-                "Done/Some(Title)/Medium badge=Some(\"추정\")\n",
-                "Working/Some(Title)/Medium badge=Some(\"추정\")\n",
+                "Done/Some(Title)/Medium badge=Some(\"inferred\")\n",
+                "Working/Some(Title)/Medium badge=Some(\"inferred\")\n",
+                "Done/Some(Title)/Medium badge=Some(\"inferred\")\n",
+                "Working/Some(Title)/Medium badge=Some(\"inferred\")\n",
             )
         );
         assert_eq!(
             replay(codex, chunk),
             concat!(
-                "Working/Some(Title)/Medium badge=Some(\"추정\")\n",
-                "Done/Some(Title)/Medium badge=Some(\"추정\")\n",
-                "Working/Some(Title)/Medium badge=Some(\"추정\")\n",
-                "Done/Some(Title)/Medium badge=Some(\"추정\")\n",
+                "Working/Some(Title)/Medium badge=Some(\"inferred\")\n",
+                "Done/Some(Title)/Medium badge=Some(\"inferred\")\n",
+                "Working/Some(Title)/Medium badge=Some(\"inferred\")\n",
+                "Done/Some(Title)/Medium badge=Some(\"inferred\")\n",
             )
         );
     }
@@ -125,7 +125,7 @@ fn hook_wins_except_confirmed_dialog_dismissal() {
             AgentState::Done,
             Some(Source::Screen),
             Confidence::Low,
-            Some("추정")
+            Some("inferred")
         )
     );
     // 화면 시각보다 오래됐지만 PermissionRequest보다 새로운 hook은 여전히 우선한다.

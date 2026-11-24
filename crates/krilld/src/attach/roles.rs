@@ -70,7 +70,7 @@ impl Clients {
 }
 
 /// 연결이 끝나면 장부에서 지운다. 화면·PTY·holder의 수명은 건드리지 않는다.
-#[must_use = "연결이 끝날 때까지 역할 등록을 보관해야 한다"]
+#[must_use = "must be held until the connection ends"]
 pub(crate) struct Client {
     tap: Tap,
     id: u64,

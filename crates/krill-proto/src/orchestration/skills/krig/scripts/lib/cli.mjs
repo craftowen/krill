@@ -37,7 +37,7 @@ export function parseCliFlags(argv, options = {}) {
       if (eqIdx !== -1) {
         const key = arg.slice(2, eqIdx);
         if (allowed && !allowed.has(key)) {
-          throw new Error(`알 수 없는 옵션입니다: --${key}`);
+          throw new Error(`Unknown option: --${key}`);
         }
         const val = arg.slice(eqIdx + 1);
         flags[key] = booleans.has(key) ? val !== 'false' : val;
@@ -45,7 +45,7 @@ export function parseCliFlags(argv, options = {}) {
       }
       const key = arg.slice(2);
       if (allowed && !allowed.has(key)) {
-        throw new Error(`알 수 없는 옵션입니다: --${key}`);
+        throw new Error(`Unknown option: --${key}`);
       }
       if (booleans.has(key)) {
         flags[key] = true;
@@ -63,14 +63,14 @@ export function parseCliFlags(argv, options = {}) {
         )
       );
       if (next === undefined || nextLooksLikeKnownFlag) {
-        throw new Error(`옵션 --${key} 에 값이 필요합니다.`);
+        throw new Error(`Option --${key} requires a value.`);
       }
       flags[key] = next;
       i += 1;
       continue;
     }
     if (arg.startsWith('-') && arg !== '-' && !allowSingleDashPositional) {
-      throw new Error(`알 수 없는 옵션입니다: ${arg}`);
+      throw new Error(`Unknown option: ${arg}`);
     }
     positional.push(arg);
   }

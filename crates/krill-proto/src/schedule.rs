@@ -833,41 +833,6 @@ pub fn classify_schedule(expr: &str) -> ClassifiedSchedule {
     result
 }
 
-pub fn format_schedule_summary(expr: &str, korean: bool) -> String {
-    let c = classify_schedule(expr);
-    let (h, m) = (c.hour, c.minute);
-    match (c.preset, korean) {
-        (SchedulePreset::Hourly, true) => format!("매시간 :{m:02} (UTC)"),
-        (SchedulePreset::Hourly, false) => format!("Every hour at :{m:02} (UTC)"),
-        (SchedulePreset::Daily, true) => format!("매일 {h:02}:{m:02} (UTC)"),
-        (SchedulePreset::Daily, false) => format!("Daily at {h:02}:{m:02} (UTC)"),
-        (SchedulePreset::Weekdays, true) => format!("평일 {h:02}:{m:02} (UTC)"),
-        (SchedulePreset::Weekdays, false) => format!("Weekdays at {h:02}:{m:02} (UTC)"),
-        (SchedulePreset::Weekly, ko) => {
-            let days = if ko {
-                [
-                    "일요일",
-                    "월요일",
-                    "화요일",
-                    "수요일",
-                    "목요일",
-                    "금요일",
-                    "토요일",
-                ]
-            } else {
-                ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-            };
-            let day = days.get(usize::from(c.day_of_week)).copied().unwrap_or("");
-            if ko {
-                format!("매주 {day} {h:02}:{m:02} (UTC)")
-            } else {
-                format!("Weekly on {day} at {h:02}:{m:02} (UTC)")
-            }
-        }
-        (SchedulePreset::Custom, _) => format!("{} (UTC)", c.cron),
-    }
-}
-
 /// UTC Gregorian calendar from an epoch minute. Years beyond i32 are saturated.
 #[expect(
     clippy::arithmetic_side_effects,

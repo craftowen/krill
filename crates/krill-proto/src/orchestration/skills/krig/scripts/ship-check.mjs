@@ -27,7 +27,7 @@ export function stampVerification(options = {}) {
   const repoDir = ensureGitRepo(options.repoDir ?? process.cwd());
   const evidence = String(options.evidence ?? '').trim();
   if (PLACEHOLDER_EVIDENCE.has(evidence.toLowerCase())) {
-    throw new Error('검증 스탬프에는 실제 실행 결과 요약(--evidence)이 필수입니다.');
+    throw new Error('Verification stamp requires an actual execution summary (--evidence).');
   }
 
   const { baseSha, source: baseSource } = readBaseSha(repoDir, options.base);
@@ -36,20 +36,20 @@ export function stampVerification(options = {}) {
 
   if (worktree.stagedKrigFiles.length > 0) {
     throw new Error(
-      `.krig 임시 파일이 git 인덱스에 스테이징되어 있습니다(${worktree.stagedKrigFiles.join(', ')}). git reset HEAD .krig 로 먼저 해제하세요.`
+      `.krig temporary files are staged in the git index (${worktree.stagedKrigFiles.join(', ')}). Unstage them first with: git reset HEAD .krig`
     );
   }
 
   const patch = computeCombinedPatch(repoDir, baseSha);
   if (patch.patchId === 'empty-diff') {
     throw new Error(
-      `기준 커밋(${baseSha.slice(0, 8)}) 대비 변경분(diff)이 비어 있어 검증 스탬프를 발급할 수 없습니다. --base <기준커밋> 을 명시하세요.`
+      `Diff against base commit (${baseSha.slice(0, 8)}) is empty; cannot mint a verification stamp. Specify --base <commit>.`
     );
   }
 
   const hazards = scanDiffHazards(patch.diffText, repoDir);
   if (hazards.length > 0) {
-    throw new Error(`변경분에 출하 차단 위험이 있습니다: ${hazards.map((h) => `${h.kind}(${h.file})`).join(', ')}`);
+    throw new Error(`Diff contains ship-blocking hazards: ${hazards.map((h) => `${h.kind}(${h.file})`).join(', ')}`);
   }
 
   const stampFile = options.stampFile ? path.resolve(options.stampFile) : defaultStampPath(repoDir);
@@ -84,8 +84,8 @@ export function verifyShipReadiness(options = {}) {
   if (worktree.stagedKrigFiles.length > 0) {
     issues.push({
       code: 'STAGED_KRIG_ARTIFACT',
-      message: `.krig 런타임 파일이 커밋 대기열에 올라와 있습니다: ${worktree.stagedKrigFiles.join(', ')}`,
-      fix: 'git reset HEAD .krig 명령으로 스테이징을 해제하세요.'
+      message: `.krig runtime files are staged for commit: ${worktree.stagedKrigFiles.join(', ')}`,
+      fix: 'Unstage them with: git reset HEAD .krig'
     });
   }
 
@@ -98,8 +98,8 @@ export function verifyShipReadiness(options = {}) {
     if (dirtySummary.length > 0) {
       issues.push({
         code: 'UNCOMMITTED_CHANGES',
-        message: `커밋되지 않은 변경 사항이 남아 있습니다(${dirtySummary.slice(0, 6).join(', ')})`,
-        fix: '변경 사항을 논리적 커밋으로 묶거나 불필요한 임시 파일을 정리하세요.'
+        message: `Uncommitted changes remain (${dirtySummary.slice(0, 6).join(', ')})`,
+        fix: 'Commit intended changes in logical commits or remove stray temporary files.'
       });
     }
   }
@@ -122,8 +122,8 @@ export function verifyShipReadiness(options = {}) {
     if (parseFailed || !isValidStampObject(rawParsed)) {
       issues.push({
         code: 'CORRUPT_VERIFICATION_STAMP',
-        message: `검증 스탬프 형식 또는 JSON이 손상되었습니다: ${stampFile}`,
-        fix: '검증을 다시 수행하고 ship-check.mjs stamp 로 갱신하세요.'
+        message: `Verification stamp JSON or schema is corrupted: ${stampFile}`,
+        fix: 'Re-run verification and refresh with ship-check.mjs stamp.'
       });
     } else {
       stamp = rawParsed;
@@ -142,16 +142,16 @@ export function verifyShipReadiness(options = {}) {
       if (!verificationFresh) {
         issues.push({
           code: 'STALE_VERIFICATION',
-          message: `검증 스탬프(${stamp.patchId.slice(0, 12)}) 이후 코드 변경이 발생해 현재 패치(${currentPatch.patchId.slice(0, 12)})와 일치하지 않습니다.`,
-          fix: '변경된 코드에 대해 테스트 및 verify 단계를 다시 실행하고 스탬프를 재발급하세요.'
+          message: `Code changed after verification stamp (${stamp.patchId.slice(0, 12)}) and no longer matches current patch (${currentPatch.patchId.slice(0, 12)}).`,
+          fix: 'Re-run tests and the verify stage on the updated code, then mint a fresh stamp.'
         });
       }
     }
   } else if (requireVerified) {
     issues.push({
       code: 'MISSING_VERIFICATION_STAMP',
-      message: '기록된 검증 스탬프(.krig/verified.json)가 없습니다.',
-      fix: 'verify 플레이북 검증을 마친 뒤 ship-check.mjs stamp --evidence "..." 를 실행하세요.'
+      message: 'No verification stamp (.krig/verified.json) was found.',
+      fix: 'Complete the verify playbook and run ship-check.mjs stamp --evidence "...".'
     });
   }
 
@@ -161,8 +161,8 @@ export function verifyShipReadiness(options = {}) {
       code: h.kind,
       message: `${h.file}: ${h.detail}`,
       fix: h.kind === 'MERGE_CONFLICT_MARKER'
-        ? '충돌 마커를 완전히 해소하고 테스트를 다시 실행하세요.'
-        : '하드코딩된 시크릿을 제거하고 환경변수나 키체인으로 분리하세요.'
+        ? 'Resolve all merge conflict markers and re-run tests.'
+        : 'Remove hardcoded secrets and move them to environment variables or keychain storage.'
     });
   }
 
@@ -183,7 +183,7 @@ export function verifyShipReadiness(options = {}) {
 export function validatePrBriefing({ title, body, maxLines = 40 }) {
   const parsedMax = Number(maxLines);
   if (!Number.isInteger(parsedMax) || parsedMax < 5) {
-    throw new Error(`유효하지 않은 maxLines 값입니다(5 이상의 정수 필요): ${maxLines}`);
+    throw new Error(`Invalid maxLines value (integer >= 5 required): ${maxLines}`);
   }
 
   const issues = [];
@@ -194,29 +194,29 @@ export function validatePrBriefing({ title, body, maxLines = 40 }) {
   if (!cleanTitle) {
     issues.push({
       code: 'EMPTY_PR_TITLE',
-      message: 'PR 제목이 비어 있습니다.',
-      fix: 'type(scope): subject 형식의 제목을 지정하세요.'
+      message: 'PR title is empty.',
+      fix: 'Provide a title in type(scope): subject format.'
     });
   } else {
     if (hasTitleNewline || !CONVENTIONAL_TITLE_RE.test(cleanTitle)) {
       issues.push({
         code: 'INVALID_CONVENTIONAL_TITLE',
-        message: `PR 제목은 개행 없는 단일 줄 Conventional Commits 형식이어야 합니다: ${cleanTitle.replace(/[\r\n]+/g, '\\n')}`,
-        fix: 'feat(scope): imperative summary 처럼 한 줄 타입과 요약을 적으세요.'
+        message: `PR title must be a single-line Conventional Commit header: ${cleanTitle.replace(/[\r\n]+/g, '\\n')}`,
+        fix: 'Write a single-line header such as feat(scope): imperative summary.'
       });
     }
     if (cleanTitle.endsWith('.')) {
       issues.push({
         code: 'TITLE_TRAILING_PERIOD',
-        message: 'PR 제목 끝에 마침표가 있습니다.',
-        fix: '제목 끝의 마침표를 제거하세요.'
+        message: 'PR title ends with a trailing period.',
+        fix: 'Remove the trailing period from the title.'
       });
     }
     if (cleanTitle.length > 72) {
       issues.push({
         code: 'TITLE_TOO_LONG',
-        message: `PR 제목 길이(${cleanTitle.length}자)가 72자를 초과했습니다.`,
-        fix: '핵심 변경 심볼 중심 72자 이내로 압축하세요.'
+        message: `PR title length (${cleanTitle.length} chars) exceeds 72 characters.`,
+        fix: 'Shorten the title to 72 characters or fewer around the key changed symbol.'
       });
     }
   }
@@ -227,8 +227,8 @@ export function validatePrBriefing({ title, body, maxLines = 40 }) {
   if (lines.length === 0) {
     issues.push({
       code: 'EMPTY_PR_BODY',
-      message: 'PR 본문 브리핑이 비어 있습니다.',
-      fix: '## Why, ## What changed, ## Scope, ## Blast Radius, ## Verification 섹션을 작성하세요.'
+      message: 'PR briefing body is empty.',
+      fix: 'Include ## Why, ## What changed, ## Scope, ## Blast Radius, and ## Verification sections.'
     });
     return { ok: false, lineCount: 0, issues };
   }
@@ -236,8 +236,8 @@ export function validatePrBriefing({ title, body, maxLines = 40 }) {
   if (lines.length > parsedMax) {
     issues.push({
       code: 'PR_BODY_TOO_LONG',
-      message: `PR 본문 줄 수(${lines.length}줄)가 상한(${parsedMax}줄)을 초과했습니다.`,
-      fix: `스쿼시 커밋 본문이 되도록 ${parsedMax}줄 이내의 1분 브리핑으로 줄이세요.`
+      message: `PR body line count (${lines.length}) exceeds the limit (${parsedMax}).`,
+      fix: `Trim the body to ${parsedMax} lines or fewer so it fits as a 1-minute squash commit message.`
     });
   }
 
@@ -261,15 +261,15 @@ export function validatePrBriefing({ title, body, maxLines = 40 }) {
     if (FORBIDDEN_BRIEF_CHARS.some((ch) => proseOnly.includes(ch))) {
       issues.push({
         code: 'FORBIDDEN_BRIEF_PUNCTUATION',
-        message: `본문 ${i + 1}행 산문에 금지 기호(가운뎃점, 대시, 화살표)가 포함되어 있습니다.`,
-        fix: '쉼표, 마침표, 콜론, 슬래시로 교체하세요.'
+        message: `Body line ${i + 1} prose contains forbidden punctuation (middle dot, dash, or arrow).`,
+        fix: 'Replace with commas, periods, colons, or slashes.'
       });
     }
     if (/\b[0-9a-f]{40}\b/i.test(proseOnly)) {
       issues.push({
         code: 'RAW_FULL_SHA_IN_BODY',
-        message: `본문 ${i + 1}행에 40자리 전체 커밋 SHA 나열이 있습니다.`,
-        fix: '리뷰어는 이미 diff를 보고 있으므로 본문에서 긴 SHA 나열을 빼세요.'
+        message: `Body line ${i + 1} lists a raw 40-character commit SHA.`,
+        fix: 'Omit raw full SHAs from the PR body; reviewers already see commits in the diff.'
       });
     }
   }
@@ -278,8 +278,8 @@ export function validatePrBriefing({ title, body, maxLines = 40 }) {
     if (!presentHeadings.has(req)) {
       issues.push({
         code: 'MISSING_PR_SECTION',
-        message: `필수 PR 브리핑 섹션(## ${req})이 누락되었습니다.`,
-        fix: `본문에 ## ${req} 제목과 1~3줄 요약을 추가하세요.`
+        message: `Required PR briefing section (## ${req}) is missing.`,
+        fix: `Add a ## ${req} heading with a 1-3 line summary.`
       });
     }
   }
@@ -293,10 +293,10 @@ export function validatePrBriefing({ title, body, maxLines = 40 }) {
 
 function printHelp() {
   console.log([
-    '사용법:',
-    '  node ship-check.mjs stamp [--repo <dir>] [--base <rev>] [--file <경로>] --evidence "<검증근거>" [--json]',
-    '  node ship-check.mjs verify [--repo <dir>] [--base <rev>] [--file <경로>] [--require-clean] [--require-verified] [--json]',
-    '  node ship-check.mjs brief --title "<제목>" [--body-file <파일> | --stdin] [--max-lines <N>] [--json]'
+    'Usage:',
+    '  node ship-check.mjs stamp [--repo <dir>] [--base <rev>] [--file <path>] --evidence "<evidence>" [--json]',
+    '  node ship-check.mjs verify [--repo <dir>] [--base <rev>] [--file <path>] [--require-clean] [--require-verified] [--json]',
+    '  node ship-check.mjs brief --title "<title>" [--body-file <file> | --stdin] [--max-lines <N>] [--json]'
   ].join('\n'));
 }
 
@@ -334,7 +334,7 @@ function main() {
       if (parsed.flags.json) {
         console.log(JSON.stringify(res, null, 2));
       } else {
-        console.log(`검증 스탬프 기록 완료: patchId=${res.record.patchId.slice(0, 12)} (${res.stampFile})`);
+        console.log(`Verification stamp recorded: patchId=${res.record.patchId.slice(0, 12)} (${res.stampFile})`);
       }
       process.exit(0);
     }
@@ -351,11 +351,11 @@ function main() {
         console.log(JSON.stringify(res, null, 2));
       } else if (res.ok) {
         console.log(
-          `OK: 출하 점검 통과 (patchId=${res.currentPatchId.slice(0, 12)}, clean=${res.worktreeClean}, verified=${res.verificationFresh})`
+          `OK: ship check passed (patchId=${res.currentPatchId.slice(0, 12)}, clean=${res.worktreeClean}, verified=${res.verificationFresh})`
         );
       } else {
         for (const issue of res.issues) {
-          console.error(`[${issue.code}] ${issue.message}\n  해결: ${issue.fix}`);
+          console.error(`[${issue.code}] ${issue.message}\n  Fix: ${issue.fix}`);
         }
       }
       process.exit(res.ok ? 0 : 1);
@@ -366,7 +366,7 @@ function main() {
       if (parsed.flags['max-lines'] !== undefined) {
         const rawMax = String(parsed.flags['max-lines']).trim();
         if (!/^\d+$/.test(rawMax)) {
-          throw new Error(`유효하지 않은 --max-lines 값입니다(양의 정수 필요): ${rawMax}`);
+          throw new Error(`Invalid --max-lines value (positive integer required): ${rawMax}`);
         }
         maxLines = Number.parseInt(rawMax, 10);
       }
@@ -384,10 +384,10 @@ function main() {
       if (parsed.flags.json) {
         console.log(JSON.stringify(res, null, 2));
       } else if (res.ok) {
-        console.log(`OK: PR 브리핑 규격 통과 (${res.lineCount}줄)`);
+        console.log(`OK: PR brief validated (${res.lineCount} lines)`);
       } else {
         for (const issue of res.issues) {
-          console.error(`[${issue.code}] ${issue.message}\n  해결: ${issue.fix}`);
+          console.error(`[${issue.code}] ${issue.message}\n  Fix: ${issue.fix}`);
         }
       }
       process.exit(res.ok ? 0 : 1);
