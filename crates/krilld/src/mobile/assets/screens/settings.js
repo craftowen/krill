@@ -26,8 +26,23 @@ M.screens.settings=(root,ctx)=>{
   let loadingDetails=false;
   function ensureUsage(){const hosts=ctx.getConnections?.()||[];usageSec.hidden=!hosts.length;if(!hosts.length)return;const current=hosts.find(h=>h.id===usageHostId)||readyHosts()[0]||hosts.find(h=>h.active)||hosts[0];usageHostId=current?.id||null;text(usageSub,current?.name||'');chooseUsageBtn.hidden=readyHosts().length<2;if(usagePanel){usagePanel.setHost?.(usageHostId);usagePanel.update?.();return;}if(M.mountAccountsPanel){usagePanel=M.mountAccountsPanel(usageBody,ctx,{embedded:true,hostId:usageHostId,reloadButton:reloadUsageBtn,prefix:'me-'});return;}if(!loadingDetails&&ctx.loadScreen){loadingDetails=true;ctx.loadScreen('accounts').then(()=>{loadingDetails=false;if(!ctx.signal.aborted&&M.mountAccountsPanel&&!usagePanel){usagePanel=M.mountAccountsPanel(usageBody,ctx,{embedded:true,hostId:usageHostId,reloadButton:reloadUsageBtn,prefix:'me-'});syncMe();}}).catch(()=>{loadingDetails=false;});}}
 
-  function syncMe(){const hosts=ctx.getConnections?.()||[];text(deskCount,hosts.length?`${hosts.filter(h=>h.connection?.phase==='ready').length}/${hosts.length}`:'0');deskEmpty.hidden=hosts.length>0;sync(deskCards,hosts.map(hostRow));for(const [id,e] of hostRows)if(!hosts.some(h=>h.id===id)){e.card.remove();hostRows.delete(id);}ensureUsage();}
-  syncMe();updateMe=syncMe;
+  function syncMe(){const hosts=ctx.getConnections?.()||[];text(deskCount,hosts.length?`${hosts.filter(h=>h.connection?.phase==='ready').length}/${hosts.length}`:'0');deskEmpty.hidden=hosts.length>0;sync(deskCards,hosts.map(hostRow));for(const [id,e] of hostRows)if(!hosts.some(h=>h.id===id)){e.card.remove();hostRows.delete(id);}ensureUsage();ensureVoice?.();}
+
+  // 2.5) Voice / Pipito section
+  const voiceSec=el('section',undefined,'me-voice-section'),voiceHead=el('div',undefined,'home-section-heading me-section-head'),voiceBadge=el('small',t('Not connected'),'muted voice-status-pill'),voiceReload=button(t('Refresh'),'','icon-button refresh-button'),voiceBox=el('div',undefined,'settings-group voice-settings-card'),refineRow=el('label',undefined,'setting-row'),refineChk=el('input'),vocabHead=el('p','','setting-label'),vocabAdd=el('form',undefined,'voice-add-row'),vocabIn=el('input'),vocabBtn=button(t('Add'),()=>{},'secondary small'),vocabChips=el('div',undefined,'voice-chips');
+  refineChk.type='checkbox';refineChk.setAttribute('aria-label',t('AI Refine'));refineRow.append(el('span',t('AI Refine')),refineChk);
+  vocabIn.placeholder=t('Add word…');vocabIn.setAttribute('aria-label',t('Add word…'));vocabBtn.type='submit';vocabAdd.append(vocabIn,vocabBtn);
+  voiceBox.append(refineRow,vocabHead,vocabAdd,vocabChips);voiceHead.append(el('h2',t('Voice / Pipito'),'section-title'),voiceBadge,voiceReload);voiceSec.append(voiceHead,voiceBox);
+  let voiceLoaded=false,voiceBusy=false;
+  const statusLabels={ready:'Connected',loading:'Loading…',not_running:'Pipito not running',not_installed:'Pipito not installed'};
+  const drawVoice=(st,cfg)=>{if(st){text(voiceBadge,t(statusLabels[st.status]||'Not connected'));voiceBadge.dataset.status=st.status||'';}if(!cfg)return;refineChk.checked=!!cfg.refine_enabled;const pinned=cfg.pinned_vocab||[],auto=cfg.auto_vocab||[];text(vocabHead,t('Learned words ({0})',pinned.length+auto.length));vocabChips.replaceChildren();for(const w of pinned){const chip=el('span',w,'voice-chip pinned'),rm=button(t('Remove'),()=>saveVoice({remove_pinned:w}),'voice-chip-x');rm.textContent='×';chip.append(rm);vocabChips.append(chip);}for(const e of auto.slice(0,12)){const chip=el('span',`${e.word} (${e.count})`,'voice-chip'),rm=button(t('Remove'),()=>saveVoice({ignore_word:e.word}),'voice-chip-x');rm.textContent='×';chip.append(rm);vocabChips.append(chip);}};
+  const loadVoice=async()=>{if(voiceBusy||!readyHosts().length)return;voiceBusy=true;try{const [st,cfg]=await Promise.all([ctx.rpc({action:'voice.status'}),ctx.rpc({action:'voice.config_get'})]);if(!ctx.signal.aborted){voiceLoaded=true;drawVoice(st,cfg);}}catch{}finally{voiceBusy=false;}};
+  const saveVoice=async patch=>{const cfg=await ctx.rpc({action:'voice.config_set',...patch});if(!ctx.signal.aborted)drawVoice(null,cfg);};
+  voiceReload.onclick=()=>ctx.act(loadVoice);
+  refineChk.addEventListener('change',()=>ctx.act(()=>saveVoice({refine_enabled:refineChk.checked})),{signal:ctx.signal});
+  vocabAdd.addEventListener('submit',ev=>{ev.preventDefault();const w=vocabIn.value.trim();if(!w)return;vocabIn.value='';ctx.act(()=>saveVoice({add_pinned:w}));},{signal:ctx.signal});
+  function ensureVoice(){const ok=readyHosts().length>0;voiceSec.hidden=!ok;if(ok&&!voiceLoaded)loadVoice();}
+  syncMe();updateMe=syncMe;list.append(voiceSec);
 
   // 3) App Settings section
   const settingsHead=el('div',undefined,'home-section-heading me-section-head');settingsHead.append(el('h2',t('Settings'),'section-title'));list.append(settingsHead);

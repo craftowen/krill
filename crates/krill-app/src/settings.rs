@@ -2438,6 +2438,7 @@ pub enum AdminTab {
     Accounts,
     Machines,
     Mobile,
+    Voice,
     Shortcuts,
     Updates,
     System,
@@ -2473,12 +2474,13 @@ fn settings_nav_tab(tab: AdminTab, selected: bool) -> gpui::Stateful<gpui::Div> 
 }
 
 impl AdminTab {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Appearance,
         Self::Agents,
         Self::Accounts,
         Self::Machines,
         Self::Mobile,
+        Self::Voice,
         Self::Shortcuts,
         Self::Updates,
         Self::System,
@@ -2517,6 +2519,7 @@ impl AdminTab {
             Self::Disk => "admin-tab-disk",
             Self::Feedback => "admin-tab-feedback",
             Self::Mobile => "admin-tab-mobile",
+            Self::Voice => "admin-tab-voice",
         }
     }
 
@@ -2539,6 +2542,7 @@ impl AdminTab {
             Self::Disk => text::TAB_DISK,
             Self::Feedback => text::TAB_FEEDBACK,
             Self::Mobile => crate::i18n::catalog::mobile::TAB,
+            Self::Voice => text::TAB_VOICE,
         }
     }
 
@@ -2557,6 +2561,7 @@ impl AdminTab {
             Self::Disk => text::TAB_DISK_DESC,
             Self::Feedback => text::TAB_FEEDBACK_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
+            Self::Voice => text::TAB_VOICE_DESC,
         }
     }
 
@@ -2575,7 +2580,7 @@ impl AdminTab {
             Self::Machines => IconName::Monitor,
             Self::Project | Self::QuickCommands => IconName::Cpu,
             Self::Shortcuts => IconName::Keyboard,
-            Self::System => IconName::Settings,
+            Self::System | Self::Voice => IconName::Settings,
             Self::Updates => IconName::RefreshCw,
             Self::Disk => IconName::CircleCheck,
             Self::Feedback => IconName::MessageSquare,
@@ -2587,6 +2592,9 @@ impl AdminTab {
     /// 빈 칸이 된다(OWE-704 실화면 QA) → 그것만 [`TabIcons`]에서 SVG를 직접 싣는다.
     pub fn icon_element(self) -> gpui_component::Icon {
         use gpui::AssetSource as _;
+        if self == Self::Voice {
+            return gpui_component::Icon::default().data(crate::ui::icons::MIC_SVG);
+        }
         let name = self.icon();
         match TabIcons.load(&name.path()) {
             Ok(Some(svg)) => gpui_component::Icon::default().data(&svg),
@@ -3096,6 +3104,7 @@ pub struct SettingsView {
     account_probe_pending: bool,
     account_file_stamp: Vec<Option<AdminFileStamp>>,
     mobile: mobile::Panel,
+    voice: voice::VoicePanel,
     release_notes: updates::Panel,
     _update_state: Subscription,
     /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
@@ -3613,6 +3622,7 @@ impl SettingsView {
             account_probe_pending: false,
             account_file_stamp: Vec::new(),
             mobile: mobile::Panel::default(),
+            voice: voice::VoicePanel::default(),
             release_notes: updates::Panel::default(),
             // 새 버전이 준비되면 열려 있는 페이지에도 그 버전의 변경 사항을 채운다.
             _update_state: cx.observe_global::<crate::updater::UpdateState>(|this, cx| {
@@ -4195,6 +4205,9 @@ impl SettingsView {
         if tab == AdminTab::Mobile {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
             self.mobile_enter(cx);
+        }
+        if tab == AdminTab::Voice {
+            self.voice_enter(cx);
         }
         if tab == AdminTab::Disk {
             self.enter_disk_page(cx);
@@ -13395,6 +13408,7 @@ impl Render for SettingsView {
                 AdminTab::Feedback => self.render_feedback_page(window, cx),
                 AdminTab::Updates => self.render_updates_tab(&settings(cx), cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
+                AdminTab::Voice => self.render_voice_tab(window, cx),
             };
             let body = div()
                 .flex()
@@ -13534,6 +13548,10 @@ impl Render for SettingsView {
                 this.focus_search(window, cx);
             }))
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                if this.handle_voice_shortcut_key(ev, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if ev.keystroke.key == "escape"
                     && (window.default_prevented() || this.input_is_composing(window, cx))
                 {
@@ -13682,6 +13700,7 @@ pub mod space;
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+mod voice;
 #[cfg(test)]
 mod host_fence_tests {
     use super::*;
