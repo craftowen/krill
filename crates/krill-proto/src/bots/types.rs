@@ -1069,13 +1069,89 @@ pub enum BotItemActor {
 }
 
 /// Structured quick-reply decision embedded in a `NeedsYou` item ask.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotItemDecision {
     pub question: String,
-    #[serde(default)]
     pub options: Vec<String>,
-    #[serde(default)]
     pub recommended: Option<usize>,
+    /// Multi-select flag serialized on human-readable (JSON/SQLite/PWA) formats while preserving
+    /// v0.3.17 binary postcard wire compatibility.
+    pub multi: bool,
+}
+
+impl Serialize for BotItemDecision {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct WireV0317<'a> {
+            question: &'a str,
+            options: &'a [String],
+            recommended: Option<usize>,
+        }
+        #[derive(Serialize)]
+        struct Human<'a> {
+            question: &'a str,
+            options: &'a [String],
+            recommended: Option<usize>,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            multi: bool,
+        }
+        if serializer.is_human_readable() {
+            Human {
+                question: &self.question,
+                options: &self.options,
+                recommended: self.recommended,
+                multi: self.multi,
+            }
+            .serialize(serializer)
+        } else {
+            WireV0317 {
+                question: &self.question,
+                options: &self.options,
+                recommended: self.recommended,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BotItemDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireV0317 {
+            question: String,
+            #[serde(default)]
+            options: Vec<String>,
+            #[serde(default)]
+            recommended: Option<usize>,
+        }
+        #[derive(Deserialize)]
+        struct Human {
+            question: String,
+            #[serde(default)]
+            options: Vec<String>,
+            #[serde(default)]
+            recommended: Option<usize>,
+            #[serde(default)]
+            multi: bool,
+        }
+        if deserializer.is_human_readable() {
+            let h = Human::deserialize(deserializer)?;
+            Ok(Self {
+                question: h.question,
+                options: h.options,
+                recommended: h.recommended,
+                multi: h.multi,
+            })
+        } else {
+            let w = WireV0317::deserialize(deserializer)?;
+            Ok(Self {
+                question: w.question,
+                options: w.options,
+                recommended: w.recommended,
+                multi: false,
+            })
+        }
+    }
 }
 
 /// A single immutable event in a [`BotItem`]'s timeline.

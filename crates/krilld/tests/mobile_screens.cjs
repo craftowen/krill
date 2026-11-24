@@ -1792,5 +1792,138 @@ async function projectIcons(){
  leg.abort.abort();
  console.log('PASS project icons: deferred batched dedupe RPC, cross-host hash cache, localStorage 0ms warm launch, Lucide/badge tint, onerror fallback, legacy guard');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function todoUxDacRegressions(){
+ const botsSrc=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/bots.js'),'utf8');
+ assert(!botsSrc.includes('innerHTML'),'bots.js must never use innerHTML');
+ assert(!botsSrc.includes('crypto.subtle'),'bots.js must never use crypto.subtle');
+ assert(!botsSrc.includes('crypto.randomUUID'),'bots.js must never use crypto.randomUUID');
+
+ // 1. D+A+C on #/up-next: action-type grouping, text-only needs_you comment context + bots.item.answer,
+ //    multi-question decision_id, recommended badge, multi-select submit, detail sheet timeline & actions, agy bot compatibility.
+ const botsList=[
+  {id:'b-agy',slug:'agy-rel',name:'Agy Release',agent_id:'agy',schedules:[{id:'nightly',name:'Nightly ship',cron:'0 9 * * *',enabled:true}]},
+  {id:'b-doc',slug:'doc-bot',name:'Doc Bot',agent_id:'claude',schedules:[]},
+ ];
+ const now=Date.now();
+ const itemsList=[
+  {
+   uid:'it-multi-q',owner_bot_id:'b-agy',title:'Rollout check',status:'needs_you',
+   done_means:'All rollout questions answered',
+   links:[{dispatch:'disp-7182'},{pr:'https://github.com/craftowen/krill/pull/208'}],
+   events:[
+    {id:10,kind:'commented',actor:{bot:{bot_id:'b-agy'}},text:'Checks passed. Please pick target and channels.',decisions:[
+     {question:'Target env?',options:['Staging','Prod'],recommended:0,multi:false},
+     {question:'Notify channels?',options:['Slack','Email','Blog'],recommended:0,multi:true},
+    ],created_at_ms:now-120000},
+    {id:11,kind:'commented',actor:{owner:{device:'mac'}},text:'Target env? → Staging',decisions:[],created_at_ms:now-60000},
+   ],
+  },
+  {
+   uid:'it-text-only',owner_bot_id:'b-agy',title:'Refund wording review',status:'needs_you',
+   done_means:'Final refund text approved',
+   links:[{dispatch:'disp-9901'}],
+   events:[
+    {id:20,kind:'commented',actor:{bot:{bot_id:'b-agy'}},text:'Should we add a prorated refund exception line?',decisions:[],created_at_ms:now-30000},
+   ],
+  },
+  {
+   uid:'it-stale-dec',owner_bot_id:'b-doc',title:'Follow-up after prior ask',status:'needs_you',
+   events:[
+    {id:30,kind:'commented',actor:{bot:{bot_id:'b-doc'}},text:'Old ask',decisions:[{question:'Old Q?',options:['OldA','OldB'],recommended:0,multi:false}],created_at_ms:now-90000},
+    {id:31,kind:'commented',actor:{owner:{device:'mac'}},text:'OldA',decisions:[],created_at_ms:now-80000},
+    {id:32,kind:'status',actor:{bot:{bot_id:'b-doc'}},text:'status -> needs_you',decisions:[],created_at_ms:now-20000},
+    {id:33,kind:'commented',actor:{bot:{bot_id:'b-doc'}},text:'Need fresh feedback on paragraph 2.',decisions:[],created_at_ms:now-10000},
+   ],
+  },
+ ];
+ const uf=fixture('up-next',{
+  state:{snapshot:{capabilities:{bots:true},sessions:[{id:41,state:'Blocked',title:'Build token expired',worktree_key:'w-build'}],orchestration:{gates:[{id:'g-db',status:'pending',question:'Run index cleanup?',options:['Approve','Deny']}],questions:[],runs:[],tasks:[]}}},
+  rpc:req=>{
+   if(req.action==='bots.list')return {bots:botsList};
+   if(req.action==='bots.items')return {items:itemsList};
+   if(req.action==='bots.access.list')return {requests:[{token:'acc-1',bot_id:'b-doc',source:'slack',sender_name:'Designer',status:'pending'}]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[{id:'sug-9',bot_id:'b-doc',title:'Summarize notes',why:'3 docs',ask:'Start now?'}]};
+   if(req.action==='bots.upcoming')return {schedules:[{id:'nightly',running:false,last_error:'Token expired'}]};
+   return {ok:true};
+  },
+ });
+ uf.ctx.closeSheet=()=>{};
+ await uf.flush();
+
+ // D: All 4 action groups render with clear headings.
+ const groups=uf.all().filter(n=>n.dataset?.todoGroup).map(n=>n.dataset.todoGroup);
+ assert.deepEqual(groups,['choices','approvals','blocked'],'D: action-type groups render in priority order');
+ assert(uf.root.textContent.includes('Choices needed'),'D: Choices needed heading rendered');
+ assert(uf.root.textContent.includes('Approvals needed'),'D: Approvals needed heading rendered');
+ assert(uf.root.textContent.includes('Blocked & errors'),'D: Blocked & errors heading rendered');
+ assert(uf.root.textContent.includes('Failed automation')&&uf.root.textContent.includes('Nightly ship'),'D: failed automation shown in Blocked & errors');
+ assert(uf.root.textContent.includes('Waiting sessions')&&uf.root.textContent.includes('Build token expired'),'D: waiting session shown in Blocked & errors');
+
+ // A: Text-only needs_you card shows bot's latest comment, hides raw dispatch: disp-9901, and submits via bots.item.answer!
+ const textCard=uf.all().find(n=>n.dataset?.item==='it-text-only');
+ assert(textCard,'text-only needs_you card rendered');
+ assert(textCard.textContent.includes('Should we add a prorated refund exception line?'),'A: latest bot comment rendered on text-only needs_you card');
+ assert(!textCard.textContent.includes('disp-9901'),'A: raw dispatch ID hidden on compact card');
+ const textArea=textCard.querySelector('textarea');
+ assert(textArea,'A: inline reply box shown for text-only needs_you item');
+ textArea.value='Add one line for prorated refunds.';
+ emit(textArea,'input');
+ await textCard.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Send answer').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.answer'&&c.item_id==='it-text-only'&&c.answer_text==='Add one line for prorated refunds.'),'root-cause fix: text-only needs_you calls bots.item.answer instead of bots.item.update');
+
+ // Stale decisions after owner reply + new text-only needs_you must NOT reappear.
+ const staleCard=uf.all().find(n=>n.dataset?.item==='it-stale-dec');
+ assert(staleCard&&!staleCard.textContent.includes('OldA'),'waitingQuestion hides stale answered decisions');
+ assert(staleCard.textContent.includes('Need fresh feedback on paragraph 2.'),'shows fresh bot context comment');
+
+ // Multi-question + answered line + Recommended badge + Multi-select toggle & submit with decision_id!
+ const multiCard=uf.all().find(n=>n.dataset?.item==='it-multi-q');
+ assert(multiCard.textContent.includes('Target env? → Staging'),'answered question collapses to summary line');
+ assert(multiCard.textContent.includes('Recommended'),'Recommended badge rendered on recommended option');
+ assert(multiCard.textContent.includes('Multi-select'),'Multi-select badge rendered on multi decision');
+ assert(!multiCard.textContent.includes('disp-7182'),'raw dispatch ID hidden on compact card');
+ assert(multiCard.textContent.includes('PR #208'),'human-readable PR link rendered');
+ const slackBtn=multiCard.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Slack');
+ const blogBtn=multiCard.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Blog');
+ await slackBtn.action();
+ await blogBtn.action();
+ const submitMulti=multiCard.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Submit (2)');
+ assert(submitMulti&&!submitMulti.disabled,'Submit (2) enabled after picking two options');
+ await submitMulti.action();
+ assert(uf.calls.some(c=>c.action==='bots.item.answer'&&c.item_id==='it-multi-q'&&c.decision_id==='10:1'&&c.answer_text==='Notify channels? → Slack, Blog'),'multi-select submits joined named answer with exact decision_id');
+
+ // C: Details button opens C-sheet with full Activity timeline, Linked task, Open chat, Snooze 4h, Done, Add link, Cancel item.
+ const detailBtn=multiCard.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Details');
+ await detailBtn.action();
+ const sheetSpec=uf.sheets.at(-1);
+ assert.equal(sheetSpec[0],'Rollout check','C: detail sheet opens with item title');
+ const sheetBody=uf.ctx.el('div');
+ sheetSpec[3](sheetBody);
+ assert(sheetBody.textContent.includes('Activity')&&sheetBody.textContent.includes('Checks passed. Please pick target and channels.')&&sheetBody.textContent.includes('Target env? → Staging'),'C: full event timeline shown in detail sheet');
+ assert(sheetBody.textContent.includes('Linked task')&&!sheetBody.textContent.includes('disp-7182'),'C: dispatch link rendered as human-readable Linked task');
+ await sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Snooze 4h').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.update'&&c.item_id==='it-multi-q'&&typeof c.snoozed_until_ms?.set==='number'),'C: Snooze 4h works from detail sheet');
+ await sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Done').action();
+ assert(uf.calls.some(c=>c.action==='bots.item.update'&&c.item_id==='it-multi-q'&&c.status==='done'),'C: Done works from detail sheet');
+ await sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Add link').action();
+ const linkInp=sheetBody.querySelector('input');
+ linkInp.value='https://krill.page/docs';
+ await sheetBody.querySelectorAll('button').filter(b=>b.getAttribute('aria-label')==='Add link').at(-1).action();
+ assert(uf.calls.some(c=>c.action==='bots.item.link'&&c.item_id==='it-multi-q'&&c.link?.url==='https://krill.page/docs'),'C: Add link works from detail sheet');
+ await sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Open chat').action();
+ assert.equal(uf.routes.at(-1),'/bots/b-agy','C: Open chat navigates to agy bot workspace');
+ uf.abort.abort();
+
+ // 2. Korean i18n coverage for all new To Do D+A+C copy.
+ const koBox=vm.createContext({navigator:{language:'ko'}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),koBox);
+ const K=koBox.KrillMobile.i18n;
+ for(const key of ['Choices needed','Approvals needed','Blocked & errors','Recommended','Send answer','Type your answer…','Select at least one option','Activity','No activity yet.','Auto','Linked task','Open chat','Item details','Add a comment…','Latest update','Multi-select','Answered','File']){
+  assert.notEqual(K.t(key),key,`missing ko translation for "${key}"`);
+ }
+ assert.equal(K.t('Submit ({0})',2),'2개 선택 보내기');
+ assert.equal(K.t('Details ({0})',3),'상세 (3)');
+ console.log('PASS To Do D+A+C regressions: action groups, bot context, bots.item.answer, decision_id, multi-select, detail sheet, agy bot, ko i18n, security');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

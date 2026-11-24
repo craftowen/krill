@@ -3156,10 +3156,15 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .get("recommended")
                     .and_then(Value::as_u64)
                     .and_then(|v| usize::try_from(v).ok());
+                let multi = arguments
+                    .get("multi")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let decision = BotItemDecision {
                     question: question.clone(),
                     options,
                     recommended,
+                    multi,
                 };
                 let existing_id = arguments
                     .get("item_id")

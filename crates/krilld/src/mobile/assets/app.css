@@ -778,8 +778,12 @@ button.quick-action-insert:active{background:var(--surface-raised)}
 #mobile-app .composer-leading>.composer-icon::after{content:"";position:absolute;inset:-4px -6px -8px}
 /* Orca chat empty, jump-to-latest, and modal Model & Effort sheet. */
 .chat-view{position:relative}
-.chat-jump-bottom{position:absolute;right:14px;bottom:calc(var(--chat-composer-h,116px) + 12px);z-index:2;display:grid;place-items:center;width:38px;height:38px;min-width:38px;min-height:38px;border-radius:50%;border:1px solid var(--floating-border);background:var(--composer-surface);color:var(--foreground);box-shadow:0 4px 16px rgba(0,0,0,.32)}
-.chat-jump-bottom::after{content:"";position:absolute;inset:-3px}
+.chat-jump-bottom,.chat-process-toggle{position:absolute;right:14px;z-index:2;display:grid;place-items:center;width:38px;height:38px;min-width:38px;min-height:38px;border-radius:50%;border:1px solid var(--floating-border);background:var(--composer-surface);color:var(--foreground);box-shadow:0 4px 16px rgba(0,0,0,.32)}
+.chat-jump-bottom{bottom:calc(var(--chat-float-bottom,var(--chat-composer-h,116px)) + 12px)}
+.chat-process-toggle{bottom:calc(var(--chat-float-bottom,var(--chat-composer-h,116px)) + 66px);color:var(--muted-foreground);transition:background-color 140ms ease,border-color 140ms ease,color 140ms ease}
+.chat-process-toggle[data-expanded=true]{background:color-mix(in srgb,var(--accent) 16%,var(--composer-surface));border-color:color-mix(in srgb,var(--accent) 52%,var(--floating-border));color:var(--foreground)}
+.chat-process-toggle[data-expanded=true]:active{background:color-mix(in srgb,var(--accent) 24%,var(--composer-surface))}
+.chat-jump-bottom::after,.chat-process-toggle::after{content:"";position:absolute;inset:-3px}
 .chat-composer-suggestions[data-kind=models]{position:fixed;inset:0;max-height:none;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;z-index:20}
 .chat-model-sheet{width:100%;max-width:600px;max-height:min(78svh,620px);margin:auto auto 0;border:0;border-top:1px solid var(--floating-border);border-radius:var(--radius-xl) var(--radius-xl) 0 0;background:var(--sheet-surface);color:var(--foreground);overflow:auto;overscroll-behavior:contain;padding:8px 16px calc(20px + max(0px, env(safe-area-inset-bottom) - var(--keyboard-inset,0px)));display:flex;flex-direction:column;gap:12px}
 dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
@@ -1072,6 +1076,35 @@ dialog.chat-model-sheet::backdrop{background:rgb(0 0 0 / 55%)}
 .bot-first-chat-form textarea{min-height:68px;border-radius:var(--radius-md);background:var(--surface-panel)}
 .bot-item-head-right{display:inline-flex;align-items:center;gap:4px;flex:none}
 .bot-item-details{display:flex;flex-direction:column;gap:8px;padding-top:6px;border-top:1px solid var(--border)}
+.bot-item-card.waiting{border-left:3px solid var(--status-waiting)}
+.bot-item-card.blocked{border-left:3px solid var(--status-blocked)}
+.bot-item-context{display:flex;flex-direction:column;gap:3px;padding:8px 10px;border-radius:10px;background:var(--surface-base);border:1px solid var(--border);font-size:var(--font-meta);line-height:1.48;overflow-wrap:anywhere}
+.bot-item-context-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:calc(11px * var(--ui-scale,1));color:var(--text-muted)}
+.bot-item-context-text{margin:0;color:var(--muted-foreground);white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.bot-item-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-top:6px;border-top:1px solid var(--border)}
+.bot-opt-btn{display:inline-flex;align-items:center;justify-content:space-between;gap:6px;text-align:left;max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.bot-opt-btn.is-multi{border:1px solid var(--border)}
+.bot-opt-btn.is-multi.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--foreground)}
+.bot-rec-badge{flex:none;padding:1px 6px;border-radius:999px;background:var(--status-waiting);color:var(--surface-base);font-size:calc(10px * var(--ui-scale,1));font-weight:700;line-height:1.4}
+.bot-decision-answered{margin:0;font-size:var(--font-meta);color:var(--muted-foreground)}
+.bot-sheet-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.bot-timeline{display:flex;flex-direction:column;gap:8px}
+.bot-timeline-item{padding:8px 10px;border-radius:10px;background:var(--surface-raised);border:1px solid var(--border);display:flex;flex-direction:column;gap:4px;font-size:var(--font-meta)}
+.bot-timeline-item.mine{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.bot-timeline-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:calc(11px * var(--ui-scale,1));color:var(--text-muted)}
+.bot-timeline-body{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--foreground)}
+.bot-sheet-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.todo-filter-bar{flex:none;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding:2px 0 4px}
+.todo-filter-bar::-webkit-scrollbar{display:none}
+.todo-filter-bar>.filter-chip{flex:none}
+.todo-action-group{flex:none;display:flex;flex-direction:column;gap:10px}
+.bot-decision-box .bot-status-pill{flex:none;white-space:nowrap}
+.todo-group-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:4px}
+.todo-group-title{display:inline-flex;align-items:center;gap:7px;font-size:var(--font-body);font-weight:700;margin:0}
+.todo-group-dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--status-waiting)}
+.todo-group-dot.approval{background:var(--accent)}
+.todo-group-dot.blocked{background:var(--status-blocked)}
+.todo-group-dot.suggestion{background:var(--status-working)}
 .bot-reply-fold{border:1px solid var(--border);border-radius:var(--radius-card);background:var(--group-surface);overflow:hidden}
 .bot-reply-fold-summary{min-height:var(--touch-target);padding:10px 14px;display:flex;align-items:center;font-weight:600;cursor:pointer}
 .bot-reply-fold>.bot-reply-card{border:0;border-top:1px solid var(--border);border-radius:0}
