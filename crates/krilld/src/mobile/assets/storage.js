@@ -4,7 +4,7 @@
  const SEED_PREFIX='krill-mobile-seed-v1:';
  const VISIBILITY=['asleep','default_branch','automation','external','external_shown'];
  const pick=(value,keys)=>Object.fromEntries(keys.filter(k=>['string','number','boolean'].includes(typeof value?.[k])||value?.[k]===null).map(k=>[k,value[k]]));
- const cleanIcon=v=>v?.kind==='emoji'&&typeof v.value==='string'&&v.value.trim().length>0&&v.value.length<=16?{kind:'emoji',value:v.value}:undefined;
+ const cleanIcon=v=>{if(!v||typeof v!=='object')return undefined;if(v.kind==='emoji'&&typeof v.value==='string'&&v.value.trim().length>0&&v.value.length<=16)return {kind:'emoji',value:v.value};if(v.kind==='lucide'&&typeof v.value==='string'&&/^[A-Za-z0-9]{1,32}$/.test(v.value))return {kind:'lucide',value:v.value};if(v.kind==='image'&&typeof v.hash==='string'&&/^[0-9a-f]{16,64}$/.test(v.hash))return {kind:'image',hash:v.hash};return undefined;};
  const cleanVisibility=v=>{if(!v||typeof v!=='object'||Array.isArray(v))return undefined;const out={};let any=false;for(const k of VISIBILITY)if(typeof v[k]==='boolean'){out[k]=v[k];any=true;}return any?out:undefined;};
  const cleanOrders=v=>Array.isArray(v)&&v.length>0&&v.length<=4&&v.every(n=>typeof n==='number'&&Number.isFinite(n)&&n>=0)?v.slice():undefined;
  const rows=(values,keys,extra)=>Array.isArray(values)?values.slice(0,256).map(v=>{const out=pick(v,keys);extra?.(v,out);return out;}):[];
@@ -64,7 +64,7 @@
     };
    },removeHost:host=>invalidate(host),
    close(){closed=true;connection?.close();channel?.close();globalThis.removeEventListener?.('storage',storageEvent);listeners.clear();},
-   async clear(){for(const scope of revisions.keys()){bump(scope);if(lifetimes.has(scope))lifetimes.get(scope).active=false;}memory.clear();try{for(let i=storage.length-1;i>=0;i--){const key=storage.key(i);if(key?.startsWith(SEED_PREFIX))storage.removeItem(key);}storage.removeItem(LEGACY);}catch{}const result=await transaction('readwrite',store=>store.clear());return !!result;}
+   async clear(){for(const scope of revisions.keys()){bump(scope);if(lifetimes.has(scope))lifetimes.get(scope).active=false;}memory.clear();try{for(let i=storage.length-1;i>=0;i--){const key=storage.key(i);if(key?.startsWith(SEED_PREFIX))storage.removeItem(key);}storage.removeItem(LEGACY);storage.removeItem('krill-mobile-repo-icons-v1');}catch{}const result=await transaction('readwrite',store=>store.clear());return !!result;}
   };
  }
  M.storage={create,identity,metadata};

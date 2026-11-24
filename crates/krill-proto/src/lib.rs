@@ -30,6 +30,7 @@ pub mod mobile;
 pub mod orchestration;
 pub mod os;
 pub mod path;
+pub mod project_icon;
 pub mod remote_fs;
 pub mod resources;
 pub mod roles;

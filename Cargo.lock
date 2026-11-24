@@ -3936,6 +3936,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "crc32fast",
  "embed-resource",
+ "image",
  "krill-holder",
  "krill-log",
  "krill-proto",

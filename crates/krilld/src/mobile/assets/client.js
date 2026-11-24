@@ -1229,6 +1229,7 @@
             "bots.groups.read",
             "bots.suggestions.list",
             "bots.avatar.read",
+            "repo_icons.read",
             "bots.soul.get",
             "bots.memory.get",
           ].includes(request?.action);
