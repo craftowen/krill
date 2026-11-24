@@ -143,6 +143,10 @@ pub(super) struct GroupPanelState {
     pub filter: GroupItemsFilter,
     pub all_items: Vec<BotItem>,
     pub closed_loaded_key: Option<(String, Vec<BotId>)>,
+    pub closed_loaded_host: Option<crate::hosts::HostId>,
+    pub closed_loading_key: Option<(crate::hosts::HostId, String, Vec<BotId>)>,
+    pub closed_failed_key: Option<(crate::hosts::HostId, String, Vec<BotId>)>,
+    pub load_task: Option<gpui::Task<()>>,
     pub gen_seq: u64,
     pub(super) list_cache: GroupListCache,
 }
@@ -163,6 +167,10 @@ impl GroupPanelState {
             self.filter = GroupItemsFilter::default();
             self.all_items.clear();
             self.closed_loaded_key = None;
+            self.closed_loaded_host = None;
+            self.closed_loading_key = None;
+            self.closed_failed_key = None;
+            self.load_task = None;
         }
     }
 }
@@ -207,8 +215,19 @@ impl View {
     pub fn clear_group_panel(&mut self, cx: &mut Context<Self>) {
         if self.group_panel.active {
             self.group_panel.active = false;
+            self.group_panel.closed_loading_key = None;
+            self.group_panel.load_task = None;
             cx.notify();
         }
+    }
+
+    /// Forces the next `show_group_in_panel` call to re-fetch the group's full items list.
+    pub fn invalidate_group_panel_items(&mut self) {
+        self.group_panel.closed_loaded_key = None;
+        self.group_panel.closed_loaded_host = None;
+        self.group_panel.closed_loading_key = None;
+        self.group_panel.closed_failed_key = None;
+        self.group_panel.load_task = None;
     }
 
     #[must_use]
@@ -305,7 +324,12 @@ impl View {
             self.items.selected.clear();
         }
         let key = (group_id.to_owned(), member_ids.to_vec());
-        if self.group_panel.closed_loaded_key.as_ref() != Some(&key) {
+        let scoped_key = (self.host.clone(), group_id.to_owned(), member_ids.to_vec());
+        let already_loaded = self.group_panel.closed_loaded_key.as_ref() == Some(&key)
+            && self.group_panel.closed_loaded_host.as_ref() == Some(&self.host);
+        let already_loading = self.group_panel.closed_loading_key.as_ref() == Some(&scoped_key);
+        let already_failed = self.group_panel.closed_failed_key.as_ref() == Some(&scoped_key);
+        if !already_loaded && !already_loading && !already_failed {
             self.load_group_panel_items(key, cx);
         }
         self.sync_group_items_backing();
@@ -319,16 +343,20 @@ impl View {
             self.group_panel.group_id.clone(),
             self.group_panel.member_ids.clone(),
         );
-        self.group_panel.closed_loaded_key = None;
+        self.invalidate_group_panel_items();
         self.load_group_panel_items(key, cx);
     }
 
     fn load_group_panel_items(&mut self, key: (String, Vec<BotId>), cx: &mut Context<Self>) {
         self.group_panel.gen_seq = self.group_panel.gen_seq.wrapping_add(1);
         let seq = self.group_panel.gen_seq;
+        let origin_host = self.host.clone();
+        let scoped_key = (origin_host.clone(), key.0.clone(), key.1.clone());
+        self.group_panel.closed_loading_key = Some(scoped_key.clone());
+        self.group_panel.closed_failed_key = None;
         let rpc = self.rpc.clone();
         let member_set: BTreeSet<BotId> = key.1.iter().cloned().collect();
-        cx.spawn(async move |this, cx| {
+        self.group_panel.load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
@@ -342,9 +370,11 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if this.group_panel.gen_seq != seq {
+                if this.group_panel.gen_seq != seq || this.host != origin_host {
                     return;
                 }
+                this.group_panel.closed_loading_key = None;
+                this.group_panel.load_task = None;
                 match loaded {
                     Ok(BotRpcResponse::Items(list)) => {
                         this.group_panel.all_items = list
@@ -352,15 +382,19 @@ impl View {
                             .filter(|i| member_set.contains(&i.owner_bot_id))
                             .collect();
                         this.group_panel.closed_loaded_key = Some(key);
+                        this.group_panel.closed_loaded_host = Some(origin_host);
+                        this.group_panel.closed_failed_key = None;
                         this.sync_group_items_backing();
                     }
                     Ok(other) => {
+                        this.group_panel.closed_failed_key = Some(scoped_key);
                         this.error = Some(SharedString::from(format!(
                             "unexpected ListItems response: {other:?}"
                         )));
                         this.notice = None;
                     }
                     Err(err) => {
+                        this.group_panel.closed_failed_key = Some(scoped_key);
                         this.error = Some(SharedString::from(err));
                         this.notice = None;
                     }
@@ -368,8 +402,7 @@ impl View {
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     fn resolved_group_items(&self) -> Vec<BotItem> {

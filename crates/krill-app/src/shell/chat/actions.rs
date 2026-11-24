@@ -248,6 +248,42 @@ impl Shell {
         }
     }
 
+    fn plan_chat_question_steps(
+        &self,
+        request: &RequestIdentity,
+        selected: &[usize],
+        multi: bool,
+    ) -> Option<Vec<Vec<u8>>> {
+        let labels: Vec<_> = request
+            .item
+            .options
+            .iter()
+            .map(|opt| opt.label.clone())
+            .collect();
+        let mut cursor = self
+            .live
+            .get(&request.pane)
+            .and_then(|live| detect_question_cursor_index(&live.pane.screen().rows, &labels))?;
+        let mut steps = Vec::new();
+        if multi {
+            // Do not assume an empty checked set. Only automate a multiselect
+            // when the live TUI exposes every checkbox state explicitly.
+            let checked = self
+                .live
+                .get(&request.pane)
+                .and_then(|live| checked_options(&live.pane.screen().rows, &labels))?;
+            let desired: BTreeSet<_> = selected.iter().copied().collect();
+            for &target in checked.symmetric_difference(&desired) {
+                step_cursor(&mut steps, &mut cursor, target);
+                steps.push(b" ".to_vec());
+            }
+        } else {
+            step_cursor(&mut steps, &mut cursor, selected[0]);
+        }
+        steps.push(b"\r".to_vec());
+        Some(steps)
+    }
+
     pub(super) fn answer_chat_question(
         &mut self,
         request: RequestIdentity,
@@ -272,44 +308,163 @@ impl Shell {
         {
             return;
         }
+        let Some(steps) = self.plan_chat_question_steps(&request, &selected, multi) else {
+            return;
+        };
         if let Some(log) = self.chat.logs.get_mut(&request.chat_key()) {
             log.multi_selected
-                .insert(request.key.clone(), selected.iter().copied().collect());
+                .insert(request.key.clone(), selected.into_iter().collect());
         }
-        let labels: Vec<_> = request
-            .item
-            .options
-            .iter()
-            .map(|opt| opt.label.clone())
+        self.start_chat_request(request, steps, cx);
+    }
+
+    /// Submits all answered steps of a multi-question batch in ascending step order, waiting for
+    /// the live TUI prompt to advance to each subsequent question before planning its keystrokes.
+    pub(super) fn answer_chat_question_batch(
+        &mut self,
+        batch: Vec<(RequestIdentity, Vec<usize>, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut valid: Vec<(RequestIdentity, Vec<usize>, bool)> = batch
+            .into_iter()
+            .filter(|(req, selected, multi)| {
+                !selected.is_empty()
+                    && selected.iter().all(|&index| index < req.item.options.len())
+                    && req.item.multi_select == *multi
+            })
             .collect();
-        let Some(mut cursor) = self
-            .live
-            .get(&request.pane)
-            .and_then(|live| detect_question_cursor_index(&live.pane.screen().rows, &labels))
+        let Some(start) = valid
+            .iter()
+            .position(|(req, _, _)| self.chat_request_is_current(req, cx))
         else {
             return;
         };
-        let mut steps = Vec::new();
-        if multi {
-            // Do not assume an empty checked set. Only automate a multiselect
-            // when the live TUI exposes every checkbox state explicitly.
-            let Some(checked) = self
-                .live
-                .get(&request.pane)
-                .and_then(|live| checked_options(&live.pane.screen().rows, &labels))
-            else {
-                return;
-            };
-            let desired: BTreeSet<_> = selected.into_iter().collect();
-            for &target in checked.symmetric_difference(&desired) {
-                step_cursor(&mut steps, &mut cursor, target);
-                steps.push(b" ".to_vec());
+        valid.drain(..start);
+        if valid.len() == 1 {
+            if let Some((req, selected, multi)) = valid.into_iter().next() {
+                self.answer_chat_question(req, selected, multi, cx);
             }
-        } else {
-            step_cursor(&mut steps, &mut cursor, selected[0]);
+            return;
         }
-        steps.push(b"\r".to_vec());
-        self.start_chat_request(request, steps, cx);
+        let key = valid[0].0.chat_key();
+        if self.chat.logs.get(&key).is_some_and(|log| {
+            valid.iter().any(|(req, _, _)| {
+                log.submissions
+                    .get(&req.key)
+                    .is_some_and(Submission::blocks_input)
+            })
+        }) {
+            return;
+        }
+        if let Some(log) = self.chat.logs.get_mut(&key) {
+            for (req, selected, _) in &valid {
+                log.multi_selected
+                    .insert(req.key.clone(), selected.iter().copied().collect());
+            }
+        }
+        let Some(first_steps) = self.plan_chat_question_steps(&valid[0].0, &valid[0].1, valid[0].2)
+        else {
+            return;
+        };
+        self.set_chat_submission(&valid[0].0, Submission::Sending);
+        let task = cx.spawn(async move |this, cx| {
+            let mut awaiting: Vec<RequestIdentity> = Vec::with_capacity(valid.len());
+            for (step_pos, (request, selected, multi)) in valid.into_iter().enumerate() {
+                let steps = if step_pos == 0 {
+                    first_steps.clone()
+                } else {
+                    let mut planned = None;
+                    for _ in 0..40 {
+                        let ready = this
+                            .update(cx, |this, cx| {
+                                if !this.chat_request_is_current(&request, cx) {
+                                    return None;
+                                }
+                                this.plan_chat_question_steps(&request, &selected, multi)
+                            })
+                            .ok()
+                            .flatten();
+                        if ready.is_some() {
+                            planned = ready;
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
+                    }
+                    let Some(steps) = planned else {
+                        this.update(cx, |this, cx| {
+                            this.set_chat_submission(&request, Submission::ReviewRequired);
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    };
+                    this.update(cx, |this, cx| {
+                        this.set_chat_submission(&request, Submission::Sending);
+                        cx.notify();
+                    })
+                    .ok();
+                    steps
+                };
+                for (sent, bytes) in steps.into_iter().enumerate() {
+                    if sent > 0 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(60))
+                            .await;
+                    }
+                    let ok = this
+                        .update(cx, |this, cx| {
+                            this.chat_request_is_current(&request, cx)
+                                && this.send_to_chat_pane(request.pane, request.session, &bytes, cx)
+                        })
+                        .unwrap_or(false);
+                    if !ok {
+                        this.update(cx, |this, cx| {
+                            this.set_chat_submission(
+                                &request,
+                                if sent > 0 || step_pos > 0 {
+                                    Submission::ReviewRequired
+                                } else {
+                                    Submission::Failed
+                                },
+                            );
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+                this.update(cx, |this, cx| {
+                    this.set_chat_submission(&request, Submission::Awaiting);
+                    cx.notify();
+                })
+                .ok();
+                awaiting.push(request);
+            }
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            this.update(cx, |this, cx| {
+                let mut changed = false;
+                for request in &awaiting {
+                    if this.chat.logs.get(&request.chat_key()).is_some_and(|log| {
+                        log.epoch == request.epoch
+                            && matches!(
+                                log.submissions.get(&request.key),
+                                Some(Submission::Awaiting)
+                            )
+                    }) {
+                        this.set_chat_submission(request, Submission::ReviewRequired);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.chat.request_tasks.insert(key, task);
+        cx.notify();
     }
 
     pub(super) fn answer_chat_question_other(

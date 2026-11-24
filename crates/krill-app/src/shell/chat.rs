@@ -591,7 +591,7 @@ pub(crate) struct ChatState {
     /// Offer IDs currently creating a bot, to prevent duplicate creation on double click.
     pub(super) creating_offers: BTreeSet<String>,
     /// Last known bot metadata for open bot chats so host switches don't strip open chat chrome.
-    cached_bots: BTreeMap<ChatKey, krill_app::bots::SidebarBot>,
+    pub(super) cached_bots: BTreeMap<ChatKey, krill_app::bots::SidebarBot>,
     /// Memory receipts the reader opened, by their time (Orca's memory note disclosure).
     pub(super) open_memory_notes: BTreeSet<u64>,
     /// Images whose chip was put in each composer's text (Orca's inline image reference).
@@ -686,18 +686,17 @@ pub(crate) struct ChatState {
     pub(super) resume_toast: Option<(ChatKey, String)>,
     /// Immediate `/resume <query>` search popover state (`#47815`).
     pub(super) resume_search: BTreeMap<ChatKey, String>,
-    /// Local resolution state for Orca bot offer/setup cards (`NativeChatCardFrame`).
-    pub(super) resolved_bot_cards: BTreeMap<String, BotCardResolution>,
+    /// Local resolution state for Orca bot offer/setup cards (`NativeChatCardFrame`),
+    /// scoped per `(ChatKey, abs_idx)` so static/default card IDs never collide across chats.
+    pub(super) resolved_bot_cards: BTreeMap<(ChatKey, usize), BotCardResolution>,
     #[cfg(test)]
     pub now_override: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BotCardResolution {
-    Connected,
     Dismissed,
     Removed,
-    Done,
     Copied,
 }
 
@@ -1605,25 +1604,36 @@ impl Shell {
         .detach();
     }
 
-    /// Updates a bot's permission mode optimistically and persists it via `UpdateBot`.
+    /// Updates a bot's permission mode optimistically on `host` and persists it via `UpdateBot`.
     pub(super) fn set_bot_permission(
         &mut self,
+        host: krill_app::hosts::HostId,
         bot_id: krill_proto::bots::BotId,
         permission: krill_proto::agent::Permission,
         cx: &mut Context<Self>,
     ) {
-        if let Some(b) = self.sidebar_bots.iter_mut().find(|b| b.id == bot_id) {
+        if let Some(b) = self
+            .sidebar_bots
+            .iter_mut()
+            .find(|b| b.host == host && b.id == bot_id)
+        {
             b.permission = permission;
         }
-        for cached in self.chat.cached_bots.values_mut() {
-            if cached.id == bot_id {
+        if let Some(entry) = self.bot_ui.hosts.get_mut(&host)
+            && let Some(b) = entry.snapshot.bots.iter_mut().find(|b| b.id == bot_id)
+        {
+            b.permission = permission;
+        }
+        for (k, cached) in &mut self.chat.cached_bots {
+            if k.0 == host && cached.id == bot_id {
                 cached.permission = permission;
             }
         }
         cx.notify();
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(&host) else {
             return;
         };
+        let host_owned = host;
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1657,8 +1667,101 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
                     this.notice = Some(err);
+                    cx.notify();
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Removes an MCP tool named in a `ToolAdded` chat card via `GetBot` + `UpdateBot`,
+    /// marking the card removed only after the daemon confirms the update.
+    pub(super) fn remove_bot_tool_from_card(
+        &mut self,
+        key: ChatKey,
+        abs_idx: usize,
+        bot_id: krill_proto::bots::BotId,
+        tool_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let host = key.0.clone();
+        let Some(rpc) = self.bot_rpc_on(&host) else {
+            return;
+        };
+        let target_name = tool_name.trim().to_owned();
+        if target_name.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    let bot = match krill_app::bots::rpc::call_checked(
+                        &rpc,
+                        &krill_proto::bots::BotRpcRequest::GetBot {
+                            bot_id: bot_id.clone(),
+                        },
+                    )? {
+                        krill_proto::bots::BotRpcResponse::Bot(b) => *b,
+                        other => {
+                            return Err(format!("unexpected GetBot response: {other:?}"));
+                        }
+                    };
+                    let mut next_tools = bot.mcp_tools;
+                    let before = next_tools.len();
+                    next_tools.retain(|t| {
+                        !(t.id.eq_ignore_ascii_case(&target_name)
+                            || t.name.eq_ignore_ascii_case(&target_name))
+                    });
+                    if next_tools.len() == before {
+                        return Err(format!(
+                            "tool `{target_name}` is not configured on this bot"
+                        ));
+                    }
+                    krill_app::bots::rpc::call_checked(
+                        &rpc,
+                        &krill_proto::bots::BotRpcRequest::UpdateBot(Box::new(
+                            krill_proto::bots::UpdateBotParams {
+                                bot_id,
+                                name: None,
+                                description: None,
+                                emoji: krill_proto::bots::FieldPatch::Unchanged,
+                                avatar: krill_proto::bots::FieldPatch::Unchanged,
+                                agent_id: None,
+                                model: krill_proto::bots::FieldPatch::Unchanged,
+                                effort: krill_proto::bots::FieldPatch::Unchanged,
+                                permission_mode: None,
+                                workspace: krill_proto::bots::FieldPatch::Unchanged,
+                                paused: None,
+                                first_run_completed: None,
+                                notifications: None,
+                                schedules: None,
+                                look_around: None,
+                                memory_tidy: None,
+                                mcp_tools: Some(next_tools),
+                            },
+                        )),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match res {
+                    Ok(krill_proto::bots::BotRpcResponse::Bot(_)) => {
+                        this.chat
+                            .resolved_bot_cards
+                            .insert((key, abs_idx), BotCardResolution::Removed);
+                        this.refresh_bots_for_host(&host, true, cx);
+                    }
+                    Ok(other) => {
+                        this.notice = Some(format!("unexpected UpdateBot response: {other:?}"));
+                    }
+                    Err(err) => {
+                        this.notice = Some(err);
+                    }
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -1705,17 +1808,15 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(log) = self.chat.logs.get_mut(key) else {
-            return;
-        };
-        let Some(pos) = log.queued_prompts.iter().position(|q| q.id == queued_id) else {
-            return;
-        };
-        let Some(queued) = log.queued_prompts.remove(pos) else {
-            return;
-        };
-        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
         let Some(pane) = self.chat_pane(key) else {
+            return;
+        };
+        let Some((pos, submitted_payload)) = self.chat.logs.get(key).and_then(|log| {
+            log.queued_prompts
+                .iter()
+                .position(|q| q.id == queued_id)
+                .map(|pos| (pos, log.queued_prompts[pos].submitted_payload.clone()))
+        }) else {
             return;
         };
         let session = key.1;
@@ -1724,12 +1825,21 @@ impl Shell {
             .get(&pane)
             .map_or_else(Default::default, |live| live.pane.modes());
         let krill_app::security::PastePlan::Immediate(bytes) =
-            self.plan_terminal_paste(pane, queued.submitted_payload.as_bytes(), modes, cx)
+            self.plan_terminal_paste(pane, submitted_payload.as_bytes(), modes, cx)
         else {
             self.chat.multiline_blocked.insert(key.clone());
             cx.notify();
             return;
         };
+        let Some(queued) = self
+            .chat
+            .logs
+            .get_mut(key)
+            .and_then(|log| log.queued_prompts.remove(pos))
+        else {
+            return;
+        };
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
         let (origin_epoch, origin_item, opens_terminal, local_slash) = self.pending_prompt_meta(
             key,
             &queued.submitted_payload,
@@ -1923,6 +2033,8 @@ impl Shell {
             log.seeded = false;
             log.earlier = None;
             log.meta = ComposerMeta::default();
+            log.rate_limited_account = None;
+            log.rate_limit_account_switched = false;
             log.replace_on_next_poll = !log.items.is_empty();
             chat.logs.entry(new_key.clone()).or_insert(log);
         }
@@ -1992,6 +2104,26 @@ impl Shell {
                 .entry(new_key.clone())
                 .or_insert(selected);
         }
+        if chat.permission_picker.remove(&old_key) {
+            chat.permission_picker.insert(new_key.clone());
+        }
+        if chat.agy_auth_picker.remove(&old_key) {
+            chat.agy_auth_picker.insert(new_key.clone());
+        }
+        if chat.worker_dock_expanded.remove(&old_key) {
+            chat.worker_dock_expanded.insert(new_key.clone());
+        }
+        if chat.worker_keep_open.remove(&from) {
+            chat.worker_keep_open.insert(to);
+        }
+        if let Some(query) = chat.resume_search.remove(&old_key) {
+            chat.resume_search.entry(new_key.clone()).or_insert(query);
+        }
+        if let Some((k, _)) = &mut chat.resume_toast
+            && *k == old_key
+        {
+            *k = new_key.clone();
+        }
         let moved_epochs: Vec<_> = chat
             .pending_epochs
             .keys()
@@ -2018,6 +2150,70 @@ impl Shell {
                     .or_insert(input);
             }
         }
+        let moved_batch_steps: Vec<_> = chat
+            .question_batch_step
+            .keys()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_batch_steps {
+            if let Some(step) = chat.question_batch_step.remove(&old_entry) {
+                chat.question_batch_step
+                    .entry((new_key.clone(), old_entry.1))
+                    .or_insert(step);
+            }
+        }
+        let moved_batch_answers: Vec<_> = chat
+            .question_batch_answers
+            .keys()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_batch_answers {
+            if let Some(ans) = chat.question_batch_answers.remove(&old_entry) {
+                chat.question_batch_answers
+                    .entry((new_key.clone(), old_entry.1))
+                    .or_insert(ans);
+            }
+        }
+        let moved_approval_focus: Vec<_> = chat
+            .approval_focus
+            .keys()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_approval_focus {
+            if let Some(handle) = chat.approval_focus.remove(&old_entry) {
+                chat.approval_focus
+                    .entry((new_key.clone(), old_entry.1))
+                    .or_insert(handle);
+            }
+        }
+        let moved_approval_auto: Vec<_> = chat
+            .approval_auto_focused
+            .iter()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_approval_auto {
+            if chat.approval_auto_focused.remove(&old_entry) {
+                chat.approval_auto_focused
+                    .insert((new_key.clone(), old_entry.1));
+            }
+        }
+        let moved_cards: Vec<_> = chat
+            .resolved_bot_cards
+            .keys()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_cards {
+            if let Some(res) = chat.resolved_bot_cards.remove(&old_entry) {
+                chat.resolved_bot_cards
+                    .entry((new_key.clone(), old_entry.1))
+                    .or_insert(res);
+            }
+        }
         match &mut chat.focus_pending {
             Some(ChatFocus::Composer(k) | ChatFocus::Terminal(k)) if *k == old_key => {
                 *k = new_key.clone();
@@ -2038,12 +2234,18 @@ impl Shell {
     /// An in-flight prompt send is left to finish.
     pub(super) fn prune_chat_sessions(&mut self) {
         let layout = &self.layout;
-        let shown: BTreeSet<ChatKey> = (0..layout.tabs().len())
+        let live_panes: BTreeSet<PaneId> = (0..layout.tabs().len())
             .flat_map(|index| layout.tab_panes(index))
-            .filter_map(|pane| self.chat_key(pane))
             .collect();
+        let shown: BTreeSet<ChatKey> = live_panes
+            .iter()
+            .filter_map(|&pane| self.chat_key(pane))
+            .collect();
+        let shown_sessions: BTreeSet<SessionId> = shown.iter().map(|(_, sid)| *sid).collect();
+        let orch = &self.orch_snapshot;
         let chat = &mut self.chat;
         let keep = |key: &ChatKey| shown.contains(key);
+        chat.pane_widths.retain(|pane, _| live_panes.contains(pane));
         chat.poll_failed.retain(keep);
         chat.poll_tasks.retain(|key, _| keep(key));
         chat.poll_generations.retain(|key, _| keep(key));
@@ -2053,6 +2255,26 @@ impl Shell {
         chat.quick_menu.retain(keep);
         chat.model_picker.retain(keep);
         chat.model_picker_selected.retain(|key, _| keep(key));
+        chat.permission_picker.retain(keep);
+        chat.agy_auth_picker.retain(keep);
+        chat.worker_dock_expanded.retain(keep);
+        chat.worker_dock_cleared
+            .retain(|id| orch.dispatches.iter().any(|d| &d.id == id));
+        chat.worker_keep_open
+            .retain(|sid| shown_sessions.contains(sid));
+        chat.question_batch_step.retain(|(key, _), _| keep(key));
+        chat.question_batch_answers.retain(|(key, _), _| keep(key));
+        chat.approval_focus.retain(|(key, _), _| keep(key));
+        chat.approval_auto_focused.retain(|(key, _)| keep(key));
+        if chat
+            .resume_toast
+            .as_ref()
+            .is_some_and(|(key, _)| !keep(key))
+        {
+            chat.resume_toast = None;
+        }
+        chat.resume_search.retain(|key, _| keep(key));
+        chat.resolved_bot_cards.retain(|(key, _), _| keep(key));
         chat.composer_models_in_flight.retain(keep);
         chat.finds.retain(|key, _| keep(key));
         chat.composer_tasks.retain(|key, _| keep(key));

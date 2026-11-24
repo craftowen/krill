@@ -381,6 +381,7 @@ impl Shell {
                     let host = view.read(cx).host().clone();
                     this.refresh_bots_for_host(&host, true, cx);
                 }
+                this.refresh_bot_up_next(cx);
             },
         )
         .detach();
@@ -812,6 +813,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 let mut should_retry_again = false;
                 let mut fetch_orch = false;
+                let mut refresh_up_next = false;
                 let mut retry_delay = None;
                 {
                     let Some(state) = this.bot_ui.hosts.get_mut(&host_owned) else {
@@ -843,6 +845,7 @@ impl Shell {
                             let sessions = sidebar_state.sessions;
                             let avatars = sidebar_state.avatars;
                             fetch_orch = host_owned.is_remote() && has_bots;
+                            refresh_up_next = true;
                             should_retry_again = dirty;
                             this.sidebar.update(cx, |sb, cx| {
                                 sb.set_bot_sessions(host_owned.clone(), sessions, cx);
@@ -891,6 +894,9 @@ impl Shell {
                 }
                 let active = this.active_bot_hosts(cx);
                 this.rebuild_merged_sidebar_bots(&active, false, cx);
+                if refresh_up_next {
+                    this.refresh_bot_up_next(cx);
+                }
                 if fetch_orch && !this.remote_orch_snapshots.contains_key(&host_owned) {
                     this.fetch_remote_orchestration(host_owned.clone(), cx);
                 }

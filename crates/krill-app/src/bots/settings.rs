@@ -332,6 +332,7 @@ impl View {
                         let live: std::collections::HashSet<&BotId> =
                             this.bots.iter().map(|b| &b.id).collect();
                         this.settings.avatar_cache.retain(|id, _| live.contains(id));
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SAVED.get()));
                     }
                     Err(err) => {
@@ -388,10 +389,12 @@ impl View {
                     Ok(BotRpcResponse::Bot(updated)) => {
                         this.settings.avatar_cache.remove(&bot_id);
                         this.upsert_bot_config(*updated);
+                        this.emit_badge(cx);
                         this.notice = Some(SharedString::from(text::SAVED.get()));
                     }
                     Ok(_) => {
                         this.settings.avatar_cache.remove(&bot_id);
+                        this.emit_badge(cx);
                     }
                     Err(err) => this.error = Some(SharedString::from(err)),
                 }
