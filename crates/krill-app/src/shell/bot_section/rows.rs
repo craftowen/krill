@@ -538,7 +538,7 @@ impl Shell {
         let now = now_secs();
         let age = match &facts.line {
             Some(RowLine::Activity { at: Some(at), .. }) => {
-                Some(krill_app::jump::format_age_secs(at / 1000, now))
+                Some(ui::format_short_time_ago_secs(at / 1000, now))
             }
             _ => None,
         };
@@ -605,12 +605,12 @@ impl Shell {
             .cursor_pointer()
             .when(bot.paused, |d| d.opacity(0.6))
             .when(facts.active, |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.worktree_sidebar_border)
+                d.bg(p.worktree_sidebar_active())
+                    .border_color(p.worktree_sidebar_active_border())
             })
             .when(!facts.active, |d| {
                 d.border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.4)))
+                    .hover(|d| d.bg(p.worktree_sidebar_accent))
             })
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                 // A double click's second click renames, as Orca's.
@@ -1122,7 +1122,7 @@ impl Shell {
             Some(line) => {
                 let age = match line {
                     RowLine::Activity { at: Some(at), .. } => {
-                        Some(krill_app::jump::format_age_secs(at / 1000, now_secs()))
+                        Some(ui::format_short_time_ago_secs(at / 1000, now_secs()))
                     }
                     _ => None,
                 };
@@ -1497,7 +1497,7 @@ pub(super) fn avatar_badge(
             .bottom(px(-3.))
             .size(px(14.))
             .rounded_full()
-            .bg(p.sidebar)
+            .bg(p.worktree_sidebar)
             .flex()
             .items_center()
             .justify_center()

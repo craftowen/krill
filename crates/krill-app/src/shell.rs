@@ -4510,16 +4510,18 @@ impl Shell {
                 }
             }
         }
-        if self.bot_ui.open_chats.remove(&from) {
-            self.bot_ui.open_chats.insert(to);
+        let from_key = (host.clone(), from);
+        let to_key = (host.clone(), to);
+        if self.bot_ui.folded_chats.remove(&from_key) {
+            self.bot_ui.folded_chats.insert(to_key.clone());
             touched = true;
         }
-        if let Some(steps) = self.bot_ui.chat_steps.remove(&from) {
-            self.bot_ui.chat_steps.insert(to, steps);
+        if let Some(steps) = self.bot_ui.chat_steps.remove(&from_key) {
+            self.bot_ui.chat_steps.insert(to_key.clone(), steps);
             touched = true;
         }
-        if self.bot_ui.panel.chat_unfolded.remove(&from) {
-            self.bot_ui.panel.chat_unfolded.insert(to);
+        if self.bot_ui.panel.chat_folded.remove(&from_key) {
+            self.bot_ui.panel.chat_folded.insert(to_key);
             touched = true;
         }
         if touched {
@@ -7250,9 +7252,9 @@ impl Shell {
             .flex()
             .items_center()
             .gap_1()
-            .bg(p.sidebar)
+            .bg(p.worktree_sidebar)
             .border_b_1()
-            .border_color(p.sidebar_border)
+            .border_color(p.worktree_sidebar_border)
             .text_color(p.muted_foreground)
             .child(
                 div()
@@ -7265,7 +7267,7 @@ impl Shell {
                     .gap_1p5()
                     .text_size(krill_app::ui::TEXT_SM)
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(p.sidebar_foreground)
+                    .text_color(p.worktree_sidebar_foreground)
                     .child(
                         krill_app::ui::icons::krill_brand_icon(krill_app::ui::ICON_MD, p)
                             .debug_selector(|| "titlebar-brand-mark".into()),
@@ -9479,7 +9481,8 @@ impl Render for Shell {
                                 .flex_none()
                                 .w(px(sidebar_width))
                                 .h_full()
-                                .bg(sidebar_bg)
+                                .bg(p.worktree_sidebar)
+                                .text_color(p.worktree_sidebar_foreground)
                                 .flex()
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))

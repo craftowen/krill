@@ -471,7 +471,7 @@ impl View {
             .child(
                 div()
                     .line_clamp(2)
-                    .text_size(ui::TEXT_LG)
+                    .text_size(ui::TEXT_HEADING)
                     .line_height(px(21.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.foreground)

@@ -416,6 +416,7 @@ pub struct Tab {
     /// restarts in sync with the indicator slide.
     pub(super) indicator_epoch: u64,
     pub(super) max_width: Option<Pixels>,
+    bottom_accent: Option<Hsla>,
     pub(super) on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -469,6 +470,7 @@ impl Default for Tab {
             variant: TabVariant::default(),
             size: Size::default(),
             max_width: None,
+            bottom_accent: None,
             on_click: None,
         }
     }
@@ -541,6 +543,12 @@ impl Tab {
     /// Set the right side of the tab
     pub fn suffix(mut self, suffix: impl IntoElement) -> Self {
         self.suffix = Some(suffix.into_any_element());
+        self
+    }
+
+    /// Krill: 2px bottom accent bar spanning the tab width (Orca `BotHomeTabAccent` / active indicator).
+    pub fn bottom_accent(mut self, color: Hsla) -> Self {
+        self.bottom_accent = Some(color);
         self
     }
 
@@ -879,6 +887,17 @@ impl RenderOnce for Tab {
                     div()
                         .when_some(max_width, |this, _| this.flex_shrink_0())
                         .child(suffix),
+                )
+            })
+            .when_some(self.bottom_accent, |this, accent| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(2.))
+                        .bg(accent),
                 )
             })
             .when_some(self.on_click.clone(), |this, on_click| {

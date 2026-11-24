@@ -670,8 +670,8 @@ impl Sidebar {
                     d.pb_1p5().mb_0p5().border_b_1().rounded_b(ui::RADIUS_MD)
                 })
                 .when(active, |d| {
-                    d.bg(p.worktree_sidebar)
-                        .border_color(p.sidebar_ring.opacity(0.65))
+                    d.bg(p.worktree_sidebar_active())
+                        .border_color(p.worktree_sidebar_active_border())
                 })
                 .when(depth > 0 && !active, |d| {
                     d.border_l_2().border_color(p.worktree_sidebar_border)
@@ -704,9 +704,9 @@ impl Sidebar {
                 d.bg(if row_highlighted {
                     p.worktree_sidebar_accent
                 } else {
-                    p.worktree_sidebar
+                    p.worktree_sidebar_active()
                 })
-                .border_color(p.sidebar_ring.opacity(0.65))
+                .border_color(p.worktree_sidebar_active_border())
             })
             .when(depth > 0 && !active, |d| {
                 d.border_l_2().border_color(p.worktree_sidebar_border)
@@ -1811,11 +1811,11 @@ impl Sidebar {
             .rounded(ui::RADIUS_MD)
             .border_1()
             .when(active, |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.sidebar_ring.opacity(0.65))
+                d.bg(p.worktree_sidebar_active())
+                    .border_color(p.worktree_sidebar_active_border())
             })
             .when(!active, |d| {
-                d.bg(p.worktree_sidebar.opacity(0.6))
+                d.bg(p.worktree_sidebar_accent.opacity(0.5))
                     .border_color(p.worktree_sidebar_border)
             })
             .text_color(p.worktree_sidebar_foreground)
@@ -2776,13 +2776,13 @@ impl Sidebar {
             .rounded(ui::RADIUS_MD)
             .border_1()
             .when(is_active_worktree, |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.worktree_sidebar_border)
+                d.bg(p.worktree_sidebar_active())
+                    .border_color(p.worktree_sidebar_active_border())
             })
             .when(!is_active_worktree, |d| {
                 let d = d
                     .border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
+                    .hover(|d| d.bg(p.worktree_sidebar_accent));
                 if lineage_depth > 0 {
                     d.border_l_2().border_color(p.worktree_sidebar_border)
                 } else {
