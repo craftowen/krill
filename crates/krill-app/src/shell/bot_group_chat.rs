@@ -864,6 +864,12 @@ impl Shell {
         state.action_error = None;
         let gid = key.group_id.clone();
         let tid = key.thread_id.clone();
+        let voice_text = text_body.clone();
+        self.notify_voice_sent(
+            &super::voice::VoiceComposerTarget::Group(key.clone()),
+            &voice_text,
+            cx,
+        );
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -2448,6 +2454,7 @@ impl Shell {
                                         })),
                                 )
                             })
+                            .child(self.render_group_voice_control(&send_key, sending, cx))
                             .child(
                                 Button::new("group-composer-send")
                                     .debug_selector(|| "group-composer-send".into())

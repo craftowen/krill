@@ -942,9 +942,10 @@ impl BotsManager {
                 },
                 Err(err) => err.into_rpc_response(),
             },
-            BotRpcRequest::ListBotSessions { bot_id } => {
-                BotRpcResponse::BotSessions(self.runtime.list_sessions(registry, bot_id.as_ref()))
-            }
+            BotRpcRequest::ListBotSessions { bot_id } => BotRpcResponse::BotSessions(
+                self.runtime
+                    .list_sessions_for_store(&self.store, registry, bot_id.as_ref()),
+            ),
             BotRpcRequest::ResetBotChat { bot_id, session_id } => {
                 match self.runtime.reset_chat(
                     registry,

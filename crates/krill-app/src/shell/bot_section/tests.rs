@@ -1347,3 +1347,249 @@ fn bot_panel_chats_tab_shows_orch_and_linked_dispatch_workers_open_by_default(
         );
     });
 }
+
+#[test]
+fn sidebar_snapshot_drops_stale_pre_creation_chats_from_reused_bot_id() {
+    let mut cfg_new = krill_proto::bots::BotConfig::new(
+        BotId::new("bot-bot-5").unwrap(),
+        "크릴 에러 수정봇",
+        "agy",
+        1_795_438_259_549,
+    )
+    .unwrap();
+    cfg_new.slug = krill_proto::bots::BotSlug::new("bot-5").unwrap();
+    cfg_new.folder = "bot-5".to_owned();
+
+    let mut cfg_other = krill_proto::bots::BotConfig::new(
+        BotId::new("bot-bot-4").unwrap(),
+        "리서치봇",
+        "agy",
+        1_795_324_030_205,
+    )
+    .unwrap();
+    cfg_other.slug = krill_proto::bots::BotSlug::new("bot-4").unwrap();
+    cfg_other.folder = "bot-4".to_owned();
+
+    let sessions = vec![
+        BotSessionSummary {
+            session_id: SessionId(41764),
+            bot_id: cfg_new.id.clone(),
+            link_id: None,
+            pid: 36865,
+            live: true,
+            working: false,
+            label: "리서치봇".to_owned(),
+            created_at_ms: 1_795_340_556_317, // 27h before cfg_new was created
+        },
+        BotSessionSummary {
+            session_id: SessionId(41801),
+            bot_id: cfg_new.id.clone(),
+            link_id: None,
+            pid: 78853,
+            live: true,
+            working: false,
+            label: "크릴 에러 수정봇".to_owned(),
+            created_at_ms: 1_795_438_259_692,
+        },
+        BotSessionSummary {
+            session_id: SessionId(41774),
+            bot_id: cfg_other.id.clone(),
+            link_id: None,
+            pid: 6994,
+            live: true,
+            working: false,
+            label: "리서치봇".to_owned(),
+            created_at_ms: 1_795_388_014_183,
+        },
+    ];
+
+    let snap = krill_app::bots::rpc::sidebar_snapshot(
+        &[cfg_other.clone(), cfg_new.clone()],
+        &[],
+        &[],
+        &sessions,
+    );
+    let err_bot = snap.bots.iter().find(|b| b.id == cfg_new.id).unwrap();
+    assert_eq!(err_bot.sessions.len(), 1);
+    assert_eq!(err_bot.sessions[0].session_id, SessionId(41801));
+
+    let other_bot = snap.bots.iter().find(|b| b.id == cfg_other.id).unwrap();
+    assert_eq!(other_bot.sessions.len(), 1);
+    assert_eq!(other_bot.sessions[0].session_id, SessionId(41774));
+
+    // Also verify `fetch_sidebar_state` excludes the stale session from `sessions` metadata map.
+    let bots_for_rpc = vec![cfg_other, cfg_new];
+    let sessions_for_rpc = sessions;
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| match req {
+        krill_proto::bots::BotRpcRequest::ListBots => Ok(krill_proto::bots::BotRpcResponse::Bots(
+            bots_for_rpc.clone(),
+        )),
+        krill_proto::bots::BotRpcRequest::ListBotSessions { .. } => Ok(
+            krill_proto::bots::BotRpcResponse::BotSessions(sessions_for_rpc.clone()),
+        ),
+        krill_proto::bots::BotRpcRequest::ListItems { .. } => {
+            Ok(krill_proto::bots::BotRpcResponse::Items(Vec::new()))
+        }
+        krill_proto::bots::BotRpcRequest::ListAccessRequests { .. } => {
+            Ok(krill_proto::bots::BotRpcResponse::AccessRequests(Vec::new()))
+        }
+        krill_proto::bots::BotRpcRequest::ListGroupSummaries => {
+            Ok(krill_proto::bots::BotRpcResponse::GroupSummaries(Vec::new()))
+        }
+        _ => Ok(krill_proto::bots::BotRpcResponse::Ok),
+    });
+    let state = krill_app::bots::fetch_sidebar_state(&rpc, &std::collections::HashMap::new())
+        .expect("sidebar state");
+    assert!(!state.sessions.contains_key(&SessionId(41764)));
+    assert!(state.sessions.contains_key(&SessionId(41801)));
+    assert!(state.sessions.contains_key(&SessionId(41774)));
+}
+
+#[gpui::test]
+fn opening_new_bot_from_existing_bot_tab_switches_right_panel_and_folder(cx: &mut TestAppContext) {
+    use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse, BotSlug};
+    use krill_proto::os::ffi::OsStrExt as _;
+
+    let (view, cx) = open(cx, state_path("bot-panel-new-bot-switch"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+
+    let mut cfg_krill = BotConfig::new(
+        BotId::new("bot-krill").unwrap(),
+        "크릴",
+        "agy",
+        1_795_312_744_127,
+    )
+    .unwrap();
+    cfg_krill.slug = BotSlug::new("bot-3").unwrap();
+    cfg_krill.folder = "bot-3".to_owned();
+
+    let mut cfg_fixer = BotConfig::new(
+        BotId::new("bot-fixer").unwrap(),
+        "크릴 에러 수정봇",
+        "agy",
+        1_795_438_259_549,
+    )
+    .unwrap();
+    cfg_fixer.slug = BotSlug::new("bot-5").unwrap();
+    cfg_fixer.folder = "bot-5".to_owned();
+
+    let bots_rpc = vec![cfg_krill.clone(), cfg_fixer.clone()];
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(bots_rpc.clone())),
+        BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(Vec::new())),
+        BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(Vec::new())),
+        BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(Vec::new())),
+        BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(Vec::new())),
+        BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(Vec::new())),
+        BotRpcRequest::GetMemoryHistory { .. } => Ok(BotRpcResponse::MemoryHistory(Vec::new())),
+        BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(Vec::new())),
+        BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+            Ok(BotRpcResponse::Text(String::new()))
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    let sess_krill = BotSessionSummary {
+        session_id: SessionId(41788),
+        bot_id: cfg_krill.id.clone(),
+        link_id: None,
+        pid: 100,
+        live: true,
+        working: false,
+        label: "크릴".to_owned(),
+        created_at_ms: 1_795_409_209_582,
+    };
+    let sess_fixer = BotSessionSummary {
+        session_id: SessionId(41801),
+        bot_id: cfg_fixer.id.clone(),
+        link_id: None,
+        pid: 200,
+        live: true,
+        working: false,
+        label: "크릴 에러 수정봇".to_owned(),
+        created_at_ms: 1_795_438_259_692,
+    };
+
+    let sb_bots = krill_app::bots::rpc::sidebar_snapshot(
+        &[cfg_krill.clone(), cfg_fixer.clone()],
+        &[],
+        &[],
+        &[sess_krill.clone(), sess_fixer.clone()],
+    )
+    .bots;
+    assert_eq!(
+        sb_bots[0].id, cfg_krill.id,
+        "크릴 precedes 크릴 에러 수정봇"
+    );
+    assert_eq!(sb_bots[1].id, cfg_fixer.id);
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            s.panel_collapsed = false;
+            s.apply_sidebar_bots(0, sb_bots, cx);
+            // Open 크릴's tab first with its folder `bot-3` as `launch.cwd`.
+            s.open_bot_session(&cfg_krill.id, SessionId(41788), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.focused_bot().map(|b| &b.id), Some(&cfg_krill.id));
+        let panel = s.bot_ui.panel.view.clone().expect("panel view");
+        assert_eq!(
+            panel.read(cx).selected_bot().map(|b| &b.id),
+            Some(&cfg_krill.id)
+        );
+    });
+
+    // Now open the newly created bot's session (not yet known to sidebar `folder_on`),
+    // while `크릴`'s tab (`cwd = .../bots/bot-3`) is active.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.open_bot_session(&cfg_fixer.id, SessionId(41801), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let pane = s.layout.focused().expect("focused pane");
+        assert_eq!(s.layout.session(pane), Some(SessionId(41801)));
+        assert_eq!(
+            s.focused_bot().map(|b| &b.id),
+            Some(&cfg_fixer.id),
+            "right panel target must switch to the new bot, not stay on 크릴"
+        );
+        let expected_folder = s.bot_folder(&s.sidebar_bots[1]).expect("bot-5 folder");
+        let actual_cwd = {
+            use krill_proto::os::ffi::OsStringExt as _;
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(s.launch_for(pane).cwd))
+        };
+        assert_eq!(
+            actual_cwd, expected_folder,
+            "new bot tab must not keep the previous bot's inherited cwd"
+        );
+        let panel = s.bot_ui.panel.view.clone().expect("panel view");
+        assert_eq!(
+            panel.read(cx).selected_bot().map(|b| &b.id),
+            Some(&cfg_fixer.id),
+            "right panel view must select the new bot"
+        );
+    });
+
+    // Even if a pane's `launch.cwd` explicitly points to another bot's folder (`bot-3`) while
+    // running `bot-fixer`'s session (`41801`), session ownership still wins over `cwd`.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let pane = s.layout.focused().expect("focused pane");
+            let krill_folder = s.bot_folder(&s.sidebar_bots[0]).expect("bot-3 folder");
+            let mut launch = s.launch_for(pane);
+            launch.cwd = krill_folder.as_os_str().as_bytes().to_vec();
+            s.layout.set_launch(pane, launch);
+            assert_eq!(s.bot_for_pane(pane).map(|b| &b.id), Some(&cfg_fixer.id));
+            cx.notify();
+        });
+    });
+}

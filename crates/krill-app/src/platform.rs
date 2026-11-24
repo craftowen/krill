@@ -23,6 +23,14 @@ pub(crate) use locale::preferred_locale;
     windows,
     expect(
         unsafe_code,
+        reason = "Native OS audio capture FFI (Windows winmm, CONVENTIONS U1)"
+    )
+)]
+pub mod audio;
+#[cfg_attr(
+    windows,
+    expect(
+        unsafe_code,
         reason = "Handle-relative Win32 filesystem boundary (CONVENTIONS U1)"
     )
 )]

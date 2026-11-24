@@ -538,8 +538,13 @@ impl View {
         }
         let mut sessions = BTreeMap::new();
         for summary in &self.bot_sessions {
-            if let Some(meta) = self.session_meta_for(&summary.bot_id) {
-                sessions.insert(summary.session_id, meta);
+            if let Some(bot) = self.bots.iter().find(|b| b.id == summary.bot_id)
+                && krill_proto::bots::session_belongs_to_bot(
+                    bot.created_at_ms,
+                    summary.created_at_ms,
+                )
+            {
+                sessions.insert(summary.session_id, BotSessionMeta::from_bot(bot));
             }
         }
         cx.emit(SessionsChanged {
@@ -550,9 +555,17 @@ impl View {
 
     #[must_use]
     pub(super) fn sessions_for_bot(&self, bot_id: &BotId) -> Vec<&BotSessionSummary> {
+        let bot_created = self
+            .bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .map_or(0, |b| b.created_at_ms);
         self.bot_sessions
             .iter()
-            .filter(|s| &s.bot_id == bot_id)
+            .filter(|s| {
+                &s.bot_id == bot_id
+                    && krill_proto::bots::session_belongs_to_bot(bot_created, s.created_at_ms)
+            })
             .collect()
     }
 
@@ -717,7 +730,8 @@ impl View {
         self.error = None;
         self.notice = None;
         if self.selected_bot_id.as_ref() != Some(&bot_id) {
-            // Home's open item, filter, folds, dialogs and look error belong to the last bot.
+            // Home's items, open item, filter, folds, dialogs and look error belong to the last bot.
+            self.items.clear_items();
             self.items.open_uid = None;
             self.items.needs_you_only = false;
             self.items.folds.clear();
@@ -728,6 +742,9 @@ impl View {
             self.items.stale_confirm = None;
             self.items.selected.clear();
             self.items.upcoming = None;
+            self.soul_memory.suggestions.clear();
+            self.connectors.bot_statuses.clear();
+            self.connectors.bot_access_requests.clear();
             self.connectors.adding = None;
             self.connectors.add_rail = 0;
             clear_input_on_window(&mut self.connectors.add_search, self.window_handle, cx);
@@ -1105,11 +1122,16 @@ impl View {
             cx.notify();
             return;
         }
-        if let Some(live) = self
-            .bot_sessions
+        let bot_created = self
+            .bots
             .iter()
-            .find(|s| s.bot_id == bot_id && s.live)
-        {
+            .find(|b| b.id == bot_id)
+            .map_or(0, |b| b.created_at_ms);
+        if let Some(live) = self.bot_sessions.iter().find(|s| {
+            s.bot_id == bot_id
+                && s.live
+                && krill_proto::bots::session_belongs_to_bot(bot_created, s.created_at_ms)
+        }) {
             cx.emit(OpenSession {
                 bot_id,
                 session_id: live.session_id,

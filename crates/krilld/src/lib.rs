@@ -35,6 +35,7 @@ mod sys;
 mod term;
 mod upgrade;
 pub mod usage;
+pub mod voice;
 mod watch;
 
 pub use appearance::{Appearance, CellSize};
