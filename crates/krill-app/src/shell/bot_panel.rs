@@ -435,10 +435,11 @@ impl Shell {
             .role(gpui::Role::TabList)
             .aria_label(text::BP_TABS.get())
             .tab_group()
+            .flex_1()
+            .min_w_0()
             .flex()
             .items_center()
             .gap_0p5()
-            .min_w_0()
             .overflow_x_hidden();
         for tab in BotPanelTab::ALL {
             let active = tab == current;
@@ -479,7 +480,8 @@ impl Shell {
                     .relative()
                     .h(px(26.))
                     .px_1p5()
-                    .flex_shrink_0()
+                    .min_w_0()
+                    .flex_shrink_1()
                     .rounded(ui::RADIUS_SM)
                     .cursor_pointer()
                     .when(active, |d| d.bg(p.foreground.opacity(0.10)))
@@ -492,8 +494,13 @@ impl Shell {
                     .text_size(ui::TEXT_SM)
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(fg)
-                    .child(Icon::new(tab.icon()).size(px(ui::ICON_SM)).text_color(fg))
-                    .child(tab.label())
+                    .child(
+                        Icon::new(tab.icon())
+                            .size(px(ui::ICON_SM))
+                            .flex_none()
+                            .text_color(fg),
+                    )
+                    .child(div().min_w_0().truncate().child(tab.label()))
                     .children(badge)
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(tab.label()).build(window, cx)
