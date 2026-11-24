@@ -91,7 +91,8 @@ impl Registry {
             tracing::warn!(
                 session = new.0,
                 from = old.0,
-                error = %error,
+                kind = ?error.kind(),
+                errno = error.raw_os_error(),
                 "continuation watcher did not start"
             );
             self.agents.finish_account_resume(new);
@@ -181,7 +182,8 @@ impl Registry {
                                     tracing::warn!(
                                         session = plan.new.0,
                                         from = plan.old.0,
-                                        error = %error,
+                                        kind = ?error.kind(),
+                                        errno = error.raw_os_error(),
                                         "failed to send continuation prompt after account switch"
                                     );
                                 }
