@@ -2,14 +2,15 @@ use super::*;
 
 #[gpui::test]
 fn app_menu_is_available_without_windows(cx: &mut gpui::TestAppContext) {
+    use krill_app::i18n::catalog::general as gtext;
     cx.update(|cx| {
         init(cx);
         let menus = cx
             .get_menus()
             .expect("app menu must exist even with no windows");
         assert!(menus.iter().any(|m| m.name.as_ref() == "Krill"));
-        assert!(menus.iter().any(|m| m.name.as_ref() == "파일"));
-        assert!(menus.iter().any(|m| m.name.as_ref() == "보기"));
+        assert!(menus.iter().any(|m| m.name.as_ref() == gtext::FILE.get()));
+        assert!(menus.iter().any(|m| m.name.as_ref() == gtext::VIEW.get()));
         let labels: Vec<_> = menus
             .iter()
             .flat_map(|menu| &menu.items)
@@ -22,14 +23,14 @@ fn app_menu_is_available_without_windows(cx: &mut gpui::TestAppContext) {
             })
             .collect();
         for expected in [
-            "설정…",
-            "Krill 종료",
-            "새 창",
-            "창 닫기",
+            gtext::SETTINGS_MENU.get(),
+            gtext::QUIT.get(),
+            gtext::NEW_WINDOW.get(),
+            gtext::CLOSE_WINDOW.get(),
             // OWE-864: 보기 메뉴의 확대/축소 항목은 `ZOOM_*_ITEM` 라벨을 쓴다.
-            krill_app::i18n::catalog::general::ZOOM_IN_ITEM.get(),
-            krill_app::i18n::catalog::general::ZOOM_OUT_ITEM.get(),
-            krill_app::i18n::catalog::general::ZOOM_RESET_ITEM.get(),
+            gtext::ZOOM_IN_ITEM.get(),
+            gtext::ZOOM_OUT_ITEM.get(),
+            gtext::ZOOM_RESET_ITEM.get(),
         ] {
             assert!(labels.contains(&expected), "missing {expected}");
         }
@@ -224,6 +225,7 @@ fn close_window_action_keeps_app_available_for_reopen(cx: &mut gpui::TestAppCont
 
 #[gpui::test]
 fn secure_keyboard_toggle_preserves_app_and_file_menus(cx: &mut gpui::TestAppContext) {
+    use krill_app::i18n::catalog::general as gtext;
     cx.update(|cx| {
         init(cx);
         let window = open_shell(cx, None).unwrap();
@@ -234,7 +236,7 @@ fn secure_keyboard_toggle_preserves_app_and_file_menus(cx: &mut gpui::TestAppCon
             .unwrap();
         let menus = cx.get_menus().expect("menus must exist after toggle");
         assert!(menus.iter().any(|m| m.name.as_ref() == "Krill"));
-        assert!(menus.iter().any(|m| m.name.as_ref() == "파일"));
+        assert!(menus.iter().any(|m| m.name.as_ref() == gtext::FILE.get()));
         let items: Vec<_> = menus
             .iter()
             .flat_map(|menu| &menu.items)
@@ -247,14 +249,14 @@ fn secure_keyboard_toggle_preserves_app_and_file_menus(cx: &mut gpui::TestAppCon
             })
             .collect();
         for expected in [
-            ("설정…", false),
+            (gtext::SETTINGS_MENU.get(), false),
             #[cfg(target_os = "macos")]
             (krill_app::security::text::SECURE_KEYBOARD_MENU.get(), true),
-            ("Krill 종료", false),
-            ("새 창", false),
-            ("새 터미널", false),
-            ("칸 닫기", false),
-            ("창 닫기", false),
+            (gtext::QUIT.get(), false),
+            (gtext::NEW_WINDOW.get(), false),
+            (gtext::NEW_TERMINAL.get(), false),
+            (gtext::CLOSE_PANE.get(), false),
+            (gtext::CLOSE_WINDOW.get(), false),
         ] {
             assert!(
                 items.contains(&expected),
@@ -332,7 +334,14 @@ fn language_switch_rebuilds_native_menus_and_keeps_the_security_check(
         krill_app::settings::init_at(Some(dir.clone()), cx);
         cx.set_global(MenuSecurity(true));
     });
-    for language in [Language::En, Language::Ko] {
+    // Start with the opposite of the startup locale so every iteration triggers a real
+    // `i18n::Locale` change and menu rebuild regardless of host OS language.
+    let order = if krill_app::i18n::language() == Language::En {
+        [Language::Ko, Language::En]
+    } else {
+        [Language::En, Language::Ko]
+    };
+    for language in order {
         cx.update(|cx| krill_app::settings::set_language(language, cx));
         cx.run_until_parked();
         cx.update(|cx| {

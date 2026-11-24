@@ -1879,7 +1879,10 @@ fn negotiated_history_missing_retains_rendered_screen_and_scroll_anchor() {
     };
     let ev = feed(&mut pane, &unavailable.encode().unwrap());
     assert!(!ev.redraw);
-    assert!(ev.history_notice.unwrap().contains("retained"));
+    assert_eq!(
+        ev.history_notice.as_deref(),
+        Some(crate::i18n::catalog::link::HISTORY_MISSING.get())
+    );
     assert_eq!(pane.scroll_offset(), 3);
     assert!(Rc::ptr_eq(&shown, &pane.shown));
     update(&mut pane, 2, snapshot(["new-a", "new-b", "new-c"]));
