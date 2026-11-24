@@ -78,11 +78,16 @@ fn is_empty_composer_row(cells: &[Cell]) -> bool {
         .iter()
         .find(|c| !c.ch.is_whitespace() || !c.zerowidth.is_empty())
         .map(|c| c.ch);
+    let has_muted_tail = tail.get(1..).is_some_and(|rest| {
+        rest.iter()
+            .any(|c| !c.ch.is_whitespace() || !c.zerowidth.is_empty())
+    });
     !matches!(first_non_ws, Some('/' | '!' | '@'))
-        && tail.iter().all(|c| {
+        && tail.iter().enumerate().all(|(idx, c)| {
             (c.ch.is_whitespace() && c.zerowidth.is_empty())
                 || c.flags.contains(Flags::DIM)
                 || (c.fg != Color::Default && c.fg != prompt_fg)
+                || (idx == 0 && has_muted_tail && c.flags.contains(Flags::INVERSE))
         })
 }
 
@@ -211,6 +216,13 @@ fn count_matching_rows_above(
         }
     }
     result
+}
+
+/// Returns `true` when Antigravity's interactive composer box (`───` / `> ...` / `───`)
+/// is visible and empty (blank or placeholder-only, with no user draft).
+#[must_use]
+pub fn empty_composer_ready(screen: &Screen) -> bool {
+    find_composer_box(screen).is_some_and(|(_, empty)| empty)
 }
 
 /// Counts how many contiguous `▸ ` queued rows directly above Antigravity's composer currently
@@ -458,5 +470,39 @@ mod tests {
             queued_submission_confirmed(&trust_dialog, "Yes, I trust this folder", 0),
             None
         );
+        assert!(!empty_composer_ready(&trust_dialog));
+    }
+
+    #[test]
+    fn empty_composer_ready_accepts_software_cursor_placeholder_and_rejects_drafts() {
+        let mut screen = screen_from_lines(&[
+            ("⚠ Conversation already open", None),
+            ("│ Introducing Gemini 4 Neon", None),
+            ("│ esc to dismiss", None),
+            (
+                "└ Interrupted · What should Antigravity CLI do instead?",
+                None,
+            ),
+            (BORDER, None),
+            (
+                "> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+                Some(3),
+            ),
+            (BORDER, None),
+        ]);
+        // Simulate Ink software block cursor (`INVERSE`) on the first placeholder character (`A`).
+        screen.rows[5][2].flags |= Flags::INVERSE;
+        assert!(empty_composer_ready(&screen));
+
+        let mut single_char_draft =
+            screen_from_lines(&[(BORDER, None), ("> x", None), (BORDER, None)]);
+        single_char_draft.rows[1][2].flags |= Flags::INVERSE;
+        assert!(!empty_composer_ready(&single_char_draft));
+
+        let draft = screen_from_lines(&[(BORDER, None), ("> hello", None), (BORDER, None)]);
+        assert!(!empty_composer_ready(&draft));
+
+        let signing_in = screen_from_lines(&[("Signing in...", None)]);
+        assert!(!empty_composer_ready(&signing_in));
     }
 }

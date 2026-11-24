@@ -3,6 +3,7 @@
 //! src/renderer/src/store/terminals/terminal-restart-state.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
+mod auto_continue;
 mod diagnose;
 pub(super) mod identity;
 mod input_recovery;
@@ -2155,6 +2156,20 @@ impl Registry {
         ) {
             return Err(super::os(&error));
         }
+        let (old_had_clients, old_showed_agy_interrupted) = {
+            let state = lock(&self.state);
+            state.sessions.get(&old).map_or((false, false), |entry| {
+                let old_tap = entry.session.tap();
+                let had_clients = old_tap.has_clients();
+                let agy_interrupted = provider == ProviderKind::Antigravity
+                    && old_tap
+                        .screen_text_and_modes()
+                        .0
+                        .contains(auto_continue::AGY_INTERRUPTED_MARKER);
+                (had_clients, agy_interrupted)
+            })
+        };
+        let was_working = self.status.get(old).state == krill_proto::control::AgentState::Working;
         let _retiring_binding = self.agents.retire_account_binding(old);
         drop(pending);
         drop(hook_commit);
@@ -2212,6 +2227,7 @@ impl Registry {
             bots.revoke_launch_token(rebound.previous_token.as_ref());
         }
         replacement.mark_committed();
+        let mut baseline_input_ns = 0_u64;
         if provider == ProviderKind::Codex {
             // Codex prints before it tries the writer lock, so this prompt can follow retirement
             // and no pre-retirement check can see it. Held input stays withheld until the guard
@@ -2234,10 +2250,17 @@ impl Registry {
                 {
                     self.agents
                         .bind_discovered_session(new, &found.id, Some(&found.path));
+                    self.agents.observe_account_resume(new, &session_id);
                     break true;
                 }
                 if !retried && tap.screen_text_and_modes().0.contains(CODEX_WRITER_LOCKED) {
-                    tap.write_input(b"r", None).ok();
+                    match tap.write_input_if_untouched(b"r", 0) {
+                        Ok(Some(stamp)) => baseline_input_ns = stamp,
+                        Ok(None) => {
+                            tap.write_input(b"r", None).ok();
+                        }
+                        Err(_) => {}
+                    }
                     retried = true;
                     deadline = Instant::now() + Duration::from_secs(15);
                 }
@@ -2254,11 +2277,36 @@ impl Registry {
                 );
             }
         }
-        // Clients now reconnect and deliver their held prompts. A synthetic continuation
-        // could overtake input still in an app journal, so only actual user input is sent.
-        self.agents.take_rate_limited(old);
-        self.agents.finish_account_resume(new);
+        let was_rate_limited = self.agents.take_rate_limited(old);
+        let continue_mode = if was_rate_limited || was_working {
+            Some(auto_continue::ContinueMode::Always)
+        } else if provider == ProviderKind::Antigravity
+            && interrupt_busy
+            && !old_showed_agy_interrupted
+        {
+            Some(auto_continue::ContinueMode::IfAgyInterrupted)
+        } else {
+            None
+        };
         drop(replacement);
+        if let Some(mode) = continue_mode {
+            self.spawn_account_continuation(auto_continue::ContinuationPlan {
+                old,
+                new,
+                provider,
+                new_pid,
+                tap,
+                session_id,
+                home: home.to_path_buf(),
+                claude_homes,
+                target: target.clone(),
+                baseline_input_ns,
+                old_had_clients,
+                mode,
+            });
+        } else {
+            self.agents.finish_account_resume(new);
+        }
         // A later selection can arrive while retirement is in progress. The replacement
         // becomes eligible only after its guard is gone, so enqueue that latest selection again.
         self.transfer_account_selection(old, new, provider, account_id, || {

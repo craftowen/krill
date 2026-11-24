@@ -397,6 +397,53 @@ pub(super) fn write_input(tap: &Tap, bytes: &[u8], peer: Option<BorrowedFd<'_>>)
     result
 }
 
+/// Atomically verifies under the input lock that no input arrived after `expected_last_input_ns`
+/// and no bracketed paste is open, then writes `bytes` and returns the updated `last_input_ns`.
+/// Returns `Ok(None)` without writing when newer input has already touched this PTY.
+pub(super) fn write_input_if_untouched(
+    tap: &Tap,
+    bytes: &[u8],
+    expected_last_input_ns: u64,
+) -> io::Result<Option<u64>> {
+    let mut state = turn(tap, None)?;
+    let owner = thread::current().id();
+    if state.orphaned(owner) {
+        state.finish(tap)?;
+        state.matched = 0;
+        state.peer = None;
+    }
+    if state.paste || state.matched != 0 {
+        return Ok(None);
+    }
+    let stamp = {
+        let clients = tap
+            .0
+            .clients
+            .lock()
+            .map_err(|_| io::Error::other("terminal client state poisoned"))?;
+        if clients.sleeping {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let mut live = tap.0.live();
+        if live.last_input_ns != expected_last_input_ns {
+            return Ok(None);
+        }
+        let stamp = crate::status::now_ns().max(expected_last_input_ns.saturating_add(1));
+        live.input_since_done = true;
+        live.last_input_ns = stamp;
+        stamp
+    };
+    state.owner = Some(owner);
+    state.peer = None;
+    let result = write_all(tap, bytes, None, &mut state);
+    if result.is_err() || state.orphaned(owner) {
+        state.finish(tap).ok();
+    } else if !state.paste && state.matched == 0 {
+        state.owner = None;
+    }
+    result.map(|()| Some(stamp))
+}
+
 /// 모바일 정지 요청: 입력 잠금을 잡은 상태에서 열린 bracketed paste가 없고
 /// 세션이 여전히 작업 중일 때만 단일 Ctrl+C(`0x03`)를 쓴다.
 pub(super) fn write_interrupt(tap: &Tap, still_working: impl FnOnce() -> bool) -> io::Result<bool> {

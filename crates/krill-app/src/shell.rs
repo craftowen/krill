@@ -5595,6 +5595,11 @@ impl Shell {
     ) -> Next {
         let host = self.layout.host(pane).clone();
         if self.expecting_account_replacement(pane, &host, session, cx) {
+            self.refresh_accounts_for_host(
+                host,
+                krill_proto::usage::UsageRequest::ListAccounts,
+                cx,
+            );
             cx.notify();
             return Next::Gone;
         }
