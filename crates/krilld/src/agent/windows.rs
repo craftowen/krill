@@ -86,6 +86,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
             .any(|arg| arg.to_string_lossy().starts_with("--gemini_dir="))
     {
         command.env("SSH_CONNECTION", "krill");
+        command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
     }
     crate::sys::console_utf8();
     if let Err(error) = crate::sys::protect_agent_launcher() {
@@ -128,6 +129,7 @@ const FALLBACK_SHELL_REMOVED_ENVS: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "OPENCODE_DB",
+    "AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
 ];
 
 #[cfg(any(windows, test))]
@@ -160,6 +162,12 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                     .iter()
                     .any(|name| key.eq_ignore_ascii_case(name.as_bytes()))
         });
+        if provider == ProviderKind::Antigravity {
+            env.retain(|(key, _)| {
+                !key.eq_ignore_ascii_case(b"SSH_CONNECTION")
+                    && !key.eq_ignore_ascii_case(b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE")
+            });
+        }
         if !dir.is_empty() {
             match provider {
                 ProviderKind::OpenCode => {
@@ -180,8 +188,8 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                     env.push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
                 }
                 ProviderKind::Antigravity => {
-                    env.retain(|(key, _)| !key.eq_ignore_ascii_case(b"SSH_CONNECTION"));
                     env.push((b"SSH_CONNECTION".to_vec(), b"krill".to_vec()));
+                    env.push((b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE".to_vec(), b"1".to_vec()));
                 }
                 _ => env.push((provider.env_var().as_bytes().to_vec(), dir)),
             }

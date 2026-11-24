@@ -40,9 +40,13 @@ pub fn login_command(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> 
     if provider == ProviderKind::Antigravity {
         if let Some(dir) = dir {
             command.env("SSH_CONNECTION", "krill");
+            command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
             let mut arg = std::ffi::OsString::from("--gemini_dir=");
             arg.push(dir.join(".gemini"));
             command.arg(arg);
+        } else {
+            command.env_remove("SSH_CONNECTION");
+            command.env_remove("AGY_CLI_FORCE_FILE_TOKEN_STORAGE");
         }
     } else {
         configure_account(&mut command, provider, dir);
@@ -101,6 +105,128 @@ pub fn agy_token_logged_in(dir: &Path) -> bool {
     let token = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
     std::fs::symlink_metadata(&token)
         .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
+}
+
+#[must_use]
+pub fn agy_identity_from_credentials(raw: &[u8]) -> Option<Identity> {
+    if raw.is_empty() || raw.len() > 64 * 1024 {
+        return None;
+    }
+    let data: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let token = match data
+        .get("id_token")
+        .or_else(|| data.pointer("/token/id_token"))
+    {
+        Some(token) => token.as_str()?,
+        None => return agy_identity_fields(&data),
+    };
+    let claims = jwt_claims(token)?;
+    if !matches!(
+        claims.get("iss").and_then(serde_json::Value::as_str),
+        Some("accounts.google.com" | "https://accounts.google.com")
+    ) || claims
+        .get("sub")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+        || claims
+            .get("email_verified")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let email = claims.get("email")?.as_str()?.trim();
+    if email.is_empty() || email.len() > 320 || email.chars().any(char::is_control) {
+        return None;
+    }
+    Some(Identity {
+        email: email.to_owned(),
+        org_id: None,
+        org_name: None,
+    })
+}
+
+fn agy_identity_fields(data: &serde_json::Value) -> Option<Identity> {
+    if data.get("id_token_email").is_some()
+        && data
+            .get("auth_method")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+        && data
+            .pointer("/token/access_token")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        if data
+            .get("email_verified")
+            .is_some_and(|v| v != &serde_json::Value::Bool(true))
+        {
+            return None;
+        }
+        return agy_email(data.get("id_token_email")?);
+    }
+    [
+        Some(data),
+        data.get("token"),
+        data.get("account"),
+        data.get("user"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|object| {
+        let valid_text = |value: &serde_json::Value| {
+            value.as_str().is_some_and(|s| {
+                !s.trim().is_empty() && s.len() <= 320 && !s.chars().any(char::is_control)
+            })
+        };
+        if !["sub", "account_id"]
+            .iter()
+            .any(|key| object.get(key).is_some_and(valid_text))
+            || object
+                .get("email_verified")
+                .is_some_and(|v| v != &serde_json::Value::Bool(true))
+        {
+            return None;
+        }
+        ["id_token_email", "email", "account_email"]
+            .iter()
+            .find_map(|key| agy_email(object.get(key)?))
+    })
+}
+
+fn agy_email(value: &serde_json::Value) -> Option<Identity> {
+    let raw = value.as_str()?;
+    if raw.len() > 320 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let email = raw.trim();
+    let (local, domain) = email.split_once('@')?;
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || email.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(Identity {
+        email: email.to_owned(),
+        org_id: None,
+        org_name: None,
+    })
+}
+
+#[must_use]
+pub fn agy_identity_from_dir(dir: &Path) -> Option<Identity> {
+    let path = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| {
+        m.is_file() && !m.file_type().is_symlink() && m.len() > 0 && m.len() <= 64 * 1024
+    }) {
+        return None;
+    }
+    let mut bytes = std::fs::read(&path).ok()?;
+    let id = agy_identity_from_credentials(&bytes);
+    bytes.fill(0);
+    id
 }
 
 #[must_use]
@@ -194,9 +320,10 @@ pub fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 pub fn probe(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<AuthStatus> {
     if provider == ProviderKind::Antigravity {
         let dir = dir?;
+        let logged_in = agy_token_logged_in(dir);
         return Some(AuthStatus {
-            logged_in: agy_token_logged_in(dir),
-            identity: None,
+            logged_in,
+            identity: logged_in.then(|| agy_identity_from_dir(dir)).flatten(),
         });
     }
     probe_with_environment(exe, provider, dir, None, None)
@@ -375,6 +502,14 @@ mod tests {
             match provider {
                 ProviderKind::Antigravity => {
                     assert_eq!(command.get_args().count(), 1);
+                    assert_eq!(
+                        env[std::ffi::OsStr::new("SSH_CONNECTION")],
+                        Some(std::ffi::OsStr::new("krill"))
+                    );
+                    assert_eq!(
+                        env[std::ffi::OsStr::new("AGY_CLI_FORCE_FILE_TOKEN_STORAGE")],
+                        Some(std::ffi::OsStr::new("1"))
+                    );
                 }
                 ProviderKind::OpenCode => {
                     assert_eq!(
@@ -748,6 +883,62 @@ mod tests {
         );
         assert_eq!(res.map(|s| s.logged_in), Some(true));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agy_login_command_forces_file_storage_for_isolated_and_clears_for_host_default() {
+        let dir = Path::new("/tmp/krill-agy-isolated");
+        let isolated = login_command(Path::new("agy"), ProviderKind::Antigravity, Some(dir))
+            .expect("isolated agy login command");
+        let iso_env: std::collections::BTreeMap<_, _> = isolated.get_envs().collect();
+        assert_eq!(
+            iso_env.get(std::ffi::OsStr::new("SSH_CONNECTION")),
+            Some(&Some(std::ffi::OsStr::new("krill")))
+        );
+        assert_eq!(
+            iso_env.get(std::ffi::OsStr::new("AGY_CLI_FORCE_FILE_TOKEN_STORAGE")),
+            Some(&Some(std::ffi::OsStr::new("1")))
+        );
+
+        let host = login_command(Path::new("agy"), ProviderKind::Antigravity, None)
+            .expect("host default agy login command");
+        let host_env: std::collections::BTreeMap<_, _> = host.get_envs().collect();
+        assert_eq!(
+            host_env.get(std::ffi::OsStr::new("SSH_CONNECTION")),
+            Some(&None)
+        );
+        assert_eq!(
+            host_env.get(std::ffi::OsStr::new("AGY_CLI_FORCE_FILE_TOKEN_STORAGE")),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn agy_probe_extracts_email_from_isolated_token_file() {
+        let root =
+            std::env::temp_dir().join(format!("krill-agy-probe-identity-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let token_dir = root.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        let envelope = serde_json::json!({
+            "auth_method": "consumer",
+            "id_token_email": "isolated@example.test",
+            "token": { "access_token": "synthetic-access" }
+        });
+        std::fs::write(
+            token_dir.join("antigravity-oauth-token"),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let status = probe(Path::new("agy"), ProviderKind::Antigravity, Some(&root))
+            .expect("agy probe status");
+        assert!(status.logged_in);
+        assert_eq!(
+            status.identity.map(|i| i.email),
+            Some("isolated@example.test".to_owned())
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

@@ -2,125 +2,20 @@
 //! 저장 형식 참고: Orca codex-auth-identity·native-credential-codec (MIT, Lovecast Inc.).
 use krill_proto::account_login::Identity;
 use krill_proto::usage::ProviderKind;
-use serde_json::Value;
 
 pub(crate) fn from_credentials(provider: ProviderKind, raw: &[u8]) -> Option<Identity> {
-    if provider == ProviderKind::Codex {
-        return krill_proto::account_login::codex_identity_from_credentials(raw);
+    match provider {
+        ProviderKind::Codex => krill_proto::account_login::codex_identity_from_credentials(raw),
+        ProviderKind::Antigravity => krill_proto::account_login::agy_identity_from_credentials(raw),
+        _ => None,
     }
-    let data: Value = serde_json::from_slice(raw).ok()?;
-    let token = match provider {
-        ProviderKind::Antigravity => {
-            match data
-                .get("id_token")
-                .or_else(|| data.pointer("/token/id_token"))
-            {
-                Some(token) => token,
-                None => return agy_identity_fields(&data),
-            }
-        }
-        _ => return None,
-    }
-    .as_str()?;
-    let claims = krill_proto::account_login::jwt_claims(token)?;
-    if !matches!(
-        claims.get("iss").and_then(Value::as_str),
-        Some("accounts.google.com" | "https://accounts.google.com")
-    ) || claims
-        .get("sub")
-        .and_then(Value::as_str)
-        .is_none_or(|s| s.trim().is_empty())
-        || claims.get("email_verified").and_then(Value::as_bool) != Some(true)
-    {
-        return None;
-    }
-    let email = claims.get("email")?.as_str()?.trim();
-    if email.is_empty() || email.len() > 320 || email.chars().any(char::is_control) {
-        return None;
-    }
-    Some(Identity {
-        email: email.to_owned(),
-        org_id: None,
-        org_name: None,
-    })
-}
-
-/// agy 1.4.8 stores `id_token_email` in the native OAuth envelope without a JWT
-/// or subject. Read that exact field only with its credentials, never from settings
-/// or another profile. A present but invalid JWT still cannot use this fallback.
-fn agy_identity_fields(data: &Value) -> Option<Identity> {
-    if data.get("id_token_email").is_some()
-        && data
-            .get("auth_method")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-        && data
-            .pointer("/token/access_token")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-    {
-        if data
-            .get("email_verified")
-            .is_some_and(|v| v != &Value::Bool(true))
-        {
-            return None;
-        }
-        return agy_email(data.get("id_token_email")?);
-    }
-    [
-        Some(data),
-        data.get("token"),
-        data.get("account"),
-        data.get("user"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|object| {
-        let valid_text = |value: &Value| {
-            value.as_str().is_some_and(|s| {
-                !s.trim().is_empty() && s.len() <= 320 && !s.chars().any(char::is_control)
-            })
-        };
-        if !["sub", "account_id"]
-            .iter()
-            .any(|key| object.get(key).is_some_and(valid_text))
-            || object
-                .get("email_verified")
-                .is_some_and(|v| v != &Value::Bool(true))
-        {
-            return None;
-        }
-        ["id_token_email", "email", "account_email"]
-            .iter()
-            .find_map(|key| agy_email(object.get(key)?))
-    })
-}
-
-fn agy_email(value: &Value) -> Option<Identity> {
-    let raw = value.as_str()?;
-    if raw.len() > 320 || raw.chars().any(char::is_control) {
-        return None;
-    }
-    let email = raw.trim();
-    let (local, domain) = email.split_once('@')?;
-    if local.is_empty()
-        || domain.is_empty()
-        || domain.contains('@')
-        || email.chars().any(char::is_whitespace)
-    {
-        return None;
-    }
-    Some(Identity {
-        email: email.to_owned(),
-        org_id: None,
-        org_name: None,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use krill_proto::account_login::jwt_claims as claims;
+    use serde_json::Value;
     fn encode(bytes: &[u8]) -> String {
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let (mut bits, mut count) = (0_u32, 0_u32);

@@ -8,13 +8,14 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::SessionId;
+use krill_proto::bots::MAX_RPC_AVATAR_PNG_BYTES;
 use krill_proto::bots::catalog::{
     BOT_MCP_APPS, BUILTIN_BOT_SKILLS, BUILTIN_BOT_TEMPLATES, COMPOSIO_CURATED_APPS,
     bot_templates_by_category, find_bot_mcp_app, find_bot_skill, find_bot_template,
     generate_slack_socket_mode_manifest,
 };
 use krill_proto::bots::home::append_memory_fact;
-use krill_proto::bots::package::{BotPackageExportOptions, MAX_AVATAR_PNG_BYTES, import_bot_zip};
+use krill_proto::bots::package::{BotPackageExportOptions, import_bot_zip};
 use krill_proto::bots::{
     BotConfig, BotId, BotItem, BotItemLink, BotItemStatus, BotItemsPage, BotMcpAuthKind,
     BotMcpToolConfig, BotRpcRequest, BotRpcResponse, BotScheduleConfig, BotSlug,
@@ -1489,9 +1490,9 @@ where
         } => {
             let png_bytes = fs::read(&png_path)
                 .map_err(|e| CliError::fail(format!("read '{png_path}': {e}")))?;
-            if png_bytes.is_empty() || png_bytes.len() > MAX_AVATAR_PNG_BYTES {
+            if png_bytes.is_empty() || png_bytes.len() > MAX_RPC_AVATAR_PNG_BYTES {
                 return Err(CliError::usage(format!(
-                    "avatar PNG must be 1..={MAX_AVATAR_PNG_BYTES} bytes"
+                    "avatar PNG must be 1..={MAX_RPC_AVATAR_PNG_BYTES} bytes"
                 )));
             }
             let bot_id = resolve_bot_id(client, &bot)?;

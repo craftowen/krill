@@ -828,7 +828,7 @@ fn agy_hidden_flag_guard_uses_only_temporary_home_and_profile() {
     let exe = root.join("agy");
     std::fs::write(
         &exe,
-        "#!/bin/sh\ntest -d \"$HOME\" && test \"$SSH_CONNECTION\" = krill && case \"$1\" in --gemini_dir=*) test \"$2 $3\" = 'mcp list' ;; *) exit 1 ;; esac\n",
+        "#!/bin/sh\ntest -d \"$HOME\" && test \"$SSH_CONNECTION\" = krill && test \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 && case \"$1\" in --gemini_dir=*) test \"$2 $3\" = 'mcp list' ;; *) exit 1 ;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -851,7 +851,7 @@ fn agy_guard_result_is_cached_per_binary_and_version() {
     std::fs::write(
         &exe,
         format!(
-            "#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = '--version' ]; then echo 'agy 1.2.0'; exit 0; fi\ntest -d \"$HOME\" && test \"$SSH_CONNECTION\" = krill && case \"$1\" in --gemini_dir=*) test \"$2 $3\" = 'mcp list' ;; *) exit 1 ;; esac\n",
+            "#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = '--version' ]; then echo 'agy 1.2.0'; exit 0; fi\ntest -d \"$HOME\" && test \"$SSH_CONNECTION\" = krill && test \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 && case \"$1\" in --gemini_dir=*) test \"$2 $3\" = 'mcp list' ;; *) exit 1 ;; esac\n",
             counter.display()
         ),
     )

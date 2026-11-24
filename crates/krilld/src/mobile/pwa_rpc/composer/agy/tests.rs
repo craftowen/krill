@@ -557,7 +557,7 @@ fn fixture(tag: &str, version: &str, delay: &str) -> io::Result<(PathBuf, Contex
     let exe = bin.join("agy");
     let script = format!(
         "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
-         test \"$SSH_CONNECTION\" = krill && test \"$1\" = \"--gemini_dir={}/account/.gemini\" && \
+         test \"$SSH_CONNECTION\" = krill && test \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 && test \"$1\" = \"--gemini_dir={}/account/.gemini\" && \
          test \"$2\" = models || exit 1\nsleep {delay}\ncat <<'ROWS'\n{MODELS}ROWS\n",
         root.display()
     );

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use krill_proto::SessionId;
 use krill_proto::bots::{
     BotAccessRequest, BotAccessRequestStatus, BotAgentModel, BotConfig, BotId, BotItem,
-    BotItemStatus, BotRpcRequest, BotRpcResponse, BotSessionSummary, MAX_AVATAR_PNG_BYTES,
+    BotItemStatus, BotRpcRequest, BotRpcResponse, BotSessionSummary, MAX_RPC_AVATAR_PNG_BYTES,
 };
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -105,7 +105,7 @@ pub fn effort_label(effort: &str) -> &'static str {
 /// Validates and wraps raw PNG bytes into a GPUI [`gpui::Image`] handle.
 pub fn decode_png_avatar(bytes: &[u8]) -> Result<Arc<gpui::Image>, String> {
     const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    if bytes.len() > MAX_AVATAR_PNG_BYTES {
+    if bytes.len() > MAX_RPC_AVATAR_PNG_BYTES {
         return Err(text::SETTINGS_AVATAR_TOO_LARGE.get().to_owned());
     }
     if bytes.len() < PNG_MAGIC.len() || bytes[..PNG_MAGIC.len()] != PNG_MAGIC {

@@ -1167,14 +1167,36 @@ fn refresh_accounts_authenticated(
     }
 
     // 로그인 프로브의 현재 신원은 등록 이름이나 오래된 사용량 캐시보다 우선한다.
+    // 격리된 Antigravity 프로필에서 확인된 이메일은 `accounts.toml`에 영속화하고,
+    // 자동 생성 라벨(`Antigravity Profile #N`)도 이메일로 승격해 로그아웃(`NeedsLogin`)
+    // 뒤에도 현재 활성 이메일은 비우되(`None`) 어느 계정인지 식별할 수 있게 유지한다.
+    let mut email_dirty = false;
     for account in &mut all {
         let status = auth.get(&(account.provider, PathBuf::from(&account.profile_dir)));
         if account.provider == ProviderKind::Antigravity && status.is_some() {
-            // 재로그인·로그아웃 뒤 이전 등록 이메일을 현재 로그인 신원으로 남기지 않는다.
-            account.email = status
+            let live_email = status
                 .filter(|status| status.logged_in)
                 .and_then(|status| status.identity.as_ref())
                 .map(|identity| identity.email.clone());
+            // 재로그인·로그아웃 뒤 이전 등록 이메일을 현재 로그인 신원으로 남기지 않는다.
+            account.email.clone_from(&live_email);
+            if let Some(email) = live_email
+                && !account.host_default
+                && let Some(stored) = file
+                    .accounts
+                    .iter_mut()
+                    .find(|stored| stored.id == account.id)
+            {
+                if stored.email.as_deref() != Some(email.as_str()) {
+                    stored.email = Some(email.clone());
+                    email_dirty = true;
+                }
+                if stored.label.starts_with("Antigravity Profile #") && stored.label != email {
+                    stored.label.clone_from(&email);
+                    account.label = email;
+                    email_dirty = true;
+                }
+            }
         } else if let Some(identity) = status
             .filter(|status| status.logged_in)
             .and_then(|status| status.identity.as_ref())
@@ -1432,17 +1454,19 @@ fn refresh_accounts_authenticated(
     // K-03: 손상된 파일(`writable=false`)에서는 저장하지 않는다. `SAVE_LOCK`을 쥐고 있어
     // `save_file`이 아니라 `save_inner`를 쓴다.
     let mut saved_dirty = false;
-    if dirty {
+    if dirty || email_dirty {
         if !writable || save_inner(home, state_dir, &file).is_err() {
-            // 저장하지 못한 전환을 UI·틱·실행 경로에 성공으로 돌려주지 않는다.
-            tracing::warn!("automatic account switch save failed");
-            for event in &switched {
-                for account in all.iter_mut().filter(|a| a.provider == event.provider) {
-                    account.active = account.id == event.from_id;
+            if dirty {
+                // 저장하지 못한 전환을 UI·틱·실행 경로에 성공으로 돌려주지 않는다.
+                tracing::warn!("automatic account switch save failed");
+                for event in &switched {
+                    for account in all.iter_mut().filter(|a| a.provider == event.provider) {
+                        account.active = account.id == event.from_id;
+                    }
                 }
+                switched.clear();
             }
-            switched.clear();
-        } else {
+        } else if dirty {
             saved_dirty = true;
         }
     }
@@ -2688,6 +2712,110 @@ mod orca_identity_regressions {
                 .iter()
                 .any(|(p, a)| *p == ProviderKind::Codex && a.id == "codex-work")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_isolated_profile_persists_discovered_email_and_keeps_it_when_logged_out() {
+        let root =
+            std::env::temp_dir().join(format!("krill-agy-email-persist-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state = root.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        let snap = add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Antigravity,
+            "Antigravity Profile #1",
+            None,
+            "",
+        )
+        .unwrap();
+        let acc = snap
+            .accounts
+            .iter()
+            .find(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
+            .unwrap()
+            .clone();
+        let dir = PathBuf::from(&acc.profile_dir);
+        let host_dir = host_default_dir(&home, ProviderKind::Antigravity);
+
+        // 1. Live login probe discovers email and persists it to accounts.toml.
+        let auth_in = BTreeMap::from([
+            (
+                (ProviderKind::Antigravity, dir.clone()),
+                krill_proto::account_login::AuthStatus {
+                    logged_in: true,
+                    identity: Some(krill_proto::account_login::Identity {
+                        email: "isolated@example.test".into(),
+                        org_id: None,
+                        org_name: None,
+                    }),
+                },
+            ),
+            (
+                (ProviderKind::Antigravity, host_dir.clone()),
+                krill_proto::account_login::AuthStatus {
+                    logged_in: true,
+                    identity: Some(krill_proto::account_login::Identity {
+                        email: "host@example.test".into(),
+                        org_id: None,
+                        org_name: None,
+                    }),
+                },
+            ),
+        ]);
+        let snap_in =
+            refresh_accounts_authenticated(&home, Some(&state), RefreshTrigger::ReadOnly, &auth_in);
+        let iso_in = snap_in.accounts.iter().find(|a| a.id == acc.id).unwrap();
+        assert_eq!(iso_in.email.as_deref(), Some("isolated@example.test"));
+
+        // Verify persisted on disk in accounts.toml (both email and promoted placeholder label).
+        let file = load_file(&home, Some(&state));
+        let stored = file.accounts.iter().find(|a| a.id == acc.id).unwrap();
+        assert_eq!(stored.email.as_deref(), Some("isolated@example.test"));
+        assert_eq!(stored.label, "isolated@example.test");
+        assert_eq!(iso_in.label, "isolated@example.test");
+
+        // 2. When logged out later, active email clears to None (no stale active identity),
+        // while the promoted label in accounts.toml keeps the account identifiable instead of
+        // falling back to "Antigravity Profile #1".
+        let auth_out = BTreeMap::from([
+            (
+                (ProviderKind::Antigravity, dir),
+                krill_proto::account_login::AuthStatus {
+                    logged_in: false,
+                    identity: None,
+                },
+            ),
+            (
+                (ProviderKind::Antigravity, host_dir),
+                krill_proto::account_login::AuthStatus {
+                    logged_in: false,
+                    identity: None,
+                },
+            ),
+        ]);
+        let snap_out = refresh_accounts_authenticated(
+            &home,
+            Some(&state),
+            RefreshTrigger::ReadOnly,
+            &auth_out,
+        );
+        let iso_out = snap_out.accounts.iter().find(|a| a.id == acc.id).unwrap();
+        assert_eq!(iso_out.email, None);
+        assert_eq!(iso_out.label, "isolated@example.test");
+        let file_out = load_file(&home, Some(&state));
+        let stored_out = file_out.accounts.iter().find(|a| a.id == acc.id).unwrap();
+        assert_eq!(stored_out.email.as_deref(), Some("isolated@example.test"));
+        let host_out = snap_out
+            .accounts
+            .iter()
+            .find(|a| a.provider == ProviderKind::Antigravity && a.host_default)
+            .unwrap();
+        assert_eq!(host_out.email, None);
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

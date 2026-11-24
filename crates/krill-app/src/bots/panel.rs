@@ -27,6 +27,17 @@ impl View {
     ) -> bool {
         let was_group = std::mem::replace(&mut self.group_panel.active, false);
         if was_group || self.selected_bot_id.as_ref() != Some(bot_id) {
+            if self.selected_bot_id.as_ref() != Some(bot_id)
+                && self.soul_memory.has_unsaved_edits(cx)
+            {
+                if self.panel_switch_dismissed_for.as_ref() == Some(bot_id) {
+                    return false;
+                }
+                self.panel_switch_dismissed_for = None;
+                self.select_bot(bot_id.clone(), cx);
+                return false;
+            }
+            self.panel_switch_dismissed_for = None;
             self.connectors.page = None;
             self.connectors.adding = None;
             self.connectors.add_rail = 0;

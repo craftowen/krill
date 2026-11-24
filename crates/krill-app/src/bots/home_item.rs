@@ -802,7 +802,14 @@ impl View {
             .into_iter()
             .flatten()
         {
-            let (fid, uid, body) = (fc.id, item.uid.clone(), fc.text.clone());
+            let (fid, uid, body, is_answer, option_index, ask_step_key) = (
+                fc.id,
+                item.uid.clone(),
+                fc.text.clone(),
+                fc.is_answer,
+                fc.option_index,
+                fc.ask_step_key.clone(),
+            );
             let uid_discard = uid.clone();
             let body_retry = body.clone();
             list = list.child(
@@ -861,12 +868,24 @@ impl View {
                                                 {
                                                     list.retain(|f| f.id != fid);
                                                 }
-                                                this.send_item_comment(
-                                                    uid.clone(),
-                                                    &body_retry,
-                                                    None,
-                                                    cx,
-                                                );
+                                                if is_answer {
+                                                    this.answer_item_decision_with_cleanup(
+                                                        uid.clone(),
+                                                        Some(body_retry.clone()),
+                                                        option_index,
+                                                        None,
+                                                        false,
+                                                        ask_step_key.clone(),
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.send_item_comment(
+                                                        uid.clone(),
+                                                        &body_retry,
+                                                        None,
+                                                        cx,
+                                                    );
+                                                }
                                             })),
                                     )
                                     .child(

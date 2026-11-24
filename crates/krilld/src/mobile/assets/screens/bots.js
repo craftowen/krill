@@ -914,7 +914,7 @@ function openItemDetailSheet(ctx, t, opts) {
 const { el, button } = ctx;
 const { item, bots, multiHost, ready, onReload, draftKey } = opts;
 let curItem = item;
-ctx.sheet(curItem.title || t("Item details"), [], "", (body) => {
+ctx.sheet(curItem.title || t("Item details"), [], "", (body, sheetSignal) => {
 let busy = false;
 const runMutation = async (fn, toastMsg, closeAfter = true) => {
 if (busy || !ready()) return;
@@ -970,8 +970,9 @@ needsAnswer() ? "primary small" : "secondary small",
 const sheetVoice = M.voice?.attach?.(input, form, {
 ctx,
 targetKind: "item",
-targetId: () => item.uid,
-rpc: (req) => rpcHost(ctx, item._hostId, req),
+targetId: () => curItem.uid,
+rpc: (req) => rpcHost(ctx, curItem._hostId, req),
+signal: sheetSignal,
 });
 const submitText = () => {
 const text = input.value.trim();

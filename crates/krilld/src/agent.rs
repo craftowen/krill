@@ -56,10 +56,10 @@ case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
   opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi; if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi;;
-  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill; fi;;
+  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1; else unset SSH_CONNECTION AGY_CLI_FORCE_FILE_TOKEN_STORAGE; fi;;
 esac
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
-if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
+if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 exec "$@"; fi; exec "$@"
 )
 unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
 exec "${SHELL:-/bin/zsh}" -l
@@ -2500,6 +2500,7 @@ fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
         .args(["mcp", "list"])
         .env("HOME", root.join("home"))
         .env("SSH_CONNECTION", "krill")
+        .env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1")
         .env(
             "PATH",
             std::ffi::OsStr::from_bytes(crate::shell::login_path()),

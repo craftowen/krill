@@ -245,6 +245,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.notice = None;
@@ -257,10 +260,17 @@ impl View {
                 )
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok(_) => {
                         this.soul_memory.soul_loaded = saved_copy;
+                        this.panel_switch_dismissed_for = None;
                         this.notice = Some(SharedString::from(text::SOUL_SAVED.get()));
                     }
                     Err(err) => {
@@ -286,6 +296,9 @@ impl View {
         }
         self.soul_memory.deletion_violation = None;
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.notice = None;
@@ -317,6 +330,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok((
@@ -368,6 +387,9 @@ impl View {
         self.soul_memory.armed_forget = None;
         self.soul_memory.deletion_violation = None;
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.notice = None;
@@ -410,6 +432,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok((next_memory, hist)) => {
@@ -448,6 +476,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.notice = None;
@@ -490,6 +521,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok((mem, hist)) => {
@@ -521,6 +558,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.memory_task = Some(cx.spawn(async move |this, cx| {
@@ -561,6 +601,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok((mem, hist)) => {
@@ -587,6 +633,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.tidy_running = true;
         self.error = None;
         self.tidy_task = Some(cx.spawn(async move |this, cx| {
@@ -632,6 +681,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.tidy_running = false;
                 match res {
                     Ok((
@@ -690,6 +745,9 @@ impl View {
             .as_ref()
             .and_then(|st| st.last_tidy_id.clone());
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.tidy_running = true;
         self.error = None;
         self.tidy_task = Some(cx.spawn(async move |this, cx| {
@@ -739,6 +797,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.tidy_running = false;
                 match res {
                     Ok((mem, status, hist)) => {
@@ -773,6 +837,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.memory_task = Some(cx.spawn(async move |this, cx| {
@@ -804,6 +871,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok(BotRpcResponse::Bot(updated)) => {
@@ -826,6 +899,9 @@ impl View {
 
     pub fn select_memory_topic(&mut self, bot_id: BotId, topic: &str, cx: &mut Context<Self>) {
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.error = None;
         self.notice = None;
         let topic_owned = topic.to_owned();
@@ -844,6 +920,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 match res {
                     Ok(BotRpcResponse::Text(content)) => {
                         this.soul_memory.selected_topic = Some(topic_owned);
@@ -880,6 +962,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.busy = true;
         self.error = None;
         self.memory_task = Some(cx.spawn(async move |this, cx| {
@@ -908,6 +993,12 @@ impl View {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.busy = false;
                 match res {
                     Ok(topics) => {
@@ -932,6 +1023,9 @@ impl View {
             return;
         }
         let rpc = self.rpc.clone();
+        let origin_host_gen = self.host_gen;
+        let origin_detail_gen = self.detail_gen;
+        let expected_bot = bot_id.clone();
         self.soul_memory.look_around_running = true;
         self.error = None;
         self.look_task = Some(cx.spawn(async move |this, cx| {
@@ -940,6 +1034,12 @@ impl View {
                 .spawn(async move { call_checked(&rpc, &BotRpcRequest::RunLookAround { bot_id }) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.host_gen != origin_host_gen
+                    || this.detail_gen != origin_detail_gen
+                    || this.selected_bot_id.as_ref() != Some(&expected_bot)
+                {
+                    return;
+                }
                 this.soul_memory.look_around_running = false;
                 match res {
                     Ok(

@@ -14,7 +14,7 @@ use crate::SessionId;
 use crate::control::bounded;
 use crate::screen::Msg;
 
-use super::package::{BotPackageExportOptions, MAX_AVATAR_PNG_BYTES};
+use super::package::BotPackageExportOptions;
 use super::types::{
     BotAccessRequest, BotAvatarData, BotConfig, BotConnectorConfig, BotConnectorStatus,
     BotConnectorTestResult, BotEventRuleConfig, BotGroupChat, BotGroupMessage,
@@ -34,6 +34,8 @@ pub const BOT_REPLY: u8 = 0x68;
 
 /// Maximum `.zip` payload transferred inside a single IPC frame (below `ipc::MAX_FRAME` = 1 MiB).
 pub const MAX_RPC_ZIP_BYTES: usize = 768 * 1024;
+/// Maximum PNG avatar payload transferred inside a single IPC frame (below `ipc::MAX_FRAME` = 1 MiB).
+pub const MAX_RPC_AVATAR_PNG_BYTES: usize = 768 * 1024;
 
 /// Parameters for creating a new bot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1732,5 +1734,5 @@ fn rpc_zip_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::E
 pub(crate) fn rpc_avatar_bytes<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Vec<u8>, D::Error> {
-    bounded::<D, u8, MAX_AVATAR_PNG_BYTES>(d)
+    bounded::<D, u8, MAX_RPC_AVATAR_PNG_BYTES>(d)
 }

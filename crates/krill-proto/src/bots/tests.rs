@@ -1977,7 +1977,7 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
     // Bounded deserialization on UploadBotAvatar and ImportBotZipV2
     let oversize_avatar = BotRpcRequest::UploadBotAvatar {
         bot_id,
-        png_bytes: vec![0u8; MAX_AVATAR_PNG_BYTES.saturating_add(1)],
+        png_bytes: vec![0u8; MAX_RPC_AVATAR_PNG_BYTES.saturating_add(1)],
     };
     let wire_avatar = postcard::to_stdvec(&oversize_avatar).unwrap();
     assert!(BotRpcRequest::decode(BOT_REQ, &wire_avatar).is_err());
