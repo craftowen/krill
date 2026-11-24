@@ -169,6 +169,10 @@ pub(crate) struct QueuedChatPrompt {
 }
 
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "SessionChatLog holds independent orthogonal lifecycle flags (bound, seeded, replace_on_next_poll, rate_limit_account_switched)"
+)]
 pub(crate) struct SessionChatLog {
     pub agent: String,
     pub offset: u64,
@@ -207,6 +211,10 @@ pub(crate) struct SessionChatLog {
     /// Carried over across an in-place account switch: keep existing rows visible until the
     /// replacement session returns its first bound/non-empty transcript, then replace cleanly.
     pub(super) replace_on_next_poll: bool,
+    /// Account ID active when `meta.rate_limited` first fired, for `#47079` switch detection.
+    pub(super) rate_limited_account: Option<String>,
+    /// True once the user switched accounts from the rate-limit banner (`#47079`).
+    pub(super) rate_limit_account_switched: bool,
 }
 
 impl SessionChatLog {
@@ -654,8 +662,43 @@ pub(crate) struct ChatState {
     history_saved_draft: BTreeMap<ChatKey, String>,
     auto_continue: HashMap<ChatKey, rate_limit::AutoContinue>,
     auto_continue_declined: HashMap<ChatKey, rate_limit::Declined>,
+    /// Last measured width per chat pane so `BotHomeBanner` hides at `<= 264px` (Orca CSS cutoff).
+    pub(super) pane_widths: HashMap<PaneId, gpui::Pixels>,
+    /// Open permission-mode dropdown above the composer shield button.
+    pub(super) permission_picker: BTreeSet<ChatKey>,
+    /// Open Antigravity auth popover above the footer chip.
+    pub(super) agy_auth_picker: BTreeSet<ChatKey>,
+    /// Cached local `agy --version` output (`None` until probed or if `agy` is unavailable).
+    pub(super) agy_version: Option<String>,
+    pub(super) agy_version_probe_started: bool,
+    /// Combined worker dock above composer: expanded state and acknowledged failed dispatch IDs.
+    pub(super) worker_dock_expanded: BTreeSet<ChatKey>,
+    pub(super) worker_dock_cleared: BTreeSet<String>,
+    /// Temporary orchestration worker sessions pinned open via `#43521` `Keep open`.
+    pub(super) worker_keep_open: BTreeSet<SessionId>,
+    /// Multi-question batch navigation & preserved step answers (`#46963`, `#47959`, `#42789`).
+    pub(super) question_batch_step: BTreeMap<(ChatKey, usize), usize>,
+    pub(super) question_batch_answers: BTreeMap<(ChatKey, usize), BTreeMap<usize, Vec<usize>>>,
+    /// Permission card default-answer focus handles & auto-focus tracking (`#47164`, `#47222`).
+    pub(super) approval_focus: BTreeMap<(ChatKey, String), gpui::FocusHandle>,
+    pub(super) approval_auto_focused: BTreeSet<(ChatKey, String)>,
+    /// Optional resume toast banner (`#47859`) with `theme_accent` Resume button.
+    pub(super) resume_toast: Option<(ChatKey, String)>,
+    /// Immediate `/resume <query>` search popover state (`#47815`).
+    pub(super) resume_search: BTreeMap<ChatKey, String>,
+    /// Local resolution state for Orca bot offer/setup cards (`NativeChatCardFrame`).
+    pub(super) resolved_bot_cards: BTreeMap<String, BotCardResolution>,
     #[cfg(test)]
     pub now_override: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BotCardResolution {
+    Connected,
+    Dismissed,
+    Removed,
+    Done,
+    Copied,
 }
 
 impl ChatState {
@@ -676,6 +719,36 @@ impl ChatState {
             }
         }
     }
+}
+
+/// Short local machine hostname matching Orca's `usePublishedMachineName` (e.g. `macmini`).
+pub(super) fn local_machine_hostname() -> Option<String> {
+    static HOST: OnceLock<Option<String>> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let raw = std::process::Command::new("hostname")
+            .arg("-s")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .or_else(|| std::env::var("HOSTNAME").ok())?;
+        let trimmed = raw.trim().trim_end_matches(".local").trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+    .clone()
+}
+
+/// Extracts a clean semver token from `agy --version` stdout (e.g. `"1.5.16"` or `"agy 1.5.16"`).
+pub(super) fn parse_cli_version(raw: &str) -> Option<String> {
+    for token in raw.split_whitespace() {
+        let clean = token
+            .trim_start_matches('v')
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        if clean.chars().next().is_some_and(|c| c.is_ascii_digit()) && clean.contains('.') {
+            return Some(clean.to_owned());
+        }
+    }
+    None
 }
 
 fn normalized(text: &str) -> String {
@@ -1471,12 +1544,303 @@ impl Shell {
         cx: &gpui::App,
     ) -> SharedString {
         match host {
-            krill_app::hosts::HostId::Local => krill_app::i18n::catalog::bots::HOST_LOCAL
-                .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
-                .get()
-                .into(),
+            krill_app::hosts::HostId::Local => {
+                if let Some(name) = local_machine_hostname() {
+                    name.into()
+                } else {
+                    krill_app::i18n::catalog::bots::HOST_LOCAL
+                        .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
+                        .get()
+                        .into()
+                }
+            }
             krill_app::hosts::HostId::Remote(id) => self.remote_host_name(id, cx).into(),
         }
+    }
+
+    /// Probes the local `agy --version` once asynchronously so the composer footer chip can
+    /// display `내 agy · v1.5.x` (`NativeChatAntigravityAuthChip`) without blocking the UI thread.
+    pub(super) fn ensure_agy_version(&mut self, cx: &mut Context<Self>) {
+        if self.chat.agy_version_probe_started {
+            return;
+        }
+        self.chat.agy_version_probe_started = true;
+        #[cfg(test)]
+        if self.chat.agy_version.is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let version = cx
+                .background_executor()
+                .spawn(async move {
+                    let output = std::process::Command::new("agy")
+                        .arg("--version")
+                        .output()
+                        .ok()?;
+                    if !output.status.success() {
+                        return None;
+                    }
+                    parse_cli_version(&String::from_utf8_lossy(&output.stdout))
+                })
+                .await;
+            if let Some(version) = version {
+                this.update(cx, |this, cx| {
+                    this.chat.agy_version = Some(version);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Updates a bot's permission mode optimistically and persists it via `UpdateBot`.
+    pub(super) fn set_bot_permission(
+        &mut self,
+        bot_id: krill_proto::bots::BotId,
+        permission: krill_proto::agent::Permission,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(b) = self.sidebar_bots.iter_mut().find(|b| b.id == bot_id) {
+            b.permission = permission;
+        }
+        for cached in self.chat.cached_bots.values_mut() {
+            if cached.id == bot_id {
+                cached.permission = permission;
+            }
+        }
+        cx.notify();
+        let Some(rpc) = self.bot_rpc() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    krill_app::bots::rpc::call_checked(
+                        &rpc,
+                        &krill_proto::bots::BotRpcRequest::UpdateBot(Box::new(
+                            krill_proto::bots::UpdateBotParams {
+                                bot_id,
+                                name: None,
+                                description: None,
+                                emoji: krill_proto::bots::FieldPatch::Unchanged,
+                                avatar: krill_proto::bots::FieldPatch::Unchanged,
+                                agent_id: None,
+                                model: krill_proto::bots::FieldPatch::Unchanged,
+                                effort: krill_proto::bots::FieldPatch::Unchanged,
+                                permission_mode: Some(permission),
+                                workspace: krill_proto::bots::FieldPatch::Unchanged,
+                                paused: None,
+                                first_run_completed: None,
+                                notifications: None,
+                                schedules: None,
+                                look_around: None,
+                                memory_tidy: None,
+                                mcp_tools: None,
+                            },
+                        )),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(err) = res {
+                    this.notice = Some(err);
+                }
+                this.refresh_bots_badge(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Loads a queued message back into the composer for editing (`#47346`).
+    pub(super) fn edit_queued_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        queued_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(log) = self.chat.logs.get_mut(key) else {
+            return;
+        };
+        let Some(pos) = log.queued_prompts.iter().position(|q| q.id == queued_id) else {
+            return;
+        };
+        let Some(queued) = log.queued_prompts.remove(pos) else {
+            return;
+        };
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        let text = queued.display_text;
+        input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.focus(window, cx);
+        });
+        if !queued.attachments.is_empty() {
+            self.chat
+                .draft_attachments
+                .insert(key.clone(), queued.attachments);
+        }
+        cx.notify();
+    }
+
+    /// Steers (or immediately sends) a queued prompt out of the queue (`#47346`).
+    pub(super) fn steer_queued_chat_prompt(
+        &mut self,
+        key: &ChatKey,
+        queued_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(log) = self.chat.logs.get_mut(key) else {
+            return;
+        };
+        let Some(pos) = log.queued_prompts.iter().position(|q| q.id == queued_id) else {
+            return;
+        };
+        let Some(queued) = log.queued_prompts.remove(pos) else {
+            return;
+        };
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        let Some(pane) = self.chat_pane(key) else {
+            return;
+        };
+        let session = key.1;
+        let modes = self
+            .live
+            .get(&pane)
+            .map_or_else(Default::default, |live| live.pane.modes());
+        let krill_app::security::PastePlan::Immediate(bytes) =
+            self.plan_terminal_paste(pane, queued.submitted_payload.as_bytes(), modes, cx)
+        else {
+            self.chat.multiline_blocked.insert(key.clone());
+            cx.notify();
+            return;
+        };
+        let (origin_epoch, origin_item, opens_terminal, local_slash) = self.pending_prompt_meta(
+            key,
+            &queued.submitted_payload,
+            queued.attachments.is_empty(),
+        );
+        self.cancel_auto_continue(key, cx);
+        let submitted_at_ms = self.chat_now_epoch_ms();
+        self.chat
+            .pending_prompts
+            .entry(key.clone())
+            .or_default()
+            .push(PendingChatPrompt {
+                id: queued.id,
+                origin_item,
+                submitted_payload: queued.submitted_payload.clone(),
+                display_text: queued.display_text,
+                attachments: queued.attachments,
+                status: PendingStatus::Sending,
+                submitted_at_ms,
+            });
+        self.chat
+            .pending_epochs
+            .insert((key.clone(), queued.id), origin_epoch);
+        self.dispatch_pending_chat_prompt(
+            PendingDispatch {
+                key: key.clone(),
+                pane,
+                session,
+                pending_id: queued.id,
+                submitted_payload: queued.submitted_payload,
+                bytes,
+                modes,
+                opens_terminal,
+                local_slash,
+                steer: true,
+            },
+            Some(window),
+            cx,
+        );
+    }
+
+    /// Re-sends the user prompt that preceded the assistant response at `abs_idx`.
+    pub(super) fn retry_assistant_turn(
+        &mut self,
+        key: &ChatKey,
+        abs_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt_text = self.chat.logs.get(key).and_then(|log| {
+            let rel = abs_idx.checked_sub(log.base_index)?;
+            log.items[..rel.min(log.items.len())]
+                .iter()
+                .rev()
+                .find(|item| item.kind == ChatItemKind::User && !item.text.trim().is_empty())
+                .map(|item| krill_term::select::clean_text(&item.text))
+        });
+        let Some(prompt_text) = prompt_text else {
+            return;
+        };
+        let input = self.ensure_chat_input(key.clone(), window, cx);
+        input.update(cx, |state, cx| {
+            state.set_value(prompt_text, window, cx);
+        });
+        self.submit_chat_prompt(key, window, cx);
+    }
+
+    /// Collects all locally readable images across every message in this chat transcript (`#47457`)
+    /// so the lightbox's ←/→ arrows step seamlessly across messages.
+    pub(super) fn collect_chat_gallery_images(
+        &self,
+        key: &ChatKey,
+        is_remote: bool,
+    ) -> (Vec<std::path::PathBuf>, Vec<usize>) {
+        let mut paths = Vec::new();
+        let mut numbers = Vec::new();
+        if let Some(log) = self.chat.logs.get(key) {
+            for item in &log.items {
+                if item.kind != ChatItemKind::User {
+                    continue;
+                }
+                let item_paths = images::item_image_paths(item);
+                let item_nums = images::image_numbers(&item.text, item_paths.len());
+                for (path, num) in item_paths.into_iter().zip(item_nums) {
+                    let resolved = if is_remote {
+                        self.chat
+                            .images
+                            .resolve_remote_preview(&path)
+                            .map(std::path::Path::to_path_buf)
+                    } else {
+                        Some(path)
+                    };
+                    if let Some(local) = resolved {
+                        paths.push(local);
+                        numbers.push(num);
+                    }
+                }
+            }
+        }
+        if let Some(pending) = self.chat.pending_prompts.get(key) {
+            for entry in pending {
+                let mut n = 0usize;
+                for att in &entry.attachments {
+                    if att.is_image {
+                        n += 1;
+                        paths.push(att.preview_path().to_path_buf());
+                        numbers.push(n);
+                    }
+                }
+            }
+        }
+        (paths, numbers)
+    }
+
+    /// Focuses an existing orchestration worker session or opens it in a tab from the worker dock.
+    pub(super) fn open_worker_session_from_dock(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_session_on(host, session_id, cx);
     }
 
     pub(super) fn chat_key(&self, pane: PaneId) -> Option<ChatKey> {
@@ -3001,6 +3365,31 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Orca `#47815`: submitting `/resume <query>` opens immediate in-chat session search
+        // even if the current turn is running.
+        if let Some((input, _)) = self.chat.inputs.get(key) {
+            let input = input.clone();
+            if !Self::chat_input_is_composing(&input, window, cx) {
+                let raw = input.read(cx).value().to_string();
+                if let Some(query) = raw
+                    .trim()
+                    .strip_prefix("/resume")
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                {
+                    self.chat
+                        .resume_search
+                        .insert(key.clone(), query.to_owned());
+                    input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+                    if let Some(ac) = self.chat.autocomplete.get_mut(key) {
+                        ac.close();
+                        ac.dismissed = None;
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let agent_state = self.session_agent_state(&key.0, key.1, cx);
         let working = agent_state == krill_proto::control::AgentState::Working;
         if working && !steer {
@@ -4132,10 +4521,18 @@ impl Shell {
             }
             return true;
         }
-        if self.chat.quick_menu.contains(key) || self.chat.model_picker.contains(key) {
+        if self.chat.quick_menu.contains(key)
+            || self.chat.model_picker.contains(key)
+            || self.chat.permission_picker.contains(key)
+            || self.chat.agy_auth_picker.contains(key)
+            || self.chat.resume_search.contains_key(key)
+        {
             self.chat.quick_menu.remove(key);
             self.chat.model_picker.remove(key);
             self.chat.model_picker_selected.remove(key);
+            self.chat.permission_picker.remove(key);
+            self.chat.agy_auth_picker.remove(key);
+            self.chat.resume_search.remove(key);
             return true;
         }
         false
@@ -5718,7 +6115,16 @@ fn display_row_matches_query(row: &work_run::DisplayRow, query_lower: &str) -> b
                     .iter()
                     .any(|sec| sec.text.to_lowercase().contains(query_lower))
         }),
-        work_run::DisplayRow::UnreadDivider { .. } | work_run::DisplayRow::TurnBar { .. } => false,
+        work_run::DisplayRow::UnreadDivider { .. }
+        | work_run::DisplayRow::ContextCleared { .. }
+        | work_run::DisplayRow::TurnBar { .. } => false,
+        work_run::DisplayRow::BotCard { card, .. } => {
+            card.search_text().to_lowercase().contains(query_lower)
+        }
+        work_run::DisplayRow::QuestionBatch { items } => items.iter().any(|(_, item)| {
+            item.text.to_lowercase().contains(query_lower)
+                || item.title.to_lowercase().contains(query_lower)
+        }),
         work_run::DisplayRow::Notice { notice, .. } => {
             notice.detail.to_lowercase().contains(query_lower)
                 || notice

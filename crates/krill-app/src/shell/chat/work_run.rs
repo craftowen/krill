@@ -117,6 +117,21 @@ impl DisplayFeed {
                     }),
                     _ => Arc::clone(item),
                 };
+                if item.kind == ChatItemKind::User && is_context_cleared_marker(&item.text) {
+                    rows.push(DisplayRow::ContextCleared { abs_idx });
+                    rel_idx += 1;
+                    continue;
+                }
+                if item.kind == ChatItemKind::Assistant
+                    && let Some(card) = parse_bot_chat_card(&item.text)
+                {
+                    rows.push(DisplayRow::BotCard {
+                        abs_idx,
+                        card: Arc::new(card),
+                    });
+                    rel_idx += 1;
+                    continue;
+                }
                 if item.kind == ChatItemKind::User
                     && let Some(notice) = parse_inbound_notice(&item.text)
                 {
@@ -125,6 +140,23 @@ impl DisplayFeed {
                         notice: Arc::new(notice),
                     });
                     rel_idx += 1;
+                    continue;
+                }
+                if item.kind == ChatItemKind::Question {
+                    let mut group = vec![(abs_idx, item)];
+                    while rel_idx + group.len() < items.len()
+                        && items[rel_idx + group.len()].kind == ChatItemKind::Question
+                    {
+                        let next_abs = base_index + rel_idx + group.len();
+                        group.push((next_abs, Arc::clone(&items[rel_idx + group.len()])));
+                    }
+                    let count = group.len();
+                    if count > 1 {
+                        rows.push(DisplayRow::QuestionBatch { items: group });
+                    } else if let Some((abs_idx, item)) = group.into_iter().next() {
+                        rows.push(DisplayRow::Item { abs_idx, item });
+                    }
+                    rel_idx += count;
                     continue;
                 }
                 rows.push(DisplayRow::Item { abs_idx, item });
@@ -209,9 +241,22 @@ pub(super) enum DisplayRow {
         abs_idx: usize,
         item: Arc<ChatItem>,
     },
+    /// Consecutive `AskUser` questions rendered one card at a time (`#46963`, `#47959`, `#42789`).
+    QuestionBatch {
+        items: Vec<(usize, Arc<ChatItem>)>,
+    },
     WorkRun(WorkRun),
     UnreadDivider {
         first_abs_idx: usize,
+    },
+    /// `/clear` context cleared boundary (`NativeChatDividerRow`: 1px lines + muted label, no pill).
+    ContextCleared {
+        abs_idx: usize,
+    },
+    /// Structured bot offer / setup / event card (`NativeChatCardFrame` family).
+    BotCard {
+        abs_idx: usize,
+        card: Arc<BotChatCard>,
     },
     /// Mail Krill delivered into the session, in place of its owner bubble.
     Notice {
@@ -237,7 +282,15 @@ pub(super) enum DisplayRow {
 impl DisplayRow {
     pub(super) fn span(&self) -> RawSpan {
         match self {
-            Self::Item { abs_idx, .. } | Self::Notice { abs_idx, .. } => RawSpan::single(*abs_idx),
+            Self::Item { abs_idx, .. }
+            | Self::Notice { abs_idx, .. }
+            | Self::ContextCleared { abs_idx }
+            | Self::BotCard { abs_idx, .. } => RawSpan::single(*abs_idx),
+            Self::QuestionBatch { items } => {
+                let start = items.first().map_or(0, |(idx, _)| *idx);
+                let end = items.last().map_or(start + 1, |(idx, _)| *idx + 1);
+                RawSpan { start, end }
+            }
             Self::WorkRun(run) => run.span,
             Self::UnreadDivider { first_abs_idx } => RawSpan::single(*first_abs_idx),
             Self::ItemNote { anchor_abs_idx, .. } => RawSpan::single(*anchor_abs_idx),
@@ -245,8 +298,8 @@ impl DisplayRow {
         }
     }
 
-    /// Which vertical edges of a display row join tightly (`4px`) with an adjacent activity row
-    /// (Orca `6edf9f05` / `#46659`, `NATIVE_CHAT_ACTIVITY_ROW_GAP_PX = 4`).
+    /// Which vertical edges of a display row join tightly (`6px`) with an adjacent activity row
+    /// (Orca `#46806`, `#46659`).
     pub(super) fn activity_edges(&self) -> (bool, bool) {
         match self {
             Self::Notice { .. } => (true, true),
@@ -254,12 +307,237 @@ impl DisplayRow {
                 NoteAction::Memory(_) | NoteAction::CreateOffer(_) => (false, false),
                 _ => (true, true),
             },
+            Self::BotCard { card, .. } => match card.as_ref() {
+                BotChatCard::ToolAdded { .. } => (true, true),
+                _ => (false, false),
+            },
             Self::Item { .. }
+            | Self::QuestionBatch { .. }
             | Self::WorkRun(_)
             | Self::UnreadDivider { .. }
+            | Self::ContextCleared { .. }
             | Self::TurnBar { .. } => (false, false),
         }
     }
+}
+
+/// Returns true when a user turn represents a `/clear` context-reset boundary.
+pub(super) fn is_context_cleared_marker(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.eq_ignore_ascii_case("/clear")
+        || trimmed == "[Krill context cleared]"
+        || trimmed == "[Context cleared]"
+}
+
+/// Orca bot offer/setup cards drawn in the central chat transcript via `NativeChatCardFrame`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BotChatCard {
+    ConnectorOffer {
+        card_id: String,
+        service: String,
+        title: String,
+        description: String,
+    },
+    GoogleOffer {
+        card_id: String,
+        title: String,
+        description: String,
+    },
+    ToolAdded {
+        card_id: String,
+        tool_name: String,
+        subtitle: String,
+    },
+    WebhookSetup {
+        card_id: String,
+        title: String,
+        url: String,
+        description: String,
+    },
+    ImportPlan {
+        card_id: String,
+        source: String,
+        bot_name: String,
+        summary: String,
+    },
+    ImportDone {
+        card_id: String,
+        bot_name: String,
+        summary: String,
+    },
+    SignInOffer {
+        card_id: String,
+        provider: String,
+        description: String,
+    },
+}
+
+impl BotChatCard {
+    pub(crate) fn card_id(&self) -> &str {
+        match self {
+            Self::ConnectorOffer { card_id, .. }
+            | Self::GoogleOffer { card_id, .. }
+            | Self::ToolAdded { card_id, .. }
+            | Self::WebhookSetup { card_id, .. }
+            | Self::ImportPlan { card_id, .. }
+            | Self::ImportDone { card_id, .. }
+            | Self::SignInOffer { card_id, .. } => card_id,
+        }
+    }
+
+    pub(crate) fn search_text(&self) -> String {
+        match self {
+            Self::ConnectorOffer {
+                service,
+                title,
+                description,
+                ..
+            } => format!("{service} {title} {description}"),
+            Self::GoogleOffer {
+                title, description, ..
+            } => format!("Google {title} {description}"),
+            Self::ToolAdded {
+                tool_name,
+                subtitle,
+                ..
+            } => format!("{tool_name} {subtitle}"),
+            Self::WebhookSetup {
+                title,
+                url,
+                description,
+                ..
+            } => format!("{title} {url} {description}"),
+            Self::ImportPlan {
+                source,
+                bot_name,
+                summary,
+                ..
+            } => format!("{source} {bot_name} {summary}"),
+            Self::ImportDone {
+                bot_name, summary, ..
+            } => format!("{bot_name} {summary}"),
+            Self::SignInOffer {
+                provider,
+                description,
+                ..
+            } => format!("{provider} {description}"),
+        }
+    }
+}
+
+/// Parses structured `[Krill card:<kind> ...]` markers emitted for Orca bot offer/setup cards.
+pub(crate) fn parse_bot_chat_card(text: &str) -> Option<BotChatCard> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("[Krill card:")?.strip_suffix(']')?;
+    let (kind, payload) = rest.split_once('|')?;
+    let parts: Vec<&str> = payload.split('|').map(str::trim).collect();
+    match kind.trim() {
+        "connector-offer" => Some(BotChatCard::ConnectorOffer {
+            card_id: parts.first().copied().unwrap_or("connector").to_owned(),
+            service: parts.get(1).copied().unwrap_or("Slack").to_owned(),
+            title: parts.get(2).copied().unwrap_or_default().to_owned(),
+            description: parts.get(3).copied().unwrap_or_default().to_owned(),
+        }),
+        "google-offer" => Some(BotChatCard::GoogleOffer {
+            card_id: parts.first().copied().unwrap_or("google").to_owned(),
+            title: parts.get(1).copied().unwrap_or("Google").to_owned(),
+            description: parts.get(2).copied().unwrap_or_default().to_owned(),
+        }),
+        "tool-added" => Some(BotChatCard::ToolAdded {
+            card_id: parts.first().copied().unwrap_or("tool").to_owned(),
+            tool_name: parts.get(1).copied().unwrap_or_default().to_owned(),
+            subtitle: parts.get(2).copied().unwrap_or_default().to_owned(),
+        }),
+        "webhook-setup" => Some(BotChatCard::WebhookSetup {
+            card_id: parts.first().copied().unwrap_or("webhook").to_owned(),
+            title: parts.get(1).copied().unwrap_or_default().to_owned(),
+            url: parts.get(2).copied().unwrap_or_default().to_owned(),
+            description: parts.get(3).copied().unwrap_or_default().to_owned(),
+        }),
+        "import-plan" => Some(BotChatCard::ImportPlan {
+            card_id: parts.first().copied().unwrap_or("import-plan").to_owned(),
+            source: parts.get(1).copied().unwrap_or_default().to_owned(),
+            bot_name: parts.get(2).copied().unwrap_or_default().to_owned(),
+            summary: parts.get(3).copied().unwrap_or_default().to_owned(),
+        }),
+        "import-done" => Some(BotChatCard::ImportDone {
+            card_id: parts.first().copied().unwrap_or("import-done").to_owned(),
+            bot_name: parts.get(1).copied().unwrap_or_default().to_owned(),
+            summary: parts.get(2).copied().unwrap_or_default().to_owned(),
+        }),
+        "sign-in-offer" => Some(BotChatCard::SignInOffer {
+            card_id: parts.first().copied().unwrap_or("sign-in").to_owned(),
+            provider: parts.get(1).copied().unwrap_or_default().to_owned(),
+            description: parts.get(2).copied().unwrap_or_default().to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+/// Orca `#47117`: parsed shell approval detail so Bash approvals show the command cleanly
+/// without repeating a `description` already displayed in the card header/prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ShellApprovalDetail {
+    pub command: String,
+    pub other_arguments: Option<String>,
+}
+
+pub(super) fn is_command_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name.trim().to_ascii_lowercase().as_str(),
+        "bash" | "shell" | "run_command" | "exec_command" | "terminal" | "sh" | "zsh"
+    )
+}
+
+pub(super) fn parse_shell_approval_detail(
+    detail: &str,
+    tool_name: &str,
+    prompt_description: &str,
+) -> Option<ShellApprovalDetail> {
+    if !is_command_tool_name(tool_name) {
+        return None;
+    }
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = parsed.as_object()?;
+    let command = obj.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let mut rest = serde_json::Map::new();
+    if let Some(sandbox) = obj.get("dangerouslyDisableSandbox") {
+        rest.insert("dangerouslyDisableSandbox".to_owned(), sandbox.clone());
+    }
+    if let Some(desc) = obj.get("description").and_then(serde_json::Value::as_str) {
+        let already_shown = !prompt_description.is_empty() && prompt_description.contains(desc);
+        if !already_shown && !desc.trim().is_empty() {
+            rest.insert(
+                "description".to_owned(),
+                serde_json::Value::String(desc.to_owned()),
+            );
+        }
+    }
+    for (k, v) in obj {
+        if matches!(
+            k.as_str(),
+            "command" | "dangerouslyDisableSandbox" | "description"
+        ) {
+            continue;
+        }
+        rest.insert(k.clone(), v.clone());
+    }
+    let other_arguments = if rest.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&rest).ok()
+    };
+    Some(ShellApprovalDetail {
+        command: command.to_owned(),
+        other_arguments,
+    })
 }
 
 /// First plain-text preview line of an agent message row (Orca `dcde358a` / `#46739`,
@@ -817,6 +1095,9 @@ fn fold_turns(
                 item.kind == ChatItemKind::Assistant && Some(pos) != answer
             }
             DisplayRow::UnreadDivider { .. }
+            | DisplayRow::ContextCleared { .. }
+            | DisplayRow::BotCard { .. }
+            | DisplayRow::QuestionBatch { .. }
             | DisplayRow::ItemNote { .. }
             | DisplayRow::Notice { .. }
             | DisplayRow::TurnBar { .. } => false,

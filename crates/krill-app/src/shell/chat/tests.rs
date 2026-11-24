@@ -1826,3 +1826,111 @@ fn upload_chat_attachments_with_maps_remote_path_and_registers_preview() {
         None
     );
 }
+
+#[test]
+fn wave2b_context_cleared_cards_question_batch_and_bash_dedup() {
+    use work_run::{
+        BotChatCard, DisplayFeed, DisplayRow, is_context_cleared_marker, parse_bot_chat_card,
+        parse_shell_approval_detail,
+    };
+
+    // Context cleared divider marker.
+    assert!(is_context_cleared_marker("/clear"));
+    assert!(is_context_cleared_marker("[Context cleared]"));
+    assert!(is_context_cleared_marker("[Krill context cleared]"));
+    assert!(!is_context_cleared_marker("please clear the cache"));
+
+    // All 7 Orca offer/setup cards parse from structured markers.
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: connector-offer | c1 | Slack | Connect Slack | Read channels]"),
+        Some(BotChatCard::ConnectorOffer { service, .. }) if service == "Slack"
+    ));
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: google-offer | g1 | Connect Google | Calendar & Gmail]"),
+        Some(BotChatCard::GoogleOffer { .. })
+    ));
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: tool-added | t1 | linear_query | Added to tools]"),
+        Some(BotChatCard::ToolAdded { tool_name, .. }) if tool_name == "linear_query"
+    ));
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: webhook-setup | w1 | GitHub PRs | https://hooks.example/gh | Incoming events]"),
+        Some(BotChatCard::WebhookSetup { url, .. }) if url == "https://hooks.example/gh"
+    ));
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: import-plan | ip1 | GitHub | OpsBot | 3 schedules]"),
+        Some(BotChatCard::ImportPlan { bot_name, .. }) if bot_name == "OpsBot"
+    ));
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: import-done | id1 | OpsBot | Imported 3 schedules]"),
+        Some(BotChatCard::ImportDone { bot_name, .. }) if bot_name == "OpsBot"
+    ));
+    assert!(matches!(
+        parse_bot_chat_card("[Krill card: sign-in-offer | s1 | Antigravity | Sign in to continue]"),
+        Some(BotChatCard::SignInOffer { provider, .. }) if provider == "Antigravity"
+    ));
+
+    // `#47117`: Bash approval dedups description already present in prompt text.
+    let raw_json = r#"{"command":"git status --short","description":"Check git status"}"#;
+    let deduped = parse_shell_approval_detail(raw_json, "Bash", "Check git status").unwrap();
+    assert_eq!(deduped.command, "git status --short");
+    assert!(deduped.other_arguments.is_none());
+    let kept = parse_shell_approval_detail(raw_json, "Bash", "Run command?").unwrap();
+    assert_eq!(kept.command, "git status --short");
+    assert!(
+        kept.other_arguments
+            .as_deref()
+            .is_some_and(|s| s.contains("Check git status"))
+    );
+
+    // Consecutive questions group into QuestionBatch; single question stays DisplayRow::Item.
+    let items: Vec<Arc<ChatItem>> = vec![
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: "/clear".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Question,
+            text: "First?".into(),
+            ..Default::default()
+        }),
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Question,
+            text: "Second?".into(),
+            ..Default::default()
+        }),
+    ];
+    let feed = DisplayFeed::project(0, &items);
+    assert!(matches!(
+        feed.get(0),
+        Some(DisplayRow::ContextCleared { abs_idx: 0 })
+    ));
+    assert!(matches!(
+        feed.get(1),
+        Some(DisplayRow::QuestionBatch { items }) if items.len() == 2
+    ));
+
+    let single = vec![Arc::new(ChatItem {
+        kind: ChatItemKind::Question,
+        text: "Only one?".into(),
+        ..Default::default()
+    })];
+    let single_feed = DisplayFeed::project(0, &single);
+    assert!(matches!(
+        single_feed.get(0),
+        Some(DisplayRow::Item { abs_idx: 0, .. })
+    ));
+
+    // CLI version & hostname helpers.
+    assert_eq!(parse_cli_version("1.5.16\n").as_deref(), Some("1.5.16"));
+    assert_eq!(
+        parse_cli_version("antigravity cli v2.0.1-beta").as_deref(),
+        Some("2.0.1-beta")
+    );
+    assert!(
+        local_machine_hostname()
+            .as_deref()
+            .is_some_and(|h| !h.trim().is_empty())
+    );
+}

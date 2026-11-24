@@ -1709,9 +1709,10 @@ fn chat_pending_card_renders_orca_intrinsic_bubble_confirms_fifo_and_rebases_acr
     cx.simulate_resize(size(px(800.), px(680.)));
     cx.run_until_parked();
 
+    // Orca `NativeChatComposerField`: circular 28x28 Send button (`size-7`).
     let send_btn = cx.debug_bounds("desktop-chat-send").unwrap();
-    assert!((send_btn.size.width - px(32.)).abs() <= px(1.));
-    assert!((send_btn.size.height - px(32.)).abs() <= px(1.));
+    assert!((send_btn.size.width - px(28.)).abs() <= px(1.));
+    assert!((send_btn.size.height - px(28.)).abs() <= px(1.));
 
     let composer = cx.debug_bounds("desktop-chat-composer").unwrap();
     let input = cx.update(|window, cx| {
@@ -2188,7 +2189,8 @@ fn chat_autocomplete_supports_file_and_slash_selection_ime_guard_working_priorit
         .expect("Working session with draft text must show Stop under Option A");
     assert!(cx.debug_bounds("desktop-chat-send").is_none());
     assert_eq!(stop_btn.size, send_btn.size);
-    assert!((stop_btn.size.width - px(32.)).abs() <= px(1.));
+    // Orca `NativeChatComposerField`: circular 28x28 Stop button (`size-7`).
+    assert!((stop_btn.size.width - px(28.)).abs() <= px(1.));
     cx.simulate_click(stop_btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert_eq!(*sent.lock().unwrap(), vec![b"\x03".to_vec()]);
@@ -4292,4 +4294,348 @@ fn remote_chat_attachments_refuse_local_fallback_and_render_uploaded_preview(
         assert_eq!(viewer.paths, vec![local_png.clone()]);
         assert_eq!(viewer.numbers, vec![1]);
     });
+}
+
+#[gpui::test]
+fn wave2b_bot_chat_flush_stage_banner_autohide_side_chat_and_resume_search(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open(cx, state_path("wave2b-bot-stage"));
+    let bot_id = krill_proto::bots::BotId::new("krillbot").unwrap();
+    let key = local_key(SESSION);
+    set_phase2b_session_state(&shell, cx, krill_proto::control::AgentState::Working, 100);
+    let pane = shell.update(cx, |s, cx| {
+        s.sidebar_collapsed = true;
+        s.panel_collapsed = true;
+        let pane = s.layout.focused().unwrap();
+        attach_live_test_pane(s, pane, SESSION, cx);
+        s.layout.set_session(pane, SESSION);
+        s.layout.set_chat_view(pane, true);
+        let cfg =
+            krill_proto::bots::BotConfig::new(bot_id.clone(), "크릴봇", "agy", 1_700_000_000_000)
+                .unwrap();
+        let summary = krill_proto::bots::BotSessionSummary {
+            session_id: SESSION,
+            bot_id: bot_id.clone(),
+            link_id: None,
+            pid: 1,
+            live: true,
+            working: false,
+            label: String::new(),
+            created_at_ms: 0,
+        };
+        let mut row = krill_app::bots::rpc::sidebar_snapshot(
+            &[cfg],
+            &[],
+            &[],
+            std::slice::from_ref(&summary),
+        )
+        .bots
+        .remove(0);
+        row.sessions = vec![summary];
+        s.sidebar_bots = vec![row];
+        s.chat.bot_souls.insert(
+            (krill_app::hosts::HostId::Local, bot_id.clone()),
+            "CI 모니터링과 이슈 분류를 담당하는 크릴 봇입니다.".into(),
+        );
+        s.chat.agy_version = Some("1.5.16".into());
+        s.chat.agy_version_probe_started = true;
+        s.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: false,
+                reset: true,
+                agent: "agy".into(),
+                items: Vec::new(),
+                ..Default::default()
+            },
+        );
+        cx.notify();
+        pane
+    });
+    cx.run_until_parked();
+
+    // Flush stage removes outer pane-card-stage border on bot chats.
+    assert!(cx.debug_bounds("pane-card-stage").is_none());
+    // Unbound first-run persona shows BotFirstScreen steps card and bot home banner.
+    assert!(cx.debug_bounds("chat-bot-first-screen").is_some());
+    assert!(cx.debug_bounds("chat-bot-home-banner").is_some());
+    assert!(cx.debug_bounds("chat-composer-agy-auth").is_some());
+    assert!(cx.debug_bounds("chat-composer-permission").is_some());
+
+    // Bound empty persona transitions to BotHowToAsk.
+    shell.update(cx, |s, cx| {
+        s.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                agent: "agy".into(),
+                items: Vec::new(),
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-bot-how-to-ask").is_some());
+
+    // Narrow width <= 264px auto-hides the bot home banner (Orca bot-home-banner.css).
+    shell.update(cx, |s, cx| {
+        s.chat.pane_widths.insert(pane, px(240.0));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-bot-home-banner").is_none());
+
+    // Restore wide width and verify ContextCleared divider renders.
+    shell.update(cx, |s, cx| {
+        s.chat.pane_widths.insert(pane, px(820.0));
+        s.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                agent: "agy".into(),
+                items: vec![ChatItem {
+                    kind: ChatItemKind::User,
+                    text: "/clear".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-bot-home-banner").is_some());
+    assert!(cx.debug_bounds("chat-context-cleared-divider").is_some());
+
+    // `#42129`: typing `/btw` displays the Side chat pill in the composer.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |st, cx| st.set_value("/btw quick question", window, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-side-chat-pill").is_some());
+
+    // `#47815`: `/resume <query>` opens immediate session search popover.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let input = s.ensure_chat_input(key.clone(), window, cx);
+            input.update(cx, |st, cx| st.set_value("/resume triage", window, cx));
+            s.submit_chat_prompt(&key, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-resume-search-popover").is_some());
+}
+
+#[gpui::test]
+fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut TestAppContext) {
+    let (shell, cx) = open(cx, state_path("wave2b-interactive"));
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    let key = local_key(SESSION);
+
+    set_phase2b_session_state(&shell, cx, krill_proto::control::AgentState::Waiting, 101);
+    shell.update(cx, |s, cx| {
+        s.sidebar_collapsed = true;
+        s.panel_collapsed = true;
+        let pane = s.layout.focused().unwrap();
+        attach_live_test_pane(s, pane, SESSION, cx);
+        s.layout.set_session(pane, SESSION);
+        s.layout.set_chat_view(pane, true);
+        inject_phase2b_screen(s, pane, "Which runtime?\n❯ 1. Node\n  2. Rust", cx);
+        s.chat.send_input = Some(Box::new(move |bytes| {
+            recorded.lock().unwrap().push(bytes);
+            true
+        }));
+
+        // Inject orchestration snapshot with 1 Active + 1 Stopped worker for this chat,
+        // and also mark SESSION as a worker dispatch for `#43521` auto-close banner test.
+        let mut orch = krill_proto::orchestration::OrchestrationStore::default();
+        orch.runs.push(krill_proto::orchestration::Run {
+            id: "run-1".into(),
+            title: "Wave 2B".into(),
+            coordinator_session_id: Some(SESSION.0),
+            status: krill_proto::orchestration::RunStatus::Active,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+        orch.dispatches.push(krill_proto::orchestration::Dispatch {
+            id: "disp-active".into(),
+            run_id: "run-1".into(),
+            task_id: None,
+            worker_name: "researcher".into(),
+            agent: "agy".into(),
+            session_id: Some(901),
+            depth: 1,
+            cwd: "/tmp".into(),
+            prompt: "Investigate long background task description wrapping cleanly across lines"
+                .into(),
+            status: krill_proto::orchestration::DispatchStatus::Active,
+            summary: None,
+            archived_output: None,
+            started_at_ms: 10,
+            ended_at_ms: None,
+            release_state: krill_proto::orchestration::DispatchReleaseState::Active,
+            session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
+        });
+        orch.dispatches.push(krill_proto::orchestration::Dispatch {
+            id: "disp-stopped".into(),
+            run_id: "run-1".into(),
+            task_id: None,
+            worker_name: "linter".into(),
+            agent: "codex".into(),
+            session_id: Some(902),
+            depth: 1,
+            cwd: "/tmp".into(),
+            prompt: "Run linter".into(),
+            status: krill_proto::orchestration::DispatchStatus::Stopped,
+            summary: Some("Stopped by user".into()),
+            archived_output: None,
+            started_at_ms: 10,
+            ended_at_ms: Some(20),
+            release_state: krill_proto::orchestration::DispatchReleaseState::Released,
+            session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
+        });
+        orch.dispatches.push(krill_proto::orchestration::Dispatch {
+            id: "disp-self".into(),
+            run_id: "run-parent".into(),
+            task_id: None,
+            worker_name: "self-worker".into(),
+            agent: "agy".into(),
+            session_id: Some(SESSION.0),
+            depth: 1,
+            cwd: "/tmp".into(),
+            prompt: "Self temp worker".into(),
+            status: krill_proto::orchestration::DispatchStatus::Active,
+            summary: None,
+            archived_output: None,
+            started_at_ms: 10,
+            ended_at_ms: None,
+            release_state: krill_proto::orchestration::DispatchReleaseState::Active,
+            session_origin: krill_proto::orchestration::DispatchSessionOrigin::Created,
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
+        });
+        s.orch_snapshot = std::sync::Arc::new(orch);
+
+        // Multi-question batch (2 consecutive questions).
+        s.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                agent: "agy".into(),
+                session_id: "s-w2b".into(),
+                transcript_path: "/tmp/w2b.jsonl".into(),
+                items: vec![
+                    ChatItem {
+                        kind: ChatItemKind::Question,
+                        tool_id: "q-1".into(),
+                        title: "Runtime".into(),
+                        text: "Which runtime?".into(),
+                        options: vec![
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Node".into(),
+                                description: String::new(),
+                            },
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Rust".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::Question,
+                        tool_id: "q-2".into(),
+                        title: "Target".into(),
+                        text: "Deploy target?".into(),
+                        options: vec![
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Local".into(),
+                                description: String::new(),
+                            },
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Cloud".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // `#43521` worker auto-close banner visible and dismisses on Keep open.
+    let keep_btn = cx
+        .debug_bounds("chat-worker-keep-open")
+        .expect("worker auto-close banner visible");
+    cx.simulate_click(keep_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-auto-close-banner").is_none());
+
+    // Combined worker dock renders, expands on click, and Clear all hides settled workers.
+    let dock_toggle = cx
+        .debug_bounds("chat-worker-dock-toggle")
+        .expect("worker dock visible");
+    cx.simulate_click(dock_toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-dock-list").is_some());
+    assert!(cx.debug_bounds("chat-worker-dock-row-0").is_some());
+    assert!(cx.debug_bounds("chat-worker-dock-row-1").is_some());
+    let clear_btn = cx
+        .debug_bounds("chat-worker-dock-clear")
+        .expect("clear all shown for settled worker");
+    cx.simulate_click(clear_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-worker-dock-row-1").is_none());
+
+    // `#46963`/`#47959`/`#42789`: 1-at-a-time question batch + Skip sends answered steps.
+    assert!(cx.debug_bounds("chat-question-batch").is_some());
+    let opt0 = cx
+        .debug_bounds("chat-question-batch-option-0")
+        .expect("step 1 option 0");
+    cx.simulate_click(opt0.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let skip_btn = cx
+        .debug_bounds("chat-question-batch-skip")
+        .expect("skip button on step 2");
+    cx.simulate_click(skip_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![b"\r".to_vec()],
+        "Skip must submit already-answered step 1 via terminal confirm"
+    );
+
+    // `#47079`: rate-limited chat with unknown reset time shows Continue after account switch.
+    shell.update(cx, |s, cx| {
+        let log = s.chat.logs.entry(key.clone()).or_default();
+        log.meta.rate_limited = true;
+        log.rate_limit_account_switched = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("chat-rate-limit-banner").is_some());
+    assert!(cx.debug_bounds("chat-rate-limit-continue").is_some());
 }
