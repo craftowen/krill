@@ -817,8 +817,15 @@ impl Sidebar {
                 let count_key = header_key.clone();
                 let detail_key = header_key.clone();
                 let error_key = header_key.clone();
+                let display_label = if host.is_local() {
+                    text::HOST_LOCAL
+                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                        .get()
+                } else {
+                    label.as_str()
+                };
                 let a11y = format!(
-                    "{label}, {status_label}, {} {sessions}",
+                    "{display_label}, {status_label}, {} {sessions}",
                     text::SESSIONS.get()
                 );
                 heading(base)
@@ -870,7 +877,7 @@ impl Sidebar {
                             .flex_col()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(p.sidebar_foreground)
-                            .child(div().truncate().child(label.clone()))
+                            .child(div().truncate().child(display_label.to_owned()))
                             .when_some(detail, |d, detail| {
                                 d.child(
                                     div()

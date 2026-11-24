@@ -497,7 +497,7 @@ pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
     }
     cx.global_mut::<AlertState>().active_tags.insert(id);
     let title = if label.is_empty() {
-        format!("Session #{}", id.0)
+        text::SESSION_NUMBER.format(&[("id", &id.0.to_string())])
     } else {
         label.to_owned()
     };
@@ -588,7 +588,7 @@ fn session_label(session: &Session) -> String {
     if !session.status.agent.is_empty() {
         return format!("{} #{}", session.status.agent, session.id.0);
     }
-    format!("Session #{}", session.id.0)
+    text::SESSION_NUMBER.format(&[("id", &session.id.0.to_string())])
 }
 
 fn basename(path: &Path) -> Option<String> {

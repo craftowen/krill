@@ -41,6 +41,33 @@ pub fn set_language(language: Language, cx: &mut gpui::App) {
     });
 }
 
+/// Refresh an `InputState` placeholder only when it differs from `expected` (such as after a
+/// runtime `ko <-> en` switch), avoiding unnecessary notifications on normal renders.
+pub fn sync_input_placeholder(
+    input: &gpui::Entity<gpui_component::input::InputState>,
+    expected: impl Into<gpui::SharedString>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) {
+    let expected: gpui::SharedString = expected.into();
+    if input.read(cx).presentation().placeholder() != &expected {
+        input.update(cx, |state, cx| state.set_placeholder(expected, window, cx));
+    }
+}
+
+/// Refresh a `TextareaState` placeholder only when it differs from `expected`.
+pub fn sync_textarea_placeholder(
+    input: &gpui::Entity<gpui_component::input::TextareaState>,
+    expected: impl Into<gpui::SharedString>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) {
+    let expected: gpui::SharedString = expected.into();
+    if input.read(cx).presentation().placeholder() != &expected {
+        input.update(cx, |state, cx| state.set_placeholder(expected, window, cx));
+    }
+}
+
 /// Nonlocalized Windows system title prefix, used for parsing rather than UI copy.
 pub const WINDOWS_ADMIN_TITLE_KO: &str = "관리자";
 
@@ -118,7 +145,7 @@ macro_rules! platform_text {
 }
 
 macro_rules! catalog {
-    ($($group:ident { $($key:ident $( [$id:literal] )? => ($ko:expr, $en:expr)),* $(,)? })*) => {
+    ($($group:ident { $($key:ident $( [$id:literal] )? => ($ko:expr, $en:expr $(,)?)),* $(,)? })*) => {
         pub mod catalog {
             $(pub mod $group {
                 $(pub const $key: super::super::Message = super::super::Message {
@@ -814,7 +841,7 @@ catalog! {
         HM_AUTOMATIONS => ("자동화", "Automations"),
         HM_TIDY_MEMORY => ("메모리 정리", "Tidy memory"),
         HM_SUGGESTIONS => ("제안", "Suggestions"),
-        HM_PAUSED => ("일시중지됨", "Paused"),
+        HM_PAUSED => ("일시정지됨", "Paused"),
         HM_AUTOMATIONS_EMPTY => ("{name}에게 채팅으로 일정에 맞춰, 또는 어떤 일이 생겼을 때 실행할 일을 부탁하세요.", "Ask {name} in chat to run something on a schedule or when something happens."),
         STATUS_PLANNED => ("예정", "Planned"),
         STATUS_WORKING => ("작업 중", "Working"),
@@ -885,7 +912,10 @@ catalog! {
         ENABLE_LABEL => ("활성화", "Enabled"),
         SAVE_CONNECTOR_BTN => ("커넥터 설정 저장", "Save Connector Settings"),
         CONNECTOR_SAVED => ("커넥터 설정을 저장했습니다.", "Saved connector settings."),
-        SECRET_PLACEHOLDER => ("새 비밀값 입력 (키체인 저장)…", "Enter new secret (stored in keychain)…"),
+        SECRET_PLACEHOLDER => (
+            platform_text!("새 비밀값 입력 (키체인 저장)…", "새 비밀값 입력 (안전 저장소에 보관)…"),
+            platform_text!("Enter new secret (stored in Keychain)…", "Enter new secret (stored in credential vault)…"),
+        ),
         SAVE_SECRET_BTN => ("시크릿 저장", "Save Secret"),
         CLEAR_SECRET_BTN => ("시크릿 삭제", "Clear Secret"),
         SECRET_SAVED => ("시크릿을 안전하게 저장했습니다.", "Secret saved securely."),
@@ -1104,7 +1134,7 @@ catalog! {
         LOOK_AROUND_ENABLED_LABEL => ("주기적 주변 살펴보기", "Scheduled Look Around"),
         LOOK_AROUND_WEEKDAYS_LABEL => ("평일만 실행", "Weekdays only"),
         LOOK_AROUND_FOCUS_PLACEHOLDER => ("집중해서 살필 영역 (선택)…", "Focus area (optional)…"),
-        LOOK_AROUND_SAVE_BTN => ("Look Around 설정 저장", "Save Look Around"),
+        LOOK_AROUND_SAVE_BTN => ("둘러보기 설정 저장", "Save Look Around"),
         SUGGESTION_START_BTN => ("바로 실행", "Start"),
         SUGGESTION_DISMISS_BTN => ("무시", "Dismiss"),
         DECISION_ANSWER_PLACEHOLDER => ("직접 답변 입력…", "Type custom answer…"),
@@ -1228,6 +1258,18 @@ catalog! {
         SB_DISCONNECTED => ("연결 끊김", "Disconnected"),
         SB_UNREAD => ("읽지 않음", "Unread"),
         SB_START_FROM_SCRATCH => ("처음부터 시작", "Start from scratch"),
+        LOCAL_HOST_NAME => ("이 컴퓨터", "this computer"),
+        AVATAR_COLOR_SKY => ("하늘", "Sky"),
+        AVATAR_COLOR_WHITE => ("흰색", "White"),
+        AVATAR_COLOR_LAVENDER => ("라벤더", "Lavender"),
+        AVATAR_COLOR_PINK => ("분홍", "Pink"),
+        AVATAR_COLOR_PEACH => ("복숭아", "Peach"),
+        AVATAR_COLOR_BUTTER => ("버터", "Butter"),
+        AVATAR_COLOR_SAGE => ("세이지", "Sage"),
+        AVATAR_COLOR_MINT => ("민트", "Mint"),
+        AVATAR_COLOR_SLATE => ("슬레이트", "Slate"),
+        AVATAR_COLOR_GRAPHITE => ("흑연", "Graphite"),
+        AVATAR_COLOR_INK => ("잉크", "Ink"),
     }
     other_os {
         REVEAL => ("파일 탐색기에서 보기", "Show in File Explorer"),
@@ -1295,8 +1337,14 @@ catalog! {
         PAIRED => ("페어링", "Paired"),
         LAST_ACTIVE => ("마지막 활동", "Last active"),
         MINUTES_AGO => ("분 전", "minutes ago"),
+        MINUTES_AGO_ONE => ("1분 전", "1 minute ago"),
+        MINUTES_AGO_MANY => ("{n}분 전", "{n} minutes ago"),
         HOURS_AGO => ("시간 전", "hours ago"),
+        HOURS_AGO_ONE => ("1시간 전", "1 hour ago"),
+        HOURS_AGO_MANY => ("{n}시간 전", "{n} hours ago"),
         DAYS_AGO => ("일 전", "days ago"),
+        DAYS_AGO_ONE => ("1일 전", "1 day ago"),
+        DAYS_AGO_MANY => ("{n}일 전", "{n} days ago"),
         JUST_NOW => ("방금 전", "Just now"),
         NEVER => ("없음", "Never")
     }
@@ -1378,7 +1426,7 @@ catalog! {
         CURRENT_WORKTREE => ("현재 워크트리", "Current Worktree"),
         CURRENT_BADGE => ("현재", "Current"),
         PRIMARY_BADGE => ("기본", "primary"),
-        LOCAL_MAC => ("Local Mac", "Local Mac"),
+        LOCAL_MAC => (platform_text!("내 Mac", "내 컴퓨터"), platform_text!("My Mac", "My computer")),
         MORE_COUNT => ("{n} 더보기", "{n} more"),
         SEE_MORE => ("자세히 보기", "See more"),
         FILTER => ("필터", "Filter"),
@@ -1438,8 +1486,28 @@ catalog! {
         HELPERS_MISSING => ("{path} 실행 파일이 없거나 실행할 수 없습니다. Krill을 다시 설치하세요.", "Executable missing or not executable: {path}. Reinstall Krill."),
         INVALID_PATH => ("설정 경로는 안전한 절대 경로여야 합니다.", "The configuration path must be a safe absolute path."),
         CLI_CONFLICT => ("관리 경로의 다른 파일이나 링크를 보존했습니다. 설정 점검에서 경로 충돌을 확인하세요.", "Preserved another file or link in the managed directory. Check the path conflict in Settings."),
-        CLI_PATH => ("사용자 관리 bin 경로가 로그인 셸 PATH에 없습니다. 셸 PATH에 ~/.local/bin을 추가하세요.", "The managed bin directory is not on your login shell PATH. Add ~/.local/bin to your shell PATH."),
-        OPEN_FAILED => ("시스템 설정 또는 Finder를 열지 못했습니다. 다시 시도하세요.", "Could not open System Settings or Finder. Try again."),
+        CLI_PATH => (
+            if cfg!(windows) {
+                "사용자 관리 bin 경로가 PATH에 없습니다. PATH 설정을 확인하세요."
+            } else {
+                "사용자 관리 bin 경로가 로그인 셸 PATH에 없습니다. 셸 PATH에 ~/.local/bin을 추가하세요."
+            },
+            if cfg!(windows) {
+                "The managed bin directory is not on your PATH. Check your PATH setting."
+            } else {
+                "The managed bin directory is not on your login shell PATH. Add ~/.local/bin to your shell PATH."
+            },
+        ),
+        OPEN_FAILED => (
+            platform_text!(
+                "시스템 설정 또는 Finder를 열지 못했습니다. 다시 시도하세요.",
+                "시스템 설정 또는 파일 탐색기를 열지 못했습니다. 다시 시도하세요."
+            ),
+            platform_text!(
+                "Could not open System Settings or Finder. Try again.",
+                "Could not open System Settings or File Explorer. Try again."
+            ),
+        ),
         HOOK_ERROR => ("훅 설치 실패: {error}", "Hook installation failed: {error}"),
         HOOK_CONFLICT => ("기존 {name} 설정과 충돌해 설치하지 않았습니다(파일 변경 없음). 펼쳐서 충돌 항목을 확인하고, 직접 병합하거나 기존 파일을 옮긴 뒤 다시 설치하세요.", "Conflicts with your existing {name} settings, so nothing was installed (no files changed). Expand to see the conflict, merge it manually or move the existing file, then install again."),
         NOTIFICATION_DENIED => ("알림이 허용되지 않았습니다. [설정 열기]에서 Krill 알림을 켜세요.", "Notifications were not allowed. Enable Krill notifications in Settings."),
@@ -1467,15 +1535,29 @@ catalog! {
         TITLE_APP_FOLDERS => ("폴더 접근", "Folder access"),
         TITLE_APP_FULL_DISK => ("전체 디스크 접근", "Full disk access"),
         DOCTOR_FAILED_SUMMARY => ("점검 실행 실패", "Checks failed to run"),
-        DOCTOR_FAILED_DETAIL => ("원인: {cause}. 다음 행동: [모두 다시 검사]를 눌러 보고, 계속 실패하면 Krill을 /Applications에 다시 설치하세요.", "Cause: {cause}. Next: press Recheck all; if it keeps failing, reinstall Krill in /Applications."),
+        DOCTOR_FAILED_DETAIL => (
+            platform_text!(
+                "원인: {cause}. 다음 행동: [모두 다시 검사]를 눌러 보고, 계속 실패하면 Krill을 /Applications에 다시 설치하세요.",
+                "원인: {cause}. 다음 행동: [모두 다시 검사]를 눌러 보고, 계속 실패하면 Krill을 다시 설치하세요."
+            ),
+            platform_text!(
+                "Cause: {cause}. Next: press Recheck all; if it keeps failing, reinstall Krill in /Applications.",
+                "Cause: {cause}. Next: press Recheck all; if it keeps failing, reinstall Krill."
+            ),
+        ),
         DOCTOR_CAUSE_MISSING => ("준비된 krill 실행 파일이 없습니다", "the staged krill executable is missing"),
         DOCTOR_CAUSE_SPAWN => ("{path}을(를) 실행하지 못했습니다({error})", "could not run {path} ({error})"),
         DOCTOR_CAUSE_EXIT => ("krill doctor가 보고서 없이 종료 코드 {code}로 끝났습니다 {stderr}", "krill doctor exited with code {code} without a report {stderr}"),
         DOCTOR_CAUSE_FORMAT => ("krill doctor 출력 형식을 읽지 못했습니다(앱과 krill 버전이 다를 수 있음)", "could not read the krill doctor output (app and krill versions may differ)"),
         D_HELPERS_OK => ("krill-holder와 krilld가 있습니다", "krill-holder and krilld are present"),
+        D_HELPERS_OK_SHORT => ("보조 바이너리가 있습니다", "helpers are present"),
         D_HELPERS_FAIL => ("krill-holder 또는 krilld가 없거나 실행할 수 없습니다", "krill-holder or krilld is missing or not executable"),
         D_HELPERS_MISSING => ("{what}이(가) 없거나 실행할 수 없습니다(Krill을 다시 설치하세요)", "{what} missing or not executable (reinstall Krill)"),
+        D_REINSTALL => ("Krill을 다시 설치하세요", "reinstall Krill"),
         D_VERSION_SKIP => ("데몬에 연결하지 못해 버전을 비교하지 않았습니다", "daemon unreachable, versions not compared"),
+        D_VERSION_NOT_COMPARED => ("버전을 비교하지 않았습니다", "versions not compared"),
+        D_VERSION_CALL_FAILED => ("--version 호출에 실패했습니다", "a --version call failed"),
+        D_MISSING_HOOK_PLAN => ("훅 설치 계획이 없습니다", "missing hook plan"),
         D_VERSION_SKIP_DETAIL => ("데몬 연결을 먼저 해결하세요", "fix daemon.connect first"),
         D_VERSION_OK => ("바이너리 버전이 같습니다", "binaries are the same version"),
         D_VERSION_DIFF => ("krill과 krilld 빌드가 다릅니다", "krill and krilld builds differ"),
@@ -1495,7 +1577,16 @@ catalog! {
         D_HISTORY_OFF => ("디스크 기록이 꺼져 있습니다", "disk recording is off"),
         D_HISTORY_OFF_DETAIL => ("history.toml에 recording = false", "recording = false in history.toml"),
         D_HISTORY_WARN => ("세그먼트 키에 접근할 수 없습니다", "segment key is not accessible"),
-        D_HISTORY_WARN_DETAIL => ("기록을 쓸 수 없습니다. history.toml을 확인하고 키체인에서 세그먼트 키 잠금을 풀거나 복원한 뒤 krilld를 다시 시작하세요", "recording unavailable; check history.toml and unlock/restore the segment key in Keychain, then restart krilld"),
+        D_HISTORY_WARN_DETAIL => (
+            platform_text!(
+                "기록을 쓸 수 없습니다. history.toml을 확인하고 키체인에서 세그먼트 키 잠금을 풀거나 복원한 뒤 krilld를 다시 시작하세요",
+                "기록을 쓸 수 없습니다. history.toml을 확인하고 OS 자격 증명 저장소에서 세그먼트 키를 복원한 뒤 krilld를 다시 시작하세요"
+            ),
+            platform_text!(
+                "recording unavailable; check history.toml and unlock/restore the segment key in Keychain, then restart krilld",
+                "recording unavailable; check history.toml and restore the segment key in the OS credential store, then restart krilld"
+            ),
+        ),
         D_HISTORY_OK => ("세그먼트 키에 접근할 수 있습니다", "segment key is accessible"),
         D_HISTORY_OK_DETAIL => ("기록 경고 없음", "no recording warning"),
         D_SHELL_OK => ("로그인 셸 PATH를 읽었습니다", "login shell PATH resolved"),
@@ -1504,7 +1595,22 @@ catalog! {
         D_SHELL_FAIL_DETAIL => ("로그인 셸이 5초 안에 응답하지 않았습니다. 에이전트 감지가 틀릴 수 있습니다", "login shell did not answer within 5s; agent detection may be wrong"),
         D_GIT_OK => ("git이 설치돼 있습니다", "git is installed"),
         D_GIT_WARN => ("git이 설치돼 있지 않습니다", "git is not installed"),
-        D_GIT_WARN_DETAIL => ("`git --version` 실행 실패(Xcode 명령행 도구를 설치하세요)", "`git --version` failed (install Xcode Command Line Tools)"),
+        D_GIT_WARN_DETAIL => (
+            if cfg!(target_os = "macos") {
+                "`git --version` 실행 실패(Xcode 명령행 도구를 설치하세요)"
+            } else if cfg!(windows) {
+                "`git --version` 실행 실패(Git for Windows를 설치하세요)"
+            } else {
+                "`git --version` 실행 실패(git을 설치하세요)"
+            },
+            if cfg!(target_os = "macos") {
+                "`git --version` failed (install Xcode Command Line Tools)"
+            } else if cfg!(windows) {
+                "`git --version` failed (install Git for Windows)"
+            } else {
+                "`git --version` failed (install git)"
+            },
+        ),
         D_GIT_WARN_DETAIL_WIN => ("`git --version` 실행 실패(Git for Windows를 설치하세요)", "`git --version` failed (install Git for Windows)"),
         D_AGENTS_FOUND => ("에이전트 {n}개 감지", "{n} agent(s) found"),
         D_AGENTS_NONE => ("감지된 에이전트가 없습니다", "no agent detected"),
@@ -1648,9 +1754,9 @@ catalog! {
         LAUNCHER_NEW_AGENT => ("새 에이전트", "New Agent"),
         LAUNCHER_CHOOSE_AGENT => ("에이전트 선택", "Choose agent"),
         LAUNCHER_TERMINAL => ("터미널", "Terminal"),
-        LAUNCHER_CLOSE_PANE => ("창 닫기", "Close pane"),
-        LAUNCHER_CLOSE_SPLIT_PANE => ("분할 창 닫기", "Close split pane"),
-        LAUNCHER_PANE_ACTIONS => ("창 작업", "Pane Actions"),
+        LAUNCHER_CLOSE_PANE => ("칸 닫기", "Close pane"),
+        LAUNCHER_CLOSE_SPLIT_PANE => ("분할 칸 닫기", "Close split pane"),
+        LAUNCHER_PANE_ACTIONS => ("칸 작업", "Pane Actions"),
         LAUNCHER_GROUP_AGENTS => ("에이전트", "Agents"),
         LAUNCHER_GROUP_NEW => ("새로 만들기", "New"),
         LAUNCHER_GROUP_FILES => ("파일", "Files"),
@@ -1698,7 +1804,7 @@ catalog! {
         EMPTY_HINT => ("폴더나 git 저장소를 열면 프로젝트 > 워크트리 > 세션으로 정리됩니다.", "Open a folder or Git repository to see projects, worktrees, and sessions here."),
         PROJECTS => ("프로젝트", "Projects"),
         FOLDER => ("폴더", "Folder"),
-        REFRESH => ("새로 고침", "Refresh"),
+        REFRESH => ("새로고침", "Refresh"),
         PIN => ("핀 고정 / 해제", "Pin / Unpin"),
         RENAME => ("이름 변경", "Rename"),
         SAVE => ("저장", "Save"),
@@ -1842,7 +1948,7 @@ catalog! {
         PROMPT_COPY_BTN => ("복사", "Copy"),
         PROMPT_COPIED => ("프롬프트 복사됨", "Prompt copied"),
         PROMPT_TIMELINE_TITLE => ("최근 프롬프트 히스토리", "Recent Prompt History"),
-        TURN_BADGE => ("Turn {n}", "Turn {n}"),
+        TURN_BADGE => ("턴 {n}", "Turn {n}"),
     }
     link {
         RECONNECTING => ("세션 데몬에 다시 연결하는 중… 세션은 krill-holder가 보관하고 있습니다", "Reconnecting to the session daemon… krill-holder is keeping your sessions"),
@@ -1857,6 +1963,9 @@ catalog! {
         UNSUPPORTED => ("데몬이 입력 프로토콜을 지원하지 않아 보내지 않은 입력", "Input not sent because the daemon does not support the input protocol"),
         ACCOUNT_SWITCH_FAILED => ("계정 전환이 실패해 보내지 않은 입력", "Input not sent because the account switch failed"),
         STALLED => ("칸의 응답이 멈췄습니다 — 데몬이 멈췄을 수 있습니다", "Pane is not responding — the daemon may have stalled"),
+        HISTORY_LIMIT => ("기록 캐시 한도에 도달했습니다. 현재 화면은 유지되며, 맨 아래로 돌아가면 새 기록 보기를 엽니다.", "History cache metadata limit reached. Current view is retained; return to the bottom to open a new view."),
+        HISTORY_MISSING => ("원본 기록을 더 이상 불러올 수 없습니다. 현재 화면은 유지되며, 맨 아래로 돌아가면 새로고침됩니다.", "Original history is no longer available. Current view is retained; return to the bottom to refresh."),
+        HISTORY_EXPIRED => ("기록 보기가 변경되었거나 만료되었습니다. 현재 화면은 유지되며, 맨 아래로 돌아가면 새로고침됩니다.", "History view changed or expired. Current view is retained; return to the bottom to refresh."),
     }
     menu_bar {
         OPEN => ("창 열기", "Open window"),
@@ -1866,6 +1975,7 @@ catalog! {
         WAITING => ("대기", "Waiting"),
     }
     alert {
+        SESSION_NUMBER => ("세션 #{id}", "Session #{id}"),
         WAITING => ("입력 대기", "Waiting for input"),
         BLOCKED => ("권한 승인 대기", "Waiting for permission"),
         DONE => ("작업 완료", "Work completed"),
@@ -2015,7 +2125,8 @@ catalog! {
         EXPLORER_DELETE_FOLDER_DESC => ("폴더와 하위 항목이 모두 운영체제 휴지통으로 이동됩니다.", "The folder and its contents will be moved to the operating system Trash."),
         EXPLORER_COPY_PATH => ("절대 경로 복사", "Copy Path"),
         EXPLORER_COPY_REL_PATH => ("상대 경로 복사", "Copy Relative Path"),
-        EXPLORER_REVEAL_FINDER => ("Finder에서 보기", "Reveal in Finder"),
+        EXPLORER_REVEAL_FINDER => (platform_text!("Finder에서 보기", "파일 탐색기에서 보기"), platform_text!("Reveal in Finder", "Show in File Explorer")),
+        EXPLORER_IGNORED_LABEL => ("git", "git"),
         EXPLORER_CANCEL => ("취소", "Cancel"),
         EXPLORER_EMPTY => ("표시할 파일이 없습니다", "No files to show"),
         EXPLORER_FILTER_EMPTY => ("일치하는 파일이 없습니다", "No matching files"),
@@ -2023,12 +2134,14 @@ catalog! {
         SEARCH => ("검색", "Search"),
         SEARCH_TOOLTIP => (platform_text!("워크스페이스 검색 (⇧⌘F)", "워크스페이스 검색 (Ctrl+Alt+Shift+F)"), platform_text!("Search in Workspace (⇧⌘F)", "Search in Workspace (Ctrl+Alt+Shift+F)")),
         SEARCH_PLACEHOLDER => ("파일에서 검색…", "Search in files…"),
+        SEARCH_CASE_LABEL => ("Aa", "Aa"),
+        SEARCH_WORD_LABEL => ("ab", "ab"),
         SEARCH_CASE_SENSITIVE => ("대소문자 구분", "Match Case"),
         SEARCH_WHOLE_WORD => ("단어 단위 일치", "Match Whole Word"),
         SEARCH_REGEX => ("정규식 사용", "Use Regular Expression"),
-        SEARCH_INCLUDE_LABEL => ("포함할 파일", "files to include"),
+        SEARCH_INCLUDE_LABEL => ("포함할 파일", "Include"),
         SEARCH_INCLUDE_PLACEHOLDER => ("예: *.ts, src/**", "e.g. *.ts, src/**"),
-        SEARCH_EXCLUDE_LABEL => ("제외할 파일", "files to exclude"),
+        SEARCH_EXCLUDE_LABEL => ("제외할 파일", "Exclude"),
         SEARCH_EXCLUDE_PLACEHOLDER => ("예: *.test.ts, dist/**", "e.g. *.test.ts, dist/**"),
         SEARCH_SUMMARY => ("{files}개 파일에서 {matches}개 결과", "{matches} results in {files} files"),
         SEARCH_TRUNCATED => ("{files}개 파일에서 {matches}+개 결과 (일부 생략)", "{matches}+ results in {files} files (results truncated)"),
@@ -2045,8 +2158,8 @@ catalog! {
         STAGE_LINE => ("줄 스테이징", "Stage Line"),
         UNSTAGE_LINE => ("줄 해제", "Unstage Line"),
         DISCARD_LINE => ("줄 버리기", "Discard Line"),
-        VIEW_UNIFIED => ("Unified", "Unified"),
-        VIEW_SPLIT => ("Split", "Split"),
+        VIEW_UNIFIED => ("통합", "Unified"),
+        VIEW_SPLIT => ("분할", "Split"),
         VIEWED => ("확인됨", "Viewed"),
         CLOSE_DIFF => ("Diff 닫기 (Esc)", "Close Diff (Esc)"),
     }
@@ -2085,7 +2198,16 @@ catalog! {
         WRAPPED => ("순환", "Wrapped"),
     }
     settings {
-        KEYS_TEMPLATE => ("# 키 바인딩 재정의. 저장하면 바로 반영된다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 모두 끈다. 한 액션의 기본 키만 끄려면 [disabled]에 적는다.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n", "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables every default binding for that key. To disable one action's default key only, list it under [disabled].\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n"),
+        KEYS_TEMPLATE => (
+            platform_text!(
+                "# 키 바인딩 재정의. 저장하면 바로 반영됩니다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 모두 끕니다. 한 액션의 기본 키만 끄려면 [disabled]에 적습니다.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n",
+                "# 키 바인딩 재정의. 저장하면 바로 반영됩니다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 모두 끕니다. 한 액션의 기본 키만 끄려면 [disabled]에 적습니다.\n[bindings]\n# \"ctrl-shift-t\" = \"shell::NewTab\"\n# \"ctrl-shift-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"ctrl-shift-n\"]\n"
+            ),
+            platform_text!(
+                "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables every default binding for that key. To disable one action's default key only, list it under [disabled].\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n",
+                "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables every default binding for that key. To disable one action's default key only, list it under [disabled].\n[bindings]\n# \"ctrl-shift-t\" = \"shell::NewTab\"\n# \"ctrl-shift-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"ctrl-shift-n\"]\n"
+            ),
+        ),
         TITLE => ("설정", "Settings"),
         THEME => ("테마", "Theme"),
         SYSTEM => ("시스템", "System"),
@@ -2132,8 +2254,8 @@ catalog! {
         INVALID_SETTINGS => ("설정 형식이 올바르지 않습니다", "Invalid settings format"),
         SETTINGS_CONFLICT => ("다른 프로그램이 설정을 바꿨습니다. 다시 시도하십시오", "Settings were changed by another program. Please retry"),
         LANGUAGE => ("언어", "Language"),
-        KO => ("한국어", "Korean"),
-        EN => ("영어", "English"),
+        KO => ("한국어", "한국어"),
+        EN => ("English", "English"),
         KEY_VALUE => ("{file}: \"{key}\" 값은 문자열이어야 합니다", "{file}: \"{key}\" must be a string"),
         EMPTY_KEY => ("{file}: 빈 키", "{file}: empty key"),
         TAB_ACCOUNTS => ("AI 제공자 계정", "AI Provider Accounts"),
@@ -2263,7 +2385,16 @@ catalog! {
         ACCOUNTS_OPEN_TOML => ("accounts.toml 열기", "Open accounts.toml"),
         ACCOUNT_SWITCH => ("전환", "Switch"),
         ACCOUNT_IN_USE => ("사용 중", "In use"),
-        ACCOUNT_REMOVE_HINT => ("등록을 지우고 Krill이 만든 프로필 폴더(로그인 정보·기록 포함)를 홈 폴더의 .Trash에 보관합니다. 복원하려면 보관 폴더를 원래 위치로 옮기고 계정을 다시 등록하세요. 직접 지정한 폴더는 그대로 둡니다. 사용 중인 계정이면 시스템 기본값으로 돌아갑니다.", "Removes the account and archives the Krill-created profile folder (sign-in and history) in .Trash in your home folder. To restore, move the archived folder to its original location and register the account again. Folders you chose yourself are kept. If it is in use, Krill falls back to the system default."),
+        ACCOUNT_REMOVE_HINT => (
+            platform_text!(
+                "등록을 지우고 Krill이 만든 프로필 폴더(로그인 정보·기록 포함)를 홈 폴더의 .Trash에 보관합니다. 복원하려면 보관 폴더를 원래 위치로 옮기고 계정을 다시 등록하세요. 직접 지정한 폴더는 그대로 둡니다. 사용 중인 계정이면 시스템 기본값으로 돌아갑니다.",
+                "등록을 지우고 Krill이 만든 프로필 폴더(로그인 정보·기록 포함)를 휴지통에 보관합니다. 복원하려면 보관 폴더를 원래 위치로 옮기고 계정을 다시 등록하세요. 직접 지정한 폴더는 그대로 둡니다. 사용 중인 계정이면 시스템 기본값으로 돌아갑니다."
+            ),
+            platform_text!(
+                "Removes the account and archives the Krill-created profile folder (sign-in and history) in .Trash in your home folder. To restore, move the archived folder to its original location and register the account again. Folders you chose yourself are kept. If it is in use, Krill falls back to the system default.",
+                "Removes the account and moves the Krill-created profile folder (sign-in and history) to the Trash. To restore, move the archived folder to its original location and register the account again. Folders you chose yourself are kept. If it is in use, Krill falls back to the system default."
+            ),
+        ),
         ACCOUNT_REMOVE_ORCA_HINT => ("Krill 목록에서만 지웁니다. Orca 앱과 Orca의 로그인 정보는 그대로 둡니다.", "Removes it from Krill's list only. Orca and its sign-in are left untouched."),
         ACCOUNT_REMOVE_TITLE => ("{name} 계정을 제거할까요?", "Remove {name}?"),
         ACCOUNT_MORE => ("계정 작업 더 보기", "More account actions"),
@@ -2293,7 +2424,16 @@ catalog! {
         ACCOUNT_DUPLICATE_HOST => ("시스템 기본값과 같은 로그인", "Same sign-in as system default"),
         ACCOUNT_DUPLICATE => ("{label}과(와) 같은 로그인", "Same sign-in as {label}"),
         ORPHANS_TITLE => ("등록되지 않은 프로필 폴더 {count}개", "{count} unregistered profile folders"),
-        ORPHANS_DESC => ("이전에 제거한 계정이 남긴 폴더입니다. 홈 폴더의 .Trash에 보관하며, 실행 중 세션이 쓰는 폴더는 건너뜁니다. 복원하려면 원래 위치로 옮기고 계정을 다시 등록하세요.", "Left behind by previously removed accounts. Archived in .Trash in your home folder; folders used by open sessions are skipped. To restore, move the folder back and register the account again."),
+        ORPHANS_DESC => (
+            platform_text!(
+                "이전에 제거한 계정이 남긴 폴더입니다. 홈 폴더의 .Trash에 보관하며, 실행 중 세션이 쓰는 폴더는 건너뜁니다. 복원하려면 원래 위치로 옮기고 계정을 다시 등록하세요.",
+                "이전에 제거한 계정이 남긴 폴더입니다. 휴지통에 보관하며, 실행 중 세션이 쓰는 폴더는 건너뜁니다. 복원하려면 원래 위치로 옮기고 계정을 다시 등록하세요."
+            ),
+            platform_text!(
+                "Left behind by previously removed accounts. Archived in .Trash in your home folder; folders used by open sessions are skipped. To restore, move the folder back and register the account again.",
+                "Left behind by previously removed accounts. Moved to the Trash; folders used by open sessions are skipped. To restore, move the folder back and register the account again."
+            ),
+        ),
         ORPHANS_PURGE => ("휴지통으로 이동", "Move to Trash"),
         ACCOUNT_REMOVE => ("제거", "Remove"),
         ACCOUNT_ORCA_MANAGED => ("Krill에서 실행 불가(Orca 관리)", "Can't run in Krill (managed by Orca)"),
@@ -2378,7 +2518,7 @@ catalog! {
         SSH_NAME_LABEL => ("표시 이름", "Label"),
         SSH_NAME_PLACEHOLDER => ("예: 집 맥미니", "e.g. Home Mac mini"),
         SSH_ADDRESS_LABEL => ("호스트 (user@host)", "Host (user@host)"),
-        SSH_ADDRESS_PLACEHOLDER => ("예: owen@100.64.0.2 또는 ~/.ssh/config 별칭", "e.g. owen@100.64.0.2 or ~/.ssh/config alias"),
+        SSH_ADDRESS_PLACEHOLDER => ("예: user@100.64.0.2 또는 ~/.ssh/config 별칭", "e.g. user@100.64.0.2 or ~/.ssh/config alias"),
         SSH_PORT_LABEL => ("포트", "Port"),
         SSH_PORT_PLACEHOLDER => ("22", "22"),
         SSH_KEY_LABEL => ("SSH 키 경로", "Identity file"),
@@ -2507,7 +2647,7 @@ catalog! {
         ERROR_REPORTS_SAVING => ("오류 보고 설정 저장 중…", "Saving error reporting setting…"),
         ERROR_REPORTS_VETO => ("{variable} 설정으로 오류 보고가 중지되어 있습니다", "Error reporting is stopped by {variable}"),
         ERROR_REPORTS_FAILED => ("오류 보고 설정을 확인하거나 저장하지 못했습니다. 다시 시도해 주세요.", "Could not read or save the error reporting setting. Please try again."),
-        RECORDING_UPDATE_NEEDED => ("데몬 업데이트 필요 — 기록 일시중지가 지원되지 않습니다", "Daemon update needed — history pause is not supported"),
+        RECORDING_UPDATE_NEEDED => ("데몬 업데이트 필요 — 기록 일시정지가 지원되지 않습니다", "Daemon update needed — history pause is not supported"),
         RECORDING_DELETE_TITLE => ("저장된 히스토리 지금 삭제", "Delete saved history now"),
         RECORDING_DELETE_NOW => ("지금 삭제", "Delete now"),
         RECORDING_CLEAR_FAILED => ("기록을 지우지 못했습니다: {error}", "Could not clear history: {error}"),
@@ -2525,7 +2665,10 @@ catalog! {
         ORCH_TASK_DEPS => ("의존 {deps}", "deps {deps}"),
         ORCH_TASK_LINE => ("[{run}] {id} · {title} · {status}", "[{run}] {id} · {title} · {status}"),
         CONFIRM_AGAIN => ("다시 눌러 확인", "Click again to confirm"),
-        THEME_DESC => ("시스템은 macOS 설정을 따릅니다.", "System follows macOS."),
+        THEME_DESC => (
+            platform_text!("시스템은 macOS 설정을 따릅니다.", "시스템은 OS 설정을 따릅니다."),
+            platform_text!("System follows macOS.", "System follows your OS."),
+        ),
         FONT_SIZE_DESC => (platform_text!("터미널에서 ⌘= / ⌘- / ⌘0", "터미널에서 Ctrl+= / Ctrl+- / Ctrl+0"), platform_text!("In the terminal: ⌘= / ⌘- / ⌘0", "In the terminal: Ctrl+= / Ctrl+- / Ctrl+0")),
         TERMINAL_FONT => ("글꼴", "Font family"),
         TERMINAL_FONT_DESC => ("고정폭 글꼴만 나옵니다.", "Only monospace fonts are listed."),
@@ -2674,9 +2817,9 @@ catalog! {
         SPACE_ERROR => ("용량 스캔, 클린업 실패: {error}", "Space scan/cleanup failed: {error}"),
         CLEANUP_MODAL_DESC => ("PR 상태(Merged / Closed), 마지막 활동 경과 일수(7일 / 14일 / 30일 이상), 미커밋(dirty) 안전 필터로 정리할 워크트리를 고릅니다. 미병합 로컬 브랜치는 경고 후 보존합니다.", "Filter worktrees by PR status (Merged / Closed), idle days (7d / 14d / 30d+), and dirty safety exclusion. Unmerged local branches are preserved with a warning."),
         CLEANUP_FILTER_PR => ("PR 상태", "PR status"),
-        CLEANUP_PR_BOTH => ("Merged + Closed", "Merged + Closed"),
-        CLEANUP_PR_MERGED => ("Merged", "Merged"),
-        CLEANUP_PR_CLOSED => ("Closed", "Closed"),
+        CLEANUP_PR_BOTH => ("병합됨 + 닫힘", "Merged + Closed"),
+        CLEANUP_PR_MERGED => ("병합됨", "Merged"),
+        CLEANUP_PR_CLOSED => ("닫힘", "Closed"),
         CLEANUP_PR_ANY => ("전체", "All"),
         CLEANUP_FILTER_IDLE => ("경과 일수", "Idle age"),
         CLEANUP_IDLE_ALL => ("전체", "Any"),
@@ -2762,7 +2905,22 @@ catalog! {
         SCHEDULE_FIELD_CRON_HINT => ("분 시 일 월 요일 순서입니다. 예: 0 9 * * 1-5 = 평일 오전 9시(UTC).", "Order: minute hour day month weekday. E.g. 0 9 * * 1-5 = 9am UTC on weekdays."),
         SCHEDULE_FIELD_CRON_PLACEHOLDER => ("예: 0 9 * * 1-5", "e.g. 0 9 * * 1-5"),
         SCHEDULE_FIELD_CWD => ("작업 폴더 (cwd)", "Working Directory (cwd)"),
-        SCHEDULE_FIELD_CWD_PLACEHOLDER => ("예: /Users/me/project", "e.g. /Users/me/project"),
+        SCHEDULE_FIELD_CWD_PLACEHOLDER => (
+            if cfg!(windows) {
+                "예: C:\\Users\\me\\project"
+            } else if cfg!(target_os = "macos") {
+                "예: /Users/me/project"
+            } else {
+                "예: /home/me/project"
+            },
+            if cfg!(windows) {
+                "e.g. C:\\Users\\me\\project"
+            } else if cfg!(target_os = "macos") {
+                "e.g. /Users/me/project"
+            } else {
+                "e.g. /home/me/project"
+            },
+        ),
         SCHEDULE_FIELD_COMMAND => ("실행 명령 (비우면 claude)", "Command (blank for claude)"),
         SCHEDULE_FIELD_COMMAND_PLACEHOLDER => ("예: claude 또는 sh -c '...'", "e.g. claude or sh -c '...'"),
         SCHEDULE_FIELD_PROMPT => ("전달 프롬프트 (선택)", "Prompt (optional)"),
@@ -2789,6 +2947,7 @@ catalog! {
         SCHEDULE_LOG_TITLE => ("실행 로그: {id} · {datetime}", "Run Log: {id} · {datetime}"),
         SCHEDULE_RUN_TIME => ("{date} {time} ({timezone})", "{date} {time} ({timezone})"),
         SCHEDULE_RUN_EXIT => ("종료 {code}", "exit {code}"),
+        SCHEDULE_PRECHECK_PREFIX => ("사전 검사", "precheck"),
         SCHEDULE_RUN_SESSION => ("세션 #{id}", "session #{id}"),
         SCHEDULE_LOG_EMPTY => ("(캡처된 터미널 출력이 없습니다)", "(No terminal output captured)"),
         SCHEDULE_ERR_ID => ("스케줄 ID는 1~64자의 영문, 숫자, _, -만 사용할 수 있습니다.", "Schedule ID must be 1..=64 ASCII letters, digits, _ or -."),
@@ -2928,7 +3087,7 @@ catalog! {
         SERVER_RECONNECT => ("다시 연결", "Reconnect"),
         SERVER_DOWN_SECS => ("연결 끊김 {n}초", "Down for {n} sec"),
         SERVER_DOWN_MINS => ("연결 끊김 {n}분", "Down for {n} min"),
-        PERMISSION_FULL_ACCESS => ("전체 액세스", "Full access"),
+        PERMISSION_FULL_ACCESS => ("전체 접근", "Full access"),
         PERMISSION_ASK => ("승인 요청", "Ask for approval"),
         PERMISSION_FULL_ACCESS_DESC => ("편집이나 명령 전에 묻지 않습니다", "Never asks before edits or commands"),
         PERMISSION_ASK_DESC => ("설정에서 허용하지 않은 편집과 명령 전에 묻습니다", "Asks before edits and commands your settings don't allow"),
@@ -2950,9 +3109,9 @@ catalog! {
         NOTE_YOU_CHANGED => ("내가 {item} 수정", "You changed {item}"),
         NOTICE_UPDATE => ("{name}의 업데이트", "Update from {name}"),
         NOTICE_MESSAGE => ("{name}의 메시지", "Message from {name}"),
-        REVIEW_DONE => ("Term에서 확인했어요 · 입력 다시 허용", "Checked in Term · enable sending"),
-        PROMPT_REVIEW => ("본문을 붙여넣은 뒤 전송을 마치지 못했습니다. 초안을 보존했습니다. 중복 전송 전에 Term에서 확인하세요.", "The text was pasted but submission did not finish. Your draft is preserved. Check in Term before sending again."),
-        MULTILINE_BLOCKED => ("이 터미널은 여러 줄 붙여넣기를 지원하지 않습니다. 초안을 보존했습니다. Term에서 확인하세요.", "This terminal does not support multiline paste. Your draft is preserved. Check in Term."),
+        REVIEW_DONE => ("터미널에서 확인했어요 · 입력 다시 허용", "Checked in Term · enable sending"),
+        PROMPT_REVIEW => ("본문을 붙여넣은 뒤 전송을 마치지 못했습니다. 초안을 보존했습니다. 중복 전송 전에 터미널에서 확인하세요.", "The text was pasted but submission did not finish. Your draft is preserved. Check in Term before sending again."),
+        MULTILINE_BLOCKED => ("이 터미널은 여러 줄 붙여넣기를 지원하지 않습니다. 초안을 보존했습니다. 터미널에서 확인하세요.", "This terminal does not support multiline paste. Your draft is preserved. Check in Term."),
         YOU => ("나", "You"),
         ASSISTANT => ("에이전트", "Assistant"),
         REASONING => ("생각 과정", "Thinking"),
@@ -2968,24 +3127,31 @@ catalog! {
         EMPTY_TITLE => ("에이전트와 작업을 시작하세요", "Start working with your agent"),
         PROMPT_FAILED => ("입력을 전달하지 못했습니다. 초안을 보존했습니다. 다시 전송하세요.", "Could not deliver input. Your draft is preserved. Retry sending."),
         REQUEST_READY => ("현재 터미널 요청과 일치합니다", "Matches the current terminal request"),
-        REQUEST_UNVERIFIED => ("현재 요청을 확인할 수 없습니다. Term에서 확인하세요.", "Cannot verify the current request. Check in Term."),
+        REQUEST_UNVERIFIED => ("현재 요청을 확인할 수 없습니다. 터미널에서 확인하세요.", "Cannot verify the current request. Check in Term."),
         REQUEST_SENDING => ("입력을 전달하는 중…", "Delivering input…"),
         REQUEST_QUEUED => ("입력 큐에 전달했습니다. 응답 확인 대기 중…", "Input queued. Waiting for response confirmation…"),
         REQUEST_CONFIRMED => ("응답 결과를 확인했습니다", "Response result confirmed"),
         REQUEST_FAILED => ("입력을 전달하지 못했습니다. 선택을 유지했습니다. 다시 시도하세요.", "Could not deliver input. Your selection is preserved. Retry."),
-        REQUEST_REVIEW => ("응답을 확인하지 못했습니다. 중복 입력을 피하려면 Term에서 확인하세요.", "Response unconfirmed. Check in Term before sending more input."),
+        REQUEST_REVIEW => ("응답을 확인하지 못했습니다. 중복 입력을 피하려면 터미널에서 확인하세요.", "Response unconfirmed. Check in Term before sending more input."),
         SEND => ("전송", "Send"),
         STOP => ("정지", "Stop"),
         STOPPING => ("정지 중…", "Stopping…"),
         TOOL_ERROR => ("실행 오류", "Error"),
-        POLL_FAILED => ("대화 기록을 불러오지 못했습니다. 자동으로 다시 시도합니다. Term에서 세션을 확인할 수 있습니다.", "Could not load conversation history. Retrying automatically. You can view the session in Term."),
+        POLL_FAILED => ("대화 기록을 불러오지 못했습니다. 자동으로 다시 시도합니다. 터미널에서 세션을 확인할 수 있습니다.", "Could not load conversation history. Retrying automatically. You can view the session in Term."),
         EMPTY_BOUND => ("새 메시지를 입력하세요", "Enter a new message"),
-        EMPTY_UNBOUND => ("새 메시지를 입력하세요. 오른쪽 위 Term 버튼으로 언제든 원시 터미널을 볼 수 있습니다.", "Enter a new message. Switch to Term in the top-right to view the raw terminal at any time."),
+        EMPTY_UNBOUND => ("새 메시지를 입력하세요. 오른쪽 위 터미널 버튼으로 언제든 원시 터미널을 볼 수 있습니다.", "Enter a new message. Switch to Term in the top-right to view the raw terminal at any time."),
         SUBMIT => ("제출 ({n})", "Submit ({n})"),
         APPROVE => ("승인 (y)", "Approve (y)"),
         DENY => ("거부 (n)", "Deny (n)"),
         REFRESH => ("새로고침", "Refresh"),
-        TERM => ("Term →", "Term →"),
+        TERM => ("터미널 →", "Term →"),
+        AGENT_FALLBACK => ("에이전트", "Agent"),
+        MODEL_DEFAULT => ("기본값", "Default"),
+        ELAPSED_SEC => ("{s}초", "{s}s"),
+        ELAPSED_MIN => ("{m}분", "{m}m"),
+        ELAPSED_MIN_SEC => ("{m}분 {s}초", "{m}m {s}s"),
+        ELAPSED_HOUR => ("{h}시간", "{h}h"),
+        ELAPSED_HOUR_MIN => ("{h}시간 {m}분", "{h}h {m}m"),
         COPY => ("복사", "Copy"),
         COPIED => ("복사됨", "Copied"),
         COPY_CODE => ("코드 복사", "Copy code"),
@@ -3353,9 +3519,21 @@ catalog! {
     open_in {
         FOLDER => ("폴더를 선택하세요", "Select a folder"),
         FAILED => ("{app} 열기 실패 (앱 설치를 확인하세요): {error}", "Could not open {app} (check that it is installed): {error}"),
+        FINDER => ("Finder", "Finder"),
+        FILE_EXPLORER => ("파일 탐색기", "File Explorer"),
+        FILE_MANAGER => ("파일 관리자", "File Manager"),
     }
     recording {
-        WARNING => ("기록 중단 · 키체인/기록 설정 확인", "Recording paused · Check Keychain and recording settings"),
+        WARNING => (
+            platform_text!(
+                "기록 중단 · 키체인/기록 설정 확인",
+                "기록 중단 · 자격 증명/기록 설정 확인"
+            ),
+            platform_text!(
+                "Recording paused · Check Keychain and recording settings",
+                "Recording paused · Check credential store and recording settings"
+            ),
+        ),
     }
     pull_request {
         TIMED_OUT => ("PR 조회 시간이 초과되었습니다. 잠시 후 다시 시도하세요", "PR lookup timed out. Try again shortly."),
@@ -3442,7 +3620,7 @@ catalog! {
     agent_history {
         TITLE => ("세션 히스토리", "Session history"),
         REFRESH => ("새로고침", "Refresh"),
-        RESUME => ("Resume", "Resume"),
+        RESUME => ("이어하기", "Resume"),
         BUSY => ("처리 중…", "Loading…"),
         EMPTY => ("세션 기록이 없습니다", "No session history"),
         LIMITED => ("일부 기록만 표시됨 · 새로고침으로 다시 스캔", "Showing partial history · Refresh to rescan"),
@@ -3559,7 +3737,7 @@ catalog! {
         NO_PREVIEW => ("앱 안에서 미리볼 수 없습니다", "This file can't be previewed in the app"),
         HTML_PREVIEW_DESC => ("브라우저에서 렌더링된 화면을 확인하거나 코드 편집기로 소스를 수정할 수 있습니다.", "Open in your browser to view the rendered page, or switch to the code editor to edit the source."),
         OPEN_DEFAULT => ("기본 앱으로 열기", "Open with Default App"),
-        OPEN_ON_THIS_PC => ("이 PC에서 열기", "Open on This Mac"),
+        OPEN_ON_THIS_PC => ("이 Mac에서 열기", "Open on This Mac"),
         REVEAL => ("Finder에서 보기", "Reveal in Finder"),
         DOWNLOAD_AND_REVEAL => ("내려받아 Finder에서 보기", "Download and Reveal in Finder"),
         DOWNLOADING_PERCENT => ("내려받는 중 {percent}%", "Downloading {percent}%"),
@@ -3658,7 +3836,56 @@ catalog! {
         USAGE_RESPONSE => ("사용량 응답을 확인하지 못했습니다. 잠시 후 다시 시도하세요", "Couldn't read usage details right now. Try again later"),
         USAGE_INTERNAL => ("지금은 사용량을 확인할 수 없습니다. 잠시 후 다시 시도하세요", "Couldn't check usage right now. Try again later"),
         USAGE_RATE_LIMITED => ("사용량 조회 요청이 잠시 제한되었습니다", "Usage check is temporarily rate-limited"),
+        USAGE_REFRESH_FAILED => ("사용량 새로고침에 실패했습니다", "Usage refresh failed"),
         USAGE_LAST_VALUE => ("마지막 확인 값", "last known value"),
+        VOICE_PIPITO_NOT_RUNNING => ("Pipito가 실행 중이 아닙니다. Pipito를 연 뒤 다시 시도하세요", "Pipito is not running. Open Pipito and try again"),
+        VOICE_PIPITO_NOT_INSTALLED => ("Pipito가 설치되어 있지 않습니다", "Pipito is not installed"),
+        VOICE_PIPITO_INVALID_RESPONSE => ("Pipito 응답을 읽지 못했습니다", "Could not read the Pipito response"),
+        VOICE_TRANSCRIBE_FAILED => ("음성 받아쓰기에 실패했습니다. 잠시 후 다시 시도하세요", "Voice transcription failed. Try again in a moment"),
+        VOICE_LEARN_FAILED => ("단어 학습에 실패했습니다. 잠시 후 다시 시도하세요", "Could not save vocabulary learning. Try again in a moment"),
+        VOICE_EMPTY_AUDIO => ("마이크에서 녹음된 음성이 없습니다", "No audio captured from the microphone"),
+        VOICE_TOO_LONG => ("녹음이 너무 깁니다. 더 짧게 나눠 말해 주세요", "Recording is too long. Try a shorter clip"),
+        VOICE_DAEMON_OUTDATED => ("데몬이 음성 기능을 지원하지 않습니다. 데몬을 재시작해 업데이트하세요", "The daemon does not support voice dictation. Restart the daemon to update"),
+        VOICE_MIC_START_FAILED => (
+            platform_text!(
+                "마이크를 시작하지 못했습니다. macOS 마이크 권한을 확인하세요",
+                "마이크를 시작하지 못했습니다. OS 마이크 권한을 확인하세요"
+            ),
+            platform_text!(
+                "Could not start the microphone. Check macOS Microphone permission",
+                "Could not start the microphone. Check OS microphone permission"
+            ),
+        ),
+        VOICE_MIC_UNAVAILABLE => ("마이크를 사용할 수 없습니다. 오디오 입력 장치와 권한을 확인하세요", "Microphone is unavailable. Check your audio input device and permissions"),
+        VOICE_UNEXPECTED_REPLY => ("음성 서비스에서 예상하지 못한 응답이 왔습니다. 다시 시도하세요", "Unexpected response from the voice service. Please try again"),
+        TAILSCALE_NOT_CONNECTED => ("Tailscale이 연결되어 있지 않습니다", "Tailscale is not connected"),
+        TAILSCALE_SERVE_STOPPED => ("Tailscale Serve가 중지되었습니다", "Tailscale Serve stopped"),
+        TAILSCALE_HTTPS_FAILED => ("Tailscale HTTPS 설정에 실패했습니다. Tailscale 설정을 확인하세요", "Tailscale HTTPS setup failed. Check your Tailscale configuration"),
+        RELAY_INVALID_RESPONSE => ("릴레이 서버 응답을 읽지 못했습니다", "Could not read the relay server response"),
+        RELAY_REQUEST_FAILED => ("릴레이 요청에 실패했습니다. 잠시 후 다시 시도하세요", "Relay request failed. Try again in a moment"),
+        MOBILE_WORKER_UNAVAILABLE => ("모바일 연결 서비스를 사용할 수 없습니다. 잠시 후 다시 시도하세요", "Mobile service is unavailable. Try again in a moment"),
+        PASTE_REFUSED_NO_BRACKETED => ("붙여넣기가 거부되었습니다: 이 프로그램은 bracketed paste를 사용하지 않습니다", "Paste refused: the program does not use bracketed paste"),
+        COMPOSER_MODEL_WIN_UNAVAILABLE => ("Windows에서는 검증된 모델 전환을 지원하지 않습니다. 현재 모델로 계속 대화하세요.", "Verified model changes are unavailable on Windows. Keep chatting with the current model."),
+        BOTS_DAEMON_OUTDATED => ("데몬이 봇 기능을 지원하지 않습니다. 데몬을 재시작해 업데이트하세요", "The daemon does not support bots. Restart the daemon to update"),
+        BOTS_UNEXPECTED_REPLY => ("데몬에서 예상하지 못한 응답이 왔습니다. 다시 시도하세요", "Unexpected response from the daemon. Please try again"),
+        OAUTH_CANCELLED => ("로그인을 취소했습니다", "Sign-in was cancelled"),
+        OAUTH_TIMED_OUT => ("로그인 응답 시간이 초과되었습니다. 다시 시도하세요", "Sign-in timed out. Please try again"),
+        GOOGLE_TOKEN_EXPIRED => ("Google 인증이 만료되었습니다. 다시 로그인하세요", "Google sign-in expired. Please sign in again"),
+        MCP_PKCE_UNSUPPORTED => ("MCP OAuth 서버가 필수 보안 방식(PKCE S256)을 지원하지 않습니다", "The MCP OAuth server does not support required PKCE S256"),
+        GITHUB_TOKEN_MISSING => ("GitHub 토큰이 설정되어 있지 않고 gh CLI 대체도 꺼져 있습니다", "GitHub token is not set and gh CLI fallback is disabled"),
+        GH_TIMED_OUT => ("GitHub CLI(gh) 응답 시간이 초과되었습니다", "GitHub CLI (gh) timed out"),
+        GH_FAILED => ("GitHub CLI(gh) 실행에 실패했습니다. gh auth status를 확인하세요", "GitHub CLI (gh) failed. Check gh auth status"),
+        GITHUB_RATE_LIMITED => ("GitHub API 요청 한도에 도달했습니다. 잠시 후 다시 시도하세요", "GitHub API rate limit reached. Try again later"),
+        LINEAR_KEY_MISSING => ("Linear API 키가 설정되어 있지 않습니다", "Linear API key is not configured"),
+        LINEAR_AUTH_REJECTED => ("Linear 인증이 거부되었습니다. API 키를 확인하세요", "Linear authentication was rejected. Check your API key"),
+        COMPOSIO_KEY_MISSING => ("Composio API 키가 설정되어 있지 않습니다", "Composio API key is not configured"),
+        COMPOSIO_KEY_REJECTED => ("Composio API 키가 거부되었습니다. 키를 확인하세요", "Composio API key was rejected. Check your key"),
+        CREDENTIALS_REJECTED => ("서비스 인증이 거부되었습니다. 로그인이나 API 키를 확인하세요", "Service rejected credentials. Check your sign-in or API key"),
+        SERVICE_RATE_LIMITED => ("서비스 요청 한도에 도달했습니다. 잠시 후 다시 시도하세요", "Service rate limit reached. Try again later"),
+        BOT_NOT_FOUND => ("봇을 찾을 수 없습니다", "Bot not found"),
+        BOT_NOT_SET_UP => ("봇 설정이 아직 완료되지 않았습니다", "Bot is not set up yet"),
+        BOT_ALREADY_RUNNING => ("이미 실행 중입니다", "Already running"),
+        GROUP_NO_ACTIVE_BOTS => ("그룹에 활성 상태인 봇이 없습니다", "This group has no active member bots"),
     }
     // CLI·모바일·다른 호스트에서 바뀐 기본 계정 안내.
     // Orca's "Import from another app" (`bots.import`).
@@ -3795,8 +4022,8 @@ catalog! {
         DUE_NOW => ("곧 실행", "Due now"),
         FAILED => ("실패", "Failed"),
         RUNNING => ("실행 중", "Running"),
-        PAUSED => ("일시중지됨", "Paused"),
-        PAUSE_SHORT => ("일시중지", "Pause"),
+        PAUSED => ("일시정지됨", "Paused"),
+        PAUSE_SHORT => ("일시정지", "Pause"),
         RESUME_SHORT => ("다시 시작", "Resume"),
         RUN_NOW => ("지금 실행", "Run now"),
         RUN_QUEUED => ("자동화 실행을 시작했습니다.", "Automation run queued."),
@@ -3804,7 +4031,7 @@ catalog! {
         NEW_AUTOMATION => ("새 자동화", "New automation"),
         NEW_AUTOMATION_DRAFT => ("다음 일을 하는 자동화를 만들어 줘: ", "Set up an automation that "),
         ALL_AUTOMATIONS => ("자동화 {n}개 모두", "All {n} automations"),
-        PAUSED_COUNT => ("{n}개 일시중지됨", "{n} paused"),
+        PAUSED_COUNT => ("{n}개 일시정지됨", "{n} paused"),
         TIDY_SETTINGS => ("메모리 정리 설정", "Tidy memory settings"),
         LOOK_SETTINGS => ("둘러보기 설정", "Look around settings"),
         LOOK_NOW => ("지금 둘러보기", "Look now"),
@@ -3957,6 +4184,20 @@ fn is_last_value_suffix(value: &str) -> bool {
     ) || matches!(trimmed, "마지막 성공 값" | "마지막 확인 값")
 }
 
+fn find_catalog_message(trimmed: &str) -> Option<Message> {
+    ALL.iter()
+        .chain(link_ui::ALL.iter())
+        .copied()
+        .find(|key| key.ko == trimmed || key.en == trimmed)
+}
+
+fn is_account_or_usage_error(lower: &str, trimmed: &str) -> bool {
+    lower.contains("usage api")
+        || trimmed.contains("사용량 api")
+        || lower.contains("account")
+        || trimmed.contains("계정")
+}
+
 fn has_internal_diagnostic_marker(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("usage api")
@@ -3980,10 +4221,75 @@ fn translate_daemon_notice_atom(trimmed: &str, lang: Language) -> Option<String>
         | "can't open the tailscale backup address. check your tailscale connection" => {
             catalog::daemon_notice::TAILSCALE_BACKUP
         }
+        "tailscale is not connected" => catalog::daemon_notice::TAILSCALE_NOT_CONNECTED,
+        "tailscale serve stopped" => catalog::daemon_notice::TAILSCALE_SERVE_STOPPED,
         "모바일 릴레이에 연결하지 못했습니다 — 네트워크 확인 후 다시 시도"
         | "couldn't connect to the mobile relay. check your network and try again" => {
             catalog::daemon_notice::RELAY_FAILED
         }
+        "invalid relay response" | "invalid relay status" | "unexpected relay account response" => {
+            catalog::daemon_notice::RELAY_INVALID_RESPONSE
+        }
+        "relay request failed" | "relay account request failed" => {
+            catalog::daemon_notice::RELAY_REQUEST_FAILED
+        }
+        "mobile ipc worker unavailable" | "mobile relay ipc worker unavailable" => {
+            catalog::daemon_notice::MOBILE_WORKER_UNAVAILABLE
+        }
+        "pipito is not running" => catalog::daemon_notice::VOICE_PIPITO_NOT_RUNNING,
+        "pipito is not installed" => catalog::daemon_notice::VOICE_PIPITO_NOT_INSTALLED,
+        "invalid pipito health response" => catalog::daemon_notice::VOICE_PIPITO_INVALID_RESPONSE,
+        "empty audio recording" | "no audio captured from microphone" => {
+            catalog::daemon_notice::VOICE_EMPTY_AUDIO
+        }
+        "recording too long" => catalog::daemon_notice::VOICE_TOO_LONG,
+        "krilld does not support voice rpc (restart daemon to update)"
+        | "krilld does not support feat_control" => catalog::daemon_notice::VOICE_DAEMON_OUTDATED,
+        "audio capture initialization failed" | "failed to create audio event" => {
+            catalog::daemon_notice::VOICE_MIC_UNAVAILABLE
+        }
+        "unexpected reply for voicerequest"
+        | "unexpected voice status reply"
+        | "unexpected voice warm reply"
+        | "unexpected voice config reply"
+        | "unexpected voice config update reply"
+        | "unexpected voice feedback reply"
+        | "unexpected voice transcribe reply"
+        | "unexpected chunked transcribe reply"
+        | "chunked transcription finished without result" => {
+            catalog::daemon_notice::VOICE_UNEXPECTED_REPLY
+        }
+        "google oauth sign-in cancelled" | "oauth sign-in cancelled" => {
+            catalog::daemon_notice::OAUTH_CANCELLED
+        }
+        "google oauth callback timed out" | "mcp oauth sign-in timed out awaiting callback" => {
+            catalog::daemon_notice::OAUTH_TIMED_OUT
+        }
+        "google access token expired and no refresh token is stored" => {
+            catalog::daemon_notice::GOOGLE_TOKEN_EXPIRED
+        }
+        "mcp oauth server does not support required pkce s256" => {
+            catalog::daemon_notice::MCP_PKCE_UNSUPPORTED
+        }
+        "github token not set and gh cli fallback is disabled" => {
+            catalog::daemon_notice::GITHUB_TOKEN_MISSING
+        }
+        "gh cli timed out" => catalog::daemon_notice::GH_TIMED_OUT,
+        "linear api key not configured in secret vault" => {
+            catalog::daemon_notice::LINEAR_KEY_MISSING
+        }
+        "composio api key not configured in secret vault" => {
+            catalog::daemon_notice::COMPOSIO_KEY_MISSING
+        }
+        "bot is not set up" => catalog::daemon_notice::BOT_NOT_SET_UP,
+        "paste refused: the program does not use bracketed paste" => {
+            catalog::daemon_notice::PASTE_REFUSED_NO_BRACKETED
+        }
+        "verified model changes are unavailable on windows. keep chatting with the current model." => {
+            catalog::daemon_notice::COMPOSER_MODEL_WIN_UNAVAILABLE
+        }
+        "refresh failed" => catalog::daemon_notice::USAGE_REFRESH_FAILED,
+        "rate limited" => catalog::daemon_notice::USAGE_RATE_LIMITED,
         "사용량 자격증명 읽기 실패" | "failed to read usage credentials" => {
             catalog::daemon_notice::USAGE_CREDENTIALS
         }
@@ -4023,7 +4329,7 @@ fn translate_daemon_notice_atom(trimmed: &str, lang: Language) -> Option<String>
         | "daemon does not support this account extension; restart daemon" => {
             catalog::settings::ACCOUNTS_DAEMON_RESTART_REQUIRED
         }
-        "daemon closed usage stream" | "broken pipe" | "not connected" => {
+        "daemon closed usage stream" | "broken pipe" | "not connected" | "daemon not connected" => {
             catalog::settings::IO_CONNECTION_LOST
         }
         "account handoff cancellation requires the daemon"
@@ -4042,7 +4348,49 @@ fn translate_daemon_notice_atom(trimmed: &str, lang: Language) -> Option<String>
         "permission denied" => catalog::settings::IO_PERMISSION_DENIED,
         _ => {
             let is_usage = lower.contains("usage") || trimmed.contains("사용량");
-            if is_usage && (lower.contains("401") || lower.contains("rejected the sign-in")) {
+            if lower.starts_with("pipito transcribe failed")
+                || lower.starts_with("invalid pipito transcribe response")
+            {
+                catalog::daemon_notice::VOICE_TRANSCRIBE_FAILED
+            } else if lower.starts_with("pipito learn failed") {
+                catalog::daemon_notice::VOICE_LEARN_FAILED
+            } else if lower.starts_with("microphone start failed") {
+                catalog::daemon_notice::VOICE_MIC_START_FAILED
+            } else if lower.starts_with("microphone unavailable")
+                || lower.starts_with("microphone buffer enqueue failed")
+                || lower.starts_with("microphone capture unavailable")
+            {
+                catalog::daemon_notice::VOICE_MIC_UNAVAILABLE
+            } else if lower.starts_with("tailscale https setup failed") {
+                catalog::daemon_notice::TAILSCALE_HTTPS_FAILED
+            } else if lower.starts_with("tailscale serve exited") {
+                catalog::daemon_notice::TAILSCALE_SERVE_STOPPED
+            } else if lower.starts_with("krilld does not support feat_bots") {
+                catalog::daemon_notice::BOTS_DAEMON_OUTDATED
+            } else if lower.starts_with("unexpected daemon response")
+                || (lower.starts_with("unexpected ") && lower.contains(" response:"))
+            {
+                catalog::daemon_notice::BOTS_UNEXPECTED_REPLY
+            } else if lower.starts_with("gh cli exited non-zero") {
+                catalog::daemon_notice::GH_FAILED
+            } else if lower.starts_with("github api rate limited") {
+                catalog::daemon_notice::GITHUB_RATE_LIMITED
+            } else if lower.starts_with("linear authentication rejected") {
+                catalog::daemon_notice::LINEAR_AUTH_REJECTED
+            } else if lower.starts_with("composio api key rejected") {
+                catalog::daemon_notice::COMPOSIO_KEY_REJECTED
+            } else if lower.contains("rejected credentials (http ") {
+                catalog::daemon_notice::CREDENTIALS_REJECTED
+            } else if !is_usage && lower.contains("rate limited (http 429)") {
+                catalog::daemon_notice::SERVICE_RATE_LIMITED
+            } else if lower.starts_with("bot not found:") {
+                catalog::daemon_notice::BOT_NOT_FOUND
+            } else if lower.ends_with(" is already running") {
+                catalog::daemon_notice::BOT_ALREADY_RUNNING
+            } else if lower.starts_with("group '") && lower.ends_with("has no active member bots") {
+                catalog::daemon_notice::GROUP_NO_ACTIVE_BOTS
+            } else if is_usage && (lower.contains("401") || lower.contains("rejected the sign-in"))
+            {
                 catalog::daemon_notice::USAGE_HTTP_401
             } else if is_usage && (lower.contains("403") || lower.contains("denied access")) {
                 catalog::daemon_notice::USAGE_HTTP_403
@@ -4089,9 +4437,7 @@ pub fn translate_daemon_notice_in(value: &str, lang: Language) -> Option<String>
         let reason_trimmed = reason.trim();
         let reason_msg = translate_daemon_notice_atom(reason_trimmed, lang)
             .or_else(|| {
-                ALL.iter()
-                    .find(|key| key.ko == reason_trimmed || key.en == reason_trimmed)
-                    .map(|k| k.in_language(lang).to_owned())
+                find_catalog_message(reason_trimmed).map(|k| k.in_language(lang).to_owned())
             })
             .unwrap_or_else(|| {
                 if has_internal_diagnostic_marker(reason_trimmed) {
@@ -4154,10 +4500,7 @@ pub fn sanitize_handoff_error_in(raw: &str, lang: Language) -> String {
     if let Some(notice) = translate_daemon_notice_in(trimmed, lang) {
         return notice;
     }
-    if let Some(key) = ALL
-        .iter()
-        .find(|key| key.ko == trimmed || key.en == trimmed)
-    {
+    if let Some(key) = find_catalog_message(trimmed) {
         return key.in_language(lang).to_owned();
     }
     if has_internal_diagnostic_marker(trimmed) {
@@ -4180,10 +4523,7 @@ fn cached_notice_line_in(value: &str, lang: Language) -> String {
     if let Some(handoff) = try_sanitize_handoff_error_in(trimmed, lang) {
         return handoff;
     }
-    if let Some(key) = ALL
-        .iter()
-        .find(|key| key.ko == trimmed || key.en == trimmed)
-    {
+    if let Some(key) = find_catalog_message(trimmed) {
         return key.in_language(lang).to_owned();
     }
     if let Some((label, detail)) = trimmed.split_once(": ")
@@ -4197,10 +4537,7 @@ fn cached_notice_line_in(value: &str, lang: Language) -> String {
                     .then(|| catalog::settings::IO_GENERIC.in_language(lang).to_owned())
             })
             .unwrap_or_else(|| detail.to_owned());
-        return catalog::open_in::FAILED
-            .in_language(lang)
-            .replace("{app}", app)
-            .replace("{error}", &clean_detail);
+        return catalog::open_in::FAILED.format_in(lang, &[("app", app), ("error", &clean_detail)]);
     }
     let parts = trimmed
         .split_once(": ")
@@ -4213,16 +4550,10 @@ fn cached_notice_line_in(value: &str, lang: Language) -> String {
                 .map(|(label, detail)| (label, detail, " — ")),
         );
     for (label, detail, separator) in parts {
-        let label_msg = translate_daemon_notice_in(label, lang).or_else(|| {
-            ALL.iter()
-                .find(|key| key.ko == label || key.en == label)
-                .map(|k| k.in_language(lang).to_owned())
-        });
-        let detail_msg = translate_daemon_notice_in(detail, lang).or_else(|| {
-            ALL.iter()
-                .find(|key| key.ko == detail || key.en == detail)
-                .map(|k| k.in_language(lang).to_owned())
-        });
+        let label_msg = translate_daemon_notice_in(label, lang)
+            .or_else(|| find_catalog_message(label).map(|k| k.in_language(lang).to_owned()));
+        let detail_msg = translate_daemon_notice_in(detail, lang)
+            .or_else(|| find_catalog_message(detail).map(|k| k.in_language(lang).to_owned()));
         if label_msg.is_some() || detail_msg.is_some() {
             if separator == " — " && is_last_value_suffix(detail) {
                 return format!(
@@ -4239,9 +4570,12 @@ fn cached_notice_line_in(value: &str, lang: Language) -> String {
         }
     }
     if has_internal_diagnostic_marker(trimmed) {
-        return catalog::settings::ACCOUNTS_ACTION_FAILED
-            .in_language(lang)
-            .to_owned();
+        let fallback = if is_account_or_usage_error(&trimmed.to_ascii_lowercase(), trimmed) {
+            catalog::settings::ACCOUNTS_ACTION_FAILED
+        } else {
+            catalog::settings::IO_GENERIC
+        };
+        return fallback.in_language(lang).to_owned();
     }
     trimmed.to_owned()
 }
@@ -4465,7 +4799,7 @@ pub const SETTINGS_SEARCH_INDEX: &[(crate::admin_tab::AdminTab, Message, &[&str]
             "페어링",
             "다른 컴퓨터",
             "원격 컴퓨터",
-            "다른 Mac",
+            "다른 기기",
             "접속 허용",
             "invite",
             "pair",
@@ -4909,7 +5243,7 @@ pub mod link_ui {
         HOST_NAME_LABEL => ("연결할 컴퓨터 이름 (이 컴퓨터에서 보일 이름)", "Name for the other computer (shown on this computer)"),
         HOST_NAME_PLACEHOLDER => ("비워 두면 상대 컴퓨터가 알려준 이름을 씁니다", "Leave empty to use the other computer’s own name"),
         DEVICE_NAME_LABEL => ("이 컴퓨터 이름 (상대 컴퓨터에서 보일 이름)", "This computer’s name (shown on the other computer)"),
-        DEVICE_NAME_PLACEHOLDER => ("예: 오웬의 노트북", "e.g. Owen’s laptop"),
+        DEVICE_NAME_PLACEHOLDER => ("예: 내 노트북", "e.g. My laptop"),
         DEFAULT_DEVICE_NAME => ("내 컴퓨터", "My computer"),
         USER_MAC_NAME => ("{user}의 컴퓨터", "{user}’s computer"),
         CONNECT_BUTTON => ("연결", "Connect"),
@@ -4939,7 +5273,7 @@ pub mod link_ui {
         NEARBY_EMPTY => ("근처 컴퓨터 자동 찾기는 아직 지원하지 않습니다. 초대 링크로 연결해 주세요.", "Nearby discovery is not available yet. Please use an invite link."),
         NEARBY_SELECT => ("선택", "Select"),
         NEARBY_CONNECT => ("연결", "Connect"),
-        DEMO_DEVICE_AIR => ("오웬의 노트북", "Owen’s laptop"),
+        DEMO_DEVICE_AIR => ("내 노트북", "My laptop"),
         DEMO_DEVICE_STUDIO => ("작업실 데스크톱", "Studio desktop"),
         DEMO_NEARBY_HOME => ("집 컴퓨터", "Home computer"),
         DEMO_NEARBY_IMAC => ("거실 컴퓨터", "Living Room computer"),

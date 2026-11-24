@@ -18,24 +18,75 @@ fn fields(template: &str) -> BTreeSet<&str> {
 #[test]
 fn catalog_has_no_missing_translations_or_mismatched_placeholders() {
     let mut ids = BTreeSet::new();
-    for key in ALL {
+    for key in ALL.iter().chain(i18n::link_ui::ALL.iter()) {
         assert!(ids.insert(key.id), "duplicate key {}", key.id);
         let ko = key.in_language(Language::Ko);
         let en = key.in_language(Language::En);
         assert!(!ko.trim().is_empty() && !en.trim().is_empty(), "{}", key.id);
         assert_eq!(fields(ko), fields(en), "{}", key.id);
-        assert!(
-            !en.chars().any(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c)),
-            "{}: {en}",
-            key.id
-        );
+        // `settings.KO` is intentionally the autonym "한국어" in every language.
+        if key.id != "settings.KO" {
+            assert!(
+                !en.chars().any(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c)),
+                "{}: {en}",
+                key.id
+            );
+        }
     }
     assert_eq!(
         settings::Settings::parse("").unwrap().language,
-        settings::Settings::default().language
+        settings::LanguageChoice::System
     );
-    assert!(settings::Settings::parse("language = 'fr'").is_err());
-    for language in [Language::Ko, Language::En] {
+    // Resilient language tag parsing: accepts system/auto, BCP-47/case variants,
+    // degrades unknown future tags to System, and still rejects non-string TOML values.
+    assert_eq!(
+        settings::Settings::parse("language = 'system'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::System
+    );
+    assert_eq!(
+        settings::Settings::parse("language = 'auto'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::System
+    );
+    assert_eq!(
+        settings::Settings::parse("language = 'en-US'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::En
+    );
+    assert_eq!(
+        settings::Settings::parse("language = 'EN'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::En
+    );
+    assert_eq!(
+        settings::Settings::parse("language = 'ko-KR'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::Ko
+    );
+    assert_eq!(
+        settings::Settings::parse("language = 'fr'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::System
+    );
+    assert_eq!(
+        settings::Settings::parse("language = 'ja'")
+            .unwrap()
+            .language,
+        settings::LanguageChoice::System
+    );
+    assert!(settings::Settings::parse("language = 123").is_err());
+    for language in [
+        settings::LanguageChoice::System,
+        settings::LanguageChoice::Ko,
+        settings::LanguageChoice::En,
+    ] {
         let value = settings::Settings {
             language,
             ..settings::Settings::default()
@@ -104,8 +155,9 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
             assert_eq!(settings::current(cx).language, language);
+            assert_eq!(settings::current(cx).resolved_language(), language);
             assert_eq!(i18n::language(), language);
-            for key in ALL {
+            for key in ALL.iter().chain(i18n::link_ui::ALL.iter()) {
                 assert_eq!(key.get(), key.in_language(language), "{}", key.id);
             }
             assert_eq!(
@@ -179,6 +231,67 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
                 i18n::cached_notice("VS Code 열기 실패: broken"),
                 catalog::open_in::FAILED.format(&[("app", "VS Code"), ("error", "broken")])
             );
+            // Placeholder tokens inside user/error details must never be re-interpolated.
+            assert_eq!(
+                i18n::cached_notice("VS Code 열기 실패: literal {app} detail"),
+                catalog::open_in::FAILED
+                    .format(&[("app", "VS Code"), ("error", "literal {app} detail")])
+            );
+            // Non-account HTTP/OS/socket errors fall back to IO_GENERIC, never ACCOUNTS_ACTION_FAILED.
+            assert_eq!(
+                i18n::cached_notice("GitHub webhook returned HTTP 500"),
+                catalog::settings::IO_GENERIC.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("failed to connect /tmp/krilld.sock (os error 61)"),
+                catalog::settings::IO_GENERIC.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("account sync returned HTTP 500"),
+                catalog::settings::ACCOUNTS_ACTION_FAILED.get()
+            );
+            // link_ui::ALL messages participate in cached_notice translation.
+            assert_eq!(
+                i18n::cached_notice(i18n::link_ui::ERR_UNAVAILABLE.in_language(Language::Ko)),
+                i18n::link_ui::ERR_UNAVAILABLE.get()
+            );
+            // Expanded daemon notice mappings (Voice/Pipito, Tailscale/Relay, Bots, Usage, IPC).
+            assert_eq!(
+                i18n::cached_notice("Pipito is not running"),
+                catalog::daemon_notice::VOICE_PIPITO_NOT_RUNNING.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Pipito transcribe failed: timeout"),
+                catalog::daemon_notice::VOICE_TRANSCRIBE_FAILED.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Tailscale is not connected"),
+                catalog::daemon_notice::TAILSCALE_NOT_CONNECTED.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Tailscale HTTPS setup failed: cert denied"),
+                catalog::daemon_notice::TAILSCALE_HTTPS_FAILED.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Google OAuth callback timed out"),
+                catalog::daemon_notice::OAUTH_TIMED_OUT.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Composio API key not configured in secret vault"),
+                catalog::daemon_notice::COMPOSIO_KEY_MISSING.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("daemon not connected"),
+                catalog::settings::IO_CONNECTION_LOST.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Refresh failed"),
+                catalog::daemon_notice::USAGE_REFRESH_FAILED.get()
+            );
+            assert_eq!(
+                i18n::cached_notice("Rate limited"),
+                catalog::daemon_notice::USAGE_RATE_LIMITED.get()
+            );
             assert_eq!(
                 catalog::security::PASTE_WARNING
                     .format(&[("lines", "2"), ("preview", "{lines} 한글")]),
@@ -189,16 +302,16 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
             );
         });
     }
-    // External edits share the same path. Invalid input retains the previous language.
+    // External edits share the same path. Invalid TOML retains the previous language.
     std::fs::write(dir.join("settings.toml"), "language = 'en'").unwrap();
     cx.update(|_, cx| settings::reload(cx));
     cx.run_until_parked();
     assert_eq!(i18n::language(), Language::En);
-    std::fs::write(dir.join("settings.toml"), "language = 'unsupported'").unwrap();
+    std::fs::write(dir.join("settings.toml"), "language = 123").unwrap();
     cx.update(|_, cx| settings::reload(cx));
     cx.run_until_parked();
     assert_eq!(i18n::language(), Language::En);
-    // Reopening honors a saved choice; removing it resolves the first-launch default again.
+    // Reopening honors a saved choice; removing it resolves the system default again.
     std::fs::write(dir.join("settings.toml"), "language = 'en'").unwrap();
     cx.update(|_, cx| settings::init_at(Some(dir.clone()), cx));
     cx.run_until_parked();
@@ -206,7 +319,14 @@ fn ko_en_ko_switch_refreshes_existing_inputs_results_and_saved_settings(cx: &mut
     std::fs::write(dir.join("settings.toml"), "theme = 'dark'").unwrap();
     cx.update(|_, cx| settings::reload(cx));
     cx.run_until_parked();
-    assert_eq!(i18n::language(), settings::Settings::default().language);
+    assert_eq!(
+        cx.update(|_, cx| settings::current(cx).language),
+        settings::LanguageChoice::System
+    );
+    assert_eq!(
+        i18n::language(),
+        settings::Settings::default().resolved_language()
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -220,7 +340,11 @@ fn embedded_input_and_diff_controls_have_korean_translations_without_fallback() 
             group = line.trim_end_matches(':');
         } else if line.starts_with("  ") && !line.starts_with("    ") {
             let name = line.trim().trim_end_matches(':');
-            if group == "Input" || group == "Diff" || (group == "Dock" && name == "Unnamed") {
+            if matches!(
+                group,
+                "Input" | "Diff" | "Select" | "ComboBox" | "DropdownButton" | "Dialog" | "List"
+            ) || (group == "Dock" && name == "Unnamed")
+            {
                 let key = format!("{group}.{name}");
                 let ko = backend
                     .translate("ko", &key)
@@ -237,5 +361,17 @@ fn embedded_input_and_diff_controls_have_korean_translations_without_fallback() 
     assert_eq!(
         backend.translate("ko", "Input.Copy").as_deref(),
         Some("복사")
+    );
+    assert_eq!(backend.translate("ko", "Copy").as_deref(), Some("복사"));
+    assert_eq!(backend.translate("en", "Copy").as_deref(), Some("Copy"));
+    assert_eq!(
+        backend.translate("ko", "Select.placeholder").as_deref(),
+        Some("선택하세요")
+    );
+    assert_eq!(
+        backend
+            .translate("ko", "List.search_placeholder")
+            .as_deref(),
+        Some("검색…")
     );
 }

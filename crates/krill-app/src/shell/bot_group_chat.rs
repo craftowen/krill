@@ -825,7 +825,14 @@ impl Shell {
         let entry = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
         if let Some((input, _)) = &entry.composer {
             let input = input.clone();
-            if std::mem::take(&mut entry.focus_composer) == ComposerFocus::Focus {
+            let focus_now = std::mem::take(&mut entry.focus_composer) == ComposerFocus::Focus;
+            krill_app::i18n::sync_textarea_placeholder(
+                &input,
+                text::GRP_COMPOSER_HINT.get(),
+                window,
+                cx,
+            );
+            if focus_now {
                 input.update(cx, |s, cx| s.focus(window, cx));
             }
             return input;

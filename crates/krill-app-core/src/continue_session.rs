@@ -201,6 +201,12 @@ impl Dialog {
 
 impl Render for Dialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::i18n::sync_input_placeholder(
+            &self.prompt,
+            text::PROMPT_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
         let p = ui::palette(cx);
         let subtitle = text::SUBTITLE.format(&[("id", &self.source.0.to_string())]);
         let selected = self.selected_agent.clone();

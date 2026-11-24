@@ -1720,7 +1720,7 @@ impl View {
 
     fn render_error_with_retry(
         &self,
-        err: SharedString,
+        err: &str,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -1743,7 +1743,7 @@ impl View {
                         .min_w_0()
                         .text_size(ui::TEXT_XS)
                         .text_color(p.destructive)
-                        .child(err),
+                        .child(crate::i18n::cached_notice(err)),
                 )
                 .child(
                     ui::secondary("bots-error-retry", text::RETRY.get())
@@ -2566,14 +2566,14 @@ impl View {
                                 )),
                             )
                             .child(
-                                ui::secondary(
+                                ui::button_with_reserved_label(
                                     "bots-toggle-pause",
-                                    if paused {
-                                        text::RESUME_BOT.get()
-                                    } else {
-                                        text::PAUSE_BOT.get()
-                                    },
+                                    text::PAUSE_BOT.get(),
+                                    text::RESUME_BOT.get(),
+                                    paused,
                                 )
+                                .small()
+                                .outline()
                                 .debug_selector(|| "bots-toggle-pause".into())
                                 .disabled(self.busy)
                                 .on_click(cx.listener(
@@ -2813,7 +2813,7 @@ impl Render for View {
                         .children(pending_switch_banner)
                         .children(
                             self.error
-                                .clone()
+                                .as_deref()
                                 .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
                         .children(self.render_notice(p))
@@ -2856,7 +2856,7 @@ impl Render for View {
                         )
                         .children(
                             self.error
-                                .clone()
+                                .as_deref()
                                 .map(|err| self.render_error_with_retry(err, p, cx)),
                         )
                         .map(|d| match self.unsupported.clone() {

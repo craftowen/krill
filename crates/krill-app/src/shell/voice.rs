@@ -238,8 +238,9 @@ impl Shell {
                 cx.notify();
             }
             Err(err) => {
-                self.notice = Some(err.clone());
-                self.voice.error = Some(SharedString::from(err));
+                let localized = krill_app::i18n::cached_notice(&err);
+                self.notice = Some(localized.clone());
+                self.voice.error = Some(SharedString::from(localized));
                 cx.notify();
             }
         }
@@ -278,8 +279,9 @@ impl Shell {
         let wav_bytes = match recorder.stop() {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.notice = Some(err.clone());
-                self.voice.error = Some(SharedString::from(err));
+                let localized = krill_app::i18n::cached_notice(&err);
+                self.notice = Some(localized.clone());
+                self.voice.error = Some(SharedString::from(localized));
                 cx.notify();
                 return;
             }
@@ -310,7 +312,7 @@ impl Shell {
                         }
                     }
                     Err(err) => {
-                        let msg = err.to_string();
+                        let msg = krill_app::i18n::cached_notice(&err.to_string());
                         this.notice = Some(msg.clone());
                         this.voice.error = Some(SharedString::from(msg));
                     }

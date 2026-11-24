@@ -67,6 +67,7 @@ struct GroupCacheKey {
     needs_keys: Vec<(BotId, String)>,
     live_working_sessions: Vec<krill_proto::SessionId>,
     minute_bucket: u64,
+    language: crate::i18n::Language,
 }
 
 pub(super) struct GroupListCache {
@@ -492,6 +493,7 @@ impl View {
                 .collect(),
             live_working_sessions,
             minute_bucket: now / 60_000,
+            language: crate::i18n::language(),
         };
         if self.group_panel.list_cache.key.as_ref() == Some(&next_key) {
             return;

@@ -129,7 +129,10 @@ fn chat_message_time_at(
     use crate::i18n::catalog::chat as text;
     let at = local_civil(epoch, offset)?;
     let today = local_civil(now, now_offset)?;
-    let yesterday = local_civil(now.checked_sub(SECONDS_PER_DAY)?, now_offset)?;
+    // Compute the calendar day before `today` in local civil coordinates so DST
+    // 23-hour / 25-hour days never skip or duplicate "yesterday".
+    let today_local = now.checked_add(i64::from(now_offset))?;
+    let yesterday = civil_from_epoch(today_local.checked_sub(SECONDS_PER_DAY)?)?;
     let hour12 = match at.hour % 12 {
         0 => 12,
         h => h,
@@ -254,6 +257,100 @@ mod tests {
                 .unwrap()
                 .0,
             "오전 12:00"
+        );
+    }
+
+    #[test]
+    fn chat_message_time_yesterday_survives_dst_transitions() {
+        let est = -5 * 3_600;
+        let edt = -4 * 3_600;
+
+        // Spring-forward (US Eastern 2027-03-14 is a 23-hour day).
+        // `now` = 2027-03-15 00:30 EDT (UTC 2027-03-15 04:30).
+        let now_spring = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 3,
+            day: 15,
+            hour: 4,
+            minute: 30,
+            second: 0,
+        })
+        .unwrap();
+        // 2027-03-14 00:30 EST (23h before `now`) is calendar yesterday.
+        let msg_spring_yesterday = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 3,
+            day: 14,
+            hour: 5,
+            minute: 30,
+            second: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            chat_message_time_at(msg_spring_yesterday, est, now_spring, edt)
+                .unwrap()
+                .0,
+            "어제 오전 12:30"
+        );
+        // 2027-03-13 23:30 EST (24h before `now`) is two calendar days ago, NOT yesterday.
+        let msg_spring_two_days = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 3,
+            day: 14,
+            hour: 4,
+            minute: 30,
+            second: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            chat_message_time_at(msg_spring_two_days, est, now_spring, edt)
+                .unwrap()
+                .0,
+            "3월 13일 오후 11:30"
+        );
+
+        // Fall-back (US Eastern 2027-11-07 is a 25-hour day).
+        // `now` = 2027-11-07 23:30 EST (UTC 2027-11-08 04:30).
+        let now_fall = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 11,
+            day: 8,
+            hour: 4,
+            minute: 30,
+            second: 0,
+        })
+        .unwrap();
+        // 2027-11-07 00:30 EDT (24h before `now`) is still today.
+        let msg_fall_today = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 11,
+            day: 7,
+            hour: 4,
+            minute: 30,
+            second: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            chat_message_time_at(msg_fall_today, edt, now_fall, est)
+                .unwrap()
+                .0,
+            "오전 12:30"
+        );
+        // 2027-11-06 23:30 EDT (25h before `now`) is calendar yesterday.
+        let msg_fall_yesterday = epoch_from_civil(CivilTime {
+            year: 2027,
+            month: 11,
+            day: 7,
+            hour: 3,
+            minute: 30,
+            second: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            chat_message_time_at(msg_fall_yesterday, edt, now_fall, est)
+                .unwrap()
+                .0,
+            "어제 오후 11:30"
         );
     }
 

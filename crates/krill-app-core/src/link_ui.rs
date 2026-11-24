@@ -1295,7 +1295,7 @@ impl ServerPanel {
             })
             .when_some(self.error.clone(), |d, err| {
                 d.child(
-                    crate::ui::error_banner(p, err)
+                    crate::ui::error_banner(p, crate::i18n::cached_notice(&err))
                         .id("link-server-error")
                         .debug_selector(|| "link-server-error".into()),
                 )

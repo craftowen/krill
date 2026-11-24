@@ -99,6 +99,12 @@ impl SettingsView {
                 })
             })
             .clone();
+        crate::i18n::sync_textarea_placeholder(
+            &input,
+            text::FEEDBACK_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
         let sending = self.feedback_status == Some(Status::Sending);
         let empty = message(&input.read(cx).value()).is_none();
         let status = self.feedback_status.and_then(|status| match status {

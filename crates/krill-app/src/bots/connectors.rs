@@ -1269,12 +1269,13 @@ impl View {
         }
         if let Some(err) = &st.last_error {
             has_any = true;
+            let localized = crate::i18n::cached_notice(err);
             let formatted = match st.error_category {
                 Some(BotErrorCategory::SignedOut) => {
-                    format!("{} — {err}", hm::CONN_RECONNECT_HINT.get())
+                    format!("{} — {localized}", hm::CONN_RECONNECT_HINT.get())
                 }
-                Some(cat) => format!("[{}] {err}", cat.as_str()),
-                None => err.clone(),
+                Some(cat) => format!("[{}] {localized}", cat.as_str()),
+                None => localized,
             };
             lines = lines.child(ui::error_banner(p, formatted));
         } else if st.error_category == Some(BotErrorCategory::SignedOut) {

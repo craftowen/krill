@@ -547,7 +547,14 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::Entity<gpui_component::input::InputState> {
         if let Some((input, _)) = &self.shortcuts.search {
-            return input.clone();
+            let input = input.clone();
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::SC_SEARCH_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            return input;
         }
         let input = cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx)

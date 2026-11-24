@@ -649,7 +649,13 @@ impl View {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings.look_focus_input.is_some() {
+        if let Some(input) = self.settings.look_focus_input.clone() {
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::SV_LOOK_FOCUS_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             return;
         }
         let focus = bot.look_around.focus.clone();

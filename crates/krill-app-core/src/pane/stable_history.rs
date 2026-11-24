@@ -86,12 +86,16 @@ impl Cache {
         self.pending = None;
     }
     fn stop(&mut self, status: HistoryViewStatus) {
+        use crate::i18n::catalog::link as text;
         self.stopped = true;
-        self.notice=Some(match status {
-            HistoryViewStatus::Capacity=>"History cache metadata limit reached. Current view is retained; return to the bottom to open a new view.",
-            HistoryViewStatus::Missing=>"Original history is no longer available. Current view is retained; return to the bottom to refresh.",
-            _=>"History view changed or expired. Current view is retained; return to the bottom to refresh.",
-        }.to_owned());
+        self.notice = Some(
+            match status {
+                HistoryViewStatus::Capacity => text::HISTORY_LIMIT.get(),
+                HistoryViewStatus::Missing => text::HISTORY_MISSING.get(),
+                _ => text::HISTORY_EXPIRED.get(),
+            }
+            .to_owned(),
+        );
     }
     pub(super) fn take_notice(&mut self) -> Option<String> {
         self.notice.take()
@@ -510,7 +514,10 @@ mod tests {
             assert!(cache.rows.values().map(Cache::weight).sum::<usize>() <= MAX_BYTES);
         }
         assert!(cache.stopped);
-        assert!(cache.take_notice().unwrap().contains("limit"));
+        assert_eq!(
+            cache.take_notice().as_deref(),
+            Some(crate::i18n::catalog::link::HISTORY_LIMIT.get())
+        );
         assert_eq!(cache.visible(), 24);
     }
 

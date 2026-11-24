@@ -2290,23 +2290,30 @@ impl WorkRunTimingState {
 }
 
 pub(super) fn format_elapsed_secs(secs: u64) -> String {
+    format_elapsed_secs_in(secs, krill_app::i18n::language())
+}
+
+pub(super) fn format_elapsed_secs_in(secs: u64, lang: krill_app::i18n::Language) -> String {
+    use krill_app::i18n::catalog::chat as text;
     if secs < 60 {
-        format!("{secs}s")
+        text::ELAPSED_SEC.format_in(lang, &[("s", &secs.to_string())])
     } else if secs < 3600 {
         let mins = secs / 60;
         let rem = secs % 60;
         if rem == 0 {
-            format!("{mins}m")
+            text::ELAPSED_MIN.format_in(lang, &[("m", &mins.to_string())])
         } else {
-            format!("{mins}m {rem}s")
+            text::ELAPSED_MIN_SEC
+                .format_in(lang, &[("m", &mins.to_string()), ("s", &rem.to_string())])
         }
     } else {
         let hours = secs / 3600;
         let mins = (secs % 3600) / 60;
         if mins == 0 {
-            format!("{hours}h")
+            text::ELAPSED_HOUR.format_in(lang, &[("h", &hours.to_string())])
         } else {
-            format!("{hours}h {mins}m")
+            text::ELAPSED_HOUR_MIN
+                .format_in(lang, &[("h", &hours.to_string()), ("m", &mins.to_string())])
         }
     }
 }

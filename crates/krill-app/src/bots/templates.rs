@@ -988,6 +988,7 @@ pub(super) fn comes_with_rows(
 
 impl Render for Templates {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::i18n::sync_input_placeholder(&self.search, text::TPL_SEARCH.get(), window, cx);
         let p = ui::palette(cx);
         let viewport = window.viewport_size();
         let width = px(WIDTH).min(viewport.width - ui::SPACE_4 * 2.);

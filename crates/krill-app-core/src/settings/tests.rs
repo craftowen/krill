@@ -73,31 +73,48 @@ proptest::proptest! {
 }
 
 #[test]
-fn missing_language_uses_first_launch_choice_but_saved_selection_wins() {
+fn missing_language_uses_system_choice_but_saved_selection_wins() {
     for default_language in [Language::En, Language::Ko] {
         for body in ["", "theme = 'light'\nnotifications = false"] {
             let parsed = Settings::parse_with_language(body, default_language).unwrap();
-            assert_eq!(parsed.language, default_language);
-            // Once written, the resolved choice survives a different OS preference on upgrade.
+            assert_eq!(parsed.language, LanguageChoice::System);
+            assert_eq!(
+                parsed.resolved_language_with(default_language),
+                default_language
+            );
+            // Saving without explicitly choosing a language keeps `system` so future OS
+            // language changes are respected instead of locking first-launch locale.
             for later_default in [Language::Ko, Language::En] {
+                let reparsed =
+                    Settings::parse_with_language(&parsed.to_toml(), later_default).unwrap();
+                assert_eq!(reparsed, parsed);
                 assert_eq!(
-                    Settings::parse_with_language(&parsed.to_toml(), later_default).unwrap(),
-                    parsed
+                    reparsed.resolved_language_with(later_default),
+                    later_default
                 );
             }
         }
         for (body, saved) in [
-            ("language = 'en'", Language::En),
-            ("language = 'ko'", Language::Ko),
+            ("language = 'en'", LanguageChoice::En),
+            ("language = 'ko'", LanguageChoice::Ko),
+            ("language = 'en-US'", LanguageChoice::En),
+            ("language = 'ko-KR'", LanguageChoice::Ko),
+            ("language = 'EN'", LanguageChoice::En),
+            ("language = 'system'", LanguageChoice::System),
+            ("language = 'auto'", LanguageChoice::System),
+            // Unknown future language tags degrade cleanly to System instead of failing config load.
+            ("language = 'fr'", LanguageChoice::System),
+            ("language = 'ja'", LanguageChoice::System),
         ] {
             assert_eq!(
                 Settings::parse_with_language(body, default_language)
                     .unwrap()
                     .language,
-                saved
+                saved,
+                "{body}"
             );
         }
-        assert!(Settings::parse_with_language("language = 'fr'", default_language).is_err());
+        assert!(Settings::parse_with_language("language = 123", default_language).is_err());
     }
 }
 
@@ -107,16 +124,20 @@ fn first_window_uses_resolved_language_before_async_config_read(cx: &mut TestApp
     for language in [Language::En, Language::Ko] {
         cx.update(|cx| {
             init_at_with_language(None, language, cx);
-            assert_eq!(current(cx).language, language);
+            assert_eq!(current(cx).language, LanguageChoice::System);
+            assert_eq!(current(cx).resolved_language_with(language), language);
             assert_eq!(crate::i18n::language(), language);
         });
         cx.run_until_parked();
-        cx.update(|cx| assert_eq!(current(cx).language, language));
+        cx.update(|cx| {
+            assert_eq!(current(cx).language, LanguageChoice::System);
+            assert_eq!(crate::i18n::language(), language);
+        });
     }
 }
 
 #[test]
-fn unrelated_saved_config_edit_preserves_explicit_language() {
+fn unrelated_saved_config_edit_preserves_explicit_or_system_language() {
     let d = dir("saved-language-edit");
     for (name, language) in [("ko", Language::Ko), ("en", Language::En)] {
         let body = format!("# User preference\nlanguage = '{name}'\nnotifications = true\n");
@@ -129,10 +150,104 @@ fn unrelated_saved_config_edit_preserves_explicit_language() {
         for later_default in [Language::Ko, Language::En] {
             let reopened = Settings::parse_with_language(&saved, later_default).unwrap();
             assert_eq!(reopened.language, language);
+            assert_eq!(reopened.resolved_language_with(later_default), language);
             assert!(!reopened.notifications);
         }
     }
+    // Unrelated edit when language was unset keeps `LanguageChoice::System` instead of locking.
+    fs::write(d.join(SETTINGS_FILE), "notifications = true\n").unwrap();
+    let (settings, _) =
+        persist_settings_edit(&d, |settings| settings.notifications = false).unwrap();
+    assert_eq!(settings.language, LanguageChoice::System);
+    let saved = fs::read_to_string(d.join(SETTINGS_FILE)).unwrap();
+    for later_default in [Language::Ko, Language::En] {
+        let reopened = Settings::parse_with_language(&saved, later_default).unwrap();
+        assert_eq!(reopened.language, LanguageChoice::System);
+        assert_eq!(
+            reopened.resolved_language_with(later_default),
+            later_default
+        );
+    }
     fs::remove_dir_all(d).unwrap();
+}
+
+#[gpui::test]
+fn language_switch_refreshes_settings_view_placeholders(cx: &mut TestAppContext) {
+    let d = dir("settings-placeholder-refresh");
+    fs::write(d.join(SETTINGS_FILE), "language = 'ko'\n").unwrap();
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(900.)));
+    vcx.run_until_parked();
+
+    // Stay on Feedback so sidebar search and feedback textarea stay alive across language switches.
+    view.update(vcx, |v, cx| v.set_tab(AdminTab::Feedback, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+
+    for language in [Language::En, Language::Ko] {
+        vcx.update(|_, cx| set_language(language, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(
+                v.search
+                    .as_ref()
+                    .expect("search input")
+                    .0
+                    .read(cx)
+                    .presentation()
+                    .placeholder()
+                    .as_ref(),
+                text::SEARCH_SETTINGS.in_language(language)
+            );
+            assert_eq!(
+                v.feedback_input
+                    .as_ref()
+                    .expect("feedback input")
+                    .read(cx)
+                    .presentation()
+                    .placeholder()
+                    .as_ref(),
+                text::FEEDBACK_PLACEHOLDER.in_language(language)
+            );
+        });
+    }
+
+    // Verify Shortcuts search input refreshes in place while Shortcuts tab remains open.
+    view.update(vcx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    for language in [Language::En, Language::Ko] {
+        vcx.update(|_, cx| set_language(language, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(
+                v.shortcuts
+                    .search
+                    .as_ref()
+                    .expect("shortcut search input")
+                    .0
+                    .read(cx)
+                    .presentation()
+                    .placeholder()
+                    .as_ref(),
+                text::SC_SEARCH_PLACEHOLDER.in_language(language)
+            );
+        });
+    }
+    fs::remove_dir_all(d).ok();
 }
 
 #[test]
@@ -10342,6 +10457,7 @@ fn orca_option_auto_preserves_explicit_legacy_overrides() {
         assert!(us_keyboard_layout(id));
     }
     for id in [
+        "com.apple.keylayout.USExtended",
         "com.apple.keylayout.German",
         "com.apple.inputmethod.Korean.2SetKorean",
         "unknown",
@@ -11245,7 +11361,7 @@ fn automations_sidebar_visibility_defaults_and_toml_roundtrip() {
     settings.terminal_custom_themes.push(custom);
     let encoded = settings.to_toml();
     assert_eq!(
-        Settings::parse_with_language(&encoded, settings.language).unwrap(),
+        Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
         settings
     );
     assert!(encoded.contains("show_automations_button = false"));
@@ -11273,7 +11389,7 @@ fn mobile_sidebar_visibility_defaults_and_toml_roundtrip() {
     settings.terminal_custom_themes.push(custom);
     let encoded = settings.to_toml();
     assert_eq!(
-        Settings::parse_with_language(&encoded, settings.language).unwrap(),
+        Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
         settings
     );
     assert!(encoded.contains("show_mobile_button = false"));
@@ -12415,7 +12531,7 @@ fn chat_auto_continue_after_rate_limit_defaults_off_and_toml_roundtrips() {
     let encoded = settings.to_toml();
     assert!(encoded.contains("chat_auto_continue_after_rate_limit = true"));
     assert_eq!(
-        Settings::parse_with_language(&encoded, settings.language).unwrap(),
+        Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
         settings
     );
 }

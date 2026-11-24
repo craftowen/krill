@@ -49,6 +49,88 @@ actions!(
     ]
 );
 
+/// UI 언어 선택. 기본값은 `System`이며 OS 기본 언어를 따른다.
+/// 첫 실행에서 무관한 설정을 바꿔도 사용자가 직접 고르지 않은 언어가 파일에 고정되지 않는다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LanguageChoice {
+    #[default]
+    System,
+    Ko,
+    En,
+}
+
+impl LanguageChoice {
+    #[must_use]
+    pub const fn resolve(self, system: Language) -> Language {
+        match self {
+            Self::System => system,
+            Self::Ko => Language::Ko,
+            Self::En => Language::En,
+        }
+    }
+
+    #[must_use]
+    pub fn parse_tag(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("system")
+            || trimmed.eq_ignore_ascii_case("auto")
+        {
+            return Self::System;
+        }
+        let primary = trimmed
+            .split(['-', '_', '.', '@'])
+            .next()
+            .unwrap_or_default();
+        if primary.eq_ignore_ascii_case("ko") {
+            Self::Ko
+        } else if primary.eq_ignore_ascii_case("en") {
+            Self::En
+        } else {
+            tracing::warn!(
+                language = trimmed,
+                "unsupported language in settings.toml; falling back to system"
+            );
+            Self::System
+        }
+    }
+}
+
+impl From<Language> for LanguageChoice {
+    fn from(language: Language) -> Self {
+        match language {
+            Language::Ko => Self::Ko,
+            Language::En => Self::En,
+        }
+    }
+}
+
+impl PartialEq<Language> for LanguageChoice {
+    fn eq(&self, other: &Language) -> bool {
+        matches!(
+            (self, other),
+            (Self::Ko, Language::Ko) | (Self::En, Language::En)
+        )
+    }
+}
+
+impl Serialize for LanguageChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::System => "system",
+            Self::Ko => "ko",
+            Self::En => "en",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for LanguageChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse_tag(&raw))
+    }
+}
+
 /// 테마 선택. 기본값은 Orca와 동일한 `System`이며, `System`은 적용 시점의 macOS 모양을 따른다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,8 +179,8 @@ pub struct Settings {
     pub ui_theme_dark: crate::ui::DarkUiTheme,
     /// 라이트 모드에서 쓸 앱 색 조합.
     pub ui_theme_light: crate::ui::LightUiTheme,
-    /// Saved choices win; an absent key uses the OS preferred language (ko, otherwise en).
-    pub language: Language,
+    /// Saved choices win; `system` (or an absent key) follows the OS preferred language (ko, otherwise en).
+    pub language: LanguageChoice,
     /// UI 배율(1.0 = 100%). 적용할 때 `ZOOM_MIN..=ZOOM_MAX`로 자른다.
     /// 레거시 `zoom` 키는 첫 로드 시 `terminal_font_size`로 이관하고 `ui_zoom = 1.0`으로 초기화한다(OWE-843).
     #[serde(rename = "ui_zoom")]
@@ -308,7 +390,7 @@ impl Default for Settings {
             theme: ThemeChoice::System,
             ui_theme_dark: crate::ui::DarkUiTheme::default(),
             ui_theme_light: crate::ui::LightUiTheme::default(),
-            language: locale::system_language(),
+            language: LanguageChoice::System,
             zoom: 1.0,
             notifications: true,
             keep_awake: KeepAwake::Off,
@@ -440,12 +522,23 @@ impl Settings {
         }
     }
 
+    #[must_use]
+    pub fn resolved_language(&self) -> Language {
+        self.language.resolve(locale::system_language())
+    }
+
+    #[must_use]
+    pub const fn resolved_language_with(&self, system: Language) -> Language {
+        self.language.resolve(system)
+    }
+
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
         Self::parse_with_language(s, locale::system_language())
     }
 
-    /// Inject the first-launch choice so parsing regressions do not depend on the host locale.
-    fn parse_with_language(s: &str, default_language: Language) -> Result<Self, toml::de::Error> {
+    /// Parse `settings.toml`; `default_language` is kept for callers that resolve `System`
+    /// deterministically via [`Self::resolved_language_with`].
+    fn parse_with_language(s: &str, _default_language: Language) -> Result<Self, toml::de::Error> {
         let mut parsed: Self = toml::from_str(s)?;
         parsed.terminal_font_size = parsed
             .terminal_font_size
@@ -484,7 +577,7 @@ impl Settings {
                 .clone_into(&mut parsed.terminal_theme_light);
         }
         if !table.contains_key("language") {
-            parsed.language = default_language;
+            parsed.language = LanguageChoice::System;
         }
         if table.contains_key("option_as_meta") && !table.contains_key("option_as_meta_auto") {
             parsed.option_as_meta_auto = false;
@@ -705,6 +798,7 @@ const HOSTS_FILE: &str = "hosts.toml";
 #[derive(Default)]
 pub struct Config {
     settings: std::sync::Arc<Settings>,
+    system_language: Language,
     initial_loaded: bool,
     durable: Settings,
     epoch: u64,
@@ -1166,6 +1260,12 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Seed `i18n` with the OS preferred language before native menus are installed at startup
+/// so non-Korean launches never flash Korean menu titles while async startup runs.
+pub fn init_startup_language(cx: &mut App) {
+    crate::i18n::set_language(locale::system_language(), cx);
+}
+
 /// `dir`의 설정으로 초기화한다(테스트는 임시 디렉터리를 준다).
 pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
     init_at_with_language(dir, locale::system_language(), cx);
@@ -1173,13 +1273,10 @@ pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
 
 fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App) {
     init_actions(cx);
-    let settings = Settings {
-        language,
-        ..Settings::default()
-    };
+    let settings = Settings::default();
     // The disk read is asynchronous; render the first window in the OS language
     // until a saved selection arrives, rather than the catalog's bootstrap language.
-    crate::i18n::set_language(settings.language, cx);
+    crate::i18n::set_language(settings.resolved_language_with(language), cx);
     let mut defaults: Vec<_> = cx.key_bindings().borrow().bindings().cloned().collect();
     for b in own_bindings() {
         if !defaults
@@ -1191,6 +1288,7 @@ fn init_at_with_language(dir: Option<PathBuf>, language: Language, cx: &mut App)
     }
     cx.set_global(Config {
         settings: settings.clone().into(),
+        system_language: language,
         initial_loaded: false,
         durable: settings,
         epoch: next_revision(),
@@ -1295,7 +1393,8 @@ fn start_reload(force: bool, cx: &mut App) {
                 && let Some((settings, keys, stamp, mut errors)) = loaded
             {
                 let defaults = c.defaults.clone();
-                crate::i18n::set_language(settings.language, cx);
+                let system_language = c.system_language;
+                crate::i18n::set_language(settings.resolved_language_with(system_language), cx);
                 match keys.map(|keys| bindings(defaults, &keys, cx)) {
                     Some(Ok(bindings)) => {
                         cx.clear_key_bindings();
@@ -1550,11 +1649,7 @@ pub fn option_as_meta(cx: &App) -> bool {
 fn us_keyboard_layout(id: &str) -> bool {
     matches!(
         id,
-        "com.apple.keylayout.US"
-            | "com.apple.keylayout.ABC"
-            | "com.apple.keylayout.USExtended"
-            | "00000409"
-            | "us"
+        "com.apple.keylayout.US" | "com.apple.keylayout.ABC" | "00000409" | "us"
     )
 }
 
@@ -1884,13 +1979,17 @@ fn apply(cx: &mut App) {
     sync_ui_theme_settings(cx);
     crate::alert::sync_settings(cx);
     let s = current(cx);
+    let system_language = cx
+        .try_global::<Config>()
+        .map_or_else(locale::system_language, |c| c.system_language);
+    let resolved_language = s.resolved_language_with(system_language);
     if !cx.has_global::<AppliedAppearance>() {
         cx.set_global(AppliedAppearance::default());
     }
     let previous = cx.global::<AppliedAppearance>().0;
     let next = (
         s.theme,
-        s.language,
+        resolved_language,
         s.zoom(),
         s.editor_font_size(),
         s.ui_theme_dark,
@@ -1906,7 +2005,7 @@ fn apply(cx: &mut App) {
             || p.5 != next.5
     });
     if language_changed {
-        crate::i18n::set_language(s.language, cx);
+        crate::i18n::set_language(resolved_language, cx);
         crate::menu_bar::refresh_language(cx);
     }
     if !language_changed && !appearance_changed {
@@ -2074,8 +2173,9 @@ pub fn import_terminal_themes(cx: &mut App) -> gpui::Task<String> {
 }
 
 /// Select the UI language, apply it to open windows, and persist it in settings.toml.
-pub fn set_language(language: Language, cx: &mut App) {
-    edit(cx, move |settings| settings.language = language);
+pub fn set_language(language: impl Into<LanguageChoice>, cx: &mut App) {
+    let choice = language.into();
+    edit(cx, move |settings| settings.language = choice);
 }
 
 /// 손상 파일을 덮어쓰지 않는다. 완성된 임시 파일만 같은 디렉터리에서 원자 교체한다.
@@ -3998,7 +4098,9 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::Entity<gpui_component::input::InputState> {
         if let Some((input, _)) = &self.search {
-            return input.clone();
+            let input = input.clone();
+            crate::i18n::sync_input_placeholder(&input, text::SEARCH_SETTINGS.get(), window, cx);
+            return input;
         }
         let input = cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx)
@@ -5451,6 +5553,12 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::Entity<gpui_component::input::InputState> {
         if let Some(input) = self.opencode_api_key_input.clone() {
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::OPENCODE_APIKEY_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             return input;
         }
         let input = cx.new(|cx| {
@@ -5978,7 +6086,37 @@ impl SettingsView {
     }
 
     fn ensure_ssh_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ssh_form.is_some() {
+        if let Some(form) = &self.ssh_form {
+            let (label, address, port, identity_file) = (
+                form.label.clone(),
+                form.address.clone(),
+                form.port.clone(),
+                form.identity_file.clone(),
+            );
+            crate::i18n::sync_input_placeholder(
+                &label,
+                text::SSH_NAME_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &address,
+                text::SSH_ADDRESS_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &port,
+                text::SSH_PORT_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &identity_file,
+                text::SSH_KEY_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             return;
         }
         let label = cx.new(|cx| {
@@ -6810,7 +6948,7 @@ impl SettingsView {
                                 .children(unpaired.map(|name| {
                                     div()
                                         .debug_selector(move || terminal_id.into())
-                                        .max_w(px(180.))
+                                        .max_w(gpui::rems(15.))
                                         .truncate()
                                         .text_size(crate::ui::TEXT_XS)
                                         .text_color(p.muted_foreground)
@@ -6925,7 +7063,7 @@ impl SettingsView {
                     .collect(),
             ));
         }
-        let language_button = |id: &'static str, label: &'static str, language: Language| {
+        let language_button = |id: &'static str, label: &'static str, language: LanguageChoice| {
             layout::segment(p, id, label, s.language == language)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
@@ -6943,8 +7081,13 @@ impl SettingsView {
                 .child(layout::controls().child(layout::segmented_control(
                     p,
                     [
-                        language_button("language-ko", text::KO.get(), Language::Ko),
-                        language_button("language-en", text::EN.get(), Language::En),
+                        language_button(
+                            "language-system",
+                            text::SYSTEM.get(),
+                            LanguageChoice::System,
+                        ),
+                        language_button("language-ko", text::KO.get(), LanguageChoice::Ko),
+                        language_button("language-en", text::EN.get(), LanguageChoice::En),
                     ],
                 )))
                 .into_any_element(),
@@ -10804,7 +10947,37 @@ impl SettingsView {
                     cx.notify();
                 }));
 
-        let custom_form = self.render_custom_agent_form(cx);
+        let custom_form = {
+            if let Some(form) = &self.custom_agent_form {
+                let (id, name, command) =
+                    (form.id.clone(), form.name.clone(), form.command.clone());
+                crate::i18n::sync_input_placeholder(
+                    &id,
+                    text::AGENTS_CUSTOM_ID_PLACEHOLDER.get(),
+                    window,
+                    cx,
+                );
+                crate::i18n::sync_input_placeholder(
+                    &name,
+                    text::AGENTS_CUSTOM_NAME_PLACEHOLDER.get(),
+                    window,
+                    cx,
+                );
+                crate::i18n::sync_input_placeholder(
+                    &command,
+                    text::AGENTS_CUSTOM_CMD_PLACEHOLDER.get(),
+                    window,
+                    cx,
+                );
+            }
+            crate::i18n::sync_input_placeholder(
+                &search_input,
+                text::AGENTS_SEARCH_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            self.render_custom_agent_form(cx)
+        };
 
         self.search_focus.anchored(
             p,
@@ -11082,12 +11255,48 @@ impl SettingsView {
 
     fn ensure_workflow_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.workflow_form {
-            if let Some(pending) = form.pending_repo_path.take() {
-                let repo_inp = form.repo_path.clone();
-                if repo_inp.read(cx).value().as_str() != pending {
-                    repo_inp.update(cx, |inp, cx| inp.set_value(pending, window, cx));
-                }
+            let (worktree_location, repo_path, symlink_path, setup_script, archive_script) = (
+                form.worktree_location.clone(),
+                form.repo_path.clone(),
+                form.symlink_path.clone(),
+                form.setup_script.clone(),
+                form.archive_script.clone(),
+            );
+            if let Some(pending) = form.pending_repo_path.take()
+                && repo_path.read(cx).value().as_str() != pending
+            {
+                repo_path.update(cx, |inp, cx| inp.set_value(pending, window, cx));
             }
+            crate::i18n::sync_input_placeholder(
+                &worktree_location,
+                text::WORKTREE_LOCATION_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &repo_path,
+                text::HOOKS_REPO_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &symlink_path,
+                text::SYMLINKS_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &setup_script,
+                text::HOOKS_SETUP_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            crate::i18n::sync_input_placeholder(
+                &archive_script,
+                text::HOOKS_ARCHIVE_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             self.sync_workflow_repo_hooks(window, cx);
             return;
         }
@@ -11556,7 +11765,15 @@ impl SettingsView {
 
     /// 빠른 명령 입력칸. 프로젝트 폼과 파일 읽기 없이 이 페이지만 쓴다.
     fn ensure_quick_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.quick_form.is_some() {
+        if let Some(form) = &self.quick_form {
+            let (name, command) = (form.name.clone(), form.command.clone());
+            crate::i18n::sync_input_placeholder(&name, text::QC_NAME_PLACEHOLDER.get(), window, cx);
+            crate::i18n::sync_input_placeholder(
+                &command,
+                text::QC_TEXT_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             return;
         }
         let name = cx.new(|cx| {
@@ -13211,7 +13428,43 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.mobile_page {
+            window.set_window_title(crate::i18n::catalog::mobile::TITLE.get());
             return self.render_mobile_page(window, cx).into_any_element();
+        }
+        if let Some(modal) = &self.schedule_modal {
+            let pairs = [
+                (modal.name.clone(), text::AUTOMATIONS_NAME.get()),
+                (modal.extra_args.clone(), text::AUTOMATIONS_EXTRA_ARGS.get()),
+                (
+                    modal.precheck_timeout.clone(),
+                    text::AUTOMATIONS_PRECHECK_TIMEOUT.get(),
+                ),
+                (
+                    modal.base_branch.clone(),
+                    text::AUTOMATIONS_BASE_BRANCH.get(),
+                ),
+                (modal.grace.clone(), text::AUTOMATIONS_GRACE.get()),
+                (modal.id.clone(), text::SCHEDULE_FIELD_ID_PLACEHOLDER.get()),
+                (
+                    modal.cron.clone(),
+                    text::SCHEDULE_FIELD_CRON_PLACEHOLDER.get(),
+                ),
+                (
+                    modal.cwd.clone(),
+                    text::SCHEDULE_FIELD_CWD_PLACEHOLDER.get(),
+                ),
+                (
+                    modal.command.clone(),
+                    text::SCHEDULE_FIELD_COMMAND_PLACEHOLDER.get(),
+                ),
+                (
+                    modal.precheck.clone(),
+                    text::SCHEDULE_FIELD_PRECHECK_PLACEHOLDER.get(),
+                ),
+            ];
+            for (input, placeholder) in pairs {
+                crate::i18n::sync_input_placeholder(&input, placeholder, window, cx);
+            }
         }
         let has_modal = self.removing.is_some() || self.schedule_modal.is_some();
         if has_modal && self.modal_return_focus.is_none() {

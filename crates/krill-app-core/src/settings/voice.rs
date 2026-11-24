@@ -159,6 +159,12 @@ impl SettingsView {
                 })
             })
             .clone();
+        crate::i18n::sync_input_placeholder(
+            &word_input,
+            text::VOICE_ADD_WORD_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
 
         let (badge_tone, status_label) = match self.voice.status.as_ref().map(|s| s.status) {
             Some(VoiceConnectionStatus::Ready) => {
@@ -448,7 +454,7 @@ impl SettingsView {
 
         let mut body = div().w_full().min_w_0().flex().flex_col().gap_3();
         if let Some(err) = &self.voice.error {
-            body = body.child(ui::error_banner(p, err.clone()));
+            body = body.child(ui::error_banner(p, crate::i18n::cached_notice(err)));
         }
         body.child(status_row)
             .child(refine_row)

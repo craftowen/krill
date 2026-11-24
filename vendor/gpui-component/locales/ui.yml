@@ -1,5 +1,8 @@
-# Krill modification (OWE-459): Korean Input/Diff/Dock labels for mk-app.
+# Krill modification (OWE-459, i18n-audit): Korean Input/Diff/Dock/Select/ComboBox/DropdownButton/Dialog/List/Copy labels for krill-app.
 _version: 2
+Copy:
+  en: Copy
+  ko: "복사"
 Attachment:
   Remove:
     en: Remove
@@ -140,6 +143,7 @@ DatePicker:
 Select:
   placeholder:
     en: "Please select"
+    ko: "선택하세요"
     zh-CN: "请选择"
     zh-HK: "請選擇"
     zh-TW: "請選擇"
@@ -147,18 +151,21 @@ Select:
 ComboBox:
   placeholder:
     en: "Please select"
+    ko: "선택하세요"
     zh-CN: "请选择"
     zh-HK: "請選擇"
     zh-TW: "請選擇"
     it: Seleziona
   search_placeholder:
     en: "Search..."
+    ko: "검색…"
     zh-CN: "搜索..."
     zh-HK: "搜索..."
     zh-TW: "搜尋..."
     it: "Cerca..."
   empty:
     en: "No results"
+    ko: "결과 없음"
     zh-CN: "暂无数据"
     zh-HK: "暫無數據"
     zh-TW: "沒有結果"
@@ -166,6 +173,7 @@ ComboBox:
 DropdownButton:
   more_options:
     en: More options
+    ko: "옵션 더 보기"
     zh-CN: 更多选项
     zh-HK: 更多選項
     zh-TW: 更多選項
@@ -247,12 +255,14 @@ ColorPicker:
 Dialog:
   ok:
     en: OK
+    ko: "확인"
     zh-CN: 确定
     zh-HK: 確定
     zh-TW: 確定
     it: OK
   cancel:
     en: Cancel
+    ko: "취소"
     zh-CN: 取消
     zh-HK: 取消
     zh-TW: 取消
@@ -273,6 +283,7 @@ Command:
 List:
   search_placeholder:
     en: Search...
+    ko: "검색…"
     zh-CN: 搜索...
     zh-HK: 搜索...
     zh-TW: 搜尋...
