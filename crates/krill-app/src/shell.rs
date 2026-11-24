@@ -3815,6 +3815,28 @@ impl Shell {
             krill_proto::usage::UsageRequest::SwitchSelectedSessions { sessions, .. } => {
                 sessions.clone()
             }
+            krill_proto::usage::UsageRequest::SwitchAccount {
+                provider,
+                account_id,
+            } => {
+                let targets = self
+                    .sidebar
+                    .read(cx)
+                    .live_sessions_for_account_switch(&host, *provider, account_id);
+                if !targets.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for &sid in &targets {
+                            s.mark_session_account_pending(
+                                host.clone(),
+                                sid,
+                                account_id.clone(),
+                                cx,
+                            );
+                        }
+                    });
+                }
+                targets
+            }
             _ => Vec::new(),
         };
         if host.is_remote() {

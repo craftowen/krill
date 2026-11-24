@@ -1184,6 +1184,98 @@ fn bot_item_notes_do_not_jump_or_vanish_when_prompt_submitted() {
         None,
     );
     assert_eq!(shape_of(&feed_at_only), expected_with_u3);
+
+    // Case 5: Image-attached prompt where `take_leading_image_paths` lifted the path into
+    // `item.file_path` (including Windows/non-POSIX paths not stripped by `clean_user_prompt`
+    // and truncated at `MAX_PROMPT_DISPLAY_CHARS` with `…`) still matches its turn stamp cleanly.
+    let img_path =
+        r"C:\Users\owen\AppData\Local\Temp\krill-paste\file-cdd938d5975cf5c9ba612ce775b382c0.png";
+    let long_korean = "첨부한 이미지 봐봐라. 빨간박스 부분에 전환 누르면 해당 채팅 탭 사라진다. 어디로 가는지 모르겠어. 전환 눌러도 현재 페이지에서 계정만 전환되어야하는데 사라지면 어떻게 다시 찾냐.. UX고려해서 수정해라. 모든 프로바이더 다 점검해라. 프로필 전환이 그냥 같은 창 안에서 전환되면 좋겠는데. 그게 어려운 일이야? 추가로 계정이 바뀌어도 현재 채팅 내용이 유지되어야 한다.";
+    let raw_img_prompt = format!("'{img_path}' {long_korean}");
+    let truncated_stamp_text = krill_proto::git::clean_prompt_display(
+        &raw_img_prompt,
+        krill_proto::git::MAX_PROMPT_DISPLAY_CHARS,
+    )
+    .expect("clean prompt display");
+    assert!(truncated_stamp_text.ends_with('…'));
+    let img_user = Arc::new(ChatItem {
+        kind: ChatItemKind::User,
+        text: long_korean.into(),
+        file_path: img_path.into(),
+        ..Default::default()
+    });
+    let items_with_img = vec![user("status report", ""), reply("all done", ""), img_user];
+    let turns_with_img = [
+        stamp(t3_ms, &truncated_stamp_text),
+        stamp(t2_ms, "status report"),
+    ];
+    let feed_img = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_with_img,
+        None,
+        &notes,
+        &turns_with_img,
+        &empty_obs,
+        None,
+    );
+    assert_eq!(
+        shape_of(&feed_img),
+        ["status report", "all done", "note:done", long_korean],
+        "image-attached prompt whose leading path was moved into file_path must still match its turn stamp"
+    );
+
+    // Case 6: Identical repeated prompt text ("진행해" submitted twice) while the second submit
+    // is already in SessionPromptHistory ahead of ChatPoll must NOT bind the earlier turn to the
+    // newer timestamp and yank Turn 1's note above Turn 1.
+    let items_dup_before = vec![user("진행해", ""), reply("done turn 1", "")];
+    let mut obs_dup = std::collections::BTreeMap::new();
+    obs_dup.insert(0, t2_ms);
+    let turns_dup_ahead = [stamp(t3_ms, "진행해"), stamp(t2_ms, "진행해")];
+    let feed_dup = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_dup_before,
+        None,
+        &notes,
+        &turns_dup_ahead,
+        &obs_dup,
+        None,
+    );
+    assert_eq!(
+        shape_of(&feed_dup),
+        ["진행해", "done turn 1", "note:done"],
+        "ahead-of-transcript duplicate-text prompt must not steal the earlier turn's timestamp"
+    );
+
+    // Case 7: When incremental ChatPoll arrives slightly after a bot note written during the new
+    // turn (observed_now_ms > turn_note_ms > submit_ms), matching SessionPromptHistory submit time
+    // anchors User #3 BEFORE its own turn's note instead of keeping the late poll arrival time.
+    let turn3_note_ms = t3_ms + 300;
+    let late_poll_ms = t3_ms + 800;
+    let mut obs_late = std::collections::BTreeMap::new();
+    obs_late.insert(4, late_poll_ms);
+    let notes_both = [note(note_ms, "done"), note(turn3_note_ms, "turn3-started")];
+    let feed_late_poll = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_with_u3,
+        None,
+        &notes_both,
+        &turns_with_t3,
+        &obs_late,
+        None,
+    );
+    assert_eq!(
+        shape_of(&feed_late_poll),
+        [
+            "swarm sweep",
+            "working",
+            "status report",
+            "all done",
+            "note:done",
+            "check screenshot",
+            "note:turn3-started"
+        ],
+        "exact prompt submit timestamp must win over late incremental poll arrival time"
+    );
 }
 
 #[test]

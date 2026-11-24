@@ -1940,6 +1940,7 @@ fn chat_unconfirmed_prompt_restores_empty_composer_or_keeps_review_card_when_new
                     display_text: "failed prompt".into(),
                     attachments: Vec::new(),
                     status: super::PendingStatus::Sending,
+                    submitted_at_ms: 0,
                 }],
             );
             input.update(cx, |state, cx| state.set_value("still typing", window, cx));

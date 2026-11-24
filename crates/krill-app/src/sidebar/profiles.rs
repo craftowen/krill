@@ -414,6 +414,46 @@ impl Sidebar {
         Some(display.to_owned())
     }
 
+    /// Live sessions on `host` that belong to `provider` and are currently running on an account
+    /// other than `target_account_id`, so global `SwitchAccount` can pre-mark them pending before
+    /// the RPC returns.
+    pub fn live_sessions_for_account_switch(
+        &self,
+        host: &HostId,
+        provider: ProviderKind,
+        target_account_id: &str,
+    ) -> Vec<SessionId> {
+        let accounts = self
+            .profiles
+            .hosts
+            .get(host)
+            .map_or(&[][..], |state| state.accounts.accounts.as_slice());
+        self.profiles
+            .snapshot(host, self.snapshot_for(host))
+            .sessions
+            .iter()
+            .filter(|s| {
+                if s.is_exited() {
+                    return false;
+                }
+                if s.account
+                    .as_ref()
+                    .is_some_and(|cur| cur.account_id == target_account_id)
+                {
+                    return false;
+                }
+                let session_provider = s
+                    .account
+                    .as_ref()
+                    .and_then(|cur| accounts.iter().find(|a| a.id == cur.account_id))
+                    .map(|a| a.provider)
+                    .or_else(|| ProviderKind::parse(&s.status.agent));
+                session_provider == Some(provider)
+            })
+            .map(|s| s.id)
+            .collect()
+    }
+
     /// Marks `session` pending an account switch before a bulk/modal RPC returns so the pane
     /// cannot be pruned if the old session exits before the handoff snapshot arrives.
     pub fn mark_session_account_pending(

@@ -155,6 +155,9 @@ pub(crate) struct PendingChatPrompt {
     pub display_text: String,
     pub attachments: Vec<DraftAttachment>,
     pub status: PendingStatus,
+    /// Epoch ms when the user submitted this prompt, used to anchor bot `ItemNote` rows when the
+    /// incremental `ChatPoll` arrives without `ChatItem.at` before `SessionPromptHistory` syncs.
+    pub submitted_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1611,11 +1614,19 @@ impl Shell {
         }
         match &mut chat.focus_pending {
             Some(ChatFocus::Composer(k) | ChatFocus::Terminal(k)) if *k == old_key => {
-                *k = new_key;
+                *k = new_key.clone();
             }
             _ => {}
         }
         chat.last_poll = None;
+        let old_voice = super::voice::VoiceComposerTarget::Chat(old_key);
+        let new_voice = super::voice::VoiceComposerTarget::Chat(new_key);
+        if let Some(dictated) = self.voice.last_dictated.remove(&old_voice) {
+            self.voice
+                .last_dictated
+                .entry(new_voice)
+                .or_insert(dictated);
+        }
     }
 
     /// An in-flight prompt send is left to finish.
@@ -2388,18 +2399,7 @@ impl Shell {
         let has_list_following = self.chat.lists.iter().any(|((_, sid), list)| {
             *sid == session && list.host == key.0 && list.state.is_following_tail()
         });
-        let system_now_ms = || {
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        };
-        #[cfg(test)]
-        let observed_now_ms = self
-            .chat
-            .now_override
-            .map_or_else(system_now_ms, |s| s.saturating_mul(1_000));
-        #[cfg(not(test))]
-        let observed_now_ms = system_now_ms();
+        let observed_now_ms = self.chat_now_epoch_ms();
         let log = self.chat.logs.entry(key.clone()).or_default();
         if !snap.items.is_empty() {
             let old_end_abs = log.base_index.saturating_add(log.items.len());
@@ -3095,6 +3095,7 @@ impl Shell {
             ac.close();
             ac.dismissed = None;
         }
+        let submitted_at_ms = self.chat_now_epoch_ms();
         self.chat
             .pending_prompts
             .entry(key.clone())
@@ -3106,6 +3107,7 @@ impl Shell {
                 display_text,
                 attachments,
                 status: PendingStatus::Sending,
+                submitted_at_ms,
             });
         self.chat
             .pending_epochs
@@ -3342,6 +3344,7 @@ impl Shell {
         );
         let pending_id = queued.id;
         let submitted_payload = queued.submitted_payload;
+        let submitted_at_ms = self.chat_now_epoch_ms();
         self.chat
             .pending_prompts
             .entry(key.clone())
@@ -3353,6 +3356,7 @@ impl Shell {
                 display_text: queued.display_text,
                 attachments: queued.attachments,
                 status: PendingStatus::Sending,
+                submitted_at_ms,
             });
         self.chat
             .pending_epochs
@@ -4541,6 +4545,31 @@ impl Shell {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "test builds read self.chat.now_override"
+        )
+    )]
+    fn chat_now_epoch_ms(&self) -> u64 {
+        let system_now_ms = || {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        };
+        #[cfg(test)]
+        {
+            self.chat
+                .now_override
+                .map_or_else(system_now_ms, |s| s.saturating_mul(1_000))
+        }
+        #[cfg(not(test))]
+        {
+            system_now_ms()
+        }
+    }
+
     pub(super) fn reconcile_pending_prompts_on_poll(&mut self, key: &ChatKey) {
         let Some(log) = self.chat.logs.get_mut(key) else {
             return;
@@ -4600,6 +4629,17 @@ impl Shell {
             });
             if let Some(abs_idx) = found_abs {
                 log.consumed_user_indices.insert(abs_idx);
+                if entry.submitted_at_ms > 0
+                    && let Some(rel) = abs_idx.checked_sub(log.base_index)
+                    && log
+                        .items
+                        .get(rel)
+                        .is_some_and(|item| item.at.trim().is_empty())
+                {
+                    log.observed_user_at_ms
+                        .insert(abs_idx, entry.submitted_at_ms);
+                    log.cached_feed = None;
+                }
                 matched_ids.push(entry.id);
             }
         }

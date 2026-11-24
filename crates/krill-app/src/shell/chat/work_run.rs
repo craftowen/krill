@@ -975,6 +975,60 @@ impl TurnStamp {
     }
 }
 
+fn turn_stamp_matches_user(stamp_text: &str, item: &ChatItem) -> bool {
+    let stamp = stamp_text.trim();
+    if stamp.is_empty() {
+        return false;
+    }
+    let item_clean = krill_proto::git::clean_prompt_display(
+        &item.text,
+        krill_proto::git::MAX_PROMPT_DISPLAY_CHARS,
+    );
+    if item_clean.as_deref() == Some(stamp) {
+        return true;
+    }
+    if item.file_path.is_empty() {
+        return false;
+    }
+    // `krilld::agent_history::chat::take_leading_image_paths` strips leading attached image paths
+    // out of `item.text` into `item.file_path`, while `SessionPromptHistory` keeps them in the
+    // raw submitted payload (and may truncate at `MAX_PROMPT_DISPLAY_CHARS` with `…`).
+    let mut rest = stamp;
+    let mut stripped_any = false;
+    for path in item
+        .file_path
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let trimmed = rest.trim_start();
+        let after = trimmed
+            .strip_prefix(&format!("'{path}'"))
+            .or_else(|| trimmed.strip_prefix(&format!("\"{path}\"")))
+            .or_else(|| trimmed.strip_prefix(path));
+        if let Some(next) = after {
+            rest = next.trim_start();
+            stripped_any = true;
+        }
+    }
+    if !stripped_any {
+        return false;
+    }
+    let Some(norm) = item_clean.as_deref() else {
+        return rest.is_empty();
+    };
+    if rest == norm
+        || krill_proto::git::clean_prompt_display(rest, krill_proto::git::MAX_PROMPT_DISPLAY_CHARS)
+            .as_deref()
+            == Some(norm)
+    {
+        return true;
+    }
+    rest.strip_suffix('…')
+        .map(str::trim_end)
+        .is_some_and(|prefix| !prefix.is_empty() && norm.starts_with(prefix))
+}
+
 fn interleave_notes(
     rows: Vec<DisplayRow>,
     notes: &[Arc<ItemNote>],
@@ -982,9 +1036,10 @@ fn interleave_notes(
     observed_user_at_ms: &std::collections::BTreeMap<usize, u64>,
     end_abs: usize,
 ) -> Vec<DisplayRow> {
-    // Owner turns, oldest first. Prefer each transcript row's own timestamp (`item.at`) or
-    // live arrival timestamp, then match `SessionPromptHistory` turns by text so an ahead-of-
-    // transcript or behind-transcript prompt submission never shifts every note by one turn.
+    // Owner turns, oldest first. Prefer each transcript row's own timestamp (`item.at`), then
+    // text-matched `SessionPromptHistory` turns (including image-attached prompts), then live
+    // observed/submitted timestamps so an ahead-of-transcript or behind-transcript prompt
+    // submission never shifts notes across turns.
     let users: Vec<(usize, usize, &ChatItem)> = rows
         .iter()
         .enumerate()
@@ -997,24 +1052,25 @@ fn interleave_notes(
         .collect();
     let mut resolved: Vec<Option<u64>> = users
         .iter()
-        .map(|&(_, abs_idx, item)| {
-            item_epoch_ms(item).or_else(|| observed_user_at_ms.get(&abs_idx).copied())
-        })
+        .map(|&(_, _, item)| item_epoch_ms(item))
         .collect();
     let has_text_stamps = turn_stamps.iter().any(|stamp| !stamp.text.is_empty());
     if has_text_stamps {
         let mut stamp_idx = 0_usize;
         for i in (0..users.len()).rev() {
-            let clean = krill_proto::git::clean_prompt_display(
-                &users[i].2.text,
-                krill_proto::git::MAX_PROMPT_DISPLAY_CHARS,
-            );
-            let matched = clean.as_deref().and_then(|norm| {
-                turn_stamps[stamp_idx..]
-                    .iter()
-                    .position(|s| !s.text.is_empty() && s.text == norm)
-                    .map(|rel| stamp_idx + rel)
-            });
+            let abs_idx = users[i].1;
+            let item = users[i].2;
+            let anchor_hint = resolved[i].or_else(|| observed_user_at_ms.get(&abs_idx).copied());
+            let matched = turn_stamps[stamp_idx..]
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| turn_stamp_matches_user(&s.text, item))
+                .find(|(_, s)| {
+                    // When we already know this row's approximate timestamp, don't bind it to a
+                    // brand-new ahead-of-transcript duplicate-text submission from a later turn.
+                    anchor_hint.is_none_or(|hint| hint.abs_diff(s.at_ms) <= 10_000)
+                })
+                .map(|(rel, _)| stamp_idx + rel);
             if let Some(found) = matched {
                 let stamp_ms = turn_stamps[found].at_ms;
                 match resolved[i] {
@@ -1031,11 +1087,19 @@ fn interleave_notes(
         let mut ti = 0_usize;
         for i in (0..users.len()).rev() {
             if resolved[i].is_none()
+                && !observed_user_at_ms.contains_key(&users[i].1)
                 && let Some(stamp) = turn_stamps.get(ti)
             {
                 resolved[i] = Some(stamp.at_ms);
                 ti += 1;
             }
+        }
+    }
+    for (slot, &(_, abs_idx, _)) in resolved.iter_mut().zip(&users) {
+        if slot.is_none()
+            && let Some(&obs_ms) = observed_user_at_ms.get(&abs_idx)
+        {
+            *slot = Some(obs_ms);
         }
     }
     let anchors: Vec<(usize, u64)> = users
