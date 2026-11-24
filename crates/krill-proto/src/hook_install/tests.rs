@@ -289,3 +289,117 @@ fn claude_settings_path_follows_only_the_shared_account_link() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn legacy_agy_receipt_upgrades_in_place_preserving_later_user_edits() {
+    let home = Home::new();
+    let hooks_path = home.0.join(".gemini/config/hooks.json");
+    fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+    let receipt_path = hooks::receipt(&home.state(), Agent::Agy);
+    let legacy_before = serde_json::json!({
+        "orca-status": {
+            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "orca-v1"}]}]
+        }
+    })
+    .to_string();
+    let legacy_krill = serde_json::json!({
+        "PreToolUse": [{
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": "/bin/sh -c 'export MK_HOOK_EVENT='\"'\"'PreToolUse'\"'\"'; if [ -n \"${MK_PANE_ID:-}\" ]; then exec '\"'\"'/Applications/Krill.app/Contents/MacOS/krill'\"'\"' hook agy '\"'\"'PreToolUse'\"'\"'; else printf '\"'\"'{\"decision\":\"ask\"}\\n'\"'\"'; fi'",
+                "timeout": 10
+            }]
+        }]
+    });
+    let legacy_after = serde_json::to_string_pretty(&serde_json::json!({
+        "orca-status": {
+            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "orca-v1"}]}]
+        },
+        "krill": legacy_krill
+    }))
+    .unwrap()
+        + "\n";
+    // Simulate Orca updating its own bundle after Krill's legacy install.
+    let current_on_disk = serde_json::to_string_pretty(&serde_json::json!({
+        "orca-status": {
+            "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "orca-v2"}]}]
+        },
+        "krill": legacy_krill
+    }))
+    .unwrap()
+        + "\n";
+    fs::write(&hooks_path, &current_on_disk).unwrap();
+    store::directory(receipt_path.parent().unwrap()).unwrap();
+    let legacy_receipt = Receipt {
+        agent: "agy".to_owned(),
+        complete: true,
+        changes: vec![Change {
+            path: hooks_path.clone(),
+            before: Some(legacy_before),
+            after: legacy_after,
+        }],
+        codex: None,
+    };
+    assert!(legacy_receipt.needs_upgrade());
+    fs::write(
+        &receipt_path,
+        serde_json::to_string_pretty(&legacy_receipt).unwrap() + "\n",
+    )
+    .unwrap();
+
+    // Installing again upgrades the legacy synchronous hook in place and keeps `orca-v2`.
+    let upgraded = install_hooks(
+        TargetAgent::Other(Agent::Agy),
+        &hooks_path,
+        &home.state(),
+        Path::new("/Applications/Krill.app/Contents/MacOS/krill"),
+    )
+    .unwrap()
+    .expect("legacy agy receipt should be upgraded");
+    assert!(!upgraded.needs_upgrade());
+    let installed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert_eq!(
+        installed["orca-status"]["PreToolUse"][0]["hooks"][0]["command"],
+        "orca-v2"
+    );
+    let pre_cmd = installed["krill"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(pre_cmd.contains(hooks::AGY_ASYNC_HOOK_MARKER));
+    assert!(!pre_cmd.contains("then exec "));
+
+    // Subsequent install is a no-op.
+    assert!(
+        install_hooks(
+            TargetAgent::Other(Agent::Agy),
+            &hooks_path,
+            &home.state(),
+            Path::new("/Applications/Krill.app/Contents/MacOS/krill"),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // Uninstall removes only the upgraded `krill` bundle and keeps `orca-v2`.
+    Plan::prepare(
+        Action::Uninstall,
+        TargetAgent::Other(Agent::Agy),
+        &hooks_path,
+        &home.state(),
+        Path::new("/Applications/Krill.app/Contents/MacOS/krill"),
+    )
+    .unwrap()
+    .unwrap()
+    .apply()
+    .unwrap();
+    let after_uninstall: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert!(after_uninstall.get("krill").is_none());
+    assert_eq!(
+        after_uninstall["orca-status"]["PreToolUse"][0]["hooks"][0]["command"],
+        "orca-v2"
+    );
+}

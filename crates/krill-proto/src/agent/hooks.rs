@@ -159,21 +159,45 @@ pub fn codex_session_event(key: &str) -> Option<&str> {
     (!event.is_empty() && slot == "0:0").then_some(event)
 }
 
-/// Wrap an Antigravity (`agy`) hook command in `/bin/sh -c` with event propagation and
-/// non-denying fallback output (`{"decision":"ask"}` on `PreToolUse`).
+/// Marker present in non-blocking, fail-open Antigravity (`agy`) hook commands.
+/// Earlier receipts wrote synchronous `exec <krill> hook agy ...` commands where
+/// macOS `syspolicyd` stalls or binary errors triggered `agy`'s 10s SIGKILL and
+/// blocked all fail-closed `PreToolUse` tool calls.
+pub const AGY_ASYNC_HOOK_MARKER: &str = "MK_HOOK_PPID";
+
+/// Wrap an Antigravity (`agy`) hook command in `/bin/sh -c` with immediate fail-open
+/// output (`{"decision":"ask"}` on `PreToolUse`, `{"decision":""}` on `Stop`, `{}`
+/// otherwise), platform-binary stdin draining, and asynchronous background delivery to
+/// `krill hook` with `MK_HOOK_PPID` preserved for daemon session attribution.
 #[must_use]
 pub fn agy_event_command(command: &str, event: &str) -> String {
-    let fallback = if event == "PreToolUse" {
-        r#"printf '{"decision":"ask"}\n'"#
+    let response = if event == "PreToolUse" {
+        r#"{"decision":"ask"}"#
     } else if event == "Stop" {
-        r#"printf '{"decision":""}\n'"#
+        r#"{"decision":""}"#
     } else {
-        r"printf '{}\n'"
+        "{}"
     };
-    let patched = command
-        .replace("hook agy", &format!("hook agy {}", shell_quote(event)))
-        .replace("printf '{}\\n'", fallback);
-    let script = format!("export MK_HOOK_EVENT={}; {patched}", shell_quote(event));
+    let event_q = shell_quote(event);
+    let runner = command
+        .strip_prefix("if [ -n \"${MK_PANE_ID:-}\" ]; then exec ")
+        .and_then(|s| s.strip_suffix("; else printf '{}\\n'; fi"))
+        .unwrap_or(command)
+        .replace("hook agy", &format!("hook agy {event_q}"));
+    let script = format!(
+        "export MK_HOOK_EVENT={event_q} {AGY_ASYNC_HOOK_MARKER}=\"${{PPID:-}}\"; \
+         printf '{response}\\n'; \
+         exec 3<&0; \
+         if [ -n \"${{MK_PANE_ID:-}}\" ]; then \
+           ( payload=$(command -p head -c 262144 <&3 2>/dev/null); \
+             {{ command -p cat <&3 || :; }} >/dev/null 2>&1; \
+             exec 3<&-; \
+             printf '%s' \"$payload\" | {runner} >/dev/null 2>&1 ) >/dev/null 2>&1 & \
+         else \
+           {{ {{ command -p cat 2>/dev/null || cat; }} <&3 || :; }} >/dev/null 2>&1 & \
+         fi; \
+         exec 3<&-"
+    );
     format!("/bin/sh -c {}", shell_quote(&script))
 }
 
@@ -564,6 +588,33 @@ mod tests {
             let parsed: toml::Value = toml::from_str(text).unwrap();
             assert!(parsed.get("hooks").is_some());
             assert!(!text.contains("auth.json"));
+        }
+    }
+
+    #[test]
+    fn agy_event_command_is_fail_open_async_and_propagates_ppid() {
+        let base = command(
+            Path::new("/Applications/Krill.app/Contents/MacOS/krill"),
+            Agent::Agy,
+        )
+        .unwrap();
+        for (event, expected_response) in [
+            ("PreToolUse", r#"{"decision":"ask"}"#),
+            ("Stop", r#"{"decision":""}"#),
+            ("PreInvocation", "{}"),
+            ("PostInvocation", "{}"),
+            ("PostToolUse", "{}"),
+        ] {
+            let cmd = agy_event_command(&base, event);
+            assert!(cmd.starts_with("/bin/sh -c "), "{event}: {cmd}");
+            assert!(cmd.contains(AGY_ASYNC_HOOK_MARKER), "{event}: {cmd}");
+            assert!(cmd.contains("if [ -n "), "{event}: {cmd}");
+            assert!(cmd.contains("hook agy"), "{event}: {cmd}");
+            assert!(cmd.contains(expected_response), "{event}: {cmd}");
+            assert!(
+                !cmd.contains("then exec "),
+                "{event} must not synchronously exec krill in the foreground: {cmd}"
+            );
         }
     }
 }

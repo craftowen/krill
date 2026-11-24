@@ -610,14 +610,9 @@ fn hook_installed(state: &Path, agent: &str) -> bool {
         .ok()
         .and_then(|bytes| serde_json::from_slice::<krill_proto::hook_install::Receipt>(&bytes).ok())
         .is_some_and(|receipt| {
-            // An old Windows Codex PowerShell command is reinstalled (see `hook_install`).
-            receipt.complete
-                && receipt.agent == agent
-                && !receipt.codex.is_some_and(|codex| {
-                    codex
-                        .command
-                        .starts_with(krill_proto::agent::hooks::POWERSHELL_CODEX_PREFIX)
-                })
+            // Superseded wrappers (legacy Windows Codex PowerShell, synchronous Antigravity)
+            // are reinstalled in place (see `hook_install`).
+            receipt.complete && receipt.agent == agent && !receipt.needs_upgrade()
         })
 }
 

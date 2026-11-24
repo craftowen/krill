@@ -666,14 +666,90 @@ fn agy_hook_install_roundtrip_and_pre_tool_use_response() {
     let o = output(&mut cmd, r#"{"tool_name":"ask_question"}"#);
     success(&o);
     assert_eq!(o.stdout, b"{\"decision\":\"ask\"}\n");
-    let spool = fs::read(h.0.join("state/hook.spool")).unwrap();
-    let events = krill_proto::hook::read_spool(&spool);
-    assert_eq!(events.first().unwrap().agent, "agy");
-    let payload: Value = serde_json::from_slice(&events.first().unwrap().payload).unwrap();
+    // Background delivery writes asynchronously to hook.spool when krilld is absent.
+    let spool_path = h.0.join("state/hook.spool");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let events = loop {
+        if let Ok(spool) = fs::read(&spool_path) {
+            let parsed = krill_proto::hook::read_spool(&spool);
+            if !parsed.is_empty() {
+                break parsed;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for async agy PreToolUse hook event in {}",
+            spool_path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let event = events.first().unwrap();
+    assert_eq!(event.agent, "agy");
+    assert!(
+        event.ppid > 1,
+        "MK_HOOK_PPID must preserve caller pid instead of launchd (got {})",
+        event.ppid
+    );
+    let payload: Value = serde_json::from_slice(&event.payload).unwrap();
     assert_eq!(payload["hook_event_name"], "PreToolUse");
     assert_eq!(payload["tool_name"], "ask_question");
 
     // Uninstall removes only krill bundle and restores original
     success(&h.run("uninstall", "agy", &["--yes"], ""));
     assert_eq!(h.read("agy"), original);
+}
+
+#[test]
+fn agy_pre_tool_use_fails_open_when_krill_stalls_is_sigkilled_or_missing() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+
+    let h = Home::new();
+    let bin_dir = h.0.join("broken-bins");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    // 1) Stalling binary (simulates macOS syspolicyd execve stall > 10s agy timeout)
+    let slow_bin = bin_dir.join("slow-krill");
+    fs::write(&slow_bin, "#!/bin/sh\nsleep 15\n").unwrap();
+    fs::set_permissions(&slow_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 2) Self-SIGKILL binary (simulates AMFI CS_KILL)
+    let killed_bin = bin_dir.join("killed-krill");
+    fs::write(&killed_bin, "#!/bin/sh\nkill -9 $$\n").unwrap();
+    fs::set_permissions(&killed_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 3) Missing binary (ENOENT)
+    let missing_bin = bin_dir.join("missing-krill");
+
+    // Use a payload larger than the 64 KiB pipe buffer to verify platform-binary draining
+    // prevents pipe backpressure even when the krill binary is completely stalled.
+    let big_payload = format!(
+        r#"{{"tool_name":"write_file","content":"{}"}}"#,
+        "x".repeat(131_072)
+    );
+
+    for (label, exe) in [
+        ("stalling-binary", slow_bin.as_path()),
+        ("sigkilled-binary", killed_bin.as_path()),
+        ("missing-binary", missing_bin.as_path()),
+    ] {
+        let base = hooks::command(exe, Agent::Agy).unwrap();
+        let pre_cmd = hooks::agy_event_command(&base, "PreToolUse");
+        let start = Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &pre_cmd])
+            .env("MK_PANE_ID", "test-pane")
+            .env("HOME", &h.0);
+        let o = output(&mut cmd, &big_payload);
+        let elapsed = start.elapsed();
+        assert!(o.status.success(), "{label}: PreToolUse hook failed: {o:?}");
+        assert_eq!(
+            o.stdout, b"{\"decision\":\"ask\"}\n",
+            "{label}: unexpected stdout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{label}: PreToolUse hook blocked for {elapsed:?}"
+        );
+    }
 }
