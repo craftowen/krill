@@ -2923,9 +2923,11 @@ fn agy_effort_options_and_alias_helpers_cover_all_cli_levels() {
         runtime_display_label("antigravity"),
         runtime_display_label("agy")
     );
-    for level in ["", "low", "medium", "high", "xhigh", "max"] {
+    for level in ["", "low", "medium", "high", "xhigh", "very_high", "max"] {
         assert!(!effort_label(level).is_empty(), "missing label for {level}");
     }
+    assert_eq!(effort_label("very_high"), effort_label("xhigh"));
+    assert_eq!(effort_label("very-high"), effort_label("xhigh"));
     let (_, builtin_efforts) = crate::agent_models::builtin("agy");
     assert_eq!(builtin_efforts, &["low", "medium", "high", "xhigh", "max"]);
 }
