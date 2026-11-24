@@ -311,6 +311,19 @@ impl Control {
         self.write_stored_preserving_launched_at(session, &mut stored)
     }
 
+    /// 봇 소유가 해제된 세션(`TakeOverWorkspace` 등)의 `bot_instructions`를 비운다.
+    pub fn clear_bot_instructions(&self, session: SessionId) -> io::Result<()> {
+        let _guard = lock(&self.config);
+        let Some(mut stored) = self.read_stored(session)? else {
+            return Ok(());
+        };
+        if stored.bot_instructions.is_none() {
+            return Ok(());
+        }
+        stored.bot_instructions = None;
+        self.write_stored_preserving_launched_at(session, &mut stored)
+    }
+
     pub fn stored(&self, session: SessionId) -> io::Result<Option<StoredLaunch>> {
         let _guard = lock(&self.config);
         self.read_stored(session)

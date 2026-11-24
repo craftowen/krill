@@ -1057,5 +1057,14 @@ fn launched_at_stays_immutable_across_all_atomic_rewrites_and_backfills_legacy_f
     );
     assert_eq!(control.launched_at(legacy_session), Some(legacy_meta_ts));
 
+    // 7. clear_bot_instructions removes bot_instructions while preserving launched_at & other fields
+    control.clear_bot_instructions(session).unwrap();
+    let cleared = control.stored(session).unwrap().unwrap();
+    assert_eq!(cleared.bot_instructions, None);
+    assert_eq!(cleared.launched_at, Some(backdated));
+    // Clearing again or on a missing session is a clean no-op
+    control.clear_bot_instructions(session).unwrap();
+    control.clear_bot_instructions(SessionId(9999)).unwrap();
+
     fs::remove_dir_all(dir).unwrap();
 }

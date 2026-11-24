@@ -490,6 +490,23 @@ pub(crate) fn spawn_slack_worker(
         })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SlackLoopTimings {
+    ping_interval: Duration,
+    pong_timeout: Duration,
+    healthy_uptime: Duration,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
+}
+
+const DEFAULT_SLACK_TIMINGS: SlackLoopTimings = SlackLoopTimings {
+    ping_interval: Duration::from_secs(30),
+    pong_timeout: Duration::from_secs(20),
+    healthy_uptime: Duration::from_secs(30),
+    initial_backoff_ms: 1_000,
+    max_backoff_ms: 30_000,
+};
+
 fn run_slack_loop(
     bot: &BotConfig,
     app_token: &Zeroizing<String>,
@@ -498,10 +515,30 @@ fn run_slack_loop(
     router: &Arc<ConversationRouter>,
     stop: &Arc<StopFlag>,
 ) {
+    run_slack_loop_with_timings(
+        bot,
+        app_token,
+        sender,
+        bridge,
+        router,
+        stop,
+        DEFAULT_SLACK_TIMINGS,
+    );
+}
+
+fn run_slack_loop_with_timings(
+    bot: &BotConfig,
+    app_token: &Zeroizing<String>,
+    sender: &Arc<SlackSender>,
+    bridge: &Arc<dyn ConnectorBridge>,
+    router: &Arc<ConversationRouter>,
+    stop: &Arc<StopFlag>,
+    timings: SlackLoopTimings,
+) {
     let (mut bot_user_id, mut account_label) = sender.auth_test().unwrap_or((None, None));
     let mut seen_events: VecDeque<String> = VecDeque::with_capacity(DEDUP_RING_CAPACITY);
     let mut participated_threads: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut backoff_ms: u64 = 1_000;
+    let mut backoff_ms: u64 = timings.initial_backoff_ms;
     let mut consecutive_disconnects: u32 = 0;
 
     while !stop.is_stopped() {
@@ -537,7 +574,7 @@ fn run_slack_loop(
                 if stop.wait(Duration::from_millis(backoff_ms)) {
                     break;
                 }
-                backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+                backoff_ms = backoff_ms.saturating_mul(2).min(timings.max_backoff_ms);
                 continue;
             }
         };
@@ -568,12 +605,11 @@ fn run_slack_loop(
                 if stop.wait(Duration::from_millis(backoff_ms)) {
                     break;
                 }
-                backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+                backoff_ms = backoff_ms.saturating_mul(2).min(timings.max_backoff_ms);
                 continue;
             }
         };
 
-        backoff_ms = 1_000;
         if bot_user_id.is_none()
             && let Ok((uid, team)) = sender.auth_test()
         {
@@ -593,12 +629,64 @@ fn run_slack_loop(
             None,
         );
 
+        let connected_at = std::time::Instant::now();
+        let mut last_rx = connected_at;
+        let mut ping_sent_at: Option<std::time::Instant> = None;
+        let mut saw_hello = false;
         let mut clean_reconnect = false;
         let mut saw_activity = false;
+        let poll_timeout = WS_POLL_TIMEOUT
+            .min(timings.ping_interval)
+            .min(timings.pong_timeout)
+            .max(Duration::from_millis(20));
+
         while !stop.is_stopped() {
-            match ws.poll_event(WS_POLL_TIMEOUT) {
-                Ok(WsEvent::Timeout | WsEvent::Pong(_) | WsEvent::Binary(_)) => {}
+            match ws.poll_event(poll_timeout) {
+                Ok(WsEvent::Timeout) => {
+                    // Periodic client Ping + Pong liveness check to detect half-open sockets (MB-16).
+                    if let Some(sent_at) = ping_sent_at {
+                        if sent_at.elapsed() >= timings.pong_timeout {
+                            tracing::warn!(
+                                bot_id = bot.id.as_str(),
+                                "Slack Socket Mode pong timeout; reconnecting"
+                            );
+                            report_status(
+                                bridge,
+                                &bot.id,
+                                false,
+                                ConnectorHealthState::Error,
+                                account_label.clone(),
+                                None,
+                                Some("Slack Socket Mode keepalive pong timeout".to_owned()),
+                                Some(BotErrorCategory::AgentError),
+                            );
+                            break;
+                        }
+                    } else if last_rx.elapsed() >= timings.ping_interval {
+                        if let Err(err) = ws.send_ping(b"krill-ping") {
+                            let raw = err.to_string();
+                            report_status(
+                                bridge,
+                                &bot.id,
+                                false,
+                                ConnectorHealthState::Error,
+                                account_label.clone(),
+                                None,
+                                Some(sanitize_error_for_status(&raw)),
+                                Some(classify_error(&raw)),
+                            );
+                            break;
+                        }
+                        ping_sent_at = Some(std::time::Instant::now());
+                    }
+                }
+                Ok(WsEvent::Pong(_) | WsEvent::Binary(_)) => {
+                    last_rx = std::time::Instant::now();
+                    ping_sent_at = None;
+                }
                 Ok(WsEvent::Text(raw)) => {
+                    last_rx = std::time::Instant::now();
+                    ping_sent_at = None;
                     let Ok(envelope) = serde_json::from_str::<Value>(&raw) else {
                         continue;
                     };
@@ -616,6 +704,7 @@ fn run_slack_loop(
                         .unwrap_or_default();
                     match env_type {
                         "hello" => {
+                            saw_hello = true;
                             report_status(
                                 bridge,
                                 &bot.id,
@@ -682,11 +771,17 @@ fn run_slack_loop(
         if stop.is_stopped() {
             break;
         }
+        // Reset reconnect backoff ONLY once the socket completed `hello` AND stayed healthy or
+        // processed real traffic, preventing 1s reconnect hot-loops on immediate drops (MB-40).
+        if saw_hello && (saw_activity || connected_at.elapsed() >= timings.healthy_uptime) {
+            backoff_ms = timings.initial_backoff_ms;
+        }
         if clean_reconnect {
             if !saw_activity && consecutive_disconnects >= 2 {
-                let exp = 1_000_u64
+                let exp = timings
+                    .initial_backoff_ms
                     .saturating_mul(1_u64 << (consecutive_disconnects.saturating_sub(2)).min(4))
-                    .min(30_000);
+                    .min(timings.max_backoff_ms);
                 let jitter = slack_jitter_ms(exp / 2);
                 if stop.wait(Duration::from_millis(exp.saturating_add(jitter))) {
                     break;
@@ -697,7 +792,7 @@ fn run_slack_loop(
             if stop.wait(Duration::from_millis(backoff_ms)) {
                 break;
             }
-            backoff_ms = backoff_ms.saturating_mul(2).min(30_000);
+            backoff_ms = backoff_ms.saturating_mul(2).min(timings.max_backoff_ms);
         }
     }
 
@@ -1660,5 +1755,172 @@ mod tests {
             &mut participated,
         );
         assert!(participated.is_empty());
+    }
+
+    #[test]
+    fn slack_loop_sends_ping_reconnects_on_pong_timeout_and_escalates_backoff() {
+        struct MinimalBridge(BotConfig);
+        impl ConnectorBridge for MinimalBridge {
+            fn dispatch_external_message(
+                &self,
+                _: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Allowed)
+            }
+            fn resolve_secret(
+                &self,
+                _: &BotId,
+                _: Option<&str>,
+                _: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+                _: ActsFor,
+            ) -> io::Result<krill_proto::bots::ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+                _: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _: BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                (&self.0.id == bot_id).then(|| self.0.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![self.0.clone()]
+            }
+        }
+
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_addr = api_listener.local_addr().unwrap();
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let stop = Arc::new(StopFlag::default());
+        let stop_api = Arc::clone(&stop);
+        let stop_ws = Arc::clone(&stop);
+
+        let api_thread = thread::spawn(move || {
+            api_listener.set_nonblocking(true).ok();
+            let ws_url = format!("ws://{ws_addr}/link");
+            while !stop_api.is_stopped() {
+                match api_listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        let (path, _, _) = read_http(&mut sock);
+                        let resp = if path.ends_with("/auth.test") {
+                            json!({"ok": true, "user_id": "U_BOT", "team": "Acme"})
+                        } else {
+                            json!({"ok": true, "url": ws_url})
+                        };
+                        let body = serde_json::to_vec(&resp).unwrap();
+                        let wire = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        sock.write_all(wire.as_bytes()).ok();
+                        sock.write_all(&body).ok();
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let saw_ping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_ping_bg = Arc::clone(&saw_ping);
+        let connect_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let connect_times_bg = Arc::clone(&connect_times);
+
+        let ws_thread = thread::spawn(move || {
+            for idx in 0..4 {
+                let (mut sock, _) = ws_listener.accept().unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                accept_ws_test_handshake(&mut sock).unwrap();
+                lock(&connect_times_bg).push(Instant::now());
+                if idx == 0 {
+                    // Send hello, then stay silent so client MUST send a Ping and time out waiting for Pong.
+                    write_server_frame(&mut sock, true, 0x1, br#"{"type":"hello"}"#).unwrap();
+                    let (op, payload) = read_client_frame(&mut sock).unwrap();
+                    if op == 0x9 && payload == b"krill-ping" {
+                        saw_ping_bg.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    // Intentionally never reply with Pong; hold open until client disconnects.
+                    let mut drain = [0u8; 64];
+                    while sock.read(&mut drain).unwrap_or(0) > 0 {}
+                } else if idx == 3 {
+                    stop_ws.signal();
+                }
+                // Connections 1 & 2 drop immediately without hello/uptime to test backoff escalation.
+                drop(sock);
+            }
+        });
+
+        let bot_id = BotId::new("sl-ka").unwrap();
+        let bot = BotConfig::new(bot_id, "SlKeepAlive", "claude", 1_000).unwrap();
+        let bridge: Arc<dyn ConnectorBridge> = Arc::new(MinimalBridge(bot.clone()));
+        let router = Arc::new(ConversationRouter::new(Arc::clone(&bridge)));
+        let sender = Arc::new(SlackSender::new(
+            &format!("http://{api_addr}"),
+            Zeroizing::new("xoxb-ka".to_owned()),
+        ));
+
+        let timings = SlackLoopTimings {
+            ping_interval: Duration::from_millis(60),
+            pong_timeout: Duration::from_millis(80),
+            healthy_uptime: Duration::from_secs(30),
+            initial_backoff_ms: 50,
+            max_backoff_ms: 400,
+        };
+        run_slack_loop_with_timings(
+            &bot,
+            &Zeroizing::new("xapp-ka".to_owned()),
+            &sender,
+            &bridge,
+            &router,
+            &stop,
+            timings,
+        );
+
+        ws_thread.join().unwrap();
+        api_thread.join().unwrap();
+
+        assert!(
+            saw_ping.load(std::sync::atomic::Ordering::Acquire),
+            "MB-16: Slack client must send WebSocket Ping on idle connection"
+        );
+        let times = lock(&connect_times);
+        assert_eq!(times.len(), 4);
+        // Backoffs after conn 0, 1, 2 should escalate: 50ms -> 100ms -> 200ms.
+        let gap_after_2 = times[3].saturating_duration_since(times[2]);
+        assert!(
+            gap_after_2 >= Duration::from_millis(160),
+            "MB-40: backoff must escalate instead of resetting on connect (gap_after_2={gap_after_2:?})"
+        );
     }
 }

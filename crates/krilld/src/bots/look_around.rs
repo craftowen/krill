@@ -159,16 +159,28 @@ impl SchedulerStateStore {
         source: Option<ExternalSource>,
         now_ms: u64,
     ) -> bool {
+        self.suggestion_dismissed_at(bot_id, title, why, source)
+            .is_some_and(|dismissed_at| {
+                now_ms.saturating_sub(dismissed_at) < SUGGESTION_DISMISS_COOLDOWN_MS
+            })
+    }
+
+    #[must_use]
+    fn suggestion_dismissed_at(
+        &self,
+        bot_id: &BotId,
+        title: &str,
+        why: &str,
+        source: Option<ExternalSource>,
+    ) -> Option<u64> {
         let key = suggestion_stable_key(title, why, source);
         self.with_state_read(|st| {
             st.dismissed_suggestions
                 .get(bot_id)
-                .and_then(|map| map.get(&key))
-                .is_some_and(|&dismissed_at| {
-                    now_ms.saturating_sub(dismissed_at) < SUGGESTION_DISMISS_COOLDOWN_MS
-                })
+                .and_then(|map| map.get(&key).copied())
         })
-        .unwrap_or(false)
+        .ok()
+        .flatten()
     }
 
     pub fn mark_up_next_seen(&self, bot_id: Option<&BotId>, now_ms: u64) -> io::Result<()> {
@@ -499,14 +511,16 @@ pub fn run_look_around_tracked(
     .unwrap_or(5);
 
     let previous = store.load_suggestions(bot_id).unwrap_or_default();
-    let mut existing_dismissed: HashMap<String, BotSuggestion> = previous
-        .into_iter()
-        .filter(|s| s.dismissed)
-        .map(|s| {
-            let key = suggestion_stable_key(&s.title, &s.why, s.source);
-            (key, s)
-        })
-        .collect();
+    let mut existing_dismissed: HashMap<String, BotSuggestion> = HashMap::new();
+    let mut existing_active: HashMap<String, BotSuggestion> = HashMap::new();
+    for s in previous {
+        let key = suggestion_stable_key(&s.title, &s.why, s.source);
+        if s.dismissed {
+            existing_dismissed.insert(key, s);
+        } else {
+            existing_active.entry(key).or_insert(s);
+        }
+    }
 
     let mut candidates = Vec::new();
     let focus_hint = bot.look_around.focus.trim();
@@ -651,17 +665,34 @@ pub fn run_look_around_tracked(
     let mut active = Vec::new();
     let mut preserved_dismissed = Vec::new();
 
-    for cand in candidates {
+    for mut cand in candidates {
         let key = suggestion_stable_key(&cand.title, &cand.why, cand.source);
-        let suppressed_by_state = scheduler_state.is_some_and(|st| {
-            st.is_suggestion_suppressed(bot_id, &cand.title, &cand.why, cand.source, now_ms)
+        let dismissed_at_state = scheduler_state
+            .and_then(|st| st.suggestion_dismissed_at(bot_id, &cand.title, &cand.why, cand.source));
+        let suppressed_by_state = dismissed_at_state.is_some_and(|dismissed_at| {
+            now_ms.saturating_sub(dismissed_at) < SUGGESTION_DISMISS_COOLDOWN_MS
         });
         let suppressed_prev = existing_dismissed.remove(&key);
-        if suppressed_by_state || suppressed_prev.is_some() {
-            let mut tomb = suppressed_prev.unwrap_or(cand);
+        let suppressed_by_prev = suppressed_prev.as_ref().is_some_and(|prev| {
+            now_ms.saturating_sub(prev.created_at_ms) < SUGGESTION_DISMISS_COOLDOWN_MS
+        });
+        if suppressed_by_state || suppressed_by_prev {
+            let mut tomb = suppressed_prev.unwrap_or_else(|| {
+                let mut fallback = cand;
+                if let Some(ts) = dismissed_at_state {
+                    fallback.created_at_ms = ts;
+                }
+                fallback
+            });
             tomb.dismissed = true;
             preserved_dismissed.push(tomb);
         } else if active.len() < cap {
+            // Preserve existing active suggestion ID and timestamp across refreshes so unseen
+            // counts do not reset and open UIs targeting this ID do not get NotFound (MB-37).
+            if let Some(prev) = existing_active.remove(&key) {
+                cand.id = prev.id;
+                cand.created_at_ms = prev.created_at_ms;
+            }
             active.push(cand);
         }
     }
@@ -860,14 +891,7 @@ pub fn bot_upcoming_with_extras(
                 .enabled
                 .then(|| Cron::parse(&s.cron).ok())
                 .flatten()
-                .and_then(|cron| {
-                    // The cron reads the schedule's wall clock: step in its local minutes.
-                    let off = tz_offset_minutes(now_secs, s.timezone.as_deref());
-                    let local = i64::try_from(now_secs / 60).ok()?.checked_add(off)?;
-                    let next = cron.next_minute_after(u64::try_from(local).ok()?)?;
-                    let utc = i64::try_from(next).ok()?.checked_sub(off)?;
-                    u64::try_from(utc).ok()?.checked_mul(60_000)
-                });
+                .and_then(|cron| next_cron_utc_ms(&cron, now_secs, s.timezone.as_deref()));
             let last_err = cron_errors.get(&s.id);
             BotScheduleUpcoming {
                 id: s.id.clone(),
@@ -890,6 +914,179 @@ pub fn bot_upcoming_with_extras(
     }
 }
 
+/// Resolves a local wall-clock minute (minutes since 1970-01-01 in `tz`) to all valid UTC minutes
+/// (0 on a spring-forward gap, 1 normally, 2 on a fall-back ambiguous hour), sorted ascending.
+fn resolve_local_minute_utc(local_min: i64, tz: Option<&str>) -> Vec<i64> {
+    let mut results: Vec<i64> = Vec::new();
+    let seed_secs = u64::try_from(local_min.max(0))
+        .unwrap_or(0)
+        .saturating_mul(60);
+    let base_off = tz_offset_minutes(seed_secs, tz);
+    let base_utc = local_min.saturating_sub(base_off);
+    for shift in [-120_i64, -60, -30, 0, 30, 60, 120] {
+        let mut cand = base_utc.saturating_add(shift);
+        for _ in 0..3 {
+            let Ok(cand_u64) = u64::try_from(cand) else {
+                break;
+            };
+            let o = tz_offset_minutes(cand_u64.saturating_mul(60), tz);
+            let refined = local_min.saturating_sub(o);
+            if refined == cand {
+                break;
+            }
+            cand = refined;
+        }
+        if let Ok(cand_u64) = u64::try_from(cand) {
+            let check = tz_offset_minutes(cand_u64.saturating_mul(60), tz);
+            if cand.saturating_add(check) == local_min && !results.contains(&cand) {
+                results.push(cand);
+            }
+        }
+    }
+    results.sort_unstable();
+    results
+}
+
+/// Computes the next UTC Unix ms after `now_secs` when `cron` fires in `tz`, re-evaluating the
+/// target timestamp's UTC offset across DST spring-forward and fall-back transitions (MB-36).
+fn next_cron_utc_ms(cron: &Cron, now_secs: u64, tz: Option<&str>) -> Option<u64> {
+    let now_min = i64::try_from(now_secs / 60).ok()?;
+    let off = tz_offset_minutes(now_secs, tz);
+    let now_local = now_min.checked_add(off)?;
+
+    // Forward scan from `now_local`, skipping across entire spring-forward DST gaps at once.
+    let mut search_local = u64::try_from(now_local).ok()?;
+    let mut forward_utc: Option<i64> = None;
+    for _ in 0..16 {
+        let Some(next_local) = cron.next_minute_after(search_local) else {
+            break;
+        };
+        let next_local_i64 = i64::try_from(next_local).ok()?;
+        let resolved = resolve_local_minute_utc(next_local_i64, tz);
+        if let Some(&chosen) = resolved.iter().find(|&&u| u > now_min) {
+            forward_utc = Some(chosen);
+            break;
+        }
+        if resolved.is_empty() {
+            // Spring-forward nonexistent wall-clock minute: binary search for the exact
+            // first existing local minute after the gap so we jump the entire gap at once.
+            let lo = next_local_i64;
+            let hi = next_local_i64.saturating_add(180);
+            if resolve_local_minute_utc(hi, tz).is_empty() {
+                search_local = u64::try_from(hi).ok()?;
+            } else {
+                let mut left = lo;
+                let mut right = hi;
+                while left + 1 < right {
+                    let mid = left + (right - left) / 2;
+                    if resolve_local_minute_utc(mid, tz).is_empty() {
+                        left = mid;
+                    } else {
+                        right = mid;
+                    }
+                }
+                search_local = u64::try_from(left).ok()?;
+            }
+        } else {
+            // All valid UTC instants for `next_local` were <= `now_min`; advance past it.
+            search_local = next_local;
+        }
+    }
+
+    // Fall-back check: if a backward DST offset transition occurs within the next 2 hours,
+    // wall-clock local time will revisit minutes <= `now_local` (e.g. 01:00..01:59 EST after
+    // 01:30 EDT). Scan `[min_future_local ..= now_local]` for any match whose UTC instant is
+    // strictly after `now_min`, and return the earliest UTC instant overall.
+    let mut min_future_off = off;
+    for delta in [1_i64, 30, 60, 90, 120] {
+        let probe_utc = now_min.saturating_add(delta);
+        if let Ok(probe_u64) = u64::try_from(probe_utc) {
+            let probe_off = tz_offset_minutes(probe_u64.saturating_mul(60), tz);
+            if probe_off < min_future_off {
+                min_future_off = probe_off;
+            }
+        }
+    }
+    let min_future_local = now_min.saturating_add(1).saturating_add(min_future_off);
+    let mut fallback_utc: Option<i64> = None;
+    if min_future_local <= now_local {
+        let mut cursor = u64::try_from(min_future_local.saturating_sub(1).max(0)).ok()?;
+        let limit = u64::try_from(now_local).ok()?;
+        while let Some(cand_local) = cron.next_minute_after(cursor) {
+            if cand_local > limit {
+                break;
+            }
+            let cand_i64 = i64::try_from(cand_local).ok()?;
+            let resolved = resolve_local_minute_utc(cand_i64, tz);
+            if let Some(&chosen) = resolved.iter().find(|&&u| u > now_min) {
+                fallback_utc = Some(fallback_utc.map_or(chosen, |prev| prev.min(chosen)));
+            }
+            cursor = cand_local;
+        }
+    }
+
+    let best = match (forward_utc, fallback_utc) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }?;
+    u64::try_from(best).ok()?.checked_mul(60_000)
+}
+
+/// Converts a local civil day (days since 1970-01-01 in `tz`) and `hour` (0..24) to UTC ms,
+/// re-evaluating `tz`'s offset at the target timestamp so DST transitions stay aligned (MB-36).
+fn local_day_hour_to_utc_ms(local_day: i64, hour: u32, tz: Option<&str>) -> Option<u64> {
+    let target_local_min = local_day
+        .checked_mul(1_440)?
+        .checked_add(i64::from(hour) * 60)?;
+    let mut utc_min = target_local_min.checked_sub(tz_offset_minutes(
+        u64::try_from(target_local_min.max(0))
+            .ok()?
+            .saturating_mul(60),
+        tz,
+    ))?;
+    for _ in 0..3 {
+        let o = tz_offset_minutes(u64::try_from(utc_min.max(0)).ok()?.saturating_mul(60), tz);
+        let refined = target_local_min.checked_sub(o)?;
+        if refined == utc_min {
+            break;
+        }
+        utc_min = refined;
+    }
+    let check_off = tz_offset_minutes(u64::try_from(utc_min.max(0)).ok()?.saturating_mul(60), tz);
+    if utc_min + check_off == target_local_min {
+        // On fall-back days prefer the earlier occurrence of a repeated wall-clock hour.
+        for shift in [60_i64, 30] {
+            let earlier = utc_min - shift;
+            if earlier >= 0 {
+                let eo = tz_offset_minutes(u64::try_from(earlier).ok()?.saturating_mul(60), tz);
+                if earlier + eo == target_local_min {
+                    return u64::try_from(earlier).ok()?.checked_mul(60_000);
+                }
+            }
+        }
+        return u64::try_from(utc_min).ok()?.checked_mul(60_000);
+    }
+    // Spring-forward gap (e.g. 02:00 jumped to 03:00): snap to the first UTC minute at/after the gap.
+    for delta in -120..=120_i64 {
+        let probe = utc_min.checked_add(delta)?;
+        if probe < 0 {
+            continue;
+        }
+        let po = tz_offset_minutes(u64::try_from(probe).ok()?.saturating_mul(60), tz);
+        if probe + po >= target_local_min {
+            return u64::try_from(probe).ok()?.checked_mul(60_000);
+        }
+    }
+    u64::try_from(utc_min).ok()?.checked_mul(60_000)
+}
+
+fn local_civil_day(unix_secs: u64, tz: Option<&str>) -> Option<i64> {
+    let off_secs = tz_offset_minutes(unix_secs, tz).checked_mul(60)?;
+    let local_secs = i64::try_from(unix_secs).ok()?.checked_add(off_secs)?;
+    Some(local_secs.div_euclid(86_400))
+}
+
 /// Computes the next Unix ms when Look Around will be due under `every`/`weekdays_only`/`tz`,
 /// matching [`SchedulerStateStore::look_around_is_due`].
 #[must_use]
@@ -908,19 +1105,17 @@ pub fn next_look_around_ms(
     {
         return Some(now_ms);
     }
-    let [minute, hour, ..] = cron_calendar_for_tz(now_secs, tz).ok()?;
-    let into_day_secs = u64::from(hour) * 3_600 + u64::from(minute) * 60 + now_secs % 60;
-    let today_midnight_ms = now_secs.saturating_sub(into_day_secs).saturating_mul(1_000);
-    for day_offset in 0..=4_u64 {
-        let day_ms = today_midnight_ms.saturating_add(day_offset.saturating_mul(86_400_000));
-        // Sample noon of that day to avoid midnight DST edge effects when checking weekday.
-        let noon_secs = (day_ms / 1_000).saturating_add(12 * 3_600);
-        if weekdays_only && is_weekend_in_tz(noon_secs, tz) {
+    let today_day = local_civil_day(now_secs, tz)?;
+    for day_offset in 0..=4_i64 {
+        let day = today_day + day_offset;
+        let weekday = (day + 4).rem_euclid(7); // 0 = Sun, 6 = Sat
+        if weekdays_only && (weekday == 0 || weekday == 6) {
             continue;
         }
         for &slot_hour in hours {
-            let candidate_ms =
-                day_ms.saturating_add(u64::from(slot_hour).saturating_mul(3_600_000));
+            let Some(candidate_ms) = local_day_hour_to_utc_ms(day, slot_hour, tz) else {
+                continue;
+            };
             if candidate_ms > now_ms && last_ms.is_none_or(|last| last < candidate_ms) {
                 return Some(candidate_ms);
             }
@@ -944,19 +1139,16 @@ pub fn next_tidy_ms(
         return Some(now_ms);
     }
     let now_secs = now_ms / 1_000;
-    let [minute, hour, ..] = cron_calendar_for_tz(now_secs, tz).ok()?;
-    let into_day_secs = u64::from(hour) * 3_600 + u64::from(minute) * 60 + now_secs % 60;
-    let today_3am_ms = now_secs
-        .saturating_sub(into_day_secs)
-        .saturating_mul(1_000)
-        .saturating_add(3 * 3_600_000);
+    let today_day = local_civil_day(now_secs, tz)?;
     let last = last_ms.unwrap_or(0);
     let back_ms = match every {
         TidyEvery::Night => 0_u64,
         TidyEvery::Week => 6 * 86_400_000,
     };
-    for day_offset in 0..=8_u64 {
-        let cand_3am = today_3am_ms.saturating_add(day_offset.saturating_mul(86_400_000));
+    for day_offset in 0..=8_i64 {
+        let Some(cand_3am) = local_day_hour_to_utc_ms(today_day + day_offset, 3, tz) else {
+            continue;
+        };
         if cand_3am > now_ms && cand_3am.saturating_sub(back_ms) > last {
             return Some(cand_3am);
         }
@@ -984,10 +1176,10 @@ fn tz_offset_minutes(unix_secs: u64, tz: Option<&str>) -> i64 {
 #[must_use]
 pub fn latest_slot_ms(now_ms: u64, tz: Option<&str>, hours: &[u32]) -> Option<u64> {
     let secs = now_ms / 1_000;
-    let [minute, hour, ..] = cron_calendar_for_tz(secs, tz).ok()?;
+    let [_, hour, ..] = cron_calendar_for_tz(secs, tz).ok()?;
     let slot = hours.iter().copied().filter(|&h| h <= hour).max()?;
-    let into = u64::from(hour - slot) * 3_600 + u64::from(minute) * 60 + secs % 60;
-    Some(secs.saturating_sub(into).saturating_mul(1_000))
+    let today_day = local_civil_day(secs, tz)?;
+    local_day_hour_to_utc_ms(today_day, slot, tz)
 }
 
 /// The last tidy-up must be older than this for the next to run: the latest 3 AM for each night,
@@ -1278,7 +1470,18 @@ fn tzif_offset_for_unix_secs(bytes: &[u8], unix_secs: u64) -> Option<i64> {
 
     let target = i64::try_from(unix_secs).unwrap_or(i64::MAX);
     let mut chosen_type: Option<usize> = None;
-    let mut last_transition: Option<i64> = None;
+    let last_table_transition: Option<i64> = if timecnt > 0 {
+        let off = transitions_off + (timecnt - 1) * time_size;
+        if time_size == 8 {
+            let raw: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+            Some(i64::from_be_bytes(raw))
+        } else {
+            let raw: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+            Some(i64::from(i32::from_be_bytes(raw)))
+        }
+    } else {
+        None
+    };
 
     for i in 0..timecnt {
         let off = transitions_off + i * time_size;
@@ -1291,15 +1494,15 @@ fn tzif_offset_for_unix_secs(bytes: &[u8], unix_secs: u64) -> Option<i64> {
         };
         if t <= target {
             chosen_type = bytes.get(type_idx_off + i).copied().map(usize::from);
-            last_transition = Some(t);
         } else {
             break;
         }
     }
 
-    // For timestamps beyond the last explicit transition in v2/v3, check the trailing POSIX TZ string
-    // (critical for future years past 2038).
-    if time_size == 8 && last_transition.is_some() && chosen_type.is_some() {
+    // RFC 8536: for timestamps at or beyond the last explicit transition in v2/v3 (or when no
+    // explicit transitions exist), evaluate the trailing POSIX TZ string including DST rules (MB-36).
+    let beyond_table = timecnt == 0 || last_table_transition.is_some_and(|lt| target >= lt);
+    if time_size == 8 && beyond_table {
         let charcnt = read_hdr_u32(40)?;
         let leapcnt = read_hdr_u32(28)?;
         let ttisstdcnt = read_hdr_u32(24)?;
@@ -1314,8 +1517,7 @@ fn tzif_offset_for_unix_secs(bytes: &[u8], unix_secs: u64) -> Option<i64> {
         {
             let trimmed = posix.trim_matches(|c| c == '\n' || c == '\r' || c == '\0');
             if !trimmed.is_empty()
-                && last_transition.is_some_and(|lt| target > lt + 365 * 86_400)
-                && let Some(off) = posix_tz_std_offset_secs(trimmed)
+                && let Some(off) = posix_tz_offset_secs(trimmed, target)
             {
                 return Some(off);
             }
@@ -1329,47 +1531,235 @@ fn tzif_offset_for_unix_secs(bytes: &[u8], unix_secs: u64) -> Option<i64> {
 }
 
 #[cfg(unix)]
-fn posix_tz_std_offset_secs(posix: &str) -> Option<i64> {
-    let std_part = posix.split(',').next()?;
-    let bytes = std_part.as_bytes();
-    let mut i = 0;
+#[derive(Debug, Clone, Copy)]
+enum PosixDstDateRule {
+    /// `Mm.w.d`: month `1..=12`, week `1..=5` (`5` = last), weekday `0..=6` (0 = Sun).
+    MonthWeekDay { month: u32, week: u32, day: u32 },
+    /// `Jn`: 1-based Julian day `1..=365` (never counts Feb 29).
+    JulianNoLeap(u32),
+    /// `n`: 0-based Julian day `0..=365` (counts Feb 29 on leap years).
+    ZeroBasedDay(u32),
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct PosixDstTransition {
+    rule: PosixDstDateRule,
+    time_secs: i64,
+}
+
+#[cfg(unix)]
+fn parse_posix_tz_name(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
     if bytes.first() == Some(&b'<') {
+        let mut i = 1;
         while i < bytes.len() && bytes.get(i) != Some(&b'>') {
             i += 1;
         }
-        i += 1;
-    } else {
-        while i < bytes.len() && bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
-            i += 1;
+        if bytes.get(i) == Some(&b'>') {
+            return Some(i + 1);
         }
-    }
-    let rest = std_part.get(i..)?;
-    if rest.is_empty() {
         return None;
     }
-    // POSIX offset has reversed sign: `UTC+5` or `EST5` means UTC-5.
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != ':' && c != '+' && c != '-')
-        .unwrap_or(rest.len());
-    let num = rest.get(..end)?;
-    let (sign, digits) = if let Some(d) = num.strip_prefix('-') {
-        (1_i64, d)
-    } else if let Some(d) = num.strip_prefix('+') {
-        (-1_i64, d)
+    let mut i = 0;
+    while i < bytes.len() && bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
+        i += 1;
+    }
+    (i > 0).then_some(i)
+}
+
+#[cfg(unix)]
+fn parse_posix_hms(raw: &str, negate_posix_sign: bool) -> Option<i64> {
+    if raw.is_empty() {
+        return None;
+    }
+    let (sign, digits) = if let Some(d) = raw.strip_prefix('-') {
+        (if negate_posix_sign { 1_i64 } else { -1_i64 }, d)
+    } else if let Some(d) = raw.strip_prefix('+') {
+        (if negate_posix_sign { -1_i64 } else { 1_i64 }, d)
     } else {
-        (-1_i64, num)
+        (if negate_posix_sign { -1_i64 } else { 1_i64 }, raw)
     };
-    let (h, m, s) = match digits.split(':').collect::<Vec<_>>().as_slice() {
-        [h] => (h.parse::<i64>().ok()?, 0_i64, 0_i64),
-        [h, m] => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?, 0_i64),
-        [h, m, s] => (
-            h.parse::<i64>().ok()?,
-            m.parse::<i64>().ok()?,
-            s.parse::<i64>().ok()?,
-        ),
-        _ => return None,
+    let mut parts = digits.split(':');
+    let h = parts.next()?.parse::<i64>().ok()?;
+    let m = match parts.next() {
+        Some(p) => p.parse::<i64>().ok()?,
+        None => 0,
     };
+    let s = match parts.next() {
+        Some(p) => p.parse::<i64>().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
     Some(sign * (h * 3_600 + m * 60 + s))
+}
+
+#[cfg(unix)]
+fn parse_posix_offset_prefix(s: &str) -> Option<(i64, usize)> {
+    let end = s
+        .find(|c: char| !c.is_ascii_digit() && c != ':' && c != '+' && c != '-')
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    let off = parse_posix_hms(s.get(..end)?, true)?;
+    Some((off, end))
+}
+
+#[cfg(unix)]
+fn parse_posix_transition_rule(raw: &str) -> Option<PosixDstTransition> {
+    let (date_part, time_part) = match raw.split_once('/') {
+        Some((d, t)) => (d, Some(t)),
+        None => (raw, None),
+    };
+    let time_secs = match time_part {
+        Some(t) => parse_posix_hms(t, false)?,
+        None => 2 * 3_600,
+    };
+    let rule = if let Some(rest) = date_part.strip_prefix('M') {
+        let mut parts = rest.split('.');
+        let month = parts.next()?.parse::<u32>().ok()?;
+        let week = parts.next()?.parse::<u32>().ok()?;
+        let day = parts.next()?.parse::<u32>().ok()?;
+        if parts.next().is_some()
+            || !(1..=12).contains(&month)
+            || !(1..=5).contains(&week)
+            || day > 6
+        {
+            return None;
+        }
+        PosixDstDateRule::MonthWeekDay { month, week, day }
+    } else if let Some(rest) = date_part.strip_prefix('J') {
+        let j = rest.parse::<u32>().ok()?;
+        if !(1..=365).contains(&j) {
+            return None;
+        }
+        PosixDstDateRule::JulianNoLeap(j)
+    } else {
+        let n = date_part.parse::<u32>().ok()?;
+        if n > 365 {
+            return None;
+        }
+        PosixDstDateRule::ZeroBasedDay(n)
+    };
+    Some(PosixDstTransition { rule, time_secs })
+}
+
+#[cfg(unix)]
+const fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+#[cfg(unix)]
+const fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+#[cfg(unix)]
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(unix)]
+fn civil_year_from_unix_secs(unix_secs: i64) -> i64 {
+    let z = unix_secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    y + i64::from(m <= 2)
+}
+
+#[cfg(unix)]
+fn posix_transition_utc_secs(year: i64, tr: PosixDstTransition, active_offset_secs: i64) -> i64 {
+    let day_num = match tr.rule {
+        PosixDstDateRule::MonthWeekDay { month, week, day } => {
+            let first_days = days_from_civil(year, month, 1);
+            let first_dow = u32::try_from((first_days + 4).rem_euclid(7)).unwrap_or(0);
+            let delta = (day + 7 - first_dow) % 7;
+            let mut dom = 1 + delta + (week - 1) * 7;
+            let dim = days_in_month(year, month);
+            if dom > dim {
+                dom = dom.saturating_sub(7);
+            }
+            days_from_civil(year, month, dom)
+        }
+        PosixDstDateRule::JulianNoLeap(j) => {
+            let jan1 = days_from_civil(year, 1, 1);
+            let leap_adj = i64::from(is_leap_year(year) && j >= 60);
+            jan1 + i64::from(j - 1) + leap_adj
+        }
+        PosixDstDateRule::ZeroBasedDay(n) => {
+            let jan1 = days_from_civil(year, 1, 1);
+            jan1 + i64::from(n)
+        }
+    };
+    day_num * 86_400 + tr.time_secs - active_offset_secs
+}
+
+#[cfg(unix)]
+fn posix_tz_offset_secs(posix: &str, unix_secs: i64) -> Option<i64> {
+    let mut parts = posix.split(',');
+    let spec = parts.next()?;
+    let std_name_end = parse_posix_tz_name(spec)?;
+    let after_std = spec.get(std_name_end..)?;
+    let (std_off, std_off_len) = parse_posix_offset_prefix(after_std)?;
+    let rest = after_std.get(std_off_len..)?;
+
+    if rest.is_empty() {
+        return Some(std_off);
+    }
+
+    let dst_name_end = parse_posix_tz_name(rest)?;
+    let after_dst = rest.get(dst_name_end..)?;
+    let dst_off = if after_dst.is_empty() {
+        std_off + 3_600
+    } else {
+        parse_posix_offset_prefix(after_dst)?.0
+    };
+
+    let (Some(start_raw), Some(end_raw)) = (parts.next(), parts.next()) else {
+        return Some(std_off);
+    };
+    if parts.next().is_some() {
+        return Some(std_off);
+    }
+    let start_rule = parse_posix_transition_rule(start_raw)?;
+    let end_rule = parse_posix_transition_rule(end_raw)?;
+
+    let year = civil_year_from_unix_secs(unix_secs.saturating_add(std_off));
+    let start_utc = posix_transition_utc_secs(year, start_rule, std_off);
+    let end_utc = posix_transition_utc_secs(year, end_rule, dst_off);
+
+    let in_dst = if start_utc < end_utc {
+        // Northern hemisphere: DST is active between spring start and autumn end.
+        unix_secs >= start_utc && unix_secs < end_utc
+    } else {
+        // Southern hemisphere: DST wraps across Jan 1 (active from Oct..Apr).
+        unix_secs >= start_utc || unix_secs < end_utc
+    };
+    Some(if in_dst { dst_off } else { std_off })
 }
 
 fn fallback_iana_fixed_offset(tz: &str) -> Option<i64> {
@@ -1623,5 +2013,271 @@ mod tests {
         assert_eq!(seoul, plus9);
         assert_eq!(seoul[1], 9);
         assert_eq!(seoul[0], 15);
+    }
+
+    #[test]
+    fn look_around_preserves_active_suggestion_ids_and_timestamps_on_refresh() {
+        let root = temp_dir("mb37-preserve");
+        let store = BotStore::new(root.clone());
+        let items = BotItemsStore::new(root.join("bot-items.db"));
+        let sched = SchedulerStateStore::new(root.clone());
+
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Stable Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: Some("# Stable Bot\n\nTracks deploys.\n".to_owned()),
+                },
+                1_000,
+            )
+            .unwrap();
+        items
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot.id.clone(),
+                    title: "Ship v2".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &BotItemActor::Owner { device: None },
+                1_500,
+            )
+            .unwrap();
+
+        let first = run_look_around_tracked(&store, &items, Some(&sched), &bot.id, 3_000).unwrap();
+        assert_eq!(first.len(), 1);
+        let first_id = first[0].id.clone();
+        let first_created = first[0].created_at_ms;
+
+        mark_up_next_seen(&sched, Some(&bot.id), 4_000).unwrap();
+        assert_eq!(up_next_unseen_count(&store, &sched, Some(&bot.id)), 0);
+
+        // Re-running look-around at t=9_000 must preserve the unchanged suggestion's ID & created_at_ms.
+        let second = run_look_around_tracked(&store, &items, Some(&sched), &bot.id, 9_000).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, first_id);
+        assert_eq!(second[0].created_at_ms, first_created);
+        assert_eq!(
+            up_next_unseen_count(&store, &sched, Some(&bot.id)),
+            0,
+            "refreshing unchanged suggestions must not reset unseen count"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dst_spring_forward_and_posix_tz_rules_evaluate_accurately() {
+        // MB-36(b): POSIX TZ DST evaluator handles Northern & Southern hemispheres past 2038.
+        // 2040-07-15 12:00:00 UTC (summer in NH -> EDT UTC-4, winter in SH -> AEST UTC+10).
+        let july_2040 = days_from_civil(2040, 7, 15) * 86_400 + 12 * 3_600;
+        assert_eq!(
+            posix_tz_offset_secs("EST5EDT,M3.2.0,M11.1.0", july_2040),
+            Some(-4 * 3_600)
+        );
+        assert_eq!(
+            posix_tz_offset_secs("AEST-10AEDT,M10.1.0,M4.1.0/3", july_2040),
+            Some(10 * 3_600)
+        );
+        // 2040-01-15 12:00:00 UTC (winter in NH -> EST UTC-5, summer in SH -> AEDT UTC+11).
+        let jan_2040 = days_from_civil(2040, 1, 15) * 86_400 + 12 * 3_600;
+        assert_eq!(
+            posix_tz_offset_secs("EST5EDT,M3.2.0,M11.1.0", jan_2040),
+            Some(-5 * 3_600)
+        );
+        assert_eq!(
+            posix_tz_offset_secs("AEST-10AEDT,M10.1.0,M4.1.0/3", jan_2040),
+            Some(11 * 3_600)
+        );
+
+        // MB-36(a): Across US spring-forward (2026-03-08 02:00 EST -> 03:00 EDT),
+        // at 01:00 EST (06:00 UTC), a `0 9 * * *` cron in America/New_York fires at 09:00 EDT (13:00 UTC),
+        // NOT 14:00 UTC!
+        let pre_dst_secs = u64::try_from(days_from_civil(2026, 3, 8) * 86_400 + 6 * 3_600).unwrap();
+        let expected_9am_edt_ms =
+            u64::try_from(days_from_civil(2026, 3, 8) * 86_400 + 13 * 3_600).unwrap() * 1_000;
+        // Only run IANA zone assertions if system zoneinfo has America/New_York.
+        if tz_offset_minutes(pre_dst_secs, Some("America/New_York")) == -300
+            && tz_offset_minutes(pre_dst_secs + 4 * 3_600, Some("America/New_York")) == -240
+        {
+            let cron = Cron::parse("0 9 * * *").unwrap();
+            assert_eq!(
+                next_cron_utc_ms(&cron, pre_dst_secs, Some("America/New_York")),
+                Some(expected_9am_edt_ms)
+            );
+            let expected_8am_edt_ms =
+                u64::try_from(days_from_civil(2026, 3, 8) * 86_400 + 12 * 3_600).unwrap() * 1_000;
+            assert_eq!(
+                next_look_around_ms(
+                    LookAroundEvery::Mornings,
+                    false,
+                    Some("America/New_York"),
+                    None,
+                    pre_dst_secs * 1_000
+                ),
+                Some(expected_8am_edt_ms)
+            );
+
+            // R2M-18: Spring-forward gap (`02:00..02:59` nonexistent) must NOT exhaust retries on `* * * * *` or `*/5 * * * *`.
+            let just_before_gap =
+                u64::try_from(days_from_civil(2026, 3, 8) * 86_400 + 6 * 3_600 + 59 * 60).unwrap(); // 01:59 EST
+            let expected_3am_edt_ms =
+                u64::try_from(days_from_civil(2026, 3, 8) * 86_400 + 7 * 3_600).unwrap() * 1_000; // 03:00 EDT (07:00 UTC)
+            assert_eq!(
+                next_cron_utc_ms(
+                    &Cron::parse("* * * * *").unwrap(),
+                    just_before_gap,
+                    Some("America/New_York")
+                ),
+                Some(expected_3am_edt_ms)
+            );
+            assert_eq!(
+                next_cron_utc_ms(
+                    &Cron::parse("*/5 * * * *").unwrap(),
+                    just_before_gap,
+                    Some("America/New_York")
+                ),
+                Some(expected_3am_edt_ms)
+            );
+        }
+
+        // R2M-18: Fall-back (`2026-11-01 01:00..01:59` repeated in America/New_York).
+        let fb_0130_edt =
+            u64::try_from(days_from_civil(2026, 11, 1) * 86_400 + 5 * 3_600 + 30 * 60).unwrap(); // 01:30 EDT = 05:30 UTC
+        let fb_0159_edt =
+            u64::try_from(days_from_civil(2026, 11, 1) * 86_400 + 5 * 3_600 + 59 * 60).unwrap(); // 01:59 EDT = 05:59 UTC
+        let fb_0145_edt =
+            u64::try_from(days_from_civil(2026, 11, 1) * 86_400 + 5 * 3_600 + 45 * 60).unwrap(); // 01:45 EDT = 05:45 UTC
+        if tz_offset_minutes(fb_0130_edt, Some("America/New_York")) == -240
+            && tz_offset_minutes(fb_0130_edt + 3_600, Some("America/New_York")) == -300
+        {
+            let expected_0130_est_ms = (fb_0130_edt + 3_600) * 1_000; // 06:30 UTC
+            let expected_0145_edt_ms = fb_0145_edt * 1_000; // 05:45 UTC
+            let expected_0105_est_ms =
+                u64::try_from(days_from_civil(2026, 11, 1) * 86_400 + 6 * 3_600 + 5 * 60).unwrap()
+                    * 1_000; // 06:05 UTC
+            assert_eq!(
+                next_cron_utc_ms(
+                    &Cron::parse("30 1 * * *").unwrap(),
+                    fb_0130_edt,
+                    Some("America/New_York")
+                ),
+                Some(expected_0130_est_ms),
+                "30 1 * * * at 01:30 EDT must hit 01:30 EST 1h later"
+            );
+            assert_eq!(
+                next_cron_utc_ms(
+                    &Cron::parse("30 1 * * *").unwrap(),
+                    fb_0159_edt,
+                    Some("America/New_York")
+                ),
+                Some(expected_0130_est_ms),
+                "30 1 * * * at 01:59 EDT must hit 01:30 EST 31m later"
+            );
+            assert_eq!(
+                next_cron_utc_ms(
+                    &Cron::parse("*/15 1 * * *").unwrap(),
+                    fb_0130_edt,
+                    Some("America/New_York")
+                ),
+                Some(expected_0145_edt_ms),
+                "*/15 1 * * * at 01:30 EDT must hit 01:45 EDT before 01:00 EST"
+            );
+            assert_eq!(
+                next_cron_utc_ms(
+                    &Cron::parse("5 1 * * *").unwrap(),
+                    fb_0145_edt,
+                    Some("America/New_York")
+                ),
+                Some(expected_0105_est_ms),
+                "5 1 * * * at 01:45 EDT must hit 01:05 EST 20m later"
+            );
+        }
+    }
+
+    #[test]
+    fn r2m19_dismissed_suggestion_resurfaces_after_7_day_cooldown() {
+        let root = temp_dir("r2m19-cooldown");
+        let store = BotStore::new(root.clone());
+        let items = BotItemsStore::new(root.join("bot-items.db"));
+        let sched = SchedulerStateStore::new(root.clone());
+
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Cooldown Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: Some("# Cooldown Bot\n\nWatches tasks.\n".to_owned()),
+                },
+                1_000,
+            )
+            .unwrap();
+        items
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot.id.clone(),
+                    title: "Unblock release".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &BotItemActor::Owner { device: None },
+                1_500,
+            )
+            .unwrap();
+
+        let initial =
+            run_look_around_tracked(&store, &items, Some(&sched), &bot.id, 3_000).unwrap();
+        assert_eq!(initial.len(), 1);
+        dismiss_suggestion(&store, &sched, &bot.id, &initial[0].id, 4_000).unwrap();
+
+        // Within 7-day cooldown -> stays suppressed.
+        let mid = run_look_around_tracked(
+            &store,
+            &items,
+            Some(&sched),
+            &bot.id,
+            4_000 + 3 * 24 * 3_600 * 1_000,
+        )
+        .unwrap();
+        assert!(mid.is_empty(), "must remain suppressed during 7d cooldown");
+
+        // Past 7-day cooldown -> MUST resurface instead of staying permanently suppressed.
+        let after = run_look_around_tracked(
+            &store,
+            &items,
+            Some(&sched),
+            &bot.id,
+            4_000 + SUGGESTION_DISMISS_COOLDOWN_MS + 1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "dismissed suggestion must resurface after 7-day cooldown expires"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -184,3 +184,10 @@ fn live_model_switch_does_not_reuse_the_previous_context_window() {
     assert!(metadata["context"].is_null());
     assert!(metadata["effort"].is_null());
 }
+
+#[test]
+fn windows_platform_blocks_model_and_effort_changes() {
+    assert!(ensure_model_change_platform(false).is_ok());
+    let err = ensure_model_change_platform(true).unwrap_err();
+    assert_eq!(err.to_string(), WINDOWS_UNAVAILABLE);
+}

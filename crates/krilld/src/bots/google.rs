@@ -62,26 +62,49 @@ fn bot_refresh_mutex(bot_id: &BotId) -> Arc<Mutex<()>> {
     )
 }
 
-fn active_google_oauth_flows() -> &'static Mutex<BTreeMap<BotId, Arc<AtomicBool>>> {
-    static FLOWS: OnceLock<Mutex<BTreeMap<BotId, Arc<AtomicBool>>>> = OnceLock::new();
+struct GoogleOAuthCancel {
+    cancel: AtomicBool,
+    active_socket: http_client::RequestCancelSlot,
+}
+
+impl GoogleOAuthCancel {
+    fn new() -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            active_socket: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn trigger(&self) {
+        self.cancel.store(true, Ordering::Release);
+        http_client::cancel_active_request(&self.active_socket);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+}
+
+fn active_google_oauth_flows() -> &'static Mutex<BTreeMap<BotId, Arc<GoogleOAuthCancel>>> {
+    static FLOWS: OnceLock<Mutex<BTreeMap<BotId, Arc<GoogleOAuthCancel>>>> = OnceLock::new();
     FLOWS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Cancels any active loopback Google OAuth listener thread for `bot_id`.
 pub fn cancel_google_oauth(bot_id: &BotId) {
-    if let Some(cancel) = lock(active_google_oauth_flows()).remove(bot_id) {
-        cancel.store(true, Ordering::Release);
+    if let Some(entry) = lock(active_google_oauth_flows()).remove(bot_id) {
+        entry.trigger();
     }
 }
 
 /// Cancels all active loopback Google OAuth listener threads (e.g. on daemon shutdown).
 pub fn cancel_all_google_oauth() {
-    let drained: Vec<Arc<AtomicBool>> = {
+    let drained: Vec<Arc<GoogleOAuthCancel>> = {
         let mut map = lock(active_google_oauth_flows());
         std::mem::take(&mut *map).into_values().collect()
     };
-    for cancel in drained {
-        cancel.store(true, Ordering::Release);
+    for entry in drained {
+        entry.trigger();
     }
 }
 
@@ -193,15 +216,20 @@ pub fn start_google_oauth(
         .connectors
         .google
         .token_secret_ref
-        .clone()
-        .unwrap_or_else(|| SecretVault::scoped_ref(&bot.id, "google_oauth_tokens"));
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || SecretVault::scoped_ref(&bot.id, "google_oauth_tokens"),
+            ToOwned::to_owned,
+        );
     let expected_state = state.clone();
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(GoogleOAuthCancel::new());
     if let Some(prev) =
         lock(active_google_oauth_flows()).insert(bot_id.clone(), Arc::clone(&cancel))
     {
-        prev.store(true, Ordering::Release);
+        prev.trigger();
     }
     let cancel_bg = Arc::clone(&cancel);
     let bot_id_bg = bot_id.clone();
@@ -233,7 +261,7 @@ pub fn start_google_oauth(
                     flows.remove(&bot_id_bg);
                 }
             }
-            if cancel_bg.load(Ordering::Acquire) {
+            if cancel_bg.is_cancelled() {
                 return;
             }
             let status = match res {
@@ -330,7 +358,7 @@ fn read_oauth_head_target(stream: &mut std::net::TcpStream) -> io::Result<String
 #[expect(clippy::too_many_arguments, reason = "OAuth callback state bundle")]
 fn run_oauth_callback_listener(
     listener: &TcpListener,
-    cancel: &AtomicBool,
+    cancel: &GoogleOAuthCancel,
     _bot_id: &BotId,
     creds: &OAuthClientCredentials,
     redirect_uri: &str,
@@ -342,7 +370,7 @@ fn run_oauth_callback_listener(
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + OAUTH_CALLBACK_TIMEOUT;
     let code = loop {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err("Google OAuth sign-in cancelled".to_owned());
         }
         if std::time::Instant::now() >= deadline {
@@ -405,10 +433,25 @@ fn run_oauth_callback_listener(
                 };
 
                 let finish_res: Result<(), String> = (|| {
-                    let bundle =
-                        exchange_code_for_tokens(token_url, creds, &code, redirect_uri, verifier)?;
+                    if cancel.is_cancelled() {
+                        return Err("Google OAuth sign-in cancelled".to_owned());
+                    }
+                    let bundle = exchange_code_for_tokens(
+                        token_url,
+                        creds,
+                        &code,
+                        redirect_uri,
+                        verifier,
+                        cancel,
+                    )?;
+                    if cancel.is_cancelled() {
+                        return Err("Google OAuth sign-in cancelled".to_owned());
+                    }
                     let encoded = serde_json::to_string(&bundle)
                         .map_err(|_| "failed to serialize Google OAuth token bundle".to_owned())?;
+                    if cancel.is_cancelled() {
+                        return Err("Google OAuth sign-in cancelled".to_owned());
+                    }
                     secrets
                         .set_ref(token_ref, Zeroizing::new(encoded))
                         .map_err(|err| {
@@ -417,12 +460,18 @@ fn run_oauth_callback_listener(
                     Ok(())
                 })();
                 if let Err(err) = finish_res {
-                    write_html_page(
-                        &mut stream,
-                        502,
-                        "Google token exchange or storage failed. Please retry from Krill.",
-                    )
-                    .ok();
+                    let (status_code, msg) = if cancel.is_cancelled() {
+                        (
+                            409,
+                            "Google sign-in was cancelled or superseded. You can close this tab.",
+                        )
+                    } else {
+                        (
+                            502,
+                            "Google token exchange or storage failed. Please retry from Krill.",
+                        )
+                    };
+                    write_html_page(&mut stream, status_code, msg).ok();
                     return Err(err);
                 }
 
@@ -450,6 +499,7 @@ fn exchange_code_for_tokens(
     code: &str,
     redirect_uri: &str,
     verifier: &Zeroizing<String>,
+    cancel: &GoogleOAuthCancel,
 ) -> Result<GoogleTokenBundle, String> {
     let mut pairs: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
@@ -461,8 +511,10 @@ fn exchange_code_for_tokens(
     if let Some(ref secret) = creds.client_secret {
         pairs.push(("client_secret", secret.as_str()));
     }
-    let resp = http_client::send(
+    let resp = http_client::send_interruptible(
         &HttpRequest::post_form(token_url, &pairs).with_ssrf_policy(policy_for_url(token_url)),
+        Some(&cancel.cancel),
+        Some(&cancel.active_socket),
     )
     .map_err(|err| format!("Google token exchange transport error: {}", err.kind()))?;
     if !resp.is_success() {
@@ -494,18 +546,15 @@ pub fn ensure_valid_access_token(
     let refresh_lock = bot_refresh_mutex(&bot.id);
     let _refresh_guard = lock(&refresh_lock);
 
-    let token_ref = bot
+    let custom_token_ref = bot
         .connectors
         .google
         .token_secret_ref
         .as_deref()
-        .unwrap_or("google_oauth_tokens");
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let raw = secrets
-        .resolve_secret(
-            &bot.id,
-            bot.connectors.google.token_secret_ref.as_deref(),
-            "google_oauth_tokens",
-        )
+        .resolve_secret(&bot.id, custom_token_ref, "google_oauth_tokens")
         .map_err(|err| BotErrorDetail {
             category: BotErrorCategory::NotSetUp,
             agent_name: None,
@@ -589,11 +638,10 @@ pub fn ensure_valid_access_token(
     }
     bundle.expires_at_ms = current_ms.saturating_add(ttl_ms);
 
-    let save_ref = if bot.connectors.google.token_secret_ref.is_some() {
-        token_ref.to_owned()
-    } else {
-        SecretVault::scoped_ref(&bot.id, "google_oauth_tokens")
-    };
+    let save_ref = custom_token_ref.map_or_else(
+        || SecretVault::scoped_ref(&bot.id, "google_oauth_tokens"),
+        ToOwned::to_owned,
+    );
     if let Ok(encoded) = serde_json::to_string(&bundle) {
         secrets.set_ref(&save_ref, Zeroizing::new(encoded)).ok();
     }
@@ -684,17 +732,21 @@ pub fn poll_bot_google(
                     .map(ToOwned::to_owned);
                 let snippet = meta_snippet.or(fallback_snippet);
 
-                let title = match (&hdr_subject, &snippet) {
+                let raw_title = match (&hdr_subject, &snippet) {
                     (Some(s), _) => format!("Gmail: {}", truncate_chars(s, 120)),
                     (None, Some(sn)) => format!("Gmail: {}", truncate_chars(sn, 120)),
                     (None, None) => format!("Unread Gmail message ({id})"),
                 };
-                let description = match (hdr_from.as_deref(), snippet.as_deref()) {
+                let title = crate::bots::items::clamp_item_title(&raw_title);
+                let raw_desc = match (hdr_from.as_deref(), snippet.as_deref()) {
                     (Some(f), Some(sn)) => Some(format!("From: {f}\n\n{sn}")),
                     (Some(f), None) => Some(format!("From: {f}")),
                     (None, Some(sn)) => Some(sn.to_owned()),
                     (None, None) => Some(format!("Detected unread Gmail message {id}.")),
                 };
+                let description = raw_desc
+                    .as_deref()
+                    .and_then(crate::bots::items::clamp_item_description);
                 if items
                     .create_item(
                         &CreateBotItemParams {
@@ -764,11 +816,14 @@ pub fn poll_bot_google(
                     .create_item(
                         &CreateBotItemParams {
                             bot_id: bot.id.clone(),
-                            title: format!("Calendar: {}", truncate_chars(summary.trim(), 120)),
+                            title: crate::bots::items::clamp_item_title(&format!(
+                                "Calendar: {}",
+                                truncate_chars(summary.trim(), 120)
+                            )),
                             description: ev
                                 .get("description")
                                 .and_then(serde_json::Value::as_str)
-                                .map(ToOwned::to_owned),
+                                .and_then(crate::bots::items::clamp_item_description),
                             done_means: None,
                             status: Some(BotItemStatus::Planned),
                             links: vec![link],
@@ -832,7 +887,10 @@ pub fn poll_bot_google(
                     .create_item(
                         &CreateBotItemParams {
                             bot_id: bot.id.clone(),
-                            title: format!("Drive: {}", truncate_chars(name.trim(), 120)),
+                            title: crate::bots::items::clamp_item_title(&format!(
+                                "Drive: {}",
+                                truncate_chars(name.trim(), 120)
+                            )),
                             description: None,
                             done_means: None,
                             status: Some(BotItemStatus::Planned),
@@ -960,6 +1018,11 @@ struct GoogleWakeState {
     wake_now: bool,
 }
 
+struct RunningGooglePoller {
+    stop: Arc<(Mutex<GoogleWakeState>, Condvar)>,
+    handle: JoinHandle<()>,
+}
+
 /// Strictly-lazy 60s local Google Workspace trigger checker thread.
 pub struct GoogleTriggerChecker {
     store: Arc<BotStore>,
@@ -968,9 +1031,9 @@ pub struct GoogleTriggerChecker {
     endpoints: GoogleEndpoints,
     statuses: Arc<Mutex<BTreeMap<BotId, BotConnectorStatus>>>,
     on_new_items: Arc<Mutex<Option<GoogleNewItemsCallback>>>,
-    stop: Arc<(Mutex<GoogleWakeState>, Condvar)>,
     running: AtomicBool,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    reconcile_lock: Mutex<()>,
+    lifecycle: Mutex<Option<RunningGooglePoller>>,
 }
 
 impl fmt::Debug for GoogleTriggerChecker {
@@ -1003,9 +1066,9 @@ impl GoogleTriggerChecker {
             endpoints,
             statuses: Arc::new(Mutex::new(BTreeMap::new())),
             on_new_items: Arc::new(Mutex::new(None)),
-            stop: Arc::new((Mutex::new(GoogleWakeState::default()), Condvar::new())),
             running: AtomicBool::new(false),
-            thread: Mutex::new(None),
+            reconcile_lock: Mutex::new(()),
+            lifecycle: Mutex::new(None),
         }
     }
 
@@ -1015,21 +1078,30 @@ impl GoogleTriggerChecker {
     }
 
     /// Starts the poller thread if ≥1 bot has `google.enabled`, wakes immediately to check
-    /// enabled bots (honoring each bot's `min_interval`), or stops it when none do.
+    /// enabled bots (honoring each bot's `min_interval`), or stops only the poller when none do
+    /// (without cancelling any in-flight OAuth sign-in flow: MB-11).
     pub fn reconcile(&self) {
-        let has_enabled = self
-            .store
-            .list_bots()
-            .unwrap_or_default()
+        let _reconcile = lock(&self.reconcile_lock);
+        let bots = self.store.list_bots().unwrap_or_default();
+        let active_ids: std::collections::BTreeSet<BotId> = bots
             .iter()
-            .any(|b| !b.paused && b.connectors.google.enabled);
-        if has_enabled {
-            self.ensure_started();
-            let mut st = lock(&self.stop.0);
-            st.wake_now = true;
-            self.stop.1.notify_all();
+            .filter(|b| !b.paused && b.connectors.google.enabled)
+            .map(|b| b.id.clone())
+            .collect();
+        if active_ids.is_empty() {
+            self.stop_poller_locked();
+            // Prune AFTER joining the poller thread so an in-flight poll cannot resurrect stale entries.
+            lock(&self.statuses).retain(|bid, _| active_ids.contains(bid));
         } else {
-            self.stop();
+            lock(&self.statuses).retain(|bid, _| active_ids.contains(bid));
+            let mut guard = lock(&self.lifecycle);
+            if let Some(ref running) = *guard {
+                let mut st = lock(&running.stop.0);
+                st.wake_now = true;
+                running.stop.1.notify_all();
+            } else {
+                self.spawn_locked(&mut guard);
+            }
         }
     }
 
@@ -1091,23 +1163,25 @@ impl GoogleTriggerChecker {
         self.running.load(Ordering::Acquire)
     }
 
-    fn ensure_started(&self) {
-        let mut handle_guard = lock(&self.thread);
-        if handle_guard.is_some() {
+    fn spawn_locked(&self, lifecycle_guard: &mut Option<RunningGooglePoller>) {
+        if lifecycle_guard.is_some() {
             return;
         }
-        {
-            let mut st = lock(&self.stop.0);
-            st.stop = false;
-            st.wake_now = true;
-        }
+        // Fresh per-generation stop/condvar state prevents stop/restart races (MB-17).
+        let stop = Arc::new((
+            Mutex::new(GoogleWakeState {
+                stop: false,
+                wake_now: true,
+            }),
+            Condvar::new(),
+        ));
         let store = Arc::clone(&self.store);
         let secrets = Arc::clone(&self.secrets);
         let items = Arc::clone(&self.items);
         let endpoints = self.endpoints.clone();
         let statuses = Arc::clone(&self.statuses);
         let on_new_items = Arc::clone(&self.on_new_items);
-        let stop = Arc::clone(&self.stop);
+        let stop_bg = Arc::clone(&stop);
 
         if let Ok(handle) = thread::Builder::new()
             .name("bot-google-poll".to_owned())
@@ -1124,7 +1198,7 @@ impl GoogleTriggerChecker {
                         .min()
                         .unwrap_or(DEFAULT_POLL_SECS);
                     let wait_res = {
-                        let mut guard = lock(&stop.0);
+                        let mut guard = lock(&stop_bg.0);
                         if guard.stop {
                             break;
                         }
@@ -1132,7 +1206,7 @@ impl GoogleTriggerChecker {
                             guard.wake_now = false;
                             false
                         } else {
-                            let (mut guard, _) = stop
+                            let (mut guard, _) = stop_bg
                                 .1
                                 .wait_timeout_while(
                                     guard,
@@ -1151,6 +1225,9 @@ impl GoogleTriggerChecker {
                         let ts = now_ms();
                         let bots = store.list_bots().unwrap_or_default();
                         for bot in bots {
+                            if lock(&stop_bg.0).stop {
+                                break;
+                            }
                             if bot.paused || !bot.connectors.google.enabled {
                                 continue;
                             }
@@ -1167,7 +1244,16 @@ impl GoogleTriggerChecker {
                                 continue;
                             }
                             last_polled.insert(bot.id.clone(), ts);
-                            let st = match poll_bot_google(&bot, &secrets, &items, &endpoints, ts) {
+                            let res = poll_bot_google(&bot, &secrets, &items, &endpoints, ts);
+                            let still_active = !lock(&stop_bg.0).stop
+                                && store.get_bot(&bot.id).ok().flatten().is_some_and(|live| {
+                                    !live.paused && live.connectors.google.enabled
+                                });
+                            if !still_active {
+                                lock(&statuses).remove(&bot.id);
+                                continue;
+                            }
+                            let st = match res {
                                 Ok(new_count) => {
                                     if new_count > 0
                                         && let Some(cb) = lock(&on_new_items).as_ref().cloned()
@@ -1206,20 +1292,36 @@ impl GoogleTriggerChecker {
             })
         {
             self.running.store(true, Ordering::Release);
-            *handle_guard = Some(handle);
+            *lifecycle_guard = Some(RunningGooglePoller { stop, handle });
         }
     }
 
-    /// Stops the background poller thread cleanly.
+    /// Stops ONLY the background poller thread without cancelling active OAuth sign-in flows.
+    pub fn stop_poller(&self) {
+        let _reconcile = lock(&self.reconcile_lock);
+        self.stop_poller_locked();
+    }
+
+    fn stop_poller_locked(&self) {
+        let running = {
+            let mut guard = lock(&self.lifecycle);
+            let taken = guard.take();
+            if let Some(ref r) = taken {
+                lock(&r.stop.0).stop = true;
+                r.stop.1.notify_all();
+            }
+            self.running.store(false, Ordering::Release);
+            taken
+        };
+        if let Some(r) = running {
+            r.handle.join().ok();
+        }
+    }
+
+    /// Stops both active OAuth sign-in listeners and the background poller thread cleanly.
     pub fn stop(&self) {
         cancel_all_google_oauth();
-        let handle = lock(&self.thread).take();
-        if let Some(h) = handle {
-            lock(&self.stop.0).stop = true;
-            self.stop.1.notify_all();
-            h.join().ok();
-            self.running.store(false, Ordering::Release);
-        }
+        self.stop_poller();
     }
 }
 
@@ -1840,6 +1942,326 @@ mod tests {
         assert!(!first_cb_called.load(Ordering::Acquire));
 
         srv.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn google_reconcile_preserves_oauth_prunes_statuses_and_handles_empty_token_ref() {
+        let dir = temp_dir("mb11-17-39-41-43");
+        let store = Arc::new(BotStore::new(dir.clone()));
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x88; 32]));
+        let items = Arc::new(BotItemsStore::new(dir.join("items.db")));
+
+        let mut bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Google OAuth Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        // Empty/whitespace token_secret_ref must normalize to default scoped secret ref (MB-43).
+        bot.connectors.google.token_secret_ref = Some("   ".to_owned());
+        bot.connectors.google.enabled = false;
+        bot.connectors.google.services.gmail = true;
+        store
+            .set_connector_config(&bot.id, bot.connectors.clone(), 1_100)
+            .unwrap();
+        secrets
+            .set_secret(
+                &bot.id,
+                "google_oauth_client",
+                Zeroizing::new(
+                    r#"{"installed":{"client_id":"cid-mb11","client_secret":"csec-mb11"}}"#
+                        .to_owned(),
+                ),
+            )
+            .unwrap();
+
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let long_cjk_subj = "긴한글이메일제목테스트".repeat(15); // 495 bytes
+        let srv = thread::spawn(move || {
+            for idx in 0..3 {
+                let (mut sock, _) = mock.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                assert!(n > 0);
+                let body = match idx {
+                    0 => r#"{"access_token":"tok-mb11","refresh_token":"ref-mb11","expires_in":3600}"#
+                        .to_owned(),
+                    1 => r#"{"messages":[{"id":"m-cjk-1"}]}"#.to_owned(),
+                    _ => serde_json::json!({
+                        "snippet": "스니펫",
+                        "payload": {
+                            "headers": [
+                                {"name": "Subject", "value": long_cjk_subj},
+                                {"name": "From", "value": "alice@example.com"}
+                            ]
+                        }
+                    })
+                    .to_string(),
+                };
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+        let ep = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{addr}/token"),
+            gmail_base_url: format!("http://{addr}"),
+            calendar_base_url: format!("http://{addr}"),
+            drive_base_url: format!("http://{addr}"),
+        };
+
+        let checker = GoogleTriggerChecker::new(
+            Arc::clone(&store),
+            Arc::clone(&secrets),
+            Arc::clone(&items),
+            ep.clone(),
+        );
+        // Seed a stale status entry for a disabled bot -> reconcile must prune it (MB-41).
+        checker.record_status(BotConnectorStatus {
+            bot_id: bot.id.clone(),
+            source: ExternalSource::Google,
+            enabled: true,
+            connected: true,
+            state: ConnectorHealthState::Connected,
+            account_label: None,
+            last_sync_ms: Some(1_000),
+            last_error: None,
+            error_category: None,
+        });
+
+        let connected = Arc::new(AtomicBool::new(false));
+        let connected_bg = Arc::clone(&connected);
+        let (auth_url, state) = start_google_oauth(
+            &bot,
+            Arc::clone(&secrets),
+            ep.clone(),
+            Some(Arc::new(move |st| {
+                if st.connected {
+                    connected_bg.store(true, Ordering::Release);
+                }
+            })),
+        )
+        .unwrap();
+
+        // MB-11: calling `reconcile()` while zero bots have `google.enabled` must NOT cancel the
+        // in-flight OAuth listener!
+        checker.reconcile();
+        assert!(
+            checker.statuses(None).is_empty(),
+            "stale disabled status must be pruned"
+        );
+        assert!(!checker.is_running());
+
+        let redirect_uri = parse_query_params(auth_url.split_once('?').unwrap().1)
+            .into_iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1;
+        let cb = http_client::send(
+            &HttpRequest::get(format!("{redirect_uri}?code=ok-code&state={state}"))
+                .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+        )
+        .unwrap();
+        assert_eq!(cb.status, 200);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !connected.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            connected.load(Ordering::Acquire),
+            "reconcile() must not cancel in-flight Google OAuth listener"
+        );
+
+        // MB-43 + MB-39: token was saved under default scoped ref despite whitespace `token_secret_ref`,
+        // AND Gmail item with >200B CJK subject clamps cleanly instead of failing validation.
+        let created = poll_bot_google(&bot, &secrets, &items, &ep, now_ms()).unwrap();
+        assert_eq!(created, 1);
+
+        srv.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r2m10_r2m11_google_poller_no_resurrect_and_oauth_cancel_blocks_persist() {
+        let dir = temp_dir("r2m10-11-google");
+        let store = Arc::new(BotStore::new(dir.clone()));
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x47; 32]));
+        let items = Arc::new(BotItemsStore::new(dir.join("items.db")));
+        let bot = store
+            .create_bot(
+                krill_proto::bots::CreateBotParams {
+                    name: "Google R2".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        secrets
+            .set_secret(
+                &bot.id,
+                "google_oauth_client",
+                Zeroizing::new(
+                    r#"{"installed":{"client_id":"cid-r2","client_secret":"csec-r2"}}"#.to_owned(),
+                ),
+            )
+            .unwrap();
+
+        // R2M-11: Cancelling Google OAuth during in-flight token exchange must NOT persist tokens.
+        let tok_hit = Arc::new(AtomicBool::new(false));
+        let tok_hit_bg = Arc::clone(&tok_hit);
+        let release_tok = Arc::new(AtomicBool::new(false));
+        let release_tok_bg = Arc::clone(&release_tok);
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = mock.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(sock.read(&mut buf).unwrap_or(0) > 0);
+            tok_hit_bg.store(true, Ordering::Release);
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while !release_tok_bg.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let body =
+                r#"{"access_token":"leaked-google","refresh_token":"ref","expires_in":3600}"#;
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(wire.as_bytes()).ok();
+        });
+        let ep = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{addr}/token"),
+            gmail_base_url: format!("http://{addr}"),
+            calendar_base_url: format!("http://{addr}"),
+            drive_base_url: format!("http://{addr}"),
+        };
+        let (auth_url, state) =
+            start_google_oauth(&bot, Arc::clone(&secrets), ep.clone(), None).unwrap();
+        let redirect_uri = parse_query_params(auth_url.split_once('?').unwrap().1)
+            .into_iter()
+            .find(|(k, _)| k == "redirect_uri")
+            .unwrap()
+            .1;
+        let cb_handle = thread::spawn(move || {
+            http_client::send(
+                &HttpRequest::get(format!("{redirect_uri}?code=c1&state={state}"))
+                    .with_ssrf_policy(SsrfPolicy::AllowLoopback),
+            )
+            .ok();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !tok_hit.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tok_hit.load(Ordering::Acquire));
+        cancel_google_oauth(&bot.id);
+        release_tok.store(true, Ordering::Release);
+        cb_handle.join().ok();
+        thread::sleep(Duration::from_millis(60));
+        assert!(
+            secrets
+                .get_secret(&bot.id, "google_oauth_tokens")
+                .unwrap()
+                .is_none(),
+            "cancelled Google OAuth flow must NOT persist tokens"
+        );
+        srv.join().ok();
+
+        // R2M-10: Disabling Google connector during an in-flight poll must NOT resurrect status.
+        let poll_hit = Arc::new(AtomicBool::new(false));
+        let poll_hit_bg = Arc::clone(&poll_hit);
+        let release_poll = Arc::new(AtomicBool::new(false));
+        let release_poll_bg = Arc::clone(&release_poll);
+        let mock2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = mock2.local_addr().unwrap();
+        let srv2 = thread::spawn(move || {
+            let (mut sock, _) = mock2.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(sock.read(&mut buf).unwrap_or(0) > 0);
+            poll_hit_bg.store(true, Ordering::Release);
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while !release_poll_bg.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let body = r#"{"messages":[]}"#;
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(wire.as_bytes()).ok();
+        });
+        let valid_bundle = serde_json::json!({
+            "access_token": "tok-live",
+            "expires_at_ms": now_ms() + 3_600_000,
+        });
+        secrets
+            .set_secret(
+                &bot.id,
+                "google_oauth_tokens",
+                Zeroizing::new(valid_bundle.to_string()),
+            )
+            .unwrap();
+        let mut conn = bot.connectors.clone();
+        conn.google.enabled = true;
+        conn.google.services.gmail = true;
+        conn.google.services.calendar = false;
+        conn.google.services.drive = false;
+        store
+            .set_connector_config(&bot.id, conn.clone(), 2_000)
+            .unwrap();
+
+        let ep2 = GoogleEndpoints {
+            auth_base_url: "https://accounts.google.com/o/oauth2/v2/auth".to_owned(),
+            token_url: format!("http://{addr2}/token"),
+            gmail_base_url: format!("http://{addr2}"),
+            calendar_base_url: format!("http://{addr2}"),
+            drive_base_url: format!("http://{addr2}"),
+        };
+        let checker = GoogleTriggerChecker::new(Arc::clone(&store), secrets, items, ep2);
+        checker.reconcile();
+        let dl2 = std::time::Instant::now() + Duration::from_secs(3);
+        while !poll_hit.load(Ordering::Acquire) && std::time::Instant::now() < dl2 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(poll_hit.load(Ordering::Acquire));
+        conn.google.enabled = false;
+        store.set_connector_config(&bot.id, conn, 2_100).unwrap();
+        release_poll.store(true, Ordering::Release);
+        checker.reconcile();
+        assert!(
+            checker.statuses(None).is_empty(),
+            "disabled Google bot status must NOT resurrect after in-flight poll finishes"
+        );
+
+        srv2.join().ok();
         fs::remove_dir_all(&dir).ok();
     }
 }

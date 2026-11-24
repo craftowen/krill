@@ -307,6 +307,8 @@ impl BotStore {
             Vec::new()
         };
 
+        validate_mcp_tools(&cfg.mcp_tools)?;
+        validate_connector_config(&cfg.connectors)?;
         cfg.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
@@ -560,9 +562,11 @@ impl BotStore {
             bot.memory_tidy = memory_tidy;
         }
         if let Some(mcp_tools) = params.mcp_tools {
+            validate_mcp_tools(&mcp_tools)?;
             bot.mcp_tools = mcp_tools;
         }
         bot.updated_at_ms = now_ms;
+        validate_connector_config(&bot.connectors)?;
         bot.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
@@ -579,6 +583,7 @@ impl BotStore {
         connectors: BotConnectorConfig,
         now_ms: u64,
     ) -> io::Result<BotConfig> {
+        validate_connector_config(&connectors)?;
         let _guard = lock(&self.io_lock);
         let mut bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
@@ -812,13 +817,32 @@ impl BotStore {
         action: &str,
         now_ms: u64,
     ) -> Result<Option<BotMemoryHistoryEntry>, MemoryUpdateError> {
+        let _guard = lock(&self.io_lock);
+        self.apply_memory_with_history_locked(
+            bot_id,
+            content,
+            allow_deletions,
+            actor,
+            action,
+            now_ms,
+        )
+    }
+
+    fn apply_memory_with_history_locked(
+        &self,
+        bot_id: &BotId,
+        content: &str,
+        allow_deletions: bool,
+        actor: &str,
+        action: &str,
+        now_ms: u64,
+    ) -> Result<Option<BotMemoryHistoryEntry>, MemoryUpdateError> {
         if content.len() > MAX_TEXT_FILE_BYTES {
             return Err(MemoryUpdateError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "MEMORY.md exceeds maximum allowed size",
             )));
         }
-        let _guard = lock(&self.io_lock);
         let bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
             .iter()
@@ -939,8 +963,13 @@ impl BotStore {
         after: &str,
         now_ms: u64,
     ) -> io::Result<Option<BotMemoryHistoryEntry>> {
-        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
-        let home = self.bot_home(&bot);
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_bots()?;
+        let bot = bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(bot);
         ensure_bot_subdirs_safe(&home)?;
         memory_history::record_turn_change(&home, bot_id, session, before, after, now_ms)
     }
@@ -954,9 +983,23 @@ impl BotStore {
         actor: &str,
         now_ms: u64,
     ) -> io::Result<String> {
-        let current = self.get_memory(bot_id)?;
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_bots()?;
+        let bot = bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .ok_or_else(|| not_found_bot(bot_id))?;
+        let home = init_bot_home(&self.root, bot, None)?;
+        ensure_bot_subdirs_safe(&home)?;
+        let mem_path = home.join("MEMORY.md");
+        ensure_no_symlink_path(&mem_path)?;
+        let current = if mem_path.exists() {
+            read_text_bounded(&mem_path)?
+        } else {
+            BOT_MEMORY_SEED.to_owned()
+        };
         let rebuilt = memory_history::rewrite_single_fact(&current, old_fact, new_fact)?;
-        self.apply_memory_with_history(bot_id, &rebuilt, true, actor, "edit_fact", now_ms)
+        self.apply_memory_with_history_locked(bot_id, &rebuilt, true, actor, "edit_fact", now_ms)
             .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(rebuilt)
     }
@@ -969,8 +1012,13 @@ impl BotStore {
         actor: &str,
         now_ms: u64,
     ) -> io::Result<String> {
-        let bot = self.get_bot(bot_id)?.ok_or_else(|| not_found_bot(bot_id))?;
-        let home = self.bot_home(&bot);
+        let _guard = lock(&self.io_lock);
+        let bots: Vec<BotConfig> = self.read_bots()?;
+        let bot = bots
+            .iter()
+            .find(|b| &b.id == bot_id)
+            .ok_or_else(|| not_found_bot(bot_id))?;
+        let home = self.bot_home(bot);
         ensure_bot_subdirs_safe(&home)?;
         let entry = memory_history::find_entry(&home, entry_id)?.ok_or_else(|| {
             io::Error::new(
@@ -985,7 +1033,7 @@ impl BotStore {
             ));
         }
         let restored = entry.before_content.clone();
-        self.apply_memory_with_history(
+        self.apply_memory_with_history_locked(
             bot_id,
             &restored,
             true,
@@ -1189,6 +1237,25 @@ impl BotStore {
         let mut cleared = 0_usize;
         for link in &mut links {
             if &link.bot_id == bot_id && link.session_id.is_some() {
+                link.session_id = None;
+                link.updated_at_ms = now_ms;
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            self.write_json(LINKS_FILE, &links)?;
+        }
+        Ok(cleared)
+    }
+
+    /// Clears live session bindings on all external links referencing `session_id` (e.g. when the
+    /// human owner takes over a live bot workspace so external messages never re-bind into it).
+    pub fn unbind_session_links(&self, session_id: SessionId, now_ms: u64) -> io::Result<usize> {
+        let _guard = lock(&self.io_lock);
+        let mut links: Vec<ExternalConversationLink> = self.read_json_or_default(LINKS_FILE)?;
+        let mut cleared = 0_usize;
+        for link in &mut links {
+            if link.session_id == Some(session_id) {
                 link.session_id = None;
                 link.updated_at_ms = now_ms;
                 cleared += 1;
@@ -1745,6 +1812,8 @@ impl BotStore {
                 enabled: false,
             })
             .collect();
+        validate_mcp_tools(&cfg.mcp_tools)?;
+        validate_connector_config(&cfg.connectors)?;
         cfg.validate()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
@@ -2426,6 +2495,33 @@ fn is_sender_allowed_with_workspace(
         | ExternalSource::Linear
         | ExternalSource::Composio => true,
     }
+}
+
+fn validate_mcp_tools(tools: &[BotMcpToolConfig]) -> io::Result<()> {
+    for tool in tools {
+        let id = tool.id.as_str();
+        if id.trim().is_empty() || id.len() > 128 || id.chars().any(|c| c.is_control() || c == '\0')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MCP tool id must be 1..=128 non-control characters",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_connector_config(connectors: &BotConnectorConfig) -> io::Result<()> {
+    for raw in &connectors.github.repos {
+        let repo = raw.trim();
+        if !crate::bots::trackers::is_valid_github_repo(repo) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid GitHub repository '{raw}' (expected owner/repo)"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Redacts pairing tokens from [`BotAccessRequest`] records for read-only Observer peers.
@@ -3391,6 +3487,90 @@ mod tests {
         assert_eq!(imported.agent_id, "codex");
         assert_eq!(imported.model, None);
         assert_eq!(imported.effort, None);
+
+        // R2M-04: unbind_session_links clears ONLY links matching the taken-over session_id.
+        let l1 = store
+            .lookup_or_create_link(
+                &bot.id,
+                ExternalSource::Telegram,
+                None,
+                "c-1",
+                None,
+                ActsFor::Owner,
+                4_000,
+            )
+            .unwrap();
+        let l2 = store
+            .lookup_or_create_link(
+                &bot.id,
+                ExternalSource::Telegram,
+                None,
+                "c-2",
+                None,
+                ActsFor::Owner,
+                4_000,
+            )
+            .unwrap();
+        store
+            .bind_link_session(&l1.id, SessionId(401), 4_010)
+            .unwrap();
+        store
+            .bind_link_session(&l2.id, SessionId(402), 4_010)
+            .unwrap();
+        assert_eq!(
+            store.unbind_session_links(SessionId(401), 4_020).unwrap(),
+            1
+        );
+        assert_eq!(store.get_link(&l1.id).unwrap().unwrap().session_id, None);
+        assert_eq!(
+            store.get_link(&l2.id).unwrap().unwrap().session_id,
+            Some(SessionId(402))
+        );
+
+        // R2M-14 / R2P-03: upload_avatar uses MAX_AVATAR_PNG_BYTES constant (rejects MAX+1).
+        let oversized = vec![0x89_u8; MAX_AVATAR_PNG_BYTES + 1];
+        assert_eq!(
+            store
+                .upload_avatar(&bot.id, &oversized, 4_030)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // R2M-22: concurrent undo_memory_entry + edit_memory_fact serialized by BotStore::io_lock.
+        store
+            .update_memory(
+                &bot.id,
+                "# Memory\n\n- 2026-11-24: fact alpha\n- 2026-11-24: fact beta\n",
+                true,
+            )
+            .unwrap();
+        store
+            .edit_memory_fact(&bot.id, "fact alpha", "fact alpha v2", "owner", 4_100)
+            .unwrap();
+        let hist = store.get_memory_history(&bot.id, Some(10)).unwrap();
+        let edit_entry_id = hist
+            .iter()
+            .find(|h| h.action == "edit_fact")
+            .unwrap()
+            .entry_id
+            .clone();
+        let store_arc = std::sync::Arc::new(store);
+        let s1 = std::sync::Arc::clone(&store_arc);
+        let s2 = std::sync::Arc::clone(&store_arc);
+        let b1 = bot.id.clone();
+        let b2 = bot.id.clone();
+        let e1 = edit_entry_id.clone();
+        let e2 = edit_entry_id;
+        let t1 = std::thread::spawn(move || s1.undo_memory_entry(&b1, &e1, "owner", 4_200));
+        let t2 = std::thread::spawn(move || s2.undo_memory_entry(&b2, &e2, "owner", 4_201));
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        let ok_count = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(
+            ok_count, 1,
+            "exactly one concurrent undo_memory_entry must succeed"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

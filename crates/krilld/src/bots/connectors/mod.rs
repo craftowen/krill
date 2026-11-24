@@ -89,6 +89,20 @@ pub trait ConnectorBridge: Send + Sync {
     fn dispatch_external_message(&self, msg: InboundExternalMessage)
     -> io::Result<DispatchOutcome>;
 
+    /// Routes an authorized inbound external message with pre-delivery registration and rollback
+    /// hooks so the caller can register its active turn BEFORE async `bot-preamble` delivery runs
+    /// and cleanly roll back BEFORE queued turns are drained on synchronous delivery failure.
+    fn dispatch_external_message_with_hooks(
+        &self,
+        msg: InboundExternalMessage,
+        on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+        _on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
+    ) -> io::Result<DispatchOutcome> {
+        let outcome = self.dispatch_external_message(msg)?;
+        on_bound(outcome.session_id, None);
+        Ok(outcome)
+    }
+
     /// Verifies sender allow-lists / approved members, or creates a pending [`BotAccessRequest`].
     fn check_or_request_access(
         &self,
@@ -635,6 +649,19 @@ impl ConnectorManager {
         self.router.on_turn_activity(bot_id, session_id, activity);
     }
 
+    /// Sequence-correlated variant of [`Self::on_turn_activity`] so non-connector turns never
+    /// leak status edits into queued external chats.
+    pub fn on_turn_activity_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        activity: &str,
+    ) {
+        self.router
+            .on_turn_activity_seq(bot_id, session_id, turn_seq, activity);
+    }
+
     /// Runs an on-demand live connectivity test (`TestConnector`) for `(bot, source)`.
     pub fn test_connector(
         &self,
@@ -783,6 +810,24 @@ impl ConnectorManager {
             .on_turn_complete(bot_id, session_id, final_reply);
     }
 
+    /// Sequence-correlated variant of [`Self::on_turn_complete`] so non-connector turns never
+    /// pop or leak replies into queued external chats.
+    pub fn on_turn_complete_seq(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        final_reply: Option<&str>,
+    ) {
+        self.router
+            .on_turn_complete_seq(bot_id, session_id, turn_seq, final_reply);
+    }
+
+    /// Cleans up queued active turn states when a bot session exits or is killed (MB-10).
+    pub fn on_session_removed(&self, session_id: SessionId) {
+        self.router.on_session_removed(session_id);
+    }
+
     /// Stops all connector workers cleanly and clears runtime state.
     pub fn shutdown(&self) {
         let _reload_guard = lock(&self.reload_lock);
@@ -835,15 +880,17 @@ fn resolve_with_fallback(
     primary_key: &str,
     secondary_key: &str,
 ) -> io::Result<Option<Zeroizing<String>>> {
-    if let Some(val) = bridge.resolve_secret(bot_id, explicit_ref, primary_key)?
-        && !val.trim().is_empty()
-    {
-        return Ok(Some(val));
+    if let Some(val) = bridge.resolve_secret(bot_id, explicit_ref, primary_key)? {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(Zeroizing::new(trimmed.to_owned())));
+        }
     }
-    if let Some(val) = bridge.resolve_secret(bot_id, None, secondary_key)?
-        && !val.trim().is_empty()
-    {
-        return Ok(Some(val));
+    if let Some(val) = bridge.resolve_secret(bot_id, None, secondary_key)? {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(Zeroizing::new(trimmed.to_owned())));
+        }
     }
     Ok(None)
 }
@@ -1106,5 +1153,73 @@ mod tests {
         assert!(test_res.detail.contains("xapp-"));
 
         mgr.shutdown();
+    }
+
+    #[test]
+    fn resolve_with_fallback_trims_surrounding_whitespace_and_newlines() {
+        struct WhitespaceBridge;
+        impl ConnectorBridge for WhitespaceBridge {
+            fn dispatch_external_message(
+                &self,
+                _: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> io::Result<AccessDecision> {
+                Ok(AccessDecision::Allowed)
+            }
+            fn resolve_secret(
+                &self,
+                _: &BotId,
+                _: Option<&str>,
+                key: &str,
+            ) -> io::Result<Option<Zeroizing<String>>> {
+                if key == "primary" {
+                    Ok(Some(Zeroizing::new("  xoxb-secret-val\r\n ".to_owned())))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn lookup_or_create_link(
+                &self,
+                _: &BotId,
+                _: ExternalSource,
+                _: Option<&str>,
+                _: &str,
+                _: Option<&str>,
+                _: ActsFor,
+            ) -> io::Result<ExternalConversationLink> {
+                Err(io::Error::other("unused"))
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+                _: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _: BotConnectorStatus) {}
+            fn get_bot_config(&self, _: &BotId) -> Option<BotConfig> {
+                None
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                Vec::new()
+            }
+        }
+        let bot_id = BotId::new("bot-trim").unwrap();
+        let resolved =
+            resolve_with_fallback(&WhitespaceBridge, &bot_id, None, "primary", "secondary")
+                .unwrap()
+                .unwrap();
+        assert_eq!(&*resolved, "xoxb-secret-val");
     }
 }

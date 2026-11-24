@@ -332,7 +332,19 @@
           retryNotBefore,
           Date.now() + Math.min(1800000, Number(retryAfter) * 1000),
         );
-      if (!response.ok) throw Error();
+      if (!response.ok) {
+        if (
+          response.status >= 400 &&
+          response.status < 500 &&
+          response.status !== 408 &&
+          response.status !== 429
+        ) {
+          const dropped = new Set(batch.map((q) => q.event.event_id));
+          queue = queue.filter((q) => !dropped.has(q.event.event_id));
+          return;
+        }
+        throw Error();
+      }
       const ack = await response.json();
       if (version !== epoch || !enabled()) return;
       if (

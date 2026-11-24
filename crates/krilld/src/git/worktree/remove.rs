@@ -283,7 +283,7 @@ fn verify_git_link(q: &GitQueue, repo: &Path, path: &Path) -> Result<(), String>
             let backlink = backlink.strip_suffix(b"\n").unwrap_or(&backlink);
             let backlink = backlink.strip_suffix(b"\r").unwrap_or(backlink);
             if fs::canonicalize(Path::new(OsStr::from_bytes(backlink))).map_err(|_| invalid())?
-                != link
+                != fs::canonicalize(&link).map_err(|_| invalid())?
             {
                 return Err(invalid());
             }
@@ -1099,6 +1099,21 @@ exec git "$@"
         )
         .unwrap();
         assert_eq!(verify_git_link(&f.queue, &f.repo, &wt), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_git_link_canonicalizes_both_sides_of_backlink_comparison() {
+        let (f, wt, _req) = fixture_worktree("backlink-canon");
+        let alias = f.dir.join("wt-alias");
+        std::os::unix::fs::symlink(&wt, &alias).unwrap();
+        // `alias.join(".git")` is non-canonical while the repo's `.git/worktrees/<name>/gitdir`
+        // backlink resolves to the canonical `.git` file (mirroring Windows `\\?\` prefix mismatch).
+        assert_ne!(
+            alias.join(".git"),
+            fs::canonicalize(wt.join(".git")).unwrap()
+        );
+        assert_eq!(verify_git_link(&f.queue, &f.repo, &alias), Ok(()));
     }
 
     proptest! {

@@ -37,14 +37,14 @@ pub enum BotItemsStatusFilter {
 }
 
 impl BotItemsStatusFilter {
-    /// Parses a mobile/CLI status filter token (`needs_you`, `working`, `planned`, `done`,
-    /// `canceled`/`cancelled`, `closed`, `snoozed`).
+    /// Parses a mobile/CLI status filter token (`needs_you`/`needs-you`, `working`, `planned`,
+    /// `done`, `canceled`/`cancelled`, `closed`, `snoozed`).
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "planned" => Some(Self::Status(BotItemStatus::Planned)),
             "working" => Some(Self::Status(BotItemStatus::Working)),
-            "needs_you" => Some(Self::Status(BotItemStatus::NeedsYou)),
+            "needs_you" | "needs-you" => Some(Self::Status(BotItemStatus::NeedsYou)),
             "done" => Some(Self::Status(BotItemStatus::Done)),
             "canceled" | "cancelled" => Some(Self::Status(BotItemStatus::Canceled)),
             "closed" => Some(Self::Closed),
@@ -840,9 +840,38 @@ impl BotItemsStore {
                 });
             }
 
+            let active_ask = (item.status == BotItemStatus::NeedsYou)
+                .then(|| active_decision_event(&item.events))
+                .flatten();
+            let multi_ask = active_ask.filter(|ev| ev.decisions.len() > 1);
+            let mut collected_multi = multi_ask
+                .map(|ask_ev| collect_decision_answers(&ask_ev.decisions, &item.events, ask_ev.id));
+
+            let decision_id_trimmed = decision_id.map(str::trim).filter(|s| !s.is_empty());
+            let target_on_multi = multi_ask.and_then(|ask_ev| {
+                let existing = collected_multi.as_deref().unwrap_or(&[]);
+                resolve_target_decision_on_event(
+                    ask_ev,
+                    decision_id_trimmed,
+                    option_index,
+                    existing,
+                )
+            });
+            if multi_ask.is_some()
+                && let Some(raw_dec_id) = decision_id_trimmed
+                && target_on_multi.is_none()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("decision_id '{raw_dec_id}' does not match an active decision"),
+                ));
+            }
+
             let resolved_option = if let Some(idx) = option_index {
                 let idx_usize = usize::try_from(idx).unwrap_or(usize::MAX);
-                let opt_label = resolve_target_decision(&item.events, decision_id)
+                let opt_label = target_on_multi
+                    .map(|(_, d)| d)
+                    .or_else(|| resolve_target_decision(&item.events, decision_id))
                     .and_then(|d| d.options.get(idx_usize))
                     .cloned();
                 match opt_label {
@@ -859,7 +888,7 @@ impl BotItemsStore {
                 None
             };
 
-            let answer_summary = match (resolved_option, text_trimmed) {
+            let raw_summary = match (resolved_option, text_trimmed) {
                 (Some(opt), Some(txt)) if opt == txt => opt,
                 (Some(_), Some(txt)) if txt.contains(" → ") => txt,
                 (Some(opt), Some(txt)) => format!("{opt} — {txt}"),
@@ -870,11 +899,51 @@ impl BotItemsStore {
                 }
             };
 
+            let (event_text, all_decisions_answered, final_summary) =
+                if let (Some(ask_ev), Some(collected)) = (multi_ask, collected_multi.as_mut()) {
+                    let matched_lines =
+                        apply_decision_answer_lines(&ask_ev.decisions, &raw_summary, collected);
+                    if matched_lines > 0 {
+                        let all_done = collected.iter().all(Option::is_some);
+                        let summary = if all_done {
+                            format_collected_decision_answers(&ask_ev.decisions, collected)
+                        } else {
+                            raw_summary.clone()
+                        };
+                        (raw_summary, all_done, summary)
+                    } else if let Some((target_idx, target_dec)) = target_on_multi {
+                        let q_line = decision_question_line(&target_dec.question);
+                        let prefixed = format!("{q_line} → {raw_summary}");
+                        let clamped =
+                            clamp_utf8_bytes(&prefixed, BOT_ITEM_COMMENT_MAX_BYTES).to_owned();
+                        if let Some(slot) = collected.get_mut(target_idx) {
+                            *slot = Some(raw_summary);
+                        }
+                        let all_done = collected.iter().all(Option::is_some);
+                        let summary = if all_done {
+                            format_collected_decision_answers(&ask_ev.decisions, collected)
+                        } else {
+                            clamped.clone()
+                        };
+                        (clamped, all_done, summary)
+                    } else {
+                        // Freeform prose answer with no explicit decision target resolves the item.
+                        (raw_summary.clone(), true, raw_summary)
+                    }
+                } else {
+                    (raw_summary.clone(), true, raw_summary)
+                };
+
             let answer_id = req_id_trimmed.unwrap_or_else(|| {
                 let seq = ITEM_UID_SEQ.fetch_add(1, Ordering::Relaxed);
                 format!("ans-{now_ms}-{seq}")
             });
-            let should_wake_bot = mail_state.as_deref() == Some("owed");
+            let should_wake_bot = all_decisions_answered && mail_state.as_deref() == Some("owed");
+            let next_mail_state: Option<&str> = if all_decisions_answered {
+                Some("answered")
+            } else {
+                mail_state.as_deref()
+            };
 
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
             insert_event(
@@ -882,12 +951,12 @@ impl BotItemsStore {
                 &uid,
                 BotItemEventKind::Commented,
                 actor,
-                &answer_summary,
+                &event_text,
                 &[],
                 now_ms,
             )?;
             let comment_row_id = tx.last_insert_rowid();
-            let next_status = if item.status == BotItemStatus::NeedsYou {
+            let next_status = if item.status == BotItemStatus::NeedsYou && all_decisions_answered {
                 insert_event(
                     &tx,
                     &uid,
@@ -914,11 +983,12 @@ impl BotItemsStore {
             }
             tx.execute(
                 "UPDATE items SET status = ?1, snoozed_until_ms = NULL, \
-                 mail_state = 'answered', answer_id = ?2, others_last_event_id = ?3, \
-                 version = version + 1, last_activity_at_ms = ?4, updated_at_ms = ?4 \
-                 WHERE uid = ?5",
+                 mail_state = ?2, answer_id = ?3, others_last_event_id = ?4, \
+                 version = version + 1, last_activity_at_ms = ?5, updated_at_ms = ?5 \
+                 WHERE uid = ?6",
                 params![
                     next_status.as_str(),
+                    next_mail_state,
                     answer_id,
                     comment_row_id,
                     u64_to_i64(now_ms),
@@ -933,7 +1003,7 @@ impl BotItemsStore {
             Ok(AnswerItemOutcome {
                 item: updated,
                 should_wake_bot,
-                answer_summary,
+                answer_summary: final_summary,
             })
         })
     }
@@ -1379,6 +1449,202 @@ fn parse_items_cursor(raw: &str) -> io::Result<(i64, String)> {
     Ok((ts, uid_part.to_owned()))
 }
 
+fn raw_decision_question_line(question: &str) -> &str {
+    question
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| question.trim())
+}
+
+fn decision_question_line(question: &str) -> String {
+    let first = raw_decision_question_line(question);
+    let stripped = first.trim_start_matches(|c: char| {
+        matches!(c, '#' | '>' | '-' | '*' | '+') || c.is_whitespace()
+    });
+    stripped
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_owned()
+}
+
+fn active_decision_event(events: &[BotItemEvent]) -> Option<&BotItemEvent> {
+    let mut current: Option<&BotItemEvent> = None;
+    let mut prev_had_decisions = false;
+    for ev in events {
+        if ev.kind == BotItemEventKind::Status {
+            let lower = ev.text.to_ascii_lowercase();
+            if lower.contains("-> done") || lower.contains("-> canceled") {
+                current = None;
+                prev_had_decisions = false;
+                continue;
+            }
+            if lower.contains("-> needs_you") {
+                if !ev.decisions.is_empty() {
+                    current = Some(ev);
+                    prev_had_decisions = true;
+                } else if !prev_had_decisions {
+                    current = None;
+                }
+                continue;
+            }
+        }
+        if ev.decisions.is_empty() {
+            prev_had_decisions = false;
+        } else {
+            current = Some(ev);
+            prev_had_decisions = true;
+        }
+    }
+    current
+}
+
+fn apply_decision_answer_lines(
+    decisions: &[BotItemDecision],
+    text: &str,
+    answers: &mut [Option<String>],
+) -> usize {
+    let mut matched = 0_usize;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut best_len = 0_usize;
+        let mut best_matches: Vec<(usize, String)> = Vec::new();
+        for (idx, dec) in decisions.iter().enumerate() {
+            let norm = decision_question_line(&dec.question);
+            let raw = raw_decision_question_line(&dec.question);
+            let mut best_for_dec: Option<String> = None;
+            for cand in [norm.as_str(), raw] {
+                if cand.is_empty() {
+                    continue;
+                }
+                let prefix = format!("{cand} →");
+                if line.starts_with(&prefix)
+                    && best_for_dec
+                        .as_ref()
+                        .is_none_or(|prev| prefix.len() > prev.len())
+                {
+                    best_for_dec = Some(prefix);
+                }
+            }
+            if let Some(prefix) = best_for_dec {
+                match prefix.len().cmp(&best_len) {
+                    std::cmp::Ordering::Greater => {
+                        best_len = prefix.len();
+                        best_matches.clear();
+                        best_matches.push((idx, prefix));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        best_matches.push((idx, prefix));
+                    }
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+        }
+        let Some((target_idx, matched_prefix)) = best_matches
+            .iter()
+            .find(|(idx, _)| answers.get(*idx).is_some_and(Option::is_none))
+            .or_else(|| best_matches.first())
+        else {
+            continue;
+        };
+        let val = line
+            .strip_prefix(matched_prefix.as_str())
+            .unwrap_or("")
+            .trim();
+        if let Some(slot) = answers.get_mut(*target_idx) {
+            *slot = Some(val.to_owned());
+            matched += 1;
+        }
+    }
+    matched
+}
+
+fn collect_decision_answers(
+    decisions: &[BotItemDecision],
+    events: &[BotItemEvent],
+    ask_event_id: u64,
+) -> Vec<Option<String>> {
+    let mut answers = vec![None; decisions.len()];
+    for ev in events {
+        if ev.id <= ask_event_id
+            || ev.kind != BotItemEventKind::Commented
+            || !matches!(ev.actor, BotItemActor::Owner { .. })
+        {
+            continue;
+        }
+        apply_decision_answer_lines(decisions, &ev.text, &mut answers);
+    }
+    answers
+}
+
+fn format_collected_decision_answers(
+    decisions: &[BotItemDecision],
+    answers: &[Option<String>],
+) -> String {
+    decisions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, dec)| {
+            let ans = answers.get(idx).and_then(Option::as_deref)?;
+            Some(format!("{} → {ans}", decision_question_line(&dec.question)))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn resolve_target_decision_on_event<'a>(
+    ask_ev: &'a BotItemEvent,
+    decision_id: Option<&str>,
+    option_index: Option<u32>,
+    existing_answers: &[Option<String>],
+) -> Option<(usize, &'a BotItemDecision)> {
+    let trimmed = decision_id.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(raw) = trimmed {
+        if let Some((ev_part, dec_part)) = raw.split_once(':')
+            && let (Ok(ev_id), Ok(dec_idx)) = (ev_part.parse::<u64>(), dec_part.parse::<usize>())
+        {
+            if ev_id == ask_ev.id {
+                return ask_ev.decisions.get(dec_idx).map(|d| (dec_idx, d));
+            }
+            return None;
+        }
+        if let Ok(dec_idx) = raw.parse::<usize>() {
+            return ask_ev.decisions.get(dec_idx).map(|d| (dec_idx, d));
+        }
+        let mut matches = ask_ev.decisions.iter().enumerate().filter(|(_, d)| {
+            let q = d.question.trim();
+            q == raw
+                || raw_decision_question_line(&d.question) == raw
+                || decision_question_line(&d.question) == raw
+        });
+        let first = matches.next()?;
+        if existing_answers.get(first.0).is_some_and(Option::is_some) {
+            for candidate in matches {
+                if existing_answers
+                    .get(candidate.0)
+                    .is_some_and(Option::is_none)
+                {
+                    return Some(candidate);
+                }
+            }
+        }
+        return Some(first);
+    }
+    if option_index.is_some() {
+        let idx = existing_answers
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(0);
+        return ask_ev.decisions.get(idx).map(|d| (idx, d));
+    }
+    None
+}
+
 fn resolve_target_decision<'a>(
     events: &'a [BotItemEvent],
     decision_id: Option<&str>,
@@ -1404,10 +1670,8 @@ fn resolve_target_decision<'a>(
         return latest.iter().find(|d| {
             let q = d.question.trim();
             q == raw
-                || q.lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .is_some_and(|line| line == raw)
+                || raw_decision_question_line(&d.question) == raw
+                || decision_question_line(&d.question) == raw
         });
     }
     events
@@ -1582,7 +1846,7 @@ fn decode_link(kind: &str, target: String) -> BotItemLink {
 fn parse_status(raw: &str) -> BotItemStatus {
     match raw {
         "working" => BotItemStatus::Working,
-        "needs_you" => BotItemStatus::NeedsYou,
+        "needs_you" | "needs-you" => BotItemStatus::NeedsYou,
         "done" => BotItemStatus::Done,
         "canceled" => BotItemStatus::Canceled,
         _ => BotItemStatus::Planned,
@@ -1611,6 +1875,56 @@ fn parse_event_kind(raw: &str) -> BotItemEventKind {
         "unsnoozed" => BotItemEventKind::Unsnoozed,
         _ => BotItemEventKind::Made,
     }
+}
+
+/// Clamps `raw` to at most `max_bytes` UTF-8 bytes on a valid character boundary.
+#[must_use]
+pub(crate) fn clamp_utf8_bytes(raw: &str, max_bytes: usize) -> &str {
+    if raw.len() <= max_bytes {
+        return raw;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw.get(..end).unwrap_or("")
+}
+
+/// Clamps `raw` to at most `max_chars` Unicode scalar values AND `max_bytes` UTF-8 bytes.
+#[must_use]
+pub(crate) fn clamp_utf8_bytes_and_chars(raw: &str, max_chars: usize, max_bytes: usize) -> String {
+    let mut end = 0_usize;
+    for (count, (idx, ch)) in raw.char_indices().enumerate() {
+        let next_end = idx + ch.len_utf8();
+        if count >= max_chars || next_end > max_bytes {
+            break;
+        }
+        end = next_end;
+    }
+    raw.get(..end).unwrap_or("").trim().to_owned()
+}
+
+/// Clamps an item title to [`BOT_ITEM_TITLE_MAX_BYTES`] UTF-8 bytes on a valid char boundary.
+#[must_use]
+pub(crate) fn clamp_item_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let clamped = clamp_utf8_bytes(trimmed, BOT_ITEM_TITLE_MAX_BYTES).trim_end();
+    if clamped.is_empty() {
+        "Untitled".to_owned()
+    } else {
+        clamped.to_owned()
+    }
+}
+
+/// Clamps an optional item description to [`BOT_ITEM_DESCRIPTION_MAX_BYTES`] UTF-8 bytes.
+#[must_use]
+pub(crate) fn clamp_item_description(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clamped = clamp_utf8_bytes(trimmed, BOT_ITEM_DESCRIPTION_MAX_BYTES).trim_end();
+    (!clamped.is_empty()).then(|| clamped.to_owned())
 }
 
 fn validate_title(raw: &str) -> io::Result<String> {
@@ -2240,23 +2554,41 @@ mod tests {
         assert!(!ask_event.decisions[0].multi);
         assert!(ask_event.decisions[1].multi);
 
-        // Matching by "<event_id>:1" targets the second decision (not decs.first()).
+        // MB-02: Matching by "<event_id>:1" targets the second decision, records it with its
+        // question prefix, and keeps the item in NeedsYou without waking the bot until all
+        // decisions on the active ask event are answered.
         let by_ev_idx = store
             .answer_item(
                 &item.uid,
                 None,
                 Some(2),
                 Some(&format!("{}:1", ask_event.id)),
-                None,
+                Some("req-partial-1"),
                 &owner,
                 2_000,
             )
             .unwrap();
-        assert_eq!(by_ev_idx.answer_summary, "Changelog");
-        assert!(by_ev_idx.should_wake_bot);
-        assert_eq!(by_ev_idx.item.status, BotItemStatus::Working);
+        assert_eq!(by_ev_idx.answer_summary, "Notify channels? → Changelog");
+        assert!(!by_ev_idx.should_wake_bot);
+        assert_eq!(by_ev_idx.item.status, BotItemStatus::NeedsYou);
 
-        // Matching by numeric index "1" and deduplicating identical option_index + answer_text.
+        // Re-submitting the same request_id is idempotent.
+        let dup_partial = store
+            .answer_item(
+                &item.uid,
+                None,
+                Some(2),
+                Some(&format!("{}:1", ask_event.id)),
+                Some("req-partial-1"),
+                &owner,
+                2_050,
+            )
+            .unwrap();
+        assert!(!dup_partial.should_wake_bot);
+        assert_eq!(dup_partial.answer_summary, "already answered");
+        assert_eq!(dup_partial.item.status, BotItemStatus::NeedsYou);
+
+        // Updating the same decision ("1") still leaves "Target env?" unanswered -> stays NeedsYou.
         let by_num = store
             .answer_item(
                 &item.uid,
@@ -2268,9 +2600,12 @@ mod tests {
                 2_100,
             )
             .unwrap();
-        assert_eq!(by_num.answer_summary, "Email");
+        assert_eq!(by_num.answer_summary, "Notify channels? → Email");
+        assert!(!by_num.should_wake_bot);
+        assert_eq!(by_num.item.status, BotItemStatus::NeedsYou);
 
-        // Matching by question text.
+        // Answering the remaining decision ("Target env?") completes all decisions, flips to
+        // Working, wakes the bot ONCE, and returns the combined summary of all decisions.
         let by_question = store
             .answer_item(
                 &item.uid,
@@ -2282,9 +2617,14 @@ mod tests {
                 2_200,
             )
             .unwrap();
-        assert_eq!(by_question.answer_summary, "Prod");
+        assert!(by_question.should_wake_bot);
+        assert_eq!(by_question.item.status, BotItemStatus::Working);
+        assert_eq!(
+            by_question.answer_summary,
+            "Target env? → Prod\nNotify channels? → Email"
+        );
 
-        // Named multi-question answer passes through cleanly without duplicating option label.
+        // Subsequent named follow-up comment once Working does not re-wake the bot and passes through cleanly.
         let named = store
             .answer_item(
                 &item.uid,
@@ -2296,6 +2636,7 @@ mod tests {
                 2_300,
             )
             .unwrap();
+        assert!(!named.should_wake_bot);
         assert_eq!(named.answer_summary, "Notify channels? → Slack, Email");
 
         // Legacy SQLite row without "multi" deserializes as multi: false.
@@ -2325,7 +2666,7 @@ mod tests {
         let text_only = store
             .create_item(
                 &CreateBotItemParams {
-                    bot_id: bot_agy,
+                    bot_id: bot_agy.clone(),
                     title: "Refund policy wording".to_owned(),
                     description: None,
                     done_means: None,
@@ -2362,6 +2703,299 @@ mod tests {
             text_ans.answer_summary,
             "Keep 7-day clause and add 1 line for prorated refunds."
         );
+
+        // MB-02: Option-index-only answers advance across unanswered decisions sequentially.
+        let seq_item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_agy,
+                    title: "Sequential multi-decision".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                4_000,
+            )
+            .unwrap();
+        store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: seq_item.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Pick both".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "Region?".to_owned(),
+                            options: vec!["US".to_owned(), "EU".to_owned()],
+                            recommended: Some(0),
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "Tier?".to_owned(),
+                            options: vec!["Free".to_owned(), "Pro".to_owned()],
+                            recommended: Some(1),
+                            multi: false,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &bot_actor,
+                4_100,
+            )
+            .unwrap();
+        let first_opt = store
+            .answer_item(&seq_item.uid, None, Some(1), None, None, &owner, 4_200)
+            .unwrap();
+        assert!(!first_opt.should_wake_bot);
+        assert_eq!(first_opt.item.status, BotItemStatus::NeedsYou);
+        assert_eq!(first_opt.answer_summary, "Region? → EU");
+        let second_opt = store
+            .answer_item(&seq_item.uid, None, Some(1), None, None, &owner, 4_300)
+            .unwrap();
+        assert!(second_opt.should_wake_bot);
+        assert_eq!(second_opt.item.status, BotItemStatus::Working);
+        assert_eq!(second_opt.answer_summary, "Region? → EU\nTier? → Pro");
+
+        // MB-09: Hyphenated "needs-you" parses consistently.
+        assert_eq!(
+            BotItemsStatusFilter::parse("needs-you"),
+            Some(BotItemsStatusFilter::Status(BotItemStatus::NeedsYou))
+        );
+        assert_eq!(parse_status("needs-you"), BotItemStatus::NeedsYou);
+
+        // MB-07/MB-39: CJK/emoji UTF-8 clamping never exceeds byte limits or panics.
+        let cjk = "가".repeat(120); // 360 bytes
+        let clamped_title = clamp_item_title(&cjk);
+        assert!(clamped_title.len() <= BOT_ITEM_TITLE_MAX_BYTES);
+        assert!(!clamped_title.is_empty());
+        let clamped_ask = clamp_utf8_bytes_and_chars(&cjk, 120, BOT_ITEM_TITLE_MAX_BYTES);
+        assert!(clamped_ask.len() <= BOT_ITEM_TITLE_MAX_BYTES);
+        assert!(clamped_ask.chars().count() <= 120);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r2m01_r2m02_markdown_decisions_backcompat_and_stale_decision_id_rejected() {
+        let (dir, db_path) = temp_db("r2m01-02");
+        let store = BotItemsStore::new(db_path);
+        let bot_id = BotId::new("bot-md").unwrap();
+        let bot_actor = BotItemActor::Bot {
+            bot_id: bot_id.clone(),
+            session_id: None,
+        };
+        let owner = BotItemActor::Owner {
+            device: Some("mobile".to_owned()),
+        };
+
+        let item = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_id.clone(),
+                    title: "Markdown multi-decision".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                1_000,
+            )
+            .unwrap();
+        let updated = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: item.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Confirm deploy settings".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "**Deploy target?**".to_owned(),
+                            options: vec!["Staging".to_owned(), "Prod".to_owned()],
+                            recommended: Some(0),
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "# `Region?`".to_owned(),
+                            options: vec!["US".to_owned(), "EU".to_owned()],
+                            recommended: Some(0),
+                            multi: false,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &bot_actor,
+                1_100,
+            )
+            .unwrap();
+        let ask_ev_id = updated
+            .events
+            .iter()
+            .rev()
+            .find(|e| !e.decisions.is_empty())
+            .unwrap()
+            .id;
+
+        // R2M-02: stale or invalid decision_id on multi-decision NeedsYou MUST return InvalidInput
+        // instead of falling through to freeform and waking the bot.
+        let stale_err = store
+            .answer_item(
+                &item.uid,
+                Some("Staging"),
+                Some(0),
+                Some("99999:0"),
+                None,
+                &owner,
+                1_150,
+            )
+            .unwrap_err();
+        assert_eq!(stale_err.kind(), io::ErrorKind::InvalidInput);
+        let invalid_err = store
+            .answer_item(
+                &item.uid,
+                Some("Staging"),
+                None,
+                Some("nonexistent-decision"),
+                None,
+                &owner,
+                1_160,
+            )
+            .unwrap_err();
+        assert_eq!(invalid_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store.get_item(&item.uid).unwrap().unwrap().status,
+            BotItemStatus::NeedsYou
+        );
+
+        // R2M-01: Mobile/Desktop normalized prefix ("Deploy target? → Staging") matches Decision 0
+        // without double-prefixing and keeps status NeedsYou until Decision 1 is answered.
+        let ans1 = store
+            .answer_item(
+                &item.uid,
+                Some("Deploy target? → Staging"),
+                Some(0),
+                Some(&format!("{ask_ev_id}:0")),
+                None,
+                &owner,
+                1_200,
+            )
+            .unwrap();
+        assert!(!ans1.should_wake_bot);
+        assert_eq!(ans1.item.status, BotItemStatus::NeedsYou);
+        assert_eq!(ans1.answer_summary, "Deploy target? → Staging");
+        assert!(
+            !ans1
+                .item
+                .events
+                .last()
+                .unwrap()
+                .text
+                .contains("**Deploy target?**"),
+            "must not double-prefix with raw Markdown"
+        );
+
+        // Answering Decision 1 via option_index uses stripped question line and completes all decisions.
+        let ans2 = store
+            .answer_item(
+                &item.uid,
+                None,
+                Some(1),
+                Some(&format!("{ask_ev_id}:1")),
+                None,
+                &owner,
+                1_300,
+            )
+            .unwrap();
+        assert!(ans2.should_wake_bot);
+        assert_eq!(ans2.item.status, BotItemStatus::Working);
+        assert_eq!(
+            ans2.answer_summary,
+            "Deploy target? → Staging\nRegion? → EU"
+        );
+
+        // R2M-01 back-compat: historical raw-Markdown prefix is still recognized on read.
+        let hist = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id,
+                    title: "Historical raw markdown".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                },
+                &bot_actor,
+                2_000,
+            )
+            .unwrap();
+        store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: hist.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    comment: Some("Pick two".to_owned()),
+                    decisions: vec![
+                        BotItemDecision {
+                            question: "**Env?**".to_owned(),
+                            options: vec!["Dev".to_owned(), "Prod".to_owned()],
+                            recommended: None,
+                            multi: false,
+                        },
+                        BotItemDecision {
+                            question: "**Mode?**".to_owned(),
+                            options: vec!["Fast".to_owned(), "Safe".to_owned()],
+                            recommended: None,
+                            multi: false,
+                        },
+                    ],
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                },
+                &bot_actor,
+                2_100,
+            )
+            .unwrap();
+        let raw_ans = store
+            .answer_item(
+                &hist.uid,
+                Some("**Env?** → Prod"),
+                None,
+                None,
+                None,
+                &owner,
+                2_200,
+            )
+            .unwrap();
+        assert!(!raw_ans.should_wake_bot);
+        assert_eq!(raw_ans.item.status, BotItemStatus::NeedsYou);
+
+        let norm_ans = store
+            .answer_item(
+                &hist.uid,
+                Some("Mode? → Safe"),
+                None,
+                None,
+                None,
+                &owner,
+                2_300,
+            )
+            .unwrap();
+        assert!(norm_ans.should_wake_bot);
+        assert_eq!(norm_ans.item.status, BotItemStatus::Working);
+        assert_eq!(norm_ans.answer_summary, "Env? → Prod\nMode? → Safe");
 
         fs::remove_dir_all(&dir).ok();
     }

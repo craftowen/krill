@@ -160,6 +160,11 @@ impl BotsManager {
             self_weak: OnceLock::new(),
         });
         manager.self_weak.set(Arc::downgrade(&manager)).ok();
+        manager.runtime.attach_callbacks(
+            manager.registry.clone(),
+            Arc::downgrade(&manager.store),
+            Arc::downgrade(&manager.groups),
+        );
         manager
             .tool_relay
             .set_builtin_handler(Arc::new(DaemonBuiltinMcpHandler {
@@ -216,7 +221,9 @@ impl BotsManager {
                 registry: self.registry.clone(),
                 manager: self.self_weak.get().cloned().unwrap_or_default(),
             });
-            Arc::new(ConnectorManager::new(bridge))
+            let cm = Arc::new(ConnectorManager::new(bridge));
+            self.runtime.attach_connectors(Arc::downgrade(&cm));
+            cm
         })
     }
 
@@ -413,6 +420,9 @@ impl BotsManager {
         self.runtime
             .on_session_removed(&self.tool_relay, session_id);
         self.groups.on_session_removed(session_id);
+        if let Some(connectors) = self.connectors.get() {
+            connectors.on_session_removed(session_id);
+        }
         lock(&self.active_cron_sessions).retain(|_, &mut sid| sid != session_id);
     }
 
@@ -606,8 +616,19 @@ impl BotsManager {
         };
         let reg_w = self.registry.clone();
         let key_err = key.clone();
+        let sched_thread_token: String = sched
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(32)
+            .collect();
+        let sched_thread_name = if sched_thread_token.is_empty() {
+            "bot-sched".to_owned()
+        } else {
+            format!("bot-sched-{sched_thread_token}")
+        };
         let spawned = std::thread::Builder::new()
-            .name(format!("bot-sched-{}", sched.id))
+            .name(sched_thread_name)
             .stack_size(256 * 1024)
             .spawn(move || {
                 struct SchedGuard {
@@ -757,6 +778,10 @@ impl BotsManager {
         if let Some(mgr) = self.connectors.get() {
             mgr.shutdown();
         }
+        if let Some(oauth) = self.mcp_oauth.get() {
+            oauth.cancel_all();
+        }
+        google::cancel_all_google_oauth();
         if let Some(g) = self.google_poller.get() {
             g.stop();
         }
@@ -784,7 +809,8 @@ impl BotsManager {
         });
 
         if let Some((ref caller_bot_id, _)) = caller_bot
-            && let Err(reason) = authorize_bot_session_rpc(&self.items, caller_bot_id, &req)
+            && let Err(reason) =
+                authorize_bot_session_rpc(&self.store, &self.items, caller_bot_id, &req)
         {
             return BotRpcResponse::Error(reason);
         }
@@ -877,6 +903,10 @@ impl BotsManager {
                     .as_deref()
                     .map(|a| krill_proto::agent::canonical_id(a.trim()))
                     .or(prev_agent.as_deref());
+                let provider_changed = prev_agent.as_deref() != effective_agent;
+                if provider_changed && params.effort.is_unchanged() {
+                    params.effort = krill_proto::bots::FieldPatch::Clear;
+                }
                 if effective_agent == Some("agy")
                     && let krill_proto::bots::FieldPatch::Set(ref model) = params.model
                 {
@@ -884,7 +914,14 @@ impl BotsManager {
                         krill_proto::bots::FieldPatch::Set(e) => Some(e.as_str()),
                         krill_proto::bots::FieldPatch::Clear => None,
                         krill_proto::bots::FieldPatch::Unchanged => {
-                            prev_bot.as_ref().and_then(|b| b.effort.as_deref())
+                            if krill_proto::agent::strip_agy_effort_suffix(model)
+                                .1
+                                .is_some()
+                            {
+                                None
+                            } else {
+                                prev_bot.as_ref().and_then(|b| b.effort.as_deref())
+                            }
                         }
                     };
                     if let Some((family, eff)) =
@@ -943,8 +980,12 @@ impl BotsManager {
                     }
                     Err(err) => return BotRpcResponse::Error(err.to_string()),
                 }
-                // Stop all live PTY sessions & clear active cron bindings BEFORE removing the bot
-                // from `BotStore`, so `DeleteBot` never leaks running agent processes.
+                // Cancel any pending OAuth sign-in listeners and stop all live PTY sessions
+                // BEFORE removing the bot and deleting its secrets so nothing races back in.
+                if let Some(oauth) = self.mcp_oauth.get() {
+                    oauth.cancel_bot(&bot_id);
+                }
+                google::cancel_google_oauth(&bot_id);
                 self.runtime
                     .stop_all_for_bot(registry, &self.tool_relay, &bot_id);
                 lock(&self.active_cron_sessions).retain(|(bid, _), _| bid != &bot_id);
@@ -1040,7 +1081,15 @@ impl BotsManager {
                     &bot_id,
                     session_id,
                 ) {
-                    Ok(()) => BotRpcResponse::Ok,
+                    Ok(()) => {
+                        self.store.unbind_session_links(session_id, ts).ok();
+                        lock(&self.active_cron_sessions).retain(|_, &mut sid| sid != session_id);
+                        self.groups.on_session_removed(session_id);
+                        if let Some(connectors) = self.connectors.get() {
+                            connectors.on_session_removed(session_id);
+                        }
+                        BotRpcResponse::Ok
+                    }
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
@@ -1331,11 +1380,17 @@ impl BotsManager {
                 Ok(page) => BotRpcResponse::ItemsPage(page),
                 Err(err) => BotRpcResponse::Error(err.to_string()),
             },
-            BotRpcRequest::GetBotItem { item_id } => match self.items.get_item(&item_id) {
-                Ok(Some(item)) => BotRpcResponse::Item(Box::new(item)),
-                Ok(None) => BotRpcResponse::Error(format!("bot item not found: {item_id}")),
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            BotRpcRequest::GetBotItem { item_id } => {
+                let effective_id = match &caller_bot {
+                    Some((bot_id, _)) => qualify_bot_item_id(bot_id, &item_id),
+                    None => item_id.clone(),
+                };
+                match self.items.get_item(&effective_id) {
+                    Ok(Some(item)) => BotRpcResponse::Item(Box::new(item)),
+                    Ok(None) => BotRpcResponse::Error(format!("bot item not found: {item_id}")),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::AnswerBotItem {
                 item_id,
                 answer_text,
@@ -1393,7 +1448,10 @@ impl BotsManager {
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
-            BotRpcRequest::UpdateItem(params) => {
+            BotRpcRequest::UpdateItem(mut params) => {
+                if let Some((ref bot_id, _)) = caller_bot {
+                    params.item_id = qualify_bot_item_id(bot_id, &params.item_id);
+                }
                 match self.items.update_item(&params, &default_actor, ts) {
                     Ok(item) => BotRpcResponse::Item(Box::new(item)),
                     Err(err) => BotRpcResponse::Error(err.to_string()),
@@ -1404,6 +1462,10 @@ impl BotsManager {
                 author,
                 text,
             } => {
+                let effective_id = match &caller_bot {
+                    Some((bot_id, _)) => qualify_bot_item_id(bot_id, &item_id),
+                    None => item_id,
+                };
                 let actor = match caller_bot {
                     Some((bot_id, sid)) => BotItemActor::Bot {
                         bot_id,
@@ -1424,13 +1486,23 @@ impl BotsManager {
                         }
                     }
                 };
-                match self.items.add_comment(&item_id, &actor, &text, &[], ts) {
+                match self
+                    .items
+                    .add_comment(&effective_id, &actor, &text, &[], ts)
+                {
                     Ok(item) => BotRpcResponse::Item(Box::new(item)),
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
             }
             BotRpcRequest::AddItemLink { item_id, link } => {
-                match self.items.add_link(&item_id, &link, &default_actor, ts) {
+                let effective_id = match &caller_bot {
+                    Some((bot_id, _)) => qualify_bot_item_id(bot_id, &item_id),
+                    None => item_id,
+                };
+                match self
+                    .items
+                    .add_link(&effective_id, &link, &default_actor, ts)
+                {
                     Ok(item) => BotRpcResponse::Item(Box::new(item)),
                     Err(err) => BotRpcResponse::Error(err.to_string()),
                 }
@@ -1641,41 +1713,14 @@ impl BotsManager {
                 reaction,
             } => {
                 // Validate bot and link BEFORE initializing the lazy ConnectorManager threads.
-                match self.store.get_bot(&bot_id) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        return BotRpcResponse::Error(format!(
-                            "bot not found: {}",
-                            bot_id.as_str()
-                        ));
-                    }
-                    Err(err) => return BotRpcResponse::Error(err.to_string()),
-                }
-                if let Some(ref lid) = link_id {
-                    match self.store.get_link(lid) {
-                        Ok(Some(l)) if l.bot_id == bot_id => {}
-                        Ok(Some(_)) => {
-                            return BotRpcResponse::Error(format!(
-                                "link '{lid}' does not belong to bot {}",
-                                bot_id.as_str()
-                            ));
-                        }
-                        Ok(None) => {
-                            return BotRpcResponse::Error(format!("link not found: {lid}"));
-                        }
-                        Err(err) => return BotRpcResponse::Error(err.to_string()),
-                    }
-                } else {
-                    match self.store.latest_link_for_bot(&bot_id) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            return BotRpcResponse::Error(format!(
-                                "no external conversation link found for bot {}",
-                                bot_id.as_str()
-                            ));
-                        }
-                        Err(err) => return BotRpcResponse::Error(err.to_string()),
-                    }
+                if let Err(err) = validate_reply_target(
+                    &self.store,
+                    &self.runtime,
+                    peer_session,
+                    &bot_id,
+                    link_id.as_deref(),
+                ) {
+                    return BotRpcResponse::Error(err);
                 }
                 let mgr = self.connector_manager();
                 match self.runtime.post_bot_reply_for_session(
@@ -2210,7 +2255,32 @@ impl BotsManager {
         let mut dispatched_bots = Vec::new();
         let mut failures = Vec::new();
         for target in &plan.target_bots {
-            match self.runtime.deliver_group_turn(
+            let registered = std::cell::Cell::new(None::<(SessionId, u64)>);
+            let mut on_bound = |sid: SessionId, turn_seq: u64| {
+                if registered.get().is_some() {
+                    return;
+                }
+                self.groups
+                    .record_turn_started_seq(
+                        &plan.group.id,
+                        &plan.thread.thread_id,
+                        target,
+                        sid,
+                        Some(turn_seq),
+                        ts,
+                    )
+                    .ok();
+                registered.set(Some((sid, turn_seq)));
+            };
+            let mut on_rollback = |sid: SessionId, turn_seq: u64| {
+                if registered.get() == Some((sid, turn_seq)) {
+                    registered.set(None);
+                    self.groups
+                        .on_bot_turn_finished_seq(&target.id, sid, Some(turn_seq), "", ts)
+                        .ok();
+                }
+            };
+            match self.runtime.deliver_group_turn_with_hooks(
                 registry,
                 &self.store,
                 &self.secrets,
@@ -2221,21 +2291,19 @@ impl BotsManager {
                 &plan.thread.thread_id,
                 &plan.prompt_for_bot,
                 ts,
+                Some(&mut on_bound),
+                Some(&mut on_rollback),
             ) {
                 Ok((sid, turn_seq, _)) => {
-                    self.groups
-                        .record_turn_started_seq(
-                            &plan.group.id,
-                            &plan.thread.thread_id,
-                            target,
-                            sid,
-                            Some(turn_seq),
-                            ts,
-                        )
-                        .ok();
+                    if registered.get().is_none() {
+                        on_bound(sid, turn_seq);
+                    }
                     dispatched_bots.push(target.id.clone());
                 }
                 Err(err) => {
+                    if let Some((sid, turn_seq)) = registered.get() {
+                        on_rollback(sid, turn_seq);
+                    }
                     tracing::warn!(
                         group = %plan.group.id,
                         bot = %target.id.as_str(),
@@ -2470,6 +2538,7 @@ impl BotsManager {
 /// Authorizes a request coming from inside a live bot session (`Scope::Session(bot_sid)`).
 /// Enforces owner-only secrets/bot-management isolation and restricts self-targeted mutations.
 fn authorize_bot_session_rpc(
+    store: &BotStore,
     items: &BotItemsStore,
     caller_bot: &BotId,
     req: &BotRpcRequest,
@@ -2514,13 +2583,24 @@ fn authorize_bot_session_rpc(
         // A bot proposes bots only from its own chat; the owner answers them.
         BotRpcRequest::OfferBot { bot_id, .. } if bot_id == caller_bot => Ok(()),
         BotRpcRequest::OfferBot { .. } => deny("cannot propose a bot for another bot"),
-        BotRpcRequest::SendGroupMessage { sender, .. }
-        | BotRpcRequest::SendGroupMessageWithAudience { sender, .. } => {
+        BotRpcRequest::SendGroupMessage {
+            group_id, sender, ..
+        }
+        | BotRpcRequest::SendGroupMessageWithAudience {
+            group_id, sender, ..
+        } => {
+            let group = store
+                .get_group(group_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("group not found: {group_id}"))?;
+            if !group.bot_ids.contains(caller_bot) {
+                return deny("bot is not a member of target group");
+            }
             let trimmed = sender.trim();
-            if trimmed.is_empty()
-                || trimmed == caller_bot.as_str()
-                || trimmed == format!("bot:{}", caller_bot.as_str())
-            {
+            if trimmed.is_empty() {
+                return deny("bot group message sender cannot be empty");
+            }
+            if trimmed == caller_bot.as_str() || trimmed == format!("bot:{}", caller_bot.as_str()) {
                 Ok(())
             } else {
                 deny("bot cannot impersonate another group sender")
@@ -2678,16 +2758,67 @@ fn updates_only_schedules(params: &UpdateBotParams) -> bool {
         && mcp_tools.is_none()
 }
 
+fn qualify_bot_item_id(bot_id: &BotId, raw: &str) -> String {
+    let trimmed = raw.trim();
+    let num_str = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{}#{num_str}", bot_id.as_str())
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 fn ensure_bot_owns_item(
     items: &BotItemsStore,
     caller_bot: &BotId,
     item_id: &str,
 ) -> Result<(), String> {
-    match items.get_item(item_id) {
+    let effective_id = qualify_bot_item_id(caller_bot, item_id);
+    match items.get_item(&effective_id) {
         Ok(Some(item)) if &item.owner_bot_id == caller_bot => Ok(()),
         Ok(Some(_)) => Err("permission denied: item owned by another bot".to_owned()),
         Ok(None) => Err(format!("bot item not found: {item_id}")),
         Err(err) => Err(err.to_string()),
+    }
+}
+
+fn validate_reply_target(
+    store: &BotStore,
+    runtime: &BotRuntime,
+    caller_session: Option<SessionId>,
+    bot_id: &BotId,
+    explicit_link_id: Option<&str>,
+) -> Result<(), String> {
+    match store.get_bot(bot_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(format!("bot not found: {}", bot_id.as_str())),
+        Err(err) => return Err(err.to_string()),
+    }
+    let session_link_id = if explicit_link_id.is_none() {
+        caller_session.and_then(|sid| runtime.session_link_for_bot(sid, bot_id))
+    } else {
+        None
+    };
+    let resolved_link_id = explicit_link_id.or(session_link_id.as_deref());
+    if let Some(lid) = resolved_link_id {
+        match store.get_link(lid) {
+            Ok(Some(l)) if l.bot_id == *bot_id => Ok(()),
+            Ok(Some(_)) => Err(format!(
+                "link '{lid}' does not belong to bot {}",
+                bot_id.as_str()
+            )),
+            Ok(None) => Err(format!("link not found: {lid}")),
+            Err(err) => Err(err.to_string()),
+        }
+    } else {
+        match store.latest_link_for_bot(bot_id) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!(
+                "no external conversation link found for bot {}",
+                bot_id.as_str()
+            )),
+            Err(err) => Err(err.to_string()),
+        }
     }
 }
 
@@ -2719,6 +2850,39 @@ impl ConnectorBridge for DaemonConnectorBridge {
             &msg,
             now_ms(),
         )?;
+        Ok(DispatchOutcome {
+            link,
+            session_id,
+            started_new_session,
+        })
+    }
+
+    fn dispatch_external_message_with_hooks(
+        &self,
+        msg: InboundExternalMessage,
+        on_bound: &mut dyn FnMut(SessionId, Option<u64>),
+        on_rollback: &mut dyn FnMut(SessionId, Option<u64>),
+    ) -> io::Result<DispatchOutcome> {
+        let mgr = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| io::Error::other("bots manager shut down"))?;
+        let reg = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| io::Error::other("daemon registry unavailable"))?;
+        let (link, session_id, started_new_session) =
+            mgr.runtime.dispatch_external_message_with_hooks(
+                &reg,
+                &mgr.store,
+                &mgr.secrets,
+                &mgr.tool_relay,
+                &mgr.composio_base_url,
+                &msg,
+                now_ms(),
+                Some(on_bound),
+                Some(on_rollback),
+            )?;
         Ok(DispatchOutcome {
             link,
             session_id,
@@ -2929,10 +3093,7 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| "missing required 'title'".to_owned())?
                     .to_owned();
-                let status = arguments
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .and_then(parse_item_status);
+                let status = parse_optional_mcp_status(arguments)?;
                 let item = mgr
                     .items
                     .create_item(
@@ -2958,18 +3119,15 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                 serde_json::to_string(&item).map_err(|e| e.to_string())
             }
             "items_update" => {
-                let item_id = arguments
+                let raw_item_id = arguments
                     .get("item_id")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "missing required 'item_id'".to_owned())?
-                    .to_owned();
+                    .ok_or_else(|| "missing required 'item_id'".to_owned())?;
+                let item_id = qualify_bot_item_id(&ctx.bot_id, raw_item_id);
                 ensure_bot_owns_item(&mgr.items, &ctx.bot_id, &item_id)?;
-                let status = arguments
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .and_then(parse_item_status);
+                let status = parse_optional_mcp_status(arguments)?;
                 let item = mgr
                     .items
                     .update_item(
@@ -3104,6 +3262,14 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .get("group_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "missing required 'group_id'".to_owned())?;
+                let group = mgr
+                    .store
+                    .get_group(group_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("group not found: {group_id}"))?;
+                if !group.bot_ids.contains(&ctx.bot_id) {
+                    return Err("permission denied: bot is not a member of target group".to_owned());
+                }
                 let text = arguments
                     .get("text")
                     .and_then(Value::as_str)
@@ -3129,7 +3295,32 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                 let mut dispatched = Vec::new();
                 let mut failed = Vec::new();
                 for target in &plan.target_bots {
-                    match mgr.runtime.deliver_group_turn(
+                    let registered = std::cell::Cell::new(None::<(SessionId, u64)>);
+                    let mut on_bound = |sid: SessionId, turn_seq: u64| {
+                        if registered.get().is_some() {
+                            return;
+                        }
+                        mgr.groups
+                            .record_turn_started_seq(
+                                &plan.group.id,
+                                &plan.thread.thread_id,
+                                target,
+                                sid,
+                                Some(turn_seq),
+                                ts,
+                            )
+                            .ok();
+                        registered.set(Some((sid, turn_seq)));
+                    };
+                    let mut on_rollback = |sid: SessionId, turn_seq: u64| {
+                        if registered.get() == Some((sid, turn_seq)) {
+                            registered.set(None);
+                            mgr.groups
+                                .on_bot_turn_finished_seq(&target.id, sid, Some(turn_seq), "", ts)
+                                .ok();
+                        }
+                    };
+                    match mgr.runtime.deliver_group_turn_with_hooks(
                         &reg,
                         &mgr.store,
                         &mgr.secrets,
@@ -3140,21 +3331,19 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                         &plan.thread.thread_id,
                         &plan.prompt_for_bot,
                         ts,
+                        Some(&mut on_bound),
+                        Some(&mut on_rollback),
                     ) {
                         Ok((sid, turn_seq, _)) => {
-                            mgr.groups
-                                .record_turn_started_seq(
-                                    &plan.group.id,
-                                    &plan.thread.thread_id,
-                                    target,
-                                    sid,
-                                    Some(turn_seq),
-                                    ts,
-                                )
-                                .ok();
+                            if registered.get().is_none() {
+                                on_bound(sid, turn_seq);
+                            }
                             dispatched.push(target.id.clone());
                         }
                         Err(err) => {
+                            if let Some((sid, turn_seq)) = registered.get() {
+                                on_rollback(sid, turn_seq);
+                            }
                             mgr.groups
                                 .record_dispatch_failure(
                                     &plan.group.id,
@@ -3183,7 +3372,8 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .store
                     .list_access_requests(Some(&ctx.bot_id))
                     .map_err(|e| e.to_string())?;
-                serde_json::to_string(&reqs).map_err(|e| e.to_string())
+                let redacted = store::redact_access_requests_for_observer(reqs);
+                serde_json::to_string(&redacted).map_err(|e| e.to_string())
             }
             "ask_owner" => {
                 let question = arguments
@@ -3221,13 +3411,14 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let uid = if let Some(eid) = existing_id {
-                    ensure_bot_owns_item(&mgr.items, &ctx.bot_id, eid)?;
+                let uid = if let Some(raw_eid) = existing_id {
+                    let eid = qualify_bot_item_id(&ctx.bot_id, raw_eid);
+                    ensure_bot_owns_item(&mgr.items, &ctx.bot_id, &eid)?;
                     let cur = mgr
                         .items
-                        .get_item(eid)
+                        .get_item(&eid)
                         .map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("bot item not found: {eid}"))?;
+                        .ok_or_else(|| format!("bot item not found: {raw_eid}"))?;
                     if cur.status != BotItemStatus::NeedsYou {
                         mgr.items
                             .update_item(
@@ -3254,7 +3445,21 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map_or_else(|| question.chars().take(120).collect(), ToOwned::to_owned);
+                        .map_or_else(
+                            || {
+                                let clamped = items::clamp_utf8_bytes_and_chars(
+                                    &question,
+                                    120,
+                                    krill_proto::bots::BOT_ITEM_TITLE_MAX_BYTES,
+                                );
+                                if clamped.is_empty() {
+                                    "Question".to_owned()
+                                } else {
+                                    clamped
+                                }
+                            },
+                            items::clamp_item_title,
+                        );
                     let created = mgr
                         .items
                         .create_item(
@@ -3320,6 +3525,14 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
                     .or_else(|| ctx.link.clone());
+                // Validate bot & link ownership BEFORE initializing lazy ConnectorManager (MB-05).
+                validate_reply_target(
+                    &mgr.store,
+                    &mgr.runtime,
+                    ctx.session_id,
+                    &ctx.bot_id,
+                    link_id.as_deref(),
+                )?;
                 let ext_ref = mgr.runtime.post_bot_reply_for_session(
                     &mgr.store,
                     mgr.connector_manager(),
@@ -3392,11 +3605,32 @@ fn parse_item_status(raw: &str) -> Option<BotItemStatus> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "planned" => Some(BotItemStatus::Planned),
         "working" => Some(BotItemStatus::Working),
-        "needs_you" => Some(BotItemStatus::NeedsYou),
+        "needs_you" | "needs-you" => Some(BotItemStatus::NeedsYou),
         "done" => Some(BotItemStatus::Done),
         "canceled" | "cancelled" => Some(BotItemStatus::Canceled),
         _ => None,
     }
+}
+
+fn parse_optional_mcp_status(arguments: &Value) -> Result<Option<BotItemStatus>, String> {
+    let Some(val) = arguments.get("status") else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    let raw = val
+        .as_str()
+        .ok_or_else(|| "invalid 'status': expected a string".to_owned())?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    parse_item_status(trimmed).map(Some).ok_or_else(|| {
+        format!(
+            "invalid 'status' value '{trimmed}': expected one of planned, working, needs_you, needs-you, done, canceled"
+        )
+    })
 }
 
 fn collect_bot_secret_refs(bot: &BotConfig) -> Vec<String> {
@@ -5389,6 +5623,319 @@ mod tests {
             mgr.store.list_groups().unwrap().is_empty(),
             "0-member zombie group must be pruned when its last bot is deleted"
         );
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn bot_security_mcp_and_item_qualification_regressions() {
+        let state = temp_state("mb04-05-06-07-09-34-38");
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+        let mk_bot = |name: &str| {
+            mgr.store
+                .create_bot(
+                    CreateBotParams {
+                        name: name.to_owned(),
+                        agent_id: "claude".to_owned(),
+                        description: String::new(),
+                        emoji: None,
+                        avatar: None,
+                        model: None,
+                        effort: Some("max".to_owned()),
+                        permission_mode: None,
+                        workspace: None,
+                        template_id: None,
+                        initial_soul: None,
+                    },
+                    1_000,
+                )
+                .unwrap()
+        };
+        let bot_a = mk_bot("Bot Alpha");
+        let bot_b = mk_bot("Bot Beta");
+
+        let sid_a = SessionId(9101);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            sid_a,
+            runtime::BotSessionBinding {
+                bot_id: bot_a.id.clone(),
+                link_id: None,
+                memory_snapshot: krill_proto::bots::MemorySnapshot::capture(""),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 1,
+                label: "alpha".to_owned(),
+                created_at_ms: 1_000,
+                owner_turn_pending: false,
+                last_prompt: None,
+            },
+        );
+
+        let handler = DaemonBuiltinMcpHandler {
+            registry: Arc::downgrade(&reg),
+            manager: Arc::downgrade(&mgr),
+        };
+        let ctx_a = tool_relay::BuiltinMcpCallContext {
+            bot_id: bot_a.id.clone(),
+            session_id: Some(sid_a),
+            link: None,
+        };
+
+        // MB-04: bot cannot post to a group it isn't a member of, nor with empty sender.
+        let group_b_only = mgr
+            .store
+            .create_group("Beta Only", vec![bot_b.id.clone()], String::new(), 1_100)
+            .unwrap();
+        let group_both = mgr
+            .store
+            .create_group(
+                "Shared",
+                vec![bot_a.id.clone(), bot_b.id.clone()],
+                String::new(),
+                1_110,
+            )
+            .unwrap();
+        let resp_nonmember = mgr.handle_rpc_for_peer(
+            &reg,
+            Some(sid_a),
+            false,
+            BotRpcRequest::SendGroupMessage {
+                group_id: group_b_only.id.clone(),
+                thread_id: None,
+                sender: bot_a.id.as_str().to_owned(),
+                text: "intrude".to_owned(),
+                reply_mode: None,
+            },
+        );
+        assert!(
+            matches!(resp_nonmember, BotRpcResponse::Error(ref e) if e.contains("not a member"))
+        );
+        let resp_empty_sender = mgr.handle_rpc_for_peer(
+            &reg,
+            Some(sid_a),
+            false,
+            BotRpcRequest::SendGroupMessage {
+                group_id: group_both.id.clone(),
+                thread_id: None,
+                sender: String::new(),
+                text: "spoof owner".to_owned(),
+                reply_mode: None,
+            },
+        );
+        assert!(
+            matches!(resp_empty_sender, BotRpcResponse::Error(ref e) if e.contains("cannot be empty"))
+        );
+        let mcp_nonmember = handler
+            .call_tool(
+                &ctx_a,
+                "group_send",
+                &json!({ "group_id": group_b_only.id, "text": "intrude" }),
+            )
+            .unwrap_err();
+        assert!(mcp_nonmember.contains("not a member"), "{mcp_nonmember}");
+
+        // MB-05: MCP `reply` rejects cross-bot link_id WITHOUT initializing lazy ConnectorManager.
+        let link_b = mgr
+            .store
+            .lookup_or_create_link(
+                &bot_b.id,
+                krill_proto::bots::ExternalSource::Telegram,
+                None,
+                "tg-chat-b",
+                None,
+                krill_proto::bots::ActsFor::Owner,
+                1_200,
+            )
+            .unwrap();
+        let reply_err = handler
+            .call_tool(
+                &ctx_a,
+                "reply",
+                &json!({ "link_id": link_b.id, "text": "cross-bot" }),
+            )
+            .unwrap_err();
+        assert!(reply_err.contains("does not belong to bot"), "{reply_err}");
+        assert!(
+            mgr.connectors.get().is_none(),
+            "rejected MCP reply must not wake lazy ConnectorManager"
+        );
+
+        // MB-06: MCP `access_list` must redact access request approval tokens.
+        let req = match mgr
+            .store
+            .check_or_request_access(
+                &bot_a.id,
+                krill_proto::bots::ExternalSource::Telegram,
+                "ext-user-1",
+                "Stranger",
+                "chat-1",
+                1_300,
+            )
+            .unwrap()
+        {
+            connectors::AccessDecision::Pending(req) => req,
+            other => panic!("expected pending access request, got {other:?}"),
+        };
+        assert!(!req.token.is_empty());
+        let access_json = handler
+            .call_tool(&ctx_a, "access_list", &json!({}))
+            .unwrap();
+        assert!(
+            !access_json.contains(&req.token),
+            "access_list leaked raw token: {access_json}"
+        );
+
+        // MB-07: MCP `ask_owner` with >200B CJK question safely clamps UTF-8 title without failing.
+        let long_korean_q = "한국어질문입니다".repeat(25); // 600 bytes
+        let ask_res = handler
+            .call_tool(
+                &ctx_a,
+                "ask_owner",
+                &json!({ "question": long_korean_q, "options": ["네", "아니오"] }),
+            )
+            .unwrap();
+        let asked_item: krill_proto::bots::BotItem = serde_json::from_str(&ask_res).unwrap();
+        assert!(asked_item.title.len() <= krill_proto::bots::BOT_ITEM_TITLE_MAX_BYTES);
+        assert_eq!(asked_item.status, BotItemStatus::NeedsYou);
+
+        // MB-09: `needs-you` accepted; unrecognized status errors cleanly.
+        let created_json = handler
+            .call_tool(
+                &ctx_a,
+                "items_create",
+                &json!({ "title": "Hyphen status", "status": "needs-you" }),
+            )
+            .unwrap();
+        let created_item: krill_proto::bots::BotItem = serde_json::from_str(&created_json).unwrap();
+        assert_eq!(created_item.status, BotItemStatus::NeedsYou);
+        let bad_status_err = handler
+            .call_tool(
+                &ctx_a,
+                "items_create",
+                &json!({ "title": "Typo status", "status": "in_progress" }),
+            )
+            .unwrap_err();
+        assert!(
+            bad_status_err.contains("invalid 'status'"),
+            "{bad_status_err}"
+        );
+        let bad_upd_err = handler
+            .call_tool(
+                &ctx_a,
+                "items_update",
+                &json!({ "item_id": created_item.uid, "status": "blocked" }),
+            )
+            .unwrap_err();
+        assert!(bad_upd_err.contains("invalid 'status'"), "{bad_upd_err}");
+
+        // MB-34: Bot-scoped bare "#1" / "1" resolves caller's own item even when another bot also has #1.
+        let b_item1 = mgr
+            .items
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot_b.id.clone(),
+                    title: "Beta item 1".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Planned),
+                    links: Vec::new(),
+                },
+                &BotItemActor::Owner { device: None },
+                1_400,
+            )
+            .unwrap();
+        assert_eq!(b_item1.number, 1);
+        let upd_bare = handler
+            .call_tool(
+                &ctx_a,
+                "items_update",
+                &json!({ "item_id": "#1", "comment": "Self update via bare #1" }),
+            )
+            .unwrap();
+        let upd_item: krill_proto::bots::BotItem = serde_json::from_str(&upd_bare).unwrap();
+        assert_eq!(upd_item.owner_bot_id, bot_a.id);
+        assert_eq!(upd_item.number, 1);
+        // Cross-bot qualified ID still rejected.
+        let cross_item_err = handler
+            .call_tool(
+                &ctx_a,
+                "items_update",
+                &json!({ "item_id": format!("{}#1", bot_b.id.as_str()), "comment": "nope" }),
+            )
+            .unwrap_err();
+        assert!(
+            cross_item_err.contains("owned by another bot"),
+            "{cross_item_err}"
+        );
+
+        // MB-38: Switching provider from claude (effort="max") to agy with model="gemini-4-carbon"
+        // and effort=Unchanged must NOT fold the previous provider's stale "max" effort.
+        let switched = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::UpdateBot(Box::new(UpdateBotParams {
+                bot_id: bot_a.id.clone(),
+                name: None,
+                description: None,
+                emoji: FieldPatch::Unchanged,
+                avatar: FieldPatch::Unchanged,
+                agent_id: Some("agy".to_owned()),
+                model: FieldPatch::Set("gemini-4-carbon".to_owned()),
+                effort: FieldPatch::Unchanged,
+                permission_mode: None,
+                workspace: FieldPatch::Unchanged,
+                paused: None,
+                first_run_completed: None,
+                notifications: None,
+                schedules: None,
+                look_around: None,
+                memory_tidy: None,
+                mcp_tools: None,
+            })),
+        );
+        if let BotRpcResponse::Bot(updated_bot) = switched {
+            assert_ne!(
+                updated_bot.effort.as_deref(),
+                Some("max"),
+                "stale claude effort must not carry into agy fold"
+            );
+        }
+
+        // R2M-23: Verify UpdateBot on existing `agy` bot with effort="high" and model=Set("gemini-4-argon-low")
+        // + effort=Unchanged passes None (not stale prev_bot.effort) to `antigravity_listed_family_selection`.
+        let listed = vec![krill_proto::agent::AgyListedModel {
+            id: "gemini-4-argon".to_owned(),
+            efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+        }];
+        let model_patch = "gemini-4-argon-low";
+        let req_effort = if krill_proto::agent::strip_agy_effort_suffix(model_patch)
+            .1
+            .is_some()
+        {
+            None
+        } else {
+            Some("high")
+        };
+        assert_eq!(
+            krill_proto::agent::antigravity_listed_family_selection(
+                model_patch,
+                req_effort,
+                &listed
+            ),
+            Some(("gemini-4-argon".to_owned(), "low".to_owned()))
+        );
+
+        // R2M-11: DeleteBot cancels pending MCP/Google OAuth listeners cleanly and shutdown cancels all.
+        let del_resp = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::DeleteBot {
+                bot_id: bot_b.id.clone(),
+                delete_home: true,
+            },
+        );
+        assert!(matches!(del_resp, BotRpcResponse::Deleted { .. }));
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();

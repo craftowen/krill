@@ -44,12 +44,22 @@ const MAX_RELAY_WORKERS: usize = 32;
 pub const BUILTIN_KRILL_CRED_ID: &str = "krill";
 pub const BUILTIN_MCP_TOOL_COUNT: u32 = 13;
 
+/// Origin category of a registered [`ToolRoute`] so custom MCP tools can never collide with
+/// or inherit the lifecycle of built-in Composio Tool Router routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteKind {
+    #[default]
+    McpTool,
+    Composio,
+}
+
 /// A single registered upstream MCP endpoint served through `/bot-tools/<cred_id>/mcp`.
 #[derive(Clone)]
 pub struct ToolRoute {
     pub cred_id: String,
     pub bot_id: BotId,
     pub tool_id: String,
+    pub kind: RouteKind,
     pub name: String,
     pub upstream_url: String,
     pub auth_kind: BotMcpAuthKind,
@@ -64,6 +74,7 @@ impl fmt::Debug for ToolRoute {
             .field("cred_id", &self.cred_id)
             .field("bot_id", &self.bot_id)
             .field("tool_id", &self.tool_id)
+            .field("kind", &self.kind)
             .field("auth_kind", &self.auth_kind)
             .finish_non_exhaustive()
     }
@@ -311,9 +322,11 @@ impl BotToolRelay {
         let mut cred_ids = Vec::new();
         let has_builtin = {
             let mut st = lock(&self.state);
-            // Replace non-composio MCP routes for this bot.
-            st.routes
-                .retain(|_, r| r.bot_id != bot.id || r.tool_id.starts_with("composio"));
+            // Replace all MCP tool routes for this bot, retaining only an enabled Composio route.
+            st.routes.retain(|_, r| {
+                r.bot_id != bot.id
+                    || (r.kind == RouteKind::Composio && bot.connectors.composio.enabled)
+            });
             for tool in &bot.mcp_tools {
                 if !tool.enabled {
                     continue;
@@ -333,6 +346,7 @@ impl BotToolRelay {
                         cred_id,
                         bot_id: bot.id.clone(),
                         tool_id: tool.id.clone(),
+                        kind: RouteKind::McpTool,
                         name: tool.name.clone(),
                         upstream_url: url.to_owned(),
                         auth_kind: tool.auth_kind,
@@ -541,10 +555,10 @@ impl BotToolRelay {
     }
 }
 
-/// Builds a deterministic, URL-safe credential route ID for `(bot_id, tool_id)`.
+/// Builds a deterministic, URL-safe, collision-resistant credential route ID for `(bot_id, tool_id)`.
 #[must_use]
 pub fn make_cred_id(bot_id: &BotId, tool_id: &str) -> String {
-    let mut out = String::with_capacity(bot_id.as_str().len() + tool_id.len() + 1);
+    let mut out = String::with_capacity(bot_id.as_str().len() + tool_id.len() + 14);
     for ch in bot_id.as_str().chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
             out.push(ch);
@@ -559,6 +573,40 @@ pub fn make_cred_id(bot_id: &BotId, tool_id: &str) -> String {
         } else {
             out.push('_');
         }
+    }
+    // Append a 12-hex SHA-256 disambiguator over `(bot_id, '\0', tool_id)` so distinct pairs
+    // can never collide after sanitization or hyphen splitting (MB-15).
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(bot_id.as_str().as_bytes());
+    ctx.update(b"\0");
+    ctx.update(tool_id.as_bytes());
+    let digest = ctx.finish();
+    out.push('-');
+    for &b in digest.as_ref().get(..6).unwrap_or_default() {
+        write!(out, "{b:02x}").ok();
+    }
+    out
+}
+
+/// Builds a distinct, collision-proof credential route ID reserved for Composio Tool Router
+/// so a custom MCP tool with `id == "composio"` can never collide with or overwrite Composio.
+#[must_use]
+pub fn make_composio_cred_id(bot_id: &BotId) -> String {
+    let mut out = String::with_capacity(bot_id.as_str().len() + 24);
+    for ch in bot_id.as_str().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out.push_str("-composio-");
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(b"composio\x01");
+    ctx.update(bot_id.as_str().as_bytes());
+    let digest = ctx.finish();
+    for &b in digest.as_ref().get(..6).unwrap_or_default() {
+        write!(out, "{b:02x}").ok();
     }
     out
 }
@@ -720,8 +768,13 @@ fn handle_connection(
                     && (cred_id == BUILTIN_KRILL_CRED_ID || g.allowed_creds.contains(cred_id))
             })
             .cloned();
-        let route = if grant.is_some() && cred_id != BUILTIN_KRILL_CRED_ID {
-            st.routes.get(cred_id).cloned()
+        let route = if let Some(ref g) = grant
+            && cred_id != BUILTIN_KRILL_CRED_ID
+        {
+            st.routes
+                .get(cred_id)
+                .filter(|r| r.bot_id == g.bot_id)
+                .cloned()
         } else {
             None
         };
@@ -1244,9 +1297,10 @@ fn inject_auth_header(
 ) {
     let header_name = route
         .header_names
-        .first()
+        .iter()
         .map(String::as_str)
-        .filter(|h| !h.trim().is_empty())
+        .map(str::trim)
+        .find(|h| !h.is_empty())
         .unwrap_or("Authorization");
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
 
@@ -1268,35 +1322,122 @@ fn inject_auth_header(
 }
 
 fn parse_relay_target(target: &str) -> Option<(&str, &str)> {
+    if target.contains('#') || target.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'\\') {
+        return None;
+    }
     let rest = target.strip_prefix("/bot-tools/")?;
     let slash = rest.find('/')?;
     let cred_id = rest.get(..slash)?;
-    if cred_id.is_empty() {
+    if cred_id.is_empty()
+        || !cred_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
         return None;
     }
     let after = rest.get(slash..)?;
-    if let Some(tail) = after.strip_prefix("/mcp")
-        && (tail.is_empty() || tail.starts_with('/') || tail.starts_with('?'))
-    {
-        return Some((cred_id, tail));
+    let tail = after.strip_prefix("/mcp")?;
+    if !(tail.is_empty() || tail.starts_with('/') || tail.starts_with('?')) {
+        return None;
     }
-    None
+    let path_part = tail.split('?').next().unwrap_or("");
+    if !is_safe_relay_subpath(path_part) {
+        return None;
+    }
+    Some((cred_id, tail))
+}
+
+fn is_safe_relay_subpath(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    if path.contains("//") || path.contains('\\') {
+        return false;
+    }
+    for seg in path.trim_start_matches('/').split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg == "." || seg == ".." {
+            return false;
+        }
+        let Some(decoded) = percent_decode_segment(seg) else {
+            return false;
+        };
+        if decoded == "."
+            || decoded == ".."
+            || decoded.contains('/')
+            || decoded.contains('\\')
+            || decoded.contains('\0')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn percent_decode_segment(seg: &str) -> Option<String> {
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'%') {
+            let hi = hex_nibble(*bytes.get(i + 1)?)?;
+            let lo = hex_nibble(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else if let Some(&b) = bytes.get(i) {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn combine_upstream_url(base: &str, suffix_and_query: &str) -> String {
     if suffix_and_query.is_empty() {
         return base.to_owned();
     }
-    if suffix_and_query.starts_with('?') {
-        if base.contains('?') {
-            let trimmed = suffix_and_query.trim_start_matches('?');
-            format!("{base}&{trimmed}")
-        } else {
-            format!("{base}{suffix_and_query}")
-        }
+    let (base_path, base_query) = match base.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base, None),
+    };
+    let (sub_path, sub_query) = match suffix_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (suffix_and_query, None),
+    };
+    let mut url = if sub_path.is_empty() {
+        base_path.to_owned()
     } else {
-        format!("{}{suffix_and_query}", base.trim_end_matches('/'))
+        format!("{}{sub_path}", base_path.trim_end_matches('/'))
+    };
+    match (base_query, sub_query) {
+        (Some(bq), Some(sq)) if !bq.is_empty() && !sq.is_empty() => {
+            url.push('?');
+            url.push_str(bq);
+            url.push('&');
+            url.push_str(sq);
+        }
+        (Some(bq), _) if !bq.is_empty() => {
+            url.push('?');
+            url.push_str(bq);
+        }
+        (_, Some(sq)) if !sq.is_empty() => {
+            url.push('?');
+            url.push_str(sq);
+        }
+        _ => {}
     }
+    url
 }
 
 fn extract_bearer_token(headers: &[(String, String)]) -> Option<&str> {
@@ -2036,6 +2177,148 @@ mod tests {
 
         up_stop.store(true, Ordering::Release);
         up_thread.join().ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relay_blocks_path_traversal_merges_queries_and_isolates_cred_ids() {
+        // MB-14: Reject traversal, encoded separators, double slashes, backslashes, bad escapes, fragments.
+        assert_eq!(parse_relay_target("/bot-tools/abc/mcp"), Some(("abc", "")));
+        assert_eq!(
+            parse_relay_target("/bot-tools/abc/mcp/sse?cursor=1"),
+            Some(("abc", "/sse?cursor=1"))
+        );
+        assert!(parse_relay_target("/bot-tools/abc/mcp/../admin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/./secret").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/%2e%2e/admin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/%2E%2e/admin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/%2fadmin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/%5cadmin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/%00admin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp//admin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/\\admin").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/%ZZ").is_none());
+        assert!(parse_relay_target("/bot-tools/abc/mcp/sub#frag").is_none());
+
+        // MB-14: Combine upstream base URL containing query string with sub-path + sub-query.
+        assert_eq!(
+            combine_upstream_url("https://api.example.com/mcp?tenant=1", "/sse?stream=true"),
+            "https://api.example.com/mcp/sse?tenant=1&stream=true"
+        );
+        assert_eq!(
+            combine_upstream_url("https://api.example.com/mcp?tenant=1", "/messages"),
+            "https://api.example.com/mcp/messages?tenant=1"
+        );
+        assert_eq!(
+            combine_upstream_url("https://api.example.com/mcp?tenant=1", "?a=2"),
+            "https://api.example.com/mcp?tenant=1&a=2"
+        );
+
+        // MB-15: Previously colliding `(bot_id, tool_id)` pairs must produce distinct `cred_id`s.
+        let b1 = BotId::new("a").unwrap();
+        let b2 = BotId::new("a-b").unwrap();
+        assert_ne!(make_cred_id(&b1, "b-c"), make_cred_id(&b2, "c"));
+        let b3 = BotId::new("bot-1").unwrap();
+        assert_ne!(make_cred_id(&b3, "foo:bar"), make_cred_id(&b3, "foo_bar"));
+    }
+
+    #[test]
+    fn r2m05_r2m15_composio_route_isolation_and_header_trimming() {
+        let dir = temp_dir("r2m05-15");
+        let secrets = Arc::new(SecretVault::with_static_key(dir.clone(), [0x55; 32]));
+        let relay = BotToolRelay::new(secrets);
+        let bot_id = BotId::new("bot-comp").unwrap();
+
+        // R2M-05: Custom MCP tool named "composio" has a distinct cred_id from Composio Tool Router.
+        assert_ne!(
+            make_composio_cred_id(&bot_id),
+            make_cred_id(&bot_id, "composio")
+        );
+
+        let mut bot = BotConfig::new(bot_id.clone(), "CompBot", "claude", 1_000).unwrap();
+        bot.connectors.composio.enabled = true;
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "composio".to_owned(),
+            name: "Custom Composio".to_owned(),
+            endpoint_url: Some("https://custom.example.com/mcp".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["x-api-key".to_owned()],
+            secret_ref: None,
+            enabled: true,
+        });
+        bot.mcp_tools.push(BotMcpToolConfig {
+            id: "composio-docs".to_owned(),
+            name: "Composio Docs".to_owned(),
+            endpoint_url: Some("https://docs.example.com/mcp".to_owned()),
+            command: Vec::new(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["x-api-key".to_owned()],
+            secret_ref: None,
+            enabled: true,
+        });
+
+        let comp_cred = make_composio_cred_id(&bot_id);
+        relay.register_route(ToolRoute {
+            cred_id: comp_cred.clone(),
+            bot_id: bot_id.clone(),
+            tool_id: "composio".to_owned(),
+            kind: RouteKind::Composio,
+            name: "Composio MCP".to_owned(),
+            upstream_url: "https://backend.composio.dev/mcp".to_owned(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["x-api-key".to_owned()],
+            secret_ref: None,
+            fallback_secret_key: "composio_api_key".to_owned(),
+        });
+
+        let grant1 = relay.prepare_launch_for_bot(&bot).unwrap().unwrap();
+        assert!(grant1.cred_ids.contains(&comp_cred));
+        assert!(grant1.cred_ids.contains(&make_cred_id(&bot_id, "composio")));
+        assert!(
+            grant1
+                .cred_ids
+                .contains(&make_cred_id(&bot_id, "composio-docs"))
+        );
+
+        // Disable both custom composio* MCP tools -> their routes MUST be removed while real Composio remains.
+        for tool in &mut bot.mcp_tools {
+            tool.enabled = false;
+        }
+        let grant2 = relay.prepare_launch_for_bot(&bot).unwrap().unwrap();
+        assert_eq!(grant2.cred_ids, vec![comp_cred.clone()]);
+
+        // Disable Composio connector -> Composio route is pruned too and relay stops when unused.
+        bot.connectors.composio.enabled = false;
+        let grant3 = relay.prepare_launch_for_bot(&bot).unwrap();
+        assert!(grant3.is_none());
+        assert!(lock(&relay.state).routes.is_empty());
+
+        // R2M-15: inject_auth_header trims whitespace and skips blank leading entries.
+        let route = ToolRoute {
+            cred_id: "c1".to_owned(),
+            bot_id,
+            tool_id: "t1".to_owned(),
+            kind: RouteKind::McpTool,
+            name: "T1".to_owned(),
+            upstream_url: "https://example.com/mcp".to_owned(),
+            auth_kind: BotMcpAuthKind::BearerHeader,
+            header_names: vec!["   ".to_owned(), "  x-api-key  ".to_owned()],
+            secret_ref: None,
+            fallback_secret_key: "mcp:t1".to_owned(),
+        };
+        let mut headers = vec![("X-API-KEY".to_owned(), "spoofed".to_owned())];
+        inject_auth_header(
+            &mut headers,
+            &route,
+            &Zeroizing::new(" real-key ".to_owned()),
+        );
+        assert_eq!(
+            headers,
+            vec![("x-api-key".to_owned(), "real-key".to_owned())]
+        );
+
+        relay.shutdown();
         fs::remove_dir_all(&dir).ok();
     }
 }

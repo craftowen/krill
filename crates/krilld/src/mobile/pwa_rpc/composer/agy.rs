@@ -677,6 +677,11 @@ pub(super) fn launch_models(context: &Context) -> BotAgentModels {
 
 pub(super) struct Agy;
 
+fn agy_effort_supported(supported: bool, family: Option<&Family>, effort: Option<&str>) -> bool {
+    supported
+        && (family.is_none_or(|f| f.levels.iter().any(|l| l.effort.is_some())) || effort.is_some())
+}
+
 impl Adapter for Agy {
     fn catalog(&self, context: &Context) -> Value {
         let (families, failure) = cached(context);
@@ -842,9 +847,7 @@ impl Adapter for Agy {
             .iter()
             .flat_map(|families| families.iter())
             .find(|family| family.label == label);
-        let effort_supported = supported
-            && family.is_none_or(|f| f.levels.iter().any(|l| l.effort.is_some()))
-            || effort.is_some();
+        let effort_supported = agy_effort_supported(supported, family, effort.as_deref());
         if let Some(family) = family {
             observe_live_model(status, &family.id);
         }

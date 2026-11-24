@@ -643,8 +643,14 @@ impl GroupCoordinator {
 
         let mut replaced_placeholders = Vec::new();
         data.turns.retain(|t| {
-            let replacing =
+            let same_slot =
                 t.group_id == group_id && t.thread_id == thread_id && t.bot_id == bot.id;
+            // Preserve queued/in-flight turns belonging to the SAME session with a distinct
+            // monotonic `turn_seq` so burst group messages queued in `BotRuntime` do not evict
+            // earlier placeholders before their replies finish (MB-03).
+            let keep_distinct_queued_turn = t.session_id == session_id
+                && matches!((t.turn_seq, turn_seq), (Some(existing), Some(incoming)) if existing != incoming);
+            let replacing = same_slot && !keep_distinct_queued_turn;
             if replacing {
                 replaced_placeholders.push(t.placeholder_message_id.clone());
             }
@@ -745,8 +751,8 @@ impl GroupCoordinator {
     }
 
     /// Relays a finished bot turn's output into a matching active group chat turn, enforcing
-    /// `turn_seq` correlation when both sides supply a sequence number so an earlier non-group
-    /// turn cannot hijack or leak into a later group placeholder.
+    /// `turn_seq` correlation so an earlier non-group or untracked (`None`) completion cannot
+    /// hijack or delete a sequence-tagged (`Some(n)`) group placeholder (R4D-02).
     pub(crate) fn on_bot_turn_finished_seq(
         &self,
         bot_id: &BotId,
@@ -767,7 +773,8 @@ impl GroupCoordinator {
                 && t.session_id == session_id
                 && match (t.turn_seq, turn_seq) {
                     (Some(expected), Some(actual)) => expected == actual,
-                    _ => true,
+                    (None, _) => true,
+                    (Some(_), None) => false,
                 }
         }) else {
             return Ok(None);
@@ -1432,7 +1439,17 @@ mod tests {
         assert_eq!(self_plan.target_bots.len(), 1);
         assert_eq!(self_plan.target_bots[0].id, bob.id);
 
-        // D-07(c): replacing an active turn removes the old empty placeholder.
+        // D-07(c): replacing an active turn from a DIFFERENT session removes the old empty placeholder.
+        groups
+            .record_turn_started_seq(
+                &grp_both.id,
+                &self_plan.thread.thread_id,
+                &bob,
+                SessionId(300),
+                Some(1),
+                2_515,
+            )
+            .unwrap();
         groups
             .record_turn_started_seq(
                 &grp_both.id,
@@ -1443,6 +1460,26 @@ mod tests {
                 2_520,
             )
             .unwrap();
+        let room_after_session_replace = groups
+            .read_group_room(
+                &store,
+                &grp_both.id,
+                Some(&self_plan.thread.thread_id),
+                None,
+                Some(50),
+            )
+            .unwrap();
+        assert_eq!(
+            room_after_session_replace
+                .messages
+                .iter()
+                .filter(|m| m.in_progress)
+                .count(),
+            1
+        );
+
+        // MB-03: queuing a second distinct `turn_seq` on the SAME session preserves BOTH
+        // placeholders and delivers BOTH replies cleanly without dropping turn 1.
         groups
             .record_turn_started_seq(
                 &grp_both.id,
@@ -1453,7 +1490,7 @@ mod tests {
                 2_530,
             )
             .unwrap();
-        let room_replaced = groups
+        let room_queued = groups
             .read_group_room(
                 &store,
                 &grp_both.id,
@@ -1462,14 +1499,21 @@ mod tests {
                 Some(50),
             )
             .unwrap();
-        let in_prog_count = room_replaced
+        let in_prog_count = room_queued
             .messages
             .iter()
             .filter(|m| m.in_progress)
             .count();
-        assert_eq!(in_prog_count, 1);
+        assert_eq!(in_prog_count, 2);
 
-        // D-07(b): empty reply cleans active turn and placeholder.
+        let reply1 = groups
+            .on_bot_turn_finished_seq(&bob.id, SessionId(301), Some(1), "First burst reply", 2_535)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply1.body, "First burst reply");
+        assert!(!reply1.in_progress);
+
+        // D-07(b): empty reply cleans remaining active turn and placeholder.
         groups
             .on_bot_turn_finished_seq(&bob.id, SessionId(301), Some(2), "", 2_540)
             .unwrap();
@@ -1482,10 +1526,179 @@ mod tests {
             )
             .unwrap();
         assert!(!view_clean.active_run);
+        assert!(
+            view_clean
+                .messages
+                .iter()
+                .any(|m| m.body == "First burst reply" && !m.in_progress)
+        );
         groups.prune_audience_for_updated_group(&updated);
         let summaries = groups.list_group_summaries(&store).unwrap();
         let summary3 = summaries.iter().find(|s| s.group.id == grp3.id).unwrap();
         assert_eq!(summary3.reply_audience, BotGroupReplyAudience::Mentions);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn r4d_02_untracked_completion_cannot_hijack_seq_tagged_group_turn() {
+        let root = temp_dir("r4d-02");
+        let store = BotStore::new(root.clone());
+        let groups = GroupCoordinator::new(root.clone());
+
+        let alice = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Alice Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        let grp = store
+            .create_group("Burst Room", vec![alice.id.clone()], String::new(), 1_000)
+            .unwrap();
+        let plan = groups
+            .prepare_message_dispatch(
+                &store,
+                &grp.id,
+                None,
+                "owner",
+                "Check burst turn",
+                Some(BotGroupReplyMode::All),
+                1_010,
+            )
+            .unwrap();
+
+        // Register a queued seq-tagged group turn (`turn_seq = Some(2)`).
+        groups
+            .record_turn_started_seq(
+                &grp.id,
+                &plan.thread.thread_id,
+                &alice,
+                SessionId(401),
+                Some(2),
+                1_020,
+            )
+            .unwrap();
+
+        // An untracked (`None`) completion — non-empty OR empty — must NOT hijack or delete
+        // the `Some(2)` placeholder.
+        assert!(
+            groups
+                .on_bot_turn_finished_seq(
+                    &alice.id,
+                    SessionId(401),
+                    None,
+                    "Spurious untracked output",
+                    1_030,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            groups
+                .on_bot_turn_finished_seq(&alice.id, SessionId(401), None, "", 1_035)
+                .unwrap()
+                .is_none()
+        );
+
+        let room_mid = groups
+            .read_group_room(
+                &store,
+                &grp.id,
+                Some(&plan.thread.thread_id),
+                None,
+                Some(50),
+            )
+            .unwrap();
+        assert_eq!(room_mid.active_turns.len(), 1);
+        assert!(
+            room_mid
+                .messages
+                .iter()
+                .any(|m| m.sender_id == alice.id.as_str() && m.in_progress),
+            "R4D-02: queued Some(2) placeholder must remain in_progress after None completions"
+        );
+        assert!(
+            room_mid
+                .messages
+                .iter()
+                .all(|m| !m.body.contains("Spurious untracked output"))
+        );
+
+        // Real completion with `Some(2)` fills and completes the placeholder cleanly.
+        let real = groups
+            .on_bot_turn_finished_seq(
+                &alice.id,
+                SessionId(401),
+                Some(2),
+                "Real queued turn 2 reply",
+                1_040,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(real.body, "Real queued turn 2 reply");
+        assert!(!real.in_progress);
+        let view_done = groups
+            .read_group(&store, &grp.id, Some(&plan.thread.thread_id), Some(50))
+            .unwrap();
+        assert!(!view_done.active_run);
+
+        // Legacy untracked turns (`t.turn_seq = None`) still complete cleanly for both `None`
+        // and `Some(n)` completions.
+        groups
+            .record_turn_started(
+                &grp.id,
+                &plan.thread.thread_id,
+                &alice,
+                SessionId(402),
+                1_050,
+            )
+            .unwrap();
+        let legacy_none = groups
+            .on_bot_turn_finished_seq(
+                &alice.id,
+                SessionId(402),
+                None,
+                "Legacy untracked reply",
+                1_060,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_none.body, "Legacy untracked reply");
+        assert!(!legacy_none.in_progress);
+
+        groups
+            .record_turn_started(
+                &grp.id,
+                &plan.thread.thread_id,
+                &alice,
+                SessionId(403),
+                1_070,
+            )
+            .unwrap();
+        let legacy_some = groups
+            .on_bot_turn_finished_seq(
+                &alice.id,
+                SessionId(403),
+                Some(7),
+                "Legacy with seq reply",
+                1_080,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_some.body, "Legacy with seq reply");
+        assert!(!legacy_some.in_progress);
 
         fs::remove_dir_all(&root).ok();
     }

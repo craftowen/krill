@@ -123,3 +123,12 @@ test('warm-cache icon allowlist preserves hex image hashes and Lucide names whil
  assert.equal(f.store.get('unrelated'),'keep');
  f.cache.close();
 });
+test('MB-31 & MB-57: activateEntrySilent bumps hostGeneration/clears expected, and updates.busy checks stopping and queuedPrompts',()=>{
+ const app=fs.readFileSync(path.join(assets,'app.js'),'utf8');
+ const silentLine=app.split('\n').find(l=>l.includes('function activateEntrySilent('));
+ assert(silentLine&&silentLine.includes('hostGeneration++')&&silentLine.includes('state.expected=new Map()'),'MB-31: activateEntrySilent bumps hostGeneration and clears state.expected');
+ const createLine=app.split('\n').find(l=>l.includes('return owner.rpc(request).then('));
+ assert(createLine&&createLine.includes('owner!==transport'),'MB-31: createSession checks owner!==transport');
+ const busyLine=app.split('\n').find(l=>l.includes('e.queuedPrompts?.length'));
+ assert(busyLine&&busyLine.includes('e.stopping')&&busyLine.includes('e.queuedPrompts?.length'),'MB-57: updates.busy checks stopping and queuedPrompts');
+});

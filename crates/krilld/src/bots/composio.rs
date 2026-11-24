@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::bots::http_client::{self, HttpMethod, HttpRequest, SsrfPolicy};
 use crate::bots::items::BotItemsStore;
 use crate::bots::secrets::SecretVault;
-use crate::bots::tool_relay::{BotToolRelay, ToolRoute, make_cred_id};
+use crate::bots::tool_relay::{BotToolRelay, RouteKind, ToolRoute, make_composio_cred_id};
 use crate::session::lock;
 
 /// Default Composio v3.1 API base URL.
@@ -199,7 +199,7 @@ pub fn cleanup_composio_bot(bot_id: &BotId, state_root: Option<&Path>, relay: &B
             krill_proto::os::write_atomic_0600(&path, &bytes).ok();
         }
     }
-    let cred = make_cred_id(bot_id, "composio");
+    let cred = make_composio_cred_id(bot_id);
     relay.unregister_route(&cred);
 }
 
@@ -252,11 +252,12 @@ pub fn resolve_and_register_composio_with_root(
     };
 
     save_persisted_session(state_root, &bot.id, session_rec.clone());
-    let cred_id = make_cred_id(&bot.id, "composio");
+    let cred_id = make_composio_cred_id(&bot.id);
     relay.register_route(ToolRoute {
         cred_id: cred_id.clone(),
         bot_id: bot.id.clone(),
         tool_id: "composio".to_owned(),
+        kind: RouteKind::Composio,
         name: "Composio MCP".to_owned(),
         upstream_url: session_rec.mcp_url.clone(),
         auth_kind: BotMcpAuthKind::BearerHeader,
@@ -640,8 +641,12 @@ pub fn poll_composio_triggers(
         if let Ok(item) = items.create_item(
             &CreateBotItemParams {
                 bot_id: bot.id.clone(),
-                title: format!("[Composio/{app_name}] {trigger_name}"),
-                description: payload_summary,
+                title: crate::bots::items::clamp_item_title(&format!(
+                    "[Composio/{app_name}] {trigger_name}"
+                )),
+                description: payload_summary
+                    .as_deref()
+                    .and_then(crate::bots::items::clamp_item_description),
                 done_means: None,
                 status: Some(BotItemStatus::Planned),
                 links: vec![link],
@@ -1008,5 +1013,63 @@ mod tests {
         seen.remove_bot(&bot_id);
         assert!(seen.set.is_empty());
         assert!(seen.order.is_empty());
+    }
+
+    #[test]
+    fn composio_poll_triggers_clamps_long_cjk_title_and_huge_payload() {
+        let dir = temp_dir("mb39-clamp");
+        let secrets = SecretVault::with_static_key(dir.clone(), [0x61; 32]);
+        let items = BotItemsStore::new(dir.join("items.db"));
+        let bot_id = BotId::new("bot-comp-clamp").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "Clamp", "claude", 1_000).unwrap();
+        bot.connectors.composio.enabled = true;
+        secrets
+            .set_secret(
+                &bot_id,
+                "composio_api_key",
+                Zeroizing::new("ck_1".to_owned()),
+            )
+            .unwrap();
+
+        let long_name = "트리거".repeat(45); // 405 bytes
+        let huge_payload = "내용".repeat(5_000); // 30,000 bytes
+        let body = serde_json::json!({
+            "items": [{
+                "id": "trig-mb39-big",
+                "trigger_name": long_name,
+                "appName": "notion",
+                "payload": { "text": huge_payload }
+            }]
+        })
+        .to_string();
+
+        let mock = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = mock.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = mock.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            assert!(n > 0);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let created =
+            poll_composio_triggers(&bot, &secrets, &items, &format!("http://{addr}"), 2_000)
+                .unwrap();
+        assert_eq!(created.len(), 1);
+        assert!(created[0].title.len() <= krill_proto::bots::BOT_ITEM_TITLE_MAX_BYTES);
+        assert!(
+            created[0]
+                .description
+                .as_deref()
+                .is_some_and(|d| d.len() <= krill_proto::bots::BOT_ITEM_DESCRIPTION_MAX_BYTES)
+        );
+
+        srv.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
     }
 }

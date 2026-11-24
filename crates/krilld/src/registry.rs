@@ -4144,6 +4144,17 @@ impl Registry {
         cvar.notify_all();
     }
 
+    /// Detaches a session from Krill Bot ownership (e.g. `TakeOverWorkspace`) so
+    /// future resumes treat it as a normal human-owned session.
+    pub(crate) fn release_bot_session(&self, id: SessionId) {
+        if let Err(error) = self.agents.clear_bot_instructions(id) {
+            tracing::warn!(
+                session = id.0,
+                kind = ?error.kind(),
+                "failed to clear bot instructions on workspace takeover"
+            );
+        }
+    }
     /// Returns the [`crate::bots::BotsManager`] only if already lazily initialized (zero side effects).
     pub fn bots_if_initialized(&self) -> Option<&Arc<crate::bots::BotsManager>> {
         self.bots.get()

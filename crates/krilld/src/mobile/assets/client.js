@@ -72,6 +72,7 @@
     return `${origin.protocol === "https:" ? "wss:" : "ws:"}//${origin.host}/ws`;
   }
   const validHostId = (value) => typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
+  const validHash = (value) => typeof value === "string" && /^[0-9a-f]{16}$/.test(value);
   function secureDirect(value) {
     if (typeof value !== "string") return null;
     try {
@@ -117,7 +118,7 @@
     });
     if (relay) {
       const u = new URL(relay.origin);
-      routes.push({ kind: "relay", url: `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}/r/${relay.rid}?v=${hash}` });
+      routes.push({ kind: "relay", url: `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}/r/${relay.rid}${validHash(hash) ? `?v=${hash}` : ""}` });
     }
     const direct = secureDirect(host.routes?.tailscale?.origin);
     if (direct) routes.push({ kind: "tailscale", url: directSocket(direct) });
@@ -216,8 +217,19 @@
       : [];
     let active = hosts.find((h) => h.id === book?.active) || hosts[0] || null;
     Array.isArray(book?.hosts) && (saved = active);
-    const hint = fragment.get("h") || fragment.get("r"),
-      hinted = hint && [...hosts, saved].some((host) => host && (host.host_id === hint || host.rid === fragment.get("r"))),
+    const fragR = fragment.get("r"),
+      fragValidR = validHostId(fragR),
+      hint = fragment.get("h") || (fragValidR ? fragR : null),
+      hinted = Boolean(
+        (hint || fragValidR) &&
+          [...hosts, saved].some(
+            (host) =>
+              host &&
+              ((hint && host.host_id === hint) ||
+                (fragValidR &&
+                  (host.rid === fragR || host.routes?.relay?.rid === fragR))),
+          ),
+      ),
       invalidDirect = fragment.has("d") && !secureDirect(fragment.get("d")),
       pair =
         ticket && secret && !invalidDirect && !hinted && !(fragment.has("install") && saved?.credential)
@@ -335,7 +347,7 @@
     let pairingDirect = pair ? secureDirect(fragment.get("d")) : null;
     let useRelay = pair ? validRid(rid) : prefersRelay(saved, rid);
     const relayUrl = () =>
-      `${new URL(credentials?.routes?.relay?.origin || credentials?.relay_origin || location.origin).origin.replace(/^http/, "ws")}/r/${rid}?v=${hash}`;
+      `${new URL(credentials?.routes?.relay?.origin || credentials?.relay_origin || location.origin).origin.replace(/^http/, "ws")}/r/${rid}${validHash(hash) ? `?v=${hash}` : ""}`;
     return (
       navigator.serviceWorker?.register("/sw.js").catch(() => {}),
       {
@@ -548,6 +560,8 @@
           clearRelayReturn();
           ((updatePending = !1),
             (pairingPending = !1),
+            (pairingDirect = null),
+            (replacementId = null),
             (active = host),
             (saved = credentials = host),
             (rid = host.rid),
@@ -640,6 +654,7 @@
           return (
             clearRelayReturn(),
             (pairingPending = !1),
+            (pairingDirect = null),
             (replacementId = null),
             (updatePending = !1),
             (credentials = saved),
@@ -717,6 +732,8 @@
                   secret: secret2,
                   use() {
                     ((pairingPending = !0),
+                      (pairingDirect = null),
+                      (replacementId = null),
                       (updatePending = !1),
                       (destinationFixed = !1),
                       (directOrigin = u.origin));
@@ -743,8 +760,13 @@
                 ? "This direct code cannot be opened here. Choose Relay server in desktop Settings \u2192 Mobile, then tap New QR code."
                 : NOT,
             );
-          const hint = f.get("h") || r,
-            existing = hosts.find((host) => host.host_id === hint || host.rid === r || host.routes?.relay?.rid === r);
+          const hint = f.get("h") || (validRid(r) ? r : null),
+            existing = hosts.find(
+              (host) =>
+                (hint && host.host_id === hint) ||
+                (validRid(r) &&
+                  (host.rid === r || host.routes?.relay?.rid === r)),
+            );
           const candidate = { rid: r, fixed: true, routes: d ? { tailscale: { origin: d } } : null };
           const route = d ? directSocket(d) : routeUrls(candidate, hash)[0]?.url;
           return {
@@ -814,7 +836,7 @@
             matching = daemonId && hosts.find((h) => h.host_id === daemonId),
             id = replacementId || (!pairingPending && active ? active.id : matching?.id) || hostId({ ...credentials, origin: directOrigin }),
             existing = hosts.find((h) => h.id === id);
-          if (pairingDirect && !patch.routes?.relay) {
+          if (pairingPending && pairingDirect && !patch.routes?.relay) {
             patch.rid = null;
             patch.relay_origin = null;
           }
@@ -830,7 +852,7 @@
               id,
               origin: directOrigin,
               fixed: destinationFixed,
-              ...(pairingDirect && { preferred_route: "tailscale", routes: { ...patch.routes, tailscale: { origin: pairingDirect } } }),
+              ...(pairingPending && pairingDirect && { preferred_route: "tailscale", routes: { ...patch.routes, tailscale: { origin: pairingDirect } } }),
               name: existing?.name || "Desktop",
             }),
             existing
@@ -848,7 +870,12 @@
           } catch {
             storageFailed = !0;
           }
-          return ((pairingPending = !1), credentials);
+          return (
+            (pairingPending = !1),
+            (pairingDirect = null),
+            (replacementId = null),
+            credentials
+          );
         },
         fallback(attempted) {
           if (credentials?.routes?.tailscale && credentials?.routes?.relay) {
@@ -1209,6 +1236,8 @@
           [
             "snapshot",
             "chat_poll",
+            "chat_subscribe",
+            "chat_unsubscribe",
             "chat_composer",
             "git",
             "accounts",
@@ -1223,6 +1252,7 @@
             "bots.models",
             "bots.upcoming",
             "bots.items",
+            "bots.sessions.list",
             "bots.access.list",
             "bots.connectors.status",
             "bots.groups.list",
