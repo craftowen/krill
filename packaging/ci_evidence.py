@@ -22,7 +22,11 @@ CHECKS = {
     "ci-windows.yml": {"check (MSVC)", "nextest (MSVC)", "release app (fxc shaders)"},
     "release.yml": {"build-windows"},
 }
-REUSE_JOBS = {"ci.yml": "reuse-hygiene-ci", "ci-macos.yml": "reuse-macos-ci"}
+REUSE_JOBS = {
+    "ci.yml": "reuse-hygiene-ci",
+    "ci-macos.yml": "reuse-macos-ci",
+    "ci-windows.yml": "reuse-windows-ci",
+}
 
 
 class EvidenceError(RuntimeError):

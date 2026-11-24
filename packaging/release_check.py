@@ -2,6 +2,7 @@
 """전체 로컬 게이트와 출고 바이너리 검증을 한 번 실행하고 서명된 증거를 남긴다."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -60,7 +61,12 @@ def target_directory(configured=None, volume=VOLUME):
 def fingerprint():
     names = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
              "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET")
-    flags = {key: value for key, value in os.environ.items() if key in names or key.startswith(("CARGO_PROFILE_", "CARGO_TARGET_"))}
+    flags = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "CARGO_TARGET_DIR"
+        and (key in names or key.startswith(("CARGO_PROFILE_", "CARGO_TARGET_")))
+    }
     config = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))) / "config.toml"
     flags["cargo-config-sha256"] = sha256(config) if config.is_file() else None
     return {"rustc": subprocess.check_output(["rustc", "-Vv"], text=True).strip(),
@@ -110,10 +116,17 @@ def verify(receipt, head, key_file, allowed_root=VOLUME, expected_fingerprint=No
     return directory
 
 
-def run(args, capture=False, timeout=14400):
+def strip_cargo_target_env(env=None):
+    """Return an environment without CARGO_TARGET_DIR so sccache cache keys stay stable."""
+    cleaned = dict(os.environ if env is None else env)
+    cleaned.pop("CARGO_TARGET_DIR", None)
+    return cleaned
+
+
+def run(args, capture=False, timeout=14400, env=None):
     print("$ " + " ".join(map(str, args)), file=sys.stderr, flush=True)
     result = subprocess.run(list(map(str, args)), stdout=subprocess.PIPE if capture else None,
-                            text=True, timeout=timeout, check=True)
+                            text=True, timeout=timeout, check=True, env=env)
     return result.stdout or ""
 
 
@@ -136,9 +149,14 @@ def verify_bundle(receipt, head, key_file, bundle):
                 raise ValueError(f"signed bundle differs from the tested binary: {name}")
 
 
-def test_executable(package, target):
-    output = run(["cargo", "test", "--release", "--locked", "-p", package, "--test", target,
-                  "--no-run", "--message-format=json"], capture=True)
+def test_executable(package, target, target_dir=None):
+    command = ["cargo", "test", "--release", "--locked", "-p", package, "--test", target,
+               "--no-run", "--message-format=json"]
+    kwargs = {"capture": True}
+    if target_dir is not None:
+        command.extend(("--target-dir", str(target_dir)))
+        kwargs["env"] = strip_cargo_target_env()
+    output = run(command, **kwargs)
     executables = []
     for line in output.splitlines():
         item = json.loads(line)
@@ -154,9 +172,12 @@ def test_executable(package, target):
 MOBILE_BROWSER_TESTS = (("mobile_live_browser.py", "--browser-only"), ("mobile_responsive_browser.py",), ("mobile_hosts_browser.py",),
                         ("mobile_terminal_input_browser.py",), ("mobile_browser.py", "--address", "127.0.0.1:0"),
                         ("chat_scroll_browser.cjs",), ("mobile_scroll_browser.cjs",), ("mobile_terminal_scroll_browser.cjs",))
+# Every script in MOBILE_BROWSER_TESTS binds ephemeral 127.0.0.1:0 ports, uses its own
+# PID-scoped agent-browser session and temp/evidence directory, so 3 concurrent suites are safe.
+MOBILE_BROWSER_JOBS = 3
 
 
-def mobile_browser_gate(release):
+def mobile_browser_gate(release, max_workers=MOBILE_BROWSER_JOBS):
     """출고 바이너리를 실제 Chromium 모바일 PWA에 붙여 본다. v0.2.25·v0.2.26은 화면 업데이트 후행 바이트를 모바일
     디코더가 거부해 'Trailing screen data'로 터미널이 안 뜬 채 출고됐다(이 테스트들이 어떤 게이트에도 없었다)."""
     env = {"KRILLD_BIN": release / "krilld", "KRILL_BIN": release / "krill", "KRILL_MOBILE_TEST_BIN": release,
@@ -164,19 +185,33 @@ def mobile_browser_gate(release):
     previous = {key: os.environ.get(key) for key in env}
     os.environ.update({key: str(value) for key, value in env.items()})
     try:
-        for script, *arguments in MOBILE_BROWSER_TESTS:
-            interpreter = "node" if script.endswith(".cjs") else "python3"
-            run([interpreter, ROOT / "crates/krilld/tests" / script, *arguments], timeout=1800)
+        commands = [(("node" if script.endswith(".cjs") else "python3"), ROOT / "crates/krilld/tests" / script, *arguments)
+                    for script, *arguments in MOBILE_BROWSER_TESTS]
+        workers = max(1, min(int(max_workers), len(commands)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(run, list(command), timeout=1800) for command in commands]
+            first_error = None
+            for future in futures:
+                try:
+                    future.result()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
     finally:
         for key, value in previous.items():
             os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
 
 
-def validate(head, directory, key_file):
+def validate(head, directory, key_file, target_dir=None):
     directory = Path(directory)
     if VOLUME not in directory.resolve().parents or directory.exists():
         raise ValueError("release staging must be a fresh directory on the external volume")
-    target = Path(os.environ["CARGO_TARGET_DIR"]).resolve()
+    raw_target = target_dir if target_dir is not None else os.environ.get("CARGO_TARGET_DIR")
+    if not raw_target:
+        raise ValueError("release validation target directory is required (--target-dir or CARGO_TARGET_DIR)")
+    target = Path(raw_target).resolve()
     if TARGETS not in target.parents or not os.path.ismount(VOLUME):
         raise ValueError("all release validation targets must stay on the external volume")
     if run(["git", "rev-parse", "HEAD"], capture=True).strip() != head:
@@ -184,26 +219,27 @@ def validate(head, directory, key_file):
     if run(["git", "status", "--porcelain"], capture=True).strip():
         raise ValueError("release validation requires a clean tracked and untracked source tree")
     run(["git", "diff", "--exit-code", "HEAD"])
+    cargo_env = strip_cargo_target_env()
     # 전체 check.sh는 최종 후보에서 한 번만. 메모리 검사는 아래에서 출고 바이너리에 직접 실행한다.
     checkpoint = directory.parent / f"{head}-full-check.json"
     if checkpoint.exists():
         attestation(json.loads(checkpoint.read_text()), head, key_file, ("scripts/check.sh",))
         print("Reusing signed full-check checkpoint for the same SHA and toolchain.", file=sys.stderr)
     else:
-        run(["/bin/zsh", "scripts/check.sh"])
+        run(["/bin/zsh", "scripts/check.sh", "--target-dir", str(target)], env=cargo_env)
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_text(json.dumps(sign({"schema": SCHEMA, "head": head, "scope": ["scripts/check.sh"],
                                               "fingerprint": fingerprint(), "passed_at": datetime.now(timezone.utc).isoformat()}, key_file)))
         checkpoint.chmod(0o600)
-    run(["/bin/bash", "scripts/check-windows.sh", "--clippy", "--target-dir", TARGETS / "nightly-windows"], timeout=7200)
-    pane = test_executable("krill-app", "pane_e2e")
-    fault = test_executable("krilld", "fault_ci")
-    holder = test_executable("krill-holder", "survive")
+    run(["/bin/bash", "scripts/check-windows.sh", "--clippy", "--target-dir", TARGETS / "nightly-windows"], timeout=7200, env=cargo_env)
+    pane = test_executable("krill-app", "pane_e2e", target_dir=target)
+    fault = test_executable("krilld", "fault_ci", target_dir=target)
+    holder = test_executable("krill-holder", "survive", target_dir=target)
     # 테스트 컴파일 뒤 최종 출고 프로필을 만든다. 이후 게이트는 Cargo 재빌드 없이 실행한다.
-    build = ["cargo", "build", "--release", "--locked", "--bins"]
+    build = ["cargo", "build", "--release", "--locked", "--bins", "--target-dir", str(target)]
     for package in BINARIES:
         build.extend(("-p", package))
-    run(build)
+    run(build, env=cargo_env)
     before = {name: sha256(target / "release" / name) for name in BINARIES}
     gates = ([pane, "release_survival::release_app_kill9_survives_and_replays_hash_three_times", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
              [fault, "release_gui_survival_e2e_2_and_3_three_rounds", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
@@ -249,6 +285,7 @@ def main():
     parser.add_argument("--key-file", type=Path)
     parser.add_argument("--base")
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--target-dir", type=Path)
     args = parser.parse_args()
     if args.action == "target-dir":
         print(target_directory(args.base))
@@ -260,7 +297,7 @@ def main():
         else:
             print(verify(args.receipt, args.head, args.key_file))
     else:
-        print(validate(args.head, args.directory, args.key_file))
+        print(validate(args.head, args.directory, args.key_file, target_dir=args.target_dir))
 
 
 if __name__ == "__main__":

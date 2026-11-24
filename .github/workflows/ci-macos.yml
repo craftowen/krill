@@ -4,13 +4,14 @@
 # 문서만 바뀐 PR에서 워크플로 자체가 안 떠 required check가 영원히 대기하므로,
 # 항상 뜨는 `changes` 잡(ubuntu)이 git diff로 판단하고 고정 이름 `ci-macos` 잡이 결과를 모은다.
 # branch protection의 required check에는 `ci-macos`만 건다(matrix 잡 이름은 skip 시 펼쳐지지 않는다).
+# dev push는 경량 스모크(cargo check)와 의존성 캐시 워밍을 실행해 dev 대상 PR의 캐시 히트를 보장하고
+# PR 간 의미 충돌을 머지 직후 즉시 탐지한다. 전체 CI는 PR·야간 후보·main에서 실행한다.
 # 저장소 검사는 ci.yml, 제품 전체·네이티브 패키징 검사는 이 워크플로가 담당한다.
 name: ci-macos
 
 on:
   push:
-    # dev push는 개발 중 부분 검사로 진행한다. 전체 CI는 야간 후보·main·PR에만 실행한다.
-    branches: [main, 'release/**']
+    branches: [dev, main, 'release/**']
   pull_request:
   workflow_dispatch:
 
@@ -34,7 +35,7 @@ jobs:
     outputs:
       reuse: ${{ steps.proof.outputs.reuse }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: proof
@@ -90,10 +91,67 @@ jobs:
             echo "rust=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # dev 머지 직후 경량 컴파일 스모크로 PR 간 의미 충돌을 즉시 잡고,
+  # refs/heads/dev 스코프에 macOS 의존성 캐시를 유지해 dev 대상 PR의 콜드 빌드를 방지한다.
+  dev-smoke:
+    name: smoke & cache warm (macos-15)
+    needs: [changes, reuse]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.changes.outputs.rust == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: 2
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust 1.98 + clippy
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+
+      - name: nextest
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+
+      - name: Stage cacheable vendored dependencies
+        id: vendor
+        run: |
+          python3 packaging/vendor_cache.py stage --case producer \
+            --cargo-home "$CARGO_HOME" --vendor-root /tmp/krill-ci-vendor \
+            --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Restore and warm Rust dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
+          shared-key: ci-macos-15
+          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
+          cache-bin: 'false'
+          cache-on-failure: true
+          save-if: 'true'
+
+      - name: Verify restored vendor and external configuration
+        run: python3 packaging/vendor_cache.py verify --directory "$RUNNER_TEMP/vendor-cache"
+
+      - name: Smoke check workspace
+        run: cargo check --workspace --all-targets --locked
+        timeout-minutes: 30
+
+      - name: Warm opt-level=2 test dependency cache when key missed
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --no-run
+        timeout-minutes: 75
+
   packaging:
     name: packaging regressions (macos-15)
     needs: [changes, reuse]
-    if: needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
+    if: (github.event_name != 'push' || github.ref != 'refs/heads/dev') && needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -108,7 +166,7 @@ jobs:
   check:
     name: clippy · nextest (${{ matrix.os }})
     needs: [changes, reuse]
-    if: needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
+    if: (github.event_name != 'push' || github.ref != 'refs/heads/dev') && needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -142,25 +200,6 @@ jobs:
           python3 packaging/vendor_cache.py stage --case producer \
             --cargo-home "$CARGO_HOME" --vendor-root /tmp/krill-ci-vendor \
             --directory "$RUNNER_TEMP/vendor-cache"
-
-      - name: Find current vendor dependency cache
-        id: vendor-cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with:
-          prefix-key: v1-vendor-${{ steps.vendor.outputs.vendor-hash }}-${{ steps.vendor.outputs.sdk }}-${{ steps.vendor.outputs.image }}-${{ hashFiles('packaging/vendor_cache.py') }}
-          shared-key: ci-${{ matrix.os }}
-          cache-directories: ${{ steps.vendor.outputs.vendor-directory }}
-          cache-bin: 'false'
-          lookup-only: 'true'
-          save-if: 'false'
-
-      - name: Seed dependencies from the legacy cache when migrating
-        if: steps.vendor-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with:
-          shared-key: ci-${{ matrix.os }}
-          cache-bin: 'false'
-          save-if: 'false'
 
       - name: Restore Rust dependencies
         id: cache
@@ -200,10 +239,30 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # required check용 고정 이름 잡. 두 macOS 잡의 성공 또는 의도된 생략만 허용한다.
+  # 새 캐시 저장 후 구버전 중복 캐시를 정리해 저장소 10 GiB 한도 초과로 인한 축출을 막는다.
+  prune-caches:
+    name: prune stale caches
+    needs: [check, dev-smoke]
+    if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/release/nightly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prune superseded Rust caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/ci_cache_prune.py
+
+  # required check용 고정 이름 잡. macOS 잡들의 성공 또는 의도된 생략만 허용한다.
   ci-macos:
     name: ci-macos
-    needs: [changes, check, packaging, reuse]
+    needs: [changes, check, packaging, dev-smoke, reuse]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -213,19 +272,28 @@ jobs:
           CHANGES: ${{ needs.changes.result }}
           CHECK: ${{ needs.check.result }}
           PACKAGING: ${{ needs.packaging.result }}
+          DEV_SMOKE: ${{ needs.dev-smoke.result }}
+          DEV_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
           PROOF: ${{ needs.reuse.result }}
           REUSED: ${{ needs.reuse.outputs.reuse }}
           RUST_CHANGED: ${{ needs.changes.outputs.rust }}
         run: |
-          echo "changes=$CHANGES check=$CHECK packaging=$PACKAGING proof=$PROOF reuse=$REUSED rust=$RUST_CHANGED"
+          echo "changes=$CHANGES check=$CHECK packaging=$PACKAGING dev_smoke=$DEV_SMOKE dev_push=$DEV_PUSH proof=$PROOF reuse=$REUSED rust=$RUST_CHANGED"
           [ "$CHANGES" = success ]
           [ "$PROOF" = success ]
-          case "$REUSED:$RUST_CHANGED" in
-            true:true|true:false|false:false)
+          case "$DEV_PUSH:$REUSED:$RUST_CHANGED" in
+            true:false:true)
+              [ "$DEV_SMOKE" = success ]
               [ "$CHECK" = skipped ]
               [ "$PACKAGING" = skipped ]
               ;;
-            false:true)
+            true:false:false|false:true:true|false:true:false|false:false:false)
+              [ "$DEV_SMOKE" = skipped ]
+              [ "$CHECK" = skipped ]
+              [ "$PACKAGING" = skipped ]
+              ;;
+            false:false:true)
+              [ "$DEV_SMOKE" = skipped ]
               [ "$CHECK" = success ]
               [ "$PACKAGING" = success ]
               ;;

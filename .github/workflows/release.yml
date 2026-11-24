@@ -248,19 +248,24 @@ jobs:
 
       - name: Verify native Windows audit regressions
         shell: powershell
-        # 19~24분 걸려 25분 제한에 걸린 적 있다(v0.3.5). 잡 전체 90분 안에 들어간다.
-        timeout-minutes: 45
+        # 출고 바이너리(target\release\*.exe, lto=thin/cgu=1)와 캐시는 건드리지 않고 격리 타깃에서
+        # 빠른 테스트 프로필(LTO=off, cgu=16, opt-level=0)로 필수 8건의 +crt-static 회귀만 컴파일·실행한다.
+        timeout-minutes: 30
         env:
           KRILL_STATE_DIR: ${{ runner.temp }}/krill-audit-native
           KRILL_LOG_DIR: ${{ runner.temp }}/krill-audit-native/logs
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: '0'
+          CARGO_PROFILE_RELEASE_LTO: 'off'
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
         run: |
           $ErrorActionPreference = 'Stop'
           $gitShell = & git var GIT_SHELL_PATH
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitShell)) { throw 'Native precheck regression requires Git for Windows sh' }
           if (-not (Test-Path -LiteralPath $gitShell.Trim() -PathType Leaf)) { throw 'Git for Windows sh is missing' }
+          $auditTarget = Join-Path $env:RUNNER_TEMP 'krill-audit-target'
           function Test-KrillNative {
             param([string]$Package, [string[]]$TargetArgs, [string]$TestName)
-            $testArgs = @('test', '--release', '--locked', '-p', $Package) + $TargetArgs + @($TestName, '--', '--exact')
+            $testArgs = @('test', '--release', '--locked', '--target-dir', $auditTarget, '-p', $Package) + $TargetArgs + @($TestName, '--', '--exact')
             $inventory = & cargo @testArgs --list
             if ($LASTEXITCODE -ne 0) { throw "Native test inventory failed: $Package $TestName" }
             if ($inventory -notcontains ($TestName + ': test')) { throw "Required native regression is missing: $Package $TestName" }

@@ -1,11 +1,12 @@
 # Windows 네이티브 검사: check, 릴리스 앱 빌드, 워크스페이스 nextest.
 # 2026-11-04 Windows 실기에서 처음 돌린 nextest가 8건 실패했다(그 전까지 Windows 테스트를 한 번도 돌리지 않음).
-# 같은 회귀가 쌓이지 않게 PR·main·release push마다 실행한다(공개 저장소라 러너 비용 없음).
+# 같은 회귀가 쌓이지 않게 PR·dev·main·release push마다 실행한다(공개 저장소라 러너 비용 없음).
+# main push는 release/** 동일 SHA 검증 증거가 있으면 reuse-windows-ci로 중복 실행을 건너뛴다.
 name: ci-windows
 
 on:
   push:
-    branches: [main, 'release/**']
+    branches: [dev, main, 'release/**']
   pull_request:
   workflow_dispatch:
 
@@ -20,8 +21,28 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  reuse:
+    name: reuse-windows-ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: proof
+        name: Verify same-SHA candidate validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/ci_evidence.py reuse --workflow ci-windows.yml
+
   check:
     name: check (MSVC)
+    needs: reuse
+    if: needs.reuse.outputs.reuse != 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -36,12 +57,22 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.98"
+
+      # nextest(dev 프로필)와 동일한 의존성 캐시를 읽기 전용으로 재사용해 추가 캐시 용량을 쓰지 않는다.
+      - name: Restore check dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-windows-test
+          cache-bin: 'false'
+          save-if: 'false'
 
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked
 
   build:
     name: release app (fxc shaders)
+    needs: reuse
+    if: needs.reuse.outputs.reuse != 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -57,11 +88,39 @@ jobs:
         with:
           toolchain: "1.98"
 
+      # dev 대상 PR·dev push는 fxc 셰이더·release 경로 검증을 유지하면서 LTO=off·codegen-units=16으로 단축한다.
+      # main·release/** push 및 기타 이벤트는 Cargo.toml의 풀 프로필(lto=thin, codegen-units=1)로 검증한다.
+      - name: Configure release build profile
+        id: profile
+        shell: bash
+        env:
+          FAST_RELEASE: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') || (github.event_name == 'push' && github.ref == 'refs/heads/dev') }}
+        run: |
+          if [ "$FAST_RELEASE" = "true" ]; then
+            echo "cache_key=ci-windows-release-fast" >> "$GITHUB_OUTPUT"
+            echo "CARGO_PROFILE_RELEASE_LTO=off" >> "$GITHUB_ENV"
+            echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+            echo "Using fast release profile (LTO=off, codegen-units=16) for dev/PR validation."
+          else
+            echo "cache_key=ci-windows-release-full" >> "$GITHUB_OUTPUT"
+            echo "Using full release profile (Cargo.toml: lto=thin, codegen-units=1)."
+          fi
+
+      - name: Restore release dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ${{ steps.profile.outputs.cache_key }}
+          cache-bin: 'false'
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+
       - name: Build app and release shaders
         run: cargo build -p krill-app --release --locked
 
   test:
     name: nextest (MSVC)
+    needs: reuse
+    if: needs.reuse.outputs.reuse != 'true'
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -82,7 +141,8 @@ jobs:
         with:
           shared-key: ci-windows-test
           cache-bin: 'false'
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
@@ -98,3 +158,53 @@ jobs:
           KRILL_TELEMETRY_DISABLED: '1'
           KRILL_ERROR_REPORTING_DISABLED: '1'
         run: cargo nextest run --profile ci --workspace --locked --no-tests=pass
+
+  prune-caches:
+    name: prune stale caches
+    needs: [build, test]
+    if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/release/nightly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prune superseded Rust caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/ci_cache_prune.py
+
+  ci-windows:
+    name: ci-windows
+    needs: [reuse, check, build, test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 결과 집계
+        env:
+          PROOF: ${{ needs.reuse.result }}
+          REUSED: ${{ needs.reuse.outputs.reuse }}
+          CHECK: ${{ needs.check.result }}
+          BUILD: ${{ needs.build.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          echo "proof=$PROOF reuse=$REUSED check=$CHECK build=$BUILD test=$TEST"
+          [ "$PROOF" = success ]
+          case "$REUSED" in
+            true)
+              [ "$CHECK" = skipped ]
+              [ "$BUILD" = skipped ]
+              [ "$TEST" = skipped ]
+              ;;
+            false)
+              [ "$CHECK" = success ]
+              [ "$BUILD" = success ]
+              [ "$TEST" = success ]
+              ;;
+            *) exit 1 ;;
+          esac

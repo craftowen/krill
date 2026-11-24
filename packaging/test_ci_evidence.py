@@ -143,23 +143,27 @@ class ProofTests(unittest.TestCase):
             fixture.evidence().proof(fixture.filename, SHA, CANDIDATE_BRANCH)
 
     def test_main_reuse_revalidates_full_candidate_proof_instead_of_trusting_gate_name(self):
-        candidate = Fixture()
-        promoted = Fixture(branch="main", identifier=200)
-        promoted.jobs = [{"name": "reuse-macos-ci", "conclusion": "success", "status": "completed",
-                          "head_sha": SHA, "run_id": 200, "run_attempt": 2}]
+        for filename, reuse_job, dropped_job in (
+            ("ci-macos.yml", "reuse-macos-ci", "packaging regressions (macos-15)"),
+            ("ci-windows.yml", "reuse-windows-ci", "release app (fxc shaders)"),
+        ):
+            with self.subTest(filename=filename):
+                candidate = Fixture(filename=filename)
+                promoted = Fixture(filename=filename, branch="main", identifier=200)
+                promoted.jobs = [{"name": reuse_job, "conclusion": "success", "status": "completed",
+                                  "head_sha": SHA, "run_id": 200, "run_attempt": 2}]
 
-        def read(endpoint, paginate=False):
-            if "branch=main" in endpoint or "/runs/200/" in endpoint:
-                return promoted.read(endpoint, paginate)
-            return candidate.read(endpoint, paginate)
+                def read(endpoint, paginate=False, c=candidate, p=promoted):
+                    if "branch=main" in endpoint or "/runs/200/" in endpoint:
+                        return p.read(endpoint, paginate)
+                    return c.read(endpoint, paginate)
 
-        evidence = Evidence(REPO, read=read, now=NOW)
-        proof = evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
-        self.assertEqual(proof["source"]["run_id"], 100)
-        candidate.jobs = [job for job in candidate.jobs
-                          if job["name"] != "packaging regressions (macos-15)"]
-        with self.assertRaises(EvidenceError):
-            evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
+                evidence = Evidence(REPO, read=read, now=NOW)
+                proof = evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
+                self.assertEqual(proof["source"]["run_id"], 100)
+                candidate.jobs = [job for job in candidate.jobs if job["name"] != dropped_job]
+                with self.assertRaises(EvidenceError):
+                    evidence.proof(candidate.filename, SHA, "main", allow_reuse=True)
 
 
     def test_any_release_branch_push_is_a_reusable_candidate_but_other_branches_are_not(self):
@@ -182,7 +186,8 @@ class MacosGateTests(unittest.TestCase):
 
     def accepted(self, **overrides):
         env = dict(os.environ, CHANGES="success", PROOF="success", REUSED="false",
-                   RUST_CHANGED="true", CHECK="success", PACKAGING="success")
+                   RUST_CHANGED="true", DEV_PUSH="false", DEV_SMOKE="skipped",
+                   CHECK="success", PACKAGING="success")
         env.update(overrides)
         result = subprocess.run(["bash", "-e", "-c", self.script],
                                 env=env, capture_output=True, text=True, timeout=5)
@@ -199,6 +204,23 @@ class MacosGateTests(unittest.TestCase):
                                                        CHECK=check, PACKAGING=packaging),
                                          check == packaging == expected)
 
+    def test_dev_push_requires_smoke_when_rust_changed_and_skips_full_jobs(self):
+        states = ("success", "failure", "cancelled", "skipped")
+        for changed in ("true", "false"):
+            expected_smoke = "success" if changed == "true" else "skipped"
+            for smoke in states:
+                with self.subTest(changed=changed, smoke=smoke):
+                    self.assertEqual(
+                        self.accepted(DEV_PUSH="true", REUSED="false", RUST_CHANGED=changed,
+                                      DEV_SMOKE=smoke, CHECK="skipped", PACKAGING="skipped"),
+                        smoke == expected_smoke,
+                    )
+        # dev_push can never be combined with reuse=true or non-skipped full jobs.
+        self.assertFalse(self.accepted(DEV_PUSH="true", REUSED="true", RUST_CHANGED="true",
+                                       DEV_SMOKE="skipped", CHECK="skipped", PACKAGING="skipped"))
+        self.assertFalse(self.accepted(DEV_PUSH="true", REUSED="false", RUST_CHANGED="true",
+                                       DEV_SMOKE="success", CHECK="success", PACKAGING="skipped"))
+
     def test_failed_prerequisites_cannot_pass_through_a_docs_or_reuse_skip(self):
         for prerequisite in ("CHANGES", "PROOF"):
             for result in ("failure", "cancelled", "skipped", ""):
@@ -208,10 +230,45 @@ class MacosGateTests(unittest.TestCase):
                                                        RUST_CHANGED="false", CHECK="skipped", PACKAGING="skipped"))
 
     def test_missing_or_unknown_decision_outputs_are_rejected(self):
-        for output in ("REUSED", "RUST_CHANGED"):
+        for output in ("REUSED", "RUST_CHANGED", "DEV_PUSH"):
             for value in ("", "unknown"):
                 with self.subTest(output=output, value=value):
                     self.assertFalse(self.accepted(**{output: value}, CHECK="skipped", PACKAGING="skipped"))
+
+
+class WindowsGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci-windows.yml").read_text()
+        gate = workflow.split("\n  ci-windows:\n", 1)[1]
+        cls.script = textwrap.dedent(gate.split("        run: |\n", 1)[1])
+
+    def accepted(self, **overrides):
+        env = dict(os.environ, PROOF="success", REUSED="false",
+                   CHECK="success", BUILD="success", TEST="success")
+        env.update(overrides)
+        result = subprocess.run(["bash", "-e", "-c", self.script],
+                                env=env, capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+
+    def test_all_windows_jobs_must_succeed_or_all_be_skipped_when_reused(self):
+        states = ("success", "failure", "cancelled", "skipped")
+        for reused in ("false", "true"):
+            expected = "skipped" if reused == "true" else "success"
+            for check in states:
+                for build in states:
+                    for test in states:
+                        with self.subTest(reused=reused, check=check, build=build, test=test):
+                            self.assertEqual(
+                                self.accepted(REUSED=reused, CHECK=check, BUILD=build, TEST=test),
+                                check == build == test == expected,
+                            )
+
+    def test_failed_proof_or_unknown_reuse_cannot_pass(self):
+        for result in ("failure", "cancelled", "skipped", ""):
+            self.assertFalse(self.accepted(PROOF=result, REUSED="true", CHECK="skipped", BUILD="skipped", TEST="skipped"))
+        for value in ("", "unknown"):
+            self.assertFalse(self.accepted(REUSED=value, CHECK="skipped", BUILD="skipped", TEST="skipped"))
 
 
 class ReuseCommandTests(unittest.TestCase):
