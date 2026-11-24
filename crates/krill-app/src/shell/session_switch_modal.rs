@@ -232,6 +232,16 @@ impl Shell {
         if sessions.is_empty() {
             return;
         }
+        self.sidebar.update(cx, |sidebar, cx| {
+            for &session in &sessions {
+                sidebar.mark_session_account_pending(
+                    host.clone(),
+                    session,
+                    plan.target_account_id.clone(),
+                    cx,
+                );
+            }
+        });
         self.refresh_accounts_for_host(
             host,
             UsageRequest::SwitchSelectedSessions {

@@ -5662,6 +5662,29 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Rebinds cached bot identity metadata when a live bot session switches accounts in place.
+    pub fn rebind_bot_session(
+        &mut self,
+        host: &HostId,
+        from: SessionId,
+        to: SessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(meta) = self
+            .bot_sessions
+            .get_mut(host)
+            .and_then(|sessions| sessions.remove(&from))
+        else {
+            return false;
+        };
+        self.bot_sessions
+            .entry(host.clone())
+            .or_default()
+            .insert(to, meta);
+        cx.notify();
+        true
+    }
+
     /// Returns cached bot identity metadata for a session on `host`, if associated with a bot.
     #[must_use]
     pub fn bot_session_meta_on(

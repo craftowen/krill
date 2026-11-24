@@ -125,6 +125,41 @@ fn opencode_and_agy_keep_their_account_isolation() {
 }
 
 #[test]
+fn opencode_preserves_krill_bot_instructions_dir_while_stripping_inherited_config() {
+    let dir = "selected-opencode-profile";
+    let instr_dir = "C:\\Users\\owen\\krill\\claude-settings\\42-instructions";
+    let mut env = env();
+    env.retain(|(k, _)| {
+        !k.starts_with(b"KRILL_ACCOUNT_")
+            && !k.eq_ignore_ascii_case(b"OPENCODE_CONFIG_DIR")
+            && !k.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+    });
+    env.extend([
+        (b"KRILL_ACCOUNT_PROVIDER".to_vec(), b"opencode".to_vec()),
+        (b"KRILL_ACCOUNT_DIR".to_vec(), dir.as_bytes().to_vec()),
+        (
+            b"OPENCODE_CONFIG_DIR".to_vec(),
+            b"C:\\Users\\owen\\inherited-user-config".to_vec(),
+        ),
+        (
+            b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(),
+            instr_dir.as_bytes().to_vec(),
+        ),
+    ]);
+    let command = command(std::env::current_exe().unwrap().as_os_str(), env).unwrap();
+    assert_eq!(
+        value(&command, "OPENCODE_CONFIG_DIR"),
+        Some(OsString::from(instr_dir))
+    );
+    assert_eq!(value(&command, "KRILL_OPENCODE_INSTRUCTIONS_DIR"), None);
+    assert_eq!(value(&command, "OPENCODE_DB"), Some("opencode.db".into()));
+    assert_eq!(
+        value(&command, "XDG_DATA_HOME"),
+        Some(PathBuf::from(dir).join("data").into_os_string())
+    );
+}
+
+#[test]
 fn missing_agent_is_not_resolved_to_a_shell() {
     assert!(command(OsStr::new("krill-no-such-agent-20261023"), env()).is_none());
 }

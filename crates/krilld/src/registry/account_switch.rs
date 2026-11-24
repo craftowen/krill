@@ -1885,8 +1885,48 @@ impl Registry {
             original: old,
             session: new,
             disposition: ReplacementDisposition::Unresolved,
+            bot_grant_token: None,
         };
         self.agents.watch_account_resume(new);
+        let cwd_path = Path::new(std::ffi::OsStr::from_bytes(&cwd));
+        let bot_launch = if let Some(bots) = self.bots_if_initialized() {
+            bots.prepare_account_switch_launch(old, new, cwd_path)
+                .map_err(|err| {
+                    prepare_failure(old, "bot_launch_preparation", &std::io::Error::other(err))
+                })?
+        } else {
+            None
+        };
+        let mut effective_profile = profile.clone();
+        if let Some(ref bl) = bot_launch {
+            replacement.bot_grant_token.clone_from(&bl.grant_token);
+            let mut overrides = krill_proto::agent::LaunchOverrides {
+                model: bl.model.clone(),
+                effort: bl.effort.clone(),
+            };
+            if canonical == "agy"
+                && let Some(ref m) = overrides.model
+                && let Some((family, eff)) =
+                    crate::mobile::fold_agy_model_selection(None, m, overrides.effort.as_deref())
+            {
+                overrides.model = Some(family);
+                overrides.effort = Some(eff);
+            }
+            if !overrides.is_empty() {
+                krill_proto::agent::apply_launch_overrides(
+                    canonical,
+                    &mut effective_profile,
+                    &overrides,
+                )
+                .map_err(|err| {
+                    prepare_failure(old, "bot_launch_overrides", &std::io::Error::other(err))
+                })?;
+            }
+        }
+        let effective_instructions = bot_launch
+            .as_ref()
+            .map(|b| b.instructions.as_str())
+            .or(stored.bot_instructions.as_deref());
         #[cfg(windows)]
         let codex_resume = (provider == ProviderKind::Codex)
             .then(|| {
@@ -1895,20 +1935,29 @@ impl Registry {
                     .and_then(|p| identity::CodexResume::new(p).ok())
             })
             .flatten();
-        let (launch, sid, applied) = crate::agent::resume_in(
-            profile,
+        let (mut launch, sid, applied) = crate::agent::resume_in_with_bot_mcp(
+            &effective_profile,
             stored.permission,
             new,
             state_dir.as_deref(),
             Some(&session_id),
             account.as_ref(),
+            Some(cwd_path),
+            bot_launch.as_ref().map(|b| &b.mcp_cfg),
+            effective_instructions,
         )
         .map_err(|e| prepare_failure(old, "resume_launch", &e))?;
         if applied.as_ref().is_none_or(|a| a.id != account_id) {
             self.discard_settings(new);
             return Err(Failure::Denied);
         }
-        crate::agent::pre_trust_workspace(profile, &cwd, applied.as_ref());
+        if let Some(ref bl) = bot_launch {
+            for (k, v) in &bl.extra_env {
+                launch.env.retain(|(ek, _)| ek != k);
+                launch.env.push((k.clone(), v.clone()));
+            }
+        }
+        crate::agent::pre_trust_workspace(&effective_profile, &cwd, applied.as_ref());
         self.agents
             .remember_session(
                 new,
@@ -1920,6 +1969,15 @@ impl Registry {
                 cwd.clone(),
                 applied,
             )
+            .and_then(|()| {
+                if let Some(text) = effective_instructions.filter(|t| {
+                    !t.trim().is_empty() && crate::agent::takes_bot_instructions(&effective_profile)
+                }) {
+                    self.agents.remember_bot_instructions(new, text)
+                } else {
+                    Ok(())
+                }
+            })
             .map_err(|e| prepare_failure(old, "replacement_identity", &e))?;
         if let Some(dir) = self.dir.as_deref() {
             let raw = serde_json::to_vec(&Prepared {
@@ -2100,9 +2158,19 @@ impl Registry {
         let _retiring_binding = self.agents.retire_account_binding(old);
         drop(pending);
         drop(hook_commit);
+        // Transfer bot ownership before retiring `old` so `registry.remove(old)` never drops
+        // the bot's runtime binding, active group turn, or cron entry.
+        let new_bot_token = replacement.bot_grant_token.take();
+        let rebound_bot = self
+            .bots_if_initialized()
+            .and_then(|bots| bots.rebind_session(old, new, new_pid, new_bot_token.clone()));
         if !self.account_original_ended(old)
             && let Err(error) = self.close(peer, old)
         {
+            if let (Some(bots), Some(rebound)) = (self.bots_if_initialized(), rebound_bot) {
+                bots.rebind_session(new, old, old_pid, rebound.previous_token);
+                bots.revoke_launch_token(new_bot_token.as_ref());
+            }
             // Do not leave two live agents consuming different accounts after a failed termination.
             self.close(peer, new).ok();
             lock(&self.account_handoffs).insert(
@@ -2123,6 +2191,9 @@ impl Registry {
             std::thread::sleep(Duration::from_millis(10));
         }
         if !self.account_original_ended(old) {
+            if let (Some(bots), Some(rebound)) = (self.bots_if_initialized(), rebound_bot) {
+                bots.revoke_launch_token(rebound.previous_token.as_ref());
+            }
             lock(&self.account_handoffs).insert(
                 old,
                 SessionHandoff::retained(
@@ -2136,6 +2207,9 @@ impl Registry {
             replacement.mark_retained(persisted);
             self.agents.finish_account_resume(new);
             return Err(Failure::Os(libc::ETIMEDOUT));
+        }
+        if let (Some(bots), Some(rebound)) = (self.bots_if_initialized(), rebound_bot) {
+            bots.revoke_launch_token(rebound.previous_token.as_ref());
         }
         replacement.mark_committed();
         if provider == ProviderKind::Codex {
@@ -2248,6 +2322,7 @@ struct Replacement<'a> {
     original: SessionId,
     session: SessionId,
     disposition: ReplacementDisposition,
+    bot_grant_token: Option<zeroize::Zeroizing<String>>,
 }
 
 impl Replacement<'_> {
@@ -2278,6 +2353,15 @@ impl Drop for Replacement<'_> {
                     && !self.registry.account_original_ended(self.session)
                     && lock(&self.registry.account_handoffs).contains_key(&self.original);
                 if only_remaining {
+                    if let Some(bots) = self.registry.bots_if_initialized() {
+                        let new_token = self.bot_grant_token.take();
+                        let pid = self.registry.session_pid(self.session).unwrap_or(0);
+                        if let Some(rebound) =
+                            bots.rebind_session(self.original, self.session, pid, new_token)
+                        {
+                            bots.revoke_launch_token(rebound.previous_token.as_ref());
+                        }
+                    }
                     let retained = {
                         let mut handoffs = lock(&self.registry.account_handoffs);
                         if let Some(account_id) =
@@ -2299,6 +2383,11 @@ impl Drop for Replacement<'_> {
                     };
                     retained && self.registry.save_account_handoffs().is_ok()
                 } else {
+                    if let Some(token) = self.bot_grant_token.take()
+                        && let Some(bots) = self.registry.bots_if_initialized()
+                    {
+                        bots.revoke_launch_token(Some(&token));
+                    }
                     // An unregistered target may be an unknown Spawn outcome. Leave its journal.
                     let registered = lock(&self.registry.state)
                         .sessions
@@ -2307,6 +2396,11 @@ impl Drop for Replacement<'_> {
                 }
             }
         };
+        if let Some(token) = self.bot_grant_token.take()
+            && let Some(bots) = self.registry.bots_if_initialized()
+        {
+            bots.revoke_launch_token(Some(&token));
+        }
         if resolved && let Some(dir) = self.registry.dir.as_deref() {
             std::fs::remove_file(replacement_journal(dir, self.session)).ok();
         }

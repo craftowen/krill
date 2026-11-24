@@ -252,3 +252,87 @@ fn switch_sends_the_session_to_the_active_account(cx: &mut TestAppContext) {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[gpui::test]
+fn switching_banner_shows_in_place_progress_while_pending_and_clears_after_rebind(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, pane, _peer) = setup(cx, "stale-account-switching-banner");
+    view.update(cx, |s, _| {
+        s.host_targets.insert(
+            studio(),
+            HostTarget::remote(
+                "studio",
+                state_path("stale-account-switching-banner").join("daemon.sock"),
+            ),
+        );
+    });
+    apply(&view, cx, studio(), accounts("new"));
+    assert!(shown(cx, pane));
+    let switching_sel: &'static str =
+        Box::leak(format!("account-switching-banner-{}", pane.get()).into_boxed_str());
+    assert!(cx.debug_bounds(switching_sel).is_none());
+
+    // Pending handoff replaces action buttons with an in-place switching notice in the same pane.
+    let mut handoff = accounts("new");
+    handoff.details.supported = true;
+    handoff.details.handoffs.push(SessionHandoff {
+        from: SESSION,
+        to: None,
+        account_id: "new".into(),
+        error: None,
+    });
+    apply(&view, cx, studio(), handoff);
+    assert!(!shown(cx, pane));
+    assert!(
+        cx.debug_bounds(switching_sel).is_some(),
+        "in-place switching status banner must appear while handoff is active"
+    );
+
+    // Once rebound to the replacement running on "new", both banners clear in the same pane.
+    let replacement = SessionId(411);
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Connected,
+                sidebar::Snapshot {
+                    sessions: vec![sidebar::Session {
+                        id: replacement,
+                        status: AgentStatus {
+                            state: AgentState::Done,
+                            agent: "claude".into(),
+                            ..AgentStatus::UNKNOWN
+                        },
+                        worktree: None,
+                        cwd: None,
+                        account: Some(SessionAccount {
+                            session: replacement,
+                            account_id: "new".into(),
+                            label: "New".into(),
+                        }),
+                    }],
+                    trees: std::collections::BTreeMap::new(),
+                },
+                cx,
+            );
+        });
+    });
+    let mut done = accounts("new");
+    done.details.supported = true;
+    done.details.handoffs.push(SessionHandoff {
+        from: SESSION,
+        to: Some(replacement),
+        account_id: "new".into(),
+        error: None,
+    });
+    apply(&view, cx, studio(), done);
+    assert!(!shown(cx, pane));
+    assert!(
+        cx.debug_bounds(switching_sel).is_none(),
+        "switching status banner must disappear once rebound onto target account"
+    );
+    view.read_with(cx, |s, _| {
+        assert_eq!(s.layout.session(pane), Some(replacement));
+    });
+}

@@ -155,6 +155,9 @@ pub(crate) struct PendingChatPrompt {
     pub display_text: String,
     pub attachments: Vec<DraftAttachment>,
     pub status: PendingStatus,
+    /// Epoch ms when the user submitted this prompt, used to anchor bot `ItemNote` rows when the
+    /// incremental `ChatPoll` arrives without `ChatItem.at` before `SessionPromptHistory` syncs.
+    pub submitted_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,10 +197,16 @@ pub(crate) struct SessionChatLog {
     consumed_user_indices: BTreeSet<usize>,
     pub queued_prompts: VecDeque<QueuedChatPrompt>,
     pub unread_from: Option<usize>,
-    /// A bot chat's item changes and its newest owner turns' times (newest first).
-    item_notes: (Vec<Arc<work_run::ItemNote>>, Vec<u64>),
+    /// A bot chat's item changes and its newest owner turns (newest first).
+    item_notes: (Vec<Arc<work_run::ItemNote>>, Vec<work_run::TurnStamp>),
+    /// Arrival timestamps (epoch ms) observed for live incremental `User` items whose wire payload
+    /// omitted `item.at`, preventing bot `ItemNote` rows from jumping when a new prompt lands.
+    observed_user_at_ms: BTreeMap<usize, u64>,
     /// A bot chat folds each settled turn behind its answer (Orca); `None` elsewhere.
     turn_fold: Option<work_run::TurnFold>,
+    /// Carried over across an in-place account switch: keep existing rows visible until the
+    /// replacement session returns its first bound/non-empty transcript, then replace cleanly.
+    pub(super) replace_on_next_poll: bool,
 }
 
 impl SessionChatLog {
@@ -206,12 +215,13 @@ impl SessionChatLog {
             if self.items.is_empty() && self.item_notes.0.is_empty() {
                 work_run::DisplayFeed::empty()
             } else {
-                Arc::new(work_run::DisplayFeed::project_with_notes(
+                Arc::new(work_run::DisplayFeed::project_with_turn_stamps(
                     self.base_index,
                     &self.items,
                     self.unread_from,
                     &self.item_notes.0,
                     &self.item_notes.1,
+                    &self.observed_user_at_ms,
                     self.turn_fold.as_ref(),
                 ))
             }
@@ -219,7 +229,11 @@ impl SessionChatLog {
     }
 
     /// Shows a bot's item changes between the turns of its chat (Orca's item note rows).
-    pub(super) fn set_item_notes(&mut self, notes: Vec<Arc<work_run::ItemNote>>, turns: Vec<u64>) {
+    pub(super) fn set_item_notes(
+        &mut self,
+        notes: Vec<Arc<work_run::ItemNote>>,
+        turns: Vec<work_run::TurnStamp>,
+    ) {
         if self.item_notes.0 != notes || self.item_notes.1 != turns {
             self.item_notes = (notes, turns);
             self.cached_feed = None;
@@ -333,6 +347,7 @@ impl SessionChatLog {
 
     pub(super) fn reset_transcript(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.replace_on_next_poll = false;
         self.items.clear();
         self.base_index = 0;
         self.seeded = false;
@@ -349,6 +364,7 @@ impl SessionChatLog {
         self.multi_selected.clear();
         self.submissions.clear();
         self.consumed_user_indices.clear();
+        self.observed_user_at_ms.clear();
         self.queued_prompts.clear();
         self.unread_from = None;
     }
@@ -394,6 +410,7 @@ impl SessionChatLog {
             self.expanded_notices.retain(|index| *index >= base);
             self.wrapped_code.retain(|(index, _)| *index >= base);
             self.consumed_user_indices.retain(|index| *index >= base);
+            self.observed_user_at_ms.retain(|index, _| *index >= base);
             self.timing.migrate_head_drain(old_run_abs_start, base);
             self.answered.retain(|key| retained.contains(key));
             self.multi_selected.retain(|key, _| retained.contains(key));
@@ -1387,11 +1404,19 @@ impl Shell {
                     .collect()
             })
             .unwrap_or_default();
-        let turns: Vec<u64> = self
+        let turns: Vec<work_run::TurnStamp> = self
             .sidebar
             .read(cx)
             .session_prompt_history_on(&key.0, key.1)
-            .map(|h| h.turns.iter().map(|t| t.unix_ns / 1_000_000).collect())
+            .map(|h| {
+                h.turns
+                    .iter()
+                    .map(|t| work_run::TurnStamp {
+                        at_ms: t.unix_ns / 1_000_000,
+                        text: t.text.clone(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         if let Some(log) = self.chat.logs.get_mut(key) {
             log.set_item_notes(notes, turns);
@@ -1457,6 +1482,153 @@ impl Shell {
     }
 
     /// After a layout change, drops per-session chat state no pane shows any more.
+    /// Migrates chat transcript, composer draft, scroll list, and bot metadata in place when a
+    /// session hands off to `to` during an account switch. Existing messages remain visible until
+    /// `to` reports its bound transcript, preventing any blank-screen flash or lost draft.
+    pub(super) fn rebind_chat_session(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        from: SessionId,
+        to: SessionId,
+        panes: &[PaneId],
+    ) {
+        let old_key = (host.clone(), from);
+        let new_key = (host.clone(), to);
+        let chat = &mut self.chat;
+
+        // Cancel stale in-flight I/O tied to the retired session.
+        chat.poll_tasks.remove(&old_key);
+        chat.poll_generations.remove(&old_key);
+        chat.poll_failed.remove(&old_key);
+        chat.composer_tasks.remove(&old_key);
+        chat.composer_models_in_flight.remove(&old_key);
+        chat.last_composer_poll.remove(&old_key);
+        chat.earlier_tasks.remove(&old_key);
+        chat.earlier_retry_after.remove(&old_key);
+        chat.request_tasks.remove(&old_key);
+        chat.interrupt_latched.remove(&old_key);
+        chat.interrupt_turn_since.remove(&old_key);
+        chat.stop_cooldown_since.remove(&old_key);
+        chat.stop_cooldown_timers.remove(&old_key);
+        chat.auto_continue.remove(&old_key);
+
+        if let Some(mut log) = chat.logs.remove(&old_key) {
+            log.offset = 0;
+            log.seeded = false;
+            log.earlier = None;
+            log.meta = ComposerMeta::default();
+            log.replace_on_next_poll = !log.items.is_empty();
+            chat.logs.entry(new_key.clone()).or_insert(log);
+        }
+        for &pane in panes {
+            if let Some(list) = chat.lists.remove(&(pane, from)) {
+                chat.lists.entry((pane, to)).or_insert(list);
+            }
+        }
+        if let Some(input) = chat.inputs.remove(&old_key) {
+            chat.inputs.entry(new_key.clone()).or_insert(input);
+        }
+        if let Some(bot) = chat.cached_bots.remove(&old_key) {
+            chat.cached_bots.entry(new_key.clone()).or_insert(bot);
+        }
+        if let Some(find) = chat.finds.remove(&old_key) {
+            chat.finds.entry(new_key.clone()).or_insert(find);
+        }
+        if let Some(attachments) = chat.draft_attachments.remove(&old_key) {
+            chat.draft_attachments
+                .entry(new_key.clone())
+                .or_insert(attachments);
+        }
+        if let Some(tokens) = chat.image_tokens.remove(&old_key) {
+            chat.image_tokens.entry(new_key.clone()).or_insert(tokens);
+        }
+        if let Some(history) = chat.sent_history.remove(&old_key) {
+            chat.sent_history.entry(new_key.clone()).or_insert(history);
+        }
+        if let Some(cursor) = chat.history_cursor.remove(&old_key) {
+            chat.history_cursor.entry(new_key.clone()).or_insert(cursor);
+        }
+        if let Some(draft) = chat.history_saved_draft.remove(&old_key) {
+            chat.history_saved_draft
+                .entry(new_key.clone())
+                .or_insert(draft);
+        }
+        if let Some(declined) = chat.auto_continue_declined.remove(&old_key) {
+            chat.auto_continue_declined
+                .entry(new_key.clone())
+                .or_insert(declined);
+        }
+        if let Some(pending) = chat.pending_prompts.remove(&old_key) {
+            chat.pending_prompts
+                .entry(new_key.clone())
+                .or_insert(pending);
+        }
+        if chat.prompt_review.remove(&old_key) {
+            chat.prompt_review.insert(new_key.clone());
+        }
+        if chat.prompt_failed.remove(&old_key) {
+            chat.prompt_failed.insert(new_key.clone());
+        }
+        if chat.multiline_blocked.remove(&old_key) {
+            chat.multiline_blocked.insert(new_key.clone());
+        }
+        if let Some(ac) = chat.autocomplete.remove(&old_key) {
+            chat.autocomplete.entry(new_key.clone()).or_insert(ac);
+        }
+        if chat.quick_menu.remove(&old_key) {
+            chat.quick_menu.insert(new_key.clone());
+        }
+        if chat.model_picker.remove(&old_key) {
+            chat.model_picker.insert(new_key.clone());
+        }
+        if let Some(selected) = chat.model_picker_selected.remove(&old_key) {
+            chat.model_picker_selected
+                .entry(new_key.clone())
+                .or_insert(selected);
+        }
+        let moved_epochs: Vec<_> = chat
+            .pending_epochs
+            .keys()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_epochs {
+            if let Some(epoch) = chat.pending_epochs.remove(&old_entry) {
+                chat.pending_epochs
+                    .entry((new_key.clone(), old_entry.1))
+                    .or_insert(epoch);
+            }
+        }
+        let moved_others: Vec<_> = chat
+            .question_other_inputs
+            .keys()
+            .filter(|(k, _)| k == &old_key)
+            .cloned()
+            .collect();
+        for old_entry in moved_others {
+            if let Some(input) = chat.question_other_inputs.remove(&old_entry) {
+                chat.question_other_inputs
+                    .entry((new_key.clone(), old_entry.1))
+                    .or_insert(input);
+            }
+        }
+        match &mut chat.focus_pending {
+            Some(ChatFocus::Composer(k) | ChatFocus::Terminal(k)) if *k == old_key => {
+                *k = new_key.clone();
+            }
+            _ => {}
+        }
+        chat.last_poll = None;
+        let old_voice = super::voice::VoiceComposerTarget::Chat(old_key);
+        let new_voice = super::voice::VoiceComposerTarget::Chat(new_key);
+        if let Some(dictated) = self.voice.last_dictated.remove(&old_voice) {
+            self.voice
+                .last_dictated
+                .entry(new_voice)
+                .or_insert(dictated);
+        }
+    }
+
     /// An in-flight prompt send is left to finish.
     pub(super) fn prune_chat_sessions(&mut self) {
         let layout = &self.layout;
@@ -1897,9 +2069,6 @@ impl Shell {
                     && this.is_pane_chat_view(pane, cx)
                     && this.chat.logs.get(&task_key).map_or(0, |log| log.offset) == offset
                 {
-                    if seeding {
-                        this.chat.logs.entry(task_key.clone()).or_default().seeded = true;
-                    }
                     let agent_state = this.session_agent_state(&host, session, cx);
                     let now = std::time::Instant::now();
                     if let Some(page) = page {
@@ -1936,6 +2105,12 @@ impl Shell {
                             agent_state,
                             now,
                         );
+                        if seeding {
+                            let log = this.chat.logs.entry(task_key.clone()).or_default();
+                            if !log.replace_on_next_poll {
+                                log.seeded = true;
+                            }
+                        }
                         if refresh_composer {
                             this.refresh_chat_composer(&task_key, false, cx);
                         }
@@ -1964,6 +2139,23 @@ impl Shell {
         now: std::time::Instant,
     ) {
         let key = (host.clone(), session);
+        if self
+            .chat
+            .logs
+            .get(&key)
+            .is_some_and(|log| log.replace_on_next_poll)
+            && !page.snapshot.bound
+            && page.snapshot.items.is_empty()
+            && !page.snapshot.reset
+        {
+            let log = self.chat.logs.entry(key).or_default();
+            if !page.snapshot.agent.is_empty() {
+                log.agent = page.snapshot.agent;
+            }
+            log.offset = page.snapshot.next_offset;
+            log.sync_timing(agent_state, now);
+            return;
+        }
         self.chat.logs.entry(key.clone()).or_default().binding = Default::default();
         self.apply_chat_poll_for_host_with_state(
             session,
@@ -1986,6 +2178,10 @@ impl Shell {
             log.consumed_user_indices = std::mem::take(&mut log.consumed_user_indices)
                 .into_iter()
                 .map(|idx| idx.saturating_add(delta))
+                .collect();
+            log.observed_user_at_ms = std::mem::take(&mut log.observed_user_at_ms)
+                .into_iter()
+                .map(|(idx, ts)| (idx.saturating_add(delta), ts))
                 .collect();
             if let Some(pending) = self.chat.pending_prompts.get_mut(&key) {
                 for entry in pending.iter_mut() {
@@ -2131,13 +2327,23 @@ impl Shell {
         let key = (host.clone(), session);
         let host = Some(host);
         let log = self.chat.logs.entry(key.clone()).or_default();
+        if log.replace_on_next_poll && !snap.bound && snap.items.is_empty() && !snap.reset {
+            if !snap.agent.is_empty() {
+                log.agent = snap.agent;
+            }
+            log.offset = snap.next_offset;
+            log.sync_timing(agent_state, now);
+            return;
+        }
+        let replace_carried = log.replace_on_next_poll;
         let binding = (snap.session_id.clone(), snap.transcript_path.clone());
         let same_host = log.host.is_none() || log.host == host;
         let initial_bind = !log.bound && snap.bound && !snap.reset && same_host;
         let stay_unbound = !log.bound && !snap.bound && !snap.reset && same_host;
-        let reset = !initial_bind
-            && !stay_unbound
-            && (snap.reset || log.binding != binding || !same_host || !snap.bound);
+        let reset = replace_carried
+            || (!initial_bind
+                && !stay_unbound
+                && (snap.reset || log.binding != binding || !same_host || !snap.bound));
         if !snap.agent.is_empty() {
             log.agent = snap.agent;
         }
@@ -2193,9 +2399,18 @@ impl Shell {
         let has_list_following = self.chat.lists.iter().any(|((_, sid), list)| {
             *sid == session && list.host == key.0 && list.state.is_following_tail()
         });
+        let observed_now_ms = self.chat_now_epoch_ms();
         let log = self.chat.logs.entry(key.clone()).or_default();
         if !snap.items.is_empty() {
             let old_end_abs = log.base_index.saturating_add(log.items.len());
+            if !initial_bind && !reset && !replace_carried && observed_now_ms > 0 {
+                for (rel, item) in snap.items.iter().enumerate() {
+                    if item.kind == ChatItemKind::User && item.at.trim().is_empty() {
+                        log.observed_user_at_ms
+                            .insert(old_end_abs.saturating_add(rel), observed_now_ms);
+                    }
+                }
+            }
             if !initial_bind && !reset && is_scrolled_up {
                 log.unread_from.get_or_insert(old_end_abs);
             } else if has_list_following {
@@ -2613,32 +2828,42 @@ impl Shell {
                 .submit_on_enter(true)
                 .placeholder(ctext::PROMPT_PLACEHOLDER.get())
         });
-        let focus_key = key.clone();
+        let input_id = input.entity_id();
         let sub = cx.subscribe_in(
             &input,
             window,
-            move |this, _state, ev: &InputEvent, window, cx| match ev {
-                InputEvent::Focus => {
-                    if let Some(pane) = this.chat_pane(&focus_key)
-                        && this.layout.focused() != Some(pane)
-                    {
-                        this.change(false, cx, |l| l.focus(pane));
-                        this.files.refocus = false;
-                    } else {
+            move |this, _state, ev: &InputEvent, window, cx| {
+                let Some(focus_key) = this
+                    .chat
+                    .inputs
+                    .iter()
+                    .find_map(|(k, (ent, _))| (ent.entity_id() == input_id).then(|| k.clone()))
+                else {
+                    return;
+                };
+                match ev {
+                    InputEvent::Focus => {
+                        if let Some(pane) = this.chat_pane(&focus_key)
+                            && this.layout.focused() != Some(pane)
+                        {
+                            this.change(false, cx, |l| l.focus(pane));
+                            this.files.refocus = false;
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                    InputEvent::Change => {
+                        this.chat.prompt_review.remove(&focus_key);
+                        this.chat.prompt_failed.remove(&focus_key);
+                        this.chat.multiline_blocked.remove(&focus_key);
+                        this.sync_chat_autocomplete(&focus_key, window, cx);
                         cx.notify();
                     }
+                    InputEvent::Blur => {
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {}
                 }
-                InputEvent::Change => {
-                    this.chat.prompt_review.remove(&focus_key);
-                    this.chat.prompt_failed.remove(&focus_key);
-                    this.chat.multiline_blocked.remove(&focus_key);
-                    this.sync_chat_autocomplete(&focus_key, window, cx);
-                    cx.notify();
-                }
-                InputEvent::Blur => {
-                    cx.notify();
-                }
-                InputEvent::PressEnter { .. } => {}
             },
         );
         let active =
@@ -2870,6 +3095,7 @@ impl Shell {
             ac.close();
             ac.dismissed = None;
         }
+        let submitted_at_ms = self.chat_now_epoch_ms();
         self.chat
             .pending_prompts
             .entry(key.clone())
@@ -2881,6 +3107,7 @@ impl Shell {
                 display_text,
                 attachments,
                 status: PendingStatus::Sending,
+                submitted_at_ms,
             });
         self.chat
             .pending_epochs
@@ -3117,6 +3344,7 @@ impl Shell {
         );
         let pending_id = queued.id;
         let submitted_payload = queued.submitted_payload;
+        let submitted_at_ms = self.chat_now_epoch_ms();
         self.chat
             .pending_prompts
             .entry(key.clone())
@@ -3128,6 +3356,7 @@ impl Shell {
                 display_text: queued.display_text,
                 attachments: queued.attachments,
                 status: PendingStatus::Sending,
+                submitted_at_ms,
             });
         self.chat
             .pending_epochs
@@ -4316,6 +4545,31 @@ impl Shell {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "test builds read self.chat.now_override"
+        )
+    )]
+    fn chat_now_epoch_ms(&self) -> u64 {
+        let system_now_ms = || {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        };
+        #[cfg(test)]
+        {
+            self.chat
+                .now_override
+                .map_or_else(system_now_ms, |s| s.saturating_mul(1_000))
+        }
+        #[cfg(not(test))]
+        {
+            system_now_ms()
+        }
+    }
+
     pub(super) fn reconcile_pending_prompts_on_poll(&mut self, key: &ChatKey) {
         let Some(log) = self.chat.logs.get_mut(key) else {
             return;
@@ -4375,6 +4629,17 @@ impl Shell {
             });
             if let Some(abs_idx) = found_abs {
                 log.consumed_user_indices.insert(abs_idx);
+                if entry.submitted_at_ms > 0
+                    && let Some(rel) = abs_idx.checked_sub(log.base_index)
+                    && log
+                        .items
+                        .get(rel)
+                        .is_some_and(|item| item.at.trim().is_empty())
+                {
+                    log.observed_user_at_ms
+                        .insert(abs_idx, entry.submitted_at_ms);
+                    log.cached_feed = None;
+                }
                 matched_ids.push(entry.id);
             }
         }
@@ -5187,12 +5452,17 @@ impl Shell {
                 .placeholder(ctext::FIND_PLACEHOLDER.get())
         });
         input.update(cx, |state, cx| state.focus(window, cx));
-        let find_key = key.clone();
+        let find_input_id = input.entity_id();
         let sub = cx.subscribe_in(
             &input,
             window,
             move |this, state, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
+                    let Some(find_key) = this.chat.finds.iter().find_map(|(k, f)| {
+                        (f.input.entity_id() == find_input_id).then(|| k.clone())
+                    }) else {
+                        return;
+                    };
                     let next_query = state.read(cx).value().to_string();
                     if let Some(find) = this.chat.finds.get_mut(&find_key)
                         && find.query != next_query

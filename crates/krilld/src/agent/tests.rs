@@ -2417,6 +2417,268 @@ fn resume_opencode_bot_instructions_reads_custom_config_dir_from_login_env() {
 }
 
 #[test]
+fn resume_in_with_bot_mcp_preserves_bot_context_for_all_four_providers() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-bot-resume-all-providers-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let bot_home = dir.join("bot-home");
+    let workspace = dir.join("workspace");
+    let acct_dir = dir.join("acct-profile");
+    std::fs::create_dir_all(state.join("hooks")).unwrap();
+    std::fs::create_dir_all(&bot_home).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&acct_dir).unwrap();
+
+    let claude_exe = dir.join("claude");
+    std::fs::write(&claude_exe, "#!/bin/sh\nprintf '2.1.299\\n'\n").unwrap();
+    let opencode_exe = dir.join("opencode");
+    std::fs::write(
+        &opencode_exe,
+        "#!/bin/sh\nprintf 'CFG=%s|DATA=%s|MARKER=%s\\n' \"${OPENCODE_CONFIG_DIR-}\" \"${XDG_DATA_HOME-}\" \"${KRILL_OPENCODE_INSTRUCTIONS_DIR-}\"\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for exe in [&claude_exe, &opencode_exe] {
+            std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    let bot_mcp = BotMcpLaunchConfig {
+        bot_home: Some(bot_home.clone()),
+        http_servers: vec![BotMcpHttpServer {
+            id: "krill".into(),
+            url: "http://127.0.0.1:41234/bot-tools/krill/mcp".into(),
+            bearer_token: "secret-tok".into(),
+        }],
+        stdio_servers: vec![BotMcpStdioServer {
+            id: "helper".into(),
+            command: vec!["helper-bin".into()],
+            env: vec![("KRILL_MCP_HELPER_TOKEN".into(), "stdio-secret".into())],
+        }],
+        instructions: Some("You are Krill Bot, keep persona across account switches.".into()),
+    };
+
+    let argv_of = |launch: &Launch| -> Vec<String> {
+        launch
+            .argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect()
+    };
+    let env_val = |launch: &Launch, key: &[u8]| -> Option<String> {
+        launch
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k.as_slice() == key)
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+    };
+
+    // 1. Claude: additionalDirectories (bot_home), --mcp-config, --append-system-prompt-file, NO_PROXY.
+    let claude_acct = LaunchAccount {
+        id: "claude-2".into(),
+        env_key: "CLAUDE_CONFIG_DIR".into(),
+        dir: acct_dir.display().to_string(),
+    };
+    let (claude_launch, _, _) = resume_in_with_bot_mcp(
+        &profile(&[claude_exe.to_str().unwrap()]),
+        Permission::Yolo,
+        krill_proto::SessionId(951),
+        Some(&state),
+        Some("11111111-2222-4333-8444-555555555555"),
+        Some(&claude_acct),
+        Some(&workspace),
+        Some(&bot_mcp),
+        None,
+    )
+    .unwrap();
+    let claude_argv = argv_of(&claude_launch);
+    let settings_idx = claude_argv.iter().position(|a| a == "--settings").unwrap();
+    let settings_json = std::fs::read_to_string(&claude_argv[settings_idx + 1]).unwrap();
+    assert!(
+        settings_json.contains(&bot_home.display().to_string()),
+        "Claude resume settings must include bot_home in additionalDirectories: {settings_json}"
+    );
+    let mcp_idx = claude_argv
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("Claude resume must preserve --mcp-config");
+    let mcp_json = std::fs::read_to_string(&claude_argv[mcp_idx + 1]).unwrap();
+    assert!(mcp_json.contains("/bot-tools/krill/mcp"), "{mcp_json}");
+    let instr_idx = claude_argv
+        .iter()
+        .position(|a| a == "--append-system-prompt-file")
+        .expect("Claude resume must preserve bot instructions");
+    assert!(
+        std::fs::read_to_string(&claude_argv[instr_idx + 1])
+            .unwrap()
+            .contains("You are Krill Bot")
+    );
+    assert!(
+        env_val(&claude_launch, b"NO_PROXY")
+            .unwrap_or_default()
+            .contains("127.0.0.1")
+    );
+
+    // 2. Codex: mcp_servers args + developer_instructions + resume <id> + NO_PROXY.
+    let codex_acct = LaunchAccount {
+        id: "codex-2".into(),
+        env_key: "CODEX_HOME".into(),
+        dir: acct_dir.display().to_string(),
+    };
+    let (codex_launch, _, _) = resume_in_with_bot_mcp(
+        &profile(&["codex"]),
+        Permission::Yolo,
+        krill_proto::SessionId(952),
+        Some(&state),
+        Some("22222222-3333-4444-8555-666666666666"),
+        Some(&codex_acct),
+        Some(&workspace),
+        Some(&bot_mcp),
+        None,
+    )
+    .unwrap();
+    let codex_argv = argv_of(&codex_launch);
+    assert!(
+        codex_argv
+            .iter()
+            .any(|a| a.contains("mcp_servers.krill.url")),
+        "Codex resume must preserve bot MCP server config: {codex_argv:?}"
+    );
+    assert!(
+        codex_argv
+            .iter()
+            .any(|a| a.starts_with("developer_instructions=") && a.contains("You are Krill Bot")),
+        "Codex resume must preserve developer_instructions: {codex_argv:?}"
+    );
+    assert!(codex_argv.ends_with(&[
+        "resume".to_owned(),
+        "22222222-3333-4444-8555-666666666666".to_owned()
+    ]));
+
+    // 3. Antigravity: --add-dir bot_home + --add-dir instructions_dir + stdio env + --conversation.
+    let agy_acct = LaunchAccount {
+        id: "agy-2".into(),
+        env_key: "ANTIGRAVITY_CLI_HOME".into(),
+        dir: acct_dir.display().to_string(),
+    };
+    let (agy_launch, _, _) = resume_in_with_bot_mcp(
+        &profile(&["agy"]),
+        Permission::Yolo,
+        krill_proto::SessionId(953),
+        Some(&state),
+        Some("conv-agy-1"),
+        Some(&agy_acct),
+        Some(&workspace),
+        Some(&bot_mcp),
+        None,
+    )
+    .unwrap();
+    let agy_argv = argv_of(&agy_launch);
+    let add_dirs: Vec<&str> = agy_argv
+        .windows(2)
+        .filter_map(|w| (w[0] == "--add-dir").then_some(w[1].as_str()))
+        .collect();
+    assert!(
+        add_dirs.contains(&bot_home.to_str().unwrap()),
+        "Antigravity resume must preserve --add-dir bot_home: {add_dirs:?}"
+    );
+    assert!(
+        add_dirs.iter().any(|d| {
+            std::fs::read_to_string(Path::new(d).join("AGENTS.md"))
+                .is_ok_and(|c| c.contains("You are Krill Bot"))
+        }),
+        "Antigravity resume must preserve instructions AGENTS.md dir: {add_dirs:?}"
+    );
+    assert_eq!(
+        env_val(&agy_launch, b"KRILL_MCP_HELPER_TOKEN").as_deref(),
+        Some("stdio-secret")
+    );
+    assert!(agy_argv.ends_with(&["--conversation".to_owned(), "conv-agy-1".to_owned()]));
+
+    // 4. OpenCode: OPENCODE_CONFIG_DIR survives Unix PREFLIGHT isolation under KRILL_ACCOUNT_PROVIDER=opencode!
+    let oc_acct = LaunchAccount {
+        id: "opencode-2".into(),
+        env_key: "OPENCODE_CONFIG_DIR".into(),
+        dir: acct_dir.display().to_string(),
+    };
+    let (oc_launch, _, _) = resume_in_with_bot_mcp(
+        &profile(&[opencode_exe.to_str().unwrap()]),
+        Permission::Yolo,
+        krill_proto::SessionId(954),
+        Some(&state),
+        Some("ses_oc_1"),
+        Some(&oc_acct),
+        Some(&workspace),
+        Some(&bot_mcp),
+        None,
+    )
+    .unwrap();
+    let oc_instr_dir = env_val(&oc_launch, b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+        .expect("KRILL_OPENCODE_INSTRUCTIONS_DIR marker set");
+    assert_eq!(
+        env_val(&oc_launch, b"OPENCODE_CONFIG_DIR").as_deref(),
+        Some(oc_instr_dir.as_str())
+    );
+    assert_eq!(
+        env_val(&oc_launch, b"KRILL_MCP_HELPER_TOKEN").as_deref(),
+        Some("stdio-secret")
+    );
+    // Run the actual PREFLIGHT subshell with /bin/sh to verify OPENCODE_CONFIG_DIR is preserved!
+    let preflight_only = format!(
+        "set -- \"$@\"\n{}\n",
+        PREFLIGHT
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("exec \"${SHELL"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(&preflight_only).arg("mk-agent");
+    // Launch argv ends with: ..., "-c", PREFLIGHT, WRAPPER_ARG0, hint, program, args...
+    let arg0_pos = oc_launch
+        .argv
+        .iter()
+        .position(|a| a.as_slice() == WRAPPER_ARG0.as_bytes())
+        .unwrap();
+    for arg in &oc_launch.argv[arg0_pos + 1..] {
+        cmd.arg(std::ffi::OsStr::from_bytes(arg));
+    }
+    cmd.env_clear();
+    for (k, v) in &oc_launch.env {
+        cmd.env(
+            std::ffi::OsStr::from_bytes(k),
+            std::ffi::OsStr::from_bytes(v),
+        );
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "preflight failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected_data = acct_dir.join("data");
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "CFG={oc_instr_dir}|DATA={}|MARKER=",
+            expected_data.display()
+        ),
+        "PREFLIGHT must restore bot OPENCODE_CONFIG_DIR while isolating XDG_DATA_HOME and clearing marker"
+    );
+
+    for sid in [951, 952, 953, 954] {
+        claude::discard(&state, krill_proto::SessionId(sid));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn launch_selected_in_with_bot_mcp_cleans_up_claude_files_on_intermediate_failure() {
     let dir = std::env::temp_dir().join(format!(
         "krill-claude-launch-cleanup-{}",

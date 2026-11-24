@@ -143,7 +143,7 @@ impl Shell {
             let Some(live) = self.live.get_mut(&pane) else {
                 continue;
             };
-            if busy {
+            if busy && live.pane.is_linked() {
                 notices.extend(live.pane.resume_account_input(false, Now::get()));
             } else {
                 live.pane.pause_account_input();
