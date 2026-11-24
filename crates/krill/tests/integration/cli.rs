@@ -1,0 +1,2019 @@
+//! MK-045: all MVP commands against real holder/krilld with no application process.
+
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+
+use std::fs::{self, File};
+use std::io::Write as _;
+use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use krill_proto::control::{Reply, Request};
+use krill_proto::daemon::{client_hello, handshake};
+use krill_proto::ipc::{self, ClientRole};
+use krill_proto::screen::Msg as _;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::termios::{Winsize, tcgetattr, tcsetwinsize};
+
+const MK: &str = env!("CARGO_BIN_EXE_krill");
+const WAIT: Duration = Duration::from_secs(10);
+
+struct Daemon {
+    holder: Child,
+    krilld: u32,
+    dir: PathBuf,
+}
+impl Daemon {
+    fn new(tag: &str) -> Self {
+        Self::configured(tag, None)
+    }
+    fn configured(tag: &str, config: Option<&str>) -> Self {
+        Self::configured_schedules(tag, config, None)
+    }
+    fn configured_schedules(tag: &str, config: Option<&str>, schedules: Option<&str>) -> Self {
+        Self::configured_schedules_home(tag, config, schedules, false)
+    }
+    fn configured_schedules_home(
+        tag: &str,
+        config: Option<&str>,
+        schedules: Option<&str>,
+        isolated_home: bool,
+    ) -> Self {
+        let dir = std::env::temp_dir().join(format!("mk045-{}-{tag}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        // 데몬은 그룹 쓰기 가능한 상태 디렉터리를 거부한다. Ubuntu 기본 umask(002)에서도 실제 설치(0700)와 같게 만든다.
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        if let Some(config) = config {
+            fs::write(dir.join("history.toml"), config).unwrap();
+        }
+        if let Some(schedules) = schedules {
+            fs::write(dir.join("schedules.toml"), schedules).unwrap();
+        }
+        let bin = Path::new(MK).parent().unwrap();
+        let socket = dir.join("run/krilld.sock");
+        let holder = Command::new(bin.join("krill-holder"))
+            .arg(bin.join("krilld"))
+            .arg(&socket)
+            // 외부 릴레이·공개 PWA 배포 상태에 의존하지 않는 격리된 모바일 게이트웨이.
+            .env("KRILL_MOBILE_ORIGIN", "http://127.0.0.1:0")
+            .env("KRILL_STATE_DIR", &dir)
+            .envs(
+                [
+                    "HOME",
+                    "CLAUDE_CONFIG_DIR",
+                    "CODEX_HOME",
+                    "ANTIGRAVITY_CLI_HOME",
+                    "AGY_HOME",
+                    "OPENCODE_CONFIG_DIR",
+                    "OPENCODE_DATA_DIR",
+                    "XDG_DATA_HOME",
+                ]
+                .into_iter()
+                .filter(|_| isolated_home)
+                .map(|name| (name, dir.join("empty-home"))),
+            )
+            .env_remove("KRILL_SESSION_ID")
+            .env_remove("MK_SESSION_ID")
+            .env_remove("KRILL_PANE_ID")
+            .env_remove("MK_PANE_ID")
+            .env_remove("KRILL_ORCH_DEPTH")
+            .env_remove("MK_WORKER_DEPTH")
+            .env_remove("KRILL_ORCH_MAX_DEPTH")
+            .env_remove("MK_MAX_WORKER_DEPTH")
+            .env_remove("KRILL_WORKTREES_DIR")
+            .env_remove("KRILL_ORCA_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + WAIT;
+        let krilld = loop {
+            if let Ok(c) = handshake(&socket, &client_hello(ClientRole::Cli, "mk045"), WAIT) {
+                break u32::try_from(c.server.instance_id).unwrap();
+            }
+            assert!(Instant::now() < deadline, "daemon startup timed out");
+            thread::sleep(Duration::from_millis(20));
+        };
+        Self {
+            holder,
+            krilld,
+            dir,
+        }
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(MK);
+        command
+            .args(args)
+            .env("KRILL_STATE_DIR", &self.dir)
+            .env_remove("KRILL_SESSION_ID")
+            .env_remove("MK_SESSION_ID")
+            .env_remove("KRILL_PANE_ID")
+            .env_remove("MK_PANE_ID")
+            .env_remove("KRILL_ORCH_DEPTH")
+            .env_remove("MK_WORKER_DEPTH")
+            .env_remove("KRILL_ORCH_MAX_DEPTH")
+            .env_remove("MK_MAX_WORKER_DEPTH")
+            .env_remove("KRILL_WORKTREES_DIR")
+            .env_remove("KRILL_ORCA_DIR");
+        command
+    }
+    fn ok(&self, args: &[&str]) -> String {
+        Self::ok_output(self.run(args), args)
+    }
+    /// Runs the CLI as an agent inside session `pane` would (`MK_PANE_ID`).
+    fn ok_in(&self, pane: &str, args: &[&str]) -> String {
+        let out = self.command(args).env("MK_PANE_ID", pane).output().unwrap();
+        Self::ok_output(out, args)
+    }
+    fn ok_output(out: Output, args: &[&str]) -> String {
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+    fn wait_text(&self, id: &str, text: &str) -> String {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let out = self.ok(&["read", id]);
+            if out.contains(text) {
+                return out;
+            }
+            assert!(Instant::now() < deadline, "missing {text:?}: {out:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// `krill ls` 출력에서 세션 ID 존재 여부를 첫 칼럼 정확 매칭으로 판정한다.
+/// 부분문자열(`contains("1\t")`)은 다른 행의 PID 끝자리와 오탐한다
+/// (예: 남은 세션 행 `2\t12341\t...`는 `"1\t"`을 포함한다).
+fn ls_has_session(ls: &str, id: &str) -> bool {
+    ls.lines()
+        .skip(1)
+        .filter_map(|line| line.split('\t').next())
+        .any(|first| first == id)
+}
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // Close our sessions first so a failing test never leaves a live shell behind.
+        if let Ok(mut c) = handshake(
+            &self.dir.join("run/krilld.sock"),
+            &client_hello(ClientRole::Cli, "cleanup"),
+            WAIT,
+        ) {
+            c.stream.write_all(&Request::List.encode().unwrap()).ok();
+            if let Ok(Some((kind, body))) = ipc::read_frame(&mut c.stream)
+                && let Ok(Reply::Sessions(sessions)) = Reply::decode(kind, &body)
+            {
+                for info in sessions {
+                    c.stream
+                        .write_all(
+                            &Request::Close {
+                                session: info.session,
+                            }
+                            .encode()
+                            .unwrap(),
+                        )
+                        .ok();
+                    ipc::read_frame(&mut c.stream).ok();
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+        }
+        self.holder.kill().ok();
+        self.holder.wait().ok();
+        Command::new("/bin/kill")
+            .args(["-9", &self.krilld.to_string()])
+            .status()
+            .ok();
+        fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+#[test]
+fn commands_work_without_app_and_reach_other_sessions() {
+    let d = Daemon::new("commands");
+    assert!(d.ok(&["doctor"]).contains("daemon     ok"));
+    let id = d.ok(&[
+        "new",
+        "--cwd",
+        d.dir.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty -echo; printf 'ready\\n'; IFS= read -r line; printf 'received:%s\\n' \"$line\"; pwd",
+    ]);
+    let id = id.trim();
+    d.wait_text(id, "ready");
+    assert!(ls_has_session(&d.ok(&["ls"]), id));
+    assert_eq!(
+        d.run(&["wait", id, "--for", "done", "--timeout", "0"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert!(
+        d.ok(&["wait", id, "--for", "unknown", "--timeout", "0"])
+            .contains("unknown")
+    );
+
+    // 다른 세션 안에서 실행한 `krill`도 무관한 세션에 입력을 보낼 수 있다(Orca 소유자 모델).
+    let unrelated = d.ok(&[
+        "new",
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty -echo; printf 'unrelated-ready\\n'; IFS= read -r line; printf 'unrelated-got:%s\\n' \"$line\"; sleep 30",
+    ]);
+    let unrelated = unrelated.trim();
+    d.wait_text(unrelated, "unrelated-ready");
+    let sent = d.dir.join("sent");
+    let child_out = d.dir.join("child-out");
+    let attack = format!(
+        "KRILL_STATE_DIR='{dir}' '{krill}' send {unrelated} --enter from-other >'{sent}' 2>&1; \
+         printf '%s' $? >'{sent}.status'; \
+         cid=$(KRILL_STATE_DIR='{dir}' '{krill}' new -- /bin/sh -c 'stty -echo; printf child-ready\\\\n; IFS= read -r l; printf child-got:%s\\\\n \"$l\"') && \
+         KRILL_STATE_DIR='{dir}' '{krill}' wait \"$cid\" --for pattern:child-ready --timeout 5 && \
+         KRILL_STATE_DIR='{dir}' '{krill}' send \"$cid\" --enter -- from-creator && \
+         KRILL_STATE_DIR='{dir}' '{krill}' wait \"$cid\" --timeout 5 && \
+         KRILL_STATE_DIR='{dir}' '{krill}' read \"$cid\" >'{cout}' 2>&1; \
+         printf '%s' $? >'{cout}.status'",
+        dir = d.dir.display(),
+        krill = MK,
+        sent = sent.display(),
+        cout = child_out.display(),
+    );
+    let attacker = d.ok(&["new", "--", "/bin/sh", "-c", &attack]);
+    d.ok(&["wait", attacker.trim(), "--timeout", "10"]);
+    assert_eq!(
+        fs::read_to_string(sent.with_extension("status")).unwrap(),
+        "0",
+        "{}",
+        fs::read_to_string(&sent).unwrap_or_default()
+    );
+    d.wait_text(unrelated, "unrelated-got:from-other");
+    assert_eq!(
+        fs::read_to_string(child_out.with_extension("status")).unwrap(),
+        "0",
+        "child output: {}",
+        fs::read_to_string(&child_out).unwrap_or_default()
+    );
+    assert!(
+        fs::read_to_string(&child_out)
+            .unwrap()
+            .contains("child-got:from-creator")
+    );
+
+    d.ok(&["send", id, "--enter", "--", "안녕"]);
+    d.ok(&["wait", id, "--timeout", "5"]);
+    let text = d.wait_text(id, "received:안녕");
+    assert!(text.contains(d.dir.to_str().unwrap()));
+    assert!(d.ok(&["ls"]).contains("exited\texited"));
+    assert_eq!(d.run(&["read", "999999"]).status.code(), Some(1));
+    assert_eq!(d.run(&["send", id, "late"]).status.code(), Some(1));
+    assert_eq!(d.run(&["new", "--cols", "0"]).status.code(), Some(2));
+}
+
+fn host() -> (OwnedFd, OwnedFd) {
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    tcsetwinsize(
+        &pty.controller,
+        Winsize {
+            ws_col: 90,
+            ws_row: 27,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    (pty.controller, pty.user)
+}
+
+fn receive_until(fd: &OwnedFd, bytes: &mut Vec<u8>, text: &str) {
+    let deadline = Instant::now() + WAIT;
+    while !String::from_utf8_lossy(bytes).contains(text) {
+        assert!(
+            Instant::now() < deadline,
+            "missing {text:?}: {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        let mut fds = [PollFd::new(fd, PollFlags::IN)];
+        poll(
+            &mut fds,
+            Some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 100_000_000,
+            }),
+        )
+        .unwrap();
+        if !fds[0].revents().is_empty() {
+            let mut buf = [0; 8192];
+            let n = rustix::io::read(fd, &mut buf).unwrap();
+            bytes.extend_from_slice(&buf[..n]);
+        }
+    }
+}
+
+#[test]
+fn attach_uses_a_normal_terminal_and_detach_preserves_session() {
+    let d = Daemon::new("attach");
+    let id = d.ok(&["new", "--", "/bin/sh", "-c", "stty -echo; printf 'before-attach\\n'; IFS= read -r line; printf 'terminal:%s\\n' \"$line\"; stty size; while IFS= read -r line; do [ \"$line\" = done ] && break; printf 'resized:%s:%s\\n' \"$line\" \"$(stty size)\"; done; IFS= read -r line; printf 'after:%s\\n' \"$line\"; stty size"]);
+    let id = id.trim();
+    d.wait_text(id, "before-attach");
+    let (master, slave) = host();
+    let before = tcgetattr(&master).unwrap();
+    let mut attach = Command::new(MK)
+        .args(["attach", id])
+        .env("KRILL_STATE_DIR", &d.dir)
+        .stdin(File::from(slave.try_clone().unwrap()))
+        .stdout(File::from(slave))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut bytes = Vec::new();
+    receive_until(&master, &mut bytes, "before-attach");
+    rustix::io::write(&master, b"from-terminal\r").unwrap();
+    receive_until(&master, &mut bytes, "terminal:from-terminal");
+    receive_until(&master, &mut bytes, "27 90");
+    // Dynamic host resize is propagated and preserved across subsequent key input on the same attach stream.
+    tcsetwinsize(
+        &master,
+        Winsize {
+            ws_col: 100,
+            ws_row: 30,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        rustix::io::write(&master, b"probe\r").unwrap();
+        receive_until(&master, &mut bytes, "resized:probe:");
+        let screen = d.ok(&["read", id]);
+        if screen.contains("resized:probe:30 100") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach key input reverted or never applied resize: {screen}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    rustix::io::write(&master, b"after-key\r").unwrap();
+    receive_until(&master, &mut bytes, "resized:after-key:30 100");
+    rustix::io::write(&master, b"done\r\x1d").unwrap();
+    assert!(attach.wait().unwrap().success());
+    assert_eq!(
+        format!("{:?}", tcgetattr(&master).unwrap()),
+        format!("{before:?}"),
+        "host termios was not restored"
+    );
+    d.ok(&["send", id, "--enter", "still-alive"]);
+    d.ok(&["wait", id, "--timeout", "5"]);
+    let final_screen = d.wait_text(id, "after:still-alive");
+    assert!(final_screen.contains("30 100"), "{final_screen}");
+    assert_eq!(
+        String::from_utf8_lossy(&bytes)
+            .matches("terminal:from-terminal")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn history_clear_preserves_live_session_and_restarts_recording() {
+    let d = Daemon::new("history");
+    let id = d.ok(&["new", "--", "/bin/sh", "-c",
+        "stty -echo; printf 'old-secret'; IFS= read -r line; printf 'new-output'; IFS= read -r line"]);
+    let id = id.trim();
+    d.wait_text(id, "old-secret");
+    // PTY append follows screen publication on the reader thread.
+    let deadline = Instant::now() + WAIT;
+    let session = d.dir.join("sessions").join(format!("{id}.noindex"));
+    while fs::read_dir(&session).unwrap().next().is_none() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(d.ok(&["history", "clear"]).contains("history cleared"));
+    assert!(!d.dir.join("sessions").exists());
+    assert!(d.ok(&["read", id]).contains("old-secret"));
+    d.ok(&["history", "clear"]);
+    d.ok(&["send", id, "--enter", "go"]);
+    d.wait_text(id, "new-output");
+    assert!(ls_has_session(&d.ok(&["ls"]), id));
+    // A session descendant holds full rights like an external shell (Orca owner model).
+    let report = d.dir.join("inside.status");
+    let script = format!(
+        "KRILL_STATE_DIR='{}' '{}' history clear; printf '%s' $? > '{}'",
+        d.dir.display(),
+        MK,
+        report.display()
+    );
+    let inside = d.ok(&["new", "--", "/bin/sh", "-c", &script]);
+    d.ok(&["wait", inside.trim(), "--timeout", "5"]);
+    assert_eq!(fs::read_to_string(report).unwrap(), "0");
+    assert_eq!(d.run(&["history"]).status.code(), Some(2));
+    d.ok(&["history", "clear"]);
+    assert!(!d.dir.join("sessions").exists());
+}
+
+#[test]
+fn history_disabled_has_no_disk_recording_through_real_pty() {
+    let d = Daemon::configured("history-disabled", Some("recording = false"));
+    let id = d.ok(&["new", "--", "/bin/sh", "-c", "printf 'private-output'"]);
+    d.ok(&["wait", id.trim(), "--timeout", "5"]);
+    assert!(d.ok(&["read", id.trim()]).contains("private-output"));
+    assert!(!d.dir.join("sessions").exists());
+    d.ok(&["history", "clear"]);
+    assert!(!d.dir.join("sessions").exists());
+}
+
+/// MK-055: 사용자 전역 설정·실제 유료 CLI 없이 `Program::Agent` 경로를 실제 PTY로 검증한다.
+#[test]
+fn agent_profile_runs_in_non_git_folder_with_literal_path() {
+    let d = Daemon::new("folder-agent");
+    let folder = d.dir.join("한글 folder 'quotes' ;$name");
+    fs::create_dir(&folder).unwrap();
+    assert!(!folder.join(".git").exists());
+    fs::write(d.dir.join("agents.toml"), r#"
+[agent.folder_probe]
+name = "Folder probe"
+launch = ["/bin/sh", "-c", "printf 'folder-agent-ready\\n'; /bin/pwd -P; IFS= read -r line; printf 'agent-received:%s\\n' \"$line\""]
+"#).unwrap();
+    let id = d.ok(&[
+        "new",
+        "--cols",
+        "240",
+        "--cwd",
+        folder.to_str().unwrap(),
+        "--agent",
+        "folder_probe",
+    ]);
+    let id = id.trim();
+    let text = d.wait_text(id, "folder-agent-ready");
+    let expected = fs::canonicalize(&folder).unwrap();
+    let text = if text.contains(expected.to_str().unwrap()) {
+        text
+    } else {
+        d.wait_text(id, expected.to_str().unwrap())
+    };
+    assert!(text.contains(expected.to_str().unwrap()), "{text}");
+    d.ok(&["send", id, "--enter", "folder-input"]);
+    d.wait_text(id, "agent-received:folder-input");
+    // 에이전트 종료는 Exited로 잡히고, 세션은 로그인 셸로 남는다.
+    d.ok(&["wait", id, "--for", "exited", "--timeout", "5"]);
+    assert!(
+        ls_has_session(&d.ok(&["ls"]), id),
+        "agent exit must retain its login shell"
+    );
+    assert!(!folder.join(".git").exists());
+}
+
+#[test]
+fn creator_can_read_child_after_daemon_sigkill() {
+    let mut d = Daemon::new("creator-restart");
+    let script = format!(
+        r#"stty -echo
+cid=$(KRILL_STATE_DIR='{dir}' '{MK}' new -- /bin/sh -c 'stty -echo; IFS= read -r _; printf child-alive; exec sleep 600')
+printf 'child-created\n'
+IFS= read -r _
+KRILL_STATE_DIR='{dir}' '{MK}' send "$cid" --enter ping &&
+KRILL_STATE_DIR='{dir}' '{MK}' wait "$cid" --for pattern:child-alive --timeout 5 &&
+KRILL_STATE_DIR='{dir}' '{MK}' read "$cid" >'{dir}/child-read' 2>'{dir}/child-error'
+printf '%s' $? >'{dir}/child-status'
+printf 'child-read-finished\n'
+exec sleep 600"#,
+        dir = d.dir.display()
+    );
+    let parent = d.ok(&["new", "--", "/bin/sh", "-c", &script]);
+    let parent = parent.trim();
+    d.wait_text(parent, "child-created");
+    Command::new("/bin/kill")
+        .args(["-9", &d.krilld.to_string()])
+        .status()
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Ok(c) = handshake(
+            &d.dir.join("run/krilld.sock"),
+            &client_hello(ClientRole::Cli, "restart"),
+            WAIT,
+        ) {
+            let next = u32::try_from(c.server.instance_id).unwrap();
+            if next != d.krilld {
+                d.krilld = next;
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "daemon did not restart");
+        thread::sleep(Duration::from_millis(20));
+    }
+    d.ok(&["send", parent, "--enter", "read-child"]);
+    d.wait_text(parent, "child-read-finished");
+    assert_eq!(
+        fs::read_to_string(d.dir.join("child-status")).unwrap(),
+        "0",
+        "{}",
+        fs::read_to_string(d.dir.join("child-error")).unwrap_or_default()
+    );
+    assert!(
+        fs::read_to_string(d.dir.join("child-read"))
+            .unwrap()
+            .contains("child-alive")
+    );
+}
+
+#[test]
+fn resume_rejects_a_running_session_without_spawning_another_process() {
+    use krill_proto::control::{Create, Failure, Program};
+    let d = Daemon::new("resume-running");
+    let id = d.ok(&[
+        "new",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf resume-ready; exec sleep 600",
+    ]);
+    let id = id.trim();
+    d.wait_text(id, "resume-ready");
+    let mut c = handshake(
+        &d.dir.join("run/krilld.sock"),
+        &client_hello(ClientRole::Cli, "resume"),
+        WAIT,
+    )
+    .unwrap();
+    let req = Request::Resume {
+        session: krill_proto::SessionId(id.parse().unwrap()),
+        create: Create {
+            account: None,
+            program: Program::Custom {
+                program: b"/bin/sleep".to_vec(),
+                args: vec![b"600".to_vec()],
+            },
+            cwd: vec![],
+            cols: 80,
+            rows: 24,
+        },
+    };
+    c.stream.write_all(&req.encode().unwrap()).unwrap();
+    let (kind, body) = ipc::read_frame(&mut c.stream).unwrap().unwrap();
+    assert_eq!(
+        Reply::decode(kind, &body).unwrap(),
+        Reply::Failed(Failure::BadRequest)
+    );
+    c.stream
+        .write_all(&Request::List.encode().unwrap())
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut c.stream).unwrap().unwrap();
+    assert!(
+        matches!(Reply::decode(kind, &body).unwrap(), Reply::Sessions(sessions) if sessions.len() == 1)
+    );
+    assert!(d.ok(&["read", id]).contains("resume-ready"));
+}
+
+#[test]
+fn scheduled_prompts_run_without_app_and_do_not_replay_after_daemon_restart() {
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let config = r#"[[schedule]]
+id = "literal"
+cron = "* * * * *"
+cwd = "/tmp"
+command = ["/bin/sh", "-c", "printf '%s\\n' \"$1\"; sleep 5", "schedule"]
+prompt = "한글 $(literal); 'quote'"
+"#;
+    let mut d = Daemon::configured_schedules("schedule", None, Some(config));
+    let deadline = Instant::now() + WAIT;
+    let session = loop {
+        let runs = d.ok(&["schedule", "runs"]);
+        let rows: Vec<serde_json::Value> = runs
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if let Some(session) = rows
+            .iter()
+            .find(|r| r["phase"] == "spawned")
+            .and_then(|r| r["session"].as_u64())
+        {
+            break session.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduled process not spawned: {runs}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    d.wait_text(&session, "한글 $(literal); 'quote'");
+    assert!(d.ok(&["schedule", "list"]).contains("literal"));
+    let before = fs::read(d.dir.join("schedules.toml")).unwrap();
+    assert!(
+        !d.run(&[
+            "schedule",
+            "add",
+            "bad",
+            "--cron",
+            "*/0 * * * *",
+            "--prompt",
+            "bad",
+            "--",
+            "/bin/echo"
+        ])
+        .status
+        .success()
+    );
+    assert_eq!(fs::read(d.dir.join("schedules.toml")).unwrap(), before);
+    d.ok(&[
+        "schedule",
+        "add",
+        "future",
+        "--cron",
+        "0 0 31 2 *",
+        "--prompt",
+        "never",
+        "--",
+        "/bin/echo",
+    ]);
+    assert!(d.ok(&["schedule", "list"]).contains("future"));
+    assert_eq!(
+        fs::metadata(d.dir.join("schedules.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    d.ok(&["schedule", "rm", "future"]);
+    assert!(!d.ok(&["schedule", "list"]).contains("future"));
+
+    let old = d.krilld;
+    Command::new("/bin/kill")
+        .args(["-9", &old.to_string()])
+        .status()
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Ok(c) = handshake(
+            &d.dir.join("run/krilld.sock"),
+            &client_hello(ClientRole::Cli, "mk101-restart"),
+            Duration::from_millis(100),
+        ) {
+            let pid = u32::try_from(c.server.instance_id).unwrap();
+            if pid != old {
+                d.krilld = pid;
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "daemon did not restart");
+        thread::sleep(Duration::from_millis(25));
+    }
+    thread::sleep(Duration::from_millis(1200));
+    let mut claimed = HashSet::new();
+    let runs = d.ok(&["schedule", "runs"]);
+    for line in runs.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        if row["phase"] == "started" {
+            assert!(
+                claimed.insert((row["id"].clone(), row["minute"].clone())),
+                "duplicate claim: {runs}"
+            );
+        }
+    }
+    d.ok(&["schedule", "rm", "literal"]);
+    assert!(!d.ok(&["schedule", "list"]).contains("literal"));
+}
+
+/// 내장 `krill` 스킬 문서가 안내하는 세션 명령을 그대로 실제 krilld에 돌린다.
+#[test]
+fn krill_skill_session_commands_match_cli() {
+    let skill = krill_proto::orchestration::BUILTIN_SKILLS
+        .iter()
+        .find(|s| s.name == "krill")
+        .unwrap();
+    let documented = |cmd: &str| assert!(skill.content.contains(cmd), "{cmd}");
+    let d = Daemon::new("skill-doc");
+    let id = d.ok(&[
+        "new",
+        "--cwd",
+        d.dir.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "stty -echo; printf 'ready\\n'; IFS= read -r line; printf 'got:%s\\n' \"$line\"; exec sleep 60",
+    ]);
+    let id = id.trim();
+    d.wait_text(id, "ready");
+
+    documented("krill ls --json");
+    let ls: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+    assert!(
+        ls.as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |s| s["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
+                    && s["process"] == "running"
+            ),
+        "{ls}"
+    );
+
+    documented("krill send <session_id> --text \"<text>\" --enter");
+    d.ok(&["send", id, "--text", "hello skill", "--enter"]);
+    d.wait_text(id, "got:hello skill");
+
+    documented("krill read <session_id> --lines 80");
+    assert!(
+        d.ok(&["read", id, "--lines", "80"])
+            .contains("got:hello skill")
+    );
+    assert!(d.ok(&["read", id, "--lines", "1"]).lines().count() <= 1);
+
+    documented("krill wait <session_id> --for idle --timeout 30");
+    // 평범한 셸은 상태를 몰라 idle에 닿지 않는다 — 파서를 통과해 시간 초과(2)로 끝나야 한다.
+    let wait = d.run(&["wait", id, "--for", "idle", "--timeout", "0"]);
+    assert_eq!(wait.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&wait.stderr).contains("wait timed out"));
+
+    documented("krill kill <session_id>");
+    d.ok(&["kill", id]);
+    assert!(!ls_has_session(&d.ok(&["ls"]), id));
+}
+
+#[test]
+fn session_checkpoint_references_and_release_preserve_the_selected_worktree_and_output() {
+    let d = Daemon::new("m8-session-context");
+    let repo = d.dir.join("repo");
+    let sub = repo.join("nested");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(&sub).unwrap();
+    let key = fs::canonicalize(&repo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let id = d.ok(&["new", "--cwd", sub.to_str().unwrap(), "--", "/bin/sh", "-c",
+        "stty -echo; printf 'archive-marker\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done"]);
+    let id = id.trim();
+    d.wait_text(id, "archive-marker");
+    let checkpoint = d.ok(&[
+        "set",
+        "--session",
+        id,
+        "--comment",
+        "selected session",
+        "--json",
+    ]);
+    let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+    assert_eq!(checkpoint["worktree"], key);
+    let refs = d.ok(&[
+        "reference",
+        "add",
+        "https://example.com/session",
+        "--session",
+        id,
+        "--json",
+    ]);
+    let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+    assert_eq!(refs["worktree"], key);
+    let before = fs::read(d.dir.join("worktree-comments.toml")).unwrap();
+    for args in [
+        vec!["set", "--session", "999999", "--comment", "wrong"],
+        vec!["reference", "add", "wrong", "--session", "999999"],
+    ] {
+        assert_eq!(d.run(&args).status.code(), Some(1));
+        assert_eq!(
+            fs::read(d.dir.join("worktree-comments.toml")).unwrap(),
+            before
+        );
+    }
+
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Archive",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    let task: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "task-create",
+        "--run",
+        run,
+        "--title",
+        "Work",
+        "--json",
+    ]))
+    .unwrap();
+    let task = task["id"].as_str().unwrap();
+    let dispatch: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run,
+        "--task",
+        task,
+        "--worker",
+        "archive-worker",
+        "--session",
+        id,
+        "--prompt",
+        "Work",
+        "--json",
+    ]))
+    .unwrap();
+    let dispatch = dispatch["id"].as_str().unwrap();
+    let before_sessions = d.ok(&["ls", "--json"]);
+    let before_store = fs::read(d.dir.join("orchestration.json")).unwrap();
+    assert!(
+        !d.run(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--task",
+            task,
+            "--worker",
+            "replacement",
+            "--prompt",
+            "retry"
+        ])
+        .status
+        .success()
+    );
+    assert_eq!(d.ok(&["ls", "--json"]), before_sessions);
+    assert_eq!(
+        fs::read(d.dir.join("orchestration.json")).unwrap(),
+        before_store
+    );
+    d.ok(&["send", id, "--text", "still-alive", "--enter"]);
+    d.wait_text(id, "got:still-alive");
+    d.ok(&[
+        "orchestration",
+        "send",
+        "--from",
+        "archive-worker",
+        "--to",
+        "coordinator",
+        "--type",
+        "worker_done",
+        "--dispatch",
+        dispatch,
+        "--summary",
+        "Result summary",
+    ]);
+    let rejected = d.run(&["orchestration", "worker-release", dispatch]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("borrowed"));
+    assert!(ls_has_session(&d.ok(&["ls"]), id));
+    let borrowed_id = id.to_owned();
+    let script = "stty -echo; printf 'archive-marker\\n> '; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done";
+    fs::write(d.dir.join("agents.toml"), format!(
+        "[agent.archive_fixture]\nname = \"Archive fixture\"\nlaunch = [\"/bin/sh\", \"-c\", {}]\n",
+        serde_json::to_string(script).unwrap(),
+    )).unwrap();
+    let owned_run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Owned archive",
+        "--json",
+    ]))
+    .unwrap();
+    let owned: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        owned_run["id"].as_str().unwrap(),
+        "--worker",
+        "owned-archive",
+        "--agent",
+        "archive_fixture",
+        "--cwd",
+        sub.to_str().unwrap(),
+        "--prompt",
+        "Work",
+        "--json",
+    ]))
+    .unwrap();
+    let dispatch = owned["id"].as_str().unwrap();
+    let owned_id = owned["session_id"].as_u64().unwrap().to_string();
+    let id = owned_id.as_str();
+    d.ok(&[
+        "orchestration",
+        "send",
+        "--from",
+        "owned-archive",
+        "--type",
+        "worker_done",
+        "--dispatch",
+        dispatch,
+        "--summary",
+        "Result summary",
+    ]);
+    let released: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-release", dispatch, "--json"]))
+            .unwrap();
+    assert_eq!(released["summary"], "Result summary");
+    assert!(
+        released["archived_output"]
+            .as_str()
+            .unwrap()
+            .contains("archive-marker")
+    );
+    assert!(!ls_has_session(&d.ok(&["ls"]), id));
+    let output: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-read", dispatch, "--json"])).unwrap();
+    assert!(
+        output["output"]
+            .as_str()
+            .unwrap()
+            .contains("archive-marker")
+    );
+    d.ok(&["orchestration", "worker-release", dispatch]);
+    assert!(ls_has_session(&d.ok(&["ls"]), &borrowed_id));
+    assert_eq!(
+        fs::read(d.dir.join("worktree-comments.toml")).unwrap(),
+        before
+    );
+    d.ok(&["kill", &borrowed_id]);
+}
+
+/// A session whose agent finished its turn (`Stop` hook) and echoes whatever is typed into it.
+fn idle_echo_session(d: &Daemon, ready: &str) -> String {
+    let script = format!(
+        "printf '%s' '{{\"hook_event_name\":\"Stop\"}}' | KRILL_STATE_DIR='{}' '{MK}' hook claude >/dev/null; \
+         printf '{ready}\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+        d.dir.display()
+    );
+    let id = d
+        .ok(&["new", "--", "/bin/sh", "-c", &script])
+        .trim()
+        .to_owned();
+    d.wait_text(&id, ready);
+    d.ok(&[
+        "wait",
+        &id,
+        "--for",
+        "idle",
+        "--quiet-ms",
+        "0",
+        "--timeout",
+        "5",
+    ]);
+    id
+}
+
+#[test]
+fn run_created_from_a_pane_wakes_its_idle_coordinator() {
+    let d = Daemon::new("coordinator-wake");
+    let coordinator = idle_echo_session(&d, "coordinator-ready");
+    let run: serde_json::Value = serde_json::from_str(&d.ok_in(
+        &coordinator,
+        &["orchestration", "run-create", "--title", "Wake", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(
+        run["coordinator_session_id"]
+            .as_u64()
+            .map(|n| n.to_string()),
+        Some(coordinator.clone())
+    );
+    let run = run["id"].as_str().unwrap();
+    d.ok(&[
+        "orchestration",
+        "send",
+        "--from",
+        "reporter",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--summary",
+        "progress",
+    ]);
+    let screen = d.wait_text(&coordinator, "got:[Krill orchestration] Unread mail.");
+    assert!(screen.contains(&format!("--run '{run}'")), "{screen}");
+}
+
+#[test]
+fn acknowledged_worker_done_releases_idle_created_workers_only() {
+    let d = Daemon::new("auto-release");
+    // Ready (Stop) at launch; a prompt line containing MAKE-BUSY starts a new turn (Working).
+    let hook = |event: &str| {
+        format!(
+            "printf '%s' '{{\"hook_event_name\":\"{event}\"}}' | KRILL_STATE_DIR='{}' '{MK}' hook claude >/dev/null",
+            d.dir.display()
+        )
+    };
+    let script = format!(
+        "stty -echo; {}; printf 'auto-marker\\n> '; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; \
+         case \"$line\" in *MAKE-BUSY*) {};; esac; done",
+        hook("Stop"),
+        hook("UserPromptSubmit")
+    );
+    fs::write(
+        d.dir.join("agents.toml"),
+        format!(
+            "[agent.auto_fixture]\nname = \"Auto fixture\"\nlaunch = [\"/bin/sh\", \"-c\", {}]\n",
+            serde_json::to_string(&script).unwrap()
+        ),
+    )
+    .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Auto release",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    let cwd = d.dir.to_str().unwrap();
+    let mut workers = Vec::new();
+    for (worker, prompt, state, wait_extra) in [
+        ("auto-idle", "Work", "idle", &["--quiet-ms", "0"][..]),
+        ("auto-kept", "Work", "idle", &["--quiet-ms", "0"]),
+        ("auto-busy", "Work MAKE-BUSY", "working", &[]),
+    ] {
+        let started: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--worker",
+            worker,
+            "--agent",
+            "auto_fixture",
+            "--cwd",
+            cwd,
+            "--prompt",
+            prompt,
+            "--json",
+        ]))
+        .unwrap();
+        let dispatch = started["id"].as_str().unwrap().to_owned();
+        let session = started["session_id"].as_u64().unwrap().to_string();
+        d.wait_text(&session, "auto-marker");
+        d.ok(&[
+            &["wait", &session, "--for", state, "--timeout", "5"],
+            wait_extra,
+        ]
+        .concat());
+        d.ok(&[
+            "orchestration",
+            "send",
+            "--from",
+            worker,
+            "--type",
+            "worker_done",
+            "--dispatch",
+            &dispatch,
+            "--summary",
+            "Result summary",
+        ]);
+        workers.push((dispatch, session));
+    }
+    let [
+        (idle, idle_session),
+        (kept, kept_session),
+        (_, busy_session),
+    ] = &workers[..]
+    else {
+        unreachable!()
+    };
+    d.ok(&["orchestration", "worker-retain", kept]);
+    let peek: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "check",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--unread",
+        "--json",
+    ]))
+    .unwrap();
+    assert!(peek.get("auto_released").is_none(), "{peek}");
+    assert_eq!(peek["messages"].as_array().unwrap().len(), 3);
+    let ls = d.ok(&["ls"]);
+    for (_, session) in &workers {
+        assert!(
+            ls_has_session(&ls, session),
+            "peek must not release {session}"
+        );
+    }
+    let acked: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "check",
+        "--to",
+        "coordinator",
+        "--run",
+        run,
+        "--ack",
+        peek["delivery"]["id"].as_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(acked["auto_released"], serde_json::json!([idle]));
+    assert!(
+        acked["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["acked"] == true)
+    );
+    let ls = d.ok(&["ls"]);
+    assert!(!ls_has_session(&ls, idle_session));
+    assert!(ls_has_session(&ls, kept_session));
+    assert!(ls_has_session(&ls, busy_session));
+    let released: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-show", idle, "--json"])).unwrap();
+    assert_eq!(released["release_state"], "released");
+    assert!(
+        released["archived_output"]
+            .as_str()
+            .unwrap()
+            .contains("auto-marker")
+    );
+}
+
+#[test]
+fn kill_and_close_wait_for_termination_including_signal_escalation() {
+    let d = Daemon::new("close-wait");
+    for command in ["kill", "close"] {
+        let id = d.ok(&[
+            "new",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' HUP TERM; printf 'ignore-signals-ready\\n'; while :; do sleep 0.1; done",
+        ]);
+        let id = id.trim();
+        d.wait_text(id, "ignore-signals-ready");
+        d.ok(&[command, id]);
+        assert!(!ls_has_session(&d.ok(&["ls"]), id));
+    }
+}
+
+#[test]
+fn worker_start_validates_run_and_task_before_spawn_and_reports_delivery_errors() {
+    let d = Daemon::new("worker-preflight");
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "Preflight",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    let before_sessions = d.ok(&["ls", "--json"]);
+    let before_store = fs::read(d.dir.join("orchestration.json")).unwrap();
+
+    // 잘못된 Run/Task는 에이전트 스폰 시도보다 먼저 거부해야 한다.
+    // 존재하지 않는 프로필을 지정해 스폰 오류가 선검증 오류를 가리는 회귀도 잡는다.
+    for (run_id, task, expected) in [
+        ("missing-run", None, "run not found"),
+        (run, Some("missing-task"), "task not found"),
+    ] {
+        let mut args = vec![
+            "orchestration",
+            "worker-start",
+            "--run",
+            run_id,
+            "--worker",
+            "invalid",
+            "--agent",
+            "missing-preflight-agent",
+            "--prompt",
+            "Work",
+        ];
+        if let Some(task) = task {
+            args.extend(["--task", task]);
+        }
+        let out = d.run(&args);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{out:?}"
+        );
+        assert_eq!(d.ok(&["ls", "--json"]), before_sessions);
+        assert_eq!(
+            fs::read(d.dir.join("orchestration.json")).unwrap(),
+            before_store
+        );
+    }
+
+    let spawn = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run,
+        "--worker",
+        "spawn-failure",
+        "--agent",
+        "missing-preflight-agent",
+        "--prompt",
+        "Work",
+        "--json",
+    ]);
+    assert_eq!(spawn.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&spawn.stderr)
+            .contains("spawn missing-preflight-agent worker session")
+    );
+    assert_eq!(d.ok(&["ls", "--json"]), before_sessions);
+    // A validated start is recorded before launch so its failure stays inspectable.
+    let failed: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "worker-show", "spawn-failure", "--json"]))
+            .unwrap();
+    assert_eq!(failed["status"], "failed");
+    let receipt: serde_json::Value = serde_json::from_slice(&spawn.stdout).unwrap();
+    assert_eq!(receipt["id"], failed["id"]);
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["summary"], failed["summary"]);
+    let request = receipt["request_id"].as_str().unwrap();
+    let lookup: serde_json::Value =
+        serde_json::from_str(&d.ok(&["orchestration", "request-show", request, "--json"])).unwrap();
+    assert_eq!(lookup, receipt);
+    assert!(
+        failed["summary"]
+            .as_str()
+            .unwrap()
+            .contains("unknown agent profile")
+    );
+    let after_failed_start = fs::read(d.dir.join("orchestration.json")).unwrap();
+
+    // 존재하지 않는 세션을 지정하면 고스트 Active dispatch를 남기지 않고 시작 전에 거부한다(C1).
+    // 예전에는 dispatch를 Active로 기록한 뒤 전송 실패로 끝내 stop/release가 영구 실패하는 쐐기가 됐다.
+    let delivered = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run,
+        "--worker",
+        "delivery-failure",
+        "--session",
+        "999999",
+        "--prompt",
+        "Work",
+        "--json",
+    ]);
+    assert_eq!(delivered.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&delivered.stderr).contains("session 999999 not found"),
+        "{:?}",
+        delivered.stderr
+    );
+    assert!(
+        delivered.stdout.is_empty(),
+        "ghost dispatch must not be printed: {:?}",
+        delivered.stdout
+    );
+    assert_eq!(
+        fs::read(d.dir.join("orchestration.json")).unwrap(),
+        after_failed_start
+    );
+}
+
+/// 시작 실패 영수증은 저장 상태와 일치하고 재시도 상한 직전에도 조회 가능해야 한다.
+#[test]
+fn orchestration_failed_start_receipts_preserve_retry_limit() {
+    let d = Daemon::new("orch-failed-receipt");
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "failed receipts",
+        "--json",
+    ]))
+    .unwrap();
+    let run_id = run["id"].as_str().unwrap();
+    let task: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "task-create",
+        "--run",
+        run_id,
+        "--title",
+        "work",
+        "--json",
+    ]))
+    .unwrap();
+    let task_id = task["id"].as_str().unwrap();
+    let mut previous = None::<String>;
+    for attempt in 1..=3 {
+        let worker = format!("failed-{attempt}");
+        let mut args = vec![
+            "orchestration",
+            "worker-start",
+            "--run",
+            run_id,
+            "--task",
+            task_id,
+            "--worker",
+            &worker,
+            "--agent",
+            "missing-fixture-profile",
+            "--prompt",
+            "work",
+            "--json",
+        ];
+        if let Some(id) = previous.as_deref() {
+            args.extend(["--retry-of", id]);
+        }
+        let out = d.run(&args);
+        assert!(!out.status.success());
+        assert_eq!(out.status.code(), Some(if attempt == 3 { 1 } else { 2 }));
+        let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(receipt["status"], "failed");
+        assert_eq!(receipt["retry_of"].as_str(), previous.as_deref());
+        let lookup: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "request-show",
+            receipt["request_id"].as_str().unwrap(),
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(lookup, receipt);
+        if attempt == 3 {
+            assert!(
+                receipt["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("circuit breaker")
+            );
+        }
+        previous = Some(receipt["id"].as_str().unwrap().to_owned());
+    }
+    let before = fs::read(d.dir.join("orchestration.json")).unwrap();
+    let blocked = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--retry-of",
+        previous.as_deref().unwrap(),
+        "--json",
+    ]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("circuit breaker"));
+    assert!(blocked.stdout.is_empty());
+    assert_eq!(fs::read(d.dir.join("orchestration.json")).unwrap(), before);
+    let plain = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run_id,
+        "--worker",
+        "plain-failure",
+        "--agent",
+        "missing-fixture-profile",
+        "--prompt",
+        "work",
+    ]);
+    assert!(!plain.status.success());
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("\tfailed\t"));
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("dispatch disp-"));
+}
+
+/// `worker-start`는 TUI가 프롬프트를 띄운 뒤에 지시문을 넣고, 부팅 중 죽은 에이전트는 실패로 알린다.
+/// `worker-stop`은 상태만 바꾸지 않고 krilld 세션을 닫는다.
+#[test]
+fn orchestration_worker_start_waits_for_tui_and_stop_closes_session() {
+    let d = Daemon::new("orch-worker");
+    fs::write(d.dir.join("agents.toml"), r#"
+[agent.slow_tui]
+name = "Slow TUI"
+launch = ["/bin/bash", "-c", "stty -echo; sleep 1; while IFS= read -r -t 1 junk; do printf 'early-input\n'; done; printf 'Slow TUI\n> '; IFS= read -r line; printf 'agent-received:%.20s\n' \"$line\"; exec sleep 60"]
+
+[agent.broken]
+name = "Broken"
+launch = ["/bin/sh", "-c", "exit 3"]
+"#).unwrap();
+    let cwd = d.dir.to_str().unwrap();
+    let run = d.ok(&["orchestration", "run-create", "--title", "R", "--json"]);
+    let run: serde_json::Value = serde_json::from_str(&run).unwrap();
+    let run = run["id"].as_str().unwrap();
+
+    let started = d.ok(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run,
+        "--worker",
+        "w1",
+        "--agent",
+        "slow_tui",
+        "--cwd",
+        cwd,
+        "--prompt",
+        "do it",
+        "--json",
+    ]);
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    let sid = started["session_id"].as_u64().unwrap().to_string();
+    // 부팅(약 2초) 중에 들어온 입력은 가짜 TUI가 버리고 `early-input`을 찍는다.
+    let text = d.wait_text(&sid, "agent-received:");
+    assert!(!text.contains("early-input"), "{text}");
+
+    let broken = d.run(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run,
+        "--worker",
+        "w2",
+        "--agent",
+        "broken",
+        "--cwd",
+        cwd,
+        "--prompt",
+        "do it",
+        "--json",
+    ]);
+    assert!(!broken.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&broken.stdout).unwrap();
+    assert_eq!(receipt["status"], "failed");
+    assert!(receipt["session_id"].is_number());
+    let recorded: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "request-show",
+        receipt["request_id"].as_str().unwrap(),
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(recorded, receipt);
+    assert!(
+        String::from_utf8_lossy(&broken.stderr).contains("exited during startup"),
+        "{}",
+        String::from_utf8_lossy(&broken.stderr)
+    );
+
+    d.ok(&["orchestration", "worker-stop", "w1"]);
+    assert!(!ls_has_session(&d.ok(&["ls"]), &sid));
+}
+
+/// 셸 복귀 래퍼의 로그인 셸 rc는 래퍼와 같은 그룹에 짧은 자식(`$(...)`, `path_helper`)을 띄운다.
+/// 그 자식이 끝나도 에이전트는 끝나지 않았다. 래퍼가 로그인 셸로 넘어갈 때만 Exited다.
+#[test]
+fn wrapper_startup_children_do_not_end_the_agent() {
+    let d = Daemon::new("wrapper-startup");
+    // 래퍼 argv 모양(`-c` 스크립트 다음 `mk-agent`)이라 krilld가 래퍼 세션으로 본다.
+    let script = "i=0; while [ $i -lt 10 ]; do /bin/sleep 0.05; i=$((i + 1)); done; \
+                  stty -echo; printf 'wrapper-ready\\n'; IFS= read -r line; exec /bin/sh";
+    let id = d.ok(&[
+        "new", "--", "/bin/sh", "-u", "-f", "-c", script, "mk-agent", "hint",
+    ]);
+    let id = id.trim();
+    d.wait_text(id, "wrapper-ready");
+    let early = d.run(&["wait", id, "--for", "exited", "--timeout", "1"]);
+    assert!(
+        String::from_utf8_lossy(&early.stderr).contains("wait timed out"),
+        "startup children must not mark the agent exited: {early:?}"
+    );
+    d.ok(&["send", id, "--enter", "--", "done"]);
+    d.ok(&["wait", id, "--for", "exited", "--timeout", "5"]);
+}
+
+/// 세션이 먼저 사라져도 `worker-stop`/`worker-release`는 '이미 종료됨'으로 정산한다(C1).
+/// 예전에는 capture 실패 지점에서 매번 실패해 고스트 Active dispatch가 영구히 남았다.
+#[test]
+fn orchestration_worker_stop_settles_after_session_killed() {
+    let d = Daemon::new("orch-stop-gone");
+    fs::write(
+        d.dir.join("agents.toml"),
+        r#"
+[agent.owned_fixture]
+name = "Owned worker fixture"
+launch = ["/bin/sh", "-c", "printf 'fixture-ready\\n> '; IFS= read -r line; exec sleep 30"]
+"#,
+    )
+    .unwrap();
+    let run = d.ok(&["orchestration", "run-create", "--title", "R", "--json"]);
+    let run: serde_json::Value = serde_json::from_str(&run).unwrap();
+    let run = run["id"].as_str().unwrap();
+    for (worker, release) in [("w-gone-stop", false), ("w-gone-release", true)] {
+        let started = d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--worker",
+            worker,
+            "--agent",
+            "owned_fixture",
+            "--cwd",
+            d.dir.to_str().unwrap(),
+            "--prompt",
+            "do it",
+            "--json",
+        ]);
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let sid = started["session_id"].as_u64().unwrap().to_string();
+        if release {
+            d.ok(&[
+                "orchestration",
+                "send",
+                "--from",
+                worker,
+                "--type",
+                "worker_done",
+                "--run",
+                run,
+                "--dispatch",
+                started["id"].as_str().unwrap(),
+                "--outcome",
+                "succeeded",
+                "--summary",
+                "finished",
+            ]);
+        }
+        d.ok(&["kill", &sid]);
+        let sub = if release {
+            "worker-release"
+        } else {
+            "worker-stop"
+        };
+        d.ok(&["orchestration", sub, worker]);
+        let show = d.ok(&["orchestration", "worker-show", worker]);
+        assert!(
+            show.contains(if release { "released" } else { "stopped" }),
+            "{show}"
+        );
+    }
+}
+
+#[test]
+fn orchestration_borrowed_session_survives_stop_rejection_and_abandon() {
+    let d = Daemon::new("orch-borrowed");
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "borrowed",
+        "--json",
+    ]))
+    .unwrap();
+    let sid = d.ok(&["new", "--", "/bin/sleep", "30"]);
+    let sid = sid.trim();
+    d.ok(&[
+        "orchestration",
+        "worker-start",
+        "--run",
+        run["id"].as_str().unwrap(),
+        "--worker",
+        "borrowed",
+        "--session",
+        sid,
+        "--no-preamble",
+        "--prompt",
+        "inspect",
+    ]);
+    let rejected = d.run(&["orchestration", "worker-stop", "borrowed"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("borrowed"));
+    assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    d.ok(&["orchestration", "worker-abandon", "borrowed"]);
+    assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    for outcome in ["succeeded", "failed"] {
+        let worker = format!("borrowed-{outcome}");
+        let dispatch: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run["id"].as_str().unwrap(),
+            "--worker",
+            &worker,
+            "--session",
+            sid,
+            "--no-preamble",
+            "--prompt",
+            "inspect",
+            "--json",
+        ]))
+        .unwrap();
+        let id = dispatch["id"].as_str().unwrap();
+        d.ok(&[
+            "orchestration",
+            "send",
+            "--from",
+            &worker,
+            "--to",
+            "coordinator",
+            "--type",
+            "worker_done",
+            "--run",
+            run["id"].as_str().unwrap(),
+            "--dispatch",
+            id,
+            "--outcome",
+            outcome,
+            "--summary",
+            "inspection result",
+        ]);
+        let rejected = d.run(&["orchestration", "worker-stop", id]);
+        assert!(!rejected.status.success());
+        let advice = String::from_utf8_lossy(&rejected.stderr);
+        assert!(advice.contains("worker-retain"), "{advice}");
+        assert!(!advice.contains("worker-abandon"), "{advice}");
+        let report: serde_json::Value =
+            serde_json::from_str(&d.ok(&["orchestration", "worker-show", id, "--json"])).unwrap();
+        assert_eq!(report["next_action"]["action"], "retain");
+        let command = report["next_action"]["command"].as_str().unwrap();
+        let retained: serde_json::Value = serde_json::from_str(
+            &d.ok(&command
+                .split_whitespace()
+                .skip(1)
+                .chain(["--json"])
+                .collect::<Vec<_>>()),
+        )
+        .unwrap();
+        assert_eq!(retained["status"], outcome);
+        assert_eq!(retained["release_state"], "retained");
+        assert!(ls_has_session(&d.ok(&["ls"]), sid));
+    }
+    d.ok(&["kill", sid]);
+}
+
+/// agy-shaped PTY work uses Krill's guide, absolute CLI, Unicode questions, and settlement.
+/// This exercises the real holder/daemon protocol with a fixture, not a live model.
+#[test]
+fn orchestration_agy_full_and_minimal_workers_read_guide_ask_and_report() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = Daemon::configured_schedules_home("agy-skills", None, None, true);
+    let scripts = d.dir.join("agy fixture with spaces");
+    fs::create_dir_all(&scripts).unwrap();
+    let executable = scripts.join("agy");
+    fs::write(&executable, include_str!("../fixtures/krill-agy-worker.py")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        d.dir.join("agents.toml"),
+        format!(
+            "[agent.agy]\nname = \"AGY protocol fixture\"\nlaunch = [{}]\nyolo_args = []\n",
+            serde_json::to_string(&executable.display().to_string()).unwrap(),
+        ),
+    )
+    .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "AGY workflow",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    for mode in ["full", "minimal"] {
+        let task: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "task-create",
+            "--run",
+            run,
+            "--title",
+            mode,
+            "--json",
+        ]))
+        .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let dispatch: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--task",
+            task_id,
+            "--worker",
+            &format!("agy-{mode}"),
+            "--agent",
+            "agy",
+            "--preamble",
+            mode,
+            "--cwd",
+            scripts.to_str().unwrap(),
+            "--prompt",
+            "한글 작업\n검증 근거를 남기세요",
+            "--json",
+        ]))
+        .unwrap();
+        let deadline = Instant::now() + WAIT;
+        let question = loop {
+            let mail: serde_json::Value = serde_json::from_str(&d.ok(&[
+                "orchestration",
+                "inbox",
+                "--to",
+                "coordinator",
+                "--run",
+                run,
+                "--json",
+            ]))
+            .unwrap();
+            if let Some(question) = mail
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["msg_type"] == "question" && m["from"] == format!("agy-{mode}"))
+            {
+                break question["id"].as_str().unwrap().to_owned();
+            }
+            assert!(Instant::now() < deadline, "agy fixture did not ask: {mail}");
+            thread::sleep(Duration::from_millis(20));
+        };
+        d.ok(&[
+            "orchestration",
+            "reply",
+            &question,
+            "--body",
+            "검증 후 진행\n범위 유지",
+            "--json",
+        ]);
+        let sid = dispatch["session_id"].as_u64().unwrap().to_string();
+        d.wait_text(&sid, "agy-fixture-completion-accepted");
+        let task_state: serde_json::Value =
+            serde_json::from_str(&d.ok(&["orchestration", "task-list", "--run", run, "--json"]))
+                .unwrap();
+        assert!(
+            task_state
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == task_id && t["status"] == "completed")
+        );
+        let dispatch_id = dispatch["id"].as_str().unwrap();
+        let report: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(scripts.join(format!("agy-evidence-{dispatch_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(report["prompt"].as_str().unwrap().contains("한글 작업"));
+        for root in krill_proto::orchestration::skill_directories(&d.dir.join("empty-home"), "agy")
+        {
+            assert!(
+                !root.exists(),
+                "isolated daemon wrote host skills: {root:?}"
+            );
+        }
+        d.ok(&["orchestration", "worker-release", dispatch_id, "--json"]);
+        assert!(!ls_has_session(&d.ok(&["ls"]), &sid));
+    }
+}
+
+#[test]
+fn mobile_cli_pair_list_revoke_and_relay_contract() {
+    let d = Daemon::new("mobile");
+    assert_eq!(d.ok(&["mobile", "devices", "--json"]).trim(), "[]");
+    assert!(d.ok(&["mobile", "--help"]).contains("krill mobile"));
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_krill"))
+            .args(["mobile", "--help"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(d.run(&["mobile", "revoke"]).status.code(), Some(2));
+    let offer: serde_json::Value =
+        serde_json::from_str(&d.ok(&["mobile", "pair", "--address", "127.0.0.1:0", "--json"]))
+            .unwrap();
+    let url = offer
+        .get("PairingOffer")
+        .unwrap()
+        .get("url")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(url.starts_with("http://127.0.0.1:"));
+    assert!(url.contains("/#pair=") && url.contains("&key="));
+    assert!(!url.split('#').next().unwrap().contains("key="));
+    d.ok(&["mobile", "revoke", "--all", "--json"]);
+    // 로그인 전에는 릴레이 접속을 거부한다.
+    let out = d.run(&["mobile", "pair", "--tunnel", "--json"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Sign in with Google to use the relay"),
+        "unexpected relay rejection: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let status: krill_proto::mobile::MobileReply =
+        serde_json::from_str(&d.ok(&["mobile", "serve"])).unwrap();
+    assert!(matches!(
+        status,
+        krill_proto::mobile::MobileReply::GatewayStatus {
+            mode: krill_proto::mobile::ConnectMode::Lan,
+            tunnel_url: None,
+            ..
+        }
+    ));
+    d.ok(&["mobile", "revoke", "--all"]);
+}
+
+#[test]
+fn search_literal_help_queries_an_isolated_daemon() {
+    let d = Daemon::configured_schedules_home("search-literal-help", None, None, true);
+    let out = d.ok(&["search", "help", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["hits"], serde_json::json!([]));
+}
+
+/// foundation-02: 1MiB 프레임을 넘는 유효 orchestration 상태의 온라인 읽기(페이지 스냅샷·N-1 fallback).
+mod orchestration_frame_bound {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use krill_proto::control::{Reply, Request};
+    use krill_proto::ipc::{ClientHello, FEATURES, PROTO_MAX, PROTO_MIN, ServerHello, read_frame};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore, frame_limit_error,
+    };
+
+    /// 검증자 재현과 같은 fixture: 활성 task 12개 × 100,000B 설명(1.2MB JSON, 1MiB 프레임 초과)을
+    /// 실제 holder/krilld 아래의 온라인 CLI가 디스크와 바이트 동일하게 읽는다.
+    #[test]
+    fn oversized_orchestration_state_lists_online_identically_to_disk() {
+        let d = Daemon::new("orch-paged");
+        let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "run-create",
+            "--title",
+            "verify_core independent synthetic snapshot",
+            "--json",
+        ]))
+        .unwrap();
+        let run = run["id"].as_str().unwrap();
+        let descriptions: Vec<String> = (0..12_u8)
+            .map(|i| String::from_utf8(vec![b'A' + i; 100_000]).unwrap())
+            .collect();
+        for (i, description) in descriptions.iter().enumerate() {
+            d.ok(&[
+                "orchestration",
+                "task-create",
+                "--run",
+                run,
+                "--title",
+                &format!("fixture-{i}"),
+                "--desc",
+                description,
+            ]);
+        }
+        let state = fs::metadata(d.dir.join("orchestration.json"))
+            .unwrap()
+            .len();
+        assert!(state > 1 << 20 && state <= 2 << 20, "{state} bytes");
+        let online: Vec<serde_json::Value> =
+            serde_json::from_str(&d.ok(&["orchestration", "task-list", "--run", run, "--json"]))
+                .unwrap();
+        let disk = OrchestrationStore::load(&d.dir).unwrap();
+        assert_eq!(online.len(), 12);
+        assert_eq!(disk.tasks.len(), 12);
+        for ((task, expected), stored) in online.iter().zip(&descriptions).zip(&disk.tasks) {
+            assert_eq!(task["description"].as_str().unwrap(), expected);
+            assert_eq!(&stored.description, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(&disk.tasks).unwrap(),
+            serde_json::Value::Array(online)
+        );
+        d.ok(&["orchestration", "run-list", "--json"]);
+        d.ok(&["orchestration", "worker-list", "--json"]);
+        let inbox: Vec<serde_json::Value> =
+            serde_json::from_str(&d.ok(&["orchestration", "inbox", "--all", "--json"])).unwrap();
+        assert!(inbox.is_empty());
+    }
+
+    /// 페이지 스냅샷을 모르는 구(N-1) 로컬 데몬이 단일 프레임을 못 보내면(이전 빌드: EOF, 현재 빌드:
+    /// 프레임 상한 명시 오류) 로컬 CLI는 데몬이 읽는 바로 그 orchestration.json을 읽기 전용으로 읽는다.
+    #[test]
+    fn prior_local_daemon_snapshot_overflow_falls_back_to_disk_read_only() {
+        for explicit in [false, true] {
+            let tag = if explicit {
+                "orch-n1-error"
+            } else {
+                "orch-n1-eof"
+            };
+            let dir = std::env::temp_dir().join(format!("mk045-{}-{tag}", std::process::id()));
+            fs::remove_dir_all(&dir).ok();
+            fs::create_dir_all(dir.join("run")).unwrap();
+            let mut store = OrchestrationStore::default();
+            let run = store.create_run("prior daemon", None).unwrap();
+            store
+                .create_task(&run.id, "visible-from-disk", "", vec![])
+                .unwrap();
+            store.save(&dir).unwrap();
+            let before = fs::read(dir.join("orchestration.json")).unwrap();
+            let (listener, stop, server) = prior_daemon(&dir, explicit);
+            let out = Command::new(MK)
+                .args(["orchestration", "task-list", "--json"])
+                .env("KRILL_STATE_DIR", &dir)
+                .output()
+                .unwrap();
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            drop(listener);
+            assert!(
+                out.status.success(),
+                "{tag}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let tasks: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(tasks.len(), 1, "{tag}");
+            assert_eq!(tasks[0]["title"], "visible-from-disk");
+            assert_eq!(
+                fs::read(dir.join("orchestration.json")).unwrap(),
+                before,
+                "{tag}: fallback must be read-only"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `FEAT_ORCH_SNAPSHOT_PAGE`를 모르는 데몬 흉내. 연결마다 Hello를 마친 뒤 첫 요청(`SnapshotV2`)에
+    /// EOF(이전 빌드) 또는 프레임 상한 명시 오류(현재 빌드)로 답한다.
+    fn prior_daemon(
+        dir: &Path,
+        explicit: bool,
+    ) -> (Arc<UnixListener>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = Arc::new(UnixListener::bind(dir.join("run/krilld.sock")).unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let listener = Arc::clone(&listener);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((socket, _)) => {
+                            thread::spawn(move || serve_prior(socket, explicit));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        (listener, stop, server)
+    }
+
+    fn serve_prior(mut socket: UnixStream, explicit: bool) {
+        socket.set_nonblocking(false).ok();
+        socket.set_read_timeout(Some(WAIT)).ok();
+        let hello = ServerHello {
+            proto_min: PROTO_MIN,
+            proto_max: PROTO_MAX,
+            features: FEATURES & !FEAT_ORCH_SNAPSHOT_PAGE,
+            build: "prior-daemon-fixture".into(),
+            instance_id: 7,
+        };
+        if socket.write_all(&hello.encode().unwrap()).is_err() {
+            return;
+        }
+        let Ok(Some((kind, body))) = read_frame(&mut socket) else {
+            return;
+        };
+        ClientHello::decode(kind, &body).unwrap();
+        while let Ok(Some((kind, body))) = read_frame(&mut socket) {
+            assert!(matches!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Orchestration(OrchAction::SnapshotV2)
+            ));
+            if !explicit {
+                return; // 이전 빌드: 인코딩 실패로 응답 없이 스트림을 닫는다.
+            }
+            let reply = Reply::Orchestration(OrchResponse::Error(frame_limit_error(1_204_357)));
+            socket.write_all(&reply.encode().unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn statusline_stays_within_its_budget_when_stdin_never_closes() {
+    let dir = std::env::temp_dir().join(format!("mk-statusline-budget-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let started = Instant::now();
+    let mut child = Command::new(MK)
+        .args(["statusline", "--chain", "exec sleep 30"])
+        .env("CLAUDE_CONFIG_DIR", &dir)
+        .env_remove(krill_proto::statusline::DEPTH_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _stdin_left_open = child.stdin.take();
+    let status = child.wait().unwrap();
+    let elapsed = started.elapsed();
+    fs::remove_dir_all(&dir).ok();
+    assert!(status.success(), "{status:?}");
+    assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+}

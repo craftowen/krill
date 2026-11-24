@@ -3,9 +3,9 @@
 # 출처: 2026-10-31~11-03 ci-macos 성공 run 10건의 junit flakyFailure(괄호는 10건 중 횟수).
 krill-app responsiveness::tests::native_sample_is_bounded_and_rotates_in_place  # (7)
 krill-app responsiveness::tests::foreground_stall_is_sampled_without_executor_progress  # (7)
-krill::status hook_states_survive_krilld_restart  # (5) status 비교에 foreground 이름이 섞인다
-krill::worktree cli_new_worktree_starts_session_in_the_created_path  # (3)
+krill::integration status::hook_states_survive_krilld_restart  # (5) status 비교에 foreground 이름이 섞인다
+krill::integration worktree::cli_new_worktree_starts_session_in_the_created_path  # (3)
 krilld registry::orchestration_delivery_tests::deliver_input_to_tap_paces_unbracketed_and_delayed_echo_submit  # (2)
-krilld::mobile_pwa non_secure_pwa_crypto_and_workflows  # (2)
+krilld::integration mobile_pwa::non_secure_pwa_crypto_and_workflows  # (2)
 krilld agent_history::opencode_sqlite::tests::independent_2307_rows_order_history_reset_wal_rollback_and_rebind  # (1)
 krilld mobile::gateway::tests::legitimate_reconnects_and_pre_auth_eof_do_not_consume_failure_budget  # (1) 2026-11-11 nightly. 끊긴 연결 정리가 5초를 넘김, 로컬 부하 300회 재현 안 됨. 실패 줄은 until()이 호출 위치로 남긴다

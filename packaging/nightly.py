@@ -213,8 +213,7 @@ class Release:
         self.work = self.root / "repository"
         self.env = dict(os.environ, CARGO_TARGET_DIR=config["target_dir"],
                         KRILL_ALLOW_PROTECTED_PUSH=AUTHORIZATION,
-                        KRILL_UPDATE_KEY_FILE=config["key_file"], RUSTC_WRAPPER="sccache", CARGO_BUILD_JOBS="4",
-                        CARGO_PROFILE_TEST_OPT_LEVEL="2", CARGO_PROFILE_TEST_DEBUG="line-tables-only")
+                        KRILL_UPDATE_KEY_FILE=config["key_file"], RUSTC_WRAPPER="sccache", CARGO_BUILD_JOBS="4")
         # 예약 실행은 유료 VM이나 사람 전용 가드 탈출구를 상속하지 않는다.
         for key in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR", "KRILL_PUBLISH_FORCE",
                     "KRILL_RELEASE_SIGNING_KEY", "KRILL_RELEASE_ASSET_DIR", "KRILL_PUBLISH_LOCKED",
