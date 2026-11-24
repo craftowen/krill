@@ -1868,3 +1868,97 @@ fn same_bot_id_across_hosts_coexists_and_badge_update_is_host_scoped(cx: &mut Te
         assert_eq!(s.bots_attention_count, 2);
     });
 }
+
+#[gpui::test]
+fn domain_a_parity_collapsed_edges_up_next_chat_controls_and_chat_search(cx: &mut TestAppContext) {
+    let (view, cx) = setup(cx, "bot-sidebar-domain-a-parity");
+
+    // 1. Avatar constant is 32px, worker shows right-aligned age, and BotUpNextCount renders & clicks.
+    assert!((super::rows::AVATAR - 32.).abs() < f32::EPSILON);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_ui.up_next_unseen.insert(
+                (
+                    krill_app::hosts::HostId::Local,
+                    BotId::new("krill").unwrap(),
+                ),
+                3,
+            );
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("bot-row-up-next-krill").is_some(),
+        "BotUpNextCount badge must render on active bot row"
+    );
+    // Hovering a chat row reveals its `⋯` BotChatMoreButton in place of the trailing age.
+    let home_chat = cx.debug_bounds("bot-chat-21").expect("Home Chat row");
+    assert!(
+        cx.debug_bounds("bot-chat-more-21").is_none(),
+        "BotChatMoreButton stays hidden until row hover"
+    );
+    cx.simulate_mouse_move(home_chat.center(), None, Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("bot-chat-more-21").is_some(),
+        "BotChatMoreButton must become visible on chat row hover"
+    );
+
+    // 2. Search matches chat titles & bodies and keeps result cards inside the scroll list (#46830).
+    click(cx, "bots-section-search");
+    cx.simulate_input("Claude");
+    cx.run_until_parked();
+    let list_bounds = cx
+        .debug_bounds("bots-search-results")
+        .expect("search results list");
+    let hit = cx
+        .debug_bounds("bot-search-result-krill")
+        .expect("chat title hit resolves to owning bot");
+    assert!(
+        hit.left() >= list_bounds.left() && hit.right() <= list_bounds.right(),
+        "search result focus border must stay inside list bounds: hit={hit:?} list={list_bounds:?}"
+    );
+    // Close search before testing collapsed preview.
+    click(cx, "bots-section-search");
+
+    // 3. Collapsed preview virtualized track + left/right overflow edges (#47622, #47884).
+    let many: Vec<_> = (0..10)
+        .map(|i| {
+            bot(
+                &format!("bot-{i}"),
+                &format!("Bot {i}"),
+                "Automation worker",
+                Vec::new(),
+            )
+        })
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.apply_sidebar_bots(0, many, cx);
+            s.bot_ui.collapsed = true;
+            s.bot_ui.preview_offset = 0;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("bots-collapsed-edge-left").is_none(),
+        "at offset 0 there are no hidden bots on the left"
+    );
+    assert!(
+        cx.debug_bounds("bots-collapsed-edge-right").is_some(),
+        "10 bots must overflow and show the right BotPreviewEdge"
+    );
+    // Paging right advances preview_offset and reveals the left BotPreviewEdge.
+    click(cx, "bots-collapsed-edge-right");
+    assert!(
+        cx.debug_bounds("bots-collapsed-edge-left").is_some(),
+        "after paging right, left BotPreviewEdge must appear"
+    );
+    click(cx, "bots-collapsed-edge-left");
+    assert!(
+        cx.debug_bounds("bots-collapsed-edge-left").is_none(),
+        "paging back left returns to offset 0"
+    );
+}

@@ -1,6 +1,6 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
 //! Orca's sidebar "Bots" section: a collapsible header with search and "+", one row per bot
-//! (36 px avatar, name, age, activity line), its Home Chat and other live chats underneath,
+//! (32 px avatar, name, age, activity line), its Home Chat and other live chats underneath,
 //! a right-click menu, and the "Meet your AI teammate" card when there are no bots.
 //! Also hosts the New bot and Bot templates dialogs, and opens a bot's Home Chat.
 
@@ -99,10 +99,18 @@ pub(super) struct BotUi {
     pub last_observed_remotes: Vec<HostId>,
     /// Safety timer so an unreachable remote host never keeps `loaded == false` forever.
     pub loaded_fallback_task: Option<Task<()>>,
+    /// Virtualized collapsed preview scroll offset (`BotCollapsedPreview` / `#47622`).
+    pub preview_offset: usize,
     /// `Some` while the search field is open.
     pub search: Option<(Entity<InputState>, Subscription)>,
+    /// Locale active when the search input was built, so language switches refresh its placeholder.
+    pub search_lang: Option<krill_app::i18n::Language>,
     pub query: String,
     pub folded: HashSet<(HostId, BotId)>,
+    /// Unseen Up Next suggestion counts per `(host, bot_id)` (`BotUpNextCount`).
+    pub up_next_unseen: HashMap<(HostId, BotId), usize>,
+    /// Whether unseen suggestion counts have been requested for the current bot list.
+    pub up_next_bots_key: Vec<(HostId, BotId)>,
     /// "Bot options" (sort and hide); read from settings on first use.
     pub view: Option<krill_app::bots::sidebar_view::BotSidebarView>,
     /// Chats whose workers the user explicitly folded (chats with workers start open).
@@ -246,6 +254,7 @@ impl Shell {
 
     /// Builds a requested dialog. Called at the start of `render`, where the window exists.
     pub(super) fn open_pending_bot_dialogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_bot_sidebar_ephemeral(window, cx);
         let Some(request) = self.bot_ui.pending.take() else {
             return;
         };
@@ -763,7 +772,9 @@ impl Shell {
     pub(super) fn toggle_bot_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.bot_ui.search.take().is_some() {
             self.bot_ui.query.clear();
+            self.bot_ui.search_lang = None;
         } else {
+            let lang = krill_app::i18n::language();
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(text::SB_SEARCH.get()));
             let sub = cx.subscribe(&input, |this, input, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
@@ -773,8 +784,108 @@ impl Shell {
             });
             input.update(cx, |s, cx| s.focus(window, cx));
             self.bot_ui.search = Some((input, sub));
+            self.bot_ui.search_lang = Some(lang);
         }
         cx.notify();
+    }
+
+    /// Keeps the sidebar's search placeholder in sync after a live language switch (Orca #46226)
+    /// and triggers a lightweight suggestion-count fetch for `BotUpNextCount`.
+    pub(super) fn sync_bot_sidebar_ephemeral(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lang = krill_app::i18n::language();
+        if let Some((input, _)) = &self.bot_ui.search
+            && self.bot_ui.search_lang != Some(lang)
+        {
+            input.update(cx, |s, cx| {
+                s.set_placeholder(text::SB_SEARCH.get(), window, cx);
+            });
+            self.bot_ui.search_lang = Some(lang);
+        }
+        let ids: Vec<(HostId, BotId)> = self
+            .sidebar_bots
+            .iter()
+            .map(|b| (b.host.clone(), b.id.clone()))
+            .collect();
+        if ids != self.bot_ui.up_next_bots_key {
+            self.bot_ui.up_next_unseen.retain(|k, _| ids.contains(k));
+            self.bot_ui.up_next_bots_key = ids;
+            self.refresh_bot_up_next(cx);
+        }
+    }
+
+    /// Reads non-dismissed suggestions newer than `up_next_seen_ms` per bot (`BotUpNextCount`).
+    pub(super) fn refresh_bot_up_next(&mut self, cx: &mut Context<Self>) {
+        let mut by_host: Vec<(HostId, krill_app::bots::BotRpcCall, Vec<BotId>)> = Vec::new();
+        for b in self.sidebar_bots.iter().filter(|b| !b.paused) {
+            if let Some((_, _, ids)) = by_host.iter_mut().find(|(h, _, _)| h == &b.host) {
+                ids.push(b.id.clone());
+            } else if let Some(rpc) = self.bot_rpc_on(&b.host) {
+                by_host.push((b.host.clone(), rpc, vec![b.id.clone()]));
+            }
+        }
+        if by_host.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let counts: Vec<((HostId, BotId), usize)> = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    for (host, rpc, bot_ids) in by_host {
+                        for bot_id in bot_ids {
+                            let seen_ms = match krill_app::bots::rpc::call_checked(
+                                &rpc,
+                                &BotRpcRequest::GetBotUpcoming {
+                                    bot_id: bot_id.clone(),
+                                },
+                            ) {
+                                Ok(BotRpcResponse::Upcoming(u)) => u.up_next_seen_ms,
+                                _ => 0,
+                            };
+                            let unseen = match krill_app::bots::rpc::call_checked(
+                                &rpc,
+                                &BotRpcRequest::ListSuggestions {
+                                    bot_id: Some(bot_id.clone()),
+                                    include_dismissed: false,
+                                },
+                            ) {
+                                Ok(BotRpcResponse::Suggestions(rows)) => rows
+                                    .iter()
+                                    .filter(|s| !s.dismissed && s.created_at_ms > seen_ms)
+                                    .count(),
+                                _ => 0,
+                            };
+                            out.push(((host.clone(), bot_id), unseen));
+                        }
+                    }
+                    out
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let mut changed = false;
+                for (key, count) in counts {
+                    if !this.bot_ui.up_next_bots_key.contains(&key) {
+                        continue;
+                    }
+                    if count == 0 {
+                        if this.bot_ui.up_next_unseen.remove(&key).is_some() {
+                            changed = true;
+                        }
+                    } else if this.bot_ui.up_next_unseen.insert(key, count) != Some(count) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Decodes newly read `avatar.png` files for `host` (empty = unreadable; remembered so the

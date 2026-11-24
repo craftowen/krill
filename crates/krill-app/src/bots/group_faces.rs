@@ -195,7 +195,7 @@ fn render_tile_or_fallback(
         .into_any_element()
 }
 
-/// Renders Orca's clustered group faces at `slot_size` (`28`, `36`, `112`, ...), separated by
+/// Renders Orca's clustered group faces at `slot_size` (`28`, `32`, `112`, ...), separated by
 /// a ring colored `ring_bg` (the underlying sidebar/surface color).
 #[must_use]
 pub fn render_group_faces(

@@ -230,12 +230,14 @@ pub fn purpose_snippet(text: &str, ranges: &[SearchRange]) -> (String, Vec<Searc
     )
 }
 
-/// One search result: marks in the name, or (name unmatched) the purpose that matched.
+/// One search result: marks in the name, the purpose that matched, or a chat title/body hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {
     pub index: usize,
     pub name_ranges: Vec<SearchRange>,
     pub purpose: Option<(String, Vec<SearchRange>)>,
+    /// Matched chat title or latest message snippet (title, snippet, marked ranges in snippet).
+    pub chat_hit: Option<(String, String, Vec<SearchRange>)>,
 }
 
 /// Orca `createBotSidebarSearchIndex`: name matches, then purpose-only matches, each in the
@@ -246,21 +248,74 @@ pub fn search(
     hidden_paused: &[&str],
     query: &str,
 ) -> (Vec<SearchMatch>, usize) {
+    let candidates: Vec<SearchCandidate<'_>> = shown
+        .iter()
+        .map(|&(name, purpose)| SearchCandidate {
+            name,
+            purpose,
+            chats: Vec::new(),
+        })
+        .collect();
+    search_with_chats(&candidates, hidden_paused, query)
+}
+
+/// One bot candidate for sidebar search, including its live chat titles and latest status text.
+#[derive(Debug, Clone)]
+pub struct SearchCandidate<'a> {
+    pub name: &'a str,
+    pub purpose: &'a str,
+    /// `(chat_title, latest_status_or_body)` pairs for this bot's chats.
+    pub chats: Vec<(&'a str, Option<&'a str>)>,
+}
+
+/// Searches bot names, `SOUL.md`/purpose descriptions, and chat titles/bodies in Orca priority order.
+#[must_use]
+pub fn search_with_chats(
+    shown: &[SearchCandidate<'_>],
+    hidden_paused: &[&str],
+    query: &str,
+) -> (Vec<SearchMatch>, usize) {
     let mut by_name = Vec::new();
     let mut by_purpose = Vec::new();
-    for (index, (name, purpose)) in shown.iter().enumerate() {
-        if let Some(name_ranges) = match_text(name, query) {
+    let mut by_chat = Vec::new();
+    for (index, bot) in shown.iter().enumerate() {
+        if let Some(name_ranges) = match_text(bot.name, query) {
             by_name.push(SearchMatch {
                 index,
                 name_ranges,
                 purpose: None,
+                chat_hit: None,
             });
-        } else if let Some(ranges) = match_text(purpose, query) {
+        } else if let Some(ranges) = match_text(bot.purpose, query) {
             by_purpose.push(SearchMatch {
                 index,
                 name_ranges: Vec::new(),
-                purpose: Some(purpose_snippet(purpose, &ranges)),
+                purpose: Some(purpose_snippet(bot.purpose, &ranges)),
+                chat_hit: None,
             });
+        } else {
+            let mut hit = None;
+            for &(chat_title, body) in &bot.chats {
+                if let Some(ranges) = match_text(chat_title, query) {
+                    hit = Some((chat_title.to_owned(), chat_title.to_owned(), ranges));
+                    break;
+                }
+                if let Some(body) = body
+                    && let Some(ranges) = match_text(body, query)
+                {
+                    let (snippet, snippet_ranges) = purpose_snippet(body, &ranges);
+                    hit = Some((chat_title.to_owned(), snippet, snippet_ranges));
+                    break;
+                }
+            }
+            if let Some(chat_hit) = hit {
+                by_chat.push(SearchMatch {
+                    index,
+                    name_ranges: Vec::new(),
+                    purpose: None,
+                    chat_hit: Some(chat_hit),
+                });
+            }
         }
     }
     let hidden = hidden_paused
@@ -268,7 +323,195 @@ pub fn search(
         .filter(|name| match_text(name, query).is_some())
         .count();
     by_name.extend(by_purpose);
+    by_name.extend(by_chat);
     (by_name, hidden)
+}
+
+/// Collapsed Bots section preview signal priority (Orca `bot-collapsed-preview.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PreviewSignal {
+    Attention = 0,
+    Unread = 1,
+    Working = 2,
+}
+
+impl PreviewSignal {
+    #[must_use]
+    pub const fn from_flags(needs_you: bool, unread: bool, working: bool) -> Option<Self> {
+        if needs_you {
+            Some(Self::Attention)
+        } else if unread {
+            Some(Self::Unread)
+        } else if working {
+            Some(Self::Working)
+        } else {
+            None
+        }
+    }
+
+    /// Sort key matching Orca `PRIORITY = { attention: 0, unread: 1, working: 2 }`.
+    #[must_use]
+    pub const fn rank(signal: Option<Self>) -> u8 {
+        match signal {
+            Some(Self::Attention) => 0,
+            Some(Self::Unread) => 1,
+            Some(Self::Working) => 2,
+            None => 3,
+        }
+    }
+}
+
+/// Geometry of Orca's virtualized collapsed preview track (`use-bot-preview-scroll.ts`, `#47622`, `#47884`).
+pub const PREVIEW_FACE_SIZE: f32 = 20.;
+pub const PREVIEW_FACE_GAP: f32 = 4.;
+pub const PREVIEW_FACE_STEP: f32 = PREVIEW_FACE_SIZE + PREVIEW_FACE_GAP;
+pub const PREVIEW_TRACK_INSET: f32 = 4.;
+pub const PREVIEW_EDGE_WIDTH: f32 = 14.;
+pub const PREVIEW_TRACK_HEIGHT: f32 = PREVIEW_FACE_SIZE + PREVIEW_TRACK_INSET * 2.;
+
+/// Visible slice of collapsed bot faces and left/right overflow counts (`#47622`, `#47884`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollapsedTrackWindow {
+    pub offset: usize,
+    pub max_offset: usize,
+    pub overflow: bool,
+    /// Number of bots hidden off the left edge (drives left `BotPreviewEdge`).
+    pub before: usize,
+    /// Number of bots hidden off the right edge (drives right `BotPreviewEdge`).
+    pub after: usize,
+    /// First rendered index (may include 1 clipped edge-peek avatar on the left).
+    pub first_visible: usize,
+    /// Exclusive end rendered index (may include 1 clipped edge-peek avatar on the right).
+    pub end_visible: usize,
+    /// First fully-unclipped index (eligible to draw `BotPreviewPip`).
+    pub first_full: usize,
+    /// Exclusive end fully-unclipped index (eligible to draw `BotPreviewPip`).
+    pub end_full: usize,
+    /// Paging step when clicking a left/right `BotPreviewEdge` control.
+    pub page_step: usize,
+}
+
+/// Computes the collapsed preview track window for `total` bots inside `available_px` width.
+#[must_use]
+pub fn compute_collapsed_track(
+    total: usize,
+    requested_offset: usize,
+    available_px: f32,
+) -> CollapsedTrackWindow {
+    if total == 0 {
+        return CollapsedTrackWindow {
+            offset: 0,
+            max_offset: 0,
+            overflow: false,
+            before: 0,
+            after: 0,
+            first_visible: 0,
+            end_visible: 0,
+            first_full: 0,
+            end_full: 0,
+            page_step: 1,
+        };
+    }
+    let total_f = f32::from(u16::try_from(total).unwrap_or(u16::MAX));
+    let total_width = total_f * PREVIEW_FACE_STEP + PREVIEW_TRACK_INSET;
+    let width = available_px.max(PREVIEW_FACE_STEP + PREVIEW_TRACK_INSET * 2.);
+    if total_width <= width {
+        return CollapsedTrackWindow {
+            offset: 0,
+            max_offset: 0,
+            overflow: false,
+            before: 0,
+            after: 0,
+            first_visible: 0,
+            end_visible: total,
+            first_full: 0,
+            end_full: total,
+            page_step: total.max(1),
+        };
+    }
+    // Reserve room for at least one edge button when overflowing; when scrolled mid-track,
+    // both left and right edges appear.
+    let usable = (width - PREVIEW_TRACK_INSET - PREVIEW_EDGE_WIDTH * 2.).max(PREVIEW_FACE_STEP);
+    let mut full_slots = 1usize;
+    while full_slots < total
+        && f32::from(u16::try_from(full_slots + 1).unwrap_or(u16::MAX)) * PREVIEW_FACE_STEP
+            <= usable
+    {
+        full_slots += 1;
+    }
+    let max_offset = total.saturating_sub(full_slots);
+    let offset = requested_offset.min(max_offset);
+    let first_full = offset;
+    let end_full = (offset + full_slots).min(total);
+    let before = first_full;
+    let after = total.saturating_sub(end_full);
+    // Include 1 partially-clipped peek face on each overflowing edge (#47884) whose pip is suppressed.
+    let first_visible = first_full.saturating_sub(usize::from(before > 0));
+    let end_visible = (end_full + usize::from(after > 0)).min(total);
+    let page_step = full_slots.saturating_sub(1).max(1);
+    CollapsedTrackWindow {
+        offset,
+        max_offset,
+        overflow: true,
+        before,
+        after,
+        first_visible,
+        end_visible,
+        first_full,
+        end_full,
+        page_step,
+    }
+}
+
+/// Strips block markers and simple inline markdown for `BotHoverLatestLine` (Orca `BotRowActivityLine.tsx`).
+#[must_use]
+pub fn strip_inline_markdown(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for (line_idx, raw_line) in input.lines().enumerate() {
+        if line_idx > 0 {
+            out.push(' ');
+        }
+        let mut line = raw_line.trim_start();
+        // Strip leading heading / quote / bullet markers.
+        if let Some(rest) = line.strip_prefix('#') {
+            line = rest.trim_start_matches('#').trim_start();
+        } else if let Some(rest) = line.strip_prefix("> ") {
+            line = rest;
+        } else if let Some(rest) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| line.strip_prefix("+ "))
+        {
+            line = rest;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            // Markdown link `[label](url)` -> `label`.
+            if chars[i] == '['
+                && let Some(close_bracket) = chars[i + 1..].iter().position(|&c| c == ']')
+            {
+                let cb = i + 1 + close_bracket;
+                if cb + 1 < chars.len()
+                    && chars[cb + 1] == '('
+                    && let Some(close_paren) = chars[cb + 2..].iter().position(|&c| c == ')')
+                {
+                    for &c in &chars[i + 1..cb] {
+                        out.push(c);
+                    }
+                    i = cb + 2 + close_paren + 1;
+                    continue;
+                }
+            }
+            if matches!(chars[i], '`' | '*' | '~') {
+                i += 1;
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out.trim().to_owned()
 }
 
 /// Where a turn is: `None` for Home Chat, else a side chat's or thread's title.
@@ -460,6 +703,77 @@ mod tests {
         assert_eq!(
             select_line(false, &[quiet, side], 0, 3),
             Some(RowLine::Replying(Some("Claude Chat".to_owned())))
+        );
+    }
+
+    #[test]
+    fn search_with_chats_matches_name_purpose_then_chat_title_and_body() {
+        let candidates = [
+            SearchCandidate {
+                name: "Ops Bot",
+                purpose: "Watches deploys",
+                chats: vec![("CI triage", Some("Checking nightly flake"))],
+            },
+            SearchCandidate {
+                name: "Design Bot",
+                purpose: "Reviews mockups",
+                chats: vec![("Home Chat", Some("Updated sidebar tokens"))],
+            },
+        ];
+        let (title_hits, _) = search_with_chats(&candidates, &[], "triage");
+        assert_eq!(title_hits.len(), 1);
+        assert_eq!(title_hits[0].index, 0);
+        let (title, snippet, ranges) = title_hits[0].chat_hit.as_ref().unwrap();
+        assert_eq!(title, "CI triage");
+        assert_eq!(snippet.get(ranges[0].clone()), Some("triage"));
+
+        let (body_hits, _) = search_with_chats(&candidates, &[], "tokens");
+        assert_eq!(body_hits.len(), 1);
+        assert_eq!(body_hits[0].index, 1);
+        let (title, snippet, ranges) = body_hits[0].chat_hit.as_ref().unwrap();
+        assert_eq!(title, "Home Chat");
+        assert_eq!(snippet.get(ranges[0].clone()), Some("tokens"));
+    }
+
+    #[test]
+    fn collapsed_track_window_virtualizes_and_clips_edges() {
+        // Fits comfortably: no overflow, no edges.
+        let fit = compute_collapsed_track(3, 0, 160.);
+        assert!(!fit.overflow);
+        assert_eq!((fit.before, fit.after), (0, 0));
+        assert_eq!((fit.first_full, fit.end_full), (0, 3));
+
+        // Overflows: right edge hides trailing bots and peeks 1 clipped avatar.
+        let start = compute_collapsed_track(8, 0, 140.);
+        assert!(start.overflow);
+        assert_eq!(start.before, 0);
+        assert!(start.after > 0);
+        assert_eq!(start.first_visible, 0);
+        assert_eq!(start.end_visible, start.end_full + 1);
+
+        // Mid-scroll: both left and right edges active, both peek 1 clipped avatar.
+        let mid = compute_collapsed_track(8, 2, 140.);
+        assert_eq!(mid.before, 2);
+        assert!(mid.after > 0);
+        assert_eq!(mid.first_visible, 1);
+        assert_eq!(mid.end_visible, mid.end_full + 1);
+
+        // Priority ranking: attention -> unread -> working -> quiet.
+        assert!(
+            PreviewSignal::rank(Some(PreviewSignal::Attention))
+                < PreviewSignal::rank(Some(PreviewSignal::Unread))
+        );
+        assert!(
+            PreviewSignal::rank(Some(PreviewSignal::Unread))
+                < PreviewSignal::rank(Some(PreviewSignal::Working))
+        );
+    }
+
+    #[test]
+    fn strip_inline_markdown_cleans_links_and_emphasis() {
+        assert_eq!(
+            strip_inline_markdown("## [인생-방향성.md](file:///Users/a/b) **updated** `now`"),
+            "인생-방향성.md updated now"
         );
     }
 }
