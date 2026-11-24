@@ -445,8 +445,8 @@ fn read_paths_recover_poisoned_engine() {
                 );
             }
             2 => {
-                let (_, _, rows) = tap.history_snapshot(&|| false).unwrap();
-                assert!(rows.is_empty());
+                let snapshot = tap.history_snapshot(&|| false).unwrap();
+                assert!(snapshot.rows.is_empty());
             }
             _ => {
                 let mut reply = HistoryViewRows {
@@ -460,6 +460,7 @@ fn read_paths_recover_poisoned_engine() {
                     total: 0,
                     complete: true,
                     rows: Vec::new(),
+                    screen: None,
                 };
                 tap.publish_history(&mut reply, &|| false, |_| Ok(()))
                     .unwrap();

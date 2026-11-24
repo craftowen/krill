@@ -215,9 +215,6 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                 _ => env.push((provider.env_var().as_bytes().to_vec(), dir)),
             }
         }
-        if provider == ProviderKind::OpenCode && !opencode_instructions_dir.is_empty() {
-            env.push((b"OPENCODE_CONFIG_DIR".to_vec(), opencode_instructions_dir));
-        }
     }
     if !opencode_instructions_dir.is_empty()
         && provider.is_none_or(|kind| kind == ProviderKind::OpenCode)

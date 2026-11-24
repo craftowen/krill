@@ -8077,7 +8077,7 @@ fn set_bot_sessions_rebuilds_hidden_bot_worktrees(cx: &mut TestAppContext) {
     );
 
     view.update(vcx, |s, cx| {
-        let meta = crate::bots::BotSessionMeta {
+        let meta = krill_ui::bot_types::BotSessionMeta {
             bot_id: krill_proto::bots::BotId::new("bot-1").unwrap(),
             bot_name: "Bot".into(),
             emoji: None,

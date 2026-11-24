@@ -1,8 +1,6 @@
 //! LL-01 & LL-03 regressions: signal monitoring before first spawn/reap and
 //! teardown / adopted-exit cleanup.
 
-#![cfg(unix)]
-
 use std::fs;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
@@ -231,7 +229,7 @@ fn upgrade_skips_exited_adopted_watch_and_terminate_release_completes() {
     fs::create_dir_all(&dir).unwrap();
     let mut holder = Command::new(HOLDER)
         .arg(std::env::current_exe().unwrap())
-        .args(["role_ll03_krilld", "--exact", "--nocapture"])
+        .args(["early_exit::role_ll03_krilld", "--exact", "--nocapture"])
         .env("MKL_ROLE", "ll03")
         .env("MKL_DIR", &dir)
         .env("KRILL_LOG_DIR", &dir)

@@ -2868,8 +2868,10 @@ enum ProbedLoginEnv {
 fn wrap_probe(profile: &Profile, login: Launch) -> Launch {
     let Launch { mut argv, env } = login;
     argv.truncate(1);
+    // `+m` disables interactive job control so `zsh -l -i` running in its own process group
+    // (`own_group`) does not call `tcsetpgrp` and stop on `SIGTTOU` when a controlling TTY exists.
     argv.extend(
-        ["-l", "-i", "-c", PROBE_PREFLIGHT, WRAPPER_ARG0]
+        ["-l", "-i", "+m", "-c", PROBE_PREFLIGHT, WRAPPER_ARG0]
             .into_iter()
             .map(|s| s.as_bytes().to_vec()),
     );

@@ -5653,8 +5653,9 @@ impl Sidebar {
         if self.bot_sessions.get(&host) == Some(&sessions) {
             return;
         }
+        let is_local = host.is_local();
         self.bot_sessions.insert(host, sessions);
-        if host.is_local() && self.bot_worktrees.is_some() {
+        if is_local && self.bot_worktrees.is_some() {
             self.rebuild(cx);
         } else {
             cx.notify();
