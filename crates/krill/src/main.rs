@@ -54,6 +54,7 @@ use krill_proto::daemon;
 const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill drop <file>...|ls|rm <id> [--json] | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions,bots] | krill bot ls/new/show/update/rm/start/templates/skills/apps/soul/memory/items/suggest/offer/reply/send/groups/connectors/access/secret/tools/export/import/import-external | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts init|lint|share|update|retention|unshare|status|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable|flush [--json] | krill errors status|enable|disable|flush [--json] | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>] | krill --version";
 
 fn main() -> ExitCode {
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     run(std::env::args_os().skip(1).collect())
 }
 
@@ -99,7 +100,7 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         raw.as_slice(),
         [flag] if matches!(flag.to_str(), Some("-V" | "--version" | "version"))
     ) {
-        println!("krill {}", krill_proto::BUILD);
+        println!("krill {}", krill_version::BUILD);
         return ExitCode::SUCCESS;
     }
     if raw.is_empty() {

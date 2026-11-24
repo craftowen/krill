@@ -126,7 +126,7 @@ fn write_crash_with_bt(
 fn header(title: &str, now: u64) -> String {
     format!(
         "{title}\nversion: {}\nos: {} {}\ntime: {now} (unix)\n",
-        env!("CARGO_PKG_VERSION"),
+        crate::release_version(),
         std::env::consts::OS,
         std::env::consts::ARCH,
     )

@@ -12,6 +12,7 @@ krill-hosts = { workspace = true }
 krill-log = { workspace = true }
 tracing = { workspace = true }
 krill-proto = { workspace = true }
+krill-version = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

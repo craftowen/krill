@@ -112,7 +112,7 @@ fn daemon_upgrade_report(outcome: DaemonUpgradeOutcome<'_>, json: bool) -> Strin
                     "status": "upgraded",
                     "upgraded": true,
                     "running": build,
-                    "installed": krill_proto::BUILD,
+                    "installed": krill_version::BUILD,
                 })
                 .to_string()
             } else {
@@ -137,7 +137,7 @@ fn daemon_upgrade_report(outcome: DaemonUpgradeOutcome<'_>, json: bool) -> Strin
                 serde_json::json!({
                     "status": "not_running",
                     "upgraded": false,
-                    "installed": krill_proto::BUILD,
+                    "installed": krill_version::BUILD,
                 })
                 .to_string()
             } else {
@@ -163,7 +163,7 @@ fn upgrade_daemon(state_dir: Option<&Path>, check: bool, json: bool) -> ExitCode
             Ok(c) => {
                 println!(
                     "{}",
-                    daemon_check_report(krill_proto::BUILD, &c.server.build, json)
+                    daemon_check_report(krill_version::BUILD, &c.server.build, json)
                 );
                 ExitCode::SUCCESS
             }
@@ -183,7 +183,7 @@ fn upgrade_daemon(state_dir: Option<&Path>, check: bool, json: bool) -> ExitCode
         Ok(None) => {
             println!(
                 "{}",
-                daemon_upgrade_report(DaemonUpgradeOutcome::UpToDate(krill_proto::BUILD), json)
+                daemon_upgrade_report(DaemonUpgradeOutcome::UpToDate(krill_version::BUILD), json)
             );
         }
         Err(e)

@@ -161,7 +161,7 @@ fn event_allowlist_is_capped() {
 #[test]
 fn payloads_carry_no_free_text() {
     let mut allowed = vec![
-        env!("CARGO_PKG_VERSION"),
+        crate::release_version(),
         std::env::consts::OS,
         std::env::consts::ARCH,
         "0-50MB",

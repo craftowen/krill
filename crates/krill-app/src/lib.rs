@@ -1,56 +1,7 @@
-//! 앱 라이브러리: 터미널 렌더러(MK-027), 입력 에코 즉시 그리기(OWE-480), 데몬 연결 상태·입력 알림 문구(MK-026),
-//! 레이아웃 모델(MK-030), 칸 ↔ 세션 연결·키 바이트(OWE-490), Jump 팔레트(MK-057), 워크트리 생성 대화상자(OWE-496), 첫 실행 온보딩(MK-073), 설정·키 바인딩 파일(MK-070), 알림·배지·잠자기 방지(MK-044). gpui 셸은 바이너리(`main.rs`)에 있다.
+//! 앱 라이브러리: `krill-ui`와 `krill-app-core`를 재노출하고 봇 UI(`bots`)·모델 목록(`agent_models`)을 제공한다.
+//! gpui 메인 셸은 바이너리(`main.rs` + `shell/`)에 있다.
 
-pub mod accounts;
-pub mod add_project;
-pub mod agent_history;
+pub use krill_app_core::*;
+
 pub mod agent_models;
-pub mod alert;
-pub mod appearance;
-pub mod artifacts;
-pub mod automations;
 pub mod bots;
-pub mod commands;
-pub mod continue_session;
-pub mod crash;
-pub mod detached;
-pub mod diff;
-pub mod echo;
-pub mod editor;
-pub mod errors;
-pub mod file_format;
-pub mod hosts;
-pub mod i18n;
-pub mod jump;
-pub mod keys;
-pub mod layout;
-pub mod link;
-pub mod link_ui;
-pub(crate) mod local_time;
-pub use local_time::chat_message_time;
-pub mod machines;
-pub mod menu_bar;
-pub mod onboarding;
-pub mod open_in;
-pub mod pane;
-pub mod platform;
-pub(crate) mod process_io;
-pub mod pull_request;
-pub mod recording;
-pub mod remote_fs;
-pub mod resources;
-#[cfg(target_os = "macos")]
-pub mod responsiveness;
-pub mod search;
-pub mod security;
-pub mod settings;
-pub mod sidebar;
-pub mod ssh_hosts;
-pub mod star_nag;
-pub mod telemetry;
-pub mod terminal;
-pub mod terminal_font;
-pub mod ui;
-pub mod updater;
-pub mod voice;
-pub mod worktree;

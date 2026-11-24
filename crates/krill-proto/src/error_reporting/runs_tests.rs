@@ -366,8 +366,8 @@ fn start_is_only_for_app_and_daemon_under_current_consent() {
     assert_eq!(record.process, Process::App);
     assert_eq!(record.pid, std::process::id());
     assert_eq!(record.generation, generation_hash(&consent));
-    assert_eq!(record.release, env!("CARGO_PKG_VERSION"));
-    assert_eq!(record.build_id, crate::BUILD);
+    assert_eq!(record.release, crate::release_version());
+    assert_eq!(record.build_id, crate::build_id());
     assert!(!record.clean && !record.panicked);
     assert_eq!(record.seen_ms, 0);
     drop(guard);

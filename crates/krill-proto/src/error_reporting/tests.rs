@@ -510,8 +510,8 @@ fn new_event_carries_build_metadata_and_random_ids() {
     let b = Event::new(Process::App, Code::Panic, None).unwrap();
     assert_ne!(a.event_id, b.event_id);
     assert_eq!(a.kind, Kind::Panic);
-    assert_eq!(a.release, env!("CARGO_PKG_VERSION"));
-    assert_eq!(a.build_id, crate::BUILD);
+    assert_eq!(a.release, crate::release_version());
+    assert_eq!(a.build_id, crate::build_id());
     assert_eq!(Some(a.os), Os::current());
     assert_eq!(a.arch, Arch::current());
     assert_eq!((a.hang_bucket_ms, a.native.is_none()), (None, true));

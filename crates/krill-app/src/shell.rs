@@ -917,7 +917,7 @@ fn daemon_upgrade_rebind_needed(server: &krill_proto::ipc::ServerHello) -> bool 
     use krill_proto::control::{FEAT_UPGRADE, FEAT_WINDOWS_UPGRADE, is_newer};
     server.features & FEAT_UPGRADE != 0
         && (!cfg!(windows) || server.features & FEAT_WINDOWS_UPGRADE != 0)
-        && is_newer(krill_proto::BUILD, &server.build) == Some(true)
+        && is_newer(krill_version::BUILD, &server.build) == Some(true)
 }
 
 fn rebind_after_daemon_upgrade_with<F>(

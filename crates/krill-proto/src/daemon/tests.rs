@@ -855,7 +855,7 @@ fn windows_paths_choose_flat_then_exact_version_holder() {
     std::fs::create_dir_all(&root).unwrap();
     let app = root.join("krill-app.exe");
     let holder = root.join("krill-holder.exe");
-    let current = root.join(format!("krill-holder-{}.exe", env!("CARGO_PKG_VERSION")));
+    let current = root.join(format!("krill-holder-{}.exe", crate::release_version()));
     let old = root.join("krill-holder-0.0.0.exe");
     for path in [&app, &current, &old] {
         std::fs::write(path, b"MZ").unwrap();

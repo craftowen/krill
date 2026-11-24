@@ -20,62 +20,11 @@ use krill_proto::screen::Msg as _;
 
 use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::bots as text;
-use crate::layout::TabColor;
 
 /// Non-blocking injectable RPC closure for `BotRpcRequest` -> `BotRpcResponse`.
 pub type BotRpcCall = Arc<dyn Fn(&BotRpcRequest) -> Result<BotRpcResponse, String> + Send + Sync>;
 
-/// Lightweight UI identity cached for sessions owned by a bot (shown in tabs & sidebar rows).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BotSessionMeta {
-    pub bot_id: BotId,
-    pub bot_name: String,
-    pub emoji: Option<String>,
-    pub avatar_color: Option<String>,
-}
-
-impl BotSessionMeta {
-    /// Builds display metadata from a [`BotConfig`].
-    #[must_use]
-    pub fn from_bot(bot: &BotConfig) -> Self {
-        Self {
-            bot_id: bot.id.clone(),
-            bot_name: bot.name.clone(),
-            emoji: bot
-                .emoji
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
-            avatar_color: bot
-                .avatar_color
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
-        }
-    }
-
-    /// Formats `<emoji> <bot_name>` when emoji is set, or `<bot_name>` otherwise.
-    #[must_use]
-    pub fn display_prefix(&self) -> String {
-        match self
-            .emoji
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(emoji) => format!("{emoji} {}", self.bot_name),
-            None => self.bot_name.clone(),
-        }
-    }
-
-    /// Resolves the mapped semantic [`TabColor`] if a known hex/name is set.
-    #[must_use]
-    pub fn tab_color(&self) -> Option<TabColor> {
-        parse_avatar_color(self.avatar_color.as_deref())
-    }
-}
+pub use krill_ui::bot_types::{BotSessionMeta, parse_avatar_color};
 
 /// Krill's 8 enabled bot agent runtimes (aligned with Orca's enabled bot agents).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,25 +73,6 @@ pub fn runtime_display_label(agent_id: &str) -> String {
 }
 
 /// Maps any persisted avatar color name or `#rrggbb` string to a semantic [`TabColor`].
-#[must_use]
-pub fn parse_avatar_color(raw: Option<&str>) -> Option<TabColor> {
-    let trimmed = raw?.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.as_str() {
-        "purple" | "#a855f7" | "#8b5cf6" => Some(TabColor::Purple),
-        "pink" | "#ec4899" => Some(TabColor::Pink),
-        "red" | "#ef4444" => Some(TabColor::Red),
-        "orange" | "#f97316" => Some(TabColor::Orange),
-        "yellow" | "#eab308" => Some(TabColor::Yellow),
-        "green" | "#22c55e" => Some(TabColor::Green),
-        "teal" | "#14b8a6" | "#06b6d4" => Some(TabColor::Teal),
-        "gray" | "grey" | "#9ca3af" | "#6b7280" => Some(TabColor::Gray),
-        _ => Some(TabColor::Blue),
-    }
-}
-
 /// Supported reasoning effort choices (empty string = runtime default).
 pub const BOT_EFFORT_OPTIONS: [&str; 6] = ["", "low", "medium", "high", "xhigh", "max"];
 

@@ -15,6 +15,7 @@ use krill_link::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

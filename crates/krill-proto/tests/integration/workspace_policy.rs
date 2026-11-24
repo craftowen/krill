@@ -3,14 +3,14 @@
 
 use std::path::Path;
 
-/// 워크스페이스 루트 기준. holder·krilld FFI 모듈(Unix·Windows), krill-app platform 모듈(objc2·Win32).
+/// 워크스페이스 루트 기준. holder·krilld FFI 모듈(Unix·Windows), krill-ui platform 모듈(objc2·Win32).
 const UNSAFE_ALLOWED: [&str; 6] = [
     "crates/krill-holder/src/sys.rs",
     "crates/krill-holder/src/sys/windows.rs",
     "crates/krilld/src/sys.rs",
-    "crates/krill-app/src/platform.rs",
-    "crates/krill-app/src/platform/windows.rs",
-    "crates/krill-app/src/platform/windows/shell.rs",
+    "crates/krill-ui/src/platform.rs",
+    "crates/krill-ui/src/platform/windows.rs",
+    "crates/krill-ui/src/platform/windows/shell.rs",
 ];
 
 /// 이 파일도 검사 대상이라 린트 이름을 글자 그대로 쓰지 않는다.

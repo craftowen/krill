@@ -12,6 +12,7 @@ same-file = { workspace = true }
 krill-log = { workspace = true }
 tracing = { workspace = true }
 krill-proto = { workspace = true }
+krill-version = { workspace = true }
 krill-holder = { workspace = true }
 alacritty_terminal = { workspace = true }
 rustix = { workspace = true }

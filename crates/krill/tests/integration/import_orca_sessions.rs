@@ -82,7 +82,7 @@ fn cli_manual_import_resumes_current_panes_retries_failure_and_skips_duplicates(
                         proto_min: ipc::PROTO_MIN,
                         proto_max: ipc::PROTO_MAX,
                         features: ipc::FEATURES | FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_AI_VAULT,
-                        build: krill_proto::BUILD.into(),
+                        build: krill_version::BUILD.into(),
                         instance_id: 1,
                     }
                     .encode()

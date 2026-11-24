@@ -339,7 +339,7 @@ fn collect(no_start: bool) -> Collected {
             missing: helpers_missing,
             detail: helpers_detail,
         },
-        cli_build: krill_proto::BUILD.to_owned(),
+        cli_build: krill_version::BUILD.to_owned(),
         daemon_build,
         state: State {
             ok: state_ok,

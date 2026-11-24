@@ -41,6 +41,7 @@ struct OpeningWindow {
 impl gpui::Global for OpeningWindow {}
 
 fn main() -> std::process::ExitCode {
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     // 테스트 실행 파일 탐색이 일반 앱 산출물을 골라도 운영 데몬에 붙지 않는다.
     if std::env::args_os().skip(1).any(|arg| arg == "--list") {
         eprintln!("krill-app: --list requires a test executable");

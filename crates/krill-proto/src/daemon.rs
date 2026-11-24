@@ -585,7 +585,7 @@ fn find_exe(bin: &Path, apps: &[PathBuf], name: &str) -> PathBuf {
     // left behind by an update. The flat zip layout remains the first choice.
     #[cfg(windows)]
     if name == "krill-holder.exe" {
-        let versioned = bin.join(format!("krill-holder-{}.exe", env!("CARGO_PKG_VERSION")));
+        let versioned = bin.join(format!("krill-holder-{}.exe", crate::release_version()));
         if versioned.is_file() {
             return versioned;
         }
@@ -818,7 +818,7 @@ pub fn preflight(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 붙은 krilld가 이 빌드(`crate::BUILD`)보다 오래됐으면 `paths`의 holder·krilld로 교체를 요청하고 새 krilld가
+/// 붙은 krilld가 이 빌드(`crate::build_id()`)보다 오래됐으면 `paths`의 holder·krilld로 교체를 요청하고 새 krilld가
 /// 클라이언트를 받을 때까지 기다린다(MK-062). 교체했으면 새 krilld의 `ServerHello`. krilld가 업그레이드를 모르거나
 /// (`FEAT_UPGRADE` 없음) 같거나 새 빌드면(다운그레이드 금지) 아무것도 하지 않고 `None`.
 /// Windows 구 데몬이 holder 보존을 지원하지 않으면 런타임 교체를 보류한다(`None`).
@@ -826,7 +826,7 @@ pub fn preflight(path: &Path) -> io::Result<()> {
 /// # Errors
 /// 연결·협상 실패, krilld의 거절(`Failed`, 범위 밖·holder 없음·실행 파일 없음), 새 krilld가 제때 뜨지 않음.
 pub fn upgrade(paths: &Paths, hello: &ClientHello) -> io::Result<Option<ServerHello>> {
-    upgrade_as(paths, hello, crate::BUILD)
+    upgrade_as(paths, hello, crate::build_id())
 }
 
 /// [`upgrade`]와 같고 이 빌드 대신 `build`로 요청한다(테스트·진단용). krilld도 다운그레이드를 거절한다.

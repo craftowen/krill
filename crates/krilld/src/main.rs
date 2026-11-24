@@ -38,6 +38,7 @@ use rustix::fs::{FileType, fstat};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> ExitCode {
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     let Some(argument) = std::env::args_os().nth(1) else {
         return ExitCode::from(2);
     };
@@ -47,7 +48,7 @@ fn main() -> ExitCode {
     // 앱 시작 점검은 소켓을 열지 않고 버전만 읽는다.
     if argument == "--version" {
         use std::io::Write as _;
-        return match writeln!(io::stdout().lock(), "{}", krill_proto::BUILD) {
+        return match writeln!(io::stdout().lock(), "{}", krill_version::BUILD) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         };
@@ -359,7 +360,7 @@ fn main() -> ExitCode {
         proto_min: PROTO_MIN,
         proto_max: PROTO_MAX,
         features: FEATURES,
-        build: krill_proto::BUILD.to_owned(),
+        build: krill_version::BUILD.to_owned(),
         instance_id: u64::from(std::process::id()),
     };
     if !owns_mobile(&path) {
