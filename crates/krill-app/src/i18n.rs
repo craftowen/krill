@@ -486,7 +486,7 @@ catalog! {
         BP_TABS => ("봇 패널", "Bot panel"),
         BP_HOME => ("홈", "Home"),
         BP_CONNECTORS => ("커넥터", "Connectors"),
-        BP_CHATS => ("채팅", "Chats"),
+        BP_CHATS => ("Chats", "Chats"),
         BP_FILES => ("파일", "Files"),
         BP_IDLE => ("대기 중", "Idle"),
         BP_SHARE_BOT => ("봇 공유…", "Share bot…"),

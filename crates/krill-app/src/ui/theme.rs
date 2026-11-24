@@ -27,12 +27,16 @@ pub const FONT_MONO: &str = "Menlo";
 #[cfg(windows)]
 pub const FONT_MONO: &str = "Consolas";
 
-/// 글자 크기 단계(Orca `text-[10px]` ~ `text-sm` 대응, 창의 `rem_size`/줌을 따른다).
+/// 글자 크기 단계(Orca `text-[10px]` ~ `text-2xl` 대응, 창의 `rem_size`/줌을 따른다).
+pub const TEXT_3XS: Rems = rems(10. / 16.);
 pub const TEXT_2XS: Rems = rems(10. / 16.);
 pub const TEXT_XS: Rems = rems(11. / 16.);
 pub const TEXT_SM: Rems = rems(12. / 16.);
+pub const TEXT_DETAIL: Rems = rems(12.5 / 16.);
 pub const TEXT_MD: Rems = rems(13. / 16.);
 pub const TEXT_LG: Rems = rems(14. / 16.);
+/// Orca `text-[15px]`: 봇 항목 상세 제목·모달 부제목.
+pub const TEXT_HEADING: Rems = rems(15. / 16.);
 /// Orca `text-lg`(18px): 새 봇 대화상자 제목.
 pub const TEXT_XL: Rems = rems(18. / 16.);
 /// Orca `text-2xl`(24px): 새 봇 이름 입력처럼 한 화면의 주인공 입력.
@@ -150,12 +154,16 @@ pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(1120.);
 
 /// Orca `--chat-content-max-width`: transcript and composer share a readable column.
 pub const CHAT_CONTENT_MAX_WIDTH: Rems = rems(46.);
-/// 토글 스위치 트랙 너비(Orca `Switch` `w-9` = 36px, OWE-793).
-pub const SWITCH_WIDTH: Pixels = px(36.);
-/// 토글 스위치 트랙 높이(Orca `Switch` `h-5` = 20px, OWE-793).
-pub const SWITCH_HEIGHT: Pixels = px(20.);
-/// 토글 스위치 원형 썸 지름(Orca `Switch` 썸 `size-3.5` = 14px, OWE-793).
+/// 토글 스위치 트랙 너비(Orca `Switch` `w-8` = 32px).
+pub const SWITCH_WIDTH: Pixels = px(32.);
+/// 토글 스위치 트랙 높이(Orca `Switch` `h-[18px]` = 18px).
+pub const SWITCH_HEIGHT: Pixels = px(18.);
+/// 토글 스위치 원형 썸 지름(Orca `Switch` 썸 `size-3.5` = 14px).
 pub const SWITCH_THUMB: Pixels = px(14.);
+/// 콤팩트 토글 스위치 치수(Orca `Switch size="sm"` `w-6 h-3.5` / `size-2.5`).
+pub const SWITCH_COMPACT_WIDTH: Pixels = px(24.);
+pub const SWITCH_COMPACT_HEIGHT: Pixels = px(14.);
+pub const SWITCH_COMPACT_THUMB: Pixels = px(10.);
 /// 상단 Jump/커맨드 팔레트 기본 너비(Orca `WorktreeJumpPalette` `w-[900px]` 대응).
 pub const COMMAND_PALETTE_WIDTH: Pixels = px(900.);
 
@@ -316,7 +324,124 @@ pub struct Palette {
     pub split_divider_strong: Hsla,
 }
 
-/// 라이트 팔레트. Orca 라이트 모드(`:root`) 기반, 무채색 크롬은 Krill 심해 틴트(Orca 값에서 변경). 상태색은 Orca 값 그대로다.
+/// sRGB 공간에서 `fg`를 `pct`(0.0..=1.0) 비율로 `bg`와 섞는다(CSS `color-mix(in srgb, fg P%, bg)` 대응).
+#[must_use]
+pub fn color_mix(fg: Hsla, pct: f32, bg: Hsla) -> Hsla {
+    let fg = fg.to_rgb();
+    let bg = bg.to_rgb();
+    let t = pct.clamp(0.0, 1.0);
+    Hsla::from(gpui::Rgba {
+        r: fg.r * t + bg.r * (1.0 - t),
+        g: fg.g * t + bg.g * (1.0 - t),
+        b: fg.b * t + bg.b * (1.0 - t),
+        a: fg.a * t + bg.a * (1.0 - t),
+    })
+}
+
+impl Palette {
+    /// 어두운 팔레트인지 여부.
+    #[must_use]
+    pub const fn is_dark(&self) -> bool {
+        self.background.l < 0.5
+    }
+
+    /// Orca `--chat-canvas`: 다크는 `color-mix(in srgb, foreground 5%, background)`(`#161616`), 라이트는 `background`.
+    #[must_use]
+    pub fn chat_canvas(&self) -> Hsla {
+        if self.is_dark() {
+            color_mix(self.foreground, 0.05, self.background)
+        } else {
+            self.background
+        }
+    }
+
+    /// Orca `--chat-composer-surface`: 다크는 `color-mix(in srgb, foreground 4%, chat_canvas)`(`#1f1f1f`), 라이트는 `background`.
+    #[must_use]
+    pub fn chat_composer_surface(&self) -> Hsla {
+        if self.is_dark() {
+            color_mix(self.foreground, 0.04, self.chat_canvas())
+        } else {
+            self.background
+        }
+    }
+
+    /// Orca `--chat-composer-border`: 다크 `foreground/9%`, 라이트 `foreground/11%`.
+    #[must_use]
+    pub fn chat_composer_border(&self) -> Hsla {
+        self.foreground
+            .opacity(if self.is_dark() { 0.09 } else { 0.11 })
+    }
+
+    /// Orca `--notice-surface` (`BotHomeBanner` 알약 등): 다크 `color-mix(in srgb, foreground 15%, card)`(`#383838`), 라이트 `card`.
+    #[must_use]
+    pub fn notice_surface(&self) -> Hsla {
+        if self.is_dark() {
+            color_mix(self.foreground, 0.15, self.card)
+        } else {
+            self.card
+        }
+    }
+
+    /// Orca `--tab-bar` (`card` / `#171717`).
+    #[must_use]
+    pub const fn tab_bar(&self) -> Hsla {
+        self.card
+    }
+
+    /// Orca `--tab-active`: 다크 `color-mix(in srgb, foreground 6%, card)`(`#242424`), 라이트 `background`.
+    #[must_use]
+    pub fn tab_active(&self) -> Hsla {
+        if self.is_dark() {
+            color_mix(self.foreground, 0.06, self.card)
+        } else {
+            self.background
+        }
+    }
+
+    /// Orca `--tab-inactive` (`card` / `#171717`).
+    #[must_use]
+    pub const fn tab_inactive(&self) -> Hsla {
+        self.card
+    }
+
+    /// Orca `[data-worktree-card-active='primary']` 배경: 왼쪽 사이드바 위 선택 카드 표면.
+    #[must_use]
+    pub fn worktree_sidebar_active(&self) -> Hsla {
+        if self.is_dark() {
+            color_mix(self.foreground, 0.10, self.worktree_sidebar)
+        } else {
+            color_mix(self.background, 0.90, self.worktree_sidebar)
+        }
+    }
+
+    /// Orca `[data-worktree-card-active='primary']` 테두리: 다크 `white/18%`, 라이트 `black/10%`.
+    #[must_use]
+    pub const fn worktree_sidebar_active_border(&self) -> Hsla {
+        if self.is_dark() {
+            hexa(0x00ff_ffff, 0.18)
+        } else {
+            hexa(0x0000_0000, 0.10)
+        }
+    }
+
+    /// Orca `--theme-accent`: Home 탭 하단 2px 언더라인 등 강조 파랑(다크 `#4493f8`, 라이트 `#0969da`).
+    #[must_use]
+    pub const fn theme_accent(&self) -> Hsla {
+        if self.is_dark() {
+            hex(0x0044_93f8)
+        } else {
+            hex(0x0009_69da)
+        }
+    }
+
+    /// Orca `--agent-working` (`#eab308` / `warning` 토큰).
+    #[must_use]
+    pub const fn agent_working(&self) -> Hsla {
+        self.warning
+    }
+}
+
+/// 라이트 팔레트. Orca 기본 라이트 모드(`:root`) 1:1 중립 팔레트(보조 글자·포커스 링은 WCAG 대비 충족).
 pub const LIGHT: Palette = Palette {
     background: hex(0x00ff_ffff),
     editor_surface: hex(0x00ff_ffff),
@@ -327,33 +452,32 @@ pub const LIGHT: Palette = Palette {
     popover_foreground: hex(0x000a_0a0a),
     primary: hex(0x0017_1717),
     primary_foreground: hex(0x00fa_fafa),
-    // Krill 심해 틴트(Orca 값에서 변경): secondary·muted·accent·border·input·ring.
-    secondary: hex(0x00f3_f4f7),
+    secondary: hex(0x00f5_f5f5),
     secondary_foreground: hex(0x0017_1717),
-    muted: hex(0x00f3_f4f7),
-    // `#666D7A`는 sidebar_accent 위 4.40:1이라 한 단계 더 어둡게 잡았다(대비 테스트가 고정).
-    muted_foreground: hex(0x0064_6b78),
-    accent: hex(0x00ee_f0f4),
+    muted: hex(0x00f5_f5f5),
+    // Orca `#737373`은 `#f5f5f5` 위 4.35:1이라 WCAG AA(4.5:1)에 맞춰 `#696969`(5.04:1)로 보정.
+    muted_foreground: hex(0x0069_6969),
+    accent: hex(0x00f5_f5f5),
     accent_foreground: hex(0x0017_1717),
     destructive: hex(0x00e4_0014),
-    destructive_foreground: hex(0x00fc_f3f3),
-    border: hex(0x00e4_e7ec),
-    input: hex(0x00e4_e7ec),
-    ring: hex(0x006b_7487),
-    // Krill 심해 틴트(Orca 값에서 변경): sidebar·worktree_sidebar 계열.
-    sidebar: hex(0x00f6_f7f9),
+    destructive_foreground: hex(0x00fa_fafa),
+    border: hex(0x00e5_e5e5),
+    input: hex(0x00e5_e5e5),
+    // Orca `#a1a1a1`은 `#ffffff` 위 2.58:1이라 WCAG 비텍스트 대비(3.0:1)에 맞춰 중립 `#767676`(4.54:1)로 보정.
+    ring: hex(0x0076_7676),
+    sidebar: hex(0x00fa_fafa),
     sidebar_foreground: hex(0x000a_0a0a),
     sidebar_primary: hex(0x0017_1717),
     sidebar_primary_foreground: hex(0x00fa_fafa),
-    sidebar_accent: hex(0x00e9_ecf1),
+    sidebar_accent: hex(0x00f5_f5f5),
     sidebar_accent_foreground: hex(0x0017_1717),
-    sidebar_border: hex(0x00e4_e7ec),
-    sidebar_ring: hex(0x006b_7487),
-    worktree_sidebar: hex(0x00f1_f3f6),
+    sidebar_border: hex(0x00e5_e5e5),
+    sidebar_ring: hex(0x0076_7676),
+    worktree_sidebar: hex(0x00f5_f5f5),
     worktree_sidebar_foreground: hex(0x000a_0a0a),
-    worktree_sidebar_accent: hex(0x00e6_e9ef),
-    worktree_sidebar_border: hex(0x00e4_e7ec),
-    success: hex(0x0015_803d),
+    worktree_sidebar_accent: hex(0x00ea_eaea),
+    worktree_sidebar_border: hex(0x00e5_e5e5),
+    success: hex(0x0014_7638),
     warning: hex(0x00ca_8a04),
     warning_foreground: hex(0x00fa_fafa),
     agent_question: hex(0x00ea_580c),
@@ -689,8 +813,8 @@ impl DarkUiTheme {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LightUiTheme {
-    #[default]
     Paper,
+    #[default]
     Classic,
     Moonlight,
     Limestone,
@@ -883,13 +1007,13 @@ pub fn terminal_theme(cx: &App) -> TerminalTheme {
     terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
-/// 주어진 [`ThemeMode`]의 기본 팔레트(흑연·[`PAPER`]). 설정 테마는 [`palette`]가 반영한다.
+/// 주어진 [`ThemeMode`]의 기본 팔레트(흑연·[`LIGHT`]). 설정 테마는 [`palette`]가 반영한다.
 #[inline]
 pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     if matches!(mode, ThemeMode::Dark) {
         &GRAPHITE
     } else {
-        &PAPER
+        &LIGHT
     }
 }
 
@@ -996,12 +1120,12 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         theme.colors.sidebar_accent_foreground = p.sidebar_accent_foreground;
         theme.colors.sidebar_border = p.sidebar_border;
 
-        theme.colors.title_bar = p.sidebar;
+        theme.colors.title_bar = p.tab_bar();
         theme.colors.title_bar_border = p.border;
-        theme.colors.tab_bar = p.sidebar;
-        theme.colors.tab = p.sidebar;
+        theme.colors.tab_bar = p.tab_bar();
+        theme.colors.tab = p.tab_inactive();
         theme.colors.tab_foreground = p.muted_foreground;
-        theme.colors.tab_active = p.background;
+        theme.colors.tab_active = p.tab_active();
         theme.colors.tab_active_foreground = p.foreground;
 
         theme.colors.danger = p.destructive;
@@ -1143,7 +1267,7 @@ mod tests {
         assert!(dark.background.l < 0.15);
         assert!(light.foreground.l < 0.15);
         assert!(dark.foreground.l > 0.90);
-        assert_eq!(light, &PAPER);
+        assert_eq!(light, &LIGHT);
         assert_eq!(dark, &GRAPHITE);
     }
 
@@ -1155,6 +1279,8 @@ mod tests {
             assert_eq!(cx.theme().mode, ThemeMode::Dark);
             assert_eq!(cx.theme().background, GRAPHITE.background);
             assert_eq!(cx.theme().sidebar, GRAPHITE.sidebar);
+            assert_eq!(cx.theme().tab_bar, GRAPHITE.tab_bar());
+            assert_eq!(cx.theme().tab_active, GRAPHITE.tab_active());
             assert_eq!(cx.theme().radius, RADIUS_SM);
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
@@ -1179,8 +1305,10 @@ mod tests {
 
             apply(ThemeMode::Light, cx);
             assert_eq!(cx.theme().mode, ThemeMode::Light);
-            assert_eq!(cx.theme().background, PAPER.background);
-            assert_eq!(cx.theme().sidebar, PAPER.sidebar);
+            assert_eq!(cx.theme().background, LIGHT.background);
+            assert_eq!(cx.theme().sidebar, LIGHT.sidebar);
+            assert_eq!(cx.theme().tab_bar, LIGHT.tab_bar());
+            assert_eq!(cx.theme().tab_active, LIGHT.tab_active());
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
             assert_ne!(cx.theme().button_primary, cx.theme().button_primary_hover);
@@ -1330,7 +1458,7 @@ mod tests {
     #[test]
     fn ui_themes_map_to_palettes_and_paired_terminal_themes() {
         assert_eq!(DarkUiTheme::default().palette(), &GRAPHITE);
-        assert_eq!(LightUiTheme::default().palette(), &PAPER);
+        assert_eq!(LightUiTheme::default().palette(), &LIGHT);
         for theme in DarkUiTheme::ALL {
             let p = theme.palette();
             assert!(p.background.l < 0.15, "{theme:?}");

@@ -194,6 +194,8 @@ impl Shell {
         let p = ui::palette(cx);
         let active = self.layout.active();
         let labels = self.workspace_tab_labels(cx);
+        let visible_tab_count = labels.len();
+        let is_bot_workspace = self.focused_bot().is_some();
         let visible_active = labels.iter().position(|(i, _)| *i == active).unwrap_or(0);
         let indices: Vec<_> = labels.iter().map(|(i, _)| *i).collect();
         let tabs = labels
@@ -287,9 +289,23 @@ impl Shell {
                 let pane = tab.focused;
                 let is_launcher = self.is_split_launcher(pane);
                 let is_group = self.is_group_pane(pane);
+                let bot_for_tab = (!is_launcher && !is_group && self.layout.file(pane).is_none())
+                    .then(|| self.bot_for_pane(pane))
+                    .flatten();
+                let is_bot_home = bot_for_tab.is_some_and(|bot| {
+                    self.layout
+                        .session(pane)
+                        .is_some_and(|sid| bot.home_session().is_some_and(|h| h.session_id == sid))
+                });
+                let unclosable = tab.pinned || is_bot_home;
+                let display_label = if is_bot_home {
+                    "Home".to_owned()
+                } else {
+                    label.clone()
+                };
                 // 파일·빈 런처·그룹 탭에는 단일 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
                 let description = if self.layout.file(pane).is_some() || is_launcher || is_group {
-                    label.clone()
+                    display_label.clone()
                 } else {
                     description
                 };
@@ -372,10 +388,19 @@ impl Shell {
                 } else {
                     None
                 };
+                let tab_bottom_accent = if is_bot_home {
+                    Some(p.theme_accent())
+                } else if selected && bot_for_tab.is_some() && visible_tab_count > 1 {
+                    Some(p.foreground)
+                } else {
+                    None
+                };
                 Tab::new()
                     .when(rename_input.is_none(), |t| {
-                        t.label(SharedString::from(label.clone()))
+                        t.label(SharedString::from(display_label.clone()))
                     })
+                    .when(is_bot_home, |t| t.font_weight(gpui::FontWeight::SEMIBOLD))
+                    .when_some(tab_bottom_accent, Tab::bottom_accent)
                     .when_some(tab_hover_spec, |t, spec| {
                         t.tooltip(move |window, cx| {
                             ui::session_hover_card_view(spec.clone(), window, cx)
@@ -398,7 +423,11 @@ impl Shell {
                     .debug_selector(move || format!("session-tab-{i}"))
                     // 탭 안쪽 왼쪽 여백 12px, 짧은 제목도 탭 모양이 나게 최소 폭(STYLEGUIDE §5.3 탭 규칙).
                     .pl(ui::SPACE_3)
-                    .min_w(ui::TAB_MIN_WIDTH)
+                    .min_w(if is_bot_home {
+                        px(96.)
+                    } else {
+                        ui::TAB_MIN_WIDTH
+                    })
                     .prefix(
                         div()
                             .debug_selector(move || format!("tab-prefix-{i}"))
@@ -409,8 +438,10 @@ impl Shell {
                             // 탭 기본 간격 4px과 더해 아이콘-제목 간격 8px.
                             .pr(ui::SPACE_1)
                             // Orca 비활성 탭 `opacity-70`: 아이덴티티는 유지하고 강조만 낮춘다.
-                            .when(!selected, |d| d.opacity(ui::TAB_INACTIVE_OPACITY))
-                            .when(tab.pinned, |d| {
+                            .when(!selected && !is_bot_home, |d| {
+                                d.opacity(ui::TAB_INACTIVE_OPACITY)
+                            })
+                            .when(tab.pinned && !is_bot_home, |d| {
                                 d.child(
                                     ui::icons::svg_box(
                                         ui::icons::PIN_SVG,
@@ -428,14 +459,16 @@ impl Shell {
                                     .rounded_full()
                                     .bg(ui::tab_tag_color(color))
                             }))
-                            .children(bot_dot_color.map(|color| {
-                                div()
-                                    .debug_selector(move || format!("tab-bot-color-{i}"))
-                                    .flex_none()
-                                    .size(ui::STATE_DOT)
-                                    .rounded_full()
-                                    .bg(color)
-                            }))
+                            .children(bot_dot_color.filter(|_| bot_for_tab.is_none()).map(
+                                |color| {
+                                    div()
+                                        .debug_selector(move || format!("tab-bot-color-{i}"))
+                                        .flex_none()
+                                        .size(ui::STATE_DOT)
+                                        .rounded_full()
+                                        .bg(color)
+                                },
+                            ))
                             .child(if let Some(fp) = file_prefix {
                                 // MK-119: 파일 탭은 [파일 아이콘][미저장 점]으로 바꾼다.
                                 fp.into_any_element()
@@ -446,6 +479,59 @@ impl Shell {
                                     .with_size(ui::ICON_SM)
                                     .text_color(p.muted_foreground)
                                     .into_any_element()
+                            } else if let Some(bot) = bot_for_tab {
+                                if is_bot_home {
+                                    // Orca Home 고정 탭: [BotAvatar 12px][Pin 12px] + "Home" + 2px theme_accent 언더라인.
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(ui::SPACE_1)
+                                        .child(self.bot_avatar(bot, ui::ICON_XS, px(3.), p))
+                                        .child(
+                                            ui::icons::svg_box(
+                                                ui::icons::PIN_SVG,
+                                                ui::ICON_XS,
+                                                p.muted_foreground,
+                                            )
+                                            .debug_selector(move || format!("tab-pin-{i}")),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    // Orca 봇 사이드 채팅 탭: [상태 글리프(활성 상태일 때)][BotAvatar 12px].
+                                    let show_status = unread
+                                        || matches!(
+                                            state,
+                                            AgentState::Working
+                                                | AgentState::Waiting
+                                                | AgentState::Blocked
+                                        );
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(ui::SPACE_1)
+                                        .when(show_status, |d| {
+                                            d.child(
+                                                match session {
+                                                    Some(session) => ui::status::status_glyph_for(
+                                                        &session.status,
+                                                        unread,
+                                                        ui::status::Size::Md,
+                                                        None,
+                                                        cx,
+                                                    ),
+                                                    None => ui::status::status_glyph(
+                                                        state,
+                                                        unread,
+                                                        ui::status::Size::Md,
+                                                        cx,
+                                                    ),
+                                                }
+                                                .debug_selector(move || format!("tab-state-{i}")),
+                                            )
+                                        })
+                                        .child(self.bot_avatar(bot, ui::ICON_XS, px(3.), p))
+                                        .into_any_element()
+                                }
                             } else {
                                 // OWE-662: [상태 글리프(미확인이면 벨)][봇 배지/에이전트 아이콘][제목].
                                 div()
@@ -506,7 +592,7 @@ impl Shell {
                             .flex()
                             .items_center()
                             .gap(ui::SPACE_1)
-                            .when(!tab.pinned, |d| {
+                            .when(!unclosable, |d| {
                                 d.child(
                                     div()
                                         .invisible()
@@ -547,7 +633,7 @@ impl Shell {
                         MouseButton::Left,
                         cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                             // OWE-870: 더블클릭으로 탭 이름 변경 대화상자를 연다(한 번 클릭은 탭바가 받는다).
-                            if e.click_count >= 2 {
+                            if e.click_count >= 2 && !is_bot_home {
                                 cx.stop_propagation();
                                 this.begin_tab_rename(i, window, cx);
                             }
@@ -557,7 +643,7 @@ impl Shell {
                         MouseButton::Middle,
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if !this.layout.is_tab_pinned(i) {
+                            if !unclosable && !this.layout.is_tab_pinned(i) {
                                 this.request_close_tab(i, cx);
                             }
                         }),
@@ -590,16 +676,7 @@ impl Shell {
                     }))
             })
             .collect::<Vec<_>>();
-        let profiles = self
-            .agents
-            .as_ref()
-            .map(|s| s.profiles.clone())
-            .unwrap_or_default();
-        let locations = self.execution_locations(cx);
-        let launch_host = self.launch_host.clone();
-        let weak = cx.weak_entity();
-        let disabled = self.agents_busy || self.agents.is_none() || self.link != Link::Up;
-        let toolbar_menu = self.toolbar_menu(cx);
+        let trailing = self.render_tab_bar_trailing(is_bot_workspace, cx);
         div()
             .id("titlebar")
             .debug_selector(|| "titlebar".into())
@@ -607,7 +684,7 @@ impl Shell {
             .items_center()
             .h(ui::TITLEBAR_HEIGHT)
             .min_w_0()
-            .bg(p.sidebar)
+            .bg(p.tab_bar())
             .border_b_1()
             .border_color(p.border)
             .font_family(ui::FONT_UI)
@@ -646,7 +723,7 @@ impl Shell {
                     .self_end()
                     .mb(px(-1.))
                     .max_width(ui::TAB_MAX_WIDTH)
-                    .menu(true)
+                    .menu(!is_bot_workspace)
                     .reveal_selected(true)
                     .selected_index(visible_active)
                     .children(tabs)
@@ -662,6 +739,84 @@ impl Shell {
                         }
                     })),
             )
+            .child(trailing)
+    }
+
+    #[inline(never)]
+    fn render_tab_bar_trailing(
+        &self,
+        is_bot_workspace: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if is_bot_workspace {
+            // Orca 봇 워크스페이스 상단 탭바: 탭 바로 뒤 `+` 버튼, 나머지 드래그 영역, 우측 패널 접혔을 때만 패널 토글.
+            return div()
+                .flex_none()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .pl_1()
+                        .child(ui::button_with_tooltip(
+                            Button::new("new-tab")
+                                .debug_selector(|| "new-tab".into())
+                                .icon(IconName::Plus)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.on_new_tab_button(cx);
+                                })),
+                            "new-tab",
+                            text::NEW_TAB.get(),
+                        )),
+                )
+                .child(
+                    div()
+                        .id("titlebar-drag")
+                        .debug_selector(|| "titlebar-drag".into())
+                        .w(px(36.))
+                        .h_full()
+                        .flex_none()
+                        .window_control_area(gpui::WindowControlArea::Drag),
+                )
+                .when(self.panel_collapsed, |d| {
+                    d.child(
+                        div().flex_none().flex().items_center().pr_2().child(
+                            ui::button_with_tooltip(
+                                Button::new("toggle-panel")
+                                    .icon(IconName::PanelRight)
+                                    .ghost()
+                                    .xsmall()
+                                    .toggled(false)
+                                    .debug_selector(|| "toggle-panel".into())
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx))),
+                                "toggle-panel",
+                                text::TOGGLE_PANEL.get(),
+                            ),
+                        ),
+                    )
+                })
+                .into_any_element();
+        }
+        let profiles = self
+            .agents
+            .as_ref()
+            .map(|s| s.profiles.clone())
+            .unwrap_or_default();
+        let locations = self.execution_locations(cx);
+        let launch_host = self.launch_host.clone();
+        let weak = cx.weak_entity();
+        let disabled = self.agents_busy || self.agents.is_none() || self.link != Link::Up;
+        let toolbar_menu = self.toolbar_menu(cx);
+        div()
+            .flex_none()
+            .h_full()
+            .flex()
+            .items_center()
             .child(
                 div()
                     .id("titlebar-drag")
@@ -770,6 +925,7 @@ impl Shell {
                         text::TOGGLE_PANEL.get(),
                     )),
             )
+            .into_any_element()
     }
 
     pub(super) fn remember_closed_tab(&mut self, index: usize, cx: &App) {

@@ -1272,7 +1272,7 @@ impl Shell {
             .items_center()
             .justify_between()
             .border_t_1()
-            .border_color(p.sidebar_border)
+            .border_color(p.worktree_sidebar_border)
             .child(
                 div()
                     .flex()

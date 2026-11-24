@@ -2696,7 +2696,7 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
     });
     for (mode, want) in [
         (ThemeMode::Dark, krill_app::ui::TERMINAL_DARK),
-        (ThemeMode::Light, krill_app::ui::TERMINAL_LIGHT),
+        (ThemeMode::Light, krill_app::ui::TERMINAL_TANGO_LIGHT),
     ] {
         cx.update(|_, cx| krill_app::ui::apply(mode, cx));
         cx.run_until_parked();

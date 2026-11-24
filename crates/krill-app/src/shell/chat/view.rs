@@ -2694,6 +2694,260 @@ impl Shell {
         )
     }
 
+    /// Orca `NativeChatPaneHeader`: 봇 채팅 패인 우상단 테두리 없는 3개 뮤트 아이콘.
+    #[inline(never)]
+    fn render_bot_chat_top_controls(
+        pane: super::super::PaneId,
+        bot_id: krill_proto::bots::BotId,
+        is_split: bool,
+        muted_fg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let new_chat_bot = bot_id.clone();
+        let settings_bot = bot_id;
+        div()
+            .id(SharedString::from(format!(
+                "chat-top-controls-{}",
+                pane.get()
+            )))
+            .debug_selector(move || format!("chat-top-controls-{}", pane.get()))
+            .group(CHAT_TOP_CONTROLS_GROUP)
+            .absolute()
+            .top_2()
+            .right_3()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .text_color(muted_fg)
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(ui::button_with_tooltip(
+                Button::new(("chat-bot-new-chat", pane.get()))
+                    .debug_selector(move || format!("chat-bot-new-chat-{}", pane.get()))
+                    .icon(gpui_component::Icon::new(
+                        gpui_kit_assets::IconName::MessageSquarePlus,
+                    ))
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let host = this.layout.host(pane).clone();
+                        this.start_bot_session_on(&host, new_chat_bot.clone(), None, cx);
+                    })),
+                format!("chat-bot-new-chat-{}", pane.get()),
+                krill_app::i18n::catalog::bots::BP_NEW_CHAT.get(),
+            ))
+            .child(ui::button_with_tooltip(
+                Button::new(("chat-split-right", pane.get()))
+                    .debug_selector(move || format!("chat-split-right-{}", pane.get()))
+                    .icon(gpui_component::Icon::new(
+                        gpui_kit_assets::IconName::SquareSplitHorizontal,
+                    ))
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.split_pane(pane, krill_app::layout::Axis::Horizontal, cx);
+                    })),
+                format!("chat-split-right-{}", pane.get()),
+                krill_app::i18n::catalog::shell::SPLIT_RIGHT.get(),
+            ))
+            .child(ui::button_with_tooltip(
+                Button::new(("chat-bot-settings", pane.get()))
+                    .debug_selector(move || format!("chat-bot-settings-{}", pane.get()))
+                    .icon(IconName::Settings)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        let host = this.layout.host(pane).clone();
+                        if !this.open_bot_settings_in_panel_on(&host, &settings_bot, cx) {
+                            this.open_settings(
+                                krill_app::settings::AdminTab::Appearance,
+                                Some(window),
+                                cx,
+                            );
+                        }
+                    })),
+                format!("chat-bot-settings-{}", pane.get()),
+                krill_app::i18n::catalog::general::SETTINGS_HINT.get(),
+            ))
+            .when(is_split, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .invisible()
+                        .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
+                        .child(ui::button_with_tooltip(
+                            Button::new(("chat-pane-close", pane.get()))
+                                .debug_selector(move || format!("chat-pane-close-{}", pane.get()))
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.maybe_close_pane(pane, cx);
+                                })),
+                            format!("chat-pane-close-{}", pane.get()),
+                            krill_app::i18n::catalog::shell::CLOSE_PANE.get(),
+                        )),
+                )
+            })
+    }
+
+    /// 일반 하이브리드 채팅 패인 우상단 컨트롤(분할 + 터미널 전환 알약).
+    #[inline(never)]
+    fn render_standard_chat_top_controls(
+        pane: super::super::PaneId,
+        is_split: bool,
+        focused: bool,
+        palette: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let border = palette.border;
+        let split_right_btn = ui::button_with_tooltip(
+            Button::new(("chat-split-right", pane.get()))
+                .debug_selector(move || format!("chat-split-right-{}", pane.get()))
+                .icon(gpui_component::Icon::default().data(ui::icons::SPLIT_HORIZONTAL_SVG))
+                .rounded_full()
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.split_pane(pane, krill_app::layout::Axis::Horizontal, cx);
+                })),
+            format!("chat-split-right-{}", pane.get()),
+            krill_app::i18n::catalog::shell::SPLIT_RIGHT.get(),
+        );
+        let split_down_btn = ui::button_with_tooltip(
+            Button::new(("chat-split-down", pane.get()))
+                .debug_selector(move || format!("chat-split-down-{}", pane.get()))
+                .icon(gpui_component::Icon::default().data(ui::icons::SPLIT_VERTICAL_SVG))
+                .rounded_full()
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.split_pane(pane, krill_app::layout::Axis::Vertical, cx);
+                })),
+            format!("chat-split-down-{}", pane.get()),
+            krill_app::i18n::catalog::shell::SPLIT_DOWN.get(),
+        );
+        let hover_bg = palette.popover.opacity(0.92);
+        let hover_controls = div()
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(ui::transparent())
+            .bg(ui::transparent())
+            .px_1()
+            .py_0p5()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .group_hover(CHAT_TOP_CONTROLS_GROUP, move |d| {
+                d.bg(hover_bg).border_color(border).shadow_lg()
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .invisible()
+                    .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
+                    .child(split_down_btn),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .when(!focused, |d| {
+                        d.invisible()
+                            .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
+                    })
+                    .when(focused, |d| {
+                        d.rounded_full()
+                            .border_1()
+                            .border_color(border)
+                            .bg(hover_bg)
+                            .shadow_lg()
+                            .opacity(0.85)
+                            .group_hover(CHAT_TOP_CONTROLS_GROUP, |s| {
+                                s.opacity(1.0)
+                                    .bg(ui::transparent())
+                                    .border_color(ui::transparent())
+                            })
+                    })
+                    .child(split_right_btn),
+            )
+            .when(is_split, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .invisible()
+                        .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
+                        .child(ui::button_with_tooltip(
+                            Button::new(("chat-pane-close", pane.get()))
+                                .debug_selector(move || format!("chat-pane-close-{}", pane.get()))
+                                .icon(IconName::Close)
+                                .rounded_full()
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.maybe_close_pane(pane, cx);
+                                })),
+                            format!("chat-pane-close-{}", pane.get()),
+                            krill_app::i18n::catalog::shell::CLOSE_PANE.get(),
+                        )),
+                )
+            });
+        let primary_pill = div()
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(border)
+            .bg(hover_bg)
+            .shadow_lg()
+            .px_1()
+            .py_0p5()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .when(focused, |d| {
+                d.opacity(0.85)
+                    .group_hover(CHAT_TOP_CONTROLS_GROUP, |s| s.opacity(1.0))
+            })
+            .child(
+                Button::new(SharedString::from(format!(
+                    "desktop-chat-switch-term-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-switch-terminal".into())
+                .icon(IconName::SquareTerminal)
+                .label(ctext::TERM.get())
+                .tooltip(krill_app::i18n::catalog::shell::TOGGLE_CHAT_VIEW.get())
+                .rounded_full()
+                .ghost()
+                .xsmall()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.switch_pane_to_terminal(pane, window, cx);
+                })),
+            );
+        div()
+            .id(SharedString::from(format!(
+                "chat-top-controls-{}",
+                pane.get()
+            )))
+            .debug_selector(move || format!("chat-top-controls-{}", pane.get()))
+            .group(CHAT_TOP_CONTROLS_GROUP)
+            .absolute()
+            .top_2()
+            .right_3()
+            .flex()
+            .items_center()
+            .gap_1()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(hover_controls)
+            .child(primary_pill)
+    }
+
     /// Orca's `BotHomeBanner`: the bot's face and name in a pill over its Home chat; it opens the
     /// bot's page in the right panel.
     fn render_bot_home_banner(
@@ -2731,14 +2985,16 @@ impl Shell {
                         .pl_1()
                         .pr_3()
                         .rounded_full()
-                        .bg(palette.popover)
+                        .border_1()
+                        .border_color(palette.foreground.opacity(0.06))
+                        .bg(palette.notice_surface())
                         .shadow_lg()
                         .flex()
                         .items_center()
                         .gap_2()
                         .text_size(ui::TEXT_LG)
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(palette.popover_foreground)
+                        .text_color(palette.foreground)
                         .child(self.bot_avatar(bot, 24., gpui::px(12.), palette))
                         .child(
                             div()
@@ -3578,7 +3834,7 @@ impl Shell {
         }
         self.sync_bot_item_notes(&key, cx);
         let palette = ui::palette(cx);
-        let bg = palette.background;
+        let bg = palette.chat_canvas();
         let border = palette.border;
         let muted_fg = palette.muted_foreground;
 
@@ -4081,150 +4337,13 @@ impl Shell {
 
         let is_split = self.layout.visible().len() > 1;
         let focused = self.layout.focused() == Some(pane);
-        let split_right_btn = |cx: &mut Context<Self>| {
-            ui::button_with_tooltip(
-                Button::new(("chat-split-right", pane.get()))
-                    .debug_selector(move || format!("chat-split-right-{}", pane.get()))
-                    .icon(gpui_component::Icon::default().data(ui::icons::SPLIT_HORIZONTAL_SVG))
-                    .rounded_full()
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.split_pane(pane, krill_app::layout::Axis::Horizontal, cx);
-                    })),
-                format!("chat-split-right-{}", pane.get()),
-                krill_app::i18n::catalog::shell::SPLIT_RIGHT.get(),
-            )
+        let chat_bot_id = self.chat_bot(&key).map(|b| b.id.clone());
+        let top_controls = match chat_bot_id {
+            Some(bot_id) => {
+                Self::render_bot_chat_top_controls(pane, bot_id, is_split, muted_fg, cx)
+            }
+            None => Self::render_standard_chat_top_controls(pane, is_split, focused, palette, cx),
         };
-        let split_down_btn = ui::button_with_tooltip(
-            Button::new(("chat-split-down", pane.get()))
-                .debug_selector(move || format!("chat-split-down-{}", pane.get()))
-                .icon(gpui_component::Icon::default().data(ui::icons::SPLIT_VERTICAL_SVG))
-                .rounded_full()
-                .ghost()
-                .xsmall()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.split_pane(pane, krill_app::layout::Axis::Vertical, cx);
-                })),
-            format!("chat-split-down-{}", pane.get()),
-            krill_app::i18n::catalog::shell::SPLIT_DOWN.get(),
-        );
-        let hover_bg = palette.popover.opacity(0.92);
-        let hover_controls = div()
-            .flex_none()
-            .rounded_full()
-            .border_1()
-            .border_color(ui::transparent())
-            .bg(ui::transparent())
-            .px_1()
-            .py_0p5()
-            .flex()
-            .items_center()
-            .gap_0p5()
-            .group_hover(CHAT_TOP_CONTROLS_GROUP, move |d| {
-                d.bg(hover_bg).border_color(border).shadow_lg()
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .invisible()
-                    .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
-                    .child(split_down_btn),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .when(!focused, |d| {
-                        d.invisible()
-                            .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
-                    })
-                    .when(focused, |d| {
-                        d.rounded_full()
-                            .border_1()
-                            .border_color(border)
-                            .bg(hover_bg)
-                            .shadow_lg()
-                            .opacity(0.85)
-                            .group_hover(CHAT_TOP_CONTROLS_GROUP, |s| {
-                                s.opacity(1.0)
-                                    .bg(ui::transparent())
-                                    .border_color(ui::transparent())
-                            })
-                    })
-                    .child(split_right_btn(cx)),
-            )
-            .when(is_split, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .invisible()
-                        .group_hover(CHAT_TOP_CONTROLS_GROUP, Styled::visible)
-                        .child(ui::button_with_tooltip(
-                            Button::new(("chat-pane-close", pane.get()))
-                                .debug_selector(move || format!("chat-pane-close-{}", pane.get()))
-                                .icon(IconName::Close)
-                                .rounded_full()
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.maybe_close_pane(pane, cx);
-                                })),
-                            format!("chat-pane-close-{}", pane.get()),
-                            krill_app::i18n::catalog::shell::CLOSE_PANE.get(),
-                        )),
-                )
-            });
-        let primary_pill = div()
-            .flex_none()
-            .rounded_full()
-            .border_1()
-            .border_color(border)
-            .bg(hover_bg)
-            .shadow_lg()
-            .px_1()
-            .py_0p5()
-            .flex()
-            .items_center()
-            .gap_0p5()
-            .when(focused, |d| {
-                d.opacity(0.85)
-                    .group_hover(CHAT_TOP_CONTROLS_GROUP, |s| s.opacity(1.0))
-            })
-            .child(
-                Button::new(SharedString::from(format!(
-                    "desktop-chat-switch-term-{}",
-                    pane.get()
-                )))
-                .debug_selector(|| "chat-switch-terminal".into())
-                .icon(IconName::SquareTerminal)
-                .label(ctext::TERM.get())
-                .tooltip(krill_app::i18n::catalog::shell::TOGGLE_CHAT_VIEW.get())
-                .rounded_full()
-                .ghost()
-                .xsmall()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.switch_pane_to_terminal(pane, window, cx);
-                })),
-            );
-        let top_controls = div()
-            .id(SharedString::from(format!(
-                "chat-top-controls-{}",
-                pane.get()
-            )))
-            .debug_selector(move || format!("chat-top-controls-{}", pane.get()))
-            .group(CHAT_TOP_CONTROLS_GROUP)
-            .absolute()
-            .top_2()
-            .right_3()
-            .flex()
-            .items_center()
-            .gap_1()
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(hover_controls)
-            .child(primary_pill);
 
         let find_bar = self.chat.finds.get(&key).map(|find| {
             let find_key = key.clone();

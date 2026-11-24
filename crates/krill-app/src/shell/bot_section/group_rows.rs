@@ -171,7 +171,7 @@ impl Shell {
             .map(|(_, _, input, _)| input.clone());
         let now = now_secs();
         let age = (facts.activity_ms > 0)
-            .then(|| krill_app::jump::format_age_secs(facts.activity_ms / 1000, now));
+            .then(|| ui::format_short_time_ago_secs(facts.activity_ms / 1000, now));
 
         let host_bots: Vec<SidebarBot> = self
             .sidebar_bots
@@ -185,7 +185,7 @@ impl Shell {
                 .get(&(host.clone(), id.clone()))
                 .and_then(|(_, img)| img.clone())
         });
-        let faces = group_faces::render_group_faces(&face_members, AVATAR, p.sidebar, p);
+        let faces = group_faces::render_group_faces(&face_members, AVATAR, p.worktree_sidebar, p);
         let badge = (facts.status == RowStatus::Permission)
             .then(|| avatar_badge(facts.status, false, p, cx))
             .flatten();
@@ -279,12 +279,12 @@ impl Shell {
             .cursor_pointer()
             .when(facts.all_paused, |d| d.opacity(0.6))
             .when(facts.active, |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.worktree_sidebar_border)
+                d.bg(p.worktree_sidebar_active())
+                    .border_color(p.worktree_sidebar_active_border())
             })
             .when(!facts.active, |d| {
                 d.border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.4)))
+                    .hover(|d| d.bg(p.worktree_sidebar_accent))
             })
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                 if e.click_count() > 1 {
@@ -360,7 +360,7 @@ impl Shell {
         let group = summary.group.clone();
         let preview = facts.preview.clone();
         let age = (facts.activity_ms > 0)
-            .then(|| krill_app::jump::format_age_secs(facts.activity_ms / 1000, now_secs()));
+            .then(|| ui::format_short_time_ago_secs(facts.activity_ms / 1000, now_secs()));
         let members: Vec<SidebarBot> = group
             .bot_ids
             .iter()

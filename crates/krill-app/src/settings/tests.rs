@@ -9258,11 +9258,11 @@ fn terminal_themes_toml_roundtrip_and_mode_resolution() {
     );
     assert_eq!(
         s.terminal_theme_light,
-        crate::ui::DEFAULT_TERMINAL_THEME_LIGHT
+        crate::ui::terminal_themes::BUILTIN_TANGO_LIGHT
     );
     assert!(s.terminal_use_separate_light_theme);
     assert!(s.terminal_custom_themes.is_empty());
-    // 기본값은 기본 앱 테마의 짝이다: 다크 → 흑연 터미널, 라이트 → TERMINAL_LIGHT.
+    // 기본값은 기본 앱 테마의 짝이다: 다크 → 흑연 터미널, 라이트 → Builtin Tango Light.
     assert_eq!(
         Some(crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &s)),
         crate::ui::builtin_terminal_theme(crate::ui::terminal_themes::KRILL_GRAPHITE)
@@ -9270,14 +9270,14 @@ fn terminal_themes_toml_roundtrip_and_mode_resolution() {
     );
     assert_eq!(
         crate::ui::terminal_theme_for_mode(ThemeMode::Light, &s),
-        crate::ui::TERMINAL_LIGHT
+        crate::ui::TERMINAL_TANGO_LIGHT
     );
     // 이전 버전 settings.toml(테마 키 없음)도 같은 기본값으로 읽힌다.
     let legacy = Settings::parse("theme = \"light\"\n").unwrap();
     assert!(legacy.terminal_use_separate_light_theme);
     assert_eq!(
         crate::ui::terminal_theme_for_mode(ThemeMode::Light, &legacy),
-        crate::ui::TERMINAL_LIGHT
+        crate::ui::TERMINAL_TANGO_LIGHT
     );
 
     s.terminal_theme_dark = "Dracula".into();
@@ -9854,19 +9854,19 @@ fn ui_theme_menus_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestA
     vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
     vcx.run_until_parked();
     vcx.update(|_, cx| {
-        assert_eq!(current(cx).ui_theme_light, LightUiTheme::Paper);
-        assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
+        assert_eq!(current(cx).ui_theme_light, LightUiTheme::Classic);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::LIGHT);
     });
-    choose(vcx, "light", 1);
+    choose(vcx, "light", 0);
     vcx.update(|_, cx| {
         let s = current(cx);
-        assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
+        assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
         assert_eq!(
             s.terminal_theme_light,
-            crate::ui::terminal_themes::BUILTIN_TANGO_LIGHT
+            crate::ui::DEFAULT_TERMINAL_THEME_LIGHT
         );
         assert_eq!(cx.theme().mode, ThemeMode::Light);
-        assert_eq!(crate::ui::palette(cx), &crate::ui::LIGHT);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
     });
     fs::remove_dir_all(&d).ok();
 }
@@ -10248,30 +10248,30 @@ fn quick_command_duplicates_edit_and_remove_the_row_that_was_pressed(cx: &mut Te
     fs::remove_dir_all(d).ok();
 }
 
-/// 앱 테마 키가 없으면 새 기본값 흑연·종이를 쓰고, 저장된 선택값은 계속 읽는다.
+/// 앱 테마 키가 없으면 새 기본값 흑연·클래식을 쓰고, 저장된 선택값은 계속 읽는다.
 #[test]
 fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("theme = \"light\"").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Graphite);
-    assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
     assert_eq!(
         s.terminal_theme_dark,
         crate::ui::terminal_themes::KRILL_GRAPHITE
     );
     assert_eq!(
         s.terminal_theme_light,
-        crate::ui::DEFAULT_TERMINAL_THEME_LIGHT
+        crate::ui::terminal_themes::BUILTIN_TANGO_LIGHT
     );
-    let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"classic\"").unwrap();
+    let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
-    assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
     assert_eq!(
         s.terminal_theme_dark,
         crate::ui::terminal_themes::KRILL_TIDEPOOL
     );
     assert_eq!(
         s.terminal_theme_light,
-        crate::ui::terminal_themes::BUILTIN_TANGO_LIGHT
+        crate::ui::DEFAULT_TERMINAL_THEME_LIGHT
     );
     let s = Settings::parse("ui_theme_dark = 'deep'\nterminal_theme_dark = 'Krill Deep'").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);

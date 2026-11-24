@@ -232,7 +232,6 @@ impl Shell {
     ) -> AnyElement {
         let submit_key = key.clone();
         let palette = ui::palette(cx);
-        let border = palette.border;
         let muted_fg = palette.muted_foreground;
         let log = self.chat.logs.get(&key);
         let meta = log.map(|l| &l.meta);
@@ -1294,8 +1293,8 @@ impl Shell {
             .min_w_0()
             .rounded(ui::RADIUS_XL)
             .border_1()
-            .border_color(border)
-            .bg(palette.card)
+            .border_color(palette.chat_composer_border())
+            .bg(palette.chat_composer_surface())
             .p_1p5()
             .flex()
             .flex_col()
@@ -1591,7 +1590,7 @@ impl Shell {
             .px_3()
             .pt_2()
             .pb_3()
-            .bg(palette.background)
+            .bg(palette.chat_canvas())
             .flex()
             .flex_col()
             .items_center()
