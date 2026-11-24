@@ -96,7 +96,7 @@ pub fn effort_label(effort: &str) -> &'static str {
         "low" => text::EFFORT_LOW.get(),
         "medium" => text::EFFORT_MEDIUM.get(),
         "high" => text::EFFORT_HIGH.get(),
-        "xhigh" => text::EFFORT_XHIGH.get(),
+        "xhigh" | "very_high" | "very-high" => text::EFFORT_XHIGH.get(),
         "max" => text::EFFORT_MAX.get(),
         _ => text::EFFORT_DEFAULT.get(),
     }

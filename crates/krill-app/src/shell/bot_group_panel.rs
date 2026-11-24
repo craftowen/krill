@@ -65,7 +65,8 @@ impl Shell {
         // to the previously shown bot always invokes `show_in_panel` again.
         self.bot_ui.panel.shown = None;
         let view = self.bot_panel_view_on(&host, cx).inspect(|view| {
-            if std::mem::take(&mut self.bot_ui.panel.stale) {
+            let stale = std::mem::take(&mut self.bot_ui.panel.stale);
+            if stale {
                 view.update(cx, krill_app::bots::View::reload);
             }
             let mut states = std::collections::BTreeMap::new();
@@ -89,6 +90,9 @@ impl Shell {
             }
             view.update(cx, |v, cx| {
                 v.set_session_states(states, cx);
+                if stale {
+                    v.invalidate_group_panel_items();
+                }
                 v.show_group_in_panel(&group.id, &group.bot_ids, &thread_ids, cx);
             });
         });

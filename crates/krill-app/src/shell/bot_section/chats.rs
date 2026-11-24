@@ -529,7 +529,7 @@ impl Shell {
     }
 
     /// Orca "Delete chat": ends that chat's session.
-    fn stop_bot_chat_on(
+    pub(super) fn stop_bot_chat_on(
         &mut self,
         host: &krill_app::hosts::HostId,
         bot_id: krill_proto::bots::BotId,
@@ -553,6 +553,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
                     this.notice = Some(err);
+                    cx.notify();
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
             })

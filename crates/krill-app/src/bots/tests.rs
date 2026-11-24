@@ -54,6 +54,7 @@ struct MockState {
     fail_get_soul: Option<String>,
     fail_get_memory: Option<String>,
     fail_create_item: Option<String>,
+    fail_list_items: Option<String>,
     fail_reload_connectors: Option<String>,
     fail_set_connector_config: Option<String>,
     /// `ListAgentModels` replies by agent; a missing agent answers like a daemon that predates it.
@@ -428,6 +429,9 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                 bot_id,
                 include_closed,
             } => {
+                if let Some(err) = st.fail_list_items.clone() {
+                    return Err(err);
+                }
                 let filtered = st
                     .items
                     .iter()
@@ -2923,9 +2927,11 @@ fn agy_effort_options_and_alias_helpers_cover_all_cli_levels() {
         runtime_display_label("antigravity"),
         runtime_display_label("agy")
     );
-    for level in ["", "low", "medium", "high", "xhigh", "max"] {
+    for level in ["", "low", "medium", "high", "xhigh", "very_high", "max"] {
         assert!(!effort_label(level).is_empty(), "missing label for {level}");
     }
+    assert_eq!(effort_label("very_high"), effort_label("xhigh"));
+    assert_eq!(effort_label("very-high"), effort_label("xhigh"));
     let (_, builtin_efforts) = crate::agent_models::builtin("agy");
     assert_eq!(builtin_efforts, &["low", "medium", "high", "xhigh", "max"]);
 }
@@ -3664,5 +3670,159 @@ fn new_bot_keeps_create_available_and_validates_inline(cx: &mut gpui::TestAppCon
             .iter()
             .any(|r| matches!(r, BotRpcRequest::CreateBotV2(p) if p.base.name == "Scout")),
         "Valid submit must call CreateBotV2 with the entered name"
+    );
+}
+
+#[gpui::test]
+fn s2_05_group_panel_dedups_in_flight_and_blocks_error_retry_storm(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let state = Arc::new(Mutex::new(MockState::default()));
+    {
+        let mut st = state.lock().unwrap();
+        st.bots.push(sample_bot("alice", "Alice"));
+        st.items
+            .push(sample_item("alice", "item-1", 1, BotItemStatus::NeedsYou));
+    }
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+    vcx.run_until_parked();
+
+    let alice = BotId::new("alice").unwrap();
+    // Clear initial reload requests so we only count group-panel ListItems calls.
+    state.lock().unwrap().requests.clear();
+
+    // Repeated show_group_in_panel calls before the first RPC settles must issue only 1 ListItems.
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_group_in_panel("grp-1", std::slice::from_ref(&alice), &[], cx);
+            v.show_group_in_panel("grp-1", std::slice::from_ref(&alice), &[], cx);
+            v.show_group_in_panel("grp-1", std::slice::from_ref(&alice), &[], cx);
+        });
+    });
+    vcx.run_until_parked();
+    let count_ok = state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                BotRpcRequest::ListItems {
+                    bot_id: None,
+                    include_closed: true
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        count_ok, 1,
+        "repeated renders must not fire duplicate ListItems RPCs while loading or after success"
+    );
+
+    // On error, repeated show_group_in_panel calls must NOT cause an infinite retry storm.
+    {
+        let mut st = state.lock().unwrap();
+        st.requests.clear();
+        st.fail_list_items = Some("daemon busy".into());
+    }
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_group_in_panel("grp-err", std::slice::from_ref(&alice), &[], cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.show_group_in_panel("grp-err", std::slice::from_ref(&alice), &[], cx);
+            v.show_group_in_panel("grp-err", std::slice::from_ref(&alice), &[], cx);
+        });
+    });
+    vcx.run_until_parked();
+    let count_err = state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                BotRpcRequest::ListItems {
+                    bot_id: None,
+                    include_closed: true
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        count_err, 1,
+        "failed group ListItems must not re-fire on subsequent renders"
+    );
+
+    // Explicit retry clears the failed guard and issues one fresh attempt.
+    state.lock().unwrap().fail_list_items = None;
+    vcx.update(|_, cx| {
+        view.update(cx, View::retry_group_panel_items);
+    });
+    vcx.run_until_parked();
+    let count_after_retry = state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                BotRpcRequest::ListItems {
+                    bot_id: None,
+                    include_closed: true
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        count_after_retry, 2,
+        "explicit retry must issue one new RPC"
+    );
+}
+
+#[gpui::test]
+fn s2_10_clear_bot_avatar_emits_badge_changed(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+    });
+    let state = Arc::new(Mutex::new(MockState::default()));
+    {
+        let mut st = state.lock().unwrap();
+        let mut bot = sample_bot("alice", "Alice");
+        bot.avatar = Some("avatar.png".into());
+        st.bots.push(bot);
+    }
+    let rpc = make_mock_rpc(state.clone());
+    let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx));
+    vcx.run_until_parked();
+
+    let badges = Arc::new(Mutex::new(0usize));
+    let badges_sub = badges.clone();
+    vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, _: &BadgeChanged, _| {
+            *badges_sub.lock().unwrap() += 1;
+        })
+        .detach();
+    });
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.clear_bot_avatar(BotId::new("alice").unwrap(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        *badges.lock().unwrap() >= 1,
+        "clearing bot avatar must emit BadgeChanged immediately"
     );
 }

@@ -576,24 +576,21 @@ impl Shell {
         }));
     }
 
-    fn poll_group_room(&mut self, key: GroupRoomKey, cx: &mut Context<Self>) {
-        let Some(rpc) = self.bot_rpc_on(&key.host) else {
-            return;
-        };
-        let gid = key.group_id.clone();
-        let tid = key.thread_id.clone();
-        let target = self.target_for_host(&key.host);
-
-        // Identify live/waiting/active member sessions to inspect via ChatPoll for turns & ApprovalDock.
-        let mut sessions_to_poll: Vec<SessionId> = Vec::new();
+    fn active_group_member_sessions(
+        &self,
+        key: &GroupRoomKey,
+        room: Option<&BotGroupRoomView>,
+        cx: &gpui::App,
+    ) -> Vec<SessionId> {
+        let mut sessions: Vec<SessionId> = Vec::new();
         if let Some(summary) = self
             .sidebar_groups
             .iter()
-            .find(|s| s.host == key.host && s.group.id == gid)
+            .find(|s| s.host == key.host && s.group.id == key.group_id)
         {
             for t in &summary.active_turns {
-                if !sessions_to_poll.contains(&t.session_id) {
-                    sessions_to_poll.push(t.session_id);
+                if !sessions.contains(&t.session_id) {
+                    sessions.push(t.session_id);
                 }
             }
             let sidebar = self.sidebar.read(cx);
@@ -610,27 +607,54 @@ impl Shell {
                         if matches!(
                             st,
                             Some(AgentState::Working | AgentState::Waiting | AgentState::Blocked)
-                        ) && !sessions_to_poll.contains(&s.session_id)
+                        ) && !sessions.contains(&s.session_id)
                         {
-                            sessions_to_poll.push(s.session_id);
+                            sessions.push(s.session_id);
                         }
                     }
                 }
             }
         }
-        let state = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
-        if state.loading {
-            return;
-        }
-        state.loading = true;
-        state.last_poll_ms = now_unix_ms();
-        if let Some(room) = &state.room {
+        if let Some(room) = room {
             for t in &room.active_turns {
-                if !sessions_to_poll.contains(&t.session_id) {
-                    sessions_to_poll.push(t.session_id);
+                if !sessions.contains(&t.session_id) {
+                    sessions.push(t.session_id);
                 }
             }
         }
+        sessions
+    }
+
+    pub(in crate::shell) fn poll_group_room(&mut self, key: GroupRoomKey, cx: &mut Context<Self>) {
+        let Some(rpc) = self.bot_rpc_on(&key.host) else {
+            return;
+        };
+        let gid = key.group_id.clone();
+        let tid = key.thread_id.clone();
+        let target = self.target_for_host(&key.host);
+
+        if self
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(&key)
+            .is_some_and(|s| s.loading)
+        {
+            return;
+        }
+        // Identify live/waiting/active member sessions to inspect via ChatPoll for turns & ApprovalDock.
+        let sessions_to_poll = self.active_group_member_sessions(
+            &key,
+            self.bot_ui
+                .group_chat
+                .rooms
+                .get(&key)
+                .and_then(|s| s.room.as_ref()),
+            cx,
+        );
+        let state = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
+        state.loading = true;
+        state.last_poll_ms = now_unix_ms();
 
         cx.spawn(async move |this, cx| {
             let (room_res, chat_items_map) = cx
@@ -694,6 +718,25 @@ impl Shell {
                     }
                     Ok(_) => {}
                     Err(err) => state.error = Some(err),
+                }
+                // Drop cached member items for sessions that are no longer active so the room
+                // returns to idle polling cadence (3s) and never surfaces stale prompts.
+                let active_sids: HashSet<SessionId> = this
+                    .active_group_member_sessions(
+                        &key,
+                        this.bot_ui
+                            .group_chat
+                            .rooms
+                            .get(&key)
+                            .and_then(|r| r.room.as_ref()),
+                        cx,
+                    )
+                    .into_iter()
+                    .collect();
+                if let Some(state) = this.bot_ui.group_chat.rooms.get_mut(&key) {
+                    state
+                        .member_items
+                        .retain(|sid, _| active_sids.contains(sid));
                 }
                 cx.notify();
             })

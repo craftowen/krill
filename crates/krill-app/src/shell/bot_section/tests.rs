@@ -1962,3 +1962,279 @@ fn domain_a_parity_collapsed_edges_up_next_chat_controls_and_chat_search(cx: &mu
         "paging back left returns to offset 0"
     );
 }
+
+#[gpui::test]
+fn s2_07_08_11_15_bot_section_errors_delete_cleanup_offline_dialogs_and_up_next(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+    use krill_proto::bots::{BotGroupChat, BotGroupSummary, BotRpcRequest, BotRpcResponse};
+
+    let (view, cx) = setup(cx, "bot-section-wave2a-fixes");
+    let krill_id = BotId::new("krill").unwrap();
+    let zed_id = BotId::new("zed").unwrap();
+
+    // S2-07: RPC errors across pause/delete/stop-chat/rename/delete-group all set notice + notify.
+    let err_rpc: krill_app::bots::BotRpcCall =
+        Arc::new(|_req| Err("simulated rpc failure".to_owned()));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(err_rpc.clone());
+            s.set_bot_paused_on(&HostId::Local, krill_id.clone(), true, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.notice.clone()).as_deref(),
+        Some("simulated rpc failure")
+    );
+
+    for action in ["stop_chat", "rename", "delete_group", "delete_bot"] {
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                s.notice = None;
+                match action {
+                    "stop_chat" => {
+                        s.stop_bot_chat_on(&HostId::Local, krill_id.clone(), SessionId(21), cx);
+                    }
+                    "rename" => {
+                        s.rename_bot_on(&HostId::Local, krill_id.clone(), "Renamed".into(), cx);
+                    }
+                    "delete_group" => {
+                        s.confirm_delete_group_on(&HostId::Local, "grp-1".into(), cx);
+                    }
+                    "delete_bot" => {
+                        s.delete_bot_keep_folder_on(&HostId::Local, zed_id.clone(), cx);
+                    }
+                    _ => {}
+                }
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |s, _| s.notice.clone()).as_deref(),
+            Some("simulated rpc failure"),
+            "S2-07 action `{action}` must surface RPC error via notice"
+        );
+    }
+
+    // S2-08: delete_bot_keep_folder_on clears panel state and closes open tabs for the deleted bot.
+    let ok_rpc: krill_app::bots::BotRpcCall = Arc::new(|req| match req {
+        BotRpcRequest::DeleteBot { bot_id, .. } => Ok(BotRpcResponse::Deleted {
+            bot_id: bot_id.clone(),
+        }),
+        _ => Ok(BotRpcResponse::Ok),
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(ok_rpc.clone());
+            s.open_bot_session_on(&HostId::Local, &krill_id, SessionId(21), cx);
+            s.bot_ui.panel.shown = Some((
+                HostId::Local,
+                krill_id.clone(),
+                krill_app::bots::DetailTab::Items,
+            ));
+            s.bot_ui.panel.settings = Some(krill_app::bots::DetailTab::Settings);
+            s.bot_ui.panel.pending_draft = Some((HostId::Local, krill_id.clone(), "draft".into()));
+            s.bot_ui.panel.stale = false;
+            s.delete_bot_keep_folder_on(&HostId::Local, krill_id.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.bot_ui.panel.shown.is_none());
+        assert!(s.bot_ui.panel.settings.is_none());
+        assert!(s.bot_ui.panel.pending_draft.is_none());
+        assert!(s.bot_ui.panel.stale);
+        let open_21 = (0..s.layout.tabs().len())
+            .flat_map(|i| s.layout.tab_panes(i))
+            .any(|p| s.layout.session(p) == Some(SessionId(21)));
+        assert!(!open_21, "deleted bot's open session tab must be closed");
+    });
+
+    // S2-11: offline remote launch_host must not drop Templates or NewBot when Local is available.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = None;
+            s.bot_rpc_overrides.clear();
+            s.bot_rpc_overrides.insert(HostId::Local, ok_rpc.clone());
+            s.launch_host = HostId::Remote("offline-host".into());
+            assert!(
+                s.bot_rpc().is_none(),
+                "offline remote launch_host has no direct bot_rpc"
+            );
+            s.request_bot_templates(cx);
+            s.open_pending_bot_dialogs(window, cx);
+            assert!(
+                s.bot_ui.templates.is_some(),
+                "Templates dialog must open even when launch_host is offline"
+            );
+            s.bot_ui.templates = None;
+            s.request_new_bot(None, None, cx);
+            s.open_pending_bot_dialogs(window, cx);
+            assert!(
+                s.bot_ui.new_bot.is_some(),
+                "NewBot dialog must open using Local when remote launch_host is offline"
+            );
+            s.bot_ui.new_bot = None;
+            s.launch_host = HostId::Local;
+        });
+    });
+
+    // S2-15: up_next_unseen refreshes when a paused bot unpauses and clears after up_next_seen_ms advances.
+    let seen_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen_ms_rpc = seen_ms.clone();
+    let up_next_rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::GetBotUpcoming { .. } => {
+            Ok(BotRpcResponse::Upcoming(krill_proto::bots::BotUpcoming {
+                up_next_seen_ms: seen_ms_rpc.load(std::sync::atomic::Ordering::SeqCst),
+                ..Default::default()
+            }))
+        }
+        BotRpcRequest::ListSuggestions { bot_id, .. } => {
+            let bid = bot_id.clone().unwrap_or_else(|| BotId::new("zed").unwrap());
+            Ok(BotRpcResponse::Suggestions(vec![
+                krill_proto::bots::BotSuggestion {
+                    id: "sug-1".into(),
+                    bot_id: bid,
+                    title: "Triage alert".into(),
+                    why: String::new(),
+                    ask: String::new(),
+                    link: None,
+                    source: None,
+                    dismissed: false,
+                    created_at_ms: 500,
+                },
+            ]))
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_overrides.clear();
+            s.bot_rpc_override = Some(up_next_rpc.clone());
+            let mut paused_bot = bot("zed", "Alpha shop", "Finds prices", vec![]);
+            paused_bot.paused = true;
+            s.apply_sidebar_bots(0, vec![paused_bot], cx);
+            s.sync_bot_sidebar_ephemeral(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s
+            .bot_ui
+            .up_next_unseen
+            .get(&(HostId::Local, zed_id.clone()))
+            .copied()),
+        None,
+        "paused bot must have no up_next_unseen count"
+    );
+    // Unpause the same bot (same (HostId, BotId) list, only paused changed!).
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let unpaused_bot = bot("zed", "Alpha shop", "Finds prices", vec![]);
+            s.apply_sidebar_bots(0, vec![unpaused_bot], cx);
+            s.sync_bot_sidebar_ephemeral(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s
+            .bot_ui
+            .up_next_unseen
+            .get(&(HostId::Local, zed_id.clone()))
+            .copied()),
+        Some(1),
+        "unpausing bot must refresh up_next_unseen"
+    );
+    // Simulate MarkUpNextSeen advancing up_next_seen_ms + BadgeChanged refreshing counts.
+    seen_ms.store(1000, std::sync::atomic::Ordering::SeqCst);
+    cx.update(|_, cx| {
+        view.update(cx, Shell::refresh_bot_up_next);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s
+            .bot_ui
+            .up_next_unseen
+            .get(&(HostId::Local, zed_id.clone()))
+            .copied()),
+        None,
+        "refresh_bot_up_next must clear stale badge once seen_ms passes suggestion timestamp"
+    );
+
+    // S2-09: poll_group_room retains only active sessions in RoomState::member_items.
+    let grp = BotGroupChat {
+        id: "grp-prune".into(),
+        name: "Ops".into(),
+        bot_ids: vec![zed_id.clone()],
+        description: String::new(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let room_rpc: krill_app::bots::BotRpcCall = Arc::new({
+        let grp = grp.clone();
+        move |req| match req {
+            BotRpcRequest::ReadGroupRoom { .. } => Ok(BotRpcResponse::GroupRoom(
+                krill_proto::bots::BotGroupRoomView {
+                    group: grp.clone(),
+                    reply_audience: krill_proto::bots::BotGroupReplyAudience::All,
+                    threads: Vec::new(),
+                    active_thread_id: None,
+                    messages: Vec::new(),
+                    has_earlier: false,
+                    active_turns: Vec::new(),
+                },
+            )),
+            _ => Ok(BotRpcResponse::Ok),
+        }
+    });
+    let room_key = crate::shell::bot_group_chat::GroupRoomKey {
+        host: HostId::Local,
+        group_id: "grp-prune".into(),
+        thread_id: None,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(room_rpc.clone());
+            s.apply_sidebar_state(
+                0,
+                vec![bot(
+                    "zed",
+                    "Alpha shop",
+                    "Finds prices",
+                    vec![chat("zed", 41, "")],
+                )],
+                vec![BotGroupSummary {
+                    group: grp.clone(),
+                    reply_audience: krill_proto::bots::BotGroupReplyAudience::All,
+                    threads: Vec::new(),
+                    latest_message: None,
+                    active_turns: Vec::new(),
+                }],
+                cx,
+            );
+            let room = s
+                .bot_ui
+                .group_chat
+                .rooms
+                .entry(room_key.clone())
+                .or_default();
+            room.member_items.insert(
+                SessionId(999),
+                vec![krill_proto::agent_history::ChatItem::default()],
+            );
+            s.poll_group_room(room_key.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        view.read_with(cx, |s, _| s
+            .bot_ui
+            .group_chat
+            .rooms
+            .get(&room_key)
+            .is_some_and(|r| r.member_items.is_empty())),
+        "S2-09: completed sessions must be pruned from RoomState::member_items"
+    );
+}

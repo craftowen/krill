@@ -109,8 +109,12 @@ pub(super) struct BotUi {
     pub folded: HashSet<(HostId, BotId)>,
     /// Unseen Up Next suggestion counts per `(host, bot_id)` (`BotUpNextCount`).
     pub up_next_unseen: HashMap<(HostId, BotId), usize>,
-    /// Whether unseen suggestion counts have been requested for the current bot list.
-    pub up_next_bots_key: Vec<(HostId, BotId)>,
+    /// Snapshot key `(host, bot_id, paused)` for which unseen suggestion counts were requested.
+    pub up_next_bots_key: Vec<(HostId, BotId, bool)>,
+    /// Replaceable background fetch for `up_next_unseen` (cancels superseded requests).
+    pub up_next_task: Option<Task<()>>,
+    /// Generation counter guarding `up_next_unseen` async responses against stale writes.
+    pub up_next_gen: u64,
     /// "Bot options" (sort and hide); read from settings on first use.
     pub view: Option<krill_app::bots::sidebar_view::BotSidebarView>,
     /// Chats whose workers the user explicitly folded (chats with workers start open).
@@ -258,15 +262,15 @@ impl Shell {
         let Some(request) = self.bot_ui.pending.take() else {
             return;
         };
-        if self.bot_rpc().is_none() {
-            return;
-        }
-        // Dialogs open over the workspace like Orca's; the Bots modal makes room.
-        self.close_settings(Some(window), cx);
         match request {
             BotDialogRequest::NewBot { template, purpose } => {
-                let taken: Vec<String> = self.sidebar_bots.iter().map(|b| b.name.clone()).collect();
                 let hosts = self.new_bot_hosts(cx);
+                if hosts.is_empty() {
+                    return;
+                }
+                // Dialogs open over the workspace like Orca's; the Bots modal makes room.
+                self.close_settings(Some(window), cx);
+                let taken: Vec<String> = self.sidebar_bots.iter().map(|b| b.name.clone()).collect();
                 let dialog = cx.new(|cx| {
                     let mut d = new_bot::NewBot::new(hosts, taken, template, window, cx);
                     if let Some(purpose) = purpose {
@@ -281,6 +285,8 @@ impl Shell {
                 self.bot_ui.new_bot = Some((dialog, sub));
             }
             BotDialogRequest::Templates => {
+                // Templates are static built-in metadata and do not require the launch host RPC.
+                self.close_settings(Some(window), cx);
                 let dialog = cx.new(|cx| templates::Templates::new(window, cx));
                 let sub = cx.subscribe_in(&dialog, window, |this, _, ev, _, cx| match ev {
                     templates::Event::Use(t) => {
@@ -719,12 +725,56 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
                     this.notice = Some(err);
+                    cx.notify();
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn close_panes_for_bot(
+        &mut self,
+        host: &HostId,
+        sessions: &HashSet<krill_proto::SessionId>,
+        cx: &mut Context<Self>,
+    ) {
+        if sessions.is_empty() {
+            return;
+        }
+        let matching: Vec<krill_app::layout::PaneId> = self
+            .layout
+            .tabs()
+            .iter()
+            .flat_map(|t| {
+                let mut leaves = Vec::new();
+                t.root.leaves(&mut leaves);
+                leaves
+            })
+            .filter(|p| {
+                self.layout.host(*p) == host
+                    && self
+                        .layout
+                        .session(*p)
+                        .is_some_and(|sid| sessions.contains(&sid))
+            })
+            .collect();
+        if matching.is_empty() {
+            return;
+        }
+        self.change(true, cx, |l| {
+            for pane in matching {
+                if let Some(tab_idx) = l.tab_of_pane(pane) {
+                    if l.tab_panes(tab_idx).len() <= 1 {
+                        l.close_tab(tab_idx);
+                    } else {
+                        l.focus(pane);
+                        l.close_pane();
+                    }
+                }
+            }
+        });
     }
 
     /// Orca's "Delete bot": removes the bot and keeps its folder (soul and memory stay).
@@ -738,12 +788,68 @@ impl Shell {
             return;
         };
         let host_owned = host.clone();
+        let mut sessions: HashSet<krill_proto::SessionId> = self
+            .sidebar_bots
+            .iter()
+            .filter(|b| b.host == host_owned && b.id == bot_id)
+            .flat_map(|b| b.sessions.iter().map(|s| s.session_id))
+            .collect();
+        for ((h, sid), cached) in &self.chat.cached_bots {
+            if h == &host_owned && cached.id == bot_id {
+                sessions.insert(*sid);
+            }
+        }
+        let focused_deleted = self.layout.focused().is_some_and(|pane| {
+            self.layout.host(pane) == &host_owned
+                && self
+                    .layout
+                    .session(pane)
+                    .is_some_and(|sid| sessions.contains(&sid))
+        });
+
         self.bot_ui.delete = None;
         self.sidebar_bots
             .retain(|b| !(b.host == host_owned && b.id == bot_id));
         if let Some(entry) = self.bot_ui.hosts.get_mut(&host_owned) {
             entry.snapshot.bots.retain(|b| b.id != bot_id);
         }
+        self.chat.cached_bots.retain(|(h, sid), b| {
+            !(h == &host_owned && (b.id == bot_id || sessions.contains(sid)))
+        });
+        let key = (host_owned.clone(), bot_id.clone());
+        self.bot_ui.avatars.remove(&key);
+        self.bot_ui.folded.remove(&key);
+        self.bot_ui.up_next_unseen.remove(&key);
+        if self
+            .bot_ui
+            .renaming
+            .as_ref()
+            .is_some_and(|(h, id, _, _)| h == &host_owned && id == &bot_id)
+        {
+            self.bot_ui.renaming = None;
+        }
+        if focused_deleted
+            || self
+                .bot_ui
+                .panel
+                .shown
+                .as_ref()
+                .is_some_and(|(h, id, _)| h == &host_owned && id == &bot_id)
+        {
+            self.bot_ui.panel.shown = None;
+            self.bot_ui.panel.settings = None;
+        }
+        if self
+            .bot_ui
+            .panel
+            .pending_draft
+            .as_ref()
+            .is_some_and(|(h, id, _)| h == &host_owned && id == &bot_id)
+        {
+            self.bot_ui.panel.pending_draft = None;
+        }
+        self.bot_ui.panel.stale = true;
+        self.close_panes_for_bot(&host_owned, &sessions, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = cx
@@ -761,6 +867,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
                     this.notice = Some(err);
+                    cx.notify();
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
             })
@@ -805,20 +912,26 @@ impl Shell {
             });
             self.bot_ui.search_lang = Some(lang);
         }
-        let ids: Vec<(HostId, BotId)> = self
+        let state_key: Vec<(HostId, BotId, bool)> = self
             .sidebar_bots
             .iter()
-            .map(|b| (b.host.clone(), b.id.clone()))
+            .map(|b| (b.host.clone(), b.id.clone(), b.paused))
             .collect();
-        if ids != self.bot_ui.up_next_bots_key {
-            self.bot_ui.up_next_unseen.retain(|k, _| ids.contains(k));
-            self.bot_ui.up_next_bots_key = ids;
+        if state_key != self.bot_ui.up_next_bots_key {
+            self.bot_ui.up_next_unseen.retain(|(h, id), _| {
+                state_key
+                    .iter()
+                    .any(|(kh, kid, paused)| kh == h && kid == id && !paused)
+            });
+            self.bot_ui.up_next_bots_key = state_key;
             self.refresh_bot_up_next(cx);
         }
     }
 
     /// Reads non-dismissed suggestions newer than `up_next_seen_ms` per bot (`BotUpNextCount`).
     pub(super) fn refresh_bot_up_next(&mut self, cx: &mut Context<Self>) {
+        self.bot_ui.up_next_gen = self.bot_ui.up_next_gen.wrapping_add(1);
+        let generation = self.bot_ui.up_next_gen;
         let mut by_host: Vec<(HostId, krill_app::bots::BotRpcCall, Vec<BotId>)> = Vec::new();
         for b in self.sidebar_bots.iter().filter(|b| !b.paused) {
             if let Some((_, _, ids)) = by_host.iter_mut().find(|(h, _, _)| h == &b.host) {
@@ -828,10 +941,24 @@ impl Shell {
             }
         }
         if by_host.is_empty() {
+            self.bot_ui.up_next_task = None;
+            let active_unpaused: HashSet<(&HostId, &BotId)> = self
+                .sidebar_bots
+                .iter()
+                .filter(|b| !b.paused)
+                .map(|b| (&b.host, &b.id))
+                .collect();
+            let before = self.bot_ui.up_next_unseen.len();
+            self.bot_ui
+                .up_next_unseen
+                .retain(|(h, id), _| active_unpaused.contains(&(h, id)));
+            if self.bot_ui.up_next_unseen.len() != before {
+                cx.notify();
+            }
             return;
         }
-        cx.spawn(async move |this, cx| {
-            let counts: Vec<((HostId, BotId), usize)> = cx
+        self.bot_ui.up_next_task = Some(cx.spawn(async move |this, cx| {
+            let counts: Vec<((HostId, BotId), Option<usize>)> = cx
                 .background_executor()
                 .spawn(async move {
                     let mut out = Vec::new();
@@ -853,11 +980,12 @@ impl Shell {
                                     include_dismissed: false,
                                 },
                             ) {
-                                Ok(BotRpcResponse::Suggestions(rows)) => rows
-                                    .iter()
-                                    .filter(|s| !s.dismissed && s.created_at_ms > seen_ms)
-                                    .count(),
-                                _ => 0,
+                                Ok(BotRpcResponse::Suggestions(rows)) => Some(
+                                    rows.iter()
+                                        .filter(|s| !s.dismissed && s.created_at_ms > seen_ms)
+                                        .count(),
+                                ),
+                                _ => None,
                             };
                             out.push(((host.clone(), bot_id), unseen));
                         }
@@ -866,11 +994,25 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.bot_ui.up_next_gen != generation {
+                    return;
+                }
+                this.bot_ui.up_next_task = None;
                 let mut changed = false;
                 for (key, count) in counts {
-                    if !this.bot_ui.up_next_bots_key.contains(&key) {
+                    let live_unpaused = this
+                        .sidebar_bots
+                        .iter()
+                        .any(|b| b.host == key.0 && b.id == key.1 && !b.paused);
+                    if !live_unpaused {
+                        if this.bot_ui.up_next_unseen.remove(&key).is_some() {
+                            changed = true;
+                        }
                         continue;
                     }
+                    let Some(count) = count else {
+                        continue;
+                    };
                     if count == 0 {
                         if this.bot_ui.up_next_unseen.remove(&key).is_some() {
                             changed = true;
@@ -884,8 +1026,7 @@ impl Shell {
                 }
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     /// Decodes newly read `avatar.png` files for `host` (empty = unreadable; remembered so the

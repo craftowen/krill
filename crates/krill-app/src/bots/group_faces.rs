@@ -240,7 +240,11 @@ fn render_group_faces_raw(
     let scale = slot_size / FACE_SLOT;
     let ring_px = (FACE_GAP * scale).max(1.);
     let ring = px(ring_px);
-    let mut container = div().relative().flex_none().size(px(slot_size));
+    let mut container = div()
+        .relative()
+        .flex_none()
+        .size(px(slot_size))
+        .overflow_hidden();
 
     if layout.spots.is_empty() {
         return container
@@ -306,8 +310,8 @@ fn render_group_faces_raw(
             container = container.child(
                 div()
                     .absolute()
-                    .left(px(spot.x * scale))
-                    .top(px(spot.y * scale))
+                    .left(px(spot.x * scale - ring_px))
+                    .top(px(spot.y * scale - ring_px))
                     .rounded(outer_radius)
                     .overflow_hidden()
                     .border(ring)
@@ -333,8 +337,8 @@ fn render_group_faces_raw(
         container = container.child(
             div()
                 .absolute()
-                .left(px(spot.x * scale))
-                .top(px(spot.y * scale))
+                .left(px(spot.x * scale - ring_px))
+                .top(px(spot.y * scale - ring_px))
                 .rounded(outer_radius)
                 .overflow_hidden()
                 .border(ring)

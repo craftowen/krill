@@ -3801,6 +3801,27 @@ impl Registry {
     }
 
     pub(crate) fn deliver_input_to_tap(tap: &Tap, bytes: &[u8], submit: bool) -> io::Result<()> {
+        let _ = Self::deliver_input_to_tap_inner(tap, bytes, submit, None)?;
+        Ok(())
+    }
+
+    /// Delivers `bytes` (and optional submit `\r`) only if no other input has touched `tap` since
+    /// `expected_last_input_ns`. Returns `Ok(true)` if delivered, `Ok(false)` if suppressed.
+    pub(crate) fn deliver_input_to_tap_if_untouched(
+        tap: &Tap,
+        bytes: &[u8],
+        submit: bool,
+        expected_last_input_ns: u64,
+    ) -> io::Result<bool> {
+        Self::deliver_input_to_tap_inner(tap, bytes, submit, Some(expected_last_input_ns))
+    }
+
+    fn deliver_input_to_tap_inner(
+        tap: &Tap,
+        bytes: &[u8],
+        submit: bool,
+        expected_last_input_ns: Option<u64>,
+    ) -> io::Result<bool> {
         let (_, _, _, modes) = tap.capture_shared_with_modes();
         let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
         let payload = if submit {
@@ -3832,6 +3853,20 @@ impl Registry {
             payload
         };
         let before_end = tap.pulse().end;
+        let mut expected_stamp = expected_last_input_ns;
+        let mut write_checked = |chunk: &[u8]| -> io::Result<bool> {
+            if let Some(expected) = expected_stamp {
+                if let Some(next_stamp) = tap.write_input_if_untouched(chunk, expected)? {
+                    expected_stamp = Some(next_stamp);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            } else {
+                tap.write_input(chunk, None)?;
+                Ok(true)
+            }
+        };
         if use_bracketed {
             let mut framed = Vec::with_capacity(payload.len() + 12);
             framed.extend_from_slice(b"\x1b[200~");
@@ -3842,9 +3877,11 @@ impl Registry {
             }
             framed.extend_from_slice(rest);
             framed.extend_from_slice(b"\x1b[201~");
-            tap.write_input(&framed, None)?;
-        } else if !payload.is_empty() {
-            tap.write_input(payload, None)?;
+            if !write_checked(&framed)? {
+                return Ok(false);
+            }
+        } else if !payload.is_empty() && !write_checked(payload)? {
+            return Ok(false);
         }
         if submit {
             // ConPTY without VT passthrough never exposes DECSET 2004, and busy TUIs can echo a
@@ -3853,9 +3890,11 @@ impl Registry {
             if !payload.is_empty() && !is_control_seq {
                 Self::wait_for_paste_submit_settle(tap, before_end);
             }
-            tap.write_input(b"\r", None)?;
+            if !write_checked(b"\r")? {
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn flatten_unbracketed_submit_lines(payload: &[u8]) -> Vec<u8> {

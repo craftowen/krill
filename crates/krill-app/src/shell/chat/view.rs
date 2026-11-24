@@ -5308,13 +5308,23 @@ impl Shell {
             .copied()
             .unwrap_or(0)
             .min(total.saturating_sub(1));
-        let (abs_idx, item) = &items[step_idx];
-        let abs_idx = *abs_idx;
+        let (_, item) = &items[step_idx];
         let palette = ui::palette(cx);
         let fg = palette.foreground;
         let muted = palette.muted_foreground;
-        let request = self.chat_request_identity(pane, session, abs_idx, item);
-        let current = self.chat_request_is_current(&request, cx);
+        let current = items.iter().any(|(idx, it)| {
+            let req = self.chat_request_identity(pane, session, *idx, it);
+            self.chat_request_is_current(&req, cx)
+        });
+        let batch_busy = items.iter().any(|(idx, it)| {
+            let req = self.chat_request_identity(pane, session, *idx, it);
+            self.chat.logs.get(&key).is_some_and(|log| {
+                log.submissions
+                    .get(&req.key)
+                    .is_some_and(super::Submission::blocks_input)
+            })
+        });
+        let interactive = current && !batch_busy;
         let saved_answers = self
             .chat
             .question_batch_answers
@@ -5323,7 +5333,8 @@ impl Shell {
             .unwrap_or_default();
         let current_picks = saved_answers.get(&step_idx).cloned().unwrap_or_default();
         let current_answered = !current_picks.is_empty();
-        let any_answered = saved_answers.values().any(|v| !v.is_empty());
+        let answered_count = saved_answers.values().filter(|v| !v.is_empty()).count();
+        let any_answered = answered_count > 0;
         let is_last = step_idx + 1 >= total;
         let header_title = if item.title.trim().is_empty() {
             ctext::QUESTION.get().to_owned()
@@ -5443,41 +5454,48 @@ impl Shell {
                     .debug_selector(move || format!("chat-question-batch-option-{opt_idx}"))
                     .w_full()
                     .min_w_0()
-                    .cursor_pointer()
                     .rounded(ui::RADIUS_MD)
                     .border_1()
                     .border_color(opt_border)
                     .bg(opt_bg)
-                    .hover(|s| s.bg(palette.muted.opacity(0.65)))
                     .px_3()
                     .py_2()
                     .flex()
                     .items_start()
                     .gap_2()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let entry = this
-                            .chat
-                            .question_batch_answers
-                            .entry(pick_key.clone())
-                            .or_default()
-                            .entry(step_idx)
-                            .or_default();
-                        if multi {
-                            if let Some(pos) = entry.iter().position(|&v| v == opt_idx) {
-                                entry.remove(pos);
-                            } else {
-                                entry.push(opt_idx);
-                            }
-                        } else {
-                            *entry = vec![opt_idx];
-                            if step_idx + 1 < total {
-                                this.chat
-                                    .question_batch_step
-                                    .insert(pick_key.clone(), step_idx + 1);
-                            }
-                        }
-                        cx.notify();
-                    }))
+                    .when(interactive, |d| {
+                        d.cursor_pointer()
+                            .hover(|s| s.bg(palette.muted.opacity(0.65)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let batch_map = this
+                                    .chat
+                                    .question_batch_answers
+                                    .entry(pick_key.clone())
+                                    .or_default();
+                                if multi {
+                                    let entry = batch_map.entry(step_idx).or_default();
+                                    if let Some(pos) = entry.iter().position(|&v| v == opt_idx) {
+                                        entry.remove(pos);
+                                    } else {
+                                        entry.push(opt_idx);
+                                    }
+                                    if entry.is_empty() {
+                                        batch_map.remove(&step_idx);
+                                    }
+                                    if batch_map.is_empty() {
+                                        this.chat.question_batch_answers.remove(&pick_key);
+                                    }
+                                } else {
+                                    batch_map.insert(step_idx, vec![opt_idx]);
+                                    if step_idx + 1 < total {
+                                        this.chat
+                                            .question_batch_step
+                                            .insert(pick_key.clone(), step_idx + 1);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                    })
                     .child(
                         div()
                             .w(ui::SPACE_4)
@@ -5530,8 +5548,12 @@ impl Shell {
         let submit_items = items.to_vec();
         let skip_items = items.to_vec();
         // `#42789`: Skipping on the last step sends any already-answered steps instead of dropping them.
+        let other_answered_count = saved_answers
+            .iter()
+            .filter(|(s, v)| **s != step_idx && !v.is_empty())
+            .count();
         let skip_label = if is_last && any_answered && !current_answered {
-            ctext::SUBMIT.format(&[("n", &saved_answers.len().to_string())])
+            ctext::SUBMIT.format(&[("n", &answered_count.to_string())])
         } else {
             ctext::QUESTION_SKIP.get().to_owned()
         };
@@ -5553,6 +5575,7 @@ impl Shell {
                 .label(skip_label)
                 .outline()
                 .small()
+                .disabled(!interactive || (is_last && other_answered_count == 0))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if !is_last {
                         this.chat
@@ -5562,18 +5585,19 @@ impl Shell {
                     } else if let Some(answers) =
                         this.chat.question_batch_answers.get(&skip_key).cloned()
                     {
-                        // Submit the latest answered question from the batch (`#42789`).
-                        if let Some((&ans_step, picks)) =
-                            answers.iter().rev().find(|(_, v)| !v.is_empty())
-                            && let Some((ans_abs, ans_item)) = skip_items.get(ans_step)
-                        {
-                            let req = this.chat_request_identity(pane, session, *ans_abs, ans_item);
-                            this.answer_chat_question(
-                                req,
-                                picks.clone(),
-                                ans_item.multi_select,
-                                cx,
-                            );
+                        // Submit all previously answered steps in ascending order (`#42789`).
+                        let batch: Vec<_> = answers
+                            .into_iter()
+                            .filter(|(s, picks)| *s != step_idx && !picks.is_empty())
+                            .filter_map(|(ans_step, picks)| {
+                                let (ans_abs, ans_item) = skip_items.get(ans_step)?;
+                                let req =
+                                    this.chat_request_identity(pane, session, *ans_abs, ans_item);
+                                Some((req, picks, ans_item.multi_select))
+                            })
+                            .collect();
+                        if !batch.is_empty() {
+                            this.answer_chat_question_batch(batch, cx);
                         }
                     }
                 })),
@@ -5591,7 +5615,7 @@ impl Shell {
                 })
                 .primary()
                 .small()
-                .disabled(!current_answered && !any_answered)
+                .disabled(!interactive || (!current_answered && !any_answered))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if !is_last {
                         this.chat
@@ -5600,12 +5624,20 @@ impl Shell {
                         cx.notify();
                     } else if let Some(answers) =
                         this.chat.question_batch_answers.get(&submit_key).cloned()
-                        && let Some((&ans_step, picks)) =
-                            answers.iter().rev().find(|(_, v)| !v.is_empty())
-                        && let Some((ans_abs, ans_item)) = submit_items.get(ans_step)
                     {
-                        let req = this.chat_request_identity(pane, session, *ans_abs, ans_item);
-                        this.answer_chat_question(req, picks.clone(), ans_item.multi_select, cx);
+                        let batch: Vec<_> = answers
+                            .into_iter()
+                            .filter(|(_, picks)| !picks.is_empty())
+                            .filter_map(|(ans_step, picks)| {
+                                let (ans_abs, ans_item) = submit_items.get(ans_step)?;
+                                let req =
+                                    this.chat_request_identity(pane, session, *ans_abs, ans_item);
+                                Some((req, picks, ans_item.multi_select))
+                            })
+                            .collect();
+                        if !batch.is_empty() {
+                            this.answer_chat_question_batch(batch, cx);
+                        }
                     }
                 })),
             );
@@ -5772,7 +5804,7 @@ impl Shell {
     fn render_bot_chat_card(
         &mut self,
         pane: super::super::PaneId,
-        _session: SessionId,
+        session: SessionId,
         abs_idx: usize,
         card: &work_run::BotChatCard,
         joins_activity_below: bool,
@@ -5780,7 +5812,10 @@ impl Shell {
     ) -> AnyElement {
         let palette = ui::palette(cx);
         let muted = palette.muted_foreground;
-        let resolution = self.chat.resolved_bot_cards.get(card.card_id()).copied();
+        let key = (self.layout.host(pane).clone(), session);
+        let card_key = (key.clone(), abs_idx);
+        let pane_id = pane.get();
+        let resolution = self.chat.resolved_bot_cards.get(&card_key).copied();
         let card_avatar = |icon: IconName, color: gpui::Hsla| {
             div()
                 .size_8()
@@ -5806,11 +5841,13 @@ impl Shell {
                 subtitle,
             } => {
                 let removed = resolution == Some(super::BotCardResolution::Removed);
-                let remove_id = card_id.clone();
+                let removable_bot =
+                    (!removed && !tool_name.trim().is_empty() && self.bot_rpc_on(&key.0).is_some())
+                        .then(|| self.chat_bot(&key).map(|b| b.id.clone()))
+                        .flatten();
                 div()
                     .id(SharedString::from(format!(
-                        "chat-tool-added-{}-{abs_idx}",
-                        pane.get()
+                        "chat-tool-added-{pane_id}-{abs_idx}-{card_id}"
                     )))
                     .debug_selector(|| "chat-tool-added-card".into())
                     .when(joins_activity_below, |d| d.pb(gpui::px(6.)))
@@ -5859,21 +5896,25 @@ impl Shell {
                                         .child(format!("· {subtitle}")),
                                 )
                             })
-                            .when(!removed, |d| {
+                            .when_some(removable_bot, |d, bot_id| {
+                                let rm_key = key.clone();
+                                let rm_tool = tool_name.clone();
                                 d.child(
                                     Button::new(SharedString::from(format!(
-                                        "chat-tool-remove-{}-{abs_idx}",
-                                        pane.get()
+                                        "chat-tool-remove-{pane_id}-{abs_idx}"
                                     )))
+                                    .debug_selector(|| "chat-tool-remove-btn".into())
                                     .label(ctext::CARD_TOOL_REMOVE.get())
                                     .ghost()
                                     .xsmall()
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.chat.resolved_bot_cards.insert(
-                                            remove_id.clone(),
-                                            super::BotCardResolution::Removed,
+                                        this.remove_bot_tool_from_card(
+                                            rm_key.clone(),
+                                            abs_idx,
+                                            bot_id.clone(),
+                                            &rm_tool,
+                                            cx,
                                         );
-                                        cx.notify();
                                     })),
                                 )
                             }),
@@ -5886,56 +5927,55 @@ impl Shell {
                 title,
                 description,
             } => {
-                let status = match resolution {
-                    Some(super::BotCardResolution::Connected) => {
-                        Some((ctext::CARD_CONNECTOR_CONNECTED.get(), palette.success))
-                    }
-                    Some(super::BotCardResolution::Dismissed) => {
-                        Some((ctext::OFFER_DISMISSED.get(), muted))
-                    }
-                    _ => None,
-                };
-                let footer = (resolution.is_none()).then(|| {
-                    let dismiss_id = card_id.clone();
-                    let connect_id = card_id.clone();
+                let status = (resolution == Some(super::BotCardResolution::Dismissed))
+                    .then_some((ctext::OFFER_DISMISSED.get(), muted));
+                let footer = resolution.is_none().then(|| {
+                    let dismiss_key = card_key.clone();
                     div()
                         .flex()
                         .items_center()
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new(SharedString::from(format!("chat-conn-dismiss-{card_id}")))
-                                .label(ctext::OFFER_NOT_NOW.get())
-                                .outline()
-                                .small()
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            Button::new(SharedString::from(format!(
+                                "chat-conn-dismiss-{pane_id}-{abs_idx}-{card_id}"
+                            )))
+                            .debug_selector(|| "chat-connector-offer-dismiss".into())
+                            .label(ctext::OFFER_NOT_NOW.get())
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.chat.resolved_bot_cards.insert(
-                                        dismiss_id.clone(),
+                                        dismiss_key.clone(),
                                         super::BotCardResolution::Dismissed,
                                     );
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         )
                         .child(
-                            Button::new(SharedString::from(format!("chat-conn-accept-{card_id}")))
-                                .label(
-                                    ctext::CARD_CONNECTOR_CONNECT
-                                        .format(&[("service", service.as_str())]),
-                                )
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.chat.resolved_bot_cards.insert(
-                                        connect_id.clone(),
-                                        super::BotCardResolution::Connected,
-                                    );
+                            Button::new(SharedString::from(format!(
+                                "chat-conn-accept-{pane_id}-{abs_idx}-{card_id}"
+                            )))
+                            .debug_selector(|| "chat-connector-offer-connect".into())
+                            .label(
+                                ctext::CARD_CONNECTOR_CONNECT
+                                    .format(&[("service", service.as_str())]),
+                            )
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     if this.panel_collapsed {
                                         this.toggle_panel(cx);
                                     }
                                     this.bot_ui.panel.tab =
                                         super::super::bot_panel::BotPanelTab::Connectors;
+                                    this.bot_ui.panel.settings = None;
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         )
                         .into_any_element()
                 });
@@ -5949,7 +5989,9 @@ impl Shell {
                 });
                 let shown_title = if title.is_empty() { service } else { title };
                 Self::render_chat_card_frame(
-                    SharedString::from(format!("chat-connector-offer-{card_id}")),
+                    SharedString::from(format!(
+                        "chat-connector-offer-{pane_id}-{abs_idx}-{card_id}"
+                    )),
                     "chat-connector-offer-card",
                     Some(card_avatar(IconName::Plug, palette.foreground)),
                     ctext::CARD_CONNECTOR_HEADING.get(),
@@ -5965,18 +6007,10 @@ impl Shell {
                 title,
                 description,
             } => {
-                let status = match resolution {
-                    Some(super::BotCardResolution::Connected) => {
-                        Some((ctext::CARD_CONNECTOR_CONNECTED.get(), palette.success))
-                    }
-                    Some(super::BotCardResolution::Dismissed) => {
-                        Some((ctext::OFFER_DISMISSED.get(), muted))
-                    }
-                    _ => None,
-                };
-                let footer = (resolution.is_none()).then(|| {
-                    let dismiss_id = card_id.clone();
-                    let connect_id = card_id.clone();
+                let status = (resolution == Some(super::BotCardResolution::Dismissed))
+                    .then_some((ctext::OFFER_DISMISSED.get(), muted));
+                let footer = resolution.is_none().then(|| {
+                    let dismiss_key = card_key.clone();
                     div()
                         .flex()
                         .items_center()
@@ -5984,15 +6018,16 @@ impl Shell {
                         .gap_2()
                         .child(
                             Button::new(SharedString::from(format!(
-                                "chat-google-dismiss-{card_id}"
+                                "chat-google-dismiss-{pane_id}-{abs_idx}-{card_id}"
                             )))
+                            .debug_selector(|| "chat-google-offer-dismiss".into())
                             .label(ctext::OFFER_NOT_NOW.get())
                             .outline()
                             .small()
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     this.chat.resolved_bot_cards.insert(
-                                        dismiss_id.clone(),
+                                        dismiss_key.clone(),
                                         super::BotCardResolution::Dismissed,
                                     );
                                     cx.notify();
@@ -6001,22 +6036,20 @@ impl Shell {
                         )
                         .child(
                             Button::new(SharedString::from(format!(
-                                "chat-google-connect-{card_id}"
+                                "chat-google-connect-{pane_id}-{abs_idx}-{card_id}"
                             )))
+                            .debug_selector(|| "chat-google-offer-connect".into())
                             .label(ctext::CARD_GOOGLE_CONNECT.get())
                             .primary()
                             .small()
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    this.chat.resolved_bot_cards.insert(
-                                        connect_id.clone(),
-                                        super::BotCardResolution::Connected,
-                                    );
                                     if this.panel_collapsed {
                                         this.toggle_panel(cx);
                                     }
                                     this.bot_ui.panel.tab =
                                         super::super::bot_panel::BotPanelTab::Connectors;
+                                    this.bot_ui.panel.settings = None;
                                     cx.notify();
                                 },
                             )),
@@ -6032,7 +6065,7 @@ impl Shell {
                         .into_any_element()
                 });
                 Self::render_chat_card_frame(
-                    SharedString::from(format!("chat-google-offer-{card_id}")),
+                    SharedString::from(format!("chat-google-offer-{pane_id}-{abs_idx}-{card_id}")),
                     "chat-google-offer-card",
                     Some(card_avatar(IconName::Mail, palette.foreground)),
                     ctext::CARD_GOOGLE_HEADING.get(),
@@ -6050,7 +6083,7 @@ impl Shell {
                 description,
             } => {
                 let copied = resolution == Some(super::BotCardResolution::Copied);
-                let copy_id = card_id.clone();
+                let copy_key = card_key.clone();
                 let copy_url = url.clone();
                 let body = div()
                     .mt_1()
@@ -6087,33 +6120,37 @@ impl Shell {
                         .flex()
                         .justify_end()
                         .child(
-                            Button::new(SharedString::from(format!("chat-webhook-copy-{card_id}")))
-                                .icon(if copied {
-                                    IconName::Check
-                                } else {
-                                    IconName::Copy
-                                })
-                                .label(if copied {
-                                    ctext::COPIED.get()
-                                } else {
-                                    ctext::CARD_WEBHOOK_COPY_URL.get()
-                                })
-                                .outline()
-                                .small()
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            Button::new(SharedString::from(format!(
+                                "chat-webhook-copy-{pane_id}-{abs_idx}-{card_id}"
+                            )))
+                            .icon(if copied {
+                                IconName::Check
+                            } else {
+                                IconName::Copy
+                            })
+                            .label(if copied {
+                                ctext::COPIED.get()
+                            } else {
+                                ctext::CARD_WEBHOOK_COPY_URL.get()
+                            })
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                         copy_url.clone(),
                                     ));
                                     this.chat
                                         .resolved_bot_cards
-                                        .insert(copy_id.clone(), super::BotCardResolution::Copied);
+                                        .insert(copy_key.clone(), super::BotCardResolution::Copied);
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         )
                         .into_any_element()
                 });
                 Self::render_chat_card_frame(
-                    SharedString::from(format!("chat-webhook-setup-{card_id}")),
+                    SharedString::from(format!("chat-webhook-setup-{pane_id}-{abs_idx}-{card_id}")),
                     "chat-webhook-setup-card",
                     Some(card_avatar(IconName::Webhook, palette.foreground)),
                     ctext::CARD_WEBHOOK_HEADING.get(),
@@ -6130,18 +6167,10 @@ impl Shell {
                 bot_name,
                 summary,
             } => {
-                let status = match resolution {
-                    Some(super::BotCardResolution::Done) => {
-                        Some((ctext::OFFER_CREATED.get(), palette.success))
-                    }
-                    Some(super::BotCardResolution::Dismissed) => {
-                        Some((ctext::OFFER_DISMISSED.get(), muted))
-                    }
-                    _ => None,
-                };
-                let footer = (resolution.is_none()).then(|| {
-                    let dismiss_id = card_id.clone();
-                    let confirm_id = card_id.clone();
+                let status = (resolution == Some(super::BotCardResolution::Dismissed))
+                    .then_some((ctext::OFFER_DISMISSED.get(), muted));
+                let footer = resolution.is_none().then(|| {
+                    let dismiss_key = card_key.clone();
                     div()
                         .flex()
                         .items_center()
@@ -6149,15 +6178,16 @@ impl Shell {
                         .gap_2()
                         .child(
                             Button::new(SharedString::from(format!(
-                                "chat-import-cancel-{card_id}"
+                                "chat-import-cancel-{pane_id}-{abs_idx}-{card_id}"
                             )))
+                            .debug_selector(|| "chat-import-plan-dismiss".into())
                             .label(ctext::OFFER_NOT_NOW.get())
                             .outline()
                             .small()
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     this.chat.resolved_bot_cards.insert(
-                                        dismiss_id.clone(),
+                                        dismiss_key.clone(),
                                         super::BotCardResolution::Dismissed,
                                     );
                                     cx.notify();
@@ -6166,17 +6196,19 @@ impl Shell {
                         )
                         .child(
                             Button::new(SharedString::from(format!(
-                                "chat-import-confirm-{card_id}"
+                                "chat-import-confirm-{pane_id}-{abs_idx}-{card_id}"
                             )))
+                            .debug_selector(|| "chat-import-plan-confirm".into())
                             .label(ctext::CARD_IMPORT_CONFIRM.get())
                             .primary()
                             .small()
                             .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.chat
-                                        .resolved_bot_cards
-                                        .insert(confirm_id.clone(), super::BotCardResolution::Done);
-                                    cx.notify();
+                                move |this, _, window, cx| {
+                                    this.open_bots_screen(
+                                        super::super::bot_section::BotsScreen::Import,
+                                        Some(window),
+                                        cx,
+                                    );
                                 },
                             )),
                         )
@@ -6196,7 +6228,7 @@ impl Shell {
                     format!("{} · {source}", ctext::CARD_IMPORT_PLAN_HEADING.get())
                 };
                 Self::render_chat_card_frame(
-                    SharedString::from(format!("chat-import-plan-{card_id}")),
+                    SharedString::from(format!("chat-import-plan-{pane_id}-{abs_idx}-{card_id}")),
                     "chat-import-plan-card",
                     Some(card_avatar(IconName::Download, palette.foreground)),
                     &heading,
@@ -6221,7 +6253,7 @@ impl Shell {
                         .into_any_element()
                 });
                 Self::render_chat_card_frame(
-                    SharedString::from(format!("chat-import-done-{card_id}")),
+                    SharedString::from(format!("chat-import-done-{pane_id}-{abs_idx}-{card_id}")),
                     "chat-import-done-card",
                     Some(card_avatar(IconName::BadgeCheck, palette.success)),
                     ctext::CARD_IMPORT_DONE_HEADING.get(),
@@ -6241,18 +6273,20 @@ impl Shell {
                     .flex()
                     .justify_end()
                     .child(
-                        Button::new(SharedString::from(format!("chat-signin-offer-{card_id}")))
-                            .icon(IconName::LogIn)
-                            .label(ctext::CARD_SIGNIN_BTN.get())
-                            .primary()
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings(
-                                    krill_app::settings::AdminTab::Accounts,
-                                    Some(window),
-                                    cx,
-                                );
-                            })),
+                        Button::new(SharedString::from(format!(
+                            "chat-signin-offer-{pane_id}-{abs_idx}-{card_id}"
+                        )))
+                        .icon(IconName::LogIn)
+                        .label(ctext::CARD_SIGNIN_BTN.get())
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings(
+                                krill_app::settings::AdminTab::Accounts,
+                                Some(window),
+                                cx,
+                            );
+                        })),
                     )
                     .into_any_element();
                 let body = (!description.is_empty()).then(|| {
@@ -6264,7 +6298,7 @@ impl Shell {
                         .into_any_element()
                 });
                 Self::render_chat_card_frame(
-                    SharedString::from(format!("chat-signin-card-{card_id}")),
+                    SharedString::from(format!("chat-signin-card-{pane_id}-{abs_idx}-{card_id}")),
                     "chat-sign-in-offer-card",
                     Some(card_avatar(IconName::KeyRound, palette.warning)),
                     ctext::CARD_SIGNIN_HEADING.get(),

@@ -1855,6 +1855,7 @@ fn negotiated_history_missing_retains_rendered_screen_and_scroll_anchor() {
         total: 100,
         complete: false,
         rows: vec![row("old-c"), row("old-b"), row("old-a")],
+        screen: None,
     };
     assert!(feed(&mut pane, &reply.encode().unwrap()).redraw);
     let shown = Rc::clone(&pane.shown);
@@ -1874,6 +1875,7 @@ fn negotiated_history_missing_retains_rendered_screen_and_scroll_anchor() {
         total: 100,
         complete: false,
         rows: Vec::new(),
+        screen: None,
     };
     let ev = feed(&mut pane, &unavailable.encode().unwrap());
     assert!(!ev.redraw);
@@ -1952,6 +1954,7 @@ fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_ca
         total: 0,
         complete: false,
         rows: Vec::new(),
+        screen: None,
     };
     let ev = feed(&mut pane, &missing.encode().unwrap());
     assert!(ev.history_notice.is_some());
@@ -1981,6 +1984,7 @@ fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_ca
         total: 10,
         complete: false,
         rows: vec![row("hist-2"), row("hist-1")],
+        screen: None,
     };
     assert!(feed(&mut pane, &ready.encode().unwrap()).redraw);
     assert_eq!(pane.scroll_offset(), 2);
@@ -2012,6 +2016,7 @@ fn stable_history_accumulates_inflight_scroll_and_recovers_from_empty_stopped_ca
         total: 20,
         complete: false,
         rows: vec![row("hist-3"), row("hist-4"), row("hist-5"), row("hist-6")],
+        screen: None,
     };
     assert!(feed(&mut pane, &prefetch.encode().unwrap()).redraw);
     assert_eq!(pane.scroll_offset(), 3);
@@ -2285,6 +2290,7 @@ fn scroll_before_link_or_initial_update_fetches_once_screen_arrives() {
         total: 10,
         complete: false,
         rows: vec![row("hist-3"), row("hist-2"), row("hist-1")],
+        screen: None,
     };
     assert!(feed(&mut pane, &ready.encode().unwrap()).redraw);
     assert_eq!(pane.scroll_offset(), 3);
@@ -2320,6 +2326,7 @@ fn scroll_before_link_or_initial_update_fetches_once_screen_arrives() {
         total: 0,
         complete: true,
         rows: Vec::new(),
+        screen: None,
     };
     feed(&mut pane2, &empty.encode().unwrap());
     assert_eq!(pane2.scroll_offset(), 0);
@@ -2330,6 +2337,364 @@ fn scroll_before_link_or_initial_update_fetches_once_screen_arrives() {
     let retry_req = HistoryViewRequest::decode(*kind, body).unwrap();
     assert_eq!(retry_req.view, 0);
     assert_ne!(retry_req.req, top_req.req);
+}
+
+#[test]
+fn partial_scroll_freezes_bottom_viewport_with_atomic_and_n_minus_1_daemons() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryScreen, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+    let snapshot4 = |lines: [&str; 4]| {
+        let mut ops = vec![Op::Reset { cols: 16, lines: 4 }];
+        ops.extend((0u16..).zip(lines).map(|(line, t)| Op::Line {
+            line,
+            cells: row(t),
+        }));
+        ops
+    };
+
+    for send_atomic_screen in [true, false] {
+        let mut pane = Pane::default();
+        pane.link(
+            SessionId(1),
+            9,
+            Vec::new(),
+            input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+            Now::get(),
+        );
+        update(&mut pane, 1, snapshot4(["s0", "s1", "s2", "s3"]));
+        sent(out(&mut pane));
+
+        pane.scroll(2);
+        let frames = sent(out(&mut pane));
+        let (k, b) = frames.last().unwrap();
+        let req = HistoryViewRequest::decode(*k, b).unwrap();
+        assert_eq!(req.view, 0);
+
+        let reply = HistoryViewRows {
+            req: req.req,
+            view: 7,
+            session: SessionId(1),
+            epoch: [0; 3],
+            status: HistoryViewStatus::Ready,
+            identity: Some(HistoryIdentity {
+                session: SessionId(1),
+                source: Source::Hot,
+                start_seq: Seq(0),
+                end_seq: Seq(1),
+                digest: [0; 32],
+            }),
+            skip: 0,
+            total: 10,
+            complete: false,
+            rows: vec![row("h0"), row("h1")],
+            screen: send_atomic_screen.then(|| HistoryScreen::from_screen(pane.screen())),
+        };
+        assert!(feed(&mut pane, &reply.encode().unwrap()).redraw);
+        assert_eq!(pane.scroll_offset(), 2);
+        assert_eq!(texts(&pane.shown()), ["h1", "h0", "s0", "s1"]);
+        assert_eq!(pane.row(-2), Some(row("h1")));
+        assert_eq!(pane.row(-1), Some(row("h0")));
+        assert_eq!(pane.row(0), Some(row("s0")));
+        assert_eq!(pane.row(1), Some(row("s1")));
+        assert_eq!(pane.row(2), Some(row("s2")));
+        assert_eq!(pane.row(3), Some(row("s3")));
+
+        let frozen_rc = pane.shown();
+        // Live scrolling output (Op::Scroll + new line) must not shift or swallow lines at row `off`.
+        update(
+            &mut pane,
+            2,
+            vec![
+                Op::Scroll(1),
+                Op::Line {
+                    line: 3,
+                    cells: row("s4"),
+                },
+            ],
+        );
+        assert_eq!(texts(&pane.shown()), ["h1", "h0", "s0", "s1"]);
+        assert!(
+            Rc::ptr_eq(&frozen_rc, &pane.shown()),
+            "unchanged frozen screen must reuse shown Rc for RowPlanCache fast path"
+        );
+        assert_eq!(pane.row(0), Some(row("s0")));
+        assert_eq!(pane.row(3), Some(row("s3")));
+
+        // Full live screen replacement must also leave the frozen viewport and selection rows untouched.
+        update(
+            &mut pane,
+            3,
+            snapshot4(["live-0", "live-1", "live-2", "live-3"]),
+        );
+        assert_eq!(texts(&pane.shown()), ["h1", "h0", "s0", "s1"]);
+        assert_eq!(pane.row(0), Some(row("s0")));
+        assert_eq!(pane.row(1), Some(row("s1")));
+
+        // Stepping down partially still reads from frozen screen.
+        assert!(pane.scroll(-1));
+        assert_eq!(pane.scroll_offset(), 1);
+        assert_eq!(texts(&pane.shown()), ["h0", "s0", "s1", "s2"]);
+        assert_eq!(pane.row(0), Some(row("s0")));
+
+        // Returning to bottom resumes the live screen immediately.
+        assert!(pane.scroll(-1));
+        assert_eq!(pane.scroll_offset(), 0);
+        assert_eq!(
+            texts(&pane.shown()),
+            ["live-0", "live-1", "live-2", "live-3"]
+        );
+        assert_eq!(pane.row(0), Some(row("live-0")));
+
+        // Typing input while partially scrolled also snaps back to the live screen.
+        sent(out(&mut pane));
+        pane.scroll(1);
+        let frames = sent(out(&mut pane));
+        let (k, b) = frames.last().unwrap();
+        let req2 = HistoryViewRequest::decode(*k, b).unwrap();
+        let reply2 = HistoryViewRows {
+            req: req2.req,
+            view: 8,
+            session: SessionId(1),
+            epoch: [0; 3],
+            status: HistoryViewStatus::Ready,
+            identity: Some(HistoryIdentity {
+                session: SessionId(1),
+                source: Source::Hot,
+                start_seq: Seq(0),
+                end_seq: Seq(3),
+                digest: [1; 32],
+            }),
+            skip: 0,
+            total: 10,
+            complete: false,
+            rows: vec![row("h2")],
+            screen: send_atomic_screen.then(|| HistoryScreen::from_screen(pane.screen())),
+        };
+        assert!(feed(&mut pane, &reply2.encode().unwrap()).redraw);
+        update(
+            &mut pane,
+            4,
+            snapshot4(["after-0", "after-1", "after-2", "after-3"]),
+        );
+        assert_eq!(texts(&pane.shown()), ["h2", "live-0", "live-1", "live-2"]);
+        pane.input(b"x", Now::get());
+        assert_eq!(pane.scroll_offset(), 0);
+        assert_eq!(
+            texts(&pane.shown()),
+            ["after-0", "after-1", "after-2", "after-3"]
+        );
+    }
+}
+
+#[test]
+fn partial_scroll_open_time_race_uses_atomic_daemon_screen_seamlessly() {
+    use krill_proto::screen::{
+        HistoryIdentity, HistoryScreen, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+    };
+    let snapshot4 = |lines: [&str; 4]| {
+        let mut ops = vec![Op::Reset { cols: 16, lines: 4 }];
+        ops.extend((0u16..).zip(lines).map(|(line, t)| Op::Line {
+            line,
+            cells: row(t),
+        }));
+        ops
+    };
+
+    let mut pane = Pane::default();
+    pane.link(
+        SessionId(1),
+        9,
+        Vec::new(),
+        input::FEAT_INPUT | krill_proto::screen::FEAT_HISTORY_VIEW,
+        Now::get(),
+    );
+    update(
+        &mut pane,
+        1,
+        snapshot4(["line-05", "line-06", "line-07", "line-08"]),
+    );
+    sent(out(&mut pane));
+
+    // User scrolls up 2 lines while daemon is about to advance.
+    pane.scroll(2);
+    let frames = sent(out(&mut pane));
+    let (k, b) = frames.last().unwrap();
+    let req = HistoryViewRequest::decode(*k, b).unwrap();
+
+    // Before HistoryViewRows arrives, live Updates advance self.view.screen to line-07..10.
+    update(
+        &mut pane,
+        2,
+        snapshot4(["line-07", "line-08", "line-09", "line-10"]),
+    );
+    assert_eq!(
+        texts(&pane.shown()),
+        ["line-07", "line-08", "line-09", "line-10"]
+    );
+
+    // Daemon's opening reply was snapshotted atomically at the earlier cutoff (hot[0]=line-04, screen[0]=line-05).
+    let atomic = HistoryScreen {
+        rows: vec![
+            row("line-05"),
+            row("line-06"),
+            row("line-07"),
+            row("line-08"),
+        ],
+        links: vec![Vec::new(); 4],
+    };
+    let reply = HistoryViewRows {
+        req: req.req,
+        view: 5,
+        session: SessionId(1),
+        epoch: [0; 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: SessionId(1),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(1),
+            digest: [2; 32],
+        }),
+        skip: 0,
+        total: 4,
+        complete: true,
+        rows: vec![row("line-04"), row("line-03")],
+        screen: Some(atomic),
+    };
+    assert!(feed(&mut pane, &reply.encode().unwrap()).redraw);
+    assert_eq!(
+        texts(&pane.shown()),
+        ["line-03", "line-04", "line-05", "line-06"],
+        "atomic reply.screen must stitch cleanly to hot[0] with zero duplicate or skipped lines"
+    );
+    assert_eq!(pane.row(-1), Some(row("line-04")));
+    assert_eq!(pane.row(0), Some(row("line-05")));
+
+    // Returning to bottom resumes the already-advanced live screen.
+    assert!(pane.scroll(isize::MIN));
+    assert_eq!(pane.scroll_offset(), 0);
+    assert_eq!(
+        texts(&pane.shown()),
+        ["line-07", "line-08", "line-09", "line-10"]
+    );
+}
+
+#[test]
+fn partial_scroll_freezes_legacy_prior_search_and_filters_narrowed_links() {
+    use krill_proto::screen::Link;
+
+    // 1. Legacy HistoryRequest / HistoryRows freezes bottom rows and filters links on narrow resize.
+    let mut legacy = linked();
+    let initial_ops = vec![
+        Op::Reset { cols: 10, lines: 3 },
+        Op::Line {
+            line: 0,
+            cells: row("abcd123456"),
+        },
+        Op::Links {
+            line: 0,
+            links: vec![
+                Link {
+                    column: 0,
+                    cols: 4,
+                    uri: "https://keep.test".into(),
+                },
+                Link {
+                    column: 4,
+                    cols: 6,
+                    uri: "https://drop.test".into(),
+                },
+            ],
+        },
+        Op::Line {
+            line: 1,
+            cells: row("s1"),
+        },
+        Op::Line {
+            line: 2,
+            cells: row("s2"),
+        },
+    ];
+    update(&mut legacy, 1, initial_ops);
+    assert!(!legacy.scroll(1));
+    answer(&mut legacy, 2, &[]);
+    assert_eq!(texts(&legacy.shown()), ["h0", "abcd123456", "s1"]);
+    assert_eq!(legacy.shown().links[1].len(), 2);
+
+    // Live output arrives AND window narrows to cols = 5: bottom rows stay frozen and OOB link is filtered.
+    update(
+        &mut legacy,
+        2,
+        vec![
+            Op::Reset { cols: 5, lines: 3 },
+            Op::Line {
+                line: 0,
+                cells: row("new0"),
+            },
+            Op::Line {
+                line: 1,
+                cells: row("new1"),
+            },
+            Op::Line {
+                line: 2,
+                cells: row("new2"),
+            },
+        ],
+    );
+    assert_eq!(texts(&legacy.shown()), ["h0", "abcd123456", "s1"]);
+    assert_eq!(legacy.shown().cols, 5);
+    assert_eq!(legacy.shown().links[1].len(), 1);
+    assert_eq!(legacy.shown().links[1][0].uri, "https://keep.test");
+    assert_eq!(legacy.row(0), Some(row("abcd123456")));
+
+    // Return to bottom resumes live screen.
+    assert!(legacy.scroll(-1));
+    assert_eq!(texts(&legacy.shown()), ["new0", "new1", "new2"]);
+
+    // 2. Resumed cold `prior` rows freeze bottom viewport immediately on scroll.
+    let mut resumed = Pane::<Vec<u8>>::default();
+    resumed
+        .show_cold(
+            SessionId(1),
+            Cold {
+                screen: snapshot(["cold-1", "", ""]),
+                history: vec![row("cold-0")],
+            },
+        )
+        .unwrap();
+    resumed.link(SessionId(2), 1, Vec::new(), input::FEAT_INPUT, Now::get());
+    update(&mut resumed, 1, snapshot(["s0", "s1", "s2"]));
+    assert!(resumed.scroll(1));
+    assert_eq!(texts(&resumed.shown()), ["cold-1", "s0", "s1"]);
+    update(&mut resumed, 2, snapshot(["live-0", "live-1", "live-2"]));
+    assert_eq!(texts(&resumed.shown()), ["cold-1", "s0", "s1"]);
+    assert_eq!(resumed.row(0), Some(row("s0")));
+    assert!(resumed.scroll(-1));
+    assert_eq!(texts(&resumed.shown()), ["live-0", "live-1", "live-2"]);
+
+    // 3. Short-scrollback search view keeps bottom rows frozen across live updates.
+    let mut searched = linked();
+    update(&mut searched, 1, snapshot(["s0", "s1", "s2"]));
+    searched.search.hist_req = Some(10);
+    searched.search.hist_target = Some(SearchTarget {
+        row: 0,
+        column: 0,
+        cols: 3,
+    });
+    let hit_reply = HistoryRows {
+        req: 10,
+        total: 1,
+        pages: 0,
+        skip: 0,
+        rows: vec![row("hit")],
+    };
+    assert!(feed(&mut searched, &hit_reply.encode().unwrap()).redraw);
+    assert_eq!(texts(&searched.shown()), ["hit", "s0", "s1"]);
+    update(&mut searched, 2, snapshot(["next-0", "next-1", "next-2"]));
+    assert_eq!(texts(&searched.shown()), ["hit", "s0", "s1"]);
+    searched.clear_search();
+    assert_eq!(texts(&searched.shown()), ["next-0", "next-1", "next-2"]);
 }
 
 /// A login shell may start an agent or switch providers without replacing its PTY.

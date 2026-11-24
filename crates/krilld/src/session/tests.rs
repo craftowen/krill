@@ -1020,19 +1020,20 @@ fn stable_history_publish_rechecks_clear_epoch_without_losing_newer_view() {
     )
     .unwrap();
     let tap = session.tap();
-    let (epoch, _, _) = tap.history_snapshot(&|| false).unwrap();
+    let snapshot = tap.history_snapshot(&|| false).unwrap();
     assert!(tap.clear_viewport());
     let mut reply = HistoryViewRows {
         req: 1,
         view: 1,
         session: tap.id(),
-        epoch,
+        epoch: snapshot.stamp,
         status: HistoryViewStatus::Ready,
         identity: None,
         skip: 0,
         total: 1,
         complete: true,
         rows: vec![Vec::new()],
+        screen: Some(snapshot.screen),
     };
     let mut encoded = Vec::new();
     tap.publish_history(&mut reply, &|| false, |bytes| {
@@ -1044,6 +1045,52 @@ fn stable_history_publish_rechecks_clear_epoch_without_losing_newer_view() {
     let result = HistoryViewRows::decode(kind, &body).unwrap();
     assert_eq!(result.status, HistoryViewStatus::Invalidated);
     assert!(result.rows.is_empty());
+    assert!(result.screen.is_none());
+    drop(pty.user);
+    session.wait().unwrap();
+}
+
+#[test]
+fn history_snapshot_captures_hot_and_screen_at_same_cutoff() {
+    use std::fmt::Write as _;
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(995),
+        pty.controller,
+        WinSize { cols: 40, rows: 4 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    let mut data = String::new();
+    for i in 1..=10 {
+        write!(data, "row-{i:02}\r\n").unwrap();
+    }
+    data.push_str("row-11");
+    let raw = data.into_bytes();
+    guarded(&tap.0, raw.len(), |engine| {
+        engine.feed(&raw, Feed::Live, &tap.0.look)
+    });
+    let seq = lock(&tap.0.live).seq;
+    lock(&tap.0.out).end = seq;
+    tap.0.changed.notify_all();
+
+    let snapshot = tap.history_snapshot(&|| false).unwrap();
+    assert_eq!(snapshot.seq, seq);
+    let text = |cells: &[krill_proto::screen::Cell]| -> String {
+        cells
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+    assert_eq!(snapshot.rows.len(), 7);
+    assert_eq!(text(&snapshot.rows[0]), "row-07");
+    assert_eq!(text(&snapshot.rows[6]), "row-01");
+    let screen_texts: Vec<String> = snapshot.screen.rows.iter().map(|r| text(r)).collect();
+    assert_eq!(screen_texts, vec!["row-08", "row-09", "row-10", "row-11"]);
     drop(pty.user);
     session.wait().unwrap();
 }

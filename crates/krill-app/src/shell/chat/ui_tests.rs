@@ -3706,6 +3706,14 @@ fn remote_bot_without_workspace_footer_does_not_overwrite_clipboard_and_efforts_
         ctext::EFFORT_MINIMAL.get()
     );
     assert_eq!(composer::effort_text("ultra"), ctext::EFFORT_ULTRA.get());
+    assert_eq!(
+        composer::effort_text("very_high"),
+        ctext::EFFORT_XHIGH.get()
+    );
+    assert_eq!(
+        composer::effort_text("very-high"),
+        ctext::EFFORT_XHIGH.get()
+    );
     assert_eq!(composer::effort_text("none"), ctext::EFFORT_NONE.get());
     assert_eq!(composer::effort_text("off"), ctext::EFFORT_OFF.get());
 
@@ -4638,4 +4646,523 @@ fn wave2b_question_batch_worker_dock_auto_close_and_rate_limit_switch(cx: &mut T
     cx.run_until_parked();
     assert!(cx.debug_bounds("chat-rate-limit-banner").is_some());
     assert!(cx.debug_bounds("chat-rate-limit-continue").is_some());
+}
+
+#[gpui::test]
+fn s2_16_18_19_20_wave2b_permission_host_cards_steer_queue_and_lifecycle(cx: &mut TestAppContext) {
+    use krill_app::hosts::HostId;
+    use krill_proto::agent::Permission;
+    use krill_proto::bots::{BotConfig, BotId, BotMcpToolConfig, BotRpcRequest, BotRpcResponse};
+
+    let (shell, cx) = open(cx, state_path("wave2b-swarm-fixes"));
+    let remote = HostId::Remote("remote-box".into());
+    let bot_id = BotId::new("ops-bot").unwrap();
+
+    // S2-16: set_bot_permission sends UpdateBot to the pane's host (not launch_host) & notifies on error.
+    let local_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let remote_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let local_hits_c = local_hits.clone();
+    let remote_hits_c = remote_hits.clone();
+    let local_rpc: krill_app::bots::BotRpcCall = std::sync::Arc::new(move |_| {
+        local_hits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(BotRpcResponse::Ok)
+    });
+    let remote_err_rpc: krill_app::bots::BotRpcCall = std::sync::Arc::new(move |req| {
+        if matches!(req, BotRpcRequest::UpdateBot(_)) {
+            remote_hits_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err("remote permission denied".into());
+        }
+        Ok(BotRpcResponse::Ok)
+    });
+    shell.update(cx, |s, cx| {
+        s.launch_host = HostId::Local;
+        s.bot_rpc_overrides.insert(HostId::Local, local_rpc);
+        s.bot_rpc_overrides.insert(remote.clone(), remote_err_rpc);
+        s.set_bot_permission(remote.clone(), bot_id.clone(), Permission::Yolo, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        local_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "S2-16: UpdateBot must not be routed to Local launch_host"
+    );
+    assert_eq!(
+        remote_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "S2-16: UpdateBot must be routed to the pane's remote host"
+    );
+    assert_eq!(
+        shell.read_with(cx, |s, _| s.notice.clone()).as_deref(),
+        Some("remote permission denied")
+    );
+
+    // S2-18: Interactive cards scope resolution by (ChatKey, abs_idx), Connect/ImportPlan do not
+    // fake resolution, and ToolAdded Remove calls GetBot + UpdateBot via real RPC.
+    let removed_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let removed_tools_c = removed_tools.clone();
+    let tool_rpc: krill_app::bots::BotRpcCall = std::sync::Arc::new({
+        let bot_id = bot_id.clone();
+        move |req| match req {
+            BotRpcRequest::GetBot { .. } => {
+                let mut cfg = BotConfig::new(bot_id.clone(), "Ops", "agy", 1).unwrap();
+                cfg.mcp_tools.push(BotMcpToolConfig {
+                    id: "linear_query".into(),
+                    name: "linear_query".into(),
+                    endpoint_url: None,
+                    command: Vec::new(),
+                    auth_kind: krill_proto::bots::BotMcpAuthKind::None,
+                    header_names: Vec::new(),
+                    secret_ref: None,
+                    enabled: true,
+                });
+                Ok(BotRpcResponse::Bot(Box::new(cfg)))
+            }
+            BotRpcRequest::UpdateBot(params) => {
+                if let Some(tools) = &params.mcp_tools {
+                    *removed_tools_c.lock().unwrap() = tools.iter().map(|t| t.id.clone()).collect();
+                }
+                let cfg = BotConfig::new(bot_id.clone(), "Ops", "agy", 2).unwrap();
+                Ok(BotRpcResponse::Bot(Box::new(cfg)))
+            }
+            _ => Ok(BotRpcResponse::Ok),
+        }
+    });
+    let key = local_key(SESSION);
+    shell.update(cx, |s, cx| {
+        s.sidebar_collapsed = true;
+        s.panel_collapsed = true;
+        s.bot_rpc_overrides.clear();
+        s.bot_rpc_override = Some(tool_rpc);
+        let pane = s.layout.focused().unwrap();
+        attach_live_test_pane(s, pane, SESSION, cx);
+        s.layout.set_session(pane, SESSION);
+        s.layout.set_chat_view(pane, true);
+        let cfg = BotConfig::new(bot_id.clone(), "Ops", "agy", 1).unwrap();
+        let summary = krill_proto::bots::BotSessionSummary {
+            session_id: SESSION,
+            bot_id: bot_id.clone(),
+            link_id: None,
+            pid: 1,
+            live: true,
+            working: false,
+            label: String::new(),
+            created_at_ms: 0,
+        };
+        let mut row = krill_app::bots::rpc::sidebar_snapshot(
+            &[cfg],
+            &[],
+            &[],
+            std::slice::from_ref(&summary),
+        )
+        .bots
+        .remove(0);
+        row.sessions = vec![summary];
+        s.sidebar_bots = vec![row];
+        s.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                agent: "agy".into(),
+                items: vec![
+                    ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "[Krill card: connector-offer | same-id | Slack | Connect Slack | Read channels]"
+                            .into(),
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "[Krill card: connector-offer | same-id | Slack | Connect Slack 2 | Read channels]"
+                            .into(),
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "[Krill card: tool-added | t1 | linear_query | Added to tools]".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    // Clicking Connect opens Connectors tab WITHOUT writing a fake Connected resolution.
+    let conn_btn = cx
+        .debug_bounds("chat-connector-offer-connect")
+        .expect("connector offer connect button");
+    cx.simulate_click(conn_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |s, _| {
+        assert!(!s.panel_collapsed);
+        assert_eq!(
+            s.bot_ui.panel.tab,
+            crate::shell::bot_panel::BotPanelTab::Connectors
+        );
+        assert!(
+            s.chat.resolved_bot_cards.is_empty(),
+            "Connect must not mark card Connected before OAuth finishes"
+        );
+    });
+
+    // Dismissing card at abs_idx 0 must NOT dismiss card at abs_idx 1 even with identical card_id.
+    shell.update(cx, |s, cx| {
+        s.chat
+            .resolved_bot_cards
+            .insert((key.clone(), 0), super::BotCardResolution::Dismissed);
+        cx.notify();
+    });
+    assert!(
+        !shell.read_with(cx, |s, _| s
+            .chat
+            .resolved_bot_cards
+            .contains_key(&(key.clone(), 1))),
+        "same static card_id at different abs_idx must remain independent"
+    );
+
+    // Clicking Remove on ToolAdded invokes GetBot + UpdateBot and only then marks (key, 2) Removed.
+    shell.update(cx, |s, cx| {
+        s.remove_bot_tool_from_card(key.clone(), 2, bot_id.clone(), "linear_query", cx);
+    });
+    cx.run_until_parked();
+    assert!(removed_tools.lock().unwrap().is_empty());
+    assert_eq!(
+        shell.read_with(cx, |s, _| s
+            .chat
+            .resolved_bot_cards
+            .get(&(key.clone(), 2))
+            .copied()),
+        Some(super::BotCardResolution::Removed)
+    );
+
+    // S2-19: steer_queued_chat_prompt preserves queued message & attachments when multiline paste blocks.
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let log = s.chat.logs.entry(key.clone()).or_default();
+            log.queued_prompts.push_back(super::QueuedChatPrompt {
+                id: 77,
+                display_text: "line1\nline2".into(),
+                submitted_payload: "line1\nline2".into(),
+                attachments: vec![super::DraftAttachment {
+                    display_name: "spec.txt".into(),
+                    path: std::path::PathBuf::from("/tmp/spec.txt"),
+                    preview_path: None,
+                    byte_len: 12,
+                    is_image: false,
+                }],
+            });
+            s.steer_queued_chat_prompt(&key, 77, window, cx);
+            assert!(
+                s.chat.multiline_blocked.contains(&key),
+                "multiline prompt without bracketed paste must trigger paste confirmation"
+            );
+            let q = s
+                .chat
+                .logs
+                .get(&key)
+                .and_then(|l| l.queued_prompts.front())
+                .expect("S2-19: queued prompt must NOT be deleted when multiline paste blocks");
+            assert_eq!(q.id, 77);
+            assert_eq!(q.attachments.len(), 1);
+        });
+    });
+
+    // S2-20: rebind_chat_session migrates all Wave 2B maps & resets rate-limit flags; prune drops closed state.
+    let rebind_to = SessionId(555);
+    let stale_key = local_key(SessionId(8888));
+    cx.update(|_, cx| {
+        shell.update(cx, |s, cx| {
+            let pane = s.layout.focused().unwrap();
+            s.layout.new_tab_after(0);
+            let stale_pane = s.layout.focused().unwrap();
+            s.layout.close_tab(1);
+            s.layout.focus(pane);
+            let log = s.chat.logs.entry(key.clone()).or_default();
+            log.rate_limited_account = Some("acct-old".into());
+            log.rate_limit_account_switched = true;
+            s.chat.permission_picker.insert(key.clone());
+            s.chat.agy_auth_picker.insert(key.clone());
+            s.chat.worker_dock_expanded.insert(key.clone());
+            s.chat.worker_keep_open.insert(SESSION);
+            s.chat.question_batch_step.insert((key.clone(), 0), 1);
+            s.chat.question_batch_answers.insert(
+                (key.clone(), 0),
+                std::collections::BTreeMap::from([(0, vec![1])]),
+            );
+            s.chat
+                .approval_focus
+                .insert((key.clone(), "req:1".into()), cx.focus_handle());
+            s.chat
+                .approval_auto_focused
+                .insert((key.clone(), "req:1".into()));
+            s.chat.resume_toast = Some((key.clone(), "ready".into()));
+            s.chat.resume_search.insert(key.clone(), "triage".into());
+
+            s.rebind_chat_session(&HostId::Local, SESSION, rebind_to, &[pane]);
+            let new_key = local_key(rebind_to);
+            let rebound_log = s.chat.logs.get(&new_key).unwrap();
+            assert!(rebound_log.rate_limited_account.is_none());
+            assert!(!rebound_log.rate_limit_account_switched);
+            assert!(s.chat.permission_picker.contains(&new_key));
+            assert!(s.chat.agy_auth_picker.contains(&new_key));
+            assert!(s.chat.worker_dock_expanded.contains(&new_key));
+            assert!(s.chat.worker_keep_open.contains(&rebind_to));
+            assert_eq!(
+                s.chat.question_batch_step.get(&(new_key.clone(), 0)),
+                Some(&1)
+            );
+            assert!(
+                s.chat
+                    .question_batch_answers
+                    .contains_key(&(new_key.clone(), 0))
+            );
+            assert!(
+                s.chat
+                    .approval_focus
+                    .contains_key(&(new_key.clone(), "req:1".into()))
+            );
+            assert!(
+                s.chat
+                    .approval_auto_focused
+                    .contains(&(new_key.clone(), "req:1".into()))
+            );
+            assert_eq!(s.chat.resume_toast.as_ref().map(|(k, _)| k), Some(&new_key));
+            assert_eq!(
+                s.chat.resume_search.get(&new_key).map(String::as_str),
+                Some("triage")
+            );
+            assert_eq!(
+                s.chat
+                    .resolved_bot_cards
+                    .get(&(new_key.clone(), 2))
+                    .copied(),
+                Some(super::BotCardResolution::Removed)
+            );
+
+            // Seed stale entries and verify prune_chat_sessions cleans all of them.
+            s.chat.pane_widths.insert(stale_pane, px(300.0));
+            s.chat.permission_picker.insert(stale_key.clone());
+            s.chat.agy_auth_picker.insert(stale_key.clone());
+            s.chat.worker_dock_expanded.insert(stale_key.clone());
+            s.chat.worker_dock_cleared.insert("gone-dispatch".into());
+            s.chat.worker_keep_open.insert(SessionId(8888));
+            s.chat.question_batch_step.insert((stale_key.clone(), 0), 1);
+            s.chat
+                .question_batch_answers
+                .insert((stale_key.clone(), 0), std::collections::BTreeMap::new());
+            s.chat
+                .approval_focus
+                .insert((stale_key.clone(), "r".into()), cx.focus_handle());
+            s.chat
+                .approval_auto_focused
+                .insert((stale_key.clone(), "r".into()));
+            s.chat.resume_toast = Some((stale_key.clone(), "stale".into()));
+            s.chat.resume_search.insert(stale_key.clone(), "old".into());
+            s.chat
+                .resolved_bot_cards
+                .insert((stale_key.clone(), 0), super::BotCardResolution::Dismissed);
+
+            s.prune_chat_sessions();
+            assert!(!s.chat.pane_widths.contains_key(&stale_pane));
+            assert!(!s.chat.permission_picker.contains(&stale_key));
+            assert!(!s.chat.agy_auth_picker.contains(&stale_key));
+            assert!(!s.chat.worker_dock_expanded.contains(&stale_key));
+            assert!(!s.chat.worker_dock_cleared.contains("gone-dispatch"));
+            assert!(!s.chat.worker_keep_open.contains(&SessionId(8888)));
+            assert!(
+                !s.chat
+                    .question_batch_step
+                    .contains_key(&(stale_key.clone(), 0))
+            );
+            assert!(
+                !s.chat
+                    .question_batch_answers
+                    .contains_key(&(stale_key.clone(), 0))
+            );
+            assert!(
+                !s.chat
+                    .approval_focus
+                    .contains_key(&(stale_key.clone(), "r".into()))
+            );
+            assert!(
+                !s.chat
+                    .approval_auto_focused
+                    .contains(&(stale_key.clone(), "r".into()))
+            );
+            assert!(s.chat.resume_toast.is_none());
+            assert!(!s.chat.resume_search.contains_key(&stale_key));
+            assert!(
+                !s.chat
+                    .resolved_bot_cards
+                    .contains_key(&(stale_key.clone(), 0))
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn s2_17_question_batch_cleans_empty_multi_submits_all_steps_and_guards_stale(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = open(cx, state_path("wave2b-qbatch-s2-17"));
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let recorded = sent.clone();
+    let key = local_key(SESSION);
+
+    set_phase2b_session_state(&shell, cx, krill_proto::control::AgentState::Waiting, 102);
+    let pane = shell.update(cx, |s, cx| {
+        s.sidebar_collapsed = true;
+        s.panel_collapsed = true;
+        let pane = s.layout.focused().unwrap();
+        attach_live_test_pane(s, pane, SESSION, cx);
+        s.layout.set_session(pane, SESSION);
+        s.layout.set_chat_view(pane, true);
+        inject_phase2b_screen(s, pane, "Features?\n❯ [ ] Lint\n  [ ] Test", cx);
+        s.chat.send_input = Some(Box::new(move |bytes| {
+            recorded.lock().unwrap().push(bytes);
+            true
+        }));
+        s.apply_chat_poll(
+            SESSION,
+            ChatPollSnapshot {
+                bound: true,
+                reset: true,
+                agent: "agy".into(),
+                session_id: "s-q17".into(),
+                transcript_path: "/tmp/q17.jsonl".into(),
+                items: vec![
+                    ChatItem {
+                        kind: ChatItemKind::Question,
+                        tool_id: "q-1".into(),
+                        title: "Features".into(),
+                        text: "Features?".into(),
+                        multi_select: true,
+                        options: vec![
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Lint".into(),
+                                description: String::new(),
+                            },
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Test".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    ChatItem {
+                        kind: ChatItemKind::Question,
+                        tool_id: "q-2".into(),
+                        title: "Target".into(),
+                        text: "Deploy target?".into(),
+                        options: vec![
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Local".into(),
+                                description: String::new(),
+                            },
+                            krill_proto::agent_history::ChatQuestionOption {
+                                label: "Cloud".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        cx.notify();
+        pane
+    });
+    cx.run_until_parked();
+
+    // Toggling a multi-select option on then off must remove the empty entry cleanly.
+    let opt0 = cx
+        .debug_bounds("chat-question-batch-option-0")
+        .expect("step 1 multi option 0");
+    cx.simulate_click(opt0.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        shell.read_with(cx, |s, _| s
+            .chat
+            .question_batch_answers
+            .get(&(key.clone(), 0))
+            .and_then(|m| m.get(&0))
+            .cloned()),
+        Some(vec![0])
+    );
+    cx.simulate_click(opt0.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        shell.read_with(cx, |s, _| !s
+            .chat
+            .question_batch_answers
+            .contains_key(&(key.clone(), 0))),
+        "unchecking last multi-select option must clean up empty vector"
+    );
+
+    // Select step 1 option 0, advance to step 2, select option 1, and submit batch ->
+    // step 1 sends first, then after screen transitions to step 2, step 2 sends as well.
+    cx.simulate_click(opt0.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let next_btn = cx
+        .debug_bounds("chat-question-batch-confirm")
+        .expect("next button");
+    cx.simulate_click(next_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let step2_opt1 = cx
+        .debug_bounds("chat-question-batch-option-1")
+        .expect("step 2 option 1");
+    cx.simulate_click(step2_opt1.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let submit_btn = cx
+        .debug_bounds("chat-question-batch-confirm")
+        .expect("submit button on step 2");
+    cx.simulate_click(submit_btn.center(), gpui::Modifiers::default());
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(120));
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![b" ".to_vec(), b"\r".to_vec()],
+        "step 1 must be submitted first while step 1 prompt is on screen"
+    );
+    // Advance TUI screen to step 2; batch task must deliver step 2's answer too.
+    shell.update(cx, |s, cx| {
+        inject_phase2b_screen(s, pane, "Deploy target?\n❯ 1. Local\n  2. Cloud", cx);
+        cx.notify();
+    });
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert_eq!(
+        *sent.lock().unwrap(),
+        vec![
+            b" ".to_vec(),
+            b"\r".to_vec(),
+            b"\x1b[B".to_vec(),
+            b"\r".to_vec(),
+        ],
+        "S2-17: batch submission must sequentially deliver step 2 after screen advances"
+    );
+
+    // Non-current (historical) batch must ignore option clicks.
+    set_phase2b_session_state(&shell, cx, krill_proto::control::AgentState::Done, 103);
+    shell.update(cx, |s, cx| {
+        s.chat.question_batch_answers.clear();
+        s.chat.question_batch_step.clear();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let stale_opt = cx
+        .debug_bounds("chat-question-batch-option-0")
+        .expect("historical option renders");
+    cx.simulate_click(stale_opt.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        shell.read_with(cx, |s, _| s.chat.question_batch_answers.is_empty()),
+        "S2-17: non-current question batch must not accept option clicks"
+    );
 }
