@@ -288,7 +288,7 @@ pub struct Envelope {
 pub fn envelope(event: Event, ts_unix: u64) -> Envelope {
     Envelope {
         v: SCHEMA_VERSION,
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        app_version: crate::release_version().to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         ts_unix,

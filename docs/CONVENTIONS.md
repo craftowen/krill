@@ -16,7 +16,7 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 
 ## 1. 워크스페이스·툴체인
 
-- **W1 MUST** 모든 크레이트는 `version`·`edition = "2024"`·`rust-version`을 `[workspace.package]`에서 상속, `publish = false`.
+- **W1 MUST** 모든 크레이트는 `edition = "2024"`·`rust-version`을 `[workspace.package]`에서 상속, `publish = false`. 출고 실행 파일 크레이트(`krill-app`·`krill`·`krilld`·`krill-holder`·`krill-link`)와 `krill-version`은 `version.workspace = true`를 상속하고, 내부 라이브러리 크레이트(`krill-proto`·`krill-term`·`krill-log`·`krill-hosts`·`krill-link-core`·`krill-ui`·`krill-app-core`)는 릴리스 버전 범프 시 컴파일 캐시 무효화를 막기 위해 고정 내부 버전(`version = "0.0.0"`)을 쓴다.
 - **W3 MUST** 외부 의존성 버전은 루트 `[workspace.dependencies]`에만. 멤버는 `x = { workspace = true }`(cargo-deny `workspace-dependencies`가 막음).
 - **W4 MUST** 패키지 레벨 `default-features = false` 덮어쓰기에 기대지 않는다(Cargo 1.99 전용, 로컬은 1.98.1).
 - **W5 MUST** MSRV `rust-version = "1.98"`. 로컬은 Homebrew rustc(rustup 없음)라 `rust-toolchain.toml`은 효과 없음.

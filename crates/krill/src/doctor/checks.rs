@@ -80,7 +80,7 @@ pub struct History {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Facts {
     pub helpers: Helpers,
-    /// 이 `krill`의 빌드 식별자(`krill_proto::BUILD`).
+    /// 이 `krill`의 빌드 식별자(`krill_version::BUILD`).
     pub cli_build: String,
     /// 붙은 krilld의 빌드. 못 붙었으면 `None`.
     pub daemon_build: Option<String>,

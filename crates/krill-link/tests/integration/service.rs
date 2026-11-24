@@ -153,6 +153,7 @@ fn disabling_exits_serve_process_and_keeps_local_socket_alive() {
     }
     assert!(!is_serve_running(&fixture.dir));
     assert!(!krill_link::service::incoming_enabled(&fixture.dir).unwrap());
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     krill_link::service::ensure_default_server(std::path::Path::new("missing"), &fixture.dir)
         .unwrap();
     // 수신 서버 종료가 로컬 세션 데몬의 리스너를 닫지 않는다.
@@ -180,7 +181,7 @@ fn incoming_server_pairs_and_forwards_to_local_socket() {
                 krill_link::serve::serve_build_command(&fixture.dir)
                     .await
                     .as_deref(),
-                Some(krill_proto::BUILD)
+                Some(krill_version::BUILD)
             );
             let local = Listener::bind(fixture.dir.join("run/krilld.sock")).unwrap();
             let client = fixture.dir.join("client");
@@ -228,6 +229,7 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
     let program = fixture.program();
     let executable = program.as_path();
     assert!(!krill_link::service::incoming_enabled(&fixture.dir).unwrap());
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
     assert!(
         !is_serve_running(&fixture.dir),
@@ -236,6 +238,7 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
     let device = iroh::SecretKey::generate().public();
     krill_link::upsert_device(&fixture.dir, device, "phone", 1).unwrap();
     assert!(krill_link::service::incoming_enabled(&fixture.dir).unwrap());
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
     assert!(is_serve_running(&fixture.dir));
     // 앱은 이 빌드로 업데이트 뒤 남은 구 서버를 알아보고 교체한다.
@@ -244,7 +247,7 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
         .build()
         .unwrap()
         .block_on(krill_link::serve::serve_build_command(&fixture.dir));
-    assert_eq!(build.as_deref(), Some(krill_proto::BUILD));
+    assert_eq!(build.as_deref(), Some(krill_version::BUILD));
     let ticket = fs::read(fixture.dir.join("link/serve.ticket")).unwrap();
     krill_link::service::enable_server(executable, &fixture.dir).unwrap();
     assert_eq!(
@@ -253,6 +256,7 @@ fn windows_default_server_starts_reuses_and_remembers_off() {
     );
     krill_link::service::disable_server(&fixture.dir).unwrap();
     assert!(!is_serve_running(&fixture.dir));
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     krill_link::service::ensure_default_server(executable, &fixture.dir).unwrap();
     assert!(!is_serve_running(&fixture.dir));
     krill_link::service::enable_server(executable, &fixture.dir).unwrap();
@@ -268,6 +272,7 @@ fn temporary_home_prevents_default_autostart_even_without_state_override() {
     if std::env::var_os(CHILD).is_some() {
         let state = krill_link::resolve_state_dir(None).unwrap();
         let executable = std::path::Path::new(env!("CARGO_BIN_EXE_krill-link"));
+        krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
         krill_link::service::ensure_default_server(executable, &state).unwrap();
         assert!(
             !state.exists(),
@@ -313,10 +318,12 @@ fn real_home_keeps_default_autostart_for_custom_state_directory() {
         let executable = std::path::Path::new(env!("CARGO_BIN_EXE_krill-link"));
         let label = krill_link::link_label(Some(&state));
         let plist = krill_link::launch_agent_plist_path(&label).unwrap();
+        krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
         krill_link::service::ensure_default_server(executable, &state).unwrap();
         assert!(!plist.exists(), "no paired device: nothing is registered");
         let device = iroh::SecretKey::generate().public();
         krill_link::upsert_device(&state, device, "phone", 1).unwrap();
+        krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
         krill_link::service::ensure_default_server(executable, &state).unwrap();
         let xml = fs::read_to_string(&plist).unwrap();
         assert!(xml.contains("<key>KRILL_LINK_AGENT_PLIST</key>"));
@@ -324,6 +331,7 @@ fn real_home_keeps_default_autostart_for_custom_state_directory() {
         assert!(xml.contains("<key>KeepAlive</key>\n\t<true/>"));
         let devices = krill_link::load_devices(&state).unwrap();
         krill_link::remove_device(&state, &devices[0].id).unwrap();
+        krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
         krill_link::service::ensure_default_server(executable, &state).unwrap();
         assert!(
             !plist.exists(),

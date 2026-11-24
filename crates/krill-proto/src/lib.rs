@@ -11,6 +11,7 @@ pub mod agent;
 pub mod agent_history;
 pub mod artifacts;
 pub mod bots;
+pub mod build_info;
 pub mod clipboard;
 pub mod config_document;
 pub mod control;
@@ -54,5 +55,5 @@ pub mod worktree_space;
 )]
 pub struct SessionId(pub u64);
 
-/// Hello·업그레이드에서 공유하는 빌드 식별자. 버전이 같아도 소스가 바뀌면 데몬을 교체한다.
-pub const BUILD: &str = env!("KRILL_DEV_BUILD");
+/// 프로세스 시작 시 실행 파일이 등록하는 빌드·버전 정보.
+pub use build_info::{build_id, init_build_info, release_version};

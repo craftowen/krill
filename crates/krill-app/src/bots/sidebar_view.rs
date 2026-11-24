@@ -2,62 +2,7 @@
 //! The sidebar Bots section's pure parts, as Orca's `shared/bots` has them: "Bot options"
 //! (sort and hide), the search's matching and marks, and which line a bot row says.
 
-use serde::{Deserialize, Serialize};
-
-use crate::i18n::catalog::bots as text;
-
-/// Orca `BOT_SIDEBAR_SORT_CHOICES`: ids and meanings match the projects' Sort by.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BotSidebarSort {
-    /// The saved order. New bots go on top.
-    #[default]
-    Manual,
-    /// "Agent Activity": bots that need you, then most recent activity.
-    Smart,
-    Recent,
-    Name,
-}
-
-impl BotSidebarSort {
-    pub const ALL: [Self; 4] = [Self::Manual, Self::Smart, Self::Recent, Self::Name];
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Manual => text::SBO_SORT_MANUAL.get(),
-            Self::Smart => text::SBO_SORT_SMART.get(),
-            Self::Recent => text::SBO_SORT_RECENT.get(),
-            Self::Name => text::SBO_SORT_NAME.get(),
-        }
-    }
-
-    #[must_use]
-    pub fn description(self) -> Option<&'static str> {
-        match self {
-            Self::Manual => Some(text::SBO_SORT_MANUAL_DESC.get()),
-            Self::Smart => Some(text::SBO_SORT_SMART_DESC.get()),
-            Self::Recent | Self::Name => None,
-        }
-    }
-}
-
-/// Orca `BotSidebarView`: how this computer's bots list.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BotSidebarView {
-    pub sort: BotSidebarSort,
-    pub hide_paused: bool,
-    /// A bot's worker lines with nothing running drop off, as the projects' Hide sleeping.
-    pub hide_sleeping_workers: bool,
-}
-
-impl BotSidebarView {
-    /// How many options differ from the default, for the button's badge.
-    #[must_use]
-    pub fn active_filters(self) -> usize {
-        usize::from(self.hide_paused) + usize::from(self.hide_sleeping_workers)
-    }
-}
+pub use krill_ui::bot_types::{BotSidebarSort, BotSidebarView};
 
 /// What `arrange` reads of each bot.
 #[derive(Debug, Clone, Copy)]

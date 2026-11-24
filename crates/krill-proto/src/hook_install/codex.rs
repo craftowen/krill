@@ -334,7 +334,7 @@ impl Rpc {
             receive,
             id: 0,
         };
-        rpc.call("initialize", &json!({"clientInfo": {"name": "krill", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {"experimentalApi": true}}))?;
+        rpc.call("initialize", &json!({"clientInfo": {"name": "krill", "version": crate::release_version()}, "capabilities": {"experimentalApi": true}}))?;
         rpc.send
             .send(json!({"method": "initialized"}))
             .map_err(io::Error::other)?;

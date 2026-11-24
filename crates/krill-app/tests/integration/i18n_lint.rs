@@ -214,6 +214,7 @@ fn cli_and_daemon_messages_are_english() {
     for path in [
         "krill/src",
         "krill-link/src",
+        "krill-link-core/src",
         "krill-proto/src/statusline.rs",
         "krill-proto/src/usage/connections.rs",
         "krilld/src/usage/direct.rs",
@@ -231,11 +232,11 @@ fn cli_and_daemon_messages_are_english() {
 
 #[test]
 fn app_ui_copy_uses_the_catalog() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut failures = Vec::new();
-    check_dir(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut failures,
-    );
+    for crate_name in ["krill-ui", "krill-app-core", "krill-app"] {
+        check_dir(&crates.join(crate_name).join("src"), &mut failures);
+    }
     assert!(
         failures.is_empty(),
         "UI literals must use i18n::catalog:\n{}",

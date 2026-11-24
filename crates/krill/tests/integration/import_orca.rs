@@ -119,7 +119,7 @@ fn spawn_fake_krilld(
                     | FEAT_USAGE_MANAGE
                     | FEAT_ACCOUNT_POLICY
                     | FEAT_ACCOUNT_CONNECTION,
-                build: krill_proto::BUILD.to_owned(),
+                build: krill_version::BUILD.to_owned(),
                 instance_id: 1,
             };
             if stream.write_all(&hello.encode().unwrap()).is_err() {

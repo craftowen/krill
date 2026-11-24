@@ -905,14 +905,6 @@ fn dev_build_hash_change_requests_replacement() {
     assert_eq!(is_newer("0.1.0", "0.1.0+dev.1111"), Some(false));
 }
 
-#[test]
-fn dev_build_identifier_contains_the_source_hash() {
-    let (version, hash) = crate::BUILD.split_once("+dev.").unwrap_or(("", ""));
-    assert_eq!(version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(hash.len(), 16);
-    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-}
-
 /// OWE-707: 세션별 사용 계정은 새 variant(끝에 추가)로 오간다.
 /// 기존 variant 번호·고정 바이트는 그대로라 N-1이다. 구버전 피어는
 /// [`FEAT_SESSION_ACCOUNT`] 없이 `SessionAccounts`를 보내지도 받지도 않는다.

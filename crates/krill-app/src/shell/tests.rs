@@ -14412,7 +14412,7 @@ fn rebind_after_daemon_upgrade_reconnects_before_wait_responsive() {
             proto_min: ipc::PROTO_MIN,
             proto_max: ipc::PROTO_MAX,
             features: ipc::FEATURES,
-            build: krill_proto::BUILD.into(),
+            build: krill_version::BUILD.into(),
             instance_id: 2,
         };
         new_daemon = Some(MockDaemon::spawn(&socket_path, new_hello.clone()));
@@ -14450,7 +14450,7 @@ fn rebind_after_daemon_upgrade_reconnects_before_wait_responsive() {
                 proto_min: ipc::PROTO_MIN,
                 proto_max: ipc::PROTO_MAX,
                 features: ipc::FEATURES,
-                build: krill_proto::BUILD.into(),
+                build: krill_version::BUILD.into(),
                 instance_id: 11,
             };
             racing_new = Some(MockDaemon::spawn(&socket_path, new_hello));
@@ -14467,7 +14467,7 @@ fn rebind_after_daemon_upgrade_reconnects_before_wait_responsive() {
             proto_min: ipc::PROTO_MIN,
             proto_max: ipc::PROTO_MAX,
             features: ipc::FEATURES,
-            build: krill_proto::BUILD.into(),
+            build: krill_version::BUILD.into(),
             instance_id: 4,
         },
     );

@@ -5,12 +5,15 @@ fn production_socket_defaults_use_the_shared_resolver() {
         (include_str!("../../../krill/src/hook_windows.rs"), 1),
         (include_str!("../../../krill/src/orca_import.rs"), 2),
         (include_str!("../../src/orchestration.rs"), 1),
-        (include_str!("../../../krill-app/src/automations.rs"), 1),
         (
-            include_str!("../../../krill-app/src/settings/schedules.rs"),
+            include_str!("../../../krill-app-core/src/automations.rs"),
+            1,
+        ),
+        (
+            include_str!("../../../krill-app-core/src/settings/schedules.rs"),
             2,
         ),
-        (include_str!("../../../krill-link/src/serve.rs"), 1),
+        (include_str!("../../../krill-link-core/src/serve.rs"), 1),
     ];
     for (source, count) in callers {
         // Inline fixtures may intentionally listen at the legacy endpoint.

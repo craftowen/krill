@@ -204,7 +204,7 @@ fn release_app_kill9_survives_and_replays_hash_three_times() {
 /// 새 상태 디렉터리 `dir`에 release holder(→ krilld)를 띄우고 소켓이 열릴 때까지 기다린다. 반환: 경로, 정리 가드, krilld
 /// instance(= PID).
 pub(super) fn start_daemon(dir: PathBuf) -> (Paths, Processes, u64) {
-    start_daemon_for_build(dir, krill_proto::BUILD)
+    start_daemon_for_build(dir, krill_version::BUILD)
 }
 
 fn start_daemon_for_build(dir: PathBuf, expected_build: &str) -> (Paths, Processes, u64) {

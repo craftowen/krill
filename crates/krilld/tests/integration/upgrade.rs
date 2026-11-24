@@ -374,6 +374,7 @@ fn upgrade_keeps_sessions_lossless_and_one_generation() {
         krilld: new_krilld.clone(),
     };
     let app = daemon::watch_hello(ClientRole::App, "it");
+    krill_proto::init_build_info(krill_version::VERSION, krill_version::BUILD);
     assert_eq!(daemon::upgrade(&paths, &app).unwrap(), None);
     assert_eq!(daemon::upgrade_as(&paths, &app, "0.0.1").unwrap(), None);
     // 구 앱(N-1): `FEAT_UPGRADE`를 모르는 Hello로 붙어도 제어가 되고, 업그레이드 요청은 협상 밖이라 거절된다.

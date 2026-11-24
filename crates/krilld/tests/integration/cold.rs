@@ -961,7 +961,7 @@ fn daemon_version_probe_does_not_start_listener() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8(out.stdout).unwrap().trim(),
-        krill_proto::BUILD
+        krill_version::BUILD
     );
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     fs::remove_dir_all(dir).ok();

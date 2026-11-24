@@ -15,11 +15,15 @@ homepage = "https://krill.page"
 base64 = "0.22.1"
 same-file = "1.0.6"
 krill-proto = { path = "crates/krill-proto" }
+krill-version = { path = "crates/krill-version" }
+krill-ui = { path = "crates/krill-ui" }
+krill-app-core = { path = "crates/krill-app-core" }
 krill-term = { path = "crates/krill-term" }
 krill-holder = { path = "crates/krill-holder" }
 krill-log = { path = "crates/krill-log" }
 krill-hosts = { path = "crates/krill-hosts" }
 krill-link = { path = "crates/krill-link" }
+krill-link-core = { path = "crates/krill-link-core" }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # gpui 등 log 크레이트 경고를 운영 로그로 넘긴다(krill-log forward). gpui 의존성으로 이미 Cargo.lock에 있는 버전.
 log = { version = "0.4.34", default-features = false, features = ["std"] }

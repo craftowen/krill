@@ -44,7 +44,7 @@ impl UsageEvent {
             install_id: install_id.to_owned(),
             name,
             ts_unix,
-            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            app_version: crate::release_version().to_owned(),
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
         };

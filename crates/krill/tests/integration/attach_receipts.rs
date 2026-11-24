@@ -110,7 +110,7 @@ impl Peer {
                             | screen::FEAT_SCREEN
                             | input::FEAT_INPUT
                             | roles::FEAT_ROLES,
-                        build: krill_proto::BUILD.into(),
+                        build: krill_version::BUILD.into(),
                         instance_id: 1,
                     }
                     .encode()

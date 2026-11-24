@@ -7263,7 +7263,7 @@ mod tests {
                         | FEAT_ACCOUNT_POLICY
                         | FEAT_ACCOUNT_CONNECTION,
                     instance_id: 1,
-                    build: krill_proto::BUILD.to_owned(),
+                    build: krill_version::BUILD.to_owned(),
                 };
                 if stream.write_all(&server_hello.encode().unwrap()).is_err() {
                     continue;

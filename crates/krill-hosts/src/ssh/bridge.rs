@@ -99,7 +99,7 @@ pub fn bridge_main(args: &[OsString]) -> ExitCode {
             "krill-os={}\nkrill-arch={}\nkrill-version={}\n{status}",
             std::env::consts::OS,
             std::env::consts::ARCH,
-            krill_proto::BUILD
+            krill_proto::build_id()
         )
         .and_then(|()| out.flush())
         .ok();

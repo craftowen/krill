@@ -26,7 +26,7 @@ use crate::holder::{Answer, Holder};
 use crate::registry::Registry;
 
 /// 이 krilld의 빌드. `ServerHello.build`와 같다.
-const BUILD: &str = krill_proto::BUILD;
+const BUILD: &str = krill_version::BUILD;
 
 #[cfg(all(test, unix))]
 mod tests;

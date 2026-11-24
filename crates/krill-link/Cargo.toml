@@ -16,26 +16,25 @@ name = "krill-link"
 path = "src/main.rs"
 
 [dependencies]
-iroh = { workspace = true }
+krill-link-core = { workspace = true }
 tokio = { workspace = true }
 krill-proto = { workspace = true }
+krill-version = { workspace = true }
 krill-log = { workspace = true }
-tracing = { workspace = true }
-postcard = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
-ring = { workspace = true }
-zeroize = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-krill-holder = { workspace = true }
 
 [dev-dependencies]
+iroh = { workspace = true }
+postcard = { workspace = true }
 proptest = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true }
 
 [build-dependencies]
 embed-resource = { workspace = true }

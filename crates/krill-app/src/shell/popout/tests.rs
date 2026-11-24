@@ -1746,7 +1746,7 @@ fn status_usage_refresh_sets_loading_and_schedules_followup_polls(cx: &mut TestA
             proto_min: krill_proto::ipc::PROTO_MIN,
             proto_max: krill_proto::ipc::PROTO_MAX,
             features: krill_proto::ipc::FEATURES & !krill_proto::daemon::FEAT_HOLDER_WATCH,
-            build: krill_proto::BUILD.to_owned(),
+            build: krill_version::BUILD.to_owned(),
             instance_id: 1,
         }
         .encode()

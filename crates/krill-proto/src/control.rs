@@ -300,7 +300,7 @@ fn optional_preparation_base<'de, D: serde::Deserializer<'de>>(
 /// 이 빌드의 holder·krilld로 교체해 달라는 요청. 경로는 krilld가 그대로 holder에 넘긴다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upgrade {
-    /// 요청자 빌드(`crate::BUILD`). krilld 빌드보다 새것이어야 한다([`is_newer`]).
+    /// 요청자 빌드(`krill_version::BUILD`). krilld 빌드보다 새것이어야 한다([`is_newer`]).
     #[serde(deserialize_with = "agent_text")]
     pub build: String,
     #[serde(deserialize_with = "sidebar_path")]
