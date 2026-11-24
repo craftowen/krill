@@ -540,7 +540,7 @@ fn search_in_with_budget(
         .docs
         .into_values()
         .filter(|doc| parsed_query.matches_path(&doc.cwd))
-        .filter_map(|doc| parsed_query.evaluate(doc))
+        .filter_map(|doc| parsed_query.evaluate(&doc))
         .collect();
 
     if parsed_query.terms.is_empty() {
@@ -656,7 +656,7 @@ impl ParsedQuery {
         })
     }
 
-    fn evaluate(&self, doc: VaultDoc) -> Option<VaultHit> {
+    fn evaluate(&self, doc: &VaultDoc) -> Option<VaultHit> {
         let title = if doc.title.is_empty() {
             doc.id.clone()
         } else {
@@ -670,8 +670,8 @@ impl ParsedQuery {
             };
             return Some(VaultHit {
                 agent: doc.agent,
-                id: doc.id,
-                cwd: doc.cwd,
+                id: clamp_utf8_bytes(&doc.id, MAX_TEXT),
+                cwd: clamp_utf8_bytes(&doc.cwd, MAX_TEXT),
                 modified: doc.modified,
                 title: truncate_chars(&one_line(&title), TITLE_CHARS),
                 summary: truncate_chars(&one_line(&doc.summary), SNIPPET_CHARS),
@@ -4482,5 +4482,47 @@ mod sweep_regressions {
         assert!(Reply::decode(bulk_wire[4], bulk_wire.get(5..).unwrap()).is_ok());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vault_empty_query_clamps_oversized_id_and_cwd_for_wire_decode() {
+        use krill_proto::agent_history::Response;
+        use krill_proto::control::Reply;
+        use krill_proto::screen::Msg as _;
+
+        let huge_id = format!("세션-{}", "아".repeat(2000)); // > MAX_TEXT (4096)
+        let huge_cwd = format!("/경로/{}", "디".repeat(2000)); // > MAX_TEXT (4096)
+        assert!(huge_id.len() > MAX_TEXT);
+        assert!(huge_cwd.len() > MAX_TEXT);
+
+        let pq = ParsedQuery::parse(&SearchQuery::default());
+        let hit = pq
+            .evaluate(&VaultDoc {
+                agent: VaultAgent::OpenCode,
+                id: huge_id,
+                cwd: huge_cwd,
+                modified: 1,
+                title: "Empty browse entry".into(),
+                summary: String::new(),
+                messages: Vec::new(),
+            })
+            .expect("empty query must emit VaultHit");
+        assert!(hit.id.len() <= MAX_TEXT);
+        assert!(hit.id.starts_with("세션-"));
+        assert!(hit.cwd.len() <= MAX_TEXT);
+        assert!(hit.cwd.starts_with("/경로/"));
+
+        let snap = SearchSnapshot {
+            hits: vec![hit],
+            truncated: false,
+            skipped: false,
+        };
+        let wire = Reply::AgentHistory(Response::Searched(snap))
+            .encode()
+            .expect("empty-query SearchSnapshot must encode");
+        assert!(
+            Reply::decode(wire[4], wire.get(5..).unwrap()).is_ok(),
+            "empty-query SearchSnapshot must decode within MAX_TEXT limits"
+        );
     }
 }

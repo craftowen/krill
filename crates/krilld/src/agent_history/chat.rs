@@ -373,7 +373,8 @@ pub(crate) fn latest_page(
             start = floor;
         }
     }
-    let mut count = 0;
+    let mut count = 0usize;
+    let mut page_bytes = 0usize;
     for line in bytes
         .get(leading..complete)
         .unwrap_or_default()
@@ -384,12 +385,18 @@ pub(crate) fn latest_page(
         if let Ok(value) = serde_json::from_slice::<Value>(line) {
             parse_line_into_items(agent, &value, &mut items);
         }
-        if count > 0 && count + items.len() > MAX_CHAT_ITEMS {
+        let line_bytes: usize = items.iter().map(estimated_chat_item_wire_bytes).sum();
+        if count > 0
+            && !items.is_empty()
+            && (count.saturating_add(items.len()) > MAX_CHAT_ITEMS
+                || page_bytes.saturating_add(line_bytes) > MAX_CHAT_RESPONSE_BYTES)
+        {
             break;
         }
-        count += items.len();
+        count = count.saturating_add(items.len());
+        page_bytes = page_bytes.saturating_add(line_bytes);
         start = start.saturating_sub(u64::try_from(line.len()).unwrap_or(0));
-        if count >= MAX_CHAT_ITEMS {
+        if count >= MAX_CHAT_ITEMS || page_bytes >= MAX_CHAT_RESPONSE_BYTES {
             break;
         }
     }
@@ -5160,6 +5167,65 @@ mod performance_tests {
         );
         assert!(snap3.reset);
         assert_eq!(snap3.items[1].text, "external-v2-updated-longer");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn jsonl_latest_page_respects_response_byte_budget_without_losing_messages() {
+        let root = std::env::temp_dir().join(format!("r3d02-jsonl-budget-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude.jsonl");
+
+        // 128 user lines of 4,050 ASCII chars each: total file < MAX_POLL_BYTES (512 KiB),
+        // item count == MAX_CHAT_ITEMS (128), but estimated wire bytes = 128 * (4050 + 48) > 512 KiB.
+        let mut raw = String::new();
+        for i in 0..128usize {
+            let prefix = format!("msg-{i:03}-");
+            let pad = "a".repeat(4050 - prefix.len());
+            let line = serde_json::json!({
+                "type": "user",
+                "content": format!("{prefix}{pad}")
+            })
+            .to_string();
+            raw.push_str(&line);
+            raw.push('\n');
+        }
+        assert!(
+            (raw.len() as u64) <= MAX_POLL_BYTES,
+            "test fixture must fit inside one MAX_POLL_BYTES window"
+        );
+        fs::write(&path, &raw).unwrap();
+
+        let snap = ChatPollSnapshot {
+            agent: "claude".into(),
+            session_id: "r3d02-sess".into(),
+            transcript_path: path.to_string_lossy().into_owned(),
+            next_offset: 0,
+            reset: false,
+            bound: true,
+            items: Vec::new(),
+        };
+
+        let (page1, start1) = latest_page(snap.clone(), None).unwrap();
+        assert_eq!(
+            page1.next_offset,
+            raw.len() as u64,
+            "initial page must reach EOF without omitting tail messages"
+        );
+        assert_eq!(page1.items.len(), 127);
+        assert!(page1.items.first().unwrap().text.starts_with("msg-001-"));
+        assert!(page1.items.last().unwrap().text.starts_with("msg-127-"));
+        assert!(start1 > 0);
+        let page1_bytes: usize = page1.items.iter().map(estimated_chat_item_wire_bytes).sum();
+        assert!(page1_bytes <= MAX_CHAT_RESPONSE_BYTES);
+
+        let (page2, start2) = latest_page(snap, Some(start1)).unwrap();
+        assert_eq!(start2, 0);
+        assert_eq!(page2.next_offset, start1);
+        assert_eq!(page2.items.len(), 1);
+        assert!(page2.items[0].text.starts_with("msg-000-"));
 
         fs::remove_dir_all(root).ok();
     }
