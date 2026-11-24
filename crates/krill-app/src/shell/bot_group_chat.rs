@@ -2812,7 +2812,11 @@ mod tests {
             },
         );
 
-        invalidate_rooms_map(&mut rooms, Some(&HostId::Local), Some(&["grp-a".to_owned()]));
+        invalidate_rooms_map(
+            &mut rooms,
+            Some(&HostId::Local),
+            Some(&["grp-a".to_owned()]),
+        );
         assert_eq!(rooms[&k1].last_poll_ms, 0);
         assert_eq!(
             rooms[&k2].last_poll_ms, 9_999,

@@ -4816,6 +4816,452 @@ pub mod link_ui {
     }
 }
 
+/// Orca `#47241`: Korean translations for all 24 built-in bot templates (commit `510b0f63`).
+#[derive(Debug, Clone, Copy)]
+pub struct BotTemplateKo {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub first_chat: &'static str,
+    pub watches: &'static str,
+    pub does: &'static str,
+    pub reports: &'static str,
+    pub needs_setup: Option<&'static str>,
+    pub examples: [&'static str; 2],
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "static Korean localization table for all 24 built-in bot templates"
+)]
+#[must_use]
+pub fn bot_template_ko(id: &str) -> Option<BotTemplateKo> {
+    Some(match id {
+        "pr-review" => BotTemplateKo {
+            name: "PR 리뷰",
+            description: "리뷰를 요청받은 PR을 살펴보고 위험한 변경을 정리합니다.",
+            first_chat: "어떤 저장소를 볼지 물어본 뒤, 내 리뷰를 기다리는 열린 PR을 리뷰하고 결과를 파일과 줄 번호와 함께 이 채팅에 올립니다. 허락하기 전에는 GitHub에 댓글을 달지 않습니다.",
+            watches: "선택한 저장소에서 내 리뷰를 기다리는 PR",
+            does: "PR을 하나씩 검토해 위험한 변경과 빠진 테스트를 파일과 줄 번호와 함께 정리합니다.",
+            reports: "이 채팅에서, 리뷰가 요청될 때",
+            needs_setup: None,
+            examples: [
+                "#4121: 재시도 카운터가 초기화되지 않아 두 번째 장애부터는 재시도가 멈춥니다.",
+                "새 타임아웃 경로를 다루는 테스트가 없습니다.",
+            ],
+        },
+        "bug-investigation" => BotTemplateKo {
+            name: "버그 조사",
+            description: "제보된 버그를 재현하고 원인 위치를 찾습니다.",
+            first_chat: "버그 리포트나 이슈 링크를 건네 주세요. 새 워크스페이스에서 에이전트를 시작해 재현 방법을 기록한 뒤 원인을 보고합니다. 수정은 동의한 뒤에만 작성합니다.",
+            watches: "건네 주신 버그 리포트와 내게 할당된 Linear 이슈",
+            does: "새 워크스페이스에서 버그를 재현하고, 시작 지점을 찾아 수정안을 제안합니다.",
+            reports: "이 채팅에서, 재현과 원인을 찾았을 때",
+            needs_setup: None,
+            examples: [
+                "Windows에서 KRL-640을 재현했습니다. 줄바꿈 없이 끝나는 텍스트를 붙여넣으면 마지막 줄이 사라집니다.",
+                "원인: 붙여넣기 종료 마커가 마지막 청크보다 먼저 전송됩니다. 수정을 시작할까요?",
+            ],
+        },
+        "dependency-updates" => BotTemplateKo {
+            name: "의존성 업데이트",
+            description: "오래되었거나 취약한 패키지를 확인하고 업그레이드를 제안합니다.",
+            first_chat: "선택한 저장소의 오래되었거나 취약한 패키지를 긴급한 순서대로 정리합니다. 동의하면 에이전트가 그룹별로 PR을 하나씩 엽니다.",
+            watches: "선택한 저장소의 패키지",
+            does: "보안 권고와 오래된 패키지를 긴급한 순서로 정리하고, 동의하면 그룹별로 PR 하나씩 업그레이드합니다.",
+            reports: "이 채팅에서, 매주 월요일 오전 9시",
+            needs_setup: None,
+            examples: [
+                "권고 1건: http-client 6.19에 심각도 높음 취약점이 있으며 6.21에서 수정되었습니다.",
+                "마이너 업그레이드 4건은 PR 하나로 묶어 올릴 수 있습니다.",
+            ],
+        },
+        "unreviewed-work" => BotTemplateKo {
+            name: "검토 안 된 에이전트 작업",
+            description: "아직 아무도 보지 않은 에이전트 작업 결과를 매일 정리한 목록입니다.",
+            first_chat: "에이전트가 변경을 마쳤지만 검토하지 않았거나 PR로 만들지 않은 워크스페이스를 정리합니다. 에이전트가 내 응답을 기다릴 때는 Krill이 이미 알려 주므로, 이 봇은 이미 끝난 작업을 다룹니다.",
+            watches: "내 Krill 워크스페이스",
+            does: "에이전트가 변경을 마쳤지만 아무도 검토하지 않았거나 PR을 열지 않은 워크스페이스를 정리합니다.",
+            reports: "이 채팅에서, 평일 오전 9시",
+            needs_setup: None,
+            examples: [
+                "mobile-pairing이 어제 340줄 변경으로 끝났고 PR이 없습니다.",
+                "이번 주에 2건이 더 완료되었습니다.",
+            ],
+        },
+        "workspace-cleanup" => BotTemplateKo {
+            name: "워크스페이스 정리",
+            description: "완료되었거나 방치된 워크스페이스를 찾아 삭제를 제안합니다.",
+            first_chat: "PR이 병합되었거나 2주 동안 변경이 없는 워크스페이스를 커밋되지 않은 변경과 함께 정리합니다. 선택한 항목만 삭제합니다.",
+            watches: "내 Krill 워크스페이스와 PR",
+            does: "완료되었거나 방치된 워크스페이스를 커밋되지 않은 변경과 함께 정리하고, 선택한 항목만 삭제합니다.",
+            reports: "이 채팅에서, 매주 금요일 오후 4시",
+            needs_setup: None,
+            examples: [
+                "워크스페이스 6개가 완료되었습니다. 이번 주에 PR이 병합되었습니다.",
+                "폴더 2개가 10월 20일 이후 변경이 없습니다.",
+            ],
+        },
+        "security-check" => BotTemplateKo {
+            name: "보안 점검",
+            description: "병합된 변경에서 유출된 시크릿과 위험한 코드를 찾습니다.",
+            first_chat: "선택한 저장소에서 지난주에 병합된 PR을 검토하고, 다시 살펴볼 항목을 파일과 줄 번호와 함께 정리합니다.",
+            watches: "선택한 저장소에서 병합된 PR",
+            does: "시크릿 유출, 인젝션, 인증 누락, 안전하지 않은 기본값을 점검합니다.",
+            reports: "이 채팅에서, 매주 월요일 오전 9시와 PR이 병합될 때",
+            needs_setup: None,
+            examples: [
+                "#4133이 인증 토큰을 포함한 요청 헤더 전체를 로그로 남깁니다.",
+                "이번 주에는 그 외 항목이 없습니다.",
+            ],
+        },
+        "release" => BotTemplateKo {
+            name: "릴리스 준비 상태",
+            description: "다음 릴리스를 막는 요소를 추적합니다.",
+            first_chat: "실패한 체크, 리뷰 대기 중인 PR, 열린 블로커를 담은 짧은 준비 상태 목록을 유지합니다.",
+            watches: "PR, 체크, 워크스페이스",
+            does: "실패한 체크, 리뷰 대기 중인 PR, 열린 블로커를 담은 짧은 준비 상태 목록을 유지합니다.",
+            reports: "이 채팅에서, 평일 아침",
+            needs_setup: None,
+            examples: [
+                "1.5는 체크 1건 실패로 막혀 있습니다. #4121의 typecheck입니다.",
+                "아직 리뷰가 필요한 PR이 2건 있습니다: #4108, #4130.",
+            ],
+        },
+        "release-notes" => BotTemplateKo {
+            name: "릴리스 노트",
+            description: "병합된 PR로 다음 릴리스 노트 초안을 작성합니다.",
+            first_chat: "마지막 릴리스 태그를 찾아 신규, 수정, 변경 세 그룹으로 노트 초안을 작성합니다. 편집은 이 채팅에서 하면 됩니다.",
+            watches: "마지막 릴리스 이후 병합된 PR",
+            does: "사용자용 릴리스 노트 초안을 신규, 수정, 변경 세 그룹으로 작성합니다.",
+            reports: "이 채팅에서, 요청할 때",
+            needs_setup: None,
+            examples: [
+                "1.5 초안: 신규 4건, 수정 9건, 변경 2건.",
+                "가장 큰 변경: 봇끼리 스킬을 공유할 수 있습니다.",
+            ],
+        },
+        "ci-failures" => BotTemplateKo {
+            name: "CI 실패",
+            description: "실패한 체크를 설명하고 불안정한 체크 목록을 관리합니다.",
+            first_chat: "최근 2주간의 체크 실행 기록을 읽어 불안정한 체크를 정리한 뒤, 내 열린 PR에서 실패한 체크를 하나씩 설명합니다. 수정은 동의한 뒤에만 시작합니다.",
+            watches: "선택한 저장소의 체크 실행 기록",
+            does: "불안정한 체크와 진짜 실패를 구분하고, 실패마다 원인을 설명하며, 불안정한 체크 목록을 관리합니다.",
+            reports: "이 채팅에서, 매주 월요일 오전 9시와 체크가 실패할 때",
+            needs_setup: Some(
+                "GitHub는 아직 브랜치별로 실패를 필터링할 수 없어, 봇이 저장소의 모든 실패를 보고 중요하지 않은 것은 건너뜁니다. 실패마다 턴이 한 번씩 사용됩니다.",
+            ),
+            examples: [
+                "#4130 typecheck: export 이름이 바뀌었는데 호출 위치 2곳이 빠졌습니다. 수정은 커밋 1개입니다.",
+                "이번 주 가장 불안정한 항목: 터미널 크기 조절 테스트, 30회 중 4회 실패.",
+            ],
+        },
+        "deploy-watch" => BotTemplateKo {
+            name: "배포 모니터링",
+            description: "배포마다 바뀐 내용을 올리고 실패한 배포를 알려 줍니다.",
+            first_chat: "배포 도구가 호출할 자동화 주소를 알려 주고, 배포된 PR을 바탕으로 배포마다 요약합니다.",
+            watches: "배포 도구의 호출",
+            does: "배포된 PR을 바탕으로 배포마다 요약하고 실패한 배포를 알려 줍니다.",
+            reports: "이 채팅에서, 배포가 끝날 때마다",
+            needs_setup: Some(
+                "배포 도구 커넥터가 없어, 자동화 주소를 배포 도구에 직접 추가해야 합니다.",
+            ),
+            examples: [
+                "운영 배포 14:02: PR 5건, 릴레이 재시도 수정 포함.",
+                "스테이징 배포가 migrate 단계에서 실패했습니다: 컬럼이 이미 존재합니다.",
+            ],
+        },
+        "support" => BotTemplateKo {
+            name: "지원 분류",
+            description: "아무도 답하지 않은 질문 목록을 관리합니다.",
+            first_chat: "선택한 Slack 채널에서 답변이 없는 질문을 링크와 함께 정리하고, 이미 이슈가 있는 질문을 표시합니다.",
+            watches: "선택한 Slack 채널",
+            does: "답변이 없는 질문을 링크와 함께 정리하고, 이미 Linear 이슈가 있는 질문을 표시합니다.",
+            reports: "이 채팅에서, 평일 2시간마다",
+            needs_setup: None,
+            examples: [
+                "오전 11시 이후 #help에 새 질문 3건. 가장 오래된 질문: SSH 원격 연결이 계속 끊김, 2시간 경과.",
+                "\"봇을 내보낼 수 있나요?\"는 이미 SUP-212가 있습니다.",
+            ],
+        },
+        "feedback" => BotTemplateKo {
+            name: "피드백 요약",
+            description: "피드백을 주간 주제 목록으로 정리합니다.",
+            first_chat: "선택한 채널의 최근 한 달 피드백을 주제별로 묶어 개수와 인용문을 함께 정리합니다.",
+            watches: "Slack 피드백 채널",
+            does: "피드백을 주제별로 묶어 인용문과 개수를 정리하고, 이미 있는 Linear 이슈를 연결합니다.",
+            reports: "이 채팅에서, 매주 월요일 오전 9시",
+            needs_setup: None,
+            examples: [
+                "가장 많은 주제: Windows 터미널에서 붙여넣기, 7명, KRL-640 연결됨.",
+                "이번 주 새 요청: 3명이 봇 내보내기를 요청했습니다.",
+            ],
+        },
+        "bug-intake" => BotTemplateKo {
+            name: "버그 리포트 접수",
+            description: "Slack의 버그 리포트를 재현 단계가 담긴 추적 가능한 이슈로 바꿉니다.",
+            first_chat: "선택한 채널을 읽고 새 버그 리포트마다 이슈 초안을 작성합니다. 승인한 뒤에만 등록합니다.",
+            watches: "버그가 제보되는 Slack 채널",
+            does: "버그 리포트마다 재현 단계가 담긴 Linear 이슈 초안을 작성하고, 승인하면 등록합니다.",
+            reports: "이 채팅에서, 버그가 제보될 때",
+            needs_setup: None,
+            examples: [
+                "초안 작성: \"macOS 27에서 절전 후 터미널이 멈춤\", 재현 단계는 스레드에서 가져왔습니다.",
+                "KRL-702와 중복일 수 있습니다.",
+            ],
+        },
+        "issue-triage" => BotTemplateKo {
+            name: "GitHub 이슈 분류",
+            description: "새 이슈에 라벨을 붙이고, 중복을 찾고, 빠진 정보를 요청합니다.",
+            first_chat: "선택한 저장소의 지난주 새 이슈를 훑어보고 라벨과 중복 후보를 이 채팅에 제안합니다.",
+            watches: "선택한 저장소의 새 이슈",
+            does: "새 이슈마다 라벨과 중복 후보를 제안하고 빠진 정보를 정리합니다.",
+            reports: "이 채팅에서, 이슈가 열릴 때",
+            needs_setup: None,
+            examples: [
+                "#2210: 버그, windows, #2188과 중복.",
+                "#2214에 버전과 재현 단계가 없습니다. 요청할까요?",
+            ],
+        },
+        "briefing" => BotTemplateKo {
+            name: "프로젝트 브리핑",
+            description: "선택한 프로젝트의 주간 브리핑입니다.",
+            first_chat: "선택한 프로젝트에서 바뀐 점, 막힌 점, 결정이 필요한 점을 정리합니다.",
+            watches: "Linear 프로젝트와 GitHub 저장소",
+            does: "바뀐 점, 막힌 점, 결정이 필요한 점을 정리합니다.",
+            reports: "이 채팅에서, 매주 금요일 오후 3시",
+            needs_setup: None,
+            examples: [
+                "모바일 v2: 이슈 6건 완료, 2건은 디자인 대기 중입니다.",
+                "결정 필요: KRL-902, 푸시 권한 문구.",
+            ],
+        },
+        "docs-upkeep" => BotTemplateKo {
+            name: "문서 관리",
+            description: "병합된 코드와 더 이상 맞지 않는 문서를 알려 줍니다.",
+            first_chat: "지난주에 병합된 PR을 읽고, 이제 내용이 틀려진 문서 페이지를 정리합니다.",
+            watches: "선택한 저장소의 병합된 PR과 문서",
+            does: "병합된 내용과 맞지 않는 문서 페이지를 지금 틀린 줄과 함께 정리합니다.",
+            reports: "이 채팅에서, 매주 수요일 오전 10시",
+            needs_setup: None,
+            examples: [
+                "docs/remote.md에는 SSH에 재시작이 필요하다고 되어 있지만, #4108에서 이미 없어졌습니다.",
+                "옛 설정 이름이 남은 페이지가 1개 더 있습니다.",
+            ],
+        },
+        "spec-drafts" => BotTemplateKo {
+            name: "스펙 초안 작성",
+            description: "논의 내용을 공유할 수 있는 짧은 스펙으로 정리합니다.",
+            first_chat: "Slack 스레드나 문서를 건네 주세요. 한 페이지 스펙 초안을 작성하고 정해지지 않은 부분은 질문합니다.",
+            watches: "건네 주신 Slack 스레드와 문서",
+            does: "문제, 결정, 범위, 열린 질문을 담은 한 페이지 스펙 초안을 작성합니다.",
+            reports: "이 채팅에서, 요청할 때",
+            needs_setup: None,
+            examples: [
+                "초안: \"봇 공유 v2\". 결정 3건, 열린 질문 2건.",
+                "내 Drive에 문서로 저장했습니다.",
+            ],
+        },
+        "backlog-cleanup" => BotTemplateKo {
+            name: "백로그 정리",
+            description: "오래된 이슈, 중복 이슈, 담당자 없는 이슈를 찾습니다.",
+            first_chat: "선택한 팀에서 60일 동안 변동이 없는 이슈, 중복으로 보이는 이슈, 담당자가 없는 이슈를 정리합니다.",
+            watches: "선택한 팀의 Linear 이슈",
+            does: "오래된 이슈, 중복으로 보이는 이슈, 담당자 없는 이슈를 정리합니다.",
+            reports: "이 채팅에서, 매월 1일",
+            needs_setup: None,
+            examples: [
+                "8월 이후 변동이 없는 이슈 14건.",
+                "KRL-511과 KRL-688은 같은 버그로 보입니다.",
+            ],
+        },
+        "incident-notes" => BotTemplateKo {
+            name: "장애 기록",
+            description: "장애 채널의 타임라인을 기록하고 회고 문서 초안을 작성합니다.",
+            first_chat: "선택한 장애 채널과 스레드를 따라가며 시각이 찍힌 타임라인을 기록하고, 장애가 끝나면 비난 없는 회고 문서 초안을 작성합니다.",
+            watches: "선택한 장애 채널과 그 스레드",
+            does: "시각이 찍힌 타임라인을 기록한 뒤 비난 없는 회고 문서 초안을 작성합니다.",
+            reports: "이 채팅에서, 장애 중과 장애 후",
+            needs_setup: None,
+            examples: [
+                "14:02 알림 발생, 14:09 롤백 시작, 14:21 오류 정상화.",
+                "회고 문서 초안이 준비되었습니다.",
+            ],
+        },
+        "oncall-handoff" => BotTemplateKo {
+            name: "온콜 인수인계",
+            description: "알림, 장애, 남은 후속 조치를 주간으로 요약합니다.",
+            first_chat: "지난주의 알림 채널과 장애 이슈를 읽고 인수인계 문서를 작성합니다.",
+            watches: "내 알림 채널과 장애 이슈",
+            does: "한 주의 알림과 장애를 요약하고 남은 후속 조치를 정리합니다.",
+            reports: "이 채팅에서, 매주 금요일 오후 4시",
+            needs_setup: Some("호출 도구 커넥터가 없어 Slack에 올라온 알림만 읽습니다."),
+            examples: [
+                "알림 12건, 장애 2건. cell-3의 디스크 알림이 5번 발생했습니다.",
+                "후속 조치 3건이 아직 열려 있습니다.",
+            ],
+        },
+        "followup" => BotTemplateKo {
+            name: "답장할 항목",
+            description: "아직 답장하지 않은 항목을 알려 줍니다.",
+            first_chat: "Slack 스레드와 이슈 댓글에서 아직 답하지 않은 나에게 온 질문과 내가 하겠다고 말한 일을 찾습니다.",
+            watches: "Slack 스레드와 Linear 댓글",
+            does: "아직 답하지 않은 나에게 온 질문과 내가 하겠다고 말한 일을 찾습니다.",
+            reports: "이 채팅에서, 매일 오후 4시",
+            needs_setup: None,
+            examples: [
+                "2일 전 #design에서 팀원에게 \"내일 확인해 볼게요\"라고 말했습니다.",
+                "KRL-881에 어제 온 질문이 있습니다.",
+            ],
+        },
+        "standup" => BotTemplateKo {
+            name: "데일리 스탠드업 노트",
+            description: "어제 나와 에이전트가 한 일과 다음 할 일을 정리합니다.",
+            first_chat: "내 워크스페이스, 병합된 PR, 상태가 바뀐 이슈를 바탕으로 어제 노트를 작성합니다. 팀이 보는 곳에는 직접 복사해 붙여넣으세요.",
+            watches: "내 워크스페이스, PR, 이슈",
+            does: "어제 노트와 오늘 계획을 작성합니다.",
+            reports: "이 채팅에서, 평일 오전 9시",
+            needs_setup: None,
+            examples: [
+                "어제: #4121 병합(릴레이 재시도). 에이전트가 워크스페이스 2개를 완료했습니다.",
+                "오늘: KRL-702, #4130 리뷰.",
+            ],
+        },
+        "email-digest" => BotTemplateKo {
+            name: "이메일 요약",
+            description: "하루 두 번, 내 답장이 필요한 이메일을 알려 줍니다.",
+            first_chat: "오늘 받은 편지함을 읽고 답장이 필요한 이메일을 최신순으로 정리합니다. 이메일은 절대 보내지 않습니다.",
+            watches: "내 받은 편지함",
+            does: "답장이 필요한 이메일을 최신순으로 정리합니다. 이메일은 보내지 않습니다.",
+            reports: "이 채팅에서, 평일 오전 9시와 오후 2시",
+            needs_setup: None,
+            examples: [
+                "답장이 필요한 메일 2건: 보안 리뷰 일정, 청구서 문의.",
+                "뉴스레터 14건은 건너뛰었습니다.",
+            ],
+        },
+        "meeting-prep" => BotTemplateKo {
+            name: "미팅 준비",
+            description: "미팅마다 관련된 이슈, PR, 문서를 미리 정리합니다.",
+            first_chat: "오늘 캘린더를 보고 미팅마다 짧은 준비 노트를 작성합니다.",
+            watches: "내 캘린더",
+            does: "미팅 전에 관련된 이슈, PR, 문서를 정리합니다.",
+            reports: "이 채팅에서, 각 미팅 전에",
+            needs_setup: None,
+            examples: [
+                "11시 모바일 싱크: KRL-902는 결정이 필요하고, #4130이 내 리뷰를 기다립니다.",
+                "문서: \"푸시 권한 문구\".",
+            ],
+        },
+        _ => return None,
+    })
+}
+
+#[must_use]
+pub fn bot_template_schedule_ko(
+    tpl_id: &str,
+    sched_id: &str,
+) -> Option<(&'static str, &'static str)> {
+    Some(match (tpl_id, sched_id) {
+        ("dependency-updates", "weekly-check") => {
+            ("매주 월요일 오전 9시", "새 보안 권고와 메이저 버전")
+        }
+        ("unreviewed-work", "daily-list") => ("평일 오전 9시", "검토를 기다리는 완료된 작업"),
+        ("workspace-cleanup", "weekly-list") => {
+            ("매주 금요일 오후 4시", "삭제할 수 있는 워크스페이스")
+        }
+        ("security-check", "weekly-review") => ("매주 월요일 오전 9시", "이번 주에 병합된 변경"),
+        ("release", "readiness-list") => ("평일 오전 9시", "준비 상태 목록"),
+        ("ci-failures", "flaky-list") => ("매주 월요일 오전 9시", "불안정한 체크"),
+        ("support", "unanswered") => ("평일 오전 9시~오후 5시, 2시간마다", "답변 없는 질문"),
+        ("feedback", "weekly-themes") => ("매주 월요일 오전 9시", "이번 주 주제"),
+        ("briefing", "weekly-brief") => ("매주 금요일 오후 3시", "브리핑"),
+        ("docs-upkeep", "weekly-docs") => ("매주 수요일 오전 10시", "수정할 문서"),
+        ("backlog-cleanup", "monthly-list") => ("매월 1일 오전 9시", "정리 목록"),
+        ("oncall-handoff", "weekly-handoff") => ("매주 금요일 오후 4시", "인수인계"),
+        ("followup", "daily-owed") => ("매일 오후 4시", "아직 남은 답장"),
+        ("standup", "daily-notes") => ("평일 오전 9시", "스탠드업 노트"),
+        ("email-digest", "morning") => ("평일 오전 9시", "내 답장이 필요한 이메일"),
+        ("email-digest", "afternoon") => ("평일 오후 2시", "내 답장이 필요한 이메일"),
+        _ => return None,
+    })
+}
+
+#[must_use]
+pub fn bot_template_event_ko(tpl_id: &str, event_id: &str) -> Option<&'static str> {
+    Some(match (tpl_id, event_id) {
+        ("pr-review", "review-requested") => "PR 리뷰를 요청받을 때 · 리뷰하고 이 채팅에 올리기",
+        ("bug-investigation", "linear-assigned") => "Linear 이슈가 나에게 할당될 때 · 조사하기",
+        ("security-check", "pr-merged") => "PR이 병합될 때 · 확인하기",
+        ("ci-failures", "check-failed") => {
+            "체크가 실패할 때 · 불안정한 체크인지 진짜 실패인지 알려 주기"
+        }
+        ("deploy-watch", "deploy-called") => "배포 도구가 호출할 때 · 배포 요약하기",
+        ("bug-intake", "bug-posted") => "버그 채널에 누군가 글을 올릴 때 · 이슈 초안 작성하기",
+        ("issue-triage", "issue-opened") => "이슈가 열릴 때 · 라벨과 중복 후보 제안하기",
+        ("incident-notes", "incident-posted") => {
+            "장애 채널에 누군가 글을 올릴 때 · 타임라인에 추가하기"
+        }
+        ("meeting-prep", "meeting-soon") => "미팅 15분 전 · 준비 노트",
+        _ => return None,
+    })
+}
+
+#[must_use]
+pub fn bot_skill_ko(skill_id: &str) -> Option<(&'static str, &'static str)> {
+    Some(match skill_id {
+        "pr-review-checklist" => (
+            "PR 리뷰 체크리스트",
+            "diff에서 동작 변경, 빠진 테스트, 위험한 수정을 읽어내고 각 지적마다 근거를 제시합니다.",
+        ),
+        "bug-reproduction" => (
+            "버그 재현 절차",
+            "원인을 찾기 전에 버그를 보여 주는 정확한 단계를 먼저 기록합니다.",
+        ),
+        "ci-failure-triage" => (
+            "CI 실패 분류",
+            "불안정한 체크, 진짜 실패, 인프라 문제를 구분하고 문제가 시작된 커밋을 찾습니다.",
+        ),
+        "release-readiness" => (
+            "릴리스 준비 점검",
+            "릴리스를 막는 요소와 목록 작성 방법: 체크, 리뷰, 열린 블로커.",
+        ),
+        "release-notes-style" => (
+            "릴리스 노트 작성 규칙",
+            "사용자용 노트: 신규, 수정, 변경. 리팩터링과 코드명은 제외합니다.",
+        ),
+        "dependency-upgrade" => (
+            "의존성 업그레이드",
+            "한 번에 한 그룹씩 업그레이드하고, 변경 내역을 읽고, 테스트를 실행하고, 그룹마다 PR을 하나씩 만듭니다.",
+        ),
+        "security-checklist" => (
+            "보안 체크리스트",
+            "변경에서 살펴볼 시크릿, 인젝션, 인증 확인, 안전하지 않은 기본값.",
+        ),
+        "issue-triage" => (
+            "이슈 분류",
+            "라벨을 붙이고, 중복을 찾고, 빠진 재현 정보를 댓글 하나로 요청합니다.",
+        ),
+        "feedback-themes" => (
+            "피드백 주제 정리",
+            "피드백을 개수와 짧은 인용문이 있는 주제별로 묶고, 기존 이슈를 연결합니다.",
+        ),
+        "status-brief" => (
+            "상태 브리핑",
+            "바뀐 점, 막힌 점, 결정이 필요한 점을 열 줄 이내 브리핑으로 정리합니다.",
+        ),
+        "spec-format" => ("스펙 형식", "한 페이지 스펙: 문제, 결정, 범위, 열린 질문."),
+        "incident-timeline" => (
+            "장애 타임라인",
+            "시각이 찍힌 타임라인을 기록한 뒤 비난 없는 회고 문서 초안을 작성합니다.",
+        ),
+        "workspace-hygiene" => (
+            "워크스페이스 정리 규칙",
+            "워크스페이스가 완료되었거나 방치된 시점과, 삭제 전에 확인할 사항.",
+        ),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod platform_shortcut_tests {
     use super::*;
