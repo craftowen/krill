@@ -24,15 +24,19 @@ class WorkflowTests(unittest.TestCase):
 
 
     def test_local_ci_and_nightly_build_tests_with_the_same_profile(self):
-        # Timing-budget tests passed locally at opt-level 0 but ran at 2 in CI and nightly (F-14).
+        # Test profile optimization is defined centrally in root Cargo.toml ([profile.test] and
+        # [profile.test.package."*"]) so local check.sh, CI, and nightly do not override it with env vars.
+        cargo = (ROOT / "Cargo.toml").read_text()
         ci = (ROOT / ".github/workflows/ci-macos.yml").read_text()
         check = (ROOT / "scripts/check.sh").read_text()
         nightly = (ROOT / "packaging/nightly.py").read_text()
+        self.assertRegex(cargo, r'(?ms)^\[profile\.test\]\n(?:[^\[]*\n)*?debug\s*=\s*"line-tables-only"')
+        self.assertRegex(cargo, r'(?ms)^\[profile\.test\.package\."\*"]\n(?:[^\[]*\n)*?opt-level\s*=\s*2\b')
         for key in ("CARGO_PROFILE_TEST_OPT_LEVEL", "CARGO_PROFILE_TEST_DEBUG"):
             with self.subTest(key=key):
-                value = re.search(r"\b" + key + r":\s*(\S+)", ci)[1]
-                self.assertRegex(check, r"(?m)^export .*\b" + key + r"=\$\{" + key + r":-" + re.escape(value) + r"\}")
-                self.assertIn(key + '="' + value + '"', nightly)
+                self.assertNotRegex(ci, r"\b" + key + r":")
+                self.assertNotRegex(check, r"(?m)^export .*\b" + key + r"=")
+                self.assertNotIn(key + "=", nightly)
 
     def test_ci_cache_scope_reuse_and_release_audit_contracts(self):
         macos = (ROOT / ".github/workflows/ci-macos.yml").read_text()

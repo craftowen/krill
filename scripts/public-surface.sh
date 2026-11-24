@@ -74,7 +74,7 @@ else
     '([Cc]loudflare|[Aa]ccount[_ -]?[Ii][Dd]|[Zz]one).{0,80}[^0-9a-f][0-9a-f]{32}([^0-9a-f]|$)'
   check 'Cloudflare D1 ID' '^$' \
     '([Dd]1|[Dd]atabase[_ -]?[Ii][Dd]).{0,80}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-  check '토큰·개인 키(리댁션 fixture 제외)' '(crates/krill-proto/src/diag/tests\.rs|crates/krill/tests/doctor\.rs|crates/krill-app/src/crash/tests\.rs)$' \
+  check '토큰·개인 키(리댁션 fixture 제외)' '(crates/krill-proto/src/diag/tests\.rs|crates/krill/tests/integration/doctor\.rs|crates/krill-app/src/crash/tests\.rs)$' \
     '(sk-ant-api[0-9]{2}-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
 fi
 

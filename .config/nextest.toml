@@ -29,7 +29,7 @@ test-threads = 10
 pty-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(teardown)'
+filter = 'package(krill-holder) & binary(integration) & test(/^teardown::/)'
 test-group = 'pty-heavy'
 threads-required = "num-test-threads"
 
@@ -41,7 +41,7 @@ threads-required = "num-test-threads"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
+filter = 'binary(survive) | (package(krill) & binary(integration) & test(/^(reconnect|wait)::/)) | (package(krilld) & binary(integration) & test(/^(attach|holder)::/)) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
 test-group = 'latency'
 threads-required = "num-test-threads"
 retries = 2

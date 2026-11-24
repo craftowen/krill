@@ -129,6 +129,29 @@ class TargetTests(unittest.TestCase):
         self.assertTrue(probe.exists())
         self.assertFalse(target.exists())
 
+    @unittest.skipUnless(sys.platform == "darwin", "local macOS policy")
+    def test_refresh_shared_target_rejects_paths_outside_external_targets(self):
+        target = self.root / "internal-shared"
+        result = subprocess.run(
+            ["/bin/bash", str(policy.ROOT / "scripts/refresh-shared-target.sh"),
+             "--no-fetch", "--dry-run", "--target-dir", str(target)],
+            capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be inside", result.stderr)
+        self.assertFalse(target.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "local macOS policy")
+    def test_refresh_shared_target_dry_run_uses_target_dir_flag(self):
+        if not policy.TARGETS.parent.is_mount():
+            self.skipTest("external build volume is not mounted")
+        result = subprocess.run(
+            ["/bin/bash", str(policy.ROOT / "scripts/refresh-shared-target.sh"),
+             "--no-fetch", "--dry-run", "--ref", "HEAD"],
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--target-dir /Volumes/krill-build/targets/shared", result.stdout)
+        self.assertNotIn("CARGO_TARGET_DIR=", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

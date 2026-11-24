@@ -170,6 +170,25 @@ string_slice = "warn"
 [profile.dev]
 debug = "line-tables-only"
 
+# 테스트 프로파일 최적화 분리:
+# - 서드파티·vendor 의존성(gpui, alacritty_terminal, zstd 등)은 opt-level = 2, debug = false로 1회만 최적화 컴파일·캐시해
+#   런타임 프레임 예산·레이턴시 테스트 성능을 유지하고 링크 시간을 줄인다.
+# - 지연·메모리 소크 예산에 민감한 krilld(fault_ci 20MiB drift·attach p95)와 krill-term(그리드 핫패스)만 opt-level = 2로 핀포인트 지정한다.
+# - 가장 무거운 krill-app을 포함한 나머지 워크스페이스 크레이트는 opt-level = 0으로 두어 테스트 컴파일 병목을 해소한다.
+[profile.test]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2
+debug = false
+
+[profile.test.package.krilld]
+opt-level = 2
+
+[profile.test.package.krill-term]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

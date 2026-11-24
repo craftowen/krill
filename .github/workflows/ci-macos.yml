@@ -99,9 +99,6 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.changes.outputs.rust == 'true'
     runs-on: macos-15
     timeout-minutes: 90
-    env:
-      CARGO_PROFILE_TEST_OPT_LEVEL: 2
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -143,7 +140,7 @@ jobs:
         run: cargo check --workspace --all-targets --locked
         timeout-minutes: 30
 
-      - name: Warm opt-level=2 test dependency cache when key missed
+      - name: Warm test dependency cache when key missed
         if: steps.cache.outputs.cache-hit != 'true'
         run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --no-run
         timeout-minutes: 75
@@ -173,11 +170,8 @@ jobs:
         os: [macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
-    env:
-      # UI 프레임 예산은 비최적화 렌더러의 디버그 비용과 구분한다.
-      # 테스트·assertion·시간 기준은 그대로 두고 테스트 빌드만 최적화한다.
-      CARGO_PROFILE_TEST_OPT_LEVEL: 2
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    # 테스트 프로필 최적화 수준([profile.test] + [profile.test.package."*"] + krilld/krill-term)은
+    # 루트 Cargo.toml이 단일 진실원천이다. env로 CARGO_PROFILE_TEST_OPT_LEVEL을 덮어쓰지 않는다.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

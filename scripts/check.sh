@@ -37,8 +37,8 @@ if [[ -n "$target_dir" ]]; then
 else
   python3 scripts/check-build-target.py
 fi
-# 테스트 빌드 프로필은 CI(ci-macos.yml)·nightly와 같다. 시간 예산 테스트가 로컬과 CI에서 같은 최적화 수준을 본다.
-export CARGO_PROFILE_TEST_OPT_LEVEL=${CARGO_PROFILE_TEST_OPT_LEVEL:-2} CARGO_PROFILE_TEST_DEBUG=${CARGO_PROFILE_TEST_DEBUG:-line-tables-only}
+# 테스트 빌드 프로필은 루트 Cargo.toml의 [profile.test] / [profile.test.package."*"]가 단일 진실원천이다.
+# 환경변수로 CARGO_PROFILE_TEST_OPT_LEVEL을 덮어쓰면 패키지별 최적화가 무력화되므로 설정하지 않는다.
 # Krill 세션에서 물려받은 운영 상태 폴더·에이전트 설정 경로를 지워 CI와 같은 환경에서 검사한다(F-01).
 # 테스트 HOME 격리는 .config/nextest.toml setup 스크립트가 맡는다.
 unset KRILL_STATE_DIR CLAUDE_CONFIG_DIR CODEX_HOME XDG_CONFIG_HOME KRILL_CLI KRILL_ROOT_PATH KRILL_WORKSPACE_NAME KRILL_WORKTREE_PATH
@@ -81,8 +81,8 @@ slot(){ local n=${KRILL_TEST_SLOTS:-$(( cores / 4 > 0 ? cores / 4 : 1 ))} k rc; 
 # 아래 필터는 .config/nextest.toml
 # latency override와 같은 집합이어야 한다(어긋나면 저지연 테스트가 고속 페이즈에서 부하를 맞아 flake 가능).
 step "test build";   run cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-run
-step "test fast";    slot cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
-step "test latency"; slot cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
+step "test fast";    slot cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | (package(krill) & binary(integration) & test(/^(reconnect|wait)::/)) | (package(krilld) & binary(integration) & test(/^(attach|holder)::/)) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
+step "test latency"; slot cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | (package(krill) & binary(integration) & test(/^(reconnect|wait)::/)) | (package(krilld) & binary(integration) & test(/^(attach|holder)::/)) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
 # --memory: MK-066 메모리 게이트까지(nightly·선택). 병렬 부하에서 흔들려 기본 경로에는 넣지 않는다.
 if [[ $run_memory -eq 1 ]]; then step "memory"; run scripts/memory-gate.sh; fi
 print -P "%B== check.sh: 전부 통과%b"

@@ -52,7 +52,7 @@ keywords = ["d1", "database"]
 description = "리댁션 테스트 fixture(가짜 토큰)"
 paths = [
   '''crates/krill-proto/src/diag/tests\.rs$''',
-  '''crates/krill/tests/doctor\.rs$''',
+  '''crates/krill/tests/integration/doctor\.rs$''',
   '''crates/krill-app/src/crash/tests\.rs$''',
   '''crates/krilld/src/agent/tests\.rs$''',
   '''vendor/gpui-pre-reqwest/src/tls\.rs$''',
