@@ -424,7 +424,14 @@ pub fn sidebar_snapshot(
             .map(|bot| {
                 let mut live: Vec<BotSessionSummary> = sessions
                     .iter()
-                    .filter(|s| s.bot_id == bot.id && s.live)
+                    .filter(|s| {
+                        s.bot_id == bot.id
+                            && s.live
+                            && krill_proto::bots::session_belongs_to_bot(
+                                bot.created_at_ms,
+                                s.created_at_ms,
+                            )
+                    })
                     .cloned()
                     .collect();
                 live.sort_by_key(|s| (s.link_id.is_some(), std::cmp::Reverse(s.created_at_ms)));
@@ -531,13 +538,17 @@ pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
             _ => Vec::new(),
         },
     };
-    let metas: HashMap<&BotId, BotSessionMeta> = bots
+    let metas: HashMap<&BotId, (u64, BotSessionMeta)> = bots
         .iter()
-        .map(|b| (&b.id, BotSessionMeta::from_bot(b)))
+        .map(|b| (&b.id, (b.created_at_ms, BotSessionMeta::from_bot(b))))
         .collect();
     let sessions = summaries
         .iter()
-        .filter_map(|s| Some((s.session_id, metas.get(&s.bot_id)?.clone())))
+        .filter_map(|s| {
+            let (bot_created, meta) = metas.get(&s.bot_id)?;
+            krill_proto::bots::session_belongs_to_bot(*bot_created, s.created_at_ms)
+                .then(|| (s.session_id, meta.clone()))
+        })
         .collect();
     let avatars = bots
         .iter()
