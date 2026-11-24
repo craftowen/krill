@@ -1237,6 +1237,96 @@ impl Shell {
         self.pending_focus = PendingFocus::Workspace;
     }
 
+    /// 개별 분할 칸 이름의 인라인 편집을 연다(탭 이름 변경과 별개).
+    pub(super) fn begin_pane_rename(
+        &mut self,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.layout.pane_exists(pane) {
+            return;
+        }
+        self.tab_rename = None;
+        self.tab_context_menu = None;
+        self.pending_focus = PendingFocus::None;
+        self.files.refocus = false;
+        if let Some(tab) = self.layout.tab_of_pane(pane) {
+            self.change(true, cx, |l| {
+                l.activate(tab);
+                l.focus(pane);
+            });
+        }
+        let current = self.layout.pane_title(pane).unwrap_or_default().to_owned();
+        let placeholder = self.pane_label(pane, cx);
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .default_value(current)
+        });
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.select_all(window, cx);
+        });
+        let enter = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if this.pane_rename.as_ref().is_none_or(|r| r.input != *input) {
+                    return;
+                }
+                if let InputEvent::PressEnter { .. } = event {
+                    let composing = input.update(cx, |s, cx| {
+                        gpui::EntityInputHandler::marked_text_range(s, window, cx).is_some()
+                    });
+                    if !composing {
+                        this.finish_pane_rename(true, cx);
+                        this.focus.focus(window, cx);
+                    }
+                }
+            },
+        );
+        let input_handle = gpui::Focusable::focus_handle(input.read(cx), cx);
+        let input_id = input.entity_id();
+        let blur = cx.on_blur(&input_handle, window, move |this, _, cx| {
+            if this
+                .pane_rename
+                .as_ref()
+                .is_some_and(|r| r.input.entity_id() == input_id)
+            {
+                this.finish_pane_rename(true, cx);
+            }
+        });
+        self.pane_rename = Some(TabRename {
+            pane,
+            input,
+            _enter: enter,
+            _blur: blur,
+        });
+        cx.notify();
+    }
+
+    /// 개별 분할 칸 이름의 인라인 편집을 마친다. `save`면 저장(빈 값은 커스텀 이름 제거).
+    pub(super) fn finish_pane_rename(&mut self, save: bool, cx: &mut Context<Self>) {
+        let Some(rename) = self.pane_rename.take() else {
+            return;
+        };
+        if save && self.layout.pane_exists(rename.pane) {
+            let title = rename.input.read(cx).value().trim().to_owned();
+            self.change(true, cx, move |l| {
+                l.set_pane_title(rename.pane, (!title.is_empty()).then_some(title.as_str()));
+            });
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// 개별 분할 칸 이름의 인라인 편집을 취소한다.
+    pub(super) fn cancel_pane_rename(&mut self, cx: &mut Context<Self>) {
+        self.finish_pane_rename(false, cx);
+        self.pending_focus = PendingFocus::Workspace;
+    }
+
     /// 탭 메뉴를 닫고 메뉴를 연 탭의 지금 번호를 돌려준다. 그사이 탭이 사라졌으면 `None`.
     fn take_tab_menu_target(&mut self, cx: &mut Context<Self>) -> Option<usize> {
         let (anchor, _) = self.tab_context_menu.take()?;

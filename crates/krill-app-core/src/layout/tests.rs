@@ -1326,3 +1326,121 @@ fn zoom_clears_when_sibling_closes_to_single_pane_or_when_splitting() {
         "splitting while zoomed must reveal the newly created pane"
     );
 }
+
+#[test]
+fn resize_focused_pane_adjusts_nearest_axis_and_clamps_bounds() {
+    let mut l = Layout::default(); // PaneId(0)
+    // Single pane cannot be resized.
+    assert!(!l.resize_focused_pane(Direction::Right, 40.0, Some([1000.0, 600.0])));
+
+    // Horizontal split: H[0, 1] with 1000px width -> 40px step = +0.04 ratio.
+    l.split(Axis::Horizontal);
+    assert!(l.resize_focused_pane(Direction::Right, 40.0, Some([1000.0, 600.0])));
+    let PaneTree::Split { ratio, .. } = &l.active_tab().root else {
+        panic!("expected split");
+    };
+    assert!((*ratio - 0.54).abs() < 1e-4, "ratio={ratio}");
+
+    // Vertical resize on a pure horizontal split is a no-op.
+    assert!(!l.resize_focused_pane(Direction::Down, 40.0, Some([1000.0, 600.0])));
+
+    // Clamp against MIN_PANE_PX (50 / 1000 = 0.05..=0.95).
+    for _ in 0..30 {
+        l.resize_focused_pane(Direction::Right, 40.0, Some([1000.0, 600.0]));
+    }
+    let PaneTree::Split { ratio, .. } = &l.active_tab().root else {
+        panic!("expected split");
+    };
+    assert!((*ratio - 0.95).abs() < 1e-4, "max clamped ratio={ratio}");
+    assert!(!l.resize_focused_pane(Direction::Right, 40.0, Some([1000.0, 600.0])));
+
+    for _ in 0..40 {
+        l.resize_focused_pane(Direction::Left, 40.0, Some([1000.0, 600.0]));
+    }
+    let PaneTree::Split { ratio, .. } = &l.active_tab().root else {
+        panic!("expected split");
+    };
+    assert!((*ratio - 0.05).abs() < 1e-4, "min clamped ratio={ratio}");
+
+    // Nested split H[0, V[1, 2]] with PaneId(2) focused:
+    // Up/Down adjusts inner V, Left/Right adjusts outer H; fallback ratio step works when surface_size is None.
+    l.set_ratio(&[], 0.5);
+    l.split(Axis::Vertical);
+    assert!(l.resize_focused_pane(Direction::Down, 40.0, None));
+    assert!(l.resize_focused_pane(Direction::Left, 40.0, None));
+    let PaneTree::Split {
+        ratio: outer_r,
+        second,
+        ..
+    } = &l.active_tab().root
+    else {
+        panic!("expected outer split");
+    };
+    assert!((*outer_r - 0.45).abs() < 1e-4);
+    let PaneTree::Split { ratio: inner_r, .. } = second.as_ref() else {
+        panic!("expected inner split");
+    };
+    assert!((*inner_r - 0.55).abs() < 1e-4);
+
+    // Zoomed pane disables keyboard resizing.
+    l.set_zoomed_pane(Some(PaneId(2)));
+    assert!(!l.resize_focused_pane(Direction::Right, 40.0, Some([1000.0, 600.0])));
+    assert!(l.is_valid());
+}
+
+#[test]
+fn pane_titles_roundtrip_distinct_from_tab_titles_and_prune() {
+    let path = temp_path("pane-titles");
+    let mut l = Layout::default();
+    l.split(Axis::Horizontal); // PaneId(0) | PaneId(1)
+    l.set_tab_title(0, Some("Main Tab"));
+    l.set_pane_title(PaneId(0), Some("  Server\nLog  "));
+    l.set_pane_title(PaneId(1), Some("Client"));
+    assert_eq!(l.tab_title(0), Some("Main Tab"));
+    assert_eq!(l.pane_title(PaneId(0)), Some("ServerLog"));
+    assert_eq!(l.pane_title(PaneId(1)), Some("Client"));
+    assert!(l.is_valid());
+
+    l.save(&path).unwrap();
+    let mut reloaded = Layout::load(&path).unwrap();
+    assert_eq!(reloaded.tab_title(0), Some("Main Tab"));
+    assert_eq!(reloaded.pane_title(PaneId(0)), Some("ServerLog"));
+    assert_eq!(reloaded.pane_title(PaneId(1)), Some("Client"));
+
+    // Clearing a pane title leaves tab title intact; closing a pane prunes its title.
+    reloaded.set_pane_title(PaneId(0), Some("   "));
+    assert_eq!(reloaded.pane_title(PaneId(0)), None);
+    assert_eq!(reloaded.tab_title(0), Some("Main Tab"));
+    reloaded.focus(PaneId(1));
+    reloaded.close_pane();
+    assert_eq!(reloaded.pane_title(PaneId(1)), None);
+    assert!(reloaded.is_valid());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn zoom_transfers_focus_and_navigation_while_zoomed_transfers_zoom() {
+    let mut l = Layout::default(); // PaneId(0)
+    l.split(Axis::Horizontal); // PaneId(0) | PaneId(1), focused = 1
+    assert_eq!(l.focused(), Some(PaneId(1)));
+
+    // Zooming unfocused PaneId(0) MUST also focus PaneId(0).
+    assert!(l.toggle_zoom_pane(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(0)));
+    assert_eq!(l.focused(), Some(PaneId(0)));
+
+    // Navigating right while zoomed MUST move both focus and zoom to PaneId(1).
+    l.focus_direction(Direction::Right);
+    assert_eq!(l.focused(), Some(PaneId(1)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(1)));
+
+    // Cycling pane while zoomed MUST transfer zoom back to PaneId(0).
+    l.cycle_pane(1);
+    assert_eq!(l.focused(), Some(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), Some(PaneId(0)));
+
+    // Unzooming leaves focus on PaneId(0).
+    assert!(!l.toggle_zoom_pane(PaneId(0)));
+    assert_eq!(l.zoomed_pane(), None);
+    assert_eq!(l.focused(), Some(PaneId(0)));
+}

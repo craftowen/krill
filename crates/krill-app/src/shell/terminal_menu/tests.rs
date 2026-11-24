@@ -339,3 +339,65 @@ fn wrapped_file_menu_copies_full_path_from_each_row(cx: &mut TestAppContext) {
         Some("c")
     );
 }
+
+#[gpui::test]
+fn pane_context_menu_puts_rename_first_and_displays_custom_pane_title(cx: &mut TestAppContext) {
+    let dir = TempDir::new("pane-rename-menu");
+    let (view, cx) = open(cx, state_path("terminal-menu-pane-rename"));
+    let (pane, at) = show_output(&view, &dir.0, "https://example.com/docs", None, cx);
+    right_click(at, cx);
+    let rename_bounds = cx
+        .debug_bounds("terminal-pane-rename")
+        .expect("Rename item must appear in pane context menu");
+    let url_copy_bounds = cx
+        .debug_bounds("terminal-url-copy")
+        .expect("URL copy item present");
+    assert!(
+        rename_bounds.origin.y < url_copy_bounds.origin.y,
+        "Rename must be the first item at the top of the pane context menu: rename={rename_bounds:?} url={url_copy_bounds:?}"
+    );
+    click("terminal-pane-rename", cx);
+    assert!(
+        cx.debug_bounds("pane-rename-input").is_some(),
+        "clicking Rename opens inline pane rename input"
+    );
+    cx.simulate_keystrokes("A P I enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pane-rename-input").is_none());
+    assert_eq!(layout_of(&view, cx).pane_title(pane), Some("API"));
+    assert_eq!(
+        layout_of(&view, cx).tab_title(0),
+        None,
+        "per-pane rename must remain distinct from tab rename"
+    );
+    let title_sel: &'static str = Box::leak(format!("pane-title-{}", pane.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(title_sel).is_some(),
+        "custom pane name must stay visible in the pane header"
+    );
+}
+
+#[gpui::test]
+fn cursor_and_vscode_remote_links_dispatch_on_cmd_click(cx: &mut TestAppContext) {
+    let dir = TempDir::new("ide-remote-links");
+    let (view, cx) = open(cx, state_path("terminal-menu-ide-links"));
+    for uri in [
+        "cursor://vscode-remote/ssh-remote+dev-box/home/user/krill",
+        "vscode://vscode-remote/wsl+Ubuntu/workspace/src/main.rs:10",
+    ] {
+        let (_, at) = show_output(&view, &dir.0, uri, None, cx);
+        cx.simulate_click(
+            at,
+            Modifiers {
+                platform: true,
+                ..Modifiers::default()
+            },
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(uri),
+            "Cmd-click must open {uri} via system URI handler"
+        );
+    }
+}

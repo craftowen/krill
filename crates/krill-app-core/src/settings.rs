@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use gpui::{
     App, AppContext as _, Bounds, Context, Global, KeyBinding, Keystroke, Render, SharedString,
-    Subscription, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Subscription, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, div,
+    prelude::*, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Sizable as _, ThemeMode};
@@ -210,6 +211,30 @@ pub struct Settings {
     /// 폴백한다(OWE-899: SF Mono처럼 비례 대체로 떨어지는 지정값이 셀을 어긋나게 했다).
     #[serde(default = "default_terminal_font_family")]
     pub terminal_font_family: String,
+    /// 터미널 기본 글자 굵기(100..=900, 기본 400).
+    #[serde(default = "default_terminal_font_weight")]
+    pub terminal_font_weight: u16,
+    /// 터미널 굵은 글씨 굵기(100..=900, 기본 700).
+    #[serde(default = "default_terminal_font_weight_bold")]
+    pub terminal_font_weight_bold: u16,
+    /// 터미널 줄 높이 배율(0.8..=2.0, 기본 1.0). 글자 메트릭 기준 행 높이에 곱한다.
+    #[serde(default = "default_terminal_line_height")]
+    pub terminal_line_height: f32,
+    /// 터미널 셀 가로 폭 배율(0.8..=2.0, 기본 1.0). 글리프는 셀 가운데에 정렬한다.
+    #[serde(default = "default_terminal_cell_width")]
+    pub terminal_cell_width: f32,
+    /// 터미널 휠·트랙패드 스크롤 속도 배율(0.25..=5.0, 기본 1.0).
+    #[serde(default = "default_terminal_scroll_speed")]
+    pub terminal_scroll_speed: f32,
+    /// 프로그래밍 합자 켜기/끄기(기본 false). 커서·선택 경계에서는 자동으로 분리한다.
+    #[serde(default)]
+    pub terminal_font_ligatures: bool,
+    /// 창 배경 흐림(macOS vibrancy / Windows blur, 기본 false).
+    #[serde(default)]
+    pub window_blur: bool,
+    /// 다중 분할 탭에서 비활성 칸을 터미널 배경색으로 덮는 불투명도(0.0..=0.8, 기본 0.0).
+    #[serde(default = "default_unfocused_pane_veil")]
+    pub unfocused_pane_veil: f32,
     /// 프로그램이 커서 모양을 지정하지 않았을 때의 기본 커서(기본 블록, OWE-658).
     #[serde(default)]
     pub terminal_cursor_shape: TerminalCursorShape,
@@ -318,6 +343,32 @@ pub const DEFAULT_EDITOR_FONT_SIZE: u8 = 12;
 pub const EDITOR_FONT_SIZE_MIN: u8 = 8;
 pub const EDITOR_FONT_SIZE_MAX: u8 = 32;
 
+pub const DEFAULT_TERMINAL_FONT_WEIGHT: u16 = 400;
+pub const DEFAULT_TERMINAL_FONT_WEIGHT_BOLD: u16 = 700;
+pub const TERMINAL_FONT_WEIGHT_MIN: u16 = 100;
+pub const TERMINAL_FONT_WEIGHT_MAX: u16 = 900;
+const TERMINAL_FONT_WEIGHT_STEP: i16 = 100;
+
+pub const DEFAULT_TERMINAL_LINE_HEIGHT: f32 = 1.0;
+pub const TERMINAL_LINE_HEIGHT_MIN: f32 = 0.8;
+pub const TERMINAL_LINE_HEIGHT_MAX: f32 = 2.0;
+const TERMINAL_LINE_HEIGHT_STEP: f32 = 0.05;
+
+pub const DEFAULT_TERMINAL_CELL_WIDTH: f32 = 1.0;
+pub const TERMINAL_CELL_WIDTH_MIN: f32 = 0.8;
+pub const TERMINAL_CELL_WIDTH_MAX: f32 = 2.0;
+const TERMINAL_CELL_WIDTH_STEP: f32 = 0.05;
+
+pub const DEFAULT_TERMINAL_SCROLL_SPEED: f32 = 1.0;
+pub const TERMINAL_SCROLL_SPEED_MIN: f32 = 0.25;
+pub const TERMINAL_SCROLL_SPEED_MAX: f32 = 5.0;
+const TERMINAL_SCROLL_SPEED_STEP: f32 = 0.25;
+
+pub const DEFAULT_UNFOCUSED_PANE_VEIL: f32 = 0.0;
+pub const UNFOCUSED_PANE_VEIL_MIN: f32 = 0.0;
+pub const UNFOCUSED_PANE_VEIL_MAX: f32 = 0.8;
+const UNFOCUSED_PANE_VEIL_STEP: f32 = 0.05;
+
 const fn default_terminal_font_size() -> u8 {
     DEFAULT_TERMINAL_FONT_SIZE
 }
@@ -328,6 +379,43 @@ const fn default_editor_font_size() -> u8 {
 
 const fn default_terminal_opacity_pct() -> u8 {
     100
+}
+
+const fn default_terminal_font_weight() -> u16 {
+    DEFAULT_TERMINAL_FONT_WEIGHT
+}
+
+const fn default_terminal_font_weight_bold() -> u16 {
+    DEFAULT_TERMINAL_FONT_WEIGHT_BOLD
+}
+
+const fn default_terminal_line_height() -> f32 {
+    DEFAULT_TERMINAL_LINE_HEIGHT
+}
+
+const fn default_terminal_cell_width() -> f32 {
+    DEFAULT_TERMINAL_CELL_WIDTH
+}
+
+const fn default_terminal_scroll_speed() -> f32 {
+    DEFAULT_TERMINAL_SCROLL_SPEED
+}
+
+const fn default_unfocused_pane_veil() -> f32 {
+    DEFAULT_UNFOCUSED_PANE_VEIL
+}
+
+fn clamp_finite(value: f32, default: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
+}
+
+fn step_f32(current: f32, dir: i8, step: f32, min: f32, max: f32) -> f32 {
+    let next = current + f32::from(dir) * step;
+    ((next * 100.0).round() / 100.0).clamp(min, max)
 }
 
 const fn default_true() -> bool {
@@ -401,6 +489,14 @@ impl Default for Settings {
             editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
             terminal_opacity_pct: 100,
             terminal_font_family: default_terminal_font_family(),
+            terminal_font_weight: DEFAULT_TERMINAL_FONT_WEIGHT,
+            terminal_font_weight_bold: DEFAULT_TERMINAL_FONT_WEIGHT_BOLD,
+            terminal_line_height: DEFAULT_TERMINAL_LINE_HEIGHT,
+            terminal_cell_width: DEFAULT_TERMINAL_CELL_WIDTH,
+            terminal_scroll_speed: DEFAULT_TERMINAL_SCROLL_SPEED,
+            terminal_font_ligatures: false,
+            window_blur: false,
+            unfocused_pane_veil: DEFAULT_UNFOCUSED_PANE_VEIL,
             terminal_cursor_shape: TerminalCursorShape::Block,
             terminal_cursor_blink: true,
             option_as_meta: false,
@@ -547,6 +643,12 @@ impl Settings {
             .editor_font_size
             .clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         parsed.terminal_opacity_pct = parsed.terminal_opacity_pct.clamp(50, 100);
+        parsed.terminal_font_weight = parsed.terminal_font_weight();
+        parsed.terminal_font_weight_bold = parsed.terminal_font_weight_bold();
+        parsed.terminal_line_height = parsed.terminal_line_height();
+        parsed.terminal_cell_width = parsed.terminal_cell_width();
+        parsed.terminal_scroll_speed = parsed.terminal_scroll_speed();
+        parsed.unfocused_pane_veil = parsed.unfocused_pane_veil();
         if parsed.terminal_theme_dark.trim().is_empty() {
             parsed.terminal_theme_dark = default_terminal_theme_dark();
         }
@@ -681,6 +783,130 @@ impl Settings {
     /// 자른 터미널 배경 불투명도(`50..=100`).
     pub fn terminal_opacity_pct(&self) -> u8 {
         self.terminal_opacity_pct.clamp(50, 100)
+    }
+
+    /// 자른 터미널 기본 글자 굵기(`100..=900`).
+    #[must_use]
+    pub fn terminal_font_weight(&self) -> u16 {
+        self.terminal_font_weight
+            .clamp(TERMINAL_FONT_WEIGHT_MIN, TERMINAL_FONT_WEIGHT_MAX)
+    }
+
+    /// 한 단계 조절한 터미널 기본 글자 굵기(`100..=900`, 100 단위).
+    #[must_use]
+    pub fn terminal_font_weight_step(&self, dir: i8) -> u16 {
+        let cur = i16::try_from(self.terminal_font_weight()).unwrap_or(400);
+        let next = (cur + i16::from(dir) * TERMINAL_FONT_WEIGHT_STEP).clamp(
+            i16::try_from(TERMINAL_FONT_WEIGHT_MIN).unwrap_or(100),
+            i16::try_from(TERMINAL_FONT_WEIGHT_MAX).unwrap_or(900),
+        );
+        u16::try_from(next).unwrap_or(DEFAULT_TERMINAL_FONT_WEIGHT)
+    }
+
+    /// 자른 터미널 굵은 글씨 굵기(`100..=900`).
+    #[must_use]
+    pub fn terminal_font_weight_bold(&self) -> u16 {
+        self.terminal_font_weight_bold
+            .clamp(TERMINAL_FONT_WEIGHT_MIN, TERMINAL_FONT_WEIGHT_MAX)
+    }
+
+    /// 한 단계 조절한 터미널 굵은 글씨 굵기(`100..=900`, 100 단위).
+    #[must_use]
+    pub fn terminal_font_weight_bold_step(&self, dir: i8) -> u16 {
+        let cur = i16::try_from(self.terminal_font_weight_bold()).unwrap_or(700);
+        let next = (cur + i16::from(dir) * TERMINAL_FONT_WEIGHT_STEP).clamp(
+            i16::try_from(TERMINAL_FONT_WEIGHT_MIN).unwrap_or(100),
+            i16::try_from(TERMINAL_FONT_WEIGHT_MAX).unwrap_or(900),
+        );
+        u16::try_from(next).unwrap_or(DEFAULT_TERMINAL_FONT_WEIGHT_BOLD)
+    }
+
+    /// 자른 터미널 줄 높이 배율(`0.8..=2.0`). `NaN`·무한대는 `1.0`.
+    #[must_use]
+    pub fn terminal_line_height(&self) -> f32 {
+        clamp_finite(
+            self.terminal_line_height,
+            DEFAULT_TERMINAL_LINE_HEIGHT,
+            TERMINAL_LINE_HEIGHT_MIN,
+            TERMINAL_LINE_HEIGHT_MAX,
+        )
+    }
+
+    #[must_use]
+    pub fn terminal_line_height_step(&self, dir: i8) -> f32 {
+        step_f32(
+            self.terminal_line_height(),
+            dir,
+            TERMINAL_LINE_HEIGHT_STEP,
+            TERMINAL_LINE_HEIGHT_MIN,
+            TERMINAL_LINE_HEIGHT_MAX,
+        )
+    }
+
+    /// 자른 터미널 셀 폭 배율(`0.8..=2.0`). `NaN`·무한대는 `1.0`.
+    #[must_use]
+    pub fn terminal_cell_width(&self) -> f32 {
+        clamp_finite(
+            self.terminal_cell_width,
+            DEFAULT_TERMINAL_CELL_WIDTH,
+            TERMINAL_CELL_WIDTH_MIN,
+            TERMINAL_CELL_WIDTH_MAX,
+        )
+    }
+
+    #[must_use]
+    pub fn terminal_cell_width_step(&self, dir: i8) -> f32 {
+        step_f32(
+            self.terminal_cell_width(),
+            dir,
+            TERMINAL_CELL_WIDTH_STEP,
+            TERMINAL_CELL_WIDTH_MIN,
+            TERMINAL_CELL_WIDTH_MAX,
+        )
+    }
+
+    /// 자른 터미널 스크롤 속도 배율(`0.25..=5.0`). `NaN`·무한대는 `1.0`.
+    #[must_use]
+    pub fn terminal_scroll_speed(&self) -> f32 {
+        clamp_finite(
+            self.terminal_scroll_speed,
+            DEFAULT_TERMINAL_SCROLL_SPEED,
+            TERMINAL_SCROLL_SPEED_MIN,
+            TERMINAL_SCROLL_SPEED_MAX,
+        )
+    }
+
+    #[must_use]
+    pub fn terminal_scroll_speed_step(&self, dir: i8) -> f32 {
+        step_f32(
+            self.terminal_scroll_speed(),
+            dir,
+            TERMINAL_SCROLL_SPEED_STEP,
+            TERMINAL_SCROLL_SPEED_MIN,
+            TERMINAL_SCROLL_SPEED_MAX,
+        )
+    }
+
+    /// 자른 비활성 분할 칸 가림막 불투명도(`0.0..=0.8`). `NaN`·무한대는 `0.0`.
+    #[must_use]
+    pub fn unfocused_pane_veil(&self) -> f32 {
+        clamp_finite(
+            self.unfocused_pane_veil,
+            DEFAULT_UNFOCUSED_PANE_VEIL,
+            UNFOCUSED_PANE_VEIL_MIN,
+            UNFOCUSED_PANE_VEIL_MAX,
+        )
+    }
+
+    #[must_use]
+    pub fn unfocused_pane_veil_step(&self, dir: i8) -> f32 {
+        step_f32(
+            self.unfocused_pane_veil(),
+            dir,
+            UNFOCUSED_PANE_VEIL_STEP,
+            UNFOCUSED_PANE_VEIL_MIN,
+            UNFOCUSED_PANE_VEIL_MAX,
+        )
     }
 
     /// 해당 프로바이더를 하단 상태바에 표시할지 여부(기본 true).
@@ -1579,6 +1805,88 @@ pub fn terminal_opacity_alpha(cx: &App) -> f32 {
     f32::from(terminal_opacity_pct(cx)) / 100.
 }
 
+/// `window_blur`가 켜져 있고 불투명도가 100%일 때 기본 반투명도(88%)를 적용해
+/// 네이티브 창 흐림 효과가 바로 드러나도록 한다.
+pub fn effective_terminal_opacity_pct(cx: &App) -> u8 {
+    let pct = terminal_opacity_pct(cx);
+    if window_blur(cx) { pct.min(88) } else { pct }
+}
+
+/// `effective_terminal_opacity_pct`의 알파값(`0.5..=1.0`).
+pub fn effective_terminal_opacity_alpha(cx: &App) -> f32 {
+    f32::from(effective_terminal_opacity_pct(cx)) / 100.
+}
+
+/// 터미널 기본 글자 굵기(`100..=900`). `init` 전이면 400.
+pub fn terminal_font_weight(cx: &App) -> u16 {
+    cx.try_global::<Config>()
+        .map_or(DEFAULT_TERMINAL_FONT_WEIGHT, |c| {
+            c.settings.terminal_font_weight()
+        })
+}
+
+/// 터미널 굵은 글씨 굵기(`100..=900`). `init` 전이면 700.
+pub fn terminal_font_weight_bold(cx: &App) -> u16 {
+    cx.try_global::<Config>()
+        .map_or(DEFAULT_TERMINAL_FONT_WEIGHT_BOLD, |c| {
+            c.settings.terminal_font_weight_bold()
+        })
+}
+
+/// 터미널 줄 높이 배율(`0.8..=2.0`). `init` 전이면 1.0.
+pub fn terminal_line_height(cx: &App) -> f32 {
+    cx.try_global::<Config>()
+        .map_or(DEFAULT_TERMINAL_LINE_HEIGHT, |c| {
+            c.settings.terminal_line_height()
+        })
+}
+
+/// 터미널 셀 가로 폭 배율(`0.8..=2.0`). `init` 전이면 1.0.
+pub fn terminal_cell_width(cx: &App) -> f32 {
+    cx.try_global::<Config>()
+        .map_or(DEFAULT_TERMINAL_CELL_WIDTH, |c| {
+            c.settings.terminal_cell_width()
+        })
+}
+
+/// 터미널 스크롤 속도 배율(`0.25..=5.0`). `init` 전이면 1.0.
+pub fn terminal_scroll_speed(cx: &App) -> f32 {
+    cx.try_global::<Config>()
+        .map_or(DEFAULT_TERMINAL_SCROLL_SPEED, |c| {
+            c.settings.terminal_scroll_speed()
+        })
+}
+
+/// 터미널 프로그래밍 합자 사용 여부. `init` 전이면 false.
+pub fn terminal_font_ligatures(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_some_and(|c| c.settings.terminal_font_ligatures)
+}
+
+/// 창 배경 흐림 사용 여부. `init` 전이면 false.
+pub fn window_blur(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_some_and(|c| c.settings.window_blur)
+}
+
+/// `window_blur` 설정에 대응하는 GPUI 창 배경 모양.
+#[must_use]
+pub const fn window_background_appearance(blur: bool) -> WindowBackgroundAppearance {
+    if blur {
+        WindowBackgroundAppearance::Blurred
+    } else {
+        WindowBackgroundAppearance::Opaque
+    }
+}
+
+/// 다중 분할 탭의 비활성 칸 가림막 불투명도(`0.0..=0.8`). `init` 전이면 0.0.
+pub fn unfocused_pane_veil(cx: &App) -> f32 {
+    cx.try_global::<Config>()
+        .map_or(DEFAULT_UNFOCUSED_PANE_VEIL, |c| {
+            c.settings.unfocused_pane_veil()
+        })
+}
+
 /// 터미널 글꼴 패밀리(OWE-658, OWE-899). 비었거나 `init` 전이면 Menlo.
 /// 지정값이 고정폭으로 해석되지 않으면 Menlo로 폴백한다(SF Mono 등).
 /// 셀 폭과 그리기가 같은 이름을 쓰므로 셀이 어긋나지 않는다.
@@ -1962,17 +2270,27 @@ pub fn system_appearance_changed(appearance: gpui::WindowAppearance, cx: &mut Ap
 
 /// 현재 설정을 테마와 열린 모든 창의 rem 크기에 반영한다. 액션·클릭 처리 중에는 그 창이 빌려져 있어
 /// `update`가 실패하므로 호출자는 `cx.defer`로 부른다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AppliedAppearanceKey {
+    theme: ThemeChoice,
+    language: Language,
+    zoom_bits: u32,
+    editor_font_size: u8,
+    ui_theme_dark: crate::ui::DarkUiTheme,
+    ui_theme_light: crate::ui::LightUiTheme,
+    terminal_font_size: u8,
+    terminal_font_weight: u16,
+    terminal_font_weight_bold: u16,
+    terminal_line_height_bits: u32,
+    terminal_cell_width_bits: u32,
+    terminal_font_ligatures: bool,
+    terminal_opacity_pct: u8,
+    window_blur: bool,
+    unfocused_pane_veil_bits: u32,
+}
+
 #[derive(Default)]
-struct AppliedAppearance(
-    Option<(
-        ThemeChoice,
-        Language,
-        f32,
-        u8,
-        crate::ui::DarkUiTheme,
-        crate::ui::LightUiTheme,
-    )>,
-);
+struct AppliedAppearance(Option<AppliedAppearanceKey>);
 impl Global for AppliedAppearance {}
 
 fn apply(cx: &mut App) {
@@ -1987,23 +2305,27 @@ fn apply(cx: &mut App) {
         cx.set_global(AppliedAppearance::default());
     }
     let previous = cx.global::<AppliedAppearance>().0;
-    let next = (
-        s.theme,
-        resolved_language,
-        s.zoom(),
-        s.editor_font_size(),
-        s.ui_theme_dark,
-        s.ui_theme_light,
-    );
+    let next = AppliedAppearanceKey {
+        theme: s.theme,
+        language: resolved_language,
+        zoom_bits: s.zoom().to_bits(),
+        editor_font_size: s.editor_font_size(),
+        ui_theme_dark: s.ui_theme_dark,
+        ui_theme_light: s.ui_theme_light,
+        terminal_font_size: s.terminal_font_size(),
+        terminal_font_weight: s.terminal_font_weight(),
+        terminal_font_weight_bold: s.terminal_font_weight_bold(),
+        terminal_line_height_bits: s.terminal_line_height().to_bits(),
+        terminal_cell_width_bits: s.terminal_cell_width().to_bits(),
+        terminal_font_ligatures: s.terminal_font_ligatures,
+        terminal_opacity_pct: s.terminal_opacity_pct(),
+        window_blur: s.window_blur,
+        unfocused_pane_veil_bits: s.unfocused_pane_veil().to_bits(),
+    };
     cx.global_mut::<AppliedAppearance>().0 = Some(next);
-    let language_changed = previous.is_none_or(|p| p.1 != next.1);
-    let appearance_changed = previous.is_none_or(|p| {
-        p.0 != next.0
-            || p.2.to_bits() != next.2.to_bits()
-            || p.3 != next.3
-            || p.4 != next.4
-            || p.5 != next.5
-    });
+    let language_changed = previous.is_none_or(|p| p.language != next.language);
+    let blur_changed = previous.is_none_or(|p| p.window_blur != next.window_blur);
+    let appearance_changed = previous.is_none_or(|p| p != next);
     if language_changed {
         crate::i18n::set_language(resolved_language, cx);
         crate::menu_bar::refresh_language(cx);
@@ -2018,9 +2340,13 @@ fn apply(cx: &mut App) {
     };
     crate::ui::apply(mode, cx);
     let rem = px(BASE_REM * s.zoom());
+    let bg_appearance = window_background_appearance(s.window_blur);
     for w in cx.windows() {
         w.update(cx, |_, window, _| {
             window.set_rem_size(rem);
+            if blur_changed {
+                window.set_background_appearance(bg_appearance);
+            }
             window.refresh();
         })
         .ok();
@@ -7491,6 +7817,177 @@ impl SettingsView {
                 )
                 .into_any_element(),
         );
+        let weight = s.terminal_font_weight();
+        let bold_weight = s.terminal_font_weight_bold();
+        let line_height = s.terminal_line_height();
+        let cell_width = s.terminal_cell_width();
+        let scroll_speed = s.terminal_scroll_speed();
+        let veil = s.unfocused_pane_veil();
+        let stepper_row = |title: &'static str,
+                           desc: &'static str,
+                           prefix: &'static str,
+                           value_text: String,
+                           at_min: bool,
+                           at_max: bool,
+                           at_default: bool,
+                           on_dec: fn(&mut Settings),
+                           on_inc: fn(&mut Settings),
+                           on_reset: fn(&mut Settings)| {
+            let dec_id = SharedString::from(format!("{prefix}-dec"));
+            let val_id = SharedString::from(format!("{prefix}-value"));
+            let inc_id = SharedString::from(format!("{prefix}-inc"));
+            let rst_id = SharedString::from(format!("{prefix}-reset"));
+            let dec_sel = dec_id.clone();
+            let val_sel = val_id.clone();
+            let inc_sel = inc_id.clone();
+            let rst_sel = rst_id.clone();
+            crate::ui::group_row()
+                .child(search_focus.label(p, title, desc))
+                .child(
+                    layout::controls()
+                        .child(
+                            layout::secondary(dec_id, "−")
+                                .accessibility_label(text::STEP_DEC.format(&[("name", title)]))
+                                .disabled(at_min)
+                                .debug_selector(move || dec_sel.to_string())
+                                .on_click(move |_, _, cx| edit(cx, on_dec)),
+                        )
+                        .child(
+                            div()
+                                .id(val_id)
+                                .debug_selector(move || val_sel.to_string())
+                                .w(px(48.))
+                                .text_center()
+                                .font_family(crate::ui::FONT_MONO)
+                                .text_size(crate::ui::TEXT_SM)
+                                .child(value_text),
+                        )
+                        .child(
+                            layout::secondary(inc_id, "+")
+                                .accessibility_label(text::STEP_INC.format(&[("name", title)]))
+                                .disabled(at_max)
+                                .debug_selector(move || inc_sel.to_string())
+                                .on_click(move |_, _, cx| edit(cx, on_inc)),
+                        )
+                        .child(
+                            layout::ghost(rst_id, text::RESET.get())
+                                .disabled(at_default)
+                                .debug_selector(move || rst_sel.to_string())
+                                .on_click(move |_, _, cx| edit(cx, on_reset)),
+                        ),
+                )
+                .into_any_element()
+        };
+        rows.push(stepper_row(
+            text::TERMINAL_FONT_WEIGHT.get(),
+            text::TERMINAL_FONT_WEIGHT_DESC.get(),
+            "terminal-font-weight",
+            weight.to_string(),
+            weight <= TERMINAL_FONT_WEIGHT_MIN,
+            weight >= TERMINAL_FONT_WEIGHT_MAX,
+            weight == DEFAULT_TERMINAL_FONT_WEIGHT,
+            |s| s.terminal_font_weight = s.terminal_font_weight_step(-1),
+            |s| s.terminal_font_weight = s.terminal_font_weight_step(1),
+            |s| s.terminal_font_weight = DEFAULT_TERMINAL_FONT_WEIGHT,
+        ));
+        rows.push(stepper_row(
+            text::TERMINAL_FONT_WEIGHT_BOLD.get(),
+            text::TERMINAL_FONT_WEIGHT_BOLD_DESC.get(),
+            "terminal-font-weight-bold",
+            bold_weight.to_string(),
+            bold_weight <= TERMINAL_FONT_WEIGHT_MIN,
+            bold_weight >= TERMINAL_FONT_WEIGHT_MAX,
+            bold_weight == DEFAULT_TERMINAL_FONT_WEIGHT_BOLD,
+            |s| s.terminal_font_weight_bold = s.terminal_font_weight_bold_step(-1),
+            |s| s.terminal_font_weight_bold = s.terminal_font_weight_bold_step(1),
+            |s| s.terminal_font_weight_bold = DEFAULT_TERMINAL_FONT_WEIGHT_BOLD,
+        ));
+        rows.push(stepper_row(
+            text::TERMINAL_LINE_HEIGHT.get(),
+            text::TERMINAL_LINE_HEIGHT_DESC.get(),
+            "terminal-line-height",
+            format!("{line_height:.2}×"),
+            line_height <= TERMINAL_LINE_HEIGHT_MIN + f32::EPSILON,
+            line_height >= TERMINAL_LINE_HEIGHT_MAX - f32::EPSILON,
+            (line_height - DEFAULT_TERMINAL_LINE_HEIGHT).abs() < 1e-4,
+            |s| s.terminal_line_height = s.terminal_line_height_step(-1),
+            |s| s.terminal_line_height = s.terminal_line_height_step(1),
+            |s| s.terminal_line_height = DEFAULT_TERMINAL_LINE_HEIGHT,
+        ));
+        rows.push(stepper_row(
+            text::TERMINAL_CELL_WIDTH.get(),
+            text::TERMINAL_CELL_WIDTH_DESC.get(),
+            "terminal-cell-width",
+            format!("{cell_width:.2}×"),
+            cell_width <= TERMINAL_CELL_WIDTH_MIN + f32::EPSILON,
+            cell_width >= TERMINAL_CELL_WIDTH_MAX - f32::EPSILON,
+            (cell_width - DEFAULT_TERMINAL_CELL_WIDTH).abs() < 1e-4,
+            |s| s.terminal_cell_width = s.terminal_cell_width_step(-1),
+            |s| s.terminal_cell_width = s.terminal_cell_width_step(1),
+            |s| s.terminal_cell_width = DEFAULT_TERMINAL_CELL_WIDTH,
+        ));
+        rows.push(stepper_row(
+            text::TERMINAL_SCROLL_SPEED.get(),
+            text::TERMINAL_SCROLL_SPEED_DESC.get(),
+            "terminal-scroll-speed",
+            format!("{scroll_speed:.2}×"),
+            scroll_speed <= TERMINAL_SCROLL_SPEED_MIN + f32::EPSILON,
+            scroll_speed >= TERMINAL_SCROLL_SPEED_MAX - f32::EPSILON,
+            (scroll_speed - DEFAULT_TERMINAL_SCROLL_SPEED).abs() < 1e-4,
+            |s| s.terminal_scroll_speed = s.terminal_scroll_speed_step(-1),
+            |s| s.terminal_scroll_speed = s.terminal_scroll_speed_step(1),
+            |s| s.terminal_scroll_speed = DEFAULT_TERMINAL_SCROLL_SPEED,
+        ));
+        rows.push(
+            crate::ui::group_row()
+                .child(search_focus.label(
+                    p,
+                    text::TERMINAL_FONT_LIGATURES.get(),
+                    text::TERMINAL_FONT_LIGATURES_DESC.get(),
+                ))
+                .child(
+                    layout::controls().child(
+                        layout::switch(
+                            p,
+                            "terminal-font-ligatures-toggle",
+                            s.terminal_font_ligatures,
+                            false,
+                            |next, _, cx| edit(cx, move |s| s.terminal_font_ligatures = next),
+                        )
+                        .aria_label(text::TERMINAL_FONT_LIGATURES.get()),
+                    ),
+                )
+                .into_any_element(),
+        );
+        rows.push(
+            crate::ui::group_row()
+                .child(search_focus.label(p, text::WINDOW_BLUR.get(), text::WINDOW_BLUR_DESC.get()))
+                .child(
+                    layout::controls().child(
+                        layout::switch(
+                            p,
+                            "window-blur-toggle",
+                            s.window_blur,
+                            false,
+                            |next, _, cx| edit(cx, move |s| s.window_blur = next),
+                        )
+                        .aria_label(text::WINDOW_BLUR.get()),
+                    ),
+                )
+                .into_any_element(),
+        );
+        rows.push(stepper_row(
+            text::UNFOCUSED_PANE_VEIL.get(),
+            text::UNFOCUSED_PANE_VEIL_DESC.get(),
+            "unfocused-pane-veil",
+            format!("{:.0}%", veil * 100.0),
+            veil <= UNFOCUSED_PANE_VEIL_MIN + f32::EPSILON,
+            veil >= UNFOCUSED_PANE_VEIL_MAX - f32::EPSILON,
+            (veil - DEFAULT_UNFOCUSED_PANE_VEIL).abs() < 1e-4,
+            |s| s.unfocused_pane_veil = s.unfocused_pane_veil_step(-1),
+            |s| s.unfocused_pane_veil = s.unfocused_pane_veil_step(1),
+            |s| s.unfocused_pane_veil = DEFAULT_UNFOCUSED_PANE_VEIL,
+        ));
         rows
     }
 

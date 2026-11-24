@@ -8,7 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
-use krill_proto::screen::url::{is_cjk_or_hangul, is_fullwidth_punct, scan_url_len};
+use krill_proto::screen::url::{
+    is_cjk_or_hangul, is_fullwidth_punct, scan_url_len, url_scheme_len,
+    url_scheme_prefix_len_ascii_ci,
+};
 use krill_proto::screen::{Cell, Flags, is_bidi_control};
 
 mod input;
@@ -88,7 +91,7 @@ fn row_chars(row: &[Cell]) -> Vec<(u16, char, u16)> {
     chars
 }
 
-/// `row`의 `column` 칸을 덮는 평문 `http://`·`https://` URL을 찾는다(OWE-867).
+/// `row`의 `column` 칸을 덮는 평문 `http://`·`https://`·`cursor://`·`vscode://` URL을 찾는다(OWE-867).
 pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
     let chars = row_chars(row);
     let len = chars.len();
@@ -96,20 +99,11 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
     while i < len {
         let start = i;
         let rest = chars.get(start..)?;
-        let scheme_len = if rest
-            .get(..8)
-            .is_some_and(|s| s.iter().map(|t| t.1).eq("https://".chars()))
-        {
-            8
-        } else if rest
-            .get(..7)
-            .is_some_and(|s| s.iter().map(|t| t.1).eq("http://".chars()))
-        {
-            7
-        } else {
+        let scheme_len = url_scheme_len(rest, |&(_, c, _)| c);
+        if scheme_len == 0 {
             i += 1;
             continue;
-        };
+        }
         let boundary = start == 0
             || chars
                 .get(start - 1)
@@ -152,7 +146,7 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
         }
         let uri: String = token.iter().map(|t| t.1).collect();
         let valid = gpui::http_client::Url::parse(&uri).is_ok_and(|u| {
-            matches!(u.scheme(), "http" | "https")
+            matches!(u.scheme(), "http" | "https" | "cursor" | "vscode")
                 && u.host_str()
                     .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.'))
         });
@@ -202,19 +196,7 @@ pub fn sanitize_external_url(raw: &str) -> Option<String> {
     {
         return None;
     }
-    let scheme_len = if s
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
-    {
-        8
-    } else if s
-        .get(..7)
-        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-    {
-        7
-    } else {
-        0
-    };
+    let scheme_len = url_scheme_prefix_len_ascii_ci(s);
     let candidate = if scheme_len > 0 {
         let mut in_path = false;
         let mut seg_delim = false;
@@ -257,7 +239,7 @@ pub fn sanitize_external_url(raw: &str) -> Option<String> {
     };
     let parsed = gpui::http_client::Url::parse(candidate).ok()?;
     let allowed = match parsed.scheme() {
-        "http" | "https" => parsed
+        "http" | "https" | "cursor" | "vscode" => parsed
             .host_str()
             .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.')),
         "mailto" => !parsed.path().is_empty(),

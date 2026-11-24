@@ -55,6 +55,37 @@ pub(super) fn render_card_stage(tree: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
+/// Computes the veil opacity for an unfocused split pane, returning `None` for single-pane,
+/// focused, or zoomed panes or when the configured veil is `0.0`.
+#[must_use]
+pub(super) fn pane_veil_alpha(
+    is_split: bool,
+    focused: bool,
+    zoomed: bool,
+    configured_veil: f32,
+) -> Option<f32> {
+    if !is_split || focused || zoomed || !configured_veil.is_finite() || configured_veil <= 0.0 {
+        return None;
+    }
+    Some(configured_veil.clamp(
+        krill_app::settings::UNFOCUSED_PANE_VEIL_MIN,
+        krill_app::settings::UNFOCUSED_PANE_VEIL_MAX,
+    ))
+}
+
+/// Click-through veil overlay painted over unfocused split panes using the terminal background color.
+#[must_use]
+pub(super) fn render_pane_veil(id: PaneId, color: Hsla) -> AnyElement {
+    let pane_num = id.get();
+    div()
+        .id(ElementId::Name(format!("pane-veil-{pane_num}").into()))
+        .debug_selector(move || format!("pane-veil-{pane_num}"))
+        .absolute()
+        .inset_0()
+        .bg(color)
+        .into_any_element()
+}
+
 /// gpui paints `border_1` after children while `overflow_hidden` clips to an axis-aligned box,
 /// so a single rounded card `div` paints `surface_bg` and strokes the 1px focus ring on top.
 #[must_use]
@@ -190,6 +221,7 @@ impl Shell {
             || self.jump.is_some()
             || self.files.has_quick_open()
             || self.tab_rename.is_some()
+            || self.pane_rename.is_some()
             || self.add_project.is_some()
             || self.continue_session.is_some()
             || self.confirm_close_tab.is_some()

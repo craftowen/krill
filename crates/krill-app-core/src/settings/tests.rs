@@ -518,6 +518,126 @@ fn settings_parse_defaults_and_zoom() {
     assert!((z(ZOOM_MIN).zoom_step(-1) - ZOOM_MIN).abs() < f32::EPSILON);
 }
 
+#[test]
+fn terminal_typography_and_visual_settings_defaults_and_clamping() {
+    let def = Settings::default();
+    assert_eq!(def.terminal_font_weight, 400);
+    assert_eq!(def.terminal_font_weight_bold, 700);
+    assert!((def.terminal_line_height - 1.0).abs() < f32::EPSILON);
+    assert!((def.terminal_cell_width - 1.0).abs() < f32::EPSILON);
+    assert!((def.terminal_scroll_speed - 1.0).abs() < f32::EPSILON);
+    assert!(!def.terminal_font_ligatures);
+    assert!(!def.window_blur);
+    assert!((def.unfocused_pane_veil - 0.0).abs() < f32::EPSILON);
+
+    // Backward-compatible serde defaults for both TOML and JSON.
+    let from_empty_toml = Settings::parse("").unwrap();
+    assert_eq!(from_empty_toml.terminal_font_weight, 400);
+    assert_eq!(from_empty_toml.terminal_font_weight_bold, 700);
+    assert!((from_empty_toml.terminal_line_height - 1.0).abs() < f32::EPSILON);
+    assert!((from_empty_toml.terminal_cell_width - 1.0).abs() < f32::EPSILON);
+    assert!((from_empty_toml.terminal_scroll_speed - 1.0).abs() < f32::EPSILON);
+    assert!(!from_empty_toml.terminal_font_ligatures);
+    assert!(!from_empty_toml.window_blur);
+    assert!((from_empty_toml.unfocused_pane_veil - 0.0).abs() < f32::EPSILON);
+
+    let from_empty_json: Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(from_empty_json.terminal_font_weight, 400);
+    assert_eq!(from_empty_json.terminal_font_weight_bold, 700);
+    assert!((from_empty_json.terminal_line_height - 1.0).abs() < f32::EPSILON);
+    assert!((from_empty_json.terminal_cell_width - 1.0).abs() < f32::EPSILON);
+    assert!((from_empty_json.terminal_scroll_speed - 1.0).abs() < f32::EPSILON);
+    assert!(!from_empty_json.terminal_font_ligatures);
+    assert!(!from_empty_json.window_blur);
+    assert!((from_empty_json.unfocused_pane_veil - 0.0).abs() < f32::EPSILON);
+
+    // Out-of-bounds clamping via TOML parse and getters (including NaN).
+    let low = Settings::parse(
+        "terminal_font_weight = 10\nterminal_font_weight_bold = 0\nterminal_line_height = 0.2\nterminal_cell_width = 0.1\nterminal_scroll_speed = 0.01\nunfocused_pane_veil = -0.5\n",
+    )
+    .unwrap();
+    assert_eq!(low.terminal_font_weight(), 100);
+    assert_eq!(low.terminal_font_weight_bold(), 100);
+    assert!((low.terminal_line_height() - 0.8).abs() < 1e-6);
+    assert!((low.terminal_cell_width() - 0.8).abs() < 1e-6);
+    assert!((low.terminal_scroll_speed() - 0.25).abs() < 1e-6);
+    assert!((low.unfocused_pane_veil() - 0.0).abs() < 1e-6);
+
+    let high = Settings::parse(
+        "terminal_font_weight = 1200\nterminal_font_weight_bold = 9999\nterminal_line_height = 5.0\nterminal_cell_width = 4.0\nterminal_scroll_speed = 12.0\nterminal_font_ligatures = true\nwindow_blur = true\nunfocused_pane_veil = 1.5\n",
+    )
+    .unwrap();
+    assert_eq!(high.terminal_font_weight(), 900);
+    assert_eq!(high.terminal_font_weight_bold(), 900);
+    assert!((high.terminal_line_height() - 2.0).abs() < 1e-6);
+    assert!((high.terminal_cell_width() - 2.0).abs() < 1e-6);
+    assert!((high.terminal_scroll_speed() - 5.0).abs() < 1e-6);
+    assert!(high.terminal_font_ligatures);
+    assert!(high.window_blur);
+    assert!((high.unfocused_pane_veil() - 0.8).abs() < 1e-6);
+    assert_eq!(Settings::parse(&high.to_toml()).unwrap(), high);
+
+    let nan = Settings {
+        terminal_line_height: f32::NAN,
+        terminal_cell_width: f32::INFINITY,
+        terminal_scroll_speed: f32::NEG_INFINITY,
+        unfocused_pane_veil: f32::NAN,
+        ..Settings::default()
+    };
+    assert!((nan.terminal_line_height() - 1.0).abs() < 1e-6);
+    assert!((nan.terminal_cell_width() - 1.0).abs() < 1e-6);
+    assert!((nan.terminal_scroll_speed() - 1.0).abs() < 1e-6);
+    assert!((nan.unfocused_pane_veil() - 0.0).abs() < 1e-6);
+
+    assert_eq!(
+        window_background_appearance(false),
+        WindowBackgroundAppearance::Opaque
+    );
+    assert_eq!(
+        window_background_appearance(true),
+        WindowBackgroundAppearance::Blurred
+    );
+}
+
+#[gpui::test]
+fn settings_appearance_tab_exposes_typography_and_visual_controls(cx: &mut TestAppContext) {
+    let d = dir("typography-controls");
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1100.), px(4000.)));
+    vcx.run_until_parked();
+
+    let click = |selector: &'static str, vcx: &mut gpui::VisualTestContext| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    click("terminal-font-weight-inc", vcx);
+    click("terminal-font-weight-bold-inc", vcx);
+    click("terminal-line-height-inc", vcx);
+    click("terminal-cell-width-inc", vcx);
+    click("terminal-scroll-speed-inc", vcx);
+    click("terminal-font-ligatures-toggle", vcx);
+    click("window-blur-toggle", vcx);
+    click("unfocused-pane-veil-inc", vcx);
+
+    vcx.update(|_, cx| {
+        assert_eq!(terminal_font_weight(cx), 500);
+        assert_eq!(terminal_font_weight_bold(cx), 800);
+        assert!((terminal_line_height(cx) - 1.05).abs() < 1e-4);
+        assert!((terminal_cell_width(cx) - 1.05).abs() < 1e-4);
+        assert!((terminal_scroll_speed(cx) - 1.25).abs() < 1e-4);
+        assert!(terminal_font_ligatures(cx));
+        assert!(window_blur(cx));
+        assert_eq!(effective_terminal_opacity_pct(cx), 88);
+        assert!((unfocused_pane_veil(cx) - 0.05).abs() < 1e-4);
+    });
+    fs::remove_dir_all(d).unwrap();
+}
+
 /// OWE-883: 사람에게 보이는 한 줄·문구에 Rust 디버그 포맷(`{:?}`)과 내부 영문이 그대로 노출되지 않는다.
 #[test]
 fn owe883_user_facing_lines_hide_debug_and_english_internals() {
@@ -3115,13 +3235,13 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
 
 /// OWE-799: 단축키 액션이 6개 기능 영역 카테고리에 빠짐없이 분류되고, 로컬 검색·수정 여부가 정확히 판별된다.
 /// (OWE-868에서 `shell::FindNext`·`shell::FindPrev`, OWE-848에서 `shell::ToggleChanges`,
-/// OWE-862에서 `shell::CommandPalette`, OWE-871에서 `shell::FocusPane{Left,Right,Up,Down}`이
-/// 추가되어 50개에서 58개가 되었다.)
+/// OWE-862에서 `shell::CommandPalette`, OWE-871에서 `shell::FocusPane{Left,Right,Up,Down}`,
+/// v0.3.26에서 `shell::ResizePane{Left,Right,Up,Down}`·`shell::RenamePane`이 추가되어 65개가 되었다.)
 #[test]
 fn owe799_category_mapping_and_search_matching() {
     use shortcuts::{ACTIONS, Category, action_category, is_modified, matches_query};
 
-    assert_eq!(ACTIONS.len(), 60);
+    assert_eq!(ACTIONS.len(), 65);
     for &cat in Category::ALL {
         let count = ACTIONS
             .iter()
@@ -3140,6 +3260,11 @@ fn owe799_category_mapping_and_search_matching() {
         "shell::FocusPaneRight",
         "shell::FocusPaneUp",
         "shell::FocusPaneDown",
+        "shell::ResizePaneLeft",
+        "shell::ResizePaneRight",
+        "shell::ResizePaneUp",
+        "shell::ResizePaneDown",
+        "shell::RenamePane",
         "shell::FindNext",
         "shell::FindPrev",
     ] {

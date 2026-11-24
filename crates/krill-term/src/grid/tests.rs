@@ -583,3 +583,110 @@ fn standalone_wrap_spacer_preserves_background_and_underline_at_end_of_row() {
         }]
     );
 }
+
+#[test]
+fn ligatures_break_cleanly_at_cursor_selection_and_bg_boundaries() {
+    // "a->b!==c": cursor on '-' (col 1, width 1) isolates '-' and breaks "->"
+    let plan = plan_row(&row("a->b!==c"), &DEFAULT);
+    let split = split_segments_for_ligatures(&plan, Some((1, 1)), None);
+    let pieces: Vec<_> = split
+        .iter()
+        .map(|s| {
+            (
+                s.column,
+                s.text.as_str(),
+                s.runs.iter().map(|r| r.len).sum::<usize>(),
+            )
+        })
+        .collect();
+    assert_eq!(pieces, [(0, "a", 1), (1, "-", 1), (2, ">b!==c", 6)]);
+
+    // Selection spanning col 4..6 ("!=") breaks "a->b!==c" cleanly at selection edges
+    // so "!=" can ligate inside the selection without bridging across the boundary into "=".
+    let split_sel = split_segments_for_ligatures(&plan, None, Some((4, 2)));
+    let pieces_sel: Vec<_> = split_sel
+        .iter()
+        .map(|s| (s.column, s.text.as_str()))
+        .collect();
+    assert_eq!(pieces_sel, [(0, "a->b"), (4, "!="), (6, "=c")]);
+
+    // Cursor + selection together split runs and preserve bold/italic and per-cell colors.
+    let mut cells = vec![
+        styled('=', Color::Rgb(RED), Color::Default, Flags::BOLD),
+        styled('=', Color::Rgb(BLUE), Color::Default, Flags::BOLD),
+        styled('>', Color::Rgb(RED), Color::Rgb(BLUE), Flags::ITALIC),
+        styled('x', Color::Default, Color::Default, Flags::default()),
+    ];
+    let styled_plan = plan_row(&cells, &DEFAULT);
+    // Cursor at col 1, bg span on col 2..3 -> breaks at [1, 2, 3].
+    let split_styled = split_segments_for_ligatures(&styled_plan, Some((1, 1)), None);
+    let summary: Vec<_> = split_styled
+        .iter()
+        .map(|s| (s.column, s.text.as_str(), s.runs.as_slice()))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (
+                0,
+                "=",
+                [Run {
+                    len: 1,
+                    bold: true,
+                    italic: false
+                }]
+                .as_slice()
+            ),
+            (
+                1,
+                "=",
+                [Run {
+                    len: 1,
+                    bold: true,
+                    italic: false
+                }]
+                .as_slice()
+            ),
+            (
+                2,
+                ">",
+                [Run {
+                    len: 1,
+                    bold: false,
+                    italic: true
+                }]
+                .as_slice()
+            ),
+            (
+                3,
+                "x",
+                [Run {
+                    len: 1,
+                    bold: false,
+                    italic: false
+                }]
+                .as_slice()
+            ),
+        ]
+    );
+    assert_eq!(
+        split_styled[0].color_at(0),
+        styled_plan.segments[0].color_at(0)
+    );
+    assert_eq!(
+        split_styled[1].color_at(0),
+        styled_plan.segments[0].color_at(1)
+    );
+    assert_eq!(
+        split_styled[2].color_at(0),
+        styled_plan.segments[0].color_at(2)
+    );
+
+    // Wide segments are never torn apart.
+    cells.clear();
+    cells.extend(wide('한'));
+    cells.extend(wide('글'));
+    let wide_plan = plan_row(&cells, &DEFAULT);
+    let split_wide = split_segments_for_ligatures(&wide_plan, Some((1, 1)), Some((0, 2)));
+    assert_eq!(split_wide, wide_plan.segments);
+}

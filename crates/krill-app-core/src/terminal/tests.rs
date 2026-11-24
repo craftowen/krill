@@ -117,6 +117,20 @@ fn link_hit_testing_excludes_padding_and_unsafe_schemes(_cx: &mut TestAppContext
         link_target(&s, &painted, point(px(25.), px(25.))),
         Some("mailto:user@example.com")
     );
+    // cursor:// and vscode:// OSC 8 links are accepted while empty/dot hosts are rejected.
+    s.links[0][0].uri = "cursor://vscode-remote/ssh-remote+dev/home/app".into();
+    assert_eq!(
+        link_target(&s, &painted, point(px(25.), px(25.))),
+        Some("cursor://vscode-remote/ssh-remote+dev/home/app")
+    );
+    s.links[0][0].uri = "vscode://vscode-remote/wsl+Ubuntu/workspace".into();
+    assert_eq!(
+        link_target(&s, &painted, point(px(25.), px(25.))),
+        Some("vscode://vscode-remote/wsl+Ubuntu/workspace")
+    );
+    s.links[0][0].uri = "cursor://...".into();
+    assert_eq!(link_target(&s, &painted, point(px(25.), px(25.))), None);
+    s.links[0][0].uri = "mailto:user@example.com".into();
     assert_eq!(
         osc_link_highlight(&s, &painted, point(px(25.), px(25.))),
         Some(Highlight {
@@ -301,8 +315,8 @@ fn terminal_cell_size_scales_with_window_zoom(cx: &mut TestAppContext) {
         zoomed.height > base.height && zoomed.width > base.width,
         "base={base:?} zoomed={zoomed:?}"
     );
-    // 13pt × 2배 줌 = 26px × 1.25 = 32.5 → 33px(반올림).
-    assert_eq!(zoomed.height, px(35.));
+    // 14pt × 2배 줌 = 28px; NoopTextSystem ascent(1.025) + |descent|(0.275) = 1.3 → 36.4 → 36px.
+    assert_eq!(zoomed.height, px(36.));
 }
 
 /// OWE-615 원인 3: preedit 묶음은 확정 셀과 같은 칸 단위로 나뉜다(2칸 글자는 2칸 강제 폭).
@@ -503,4 +517,133 @@ fn url_at_and_sanitize_strip_delimiter_cjk_suffix_and_percent_encode_utf8() {
         Some("http://localhost:3000")
     );
     assert_eq!(sanitize_external_url("javascript:alert(1)"), None);
+}
+
+#[test]
+fn compute_cell_metrics_applies_tight_font_metrics_clamping_and_glyph_centering() {
+    // Tight font metrics: ascent 13.0 + |descent -3.3| = 16.3 -> 16px at 1.0x
+    let base = compute_cell_metrics(px(14.), px(8.4), px(13.0), px(-3.3), 1.0, 1.0);
+    assert_eq!(base.size.height, px(16.));
+    assert!((f32::from(base.size.width) - 8.4).abs() < 1e-4);
+    assert!((f32::from(base.glyph_x)).abs() < 1e-4);
+
+    // Wider cells center glyphs positively; narrower cells shift glyphs negatively.
+    let wide = compute_cell_metrics(px(14.), px(8.0), px(13.0), px(-3.0), 1.25, 1.5);
+    assert_eq!(wide.size.height, px(20.));
+    assert_eq!(wide.size.width, px(12.));
+    assert_eq!(wide.glyph_x, px(2.));
+
+    let narrow = compute_cell_metrics(px(14.), px(10.0), px(13.0), px(-3.0), 0.8, 0.8);
+    assert_eq!(narrow.size.height, px(13.));
+    assert_eq!(narrow.size.width, px(8.));
+    assert_eq!(narrow.glyph_x, px(-1.));
+
+    // Out-of-range and NaN multipliers clamp cleanly to documented bounds / defaults.
+    let clamped_hi = compute_cell_metrics(px(14.), px(10.0), px(10.0), px(2.0), 9.0, 9.0);
+    assert_eq!(clamped_hi.size.height, px(24.));
+    assert_eq!(clamped_hi.size.width, px(20.));
+    let clamped_lo = compute_cell_metrics(px(14.), px(10.0), px(10.0), px(2.0), 0.1, 0.1);
+    assert_eq!(clamped_lo.size.height, px(10.));
+    assert_eq!(clamped_lo.size.width, px(8.));
+    let nan = compute_cell_metrics(px(14.), px(10.0), px(10.0), px(2.0), f32::NAN, f32::NAN);
+    assert_eq!(nan.size.height, px(12.));
+    assert_eq!(nan.size.width, px(10.));
+    assert_eq!(nan.glyph_x, px(0.));
+}
+
+#[test]
+fn term_font_applies_configured_weights_and_opt_in_ligatures() {
+    let family = SharedString::new_static("Menlo");
+    let default_cfg = TerminalFontConfig {
+        weight: 400,
+        bold_weight: 700,
+        ligatures: false,
+    };
+    let normal = term_font(&family, false, false, default_cfg);
+    assert_eq!(normal.weight, FontWeight(400.0));
+    assert_eq!(normal.features.is_calt_enabled(), Some(false));
+    let bold = term_font(&family, true, false, default_cfg);
+    assert_eq!(bold.weight, FontWeight(700.0));
+
+    let custom_cfg = TerminalFontConfig {
+        weight: 300,
+        bold_weight: 800,
+        ligatures: true,
+    };
+    let custom_normal = term_font(&family, false, false, custom_cfg);
+    assert_eq!(custom_normal.weight, FontWeight(300.0));
+    assert_eq!(custom_normal.features.is_calt_enabled(), Some(true));
+    assert!(
+        custom_normal
+            .features
+            .tag_value_list()
+            .contains(&("liga".to_owned(), 1))
+    );
+    let custom_bold = term_font(&family, true, true, custom_cfg);
+    assert_eq!(custom_bold.weight, FontWeight(800.0));
+    assert_eq!(custom_bold.style, FontStyle::Italic);
+}
+
+#[gpui::test]
+fn ligatures_split_shaping_at_cursor_and_selection_and_invalidate_shape_cache(
+    cx: &mut TestAppContext,
+) {
+    let dir = std::env::temp_dir().join(format!("mk-terminal-lig-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::settings::init_at(Some(dir.clone()), cx);
+    });
+    let mut screen = Screen::blank(10, 1);
+    screen.rows[0] = "a->b!==c  "
+        .chars()
+        .map(|ch| Cell {
+            ch,
+            ..Cell::default()
+        })
+        .collect();
+    screen.cursor.line = 0;
+    screen.cursor.column = 1; // '-' inside "->"
+    screen.cursor.visible = true;
+    let screen = Rc::new(screen);
+    let (_, vcx) = cx.add_window_view(|_, _| Terminal::new(Screen::blank(1, 1), DEFAULT));
+
+    SHAPE_CACHE.with(|cache| {
+        *cache.borrow_mut() = ShapeCache::default();
+    });
+
+    // With ligatures off (default), row shapes as 1 contiguous segment.
+    vcx.draw(point(px(0.), px(0.)), size(px(400.), px(100.)), |_, _| {
+        TerminalElement::new(screen.clone(), DEFAULT)
+    });
+    let (misses_off, styles_off) = SHAPE_CACHE.with(|c| {
+        let c = c.borrow();
+        (c.misses, c.styles.len())
+    });
+    assert_eq!((misses_off, styles_off), (1, 1));
+
+    // Enable ligatures + adjust weight: style cache registers a new style, and cursor at col 1
+    // + selection at col 4..6 splits "a->b!==c" into 5 pieces ("a", "-", ">b", "!=", "=c").
+    std::fs::write(
+        dir.join("settings.toml"),
+        "terminal_font_ligatures = true\nterminal_font_weight = 500\nterminal_line_height = 1.2\nterminal_cell_width = 1.1\n",
+    )
+    .unwrap();
+    vcx.update(|_, cx| crate::settings::reload(cx));
+    vcx.run_until_parked();
+    let mut selection = Selection::new(krill_term::select::Point { line: 0, column: 4 });
+    selection.head = krill_term::select::Point { line: 0, column: 5 };
+    vcx.draw(point(px(0.), px(0.)), size(px(400.), px(100.)), |_, _| {
+        let mut el = TerminalElement::new(screen.clone(), DEFAULT);
+        el.selection = Some(selection);
+        el
+    });
+    let (misses_on, styles_on) = SHAPE_CACHE.with(|c| {
+        let c = c.borrow();
+        (c.misses, c.styles.len())
+    });
+    assert_eq!(styles_on, 2);
+    assert_eq!(misses_on, 1 + 5);
+    std::fs::remove_dir_all(&dir).ok();
 }

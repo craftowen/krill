@@ -181,6 +181,32 @@ fn excessive_soft_wraps_are_rejected_instead_of_opening_a_prefix() {
     assert!(at(&s, 0, 10).is_none());
 }
 
+#[test]
+fn wrapped_cursor_and_vscode_remote_urls_resolve_across_rows() {
+    let s = screen(
+        24,
+        &[
+            "open cursor://vscode-rem",
+            "ote/ssh-remote+dev/app/m",
+            "ain.rs:12 now",
+        ],
+        true,
+    );
+    let expected = "cursor://vscode-remote/ssh-remote+dev/app/main.rs:12";
+    assert_eq!(at(&s, 0, 10).unwrap().1, expected);
+    assert_eq!(at(&s, 1, 5).unwrap().1, expected);
+    assert_eq!(at(&s, 2, 4).unwrap().1, expected);
+
+    let hard = screen(
+        34,
+        &["  vscode://vscode-remote/ssh-remot", "  e+prod/srv/krill"],
+        false,
+    );
+    let expected_vscode = "vscode://vscode-remote/ssh-remote+prod/srv/krill";
+    assert_eq!(at(&hard, 0, 4).unwrap().1, expected_vscode);
+    assert_eq!(at(&hard, 1, 4).unwrap().1, expected_vscode);
+}
+
 proptest::proptest! {
     #[test]
     fn url_survives_arbitrary_soft_wrap_positions(

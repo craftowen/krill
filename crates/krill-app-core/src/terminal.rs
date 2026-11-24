@@ -24,10 +24,10 @@ use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use gpui::{
-    App, Bounds, Context, Element, ElementId, Font, FontId, FontStyle, FontWeight, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, Pixels, Render, ShapedGlyph,
-    ShapedRun, SharedString, Size, Style, TextRun, Window, WindowTextSystem, fill, font, point, px,
-    rems, size, underline_y_offset,
+    App, Bounds, Context, Element, ElementId, Font, FontFeatures, FontId, FontStyle, FontWeight,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, LineLayout, Pixels, Render,
+    ShapedGlyph, ShapedRun, SharedString, Size, Style, TextRun, Window, WindowTextSystem, fill,
+    font, point, px, rems, size, underline_y_offset,
 };
 use krill_proto::screen::{CursorShape, CursorStyle};
 use krill_proto::theme::{Rgb, Theme};
@@ -58,16 +58,125 @@ pub fn font_size(window: &Window, cx: &App) -> Pixels {
     rems(pt / 16.).to_pixels(window.rem_size())
 }
 
-/// 칸 크기: 'm' 폭 × round(글꼴 × 1.25).
-pub fn cell_size(window: &Window, cx: &App) -> Size<Pixels> {
+/// Typography settings applied to terminal shaping and cell layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalFontConfig {
+    pub weight: u16,
+    pub bold_weight: u16,
+    pub ligatures: bool,
+}
+
+impl TerminalFontConfig {
+    #[must_use]
+    pub fn from_settings(cx: &App) -> Self {
+        Self {
+            weight: crate::settings::terminal_font_weight(cx),
+            bold_weight: crate::settings::terminal_font_weight_bold(cx),
+            ligatures: crate::settings::terminal_font_ligatures(cx),
+        }
+    }
+}
+
+/// Computed cell dimensions and horizontal glyph centering offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellMetrics {
+    pub size: Size<Pixels>,
+    /// Horizontal offset to center a single-cell glyph inside `size.width`.
+    pub glyph_x: Pixels,
+}
+
+/// Pure cell metric computation from raw font advance, ascent, descent, and multipliers.
+/// Uses tighter font-metric row height (`ascent + |descent|`) instead of excessive extra
+/// padding, and centers glyphs within scaled cell widths.
+#[must_use]
+pub fn compute_cell_metrics(
+    font_size: Pixels,
+    face_width: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
+    line_height_mult: f32,
+    cell_width_mult: f32,
+) -> CellMetrics {
+    let font_px = f32::from(font_size).max(1.0);
+    let face_w = {
+        let w = f32::from(face_width);
+        if w.is_finite() && w > 0.0 {
+            w
+        } else {
+            font_px * 0.6
+        }
+    };
+    let metric_h = {
+        let a = f32::from(ascent);
+        let d = f32::from(descent);
+        let sum = if a.is_finite() && d.is_finite() {
+            a.abs() + d.abs()
+        } else {
+            0.0
+        };
+        if sum > 0.0 { sum } else { font_px * 1.2 }
+    };
+    let lh = if line_height_mult.is_finite() {
+        line_height_mult.clamp(
+            crate::settings::TERMINAL_LINE_HEIGHT_MIN,
+            crate::settings::TERMINAL_LINE_HEIGHT_MAX,
+        )
+    } else {
+        crate::settings::DEFAULT_TERMINAL_LINE_HEIGHT
+    };
+    let cw = if cell_width_mult.is_finite() {
+        cell_width_mult.clamp(
+            crate::settings::TERMINAL_CELL_WIDTH_MIN,
+            crate::settings::TERMINAL_CELL_WIDTH_MAX,
+        )
+    } else {
+        crate::settings::DEFAULT_TERMINAL_CELL_WIDTH
+    };
+    let width = (face_w * cw).max(1.0);
+    let height = (metric_h * lh).round().max(1.0);
+    let glyph_x = (width - face_w) * 0.5;
+    CellMetrics {
+        size: size(px(width), px(height)),
+        glyph_x: px(glyph_x),
+    }
+}
+
+/// OpenType feature set for terminal programming ligatures (opt-in `calt`/`liga`, off by default).
+#[must_use]
+pub fn ligature_features(enabled: bool) -> FontFeatures {
+    let flag = u32::from(enabled);
+    FontFeatures(Arc::new(vec![
+        ("calt".into(), flag),
+        ("liga".into(), flag),
+        ("dlig".into(), 0),
+    ]))
+}
+
+/// 칸 크기와 가로 글리프 가운데 정렬 오프셋.
+pub fn cell_metrics(window: &Window, cx: &App) -> CellMetrics {
     let font_size = font_size(window, cx);
     let text = window.text_system();
     let family = crate::settings::terminal_font_family(cx);
-    let id = text.resolve_font(&term_font(&family, false, false));
-    let width = text
+    let font_cfg = TerminalFontConfig::from_settings(cx);
+    let id = text.resolve_font(&term_font(&family, false, false, font_cfg));
+    let face_width = text
         .advance(id, font_size, 'm')
         .map_or(font_size * 0.6, |s| s.width);
-    size(width, (font_size * 1.25).round())
+    let ascent = text.ascent(id, font_size);
+    let descent = text.descent(id, font_size);
+    compute_cell_metrics(
+        font_size,
+        face_width,
+        ascent,
+        descent,
+        crate::settings::terminal_line_height(cx),
+        crate::settings::terminal_cell_width(cx),
+    )
+}
+
+/// 칸 크기: 'm' 폭 × 셀 폭 배율, 글꼴 메트릭(ascent + |descent|) × 줄 높이 배율.
+pub fn cell_size(window: &Window, cx: &App) -> Size<Pixels> {
+    cell_metrics(window, cx).size
 }
 
 /// `area`에 들어가는 (열, 행). 최소 1(빈 영역·잴 수 없는 칸에서도 PTY가 0이 되지 않게).
@@ -88,21 +197,30 @@ pub fn grid(area: Size<Pixels>, cell: Size<Pixels>) -> (u16, u16) {
     (fit(area.width, cell.width), fit(area.height, cell.height))
 }
 
-fn term_font(family: &SharedString, bold: bool, italic: bool) -> Font {
+fn term_font(family: &SharedString, bold: bool, italic: bool, cfg: TerminalFontConfig) -> Font {
     let mut f = font(family.clone());
-    if bold {
-        f.weight = FontWeight::BOLD;
-    }
+    let weight = if bold { cfg.bold_weight } else { cfg.weight }.clamp(
+        crate::settings::TERMINAL_FONT_WEIGHT_MIN,
+        crate::settings::TERMINAL_FONT_WEIGHT_MAX,
+    );
+    f.weight = FontWeight(f32::from(weight));
+    f.features = ligature_features(cfg.ligatures);
     if italic {
         f.style = FontStyle::Italic;
     }
     f
 }
 
-fn text_run(family: &SharedString, len: usize, bold: bool, italic: bool) -> TextRun {
+fn text_run(
+    family: &SharedString,
+    len: usize,
+    bold: bool,
+    italic: bool,
+    cfg: TerminalFontConfig,
+) -> TextRun {
     TextRun {
         len,
-        font: term_font(family, bold, italic),
+        font: term_font(family, bold, italic, cfg),
         color: Hsla::default(),
         background_color: None,
         underline: None,
@@ -157,7 +275,7 @@ impl Render for Terminal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut element = TerminalElement::new(self.screen.clone(), self.theme)
             .with_row_cache(self.row_cache.clone());
-        element.opacity = crate::settings::terminal_opacity_alpha(cx);
+        element.opacity = crate::settings::effective_terminal_opacity_alpha(cx);
         element.cursor = effective_cursor(
             self.screen.cursor_style,
             self.screen.cursor_explicit,
@@ -244,9 +362,9 @@ pub fn link_target<'a>(
     {
         return None;
     }
-    if uri.starts_with("https://") || uri.starts_with("http://") {
+    if krill_proto::screen::url::strip_url_scheme(uri).is_some() {
         let valid = gpui::http_client::Url::parse(uri).is_ok_and(|u| {
-            matches!(u.scheme(), "http" | "https")
+            matches!(u.scheme(), "http" | "https" | "cursor" | "vscode")
                 && u.host_str()
                     .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.'))
         });
@@ -579,8 +697,10 @@ impl Element for TerminalElement {
 
         // 밑줄·취소선 세로 위치(칸 위에서부터). 기본 글꼴 한 글자 레이아웃의 ascent·descent로(스타일별 캐시).
         let font_size = font_size(window, cx);
+        let font_cfg = TerminalFontConfig::from_settings(cx);
+        let metrics = cell_metrics(window, cx);
         let text_system = window.text_system();
-        let base_font_id = text_system.resolve_font(&term_font(&family, false, false));
+        let base_font_id = text_system.resolve_font(&term_font(&family, false, false, font_cfg));
         let (style_id, probe_ascent, probe_descent) = if let Some(resolved) =
             SHAPE_CACHE.with(|cache| {
                 cache.borrow_mut().resolve_style(
@@ -589,6 +709,7 @@ impl Element for TerminalElement {
                     &family,
                     font_size,
                     cell.width,
+                    font_cfg,
                 )
             }) {
             resolved
@@ -596,7 +717,7 @@ impl Element for TerminalElement {
             let probe = text_system.layout_line(
                 "m",
                 font_size,
-                &[text_run(&family, 1, false, false)],
+                &[text_run(&family, 1, false, false, font_cfg)],
                 None,
             );
             let style_id = SHAPE_CACHE.with(|cache| {
@@ -606,6 +727,7 @@ impl Element for TerminalElement {
                     family.clone(),
                     font_size,
                     cell.width,
+                    font_cfg,
                     probe.ascent,
                     probe.descent,
                 )
@@ -617,7 +739,66 @@ impl Element for TerminalElement {
             (cell.height - probe_ascent - probe_descent) / 2. + probe_ascent * (1. - STRIKE_RISE);
 
         let mut runs_scratch = SHAPE_CACHE.with(|cache| cache.borrow_mut().take_runs());
+        let cursor_state = self.screen.cursor;
+        let cursor_width = self.screen.cursor_width();
         window.paint_layer(bounds, |window| {
+            let mut paint_segment = |line: u16,
+                                     seg: &krill_term::grid::Segment,
+                                     window: &mut Window| {
+                let two_cell = seg.wide || seg.overflow;
+                let cached = SHAPE_CACHE.with(|cache| {
+                    cache
+                        .borrow_mut()
+                        .get_layout(style_id, two_cell, &seg.text, &seg.runs)
+                });
+                let layout = if let Some(layout) = cached {
+                    layout
+                } else {
+                    runs_scratch.clear();
+                    runs_scratch.extend(
+                        seg.runs
+                            .iter()
+                            .map(|r| text_run(&family, r.len, r.bold, r.italic, font_cfg)),
+                    );
+                    // MK-058: ZWJ 묶음·넘침(VS16) 묶음은 2칸 간격으로 칠한다(엔진 열은 그대로).
+                    let force = cell.width * if two_cell { 2. } else { 1. };
+                    let layout = window.text_system().layout_line(
+                        &seg.text,
+                        font_size,
+                        &runs_scratch,
+                        Some(force),
+                    );
+                    SHAPE_CACHE.with(|cache| {
+                        cache.borrow_mut().insert_layout(
+                            style_id,
+                            two_cell,
+                            &seg.text,
+                            &seg.runs,
+                            Arc::clone(&layout),
+                        );
+                    });
+                    layout
+                };
+                // 줄 높이 안에서 세로 가운데(gpui ShapedLine::paint와 같은 계산).
+                let baseline = line_y(line)
+                    + (cell.height - layout.ascent - layout.descent) / 2.
+                    + layout.ascent;
+                let glyph_offset_x = metrics.glyph_x * if two_cell { 2. } else { 1. };
+                let x = col_x(seg.column) + glyph_offset_x;
+                for run in &layout.runs {
+                    for g in &run.glyphs {
+                        let origin = point(x + g.position.x, baseline + g.position.y);
+                        // 글리프 하나를 못 그려도(아틀라스 실패) 화면 나머지는 그린다.
+                        let painted = if g.is_emoji {
+                            window.paint_emoji(origin, run.font_id, g.id, font_size)
+                        } else {
+                            let color = seg.color_at(g.index).unwrap_or(theme.foreground);
+                            window.paint_glyph(origin, run.font_id, g.id, font_size, hsla(color))
+                        };
+                        painted.ok();
+                    }
+                }
+            };
             for (line, plan) in (0u16..).zip(plans.iter()) {
                 for (spans, dy) in [(&plan.underlines, underline_dy), (&plan.strikes, strike_dy)] {
                     for span in spans {
@@ -631,63 +812,28 @@ impl Element for TerminalElement {
                     let extent = size(cell.width * f32::from(link.cols), DECORATION);
                     window.paint_quad(fill(Bounds::new(origin, extent), hsla(theme.foreground)));
                 }
-                for seg in &plan.segments {
-                    let two_cell = seg.wide || seg.overflow;
-                    let cached = SHAPE_CACHE.with(|cache| {
-                        cache
-                            .borrow_mut()
-                            .get_layout(style_id, two_cell, &seg.text, &seg.runs)
-                    });
-                    let layout = if let Some(layout) = cached {
-                        layout
-                    } else {
-                        runs_scratch.clear();
-                        runs_scratch.extend(
-                            seg.runs
-                                .iter()
-                                .map(|r| text_run(&family, r.len, r.bold, r.italic)),
-                        );
-                        // MK-058: ZWJ 묶음·넘침(VS16) 묶음은 2칸 간격으로 칠한다(엔진 열은 그대로).
-                        let force = cell.width * if two_cell { 2. } else { 1. };
-                        let layout = window.text_system().layout_line(
-                            &seg.text,
-                            font_size,
-                            &runs_scratch,
-                            Some(force),
-                        );
-                        SHAPE_CACHE.with(|cache| {
-                            cache.borrow_mut().insert_layout(
-                                style_id,
-                                two_cell,
-                                &seg.text,
-                                &seg.runs,
-                                Arc::clone(&layout),
-                            );
-                        });
-                        layout
-                    };
-                    // 줄 높이 안에서 세로 가운데(gpui ShapedLine::paint와 같은 계산).
-                    let baseline = line_y(line)
-                        + (cell.height - layout.ascent - layout.descent) / 2.
-                        + layout.ascent;
-                    let x = col_x(seg.column);
-                    for run in &layout.runs {
-                        for g in &run.glyphs {
-                            let origin = point(x + g.position.x, baseline + g.position.y);
-                            // 글리프 하나를 못 그려도(아틀라스 실패) 화면 나머지는 그린다.
-                            let painted = if g.is_emoji {
-                                window.paint_emoji(origin, run.font_id, g.id, font_size)
-                            } else {
-                                let color = seg.color_at(g.index).unwrap_or(theme.foreground);
-                                window.paint_glyph(
-                                    origin,
-                                    run.font_id,
-                                    g.id,
-                                    font_size,
-                                    hsla(color),
-                                )
-                            };
-                            painted.ok();
+                let ligature_breaks = if font_cfg.ligatures {
+                    let cursor_span =
+                        (cursor_state.visible && !self.cursor_hidden && cursor_state.line == line)
+                            .then_some((cursor_state.column, cursor_width));
+                    let selection_span = self
+                        .selection
+                        .as_ref()
+                        .and_then(|sel| sel.span(line, self.screen.cols));
+                    krill_term::grid::ligature_break_columns(plan, cursor_span, selection_span)
+                } else {
+                    Vec::new()
+                };
+                if ligature_breaks.is_empty() {
+                    for seg in &plan.segments {
+                        paint_segment(line, seg, window);
+                    }
+                } else {
+                    for seg in &plan.segments {
+                        for piece in
+                            krill_term::grid::split_segment_at_columns(seg, &ligature_breaks)
+                        {
+                            paint_segment(line, &piece, window);
                         }
                     }
                 }
@@ -698,6 +844,10 @@ impl Element for TerminalElement {
         // OWE-615 원인 1·3: 확정 에코 대기 글자와 조합 중 글자를 확정 셀과 같은 폭으로 그린다.
         // `pending`은 밑줄 없이(확정된 글자), `preedit`는 밑줄 장식으로. 커서는 마지막 글자 끝에.
         if self.pending.is_some() || self.preedit.is_some() {
+            let ime_font_cfg = TerminalFontConfig {
+                ligatures: false,
+                ..font_cfg
+            };
             let paint_run = |run: &Preedit, underline: bool, window: &mut Window| {
                 let cols = |v: usize| cell.width * f32::from(u16::try_from(v).unwrap_or(u16::MAX));
                 let screen_cols = usize::from(self.screen.cols);
@@ -723,8 +873,8 @@ impl Element for TerminalElement {
                     }
                     let rel = offset - scroll;
                     // 확정 셀과 같은 강제 폭(2칸 글자는 2칸, 아니면 1칸)으로 같은 자리에 그린다.
-                    let force = cell.width
-                        * f32::from(u16::try_from(group_cols.max(1)).unwrap_or(u16::MAX));
+                    let span_cols = f32::from(u16::try_from(group_cols.max(1)).unwrap_or(u16::MAX));
+                    let force = cell.width * span_cols;
                     if run
                         .origin
                         .column
@@ -735,10 +885,11 @@ impl Element for TerminalElement {
                         continue;
                     }
                     let x = row.x + cell.width * f32::from(u16::try_from(rel).unwrap_or(u16::MAX));
+                    let glyph_x = x + metrics.glyph_x * span_cols;
                     let layout = window.text_system().layout_line(
                         &text,
                         font_size,
-                        &[text_run(&family, text.len(), false, false)],
+                        &[text_run(&family, text.len(), false, false, ime_font_cfg)],
                         Some(force),
                     );
                     // 줄 높이 안에서 세로 가운데(확정 셀과 같은 계산).
@@ -746,7 +897,7 @@ impl Element for TerminalElement {
                         row.y + (cell.height - layout.ascent - layout.descent) / 2. + layout.ascent;
                     for layout_run in &layout.runs {
                         for g in &layout_run.glyphs {
-                            let origin = point(x + g.position.x, baseline + g.position.y);
+                            let origin = point(glyph_x + g.position.x, baseline + g.position.y);
                             let painted = if g.is_emoji {
                                 window.paint_emoji(origin, layout_run.font_id, g.id, font_size)
                             } else {
@@ -922,6 +1073,7 @@ struct StyleEntry {
     family: SharedString,
     font_size_bits: u32,
     cell_width_bits: u32,
+    font_cfg: TerminalFontConfig,
     probe_ascent: Pixels,
     probe_descent: Pixels,
 }
@@ -1020,6 +1172,7 @@ impl ShapeCache {
         family: &SharedString,
         font_size: Pixels,
         cell_width: Pixels,
+        font_cfg: TerminalFontConfig,
     ) -> Option<(u64, Pixels, Pixels)> {
         self.prune_dead_styles();
         let font_size_bits = px_bits(font_size);
@@ -1028,6 +1181,7 @@ impl ShapeCache {
             entry.base_font_id == base_font_id
                 && entry.font_size_bits == font_size_bits
                 && entry.cell_width_bits == cell_width_bits
+                && entry.font_cfg == font_cfg
                 && entry.family == *family
                 && entry
                     .text_system
@@ -1055,12 +1209,18 @@ impl ShapeCache {
         family: SharedString,
         font_size: Pixels,
         cell_width: Pixels,
+        font_cfg: TerminalFontConfig,
         probe_ascent: Pixels,
         probe_descent: Pixels,
     ) -> u64 {
-        if let Some((id, _, _)) =
-            self.resolve_style(text_system, base_font_id, &family, font_size, cell_width)
-        {
+        if let Some((id, _, _)) = self.resolve_style(
+            text_system,
+            base_font_id,
+            &family,
+            font_size,
+            cell_width,
+            font_cfg,
+        ) {
             return id;
         }
         if self.styles.len() >= SHAPE_CACHE_MAX_STYLES
@@ -1079,6 +1239,7 @@ impl ShapeCache {
                 family,
                 font_size_bits: px_bits(font_size),
                 cell_width_bits: px_bits(cell_width),
+                font_cfg,
                 probe_ascent,
                 probe_descent,
             },

@@ -433,6 +433,51 @@ fn url_at_strips_trailing_delimiters_before_particles_and_suffixes() {
 }
 
 #[test]
+fn url_at_and_sanitize_support_cursor_and_vscode_remote_links() {
+    let cursor_uri = "cursor://vscode-remote/ssh-remote+prod-box/home/dev/krill";
+    let cursor_row = row(&format!("open ({cursor_uri})에서"));
+    assert_eq!(
+        url_at(&cursor_row, 10),
+        Some(UrlLink {
+            column: 6,
+            cols: u16::try_from(cursor_uri.len()).unwrap(),
+            uri: cursor_uri.into(),
+        })
+    );
+    assert_eq!(
+        sanitize_external_url(&format!("{cursor_uri})에서")),
+        Some(cursor_uri.into())
+    );
+
+    let vscode_uri = "vscode://vscode-remote/wsl+Ubuntu/workspace/src/main.rs:14:2";
+    let vscode_row = row(&format!("see {vscode_uri}."));
+    assert_eq!(
+        url_at(&vscode_row, 12),
+        Some(UrlLink {
+            column: 4,
+            cols: u16::try_from(vscode_uri.len()).unwrap(),
+            uri: vscode_uri.into(),
+        })
+    );
+    assert_eq!(sanitize_external_url(vscode_uri), Some(vscode_uri.into()));
+
+    // Invalid/spoofed cursor & vscode URLs are rejected.
+    assert_eq!(url_at(&row("cursor://"), 2), None);
+    assert_eq!(url_at(&row("vscode://..."), 4), None);
+    assert_eq!(url_at(&row("foocursor://vscode-remote/a"), 10), None);
+    assert_eq!(
+        url_at(&row("cursor://vscode-remote/\u{202e}evil"), 10),
+        None
+    );
+    assert_eq!(sanitize_external_url("cursor://"), None);
+    assert_eq!(sanitize_external_url("vscode://..."), None);
+    assert_eq!(
+        sanitize_external_url("vscode://vscode-remote/\u{202e}evil"),
+        None
+    );
+}
+
+#[test]
 fn input_policy_native_home_lookup_uses_userprofile_on_windows() {
     const CHILD: &str = "KRILL_TEST_NATIVE_LINK_HOME";
     if let Some(home) = std::env::var_os(CHILD) {
