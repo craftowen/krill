@@ -1013,6 +1013,10 @@ pub struct Sidebar {
     /// settings): `Some` while on, holding the worktrees bot workers made (refreshed by
     /// `rebuild`).
     bot_worktrees: Option<BTreeSet<PathBuf>>,
+    /// Cached orchestration snapshots per remote host (fed by `Shell` polling).
+    remote_orchestration: BTreeMap<HostId, Arc<krill_proto::orchestration::OrchestrationStore>>,
+    /// Remote bot worker worktrees to hide per host while `bot_worktrees` is `Some`.
+    remote_bot_worktrees: BTreeMap<HostId, BTreeSet<PathBuf>>,
     comments: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
     collapsed_lineage: BTreeSet<PathBuf>,
@@ -1424,6 +1428,8 @@ impl Sidebar {
             automation_worktrees: BTreeSet::new(),
             cli_worktrees: BTreeSet::new(),
             bot_worktrees: Some(BTreeSet::new()),
+            remote_orchestration: BTreeMap::new(),
+            remote_bot_worktrees: BTreeMap::new(),
             comments: BTreeMap::new(),
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
@@ -2034,6 +2040,16 @@ impl Sidebar {
                     .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
                 s.remote_poll_pacing
                     .retain(|id, _| s.remote_hosts.iter().any(|entry| entry.id == *id));
+                s.remote_orchestration.retain(|host, _| {
+                    s.remote_hosts
+                        .iter()
+                        .any(|entry| *host == HostId::Remote(entry.id.clone()))
+                });
+                s.remote_bot_worktrees.retain(|host, _| {
+                    s.remote_hosts
+                        .iter()
+                        .any(|entry| *host == HostId::Remote(entry.id.clone()))
+                });
                 if changed {
                     s.rebuild(cx);
                 }
@@ -2716,10 +2732,18 @@ impl Sidebar {
     /// Worktrees a local bot chat's workers made: dispatches of runs whose coordinator is a bot
     /// session. A project's own root never counts, so hiding it can't drop the project.
     fn bot_worker_worktrees(&self) -> BTreeSet<PathBuf> {
-        let Some(bots) = self.bot_sessions.get(&HostId::Local) else {
+        self.bot_worker_worktrees_on(&HostId::Local, &self.disk.orchestration)
+    }
+
+    fn bot_worker_worktrees_on(
+        &self,
+        host: &HostId,
+        orch: &krill_proto::orchestration::OrchestrationStore,
+    ) -> BTreeSet<PathBuf> {
+        let Some(bots) = self.bot_sessions.get(host) else {
             return BTreeSet::new();
         };
-        let orch = &self.disk.orchestration;
+        let trees = &self.snapshot_for(host).trees;
         orch.runs
             .iter()
             .filter(|r| {
@@ -2729,12 +2753,41 @@ impl Sidebar {
             .flat_map(|r| orch.dispatches.iter().filter(move |d| d.run_id == r.id))
             .filter_map(|d| {
                 d.session_id
-                    .and_then(|sid| self.session(SessionId(sid)))
+                    .and_then(|sid| self.session_on(host, SessionId(sid)))
                     .and_then(|s| s.worktree.clone())
                     .or_else(|| (!d.cwd.is_empty()).then(|| PathBuf::from(&d.cwd)))
             })
-            .filter(|path| !self.snapshot.trees.contains_key(path))
+            .filter(|path| !trees.contains_key(path))
             .collect()
+    }
+
+    /// Updates cached orchestration state for a remote host so remote bot worker worktrees
+    /// can be hidden from Projects when `hide_bot_workspaces` is enabled.
+    pub fn set_remote_orchestration(
+        &mut self,
+        host: HostId,
+        store: Arc<krill_proto::orchestration::OrchestrationStore>,
+        cx: &mut Context<Self>,
+    ) {
+        if !host.is_remote() || self.remote_orchestration.get(&host) == Some(&store) {
+            return;
+        }
+        self.remote_orchestration.insert(host, store);
+        self.rebuild(cx);
+    }
+
+    /// Drops cached remote orchestration snapshots for hosts that are no longer targeted.
+    pub fn retain_remote_orchestration(
+        &mut self,
+        keep: impl Fn(&HostId) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.remote_orchestration.len();
+        self.remote_orchestration.retain(|host, _| keep(host));
+        self.remote_bot_worktrees.retain(|host, _| keep(host));
+        if self.remote_orchestration.len() != before {
+            self.rebuild(cx);
+        }
     }
 
     /// Orca "Mark Unread" on a bot row: shows the session as unread again (local sessions only,
@@ -3498,6 +3551,13 @@ impl Sidebar {
         self.reconcile_path_identity();
         if self.bot_worktrees.is_some() {
             self.bot_worktrees = Some(self.bot_worker_worktrees());
+            self.remote_bot_worktrees = self
+                .remote_orchestration
+                .iter()
+                .map(|(host, orch)| (host.clone(), self.bot_worker_worktrees_on(host, orch)))
+                .collect();
+        } else {
+            self.remote_bot_worktrees.clear();
         }
         if self.reconcile_pending_added_projects() {
             self.write_state(cx);
@@ -5576,8 +5636,15 @@ impl Sidebar {
         sessions: BTreeMap<SessionId, crate::bots::BotSessionMeta>,
         cx: &mut Context<Self>,
     ) {
+        if self.bot_sessions.get(&host) == Some(&sessions) {
+            return;
+        }
         self.bot_sessions.insert(host, sessions);
-        cx.notify();
+        if self.bot_worktrees.is_some() {
+            self.rebuild(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Registers or refreshes bot identity metadata for a single newly opened bot session.
@@ -5593,6 +5660,29 @@ impl Sidebar {
             .or_default()
             .insert(session_id, meta);
         cx.notify();
+    }
+
+    /// Rebinds cached bot identity metadata when a live bot session switches accounts in place.
+    pub fn rebind_bot_session(
+        &mut self,
+        host: &HostId,
+        from: SessionId,
+        to: SessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(meta) = self
+            .bot_sessions
+            .get_mut(host)
+            .and_then(|sessions| sessions.remove(&from))
+        else {
+            return false;
+        };
+        self.bot_sessions
+            .entry(host.clone())
+            .or_default()
+            .insert(to, meta);
+        cx.notify();
+        true
     }
 
     /// Returns cached bot identity metadata for a session on `host`, if associated with a bot.

@@ -64,6 +64,7 @@ use crate::ui;
 pub use group_dialog::BotGroupMembersDialog;
 pub use group_panel::{GroupChatScope, GroupItemsFilter};
 pub use home::HomeFilter;
+pub use home_item_parts::LinkedDispatchRef;
 
 pub use rpc::{
     BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,

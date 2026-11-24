@@ -68,12 +68,31 @@ impl DisplayFeed {
     /// item note rows). Desktop chat rows carry no time, so a change goes just before the first
     /// owner turn sent after it (`turn_times`: the newest turns' times, newest first), or at
     /// the end when it is newer than all of them.
+    #[cfg(test)]
     pub(super) fn project_with_notes(
         base_index: usize,
         items: &[Arc<ChatItem>],
         unread_from: Option<usize>,
         notes: &[Arc<ItemNote>],
         turn_times: &[u64],
+        fold: Option<&TurnFold>,
+    ) -> Self {
+        let stamps: Vec<TurnStamp> = turn_times
+            .iter()
+            .copied()
+            .map(TurnStamp::time_only)
+            .collect();
+        let empty = std::collections::BTreeMap::new();
+        Self::project_with_turn_stamps(base_index, items, unread_from, notes, &stamps, &empty, fold)
+    }
+
+    pub(super) fn project_with_turn_stamps(
+        base_index: usize,
+        items: &[Arc<ChatItem>],
+        unread_from: Option<usize>,
+        notes: &[Arc<ItemNote>],
+        turn_stamps: &[TurnStamp],
+        observed_user_at_ms: &std::collections::BTreeMap<usize, u64>,
         fold: Option<&TurnFold>,
     ) -> Self {
         let foldable = compute_foldable_notes(items);
@@ -141,7 +160,13 @@ impl DisplayFeed {
             rel_idx = rel_end;
         }
         if !notes.is_empty() {
-            rows = interleave_notes(rows, notes, turn_times, base_index + items.len());
+            rows = interleave_notes(
+                rows,
+                notes,
+                turn_stamps,
+                observed_user_at_ms,
+                base_index + items.len(),
+            );
         }
         if let Some(fold) = fold {
             rows = fold_turns(rows, base_index, items, fold);
@@ -689,17 +714,40 @@ pub(super) struct TurnFold {
     pub expanded: BTreeSet<usize>,
 }
 
-fn item_epoch_secs(item: &ChatItem) -> Option<u64> {
+fn item_epoch_ms(item: &ChatItem) -> Option<u64> {
     let raw = item.at.trim();
     if raw.is_empty() {
         return None;
     }
-    let parsed = u64::try_from(krill_proto::time::parse_reset_epoch(raw)?).ok()?;
-    Some(if parsed > 10_000_000_000 {
-        parsed / 1_000
-    } else {
-        parsed
-    })
+    if let Ok(parsed) = raw.parse::<u64>() {
+        return Some(if parsed > 10_000_000_000 {
+            parsed
+        } else {
+            parsed.saturating_mul(1_000)
+        });
+    }
+    let secs = u64::try_from(krill_proto::time::parse_reset_epoch(raw)?).ok()?;
+    let frac_ms = raw
+        .split_once(['T', 't', ' '])
+        .and_then(|(_, time)| time.split_once(['.', ',']))
+        .map_or(0, |(_, frac)| {
+            let digits: String = frac
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .take(3)
+                .collect();
+            match digits.len() {
+                0 => 0,
+                1 => digits.parse::<u64>().unwrap_or(0) * 100,
+                2 => digits.parse::<u64>().unwrap_or(0) * 10,
+                _ => digits.parse::<u64>().unwrap_or(0),
+            }
+        });
+    Some(secs.saturating_mul(1_000).saturating_add(frac_ms))
+}
+
+fn item_epoch_secs(item: &ChatItem) -> Option<u64> {
+    item_epoch_ms(item).map(|ms| ms / 1_000)
 }
 
 /// Orca's turn fold: under each settled prompt a "Worked for" line, and unless opened, the turn's
@@ -909,29 +957,155 @@ pub(crate) fn parse_inbound_notice(text: &str) -> Option<InboundNotice> {
     })
 }
 
+/// A recorded prompt turn's timestamp and cleaned text for stable `ItemNote` placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TurnStamp {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+impl TurnStamp {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn time_only(at_ms: u64) -> Self {
+        Self {
+            at_ms,
+            text: String::new(),
+        }
+    }
+}
+
+fn turn_stamp_matches_user(stamp_text: &str, item: &ChatItem) -> bool {
+    let stamp = stamp_text.trim();
+    if stamp.is_empty() {
+        return false;
+    }
+    let item_clean = krill_proto::git::clean_prompt_display(
+        &item.text,
+        krill_proto::git::MAX_PROMPT_DISPLAY_CHARS,
+    );
+    if item_clean.as_deref() == Some(stamp) {
+        return true;
+    }
+    if item.file_path.is_empty() {
+        return false;
+    }
+    // `krilld::agent_history::chat::take_leading_image_paths` strips leading attached image paths
+    // out of `item.text` into `item.file_path`, while `SessionPromptHistory` keeps them in the
+    // raw submitted payload (and may truncate at `MAX_PROMPT_DISPLAY_CHARS` with `…`).
+    let mut rest = stamp;
+    let mut stripped_any = false;
+    for path in item
+        .file_path
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let trimmed = rest.trim_start();
+        let after = trimmed
+            .strip_prefix(&format!("'{path}'"))
+            .or_else(|| trimmed.strip_prefix(&format!("\"{path}\"")))
+            .or_else(|| trimmed.strip_prefix(path));
+        if let Some(next) = after {
+            rest = next.trim_start();
+            stripped_any = true;
+        }
+    }
+    if !stripped_any {
+        return false;
+    }
+    let Some(norm) = item_clean.as_deref() else {
+        return rest.is_empty();
+    };
+    if rest == norm
+        || krill_proto::git::clean_prompt_display(rest, krill_proto::git::MAX_PROMPT_DISPLAY_CHARS)
+            .as_deref()
+            == Some(norm)
+    {
+        return true;
+    }
+    rest.strip_suffix('…')
+        .map(str::trim_end)
+        .is_some_and(|prefix| !prefix.is_empty() && norm.starts_with(prefix))
+}
+
 fn interleave_notes(
     rows: Vec<DisplayRow>,
     notes: &[Arc<ItemNote>],
-    turn_times: &[u64],
+    turn_stamps: &[TurnStamp],
+    observed_user_at_ms: &std::collections::BTreeMap<usize, u64>,
     end_abs: usize,
 ) -> Vec<DisplayRow> {
-    // Owner turns, oldest first, paired with their times from the newest end.
-    let users: Vec<usize> = rows
+    // Owner turns, oldest first. Prefer each transcript row's own timestamp (`item.at`), then
+    // text-matched `SessionPromptHistory` turns (including image-attached prompts), then live
+    // observed/submitted timestamps so an ahead-of-transcript or behind-transcript prompt
+    // submission never shifts notes across turns.
+    let users: Vec<(usize, usize, &ChatItem)> = rows
         .iter()
         .enumerate()
         .filter_map(|(pos, row)| match row {
-            DisplayRow::Item { item, .. } if item.kind == ChatItemKind::User => Some(pos),
+            DisplayRow::Item { abs_idx, item } if item.kind == ChatItemKind::User => {
+                Some((pos, *abs_idx, item.as_ref()))
+            }
             _ => None,
         })
         .collect();
+    let mut resolved: Vec<Option<u64>> = users
+        .iter()
+        .map(|&(_, _, item)| item_epoch_ms(item))
+        .collect();
+    let has_text_stamps = turn_stamps.iter().any(|stamp| !stamp.text.is_empty());
+    if has_text_stamps {
+        let mut stamp_idx = 0_usize;
+        for i in (0..users.len()).rev() {
+            let abs_idx = users[i].1;
+            let item = users[i].2;
+            let anchor_hint = resolved[i].or_else(|| observed_user_at_ms.get(&abs_idx).copied());
+            let matched = turn_stamps[stamp_idx..]
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| turn_stamp_matches_user(&s.text, item))
+                .find(|(_, s)| {
+                    // When we already know this row's approximate timestamp, don't bind it to a
+                    // brand-new ahead-of-transcript duplicate-text submission from a later turn.
+                    anchor_hint.is_none_or(|hint| hint.abs_diff(s.at_ms) <= 10_000)
+                })
+                .map(|(rel, _)| stamp_idx + rel);
+            if let Some(found) = matched {
+                let stamp_ms = turn_stamps[found].at_ms;
+                match resolved[i] {
+                    None => resolved[i] = Some(stamp_ms),
+                    Some(own_ms) if own_ms % 1_000 == 0 && own_ms.abs_diff(stamp_ms) < 2_000 => {
+                        resolved[i] = Some(stamp_ms);
+                    }
+                    Some(_) => {}
+                }
+                stamp_idx = found + 1;
+            }
+        }
+    } else if !turn_stamps.is_empty() {
+        let mut ti = 0_usize;
+        for i in (0..users.len()).rev() {
+            if resolved[i].is_none()
+                && !observed_user_at_ms.contains_key(&users[i].1)
+                && let Some(stamp) = turn_stamps.get(ti)
+            {
+                resolved[i] = Some(stamp.at_ms);
+                ti += 1;
+            }
+        }
+    }
+    for (slot, &(_, abs_idx, _)) in resolved.iter_mut().zip(&users) {
+        if slot.is_none()
+            && let Some(&obs_ms) = observed_user_at_ms.get(&abs_idx)
+        {
+            *slot = Some(obs_ms);
+        }
+    }
     let anchors: Vec<(usize, u64)> = users
         .iter()
-        .rev()
-        .zip(turn_times)
-        .map(|(&pos, &at)| (pos, at))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .zip(resolved)
+        .filter_map(|(&(pos, _, _), at)| at.map(|at| (pos, at)))
         .collect();
     let mut before: Vec<Vec<Arc<ItemNote>>> = vec![Vec::new(); rows.len() + 1];
     let mut sorted: Vec<&Arc<ItemNote>> = notes.iter().collect();

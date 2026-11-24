@@ -18,8 +18,8 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
     DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchReleaseState, DispatchSessionOrigin,
     DispatchStatus, FEAT_ORCH_SNAPSHOT_PAGE, FRAME_LIMIT_ERROR, GateStatus, MessageType,
-    OrchAction, OrchMessage, OrchResponse, OrchestrationStore, Run, SendParams, TaskStatus,
-    WorkerOperation, WorkerStartSpec, worker_preamble,
+    OrchAction, OrchMessage, OrchResponse, OrchestrationStore, Run, RunStatus, SendParams,
+    TaskStatus, WorkerOperation, WorkerStartSpec, worker_preamble,
 };
 use krill_proto::screen::Msg;
 
@@ -71,9 +71,18 @@ impl std::ops::Deref for TargetRef<'_> {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestCaller {
+    Env,
+    Custom { session: Option<u32>, is_bot: bool },
+}
+
 struct OrchCtx<'a> {
     target: Option<&'a Target>,
     state_dir: &'a Path,
+    #[cfg(test)]
+    caller: TestCaller,
 }
 
 impl<'a> OrchCtx<'a> {
@@ -82,7 +91,14 @@ impl<'a> OrchCtx<'a> {
         Self {
             target: None,
             state_dir,
+            caller: TestCaller::Env,
         }
+    }
+
+    #[cfg(test)]
+    fn with_caller(mut self, session: Option<u32>, is_bot: bool) -> Self {
+        self.caller = TestCaller::Custom { session, is_bot };
+        self
     }
 
     fn is_remote(&self) -> bool {
@@ -94,10 +110,24 @@ impl<'a> OrchCtx<'a> {
     /// with the same number.
     fn caller_session(&self) -> Option<u32> {
         if self.is_remote() {
-            None
-        } else {
-            caller_session_id()
+            return None;
         }
+        #[cfg(test)]
+        if let TestCaller::Custom { session, .. } = self.caller {
+            return session;
+        }
+        caller_session_id()
+    }
+
+    fn is_bot_caller(&self) -> bool {
+        if self.is_remote() {
+            return false;
+        }
+        #[cfg(test)]
+        if let TestCaller::Custom { is_bot, .. } = self.caller {
+            return is_bot;
+        }
+        std::env::var_os("KRILL_BOT_ID").is_some_and(|v| !v.is_empty())
     }
 
     fn resolve_env_depth(&self, krill_depth: Option<&str>, mk_depth: Option<&str>) -> Option<u32> {
@@ -348,6 +378,8 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     let ctx = OrchCtx {
         target: Some(&target),
         state_dir: &state_dir,
+        #[cfg(test)]
+        caller: TestCaller::Env,
     };
 
     let res = match sub.as_str() {
@@ -1175,7 +1207,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         .transpose()?;
 
     // 스폰 전에 run/task 유효성과 상태를 먼저 검증해 잘못된 요청이 고아 PTY 세션을 남기지 않게 한다.
-    let store = ctx.load_store()?;
+    let mut store = ctx.load_store()?;
     let worker_name = match spec.worker {
         Some(w) => w,
         None if auto_create_task => {
@@ -1189,12 +1221,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         .or(env_depth)
         .or_else(|| store.inferred_child_depth(current_pane))
         .unwrap_or(0);
-    let run_id = match spec.run_id {
-        Some(id) => id,
-        None => store
-            .resolve_run_for_session(None, ctx.caller_session())
-            .map_err(|_| bad_arg("missing --run"))?,
-    };
+    let run_id = resolve_or_create_worker_run(ctx, &mut store, spec.run_id, &prompt, &worker_name)?;
     store.validate_worker_start_with_depth(
         &run_id,
         spec.task_id.as_deref(),
@@ -1341,6 +1368,75 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
         Ok(())
     })
+}
+
+fn resolve_or_create_worker_run(
+    ctx: &OrchCtx<'_>,
+    store: &mut OrchestrationStore,
+    given_run_id: Option<String>,
+    prompt: &str,
+    worker_name: &str,
+) -> io::Result<String> {
+    if let Some(id) = given_run_id {
+        return Ok(id);
+    }
+    let Some(caller_sid) = ctx.caller_session() else {
+        return store
+            .resolve_run_for_session(None, None)
+            .map_err(|_| bad_arg("missing --run"));
+    };
+    let caller_u64 = u64::from(caller_sid);
+    if let Some(bound) = store
+        .session_runs
+        .get(&caller_sid)
+        .filter(|rid| store.runs.iter().any(|r| &r.id == *rid))
+    {
+        return Ok(bound.clone());
+    }
+    if let Some(owned) = store
+        .runs
+        .iter()
+        .rev()
+        .find(|r| r.status == RunStatus::Active && r.coordinator_session_id == Some(caller_u64))
+    {
+        return Ok(owned.id.clone());
+    }
+    let fallback = store.resolve_run_for_session(None, Some(caller_sid)).ok();
+    let fallback_has_other_coordinator = fallback
+        .as_deref()
+        .and_then(|rid| store.runs.iter().find(|r| r.id == rid))
+        .and_then(|r| r.coordinator_session_id)
+        .is_some_and(|other| other != caller_u64);
+    if ctx.is_bot_caller() || fallback.is_none() || fallback_has_other_coordinator {
+        let first_line = prompt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default();
+        let mut title: String = first_line.chars().take(80).collect();
+        if title.is_empty() {
+            title = worker_name.trim().chars().take(80).collect();
+        }
+        if title.is_empty() {
+            "bot-run".clone_into(&mut title);
+        }
+        let created = match ctx.try_ipc(
+            &OrchAction::CreateRun {
+                title: title.clone(),
+                coordinator_session_id: Some(caller_u64),
+            },
+            Duration::from_secs(2),
+        )? {
+            Some(OrchResponse::Run(run)) => run,
+            None => OrchestrationStore::mutate(ctx.state_dir, |s| {
+                s.create_run(&title, Some(caller_u64))
+            })?,
+            Some(_) => return Err(io::Error::other("unexpected create-run reply")),
+        };
+        *store = ctx.load_store()?;
+        return Ok(created.id);
+    }
+    fallback.ok_or_else(|| bad_arg("missing --run"))
 }
 
 fn caller_session_id() -> Option<u32> {
@@ -4981,5 +5077,135 @@ mod snapshot_fallback_tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bot_worker_start_without_run_auto_creates_and_reuses_run_for_caller_session()
+    -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "mk-bot-worker-start-autobind-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+        // Another session's active run is currently `current_run_id`.
+        let other = OrchestrationStore::mutate(&dir, |s| s.create_run("Other run", Some(99)))?;
+        let unbound = OrchestrationStore::mutate(&dir, |s| s.create_run("Unbound run", None))?;
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.current_run_id.as_deref(),
+            Some(unbound.id.as_str())
+        );
+
+        // Bot chat session 42 calls `worker-start` without `--run` while `KRILL_BOT_ID` is set:
+        // must auto-create a run bound to coordinator 42 instead of attaching to `unbound` or `other`.
+        let bot_ctx = OrchCtx::local(&dir).with_caller(Some(42), true);
+        cmd_worker_start_ctx(
+            &bot_ctx,
+            &args(&[
+                "--worker",
+                "w-first",
+                "--prompt",
+                "\nFix bot chat workers\nwith details",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        let bot_run = store
+            .runs
+            .iter()
+            .find(|r| r.coordinator_session_id == Some(42))
+            .expect("auto-created run for bot session 42");
+        assert_ne!(bot_run.id, other.id);
+        assert_ne!(bot_run.id, unbound.id);
+        assert_eq!(bot_run.title, "Fix bot chat workers");
+        assert_eq!(
+            store.session_runs.get(&42).map(String::as_str),
+            Some(bot_run.id.as_str())
+        );
+        let first_disp = store
+            .dispatches
+            .iter()
+            .find(|d| d.worker_name == "w-first")
+            .expect("first dispatch");
+        assert_eq!(first_disp.run_id, bot_run.id);
+
+        // A second `worker-start` from the same bot chat reuses the bound run instead of creating another.
+        cmd_worker_start_ctx(
+            &bot_ctx,
+            &args(&[
+                "--worker",
+                "w-second",
+                "--prompt",
+                "Second worker",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        assert_eq!(
+            store
+                .runs
+                .iter()
+                .filter(|r| r.coordinator_session_id == Some(42))
+                .count(),
+            1
+        );
+        let second_disp = store
+            .dispatches
+            .iter()
+            .find(|d| d.worker_name == "w-second")
+            .expect("second dispatch");
+        assert_eq!(second_disp.run_id, bot_run.id);
+
+        // Non-bot caller whose fallback `current_run_id` belongs to another coordinator (42)
+        // also auto-creates its own run instead of stealing bot 42's run.
+        let other_ctx = OrchCtx::local(&dir).with_caller(Some(77), false);
+        cmd_worker_start_ctx(
+            &other_ctx,
+            &args(&[
+                "--worker",
+                "w-nonbot",
+                "--prompt",
+                "Own work",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        let nonbot_run = store
+            .runs
+            .iter()
+            .find(|r| r.coordinator_session_id == Some(77))
+            .expect("auto-created run for non-bot caller 77");
+        assert_ne!(nonbot_run.id, bot_run.id);
+
+        // Non-bot caller using an unbound (`coordinator_session_id: None`) `current_run_id`
+        // keeps reusing `current_run_id`.
+        OrchestrationStore::mutate(&dir, |s| s.set_current_run(Some(&unbound.id)))?;
+        let unbound_caller = OrchCtx::local(&dir).with_caller(Some(88), false);
+        cmd_worker_start_ctx(
+            &unbound_caller,
+            &args(&[
+                "--worker",
+                "w-unbound",
+                "--prompt",
+                "Keep unbound",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        let unbound_disp = store
+            .dispatches
+            .iter()
+            .find(|d| d.worker_name == "w-unbound")
+            .expect("unbound dispatch");
+        assert_eq!(unbound_disp.run_id, unbound.id);
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }

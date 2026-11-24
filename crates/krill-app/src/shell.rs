@@ -652,6 +652,10 @@ pub struct Shell {
     local_generation: u64,
     ssh_generation: u64,
     orch_snapshot: Arc<krill_proto::orchestration::OrchestrationStore>,
+    remote_orch_snapshots:
+        HashMap<krill_app::hosts::HostId, Arc<krill_proto::orchestration::OrchestrationStore>>,
+    remote_orch_generations: HashMap<krill_app::hosts::HostId, u64>,
+    remote_orch_in_flight: bool,
     orch_poll: Option<Task<()>>,
     fits: fit::Pending,
     focus: FocusHandle,
@@ -1378,6 +1382,9 @@ impl Shell {
             local_generation: 0,
             ssh_generation: 0,
             orch_snapshot: Arc::default(),
+            remote_orch_snapshots: HashMap::new(),
+            remote_orch_generations: HashMap::new(),
+            remote_orch_in_flight: false,
             orch_poll: None,
             fits: fit::Pending::default(),
             focus: cx.focus_handle(),
@@ -1694,9 +1701,92 @@ impl Shell {
         .detach();
     }
 
+    pub(super) fn orch_snapshot_for(
+        &self,
+        host: &krill_app::hosts::HostId,
+    ) -> Option<&krill_proto::orchestration::OrchestrationStore> {
+        match host {
+            krill_app::hosts::HostId::Local => Some(self.orch_snapshot.as_ref()),
+            krill_app::hosts::HostId::Remote(_) => {
+                self.remote_orch_snapshots.get(host).map(Arc::as_ref)
+            }
+        }
+    }
+
+    pub(super) fn prune_remote_orchestration(&mut self, cx: &mut Context<Self>) {
+        let targets = &self.host_targets;
+        self.remote_orch_snapshots
+            .retain(|host, _| targets.contains_key(host));
+        self.remote_orch_generations
+            .retain(|host, _| targets.contains_key(host));
+        let keep: HashSet<krill_app::hosts::HostId> = targets.keys().cloned().collect();
+        self.sidebar.update(cx, |sb, cx| {
+            sb.retain_remote_orchestration(|h| keep.contains(h), cx);
+        });
+    }
+
+    pub(super) fn fetch_remote_orchestration(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        cx: &mut Context<Self>,
+    ) {
+        if !host.is_remote() || self.remote_orch_in_flight {
+            return;
+        }
+        let Some(target) = self.host_targets.get(&host).cloned() else {
+            return;
+        };
+        let prev_generation = self.remote_orch_generations.get(&host).copied();
+        self.remote_orch_in_flight = true;
+        let fetch_target = target.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fetch_remote_orchestration_snapshot(&fetch_target, prev_generation)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.remote_orch_in_flight = false;
+                if this.host_targets.get(&host) == Some(&target)
+                    && let Ok(RemoteOrchFetch::Updated { store, generation }) = result
+                {
+                    if let Some(generation) = generation {
+                        this.remote_orch_generations
+                            .insert(host.clone(), generation);
+                    } else {
+                        this.remote_orch_generations.remove(&host);
+                    }
+                    let changed = this
+                        .remote_orch_snapshots
+                        .insert(host.clone(), store.clone())
+                        .as_ref()
+                        != Some(&store);
+                    this.sidebar.update(cx, |sb, cx| {
+                        sb.set_remote_orchestration(host.clone(), store, cx);
+                    });
+                    if changed {
+                        cx.notify();
+                    }
+                }
+                if this.launch_host != host
+                    && this.launch_host.is_remote()
+                    && this.host_targets.contains_key(&this.launch_host)
+                    && !this.remote_orch_snapshots.contains_key(&this.launch_host)
+                {
+                    let next = this.launch_host.clone();
+                    this.fetch_remote_orchestration(next, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Snapshot reads and file locks happen only on this serial background loop.
     fn poll_orchestration(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
+            let mut tick: u64 = 0;
             loop {
                 let Ok((dir, screens, mut previous, old_ports)) = this.read_with(cx, |this, cx| {
                     let cache = this.ports_cache.borrow();
@@ -1765,6 +1855,14 @@ impl Shell {
                             this.orch_snapshot = snapshot;
                             changed = true;
                         }
+                        this.prune_remote_orchestration(cx);
+                        if this.launch_host.is_remote()
+                            && (!this.remote_orch_snapshots.contains_key(&this.launch_host)
+                                || tick.is_multiple_of(3))
+                        {
+                            let host = this.launch_host.clone();
+                            this.fetch_remote_orchestration(host, cx);
+                        }
                         let mut cache = this.ports_cache.borrow_mut();
                         cache.retain(|id, entry| {
                             let retained = this.live.iter().any(|(pane, live)| {
@@ -1798,6 +1896,7 @@ impl Shell {
                 {
                     return;
                 }
+                tick = tick.wrapping_add(1);
                 cx.background_executor().timer(Duration::from_secs(1)).await;
             }
         })
@@ -2974,12 +3073,22 @@ impl Shell {
                             .retain(|(host, _)| !invalidated.contains(host));
                         this.observed_sessions
                             .retain(|(host, _)| !invalidated.contains(host));
+                        this.remote_orch_generations
+                            .retain(|host, _| !invalidated.contains(host));
                     }
                     this.purge_stale_remote_session_authority();
+                    this.prune_remote_orchestration(cx);
                     this.remote_accounts
                         .retain(|host, _| this.host_targets.contains_key(host));
                     this.remote_account_handoff_polls
                         .retain(|host, _| this.host_targets.contains_key(host));
+                    if this.launch_host.is_remote()
+                        && this.host_targets.contains_key(&this.launch_host)
+                        && !this.remote_orch_snapshots.contains_key(&this.launch_host)
+                    {
+                        let host = this.launch_host.clone();
+                        this.fetch_remote_orchestration(host, cx);
+                    }
                     let connected_remotes: Vec<krill_app::hosts::HostId> = this
                         .host_statuses
                         .iter()
@@ -3043,20 +3152,12 @@ impl Shell {
         self.observed_sessions.retain(|(host, _)| keep(host));
     }
 
-    pub(super) fn blocks_session_prune(
+    fn has_active_account_handoff(
         &self,
-        pane: PaneId,
         host: &krill_app::hosts::HostId,
         session: krill_proto::SessionId,
         cx: &App,
     ) -> bool {
-        if self
-            .live
-            .get(&pane)
-            .is_some_and(|l| l.pane.holds_account_input())
-        {
-            return true;
-        }
         let handoffs = &self.accounts_for_host(host).details.handoffs;
         let sidebar = self.sidebar.read(cx);
         let max_hops = handoffs.len().saturating_add(1);
@@ -3090,6 +3191,30 @@ impl Shell {
                 || self.gone_sessions.contains(&(host.clone(), target));
             !target_closed
         })
+    }
+
+    pub(super) fn expecting_account_replacement(
+        &self,
+        pane: PaneId,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> bool {
+        self.live
+            .get(&pane)
+            .is_some_and(|l| l.pane.awaiting_account_replacement() || l.pane.holds_account_input())
+            || self.sidebar.read(cx).session_account_pending(host, session)
+            || self.has_active_account_handoff(host, session, cx)
+    }
+
+    pub(super) fn blocks_session_prune(
+        &self,
+        pane: PaneId,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &App,
+    ) -> bool {
+        self.expecting_account_replacement(pane, host, session, cx)
     }
 
     /// 상태바·새 세션·설정 진입 시 우선할 계정 대상 호스트.
@@ -3795,8 +3920,43 @@ impl Shell {
                 cx,
             );
         }
+        let switch_sessions = match &req {
+            krill_proto::usage::UsageRequest::SwitchSelectedSessions { sessions, .. } => {
+                sessions.clone()
+            }
+            krill_proto::usage::UsageRequest::SwitchAccount {
+                provider,
+                account_id,
+            } => {
+                let targets = self
+                    .sidebar
+                    .read(cx)
+                    .live_sessions_for_account_switch(&host, *provider, account_id);
+                if !targets.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for &sid in &targets {
+                            s.mark_session_account_pending(
+                                host.clone(),
+                                sid,
+                                account_id.clone(),
+                                cx,
+                            );
+                        }
+                    });
+                }
+                targets
+            }
+            _ => Vec::new(),
+        };
         if host.is_remote() {
             let Some(target) = self.target_for_host(&host) else {
+                if !switch_sessions.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for sid in &switch_sessions {
+                            s.finish_session_account_switch(&host, *sid, cx);
+                        }
+                    });
+                }
                 if mutating {
                     self.notice = Some(
                         krill_app::i18n::catalog::sidebar::HOST_DISCONNECTED
@@ -3823,32 +3983,36 @@ impl Shell {
                     if mutating {
                         this.finish_account_mutation(&host, cx);
                     }
-                    if !current {
-                        return;
-                    }
-                    if !mutating
-                        && read_stamp
-                            .as_ref()
-                            .is_none_or(|stamp| !this.account_read_is_current(stamp))
-                    {
-                        return;
-                    }
-                    match res {
-                        Ok((snap, features)) => {
-                            this.sidebar.update(cx, |s, cx| {
-                                s.set_session_account_features(host.clone(), features, cx);
-                            });
-                            this.apply_accounts_snapshot_for_host(host, snap, cx);
-                            if mutating {
-                                cx.defer(krill_app::settings::notify_external_change);
+                    let apply_ok = current
+                        && (mutating
+                            || read_stamp
+                                .as_ref()
+                                .is_some_and(|stamp| this.account_read_is_current(stamp)));
+                    if apply_ok {
+                        match res {
+                            Ok((snap, features)) => {
+                                this.sidebar.update(cx, |s, cx| {
+                                    s.set_session_account_features(host.clone(), features, cx);
+                                });
+                                this.apply_accounts_snapshot_for_host(host.clone(), snap, cx);
+                                if mutating {
+                                    cx.defer(krill_app::settings::notify_external_change);
+                                }
+                            }
+                            Err(e) => {
+                                if mutating {
+                                    this.notice = Some(e);
+                                    cx.notify();
+                                }
                             }
                         }
-                        Err(e) => {
-                            if mutating {
-                                this.notice = Some(e);
-                                cx.notify();
+                    }
+                    if !switch_sessions.is_empty() {
+                        this.sidebar.update(cx, |s, cx| {
+                            for sid in &switch_sessions {
+                                s.finish_session_account_switch(&host, *sid, cx);
                             }
-                        }
+                        });
                     }
                 })
                 .ok();
@@ -3861,6 +4025,13 @@ impl Shell {
             // OWE-697: 실제 상태 디렉터리에서 데몬 없이 계정을 바꾸지 않는다(읽기 전용).
             // 로컬 변이는 데몬 없는 임시 상태 디렉터리(테스트)에서만 쓴다.
             if mutating && state_dir == krill_proto::daemon::state_dir() {
+                if !switch_sessions.is_empty() {
+                    self.sidebar.update(cx, |s, cx| {
+                        for sid in &switch_sessions {
+                            s.finish_session_account_switch(&host, *sid, cx);
+                        }
+                    });
+                }
                 self.notice = Some(
                     krill_app::i18n::catalog::settings::ACCOUNTS_DAEMON_REQUIRED
                         .get()
@@ -3891,24 +4062,25 @@ impl Shell {
                     if mutating {
                         this.finish_account_mutation(&host, cx);
                     }
-                    if !current {
-                        return;
-                    }
-                    if !mutating
-                        && read_stamp
-                            .as_ref()
-                            .is_none_or(|stamp| !this.account_read_is_current(stamp))
-                    {
-                        return;
-                    }
-                    if this.local_generation != generation || this.link == Link::Up {
-                        return;
-                    }
-                    if let Ok(snap) = result {
+                    let apply_ok = current
+                        && (mutating
+                            || read_stamp
+                                .as_ref()
+                                .is_some_and(|stamp| this.account_read_is_current(stamp)))
+                        && this.local_generation == generation
+                        && this.link != Link::Up;
+                    if apply_ok && let Ok(snap) = result {
                         this.apply_accounts_snapshot(snap, cx);
                         if mutating {
                             cx.defer(krill_app::settings::notify_external_change);
                         }
+                    }
+                    if !switch_sessions.is_empty() {
+                        this.sidebar.update(cx, |s, cx| {
+                            for sid in &switch_sessions {
+                                s.finish_session_account_switch(&host, *sid, cx);
+                            }
+                        });
                     }
                 })
                 .ok();
@@ -3935,38 +4107,42 @@ impl Shell {
                 if mutating {
                     this.finish_account_mutation(&host, cx);
                 }
-                if !current {
-                    return;
-                }
-                if !mutating
-                    && read_stamp
-                        .as_ref()
-                        .is_none_or(|stamp| !this.account_read_is_current(stamp))
-                {
-                    return;
-                }
-                match res {
-                    Ok((snap, features)) => {
-                        this.sidebar.update(cx, |s, cx| {
-                            s.set_session_account_features(
-                                krill_app::hosts::HostId::Local,
-                                features,
-                                cx,
-                            );
-                        });
-                        this.apply_accounts_snapshot(snap, cx);
-                        if mutating {
-                            cx.defer(krill_app::settings::notify_external_change);
+                let apply_ok = current
+                    && (mutating
+                        || read_stamp
+                            .as_ref()
+                            .is_some_and(|stamp| this.account_read_is_current(stamp)));
+                if apply_ok {
+                    match res {
+                        Ok((snap, features)) => {
+                            this.sidebar.update(cx, |s, cx| {
+                                s.set_session_account_features(
+                                    krill_app::hosts::HostId::Local,
+                                    features,
+                                    cx,
+                                );
+                            });
+                            this.apply_accounts_snapshot(snap, cx);
+                            if mutating {
+                                cx.defer(krill_app::settings::notify_external_change);
+                            }
+                        }
+                        Err(e) => {
+                            if mutating {
+                                this.notice = Some(e);
+                                cx.notify();
+                            } else {
+                                tracing::debug!(error = %e, "background account refresh failed");
+                            }
                         }
                     }
-                    Err(e) => {
-                        if mutating {
-                            this.notice = Some(e);
-                            cx.notify();
-                        } else {
-                            tracing::debug!(error = %e, "background account refresh failed");
+                }
+                if !switch_sessions.is_empty() {
+                    this.sidebar.update(cx, |s, cx| {
+                        for sid in &switch_sessions {
+                            s.finish_session_account_switch(&host, *sid, cx);
                         }
-                    }
+                    });
                 }
             })
             .ok();
@@ -4096,9 +4272,8 @@ impl Shell {
             if self.layout.host(*pane) != &host || !snap.details.supported {
                 continue;
             }
-            let handoff = self
-                .layout
-                .session(*pane)
+            let session = self.layout.session(*pane);
+            let handoff = session
                 .and_then(|session| snap.details.handoffs.iter().find(|h| h.from == session));
             match handoff {
                 Some(h) if h.to.is_none() && h.error.is_none() => {} // sync_queued_account_input
@@ -4110,7 +4285,21 @@ impl Shell {
                     }
                     input_notices.extend(live.pane.resume_account_input(true, Now::get()));
                 }
-                None => {} // Observations cannot authorize delivery to the original account.
+                None => {
+                    // Observations cannot authorize delivery to the original account. If a pane
+                    // was detached awaiting a switch with no held bytes and no pending RPC, let it
+                    // reconnect so it is never stranded disconnected after a cancelled switch.
+                    if live.pane.awaiting_account_replacement()
+                        && !live.pane.is_linked()
+                        && !live.pane.holds_account_input()
+                        && session.is_some_and(|sid| {
+                            !self.sidebar.read(cx).session_account_pending(&host, sid)
+                        })
+                    {
+                        input_notices.extend(live.pane.resume_account_input(false, Now::get()));
+                        failed_detached.push(*pane);
+                    }
+                }
             }
         }
         for pane in failed_detached {
@@ -4122,6 +4311,7 @@ impl Shell {
             }
         }
         let mut rebound = false;
+        let mut rebound_bot = false;
         let mut reconnect = std::collections::BTreeSet::new();
         // Durable handoffs can form A -> B -> C while this window is closed.
         for _ in 0..snap.details.handoffs.len().min(128) {
@@ -4131,11 +4321,22 @@ impl Shell {
                     if !self.account_hold_target_matches(&host, handoff.from) {
                         continue;
                     }
+                    let bot_sidebar_rebound = self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.rebind_bot_session(&host, handoff.from, to, cx)
+                    });
+                    let bot_ui_rebound = self.rebind_bot_session_ui(&host, handoff.from, to);
+                    rebound_bot |= bot_sidebar_rebound || bot_ui_rebound;
                     let panes = self.layout.rebind_session(&host, handoff.from, to);
                     if !panes.is_empty() {
                         self.account_holds.remove(&(host.clone(), handoff.from));
-                        // View choices stay on the rebound panes, scoped to their host.
-                        self.chat.logs.remove(&(host.clone(), handoff.from));
+                        self.dismissed_stale_account_banners
+                            .remove(&(host.clone(), handoff.from));
+                        self.gone_sessions.remove(&(host.clone(), handoff.from));
+                        self.gone_sessions.remove(&(host.clone(), to));
+                        self.workspace_closing.remove(&(host.clone(), handoff.from));
+                        self.workspace_closing.remove(&(host.clone(), to));
+                        // View choices, transcript, draft, and scroll position stay on the rebound panes.
+                        self.rebind_chat_session(&host, handoff.from, to, &panes);
                     }
                     changed |= !panes.is_empty();
                     for pane in panes {
@@ -4207,6 +4408,10 @@ impl Shell {
             self.sync_sidebar_tab_state(cx);
             self.save();
             self.refresh_detached(cx);
+            self.poll_visible_chats(cx);
+        }
+        if rebound_bot {
+            self.refresh_bots_badge(cx);
         }
         for notice in &input_notices {
             self.show(Some(notice), cx);
@@ -4285,6 +4490,42 @@ impl Shell {
             }
         }
         cx.notify();
+    }
+
+    fn rebind_bot_session_ui(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        from: krill_proto::SessionId,
+        to: krill_proto::SessionId,
+    ) -> bool {
+        if host != &self.launch_host {
+            return false;
+        }
+        let mut touched = false;
+        for bot in &mut self.sidebar_bots {
+            for session in &mut bot.sessions {
+                if session.session_id == from {
+                    session.session_id = to;
+                    touched = true;
+                }
+            }
+        }
+        if self.bot_ui.open_chats.remove(&from) {
+            self.bot_ui.open_chats.insert(to);
+            touched = true;
+        }
+        if let Some(steps) = self.bot_ui.chat_steps.remove(&from) {
+            self.bot_ui.chat_steps.insert(to, steps);
+            touched = true;
+        }
+        if self.bot_ui.panel.chat_unfolded.remove(&from) {
+            self.bot_ui.panel.chat_unfolded.insert(to);
+            touched = true;
+        }
+        if touched {
+            self.bot_ui.panel.stale = true;
+        }
+        touched
     }
 
     pub(super) fn connect_ssh_host(
@@ -5044,9 +5285,16 @@ impl Shell {
                     }
                 }
                 let alive = this.update(cx, |t, cx| {
+                    let host = t.layout.host(pane).clone();
+                    let session = t
+                        .layout
+                        .session(pane)
+                        .or_else(|| t.live.get(&pane).and_then(|l| l.pane.session()));
+                    let expecting = session
+                        .is_some_and(|sid| t.expecting_account_replacement(pane, &host, sid, cx));
                     let l = t.live.get_mut(&pane)?;
                     l.cut();
-                    if l.pane.is_closed() {
+                    if l.pane.is_closed() || expecting {
                         return None;
                     }
                     let n = l.pane.unlink();
@@ -5224,22 +5472,39 @@ impl Shell {
                     .detach();
                 }
                 let old = self.layout.session(pane);
+                let host = self.layout.host(pane).clone();
                 // 계정 전환 중이면 옛 세션의 끝은 예정된 일이다. 화면·입력을 그대로 두면 재바인딩이 칸을 다시 붙인다.
                 let awaiting = self
                     .live
                     .get(&pane)
                     .is_some_and(|l| l.pane.awaiting_account_replacement());
+                let expecting = old.is_some_and(|session| {
+                    self.expecting_account_replacement(pane, &host, session, cx)
+                });
                 let held = awaiting
+                    || expecting
                     || self
                         .live
                         .get(&pane)
                         .is_some_and(|l| l.pane.holds_account_input());
+                if pane::is_session_gone(&e) && expecting {
+                    if let Some(l) = self.live.get_mut(&pane) {
+                        l.error = None;
+                        l.pane.pause_account_input();
+                    }
+                    self.refresh_accounts_for_host(
+                        host,
+                        krill_proto::usage::UsageRequest::ListAccounts,
+                        cx,
+                    );
+                    cx.notify();
+                    return Next::Gone;
+                }
                 // 데몬이 끝났다고 확정한 세션의 칸은 오류 문구로 남기지 않고 reconcile이 거둔다.
                 if pane::is_session_gone(&e)
                     && !held
                     && let Some(session) = old
                 {
-                    let host = self.layout.host(pane).clone();
                     self.gone_sessions.insert((host.clone(), session));
                     // 계정 이어받기가 남긴 사이드바 사본 행이 reconcile을 막지 않게 먼저 지운다.
                     if self
@@ -5275,7 +5540,7 @@ impl Shell {
                                 )
                                 .ok();
                         }
-                        if !awaiting {
+                        if !awaiting && !expecting {
                             l.error = Some(start_error_text(&e));
                         }
                         cx.notify();
@@ -5304,11 +5569,8 @@ impl Shell {
         cold: krill_proto::control::Cold,
         cx: &mut Context<Self>,
     ) -> Next {
-        if self
-            .live
-            .get(&pane)
-            .is_some_and(|l| l.pane.awaiting_account_replacement() || l.pane.holds_account_input())
-        {
+        let host = self.layout.host(pane).clone();
+        if self.expecting_account_replacement(pane, &host, session, cx) {
             cx.notify();
             return Next::Gone;
         }
@@ -5454,6 +5716,38 @@ impl Shell {
 
     /// krilld 프레임 하나. 연결을 이어 가면 `true`.
     fn on_frame(&mut self, pane: PaneId, k: u8, body: &[u8], cx: &mut Context<Self>) -> bool {
+        if k == krill_proto::screen::kind::CLOSED {
+            let session = self
+                .layout
+                .session(pane)
+                .or_else(|| self.live.get(&pane).and_then(|l| l.pane.session()));
+            let host = self.layout.host(pane).clone();
+            if let Some(session) = session
+                && self.expecting_account_replacement(pane, &host, session, cx)
+                && <krill_proto::screen::Closed as krill_proto::screen::Msg>::decode(k, body)
+                    .is_ok()
+            {
+                // The retired session's PTY closes right before the next ListAccounts poll carries
+                // its replacement handoff. Keep the tab, pane, picture, and held input intact and
+                // fetch the handoff immediately so the pane rebinds in place instead of vanishing.
+                let notice = if let Some(l) = self.live.get_mut(&pane) {
+                    l.cut();
+                    l.error = None;
+                    l.pane.pause_account_input();
+                    l.pane.unlink()
+                } else {
+                    None
+                };
+                self.show(notice.as_ref(), cx);
+                self.refresh_accounts_for_host(
+                    host,
+                    krill_proto::usage::UsageRequest::ListAccounts,
+                    cx,
+                );
+                cx.notify();
+                return false;
+            }
+        }
         let Some(l) = self.live.get_mut(&pane) else {
             return false;
         };
@@ -10190,6 +10484,118 @@ fn start_error_text(err: &std::io::Error) -> String {
         text::START_UNKNOWN_AGENT.get().to_owned()
     } else {
         raw
+    }
+}
+
+enum RemoteOrchFetch {
+    Unchanged,
+    Updated {
+        store: Arc<krill_proto::orchestration::OrchestrationStore>,
+        generation: Option<u64>,
+    },
+}
+
+fn fetch_remote_orchestration_snapshot(
+    target: &krill_app::hosts::HostTarget,
+    prev_generation: Option<u64>,
+) -> std::io::Result<RemoteOrchFetch> {
+    use krill_proto::control::{FEAT_CONTROL, Reply, Request};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore,
+        SNAPSHOT_CHANGED_ERROR,
+    };
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+
+    let hello = daemon::client_hello(ClientRole::App, "krill-app-orch");
+    let mut conn = target.connect(&hello).map_err(std::io::Error::other)?;
+    if conn.negotiated.features & FEAT_CONTROL == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote krilld does not support FEAT_CONTROL",
+        ));
+    }
+    let timeout = Duration::from_secs(2);
+    conn.stream.set_read_timeout(Some(timeout))?;
+    conn.stream.set_write_timeout(Some(timeout))?;
+
+    let mut request = |action: &OrchAction| -> std::io::Result<OrchResponse> {
+        let encoded = Request::Orchestration(action.clone())
+            .encode()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        conn.stream.write_all(&encoded)?;
+        let (kind, body) =
+            ipc::read_frame(&mut conn.stream)?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        match Reply::decode(kind, &body)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        {
+            Reply::Orchestration(resp) => Ok(resp),
+            Reply::Failed(failure) => Err(std::io::Error::other(failure.to_string())),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected orchestration reply",
+            )),
+        }
+    };
+
+    if conn.negotiated.features & FEAT_ORCH_SNAPSHOT_PAGE != 0 {
+        let first = request(&OrchAction::SnapshotPage {
+            generation: None,
+            offset: 0,
+        })?;
+        let (mut cached_first, mut fetched_generation) = match first {
+            OrchResponse::SnapshotPage { generation, .. }
+                if prev_generation == Some(generation) =>
+            {
+                return Ok(RemoteOrchFetch::Unchanged);
+            }
+            page @ OrchResponse::SnapshotPage { generation, .. } => (Some(page), Some(generation)),
+            OrchResponse::Error(msg) if msg.contains(SNAPSHOT_CHANGED_ERROR) => (None, None),
+            OrchResponse::Error(msg) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected snapshot page reply",
+                ));
+            }
+        };
+        let store = OrchestrationStore::fetch_paged(|generation, offset| {
+            if generation.is_none()
+                && offset == 0
+                && let Some(page) = cached_first.take()
+            {
+                return Ok(page);
+            }
+            let resp = request(&OrchAction::SnapshotPage { generation, offset })?;
+            if let OrchResponse::SnapshotPage {
+                generation: page_gen,
+                ..
+            } = &resp
+            {
+                fetched_generation = Some(*page_gen);
+            }
+            Ok(resp)
+        })?;
+        return Ok(RemoteOrchFetch::Updated {
+            store: Arc::new(store),
+            generation: fetched_generation,
+        });
+    }
+
+    match request(&OrchAction::SnapshotV2)? {
+        OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store) => {
+            Ok(RemoteOrchFetch::Updated {
+                store: Arc::new(store),
+                generation: None,
+            })
+        }
+        OrchResponse::Error(msg) => Err(std::io::Error::other(msg)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected orchestration snapshot reply",
+        )),
     }
 }
 

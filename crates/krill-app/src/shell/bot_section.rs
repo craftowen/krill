@@ -53,10 +53,10 @@ pub(super) struct BotUi {
     pub folded: HashSet<BotId>,
     /// "Bot options" (sort and hide); read from settings on first use.
     pub view: Option<krill_app::bots::sidebar_view::BotSidebarView>,
-    /// Chats whose workers are unfolded (Orca: a chat starts folded).
-    pub open_chats: HashSet<krill_proto::SessionId>,
+    /// Chats whose workers the user explicitly folded (chats with workers start open).
+    pub folded_chats: HashSet<(HostId, krill_proto::SessionId)>,
     /// "Show more" steps taken per chat.
-    pub chat_steps: HashMap<krill_proto::SessionId, usize>,
+    pub chat_steps: HashMap<(HostId, krill_proto::SessionId), usize>,
     /// The bot row being renamed in place.
     pub renaming: Option<(BotId, Entity<InputState>, Subscription)>,
     /// The group row being renamed in place.

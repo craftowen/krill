@@ -92,6 +92,22 @@ impl Drop for ReadyDropGuard {
     }
 }
 
+/// Bot-specific launch inputs prepared when resuming a live bot session under a new account.
+pub(crate) struct BotAccountSwitchLaunch {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub extra_env: Vec<(Vec<u8>, Vec<u8>)>,
+    pub mcp_cfg: BotMcpLaunchConfig,
+    pub grant_token: Option<Zeroizing<String>>,
+    pub instructions: String,
+}
+
+/// Outcome of rebinding a live bot session from `old` to `new`, holding `old`'s prior relay
+/// launch token so the caller can revoke it after retirement or roll back on error.
+pub(crate) struct ReboundBotSession {
+    pub previous_token: Option<Zeroizing<String>>,
+}
+
 /// Active mapping between a live Krill PTY session and the bot running inside it.
 #[derive(Clone)]
 pub struct BotSessionBinding {
@@ -1635,6 +1651,133 @@ impl BotRuntime {
                 }
             }
         }
+    }
+
+    /// Prepares bot overrides, MCP config, relay grant, env vars, and instructions when `old`
+    /// is a live bot session switching accounts into replacement session `new`.
+    #[expect(clippy::too_many_arguments, reason = "bot switch launch preparation")]
+    pub(crate) fn prepare_account_switch_launch(
+        &self,
+        store: &BotStore,
+        secrets: &SecretVault,
+        relay: &BotToolRelay,
+        composio_base_url: &str,
+        old: SessionId,
+        new: SessionId,
+        launch_cwd: &std::path::Path,
+    ) -> Result<Option<BotAccountSwitchLaunch>, String> {
+        let Some((bot_id, link_id)) = lock(&self.sessions)
+            .get(&old)
+            .map(|b| (b.bot_id.clone(), b.link_id.clone()))
+        else {
+            return Ok(None);
+        };
+        let Some(bot) = store.get_bot(&bot_id).map_err(|err| err.to_string())? else {
+            return Ok(None);
+        };
+        let home = init_bot_home(store.root(), &bot, None).map_err(|err| err.to_string())?;
+        let soul = store.get_soul(&bot_id).unwrap_or_default();
+        let memory = store.get_memory(&bot_id).unwrap_or_default();
+        let preamble = build_launch_preamble_in(
+            &bot,
+            Some(&soul),
+            Some(&memory),
+            Some(&home),
+            Some(launch_cwd),
+        );
+
+        if bot.connectors.composio.enabled {
+            composio::resolve_and_register_composio_with_root(
+                &bot,
+                secrets,
+                relay,
+                Some(store.root()),
+                composio_base_url,
+                now_ms(),
+            )
+            .ok();
+        }
+
+        let grant = match relay.prepare_launch_for_bot(&bot) {
+            Ok(Some(g)) => Some(g),
+            Ok(None) => Some(
+                relay
+                    .mint_grant_for_creds(&bot.id, vec!["krill".to_owned()])
+                    .map_err(|err| format!("failed to prepare bot tool relay: {err}"))?,
+            ),
+            Err(err) => return Err(format!("failed to prepare bot tool relay: {err}")),
+        };
+        if let Some(ref g) = grant {
+            relay.bind_grant_session(&g.token, new, link_id.as_deref());
+        }
+
+        let mut extra_env: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (
+                b"KRILL_BOT_ID".to_vec(),
+                bot.id.as_str().as_bytes().to_vec(),
+            ),
+            (
+                b"KRILL_BOT_HOME".to_vec(),
+                home.to_string_lossy().as_bytes().to_vec(),
+            ),
+        ];
+        if let Some(ref g) = grant {
+            extra_env.push((
+                b"KRILL_BOT_TOOLS_URL".to_vec(),
+                g.base_url.as_bytes().to_vec(),
+            ));
+            extra_env.push((
+                b"KRILL_BOT_TOOLS_TOKEN".to_vec(),
+                g.token.as_bytes().to_vec(),
+            ));
+        }
+
+        let mut mcp_cfg = build_bot_mcp_launch_config(&bot, &home, grant.as_ref(), secrets);
+        mcp_cfg.instructions = Some(preamble.clone());
+
+        Ok(Some(BotAccountSwitchLaunch {
+            model: bot.model,
+            effort: bot.effort,
+            extra_env,
+            mcp_cfg,
+            grant_token: grant.map(|g| g.token),
+            instructions: preamble,
+        }))
+    }
+
+    /// Rebinds an active bot session from `old` to `new`, returning the previous launch token
+    /// so the caller can revoke it once `old` has retired (or roll back if retirement fails).
+    pub(crate) fn rebind_session(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        new_pid: u32,
+        new_token: Option<Zeroizing<String>>,
+    ) -> Option<ReboundBotSession> {
+        let previous_token = {
+            let mut sessions = lock(&self.sessions);
+            let mut binding = sessions.remove(&old)?;
+            let prev_token = std::mem::replace(&mut binding.launch_token, new_token);
+            binding.pid = new_pid;
+            sessions.insert(new, binding);
+            prev_token
+        };
+        {
+            let mut controls = lock(&self.turn_controls);
+            let ctrl = controls
+                .remove(&old)
+                .unwrap_or_else(|| SessionTurnControl::new(true));
+            ctrl.mark_ready();
+            controls.insert(new, ctrl);
+        }
+        {
+            let mut meta = lock(&self.turn_meta);
+            if let Some(entry) = meta.remove(&old) {
+                meta.insert(new, entry);
+            }
+        }
+        self.persist_bindings();
+        Some(ReboundBotSession { previous_token })
     }
 
     /// Cleans up session state and revokes the session's ephemeral `BotToolRelay` token.

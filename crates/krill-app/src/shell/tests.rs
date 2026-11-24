@@ -3540,6 +3540,214 @@ fn account_switch_keeps_the_same_pane_and_picture(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression: clicking Switch on the stale-account banner (especially in a bot Chat View tab)
+/// must NEVER close or lose the tab when the retiring session's PTY delivers `kind::CLOSED`
+/// before the next `ListAccounts` poll reports `handoff.to = Some(replacement)`.
+/// Tab, pane, chat mode, bot metadata, transcript, and unsent draft must all stay in place.
+#[gpui::test]
+fn account_switch_closed_frame_keeps_bot_chat_tab_and_draft_in_place(cx: &mut TestAppContext) {
+    use krill_proto::SessionId;
+    use krill_proto::agent_history::{ChatItem, ChatItemKind, ChatPollSnapshot};
+    use krill_proto::bots::{BotId, BotSessionSummary};
+    use krill_proto::screen::Msg as _;
+    use krill_proto::usage::{AccountsSnapshot, SessionHandoff};
+
+    let (view, cx) = open(cx, state_path("account-switch-closed-frame-bot-chat"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let tab_count_before = layout_of(&view, cx).tabs().len();
+    let (original, replacement) = (SessionId(860), SessionId(861));
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    let closed_frame = krill_proto::screen::Closed {
+        seq: krill_proto::screen::Seq(1),
+    }
+    .encode()
+    .unwrap();
+    let (closed_kind, closed_body) = ipc::read_frame(&mut &closed_frame[..]).unwrap().unwrap();
+    let bot_id = BotId::new("bot-krill").unwrap();
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let fixture = state_path("account-switch-closed-frame-bot-chat-target");
+            s.paths = Some(Paths {
+                socket: fixture.join("run/krilld.sock"),
+                holder: fixture.join("holder"),
+                krilld: fixture.join("daemon"),
+            });
+            s.link = Link::Up;
+            s.layout.set_session(pane, original);
+            s.attach_test(pane, original, ours, cx);
+            s.set_pane_chat_view(pane, true, cx);
+
+            // Seed bot metadata in sidebar + Shell sidebar_bots.
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.register_bot_session(
+                    krill_app::hosts::HostId::Local,
+                    original,
+                    krill_app::bots::BotSessionMeta {
+                        bot_id: bot_id.clone(),
+                        bot_name: "크릴".into(),
+                        emoji: None,
+                        avatar_color: Some("blue".into()),
+                    },
+                    cx,
+                );
+                // Mark pending (as clicking Switch does at t=0 before ListAccounts arrives).
+                sidebar.mark_session_account_pending(
+                    krill_app::hosts::HostId::Local,
+                    original,
+                    "agy-profile-2".into(),
+                    cx,
+                );
+            });
+            s.sidebar_bots.push(krill_app::bots::SidebarBot {
+                id: bot_id.clone(),
+                name: "크릴".into(),
+                emoji: None,
+                avatar: krill_app::bots::avatar::Avatar::Initial("크".into()),
+                avatar_color: Some("blue".into()),
+                description: String::new(),
+                slug: "bot-krill".into(),
+                paused: false,
+                agent_id: "agy".into(),
+                permission: krill_proto::agent::Permission::Yolo,
+                workspace: None,
+                attention: 0,
+                items_need_you: 0,
+                access_requesters: Vec::new(),
+                sessions: vec![BotSessionSummary {
+                    session_id: original,
+                    bot_id: bot_id.clone(),
+                    link_id: None,
+                    label: "크릴".into(),
+                    working: false,
+                    live: true,
+                    pid: 1234,
+                    created_at_ms: 1,
+                }],
+                updated_at_ms: 1,
+                schedules: Vec::new(),
+            });
+
+            // Seed chat transcript and unsent composer draft.
+            s.apply_chat_poll(
+                original,
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "conv-bot-1".into(),
+                    transcript_path: "/tmp/conv-bot-1.jsonl".into(),
+                    bound: true,
+                    next_offset: 100,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "기존 대화 내용입니다".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let input =
+                s.ensure_chat_input((krill_app::hosts::HostId::Local, original), window, cx);
+            input.update(cx, |state, cx| {
+                state.set_value("아직 보내지 않은 초안", window, cx);
+            });
+
+            let picture = s.live[&pane].pane.shown();
+
+            // 1. Retiring session's PTY delivers CLOSED BEFORE any handoff snapshot arrives!
+            assert!(!s.on_frame(pane, closed_kind, &closed_body, cx));
+
+            // Tab, pane, picture, chat view, and bot metadata must ALL remain intact in place.
+            assert_eq!(s.layout.tabs().len(), tab_count_before);
+            assert!(s.layout.pane_exists(pane));
+            assert_eq!(s.layout.focused(), Some(pane));
+            assert_eq!(s.layout.session(pane), Some(original));
+            assert!(s.is_pane_chat_view(pane, cx));
+            assert!(!s.live[&pane].pane.is_closed());
+            assert!(!s.live[&pane].pane.is_cold());
+            assert!(s.live[&pane].pane.awaiting_account_replacement());
+            assert!(s.workspace_closing.is_empty());
+            assert!(s.gone_sessions.is_empty());
+            assert!(std::rc::Rc::ptr_eq(&picture, &s.live[&pane].pane.shown()));
+
+            // 2. Replacement handoff arrives -> rebinds the SAME tab & pane to `replacement`.
+            let mut snap = AccountsSnapshot::default();
+            snap.details.supported = true;
+            snap.details.handoffs.push(SessionHandoff {
+                from: original,
+                to: Some(replacement),
+                account_id: "agy-profile-2".into(),
+                error: None,
+            });
+            s.apply_accounts_snapshot(snap, cx);
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.finish_session_account_switch(
+                    &krill_app::hosts::HostId::Local,
+                    original,
+                    cx,
+                );
+            });
+
+            assert_eq!(s.layout.tabs().len(), tab_count_before);
+            assert_eq!(s.layout.focused(), Some(pane));
+            assert_eq!(s.layout.session(pane), Some(replacement));
+            assert!(s.is_pane_chat_view(pane, cx));
+            assert!(
+                s.sidebar
+                    .read(cx)
+                    .bot_session_meta_on(&krill_app::hosts::HostId::Local, replacement)
+                    .is_some(),
+                "bot sidebar metadata must follow old -> new"
+            );
+            assert_eq!(s.sidebar_bots[0].sessions[0].session_id, replacement);
+
+            // Draft text and carried-over messages survive with zero blank flash.
+            let new_key = (krill_app::hosts::HostId::Local, replacement);
+            assert_eq!(
+                s.chat.inputs[&new_key].0.read(cx).value().as_ref(),
+                "아직 보내지 않은 초안"
+            );
+            assert_eq!(s.chat.logs[&new_key].items.len(), 1);
+            assert_eq!(s.chat.logs[&new_key].items[0].text, "기존 대화 내용입니다");
+            assert!(s.chat.logs[&new_key].replace_on_next_poll);
+
+            // An unbound poll while the replacement is still booting must NOT flash blank.
+            s.apply_chat_poll(
+                replacement,
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    bound: false,
+                    next_offset: 0,
+                    items: Vec::new(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(s.chat.logs[&new_key].items.len(), 1);
+            assert!(s.chat.logs[&new_key].replace_on_next_poll);
+
+            // First bound poll cleanly replaces carried items with zero duplication.
+            s.apply_chat_poll(
+                replacement,
+                ChatPollSnapshot {
+                    agent: "agy".into(),
+                    session_id: "conv-bot-1".into(),
+                    transcript_path: "/tmp/conv-bot-1-new-profile.jsonl".into(),
+                    bound: true,
+                    next_offset: 100,
+                    items: vec![ChatItem {
+                        kind: ChatItemKind::Assistant,
+                        text: "기존 대화 내용입니다".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            assert!(!s.chat.logs[&new_key].replace_on_next_poll);
+            assert_eq!(s.chat.logs[&new_key].items.len(), 1);
+            assert_eq!(s.chat.logs[&new_key].items[0].text, "기존 대화 내용입니다");
+        });
+    });
+}
+
 /// OWE-615 원인 1: 연속 음절 입력에서 `insertText` 직후 프레임이 와도 이전 확정 글자가 사라지지 않고
 /// 새 preedit가 그 다음 칸에 그려진다. 에코(커서 전진)가 오면 낙관적 글자가 지워진다.
 #[gpui::test]

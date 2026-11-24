@@ -55,13 +55,13 @@ set +m; trap : INT QUIT; trap 'exit 129' HUP; trap 'exit 143' TERM
 case "${KRILL_ACCOUNT_PROVIDER-}" in
   claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
   codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
-  opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi;;
+  opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi; if [ -n "${KRILL_OPENCODE_INSTRUCTIONS_DIR-}" ]; then export OPENCODE_CONFIG_DIR="$KRILL_OPENCODE_INSTRUCTIONS_DIR"; fi;;
   agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill; fi;;
 esac
-unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
 if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
 )
-unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR KRILL_OPENCODE_INSTRUCTIONS_DIR
 exec "${SHELL:-/bin/zsh}" -l
 "#;
 
@@ -649,11 +649,15 @@ fn instruction_args(
                 }
             }
         }
-        env.retain(|(k, _)| k.as_slice() != b"OPENCODE_CONFIG_DIR");
-        env.push((
-            b"OPENCODE_CONFIG_DIR".to_vec(),
-            dir.as_os_str().as_bytes().to_vec(),
-        ));
+        env.retain(|(k, _)| {
+            k.as_slice() != b"OPENCODE_CONFIG_DIR"
+                && k.as_slice() != b"KRILL_OPENCODE_INSTRUCTIONS_DIR"
+        });
+        let dir_bytes = dir.as_os_str().as_bytes().to_vec();
+        env.push((b"OPENCODE_CONFIG_DIR".to_vec(), dir_bytes.clone()));
+        // Preflight/Windows account isolation strips inherited OPENCODE_CONFIG_DIR; pass the
+        // Krill-generated bot instructions dir through an explicit marker so it is restored.
+        env.push((b"KRILL_OPENCODE_INSTRUCTIONS_DIR".to_vec(), dir_bytes));
         return Ok(Vec::new());
     }
     Ok(Vec::new())
@@ -806,6 +810,33 @@ pub(crate) fn resume_in_with_bot_instructions(
     account: Option<&LaunchAccount>,
     instructions: Option<&str>,
 ) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
+    resume_in_with_bot_mcp(
+        profile,
+        permission,
+        session,
+        state,
+        session_id,
+        account,
+        None,
+        None,
+        instructions,
+    )
+}
+
+/// Bot-aware extension of [`resume_in`] that preserves MCP servers, bot home directories,
+/// loopback `NO_PROXY`, and system-prompt instructions across all providers on resume/switch.
+#[expect(clippy::too_many_arguments, reason = "bot resume launch configuration")]
+pub(crate) fn resume_in_with_bot_mcp(
+    profile: &Profile,
+    permission: Permission,
+    session: krill_proto::SessionId,
+    state: Option<&Path>,
+    session_id: Option<&str>,
+    account: Option<&LaunchAccount>,
+    cwd: Option<&Path>,
+    bot_mcp: Option<&BotMcpLaunchConfig>,
+    instructions: Option<&str>,
+) -> io::Result<(Launch, Option<String>, Option<LaunchAccount>)> {
     if session_id.is_some_and(|id| !control::valid_session_id(id)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -815,22 +846,35 @@ pub(crate) fn resume_in_with_bot_instructions(
     let mut files_guard = SessionFilesGuard::new(state, session);
     let mut login = Shell::Login.launch();
     let account = apply_account_env(&mut login, profile, state, account);
-    let instructions =
-        instructions.filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile));
-    let mut effective_profile = std::borrow::Cow::Borrowed(profile);
-    if let Some(text) = instructions {
-        let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
-        let args = instruction_args(&effective_profile, &mut login.env, state_dir, session, text)?;
-        if !args.is_empty() && !effective_profile.launch.is_empty() {
-            effective_profile.to_mut().launch.splice(1..1, args);
-        }
+    if bot_mcp.is_some() {
+        merge_loopback_no_proxy(&mut login.env);
     }
-    let profile = effective_profile.as_ref();
+    let instructions = instructions
+        .or_else(|| bot_mcp.and_then(|m| m.instructions.as_deref()))
+        .filter(|text| !text.trim().is_empty() && takes_bot_instructions(profile));
     let kept_id = session_id.filter(|s| !s.is_empty()).map(str::to_owned);
+
     if is(profile, "codex") {
         let hooked = codex_hooks(profile, state, &login.env)?;
-        let profile = hooked.as_ref().unwrap_or(profile);
-        let mut launch = wrap_account(profile, permission, login, account.as_ref());
+        let mut effective = hooked.unwrap_or_else(|| profile.clone());
+        if let Some(mcp) = bot_mcp {
+            let (mcp_args, mcp_env) = codex::mcp_args_and_env(mcp);
+            if !mcp_args.is_empty() && !effective.launch.is_empty() {
+                effective.launch.splice(1..1, mcp_args);
+            }
+            for (k, v) in mcp_env {
+                login.env.retain(|(ek, _)| ek != &k);
+                login.env.push((k, v));
+            }
+        }
+        if let Some(text) = instructions
+            && !effective.launch.is_empty()
+        {
+            let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
+            let args = instruction_args(&effective, &mut login.env, state_dir, session, text)?;
+            effective.launch.splice(1..1, args);
+        }
+        let mut launch = wrap_account(&effective, permission, login, account.as_ref());
         launch.argv.push(b"resume".to_vec());
         if let Some(id) = &kept_id {
             launch.argv.push(id.as_bytes().to_vec());
@@ -847,9 +891,68 @@ pub(crate) fn resume_in_with_bot_instructions(
         } else {
             claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?
         };
-        let launch = settings.resume(profile, permission, login, kept_id.as_deref())?;
+        if let Some(home) = bot_mcp.and_then(|m| m.bot_home.as_deref())
+            && cwd.is_none_or(|c| !same_workspace_dir(c, home))
+        {
+            settings.add_directories(&[home])?;
+        }
+        let mut effective = std::borrow::Cow::Borrowed(profile);
+        if let Some(mcp) = bot_mcp
+            && (!mcp.http_servers.is_empty() || !mcp.stdio_servers.is_empty())
+            && !effective.launch.is_empty()
+        {
+            let mcp_path =
+                claude::create_mcp_config(state, session, &mcp.http_servers, &mcp.stdio_servers)?;
+            let mcp_str = mcp_path.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "mcp config path is not utf-8")
+            })?;
+            effective
+                .to_mut()
+                .launch
+                .splice(1..1, ["--mcp-config".to_owned(), mcp_str.to_owned()]);
+        }
+        if let Some(text) = instructions
+            && !effective.launch.is_empty()
+        {
+            let args = instruction_args(&effective, &mut login.env, state, session, text)?;
+            if !args.is_empty() {
+                effective.to_mut().launch.splice(1..1, args);
+            }
+        }
+        let launch = settings.resume(effective.as_ref(), permission, login, kept_id.as_deref())?;
         files_guard.disarm();
         return Ok((launch, kept_id, account));
+    }
+
+    let mut effective_profile = std::borrow::Cow::Borrowed(profile);
+    if (is(&effective_profile, "agy") || is(&effective_profile, "antigravity"))
+        && let Some(home) = bot_mcp.and_then(|m| m.bot_home.as_deref())
+        && cwd.is_none_or(|c| !same_workspace_dir(c, home))
+        && let Some(home_str) = home.to_str()
+        && !effective_profile.launch.is_empty()
+    {
+        effective_profile
+            .to_mut()
+            .launch
+            .splice(1..1, ["--add-dir".to_owned(), home_str.to_owned()]);
+    }
+    if let Some(text) = instructions {
+        let state_dir = state.ok_or(io::ErrorKind::NotFound)?;
+        let args = instruction_args(&effective_profile, &mut login.env, state_dir, session, text)?;
+        if !args.is_empty() && !effective_profile.launch.is_empty() {
+            effective_profile.to_mut().launch.splice(1..1, args);
+        }
+    }
+    let profile = effective_profile.as_ref();
+    if let Some(mcp) = bot_mcp {
+        for srv in &mcp.stdio_servers {
+            for (k, v) in &srv.env {
+                login.env.retain(|(ek, _)| ek.as_slice() != k.as_bytes());
+                login
+                    .env
+                    .push((k.as_bytes().to_vec(), v.as_bytes().to_vec()));
+            }
+        }
     }
     if is(profile, "agy") || is(profile, "antigravity") {
         let mut launch = wrap_account(profile, permission, login, account.as_ref());

@@ -192,10 +192,17 @@ fn bot_chats_fold_their_workers_and_rows_say_what_needs_you(cx: &mut TestAppCont
             "Home Chat started the worker"
         );
     });
-    // A chat starts folded; its chevron shows the worker it started.
+    // A chat with workers starts OPEN; clicking its chevron folds it, clicking again unfolds it.
+    let worker = cx
+        .debug_bounds("bot-worker-d1")
+        .expect("worker line visible by default");
+    assert!(worker.top() > home.top() && worker.left() > home.left());
+    click(cx, "bot-chat-fold-21");
     assert!(cx.debug_bounds("bot-worker-d1").is_none());
     click(cx, "bot-chat-fold-21");
-    let worker = cx.debug_bounds("bot-worker-d1").expect("worker line");
+    let worker = cx
+        .debug_bounds("bot-worker-d1")
+        .expect("worker line re-shown");
     assert!(worker.top() > home.top() && worker.left() > home.left());
     // The bot's fold strip hides its chats; collapse all folds every bot.
     click(cx, "bot-fold-krill");
@@ -941,6 +948,404 @@ fn bot_sidebar_times_match_projects_size_and_folded_avatars_show_blue_unread_dot
         .expect("folded bot avatar must display unread dot");
     assert_eq!(dot.size.width, px(10.), "6px dot + 2px ring on each side");
     assert_eq!(dot.size.height, px(10.), "6px dot + 2px ring on each side");
+}
+
+#[gpui::test]
+fn remote_host_bot_chat_workers_render_open_by_default_and_fold_cleanly(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("bot-sidebar-remote-workers"));
+    cx.simulate_resize(gpui::size(px(1400.), px(1000.)));
+    let remote_host = krill_app::hosts::HostId::Remote("studio".into());
+    let wt = "/remote/krill/.worktrees/fix-ui";
+    let remote_snapshot = sidebar::Snapshot {
+        sessions: vec![
+            session(21, AgentState::Done, Some("Checked remote PR"), None),
+            session(31, AgentState::Working, None, Some(wt)),
+        ],
+        trees: std::collections::BTreeMap::from([(
+            std::path::PathBuf::from("/remote/krill"),
+            vec![std::path::PathBuf::from(wt)],
+        )]),
+    };
+    let store = Arc::new(worker_store(21, 31, wt));
+    let remote_bot = bot(
+        "remote-krill",
+        "Remote Krill",
+        "Runs on studio",
+        vec![chat("remote-krill", 21, "")],
+    );
+    let remote_bot_meta = remote_bot.session_meta();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.launch_host = remote_host.clone();
+            s.remote_orch_snapshots
+                .insert(remote_host.clone(), store.clone());
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "studio",
+                    krill_app::hosts::HostStatus::Connected,
+                    remote_snapshot,
+                    cx,
+                );
+                sb.set_bot_sessions(
+                    remote_host.clone(),
+                    std::collections::BTreeMap::from([(SessionId(21), remote_bot_meta)]),
+                    cx,
+                );
+                let rows_before = sb.row_count();
+                sb.set_remote_orchestration(remote_host.clone(), store, cx);
+                assert!(
+                    sb.row_count() < rows_before,
+                    "remote bot worker worktree should be hidden from Projects ({} -> {})",
+                    rows_before,
+                    sb.row_count()
+                );
+            });
+            s.apply_sidebar_bots(0, vec![remote_bot], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let home = cx.debug_bounds("bot-chat-21").expect("remote bot chat");
+    let worker = cx
+        .debug_bounds("bot-worker-d1")
+        .expect("remote worker visible immediately by default");
+    assert!(worker.top() > home.top() && worker.left() > home.left());
+
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let facts = s.bot_facts(&s.sidebar_bots[0], None, cx);
+        assert_eq!(facts.chats[0].workers.len(), 1);
+        assert_eq!(facts.chats[0].workers[0].title, "fix-ui");
+        assert_eq!(facts.chats[0].workers[0].repo.as_deref(), Some("krill"));
+        assert!(facts.chats[0].workers[0].live);
+    });
+
+    click(cx, "bot-chat-fold-21");
+    assert!(cx.debug_bounds("bot-worker-d1").is_none());
+    click(cx, "bot-chat-fold-21");
+    assert!(cx.debug_bounds("bot-worker-d1").is_some());
+}
+
+#[gpui::test]
+fn bot_workers_dedup_by_session_keep_resumed_live_and_avoid_repo_root_duplicate_title(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::orchestration::{
+        Dispatch, DispatchStatus, OrchestrationStore, Run, RunStatus,
+    };
+
+    let (view, cx) = open(cx, state_path("bot-sidebar-worker-facts"));
+    cx.simulate_resize(gpui::size(px(1400.), px(1000.)));
+    let repo_root = "/repo/krill";
+    let child_wt = "/repo/krill/.worktrees/feature-a";
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![
+            session(21, AgentState::Done, None, None),
+            // Resumed worker after previous dispatch succeeded: still actively Working in repo root
+            // with a bare agent title ("claude"), so title must fall back to worker_name, not "krill".
+            session(31, AgentState::Working, Some("claude"), Some(repo_root)),
+            // Worker in repo root with a meaningful session title.
+            session(
+                32,
+                AgentState::Done,
+                Some("Refactor auth flow"),
+                Some(repo_root),
+            ),
+            // Worker in distinct child worktree: keeps worktree directory basename.
+            session(
+                33,
+                AgentState::Working,
+                Some("Ignored for child wt"),
+                Some(child_wt),
+            ),
+        ],
+        trees: std::collections::BTreeMap::from([(
+            std::path::PathBuf::from(repo_root),
+            vec![
+                std::path::PathBuf::from(repo_root),
+                std::path::PathBuf::from(child_wt),
+            ],
+        )]),
+    };
+    let make_dispatch =
+        |id: &str, worker_name: &str, sid: u64, cwd: &str, status, at_ms| Dispatch {
+            id: id.into(),
+            run_id: "r1".into(),
+            task_id: None,
+            worker_name: worker_name.into(),
+            agent: "claude".into(),
+            session_id: Some(sid),
+            depth: 1,
+            cwd: cwd.into(),
+            prompt: String::new(),
+            status,
+            summary: None,
+            archived_output: None,
+            started_at_ms: at_ms,
+            ended_at_ms: (status != DispatchStatus::Active).then_some(at_ms),
+            release_state: krill_proto::orchestration::DispatchReleaseState::default(),
+            session_origin: krill_proto::orchestration::DispatchSessionOrigin::default(),
+            model: None,
+            effort: None,
+            retry_of: None,
+            request_id: None,
+        };
+    let store = OrchestrationStore {
+        runs: vec![Run {
+            id: "r1".into(),
+            title: "run".into(),
+            coordinator_session_id: Some(21),
+            status: RunStatus::Active,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }],
+        dispatches: vec![
+            // Two dispatches sharing session 31 (older succeeded + newer succeeded while session is Working).
+            make_dispatch(
+                "d-old",
+                "old-name",
+                31,
+                repo_root,
+                DispatchStatus::Succeeded,
+                1000,
+            ),
+            make_dispatch(
+                "d-new",
+                "fix-login",
+                31,
+                repo_root,
+                DispatchStatus::Succeeded,
+                2000,
+            ),
+            make_dispatch(
+                "d-titled",
+                "auth-worker",
+                32,
+                repo_root,
+                DispatchStatus::Succeeded,
+                1500,
+            ),
+            make_dispatch(
+                "d-child",
+                "child-worker",
+                33,
+                child_wt,
+                DispatchStatus::Active,
+                1800,
+            ),
+        ],
+        ..OrchestrationStore::default()
+    };
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.orch_snapshot = Arc::new(store);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+            let krill = bot("krill", "Krill bot", "Ships", vec![chat("krill", 21, "")]);
+            s.apply_sidebar_bots(0, vec![krill], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let facts = s.bot_facts(&s.sidebar_bots[0], None, cx);
+        let workers = &facts.chats[0].workers;
+        assert_eq!(workers.len(), 3, "duplicate session 31 must be deduplicated");
+
+        let w31 = workers
+            .iter()
+            .find(|w| w.session == Some(SessionId(31)))
+            .expect("session 31");
+        assert_eq!(w31.key, "d-new", "newest dispatch for session 31 wins");
+        assert!(
+            w31.live,
+            "resumed Working session must be live even after DispatchStatus::Succeeded"
+        );
+        assert_eq!(
+            w31.title, "fix-login",
+            "repo-root worker with bare agent title must fall back to worker_name, not repo basename"
+        );
+        assert_eq!(w31.repo.as_deref(), Some("krill"));
+
+        let w32 = workers
+            .iter()
+            .find(|w| w.session == Some(SessionId(32)))
+            .expect("session 32");
+        assert!(!w32.live);
+        assert_eq!(
+            w32.title, "Refactor auth flow",
+            "repo-root worker prefers meaningful session title"
+        );
+        assert_eq!(w32.repo.as_deref(), Some("krill"));
+
+        let w33 = workers
+            .iter()
+            .find(|w| w.session == Some(SessionId(33)))
+            .expect("session 33");
+        assert!(w33.live);
+        assert_eq!(
+            w33.title, "feature-a",
+            "distinct child worktree keeps worktree directory name"
+        );
+        assert_eq!(w33.repo.as_deref(), Some("krill"));
+    });
+}
+
+#[gpui::test]
+fn bot_panel_chats_tab_shows_orch_and_linked_dispatch_workers_open_by_default(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::bots::{
+        BotConfig, BotItem, BotItemActor, BotItemEvent, BotItemEventKind, BotItemStatus,
+        BotRpcRequest, BotRpcResponse,
+    };
+    use krill_proto::orchestration::{Dispatch, DispatchStatus, Run, RunStatus};
+
+    let (view, cx) = open(cx, state_path("bot-panel-chats-workers"));
+    cx.simulate_resize(gpui::size(px(1400.), px(1000.)));
+    let wt1 = "/repo/krill/.worktrees/release";
+    let wt2 = "/repo/krill/.worktrees/linked-fix";
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![
+            session(21, AgentState::Done, Some("Home"), None),
+            session(31, AgentState::Working, Some("Release build"), Some(wt1)),
+            session(32, AgentState::Done, Some("Linked dispatch fix"), Some(wt2)),
+        ],
+        trees: std::collections::BTreeMap::from([(
+            std::path::PathBuf::from("/repo/krill"),
+            vec![std::path::PathBuf::from(wt1), std::path::PathBuf::from(wt2)],
+        )]),
+    };
+    let krill_id = BotId::new("krill").unwrap();
+    let cfg = BotConfig::new(krill_id.clone(), "Krill bot", "claude", 1_700_000_000_000).unwrap();
+    let item = BotItem {
+        uid: "item-1".to_owned(),
+        number: 1,
+        owner_bot_id: krill_id.clone(),
+        title: "Track linked dispatch".to_owned(),
+        description: None,
+        done_means: None,
+        status: BotItemStatus::Working,
+        close_note: None,
+        links: Vec::new(),
+        events: vec![BotItemEvent {
+            id: 1,
+            item_uid: "item-1".to_owned(),
+            actor: BotItemActor::Bot {
+                bot_id: krill_id,
+                session_id: Some(SessionId(21)),
+            },
+            kind: BotItemEventKind::Linked,
+            text: "dispatch:disp-7182".to_owned(),
+            decisions: Vec::new(),
+            created_at_ms: 1_700_000_050_000,
+        }],
+        snoozed_until_ms: None,
+        version: 1,
+        last_activity_at_ms: 1_700_000_050_000,
+        created_at_ms: 1_700_000_050_000,
+        updated_at_ms: 1_700_000_050_000,
+        closed_at_ms: None,
+    };
+    let chats = vec![chat("krill", 21, "")];
+    let listed = chats.clone();
+    let rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        Ok(match req {
+            BotRpcRequest::ListBots => BotRpcResponse::Bots(vec![cfg.clone()]),
+            BotRpcRequest::ListItems { .. } => BotRpcResponse::Items(vec![item.clone()]),
+            BotRpcRequest::ListBotSessions { .. } => BotRpcResponse::BotSessions(listed.clone()),
+            BotRpcRequest::ConnectorStatus { .. } => BotRpcResponse::ConnectorStatuses(Vec::new()),
+            BotRpcRequest::ListAccessRequests { .. } => BotRpcResponse::AccessRequests(Vec::new()),
+            BotRpcRequest::ToolRelayStatus => {
+                BotRpcResponse::ToolRelayStatus(krill_proto::bots::BotToolRelayStatus::default())
+            }
+            _ => BotRpcResponse::Ok,
+        })
+    });
+    let mut store = worker_store(21, 31, wt1);
+    store.runs.push(Run {
+        id: "r-linked".into(),
+        title: "linked".into(),
+        coordinator_session_id: None,
+        status: RunStatus::Active,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    });
+    store.dispatches.push(Dispatch {
+        id: "disp-7182".into(),
+        run_id: "r-linked".into(),
+        task_id: None,
+        worker_name: "linked-fix".into(),
+        agent: "claude".into(),
+        session_id: Some(32),
+        depth: 1,
+        cwd: wt2.into(),
+        prompt: String::new(),
+        status: DispatchStatus::Succeeded,
+        summary: None,
+        archived_output: None,
+        started_at_ms: 1_700_000_040_000,
+        ended_at_ms: Some(1_700_000_045_000),
+        release_state: krill_proto::orchestration::DispatchReleaseState::default(),
+        session_origin: krill_proto::orchestration::DispatchSessionOrigin::default(),
+        model: None,
+        effort: None,
+        retry_of: None,
+        request_id: None,
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_override = Some(rpc);
+            s.orch_snapshot = Arc::new(store);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+            let krill = bot("krill", "Krill bot", "Ships releases", chats);
+            s.apply_sidebar_bots(0, vec![krill], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Open the bot's Home Chat so the right-hand BotPanel appears, then switch to Chats tab.
+    click(cx, "bot-row-krill");
+    assert!(cx.debug_bounds("bot-panel").is_some());
+    click(cx, "bot-panel-tab-chats");
+    assert!(cx.debug_bounds("bot-panel-chat-21").is_some());
+    assert!(
+        cx.debug_bounds("bot-chat-worker-31").is_some(),
+        "orchestration worker must appear open by default in Chats tab"
+    );
+    assert!(
+        cx.debug_bounds("bot-chat-worker-32").is_some(),
+        "dispatch:disp-7182 item-linked worker must resolve via orch_snapshot and appear open by default"
+    );
+
+    // Clicking the panel's fold button collapses/expands the worker list.
+    click(cx, "bot-panel-chat-fold-21");
+    assert!(cx.debug_bounds("bot-chat-worker-31").is_none());
+    assert!(cx.debug_bounds("bot-chat-worker-32").is_none());
+    click(cx, "bot-panel-chat-fold-21");
+    assert!(cx.debug_bounds("bot-chat-worker-31").is_some());
+    assert!(cx.debug_bounds("bot-chat-worker-32").is_some());
+
+    // Clicking a worker opens it as a regular session (NOT a bot chat session).
+    click(cx, "bot-chat-worker-31");
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(
+            s.focused_session(),
+            Some((krill_app::hosts::HostId::Local, SessionId(31)))
+        );
+        assert!(
+            s.sidebar
+                .read(cx)
+                .bot_session_meta_on(&krill_app::hosts::HostId::Local, SessionId(31))
+                .is_none(),
+            "opening a worker must not register it as a bot chat session"
+        );
+    });
 }
 
 #[test]
