@@ -185,9 +185,14 @@ impl Shell {
                 .get(&(host.clone(), id.clone()))
                 .and_then(|(_, img)| img.clone())
         });
-        let faces = group_faces::render_group_faces(&face_members, AVATAR, p.worktree_sidebar, p);
+        let surface_bg = if facts.active {
+            p.worktree_sidebar_active()
+        } else {
+            p.worktree_sidebar
+        };
+        let faces = group_faces::render_group_faces(&face_members, AVATAR, surface_bg, p);
         let badge = (facts.status == RowStatus::Permission)
-            .then(|| avatar_badge(facts.status, false, p, cx))
+            .then(|| avatar_badge(facts.status, None, surface_bg, p, cx))
             .flatten();
         let trailing_working = (!facts.all_paused && facts.status == RowStatus::Working)
             .then(|| self.render_row_working_mark(&format!("group-{gid}"), cx));
@@ -205,12 +210,10 @@ impl Shell {
                 .truncate()
                 .text_size(ui::TEXT_MD)
                 .line_height(px(20.))
-                .when(unread || facts.active, |d| {
+                .when(unread, |d| {
                     d.font_weight(FontWeight::SEMIBOLD).text_color(p.foreground)
                 })
-                .when(!unread && !facts.active, |d| {
-                    d.text_color(p.foreground.opacity(0.8))
-                })
+                .when(!unread, |d| d.text_color(p.foreground.opacity(0.8)))
                 .child(group.name.clone())
                 .into_any_element(),
         };
@@ -271,7 +274,7 @@ impl Shell {
             .pl(px(5.))
             .pr_1p5()
             .py(px(5.))
-            .rounded(ui::RADIUS_LG)
+            .rounded(ui::RADIUS_MD)
             .border_1()
             .overflow_hidden()
             .flex()
@@ -335,7 +338,7 @@ impl Shell {
                                                 .debug_selector(move || age_sel.clone())
                                                 .ml_auto()
                                                 .flex_none()
-                                                .text_size(ui::TEXT_2XS)
+                                                .text_size(ui::TEXT_3XS)
                                                 .line_height(gpui::relative(1.))
                                                 .text_color(p.muted_foreground)
                                                 .child(age),
@@ -434,7 +437,7 @@ impl Shell {
                         upload,
                         &m.name,
                         px(20.),
-                        px(6.),
+                        ui::RADIUS_XS,
                         p,
                     );
                     member_list = member_list.child(
@@ -451,6 +454,10 @@ impl Shell {
                 }
                 col = col.child(member_list);
                 if let Some(line) = preview.clone() {
+                    let text_line = match age.clone() {
+                        Some(age) => format!("{age} · {line}"),
+                        None => line,
+                    };
                     col = col.child(
                         div()
                             .pt_2()
@@ -459,14 +466,7 @@ impl Shell {
                             .text_size(ui::TEXT_SM)
                             .text_color(p.popover_foreground)
                             .line_clamp(3)
-                            .when_some(age.clone(), |d, age| {
-                                d.child(
-                                    div()
-                                        .text_color(p.muted_foreground)
-                                        .child(format!("{age} · ")),
-                                )
-                            })
-                            .child(line),
+                            .child(text_line),
                     );
                 }
                 col
@@ -503,6 +503,14 @@ impl Shell {
             let aud = audience.clone();
             let new_thread = text::GRP_NEW_THREAD.format(&[("name", &g2.name)]);
             menu.item(
+                PopupMenuItem::new(text::SB_RENAME.get())
+                    .icon(gpui_component::Icon::default().data(ui::icons::PENCIL_SVG))
+                    .on_click(move |_, window, cx| {
+                        t4.update(cx, |s, cx| s.start_group_rename_on(&h4, &g4.id, window, cx))
+                            .ok();
+                    }),
+            )
+            .item(
                 PopupMenuItem::new(text::GRP_MANAGE_MEMBERS_MENU.get())
                     .icon(gpui_component::Icon::default().data(ui::icons::USERS_SVG))
                     .on_click(move |_, window, cx| {
@@ -522,18 +530,10 @@ impl Shell {
                         .ok();
                     }),
             )
-            .item(
-                PopupMenuItem::new(text::SB_RENAME.get())
-                    .icon(gpui_component::Icon::default().data(ui::icons::PENCIL_SVG))
-                    .on_click(move |_, window, cx| {
-                        t4.update(cx, |s, cx| s.start_group_rename_on(&h4, &g4.id, window, cx))
-                            .ok();
-                    }),
-            )
             .separator()
             .item(
                 PopupMenuItem::new(text::GRP_DELETE_MENU.get())
-                    .icon(IconName::Delete)
+                    .icon(gpui_component::Icon::default().data(ui::icons::TRASH_SVG))
                     .on_click(move |_, _, cx| {
                         t3.update(cx, |s, cx| {
                             s.bot_ui.delete_group = Some((h3.clone(), g3.clone()));

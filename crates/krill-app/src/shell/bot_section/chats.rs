@@ -4,8 +4,9 @@
 //! lines), capped with "Show N more".
 
 use gpui::{Context, FontWeight, SharedString, div, prelude::*, px};
-use gpui_component::IconName;
-use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::{IconName, Sizable as _};
 use krill_app::bots::SidebarBot;
 use krill_app::i18n::catalog::bots as text;
 use krill_app::ui;
@@ -81,6 +82,11 @@ impl Shell {
         } else {
             (chat.at_ms > 0).then(|| ui::format_short_time_ago_secs(chat.at_ms / 1000, now_secs()))
         };
+        let display_title: SharedString = if chat.home {
+            text::SB_HOME_CHAT_EXACT.get().into()
+        } else {
+            chat.title.clone()
+        };
         let sel = SharedString::from(format!("bot-chat-{}", chat.session.0));
         let elem_id = SharedString::from(if host.is_local() {
             format!("bot-chat-{}", chat.session.0)
@@ -94,6 +100,9 @@ impl Shell {
         let this = cx.weak_entity();
         let menu_host = host.clone();
         let menu_bot = bot.id.clone();
+        let more_this = cx.weak_entity();
+        let more_host = host.clone();
+        let more_bot = bot.id.clone();
         let group = SharedString::from(if host.is_local() {
             format!("bot-chat-group-{}", chat.session.0)
         } else {
@@ -105,15 +114,15 @@ impl Shell {
             .role(gpui::Role::Button)
             .tab_index(0)
             .focus_visible(|d| d.border_1().border_color(p.ring))
-            .aria_label(chat.title.clone())
+            .aria_label(display_title.clone())
             .aria_expanded(open)
-            .group(group)
-            // Orca: `h-6 gap-1.5 rounded-md pr-0.5 pl-1 text-xs text-muted-foreground`.
+            .group(group.clone())
+            // Orca: `h-6 gap-1.5 rounded-md (6px) pr-0.5 pl-1 text-xs (12px) text-muted-foreground`.
             .h(px(24.))
             .min_w_0()
             .pl_1()
             .pr_0p5()
-            .rounded(ui::RADIUS_MD)
+            .rounded(ui::RADIUS_SM)
             .flex()
             .items_center()
             .gap_1p5()
@@ -139,7 +148,7 @@ impl Shell {
                     .when(chat.unread || chat.active, |d| {
                         d.font_weight(FontWeight::SEMIBOLD)
                     })
-                    .child(chat.title.clone()),
+                    .child(display_title.clone()),
             )
             .child(
                 div()
@@ -151,19 +160,62 @@ impl Shell {
                     .gap_1()
                     .child({
                         let age_sel = format!("bot-chat-age-{}", chat.session.0);
+                        let more_sel = format!("bot-chat-more-{}", chat.session.0);
+                        let more_dbg = more_sel.clone();
                         div()
-                            .debug_selector(move || age_sel.clone())
+                            .relative()
                             .min_w(px(24.))
-                            .truncate()
-                            .text_size(ui::TEXT_2XS)
-                            .line_height(gpui::relative(1.))
-                            .text_color(p.muted_foreground)
-                            .children(trailing)
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .debug_selector(move || age_sel.clone())
+                                    .min_w(px(24.))
+                                    .truncate()
+                                    .text_right()
+                                    .text_size(ui::TEXT_3XS)
+                                    .line_height(gpui::relative(1.))
+                                    .text_color(p.muted_foreground)
+                                    .group_hover(group.clone(), gpui::Styled::invisible)
+                                    .children(trailing),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .invisible()
+                                    .group_hover(group, gpui::Styled::visible)
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(
+                                        Button::new(SharedString::from(more_sel))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(
+                                                gpui_component::Icon::new(IconName::Ellipsis)
+                                                    .size(px(14.)),
+                                            )
+                                            .accessibility_label(text::SB_CHAT_ACTIONS.get())
+                                            .debug_selector(move || more_dbg.clone())
+                                            .dropdown_menu(move |menu, _, _| {
+                                                bot_chat_menu(
+                                                    menu,
+                                                    more_this.clone(),
+                                                    more_host.clone(),
+                                                    more_bot.clone(),
+                                                    session,
+                                                    home,
+                                                )
+                                            }),
+                                    ),
+                            )
                     })
                     .when(foldable, |d| {
                         let fold_host = host.clone();
                         let fold = chat.session;
-                        let name = chat.title.to_string();
+                        let name = display_title.to_string();
                         let fold_id = if host.is_local() {
                             format!("bot-chat-fold-{}", chat.session.0)
                         } else {
@@ -187,7 +239,7 @@ impl Shell {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .rounded(ui::RADIUS_SM)
+                                .rounded(ui::RADIUS_XS)
                                 .text_color(p.muted_foreground)
                                 .hover(|d| d.text_color(p.foreground))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -211,36 +263,13 @@ impl Shell {
             )
             // Orca `BotChatRowMenu`: Open, then Delete chat (not Home Chat).
             .context_menu(move |menu, _, _| {
-                let open_this = this.clone();
-                let open_host = menu_host.clone();
-                let bot = menu_bot.clone();
-                let menu = menu.item(
-                    PopupMenuItem::new(text::SB_OPEN.get())
-                        .icon(gpui_component::Icon::default().data(ui::icons::ARROW_UP_RIGHT_SVG))
-                        .on_click(move |_, _, cx| {
-                            open_this
-                                .update(cx, |s, cx| {
-                                    s.open_bot_session_on(&open_host, &bot, session, cx);
-                                })
-                                .ok();
-                        }),
-                );
-                if home {
-                    return menu;
-                }
-                let stop_this = this.clone();
-                let stop_host = menu_host.clone();
-                let bot = menu_bot.clone();
-                menu.separator().item(
-                    PopupMenuItem::new(text::SB_DELETE_CHAT.get())
-                        .icon(IconName::Delete)
-                        .on_click(move |_, _, cx| {
-                            stop_this
-                                .update(cx, |s, cx| {
-                                    s.stop_bot_chat_on(&stop_host, bot.clone(), session, cx);
-                                })
-                                .ok();
-                        }),
+                bot_chat_menu(
+                    menu,
+                    this.clone(),
+                    menu_host.clone(),
+                    menu_bot.clone(),
+                    session,
+                    home,
                 )
             });
         let mut col = div().flex().flex_col().gap_1().child(row);
@@ -344,6 +373,11 @@ impl Shell {
                 .as_ref()
                 .map(|_| ui::icons::svg_box(ui::icons::GAUGE_SVG, 8., p.warning))
         };
+        let badge_bg = if chat.active {
+            p.worktree_sidebar_accent
+        } else {
+            p.worktree_sidebar
+        };
         div()
             .relative()
             .size_3()
@@ -353,11 +387,11 @@ impl Shell {
                 d.child(
                     div()
                         .absolute()
-                        .right(px(-4.))
-                        .bottom(px(-4.))
+                        .right(px(-3.))
+                        .bottom(px(-3.))
                         .size(px(9.))
                         .rounded_full()
-                        .bg(p.worktree_sidebar)
+                        .bg(badge_bg)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -366,7 +400,9 @@ impl Shell {
             })
     }
 
-    /// One worker as Orca's compact workspace line: status, agent, workspace name, project.
+    /// One worker as Orca's compact workspace line (`BotChatTreeWorkerRow` / `AttachedWorktreeCards`):
+    /// 24 px height, state glyph, agent, title, inline note (`handed over` / `from closed chat`),
+    /// repo badge, and right-aligned relative age.
     fn render_worker_line(
         &self,
         host: &krill_app::hosts::HostId,
@@ -388,30 +424,32 @@ impl Shell {
         } else {
             AgentState::Done
         };
+        let age = (worker.at_ms > 0)
+            .then(|| ui::format_short_time_ago_secs(worker.at_ms / 1000, now_secs()));
         div()
             .id(SharedString::from(elem_id))
             .debug_selector(move || sel.clone())
             .role(gpui::Role::Button)
             .aria_label(worker.title.clone())
-            // A compact workspace card: `ml-1`, the status lane, a 13 px title.
+            // Orca compact worker line: 24 px tall, 6 px radius, 12 px text.
             .h(px(24.))
             .min_w_0()
             .ml_1()
             .pl(px(6.))
             .pr_1p5()
-            .rounded(ui::RADIUS_MD)
+            .rounded(ui::RADIUS_SM)
             .border_1()
             .flex()
             .items_center()
             .gap_1p5()
-            .text_size(ui::TEXT_MD)
+            .text_size(ui::TEXT_SM)
             .when(worker.active, |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.worktree_sidebar_border)
+                d.bg(p.worktree_sidebar_active())
+                    .border_color(p.worktree_sidebar_active_border())
             })
             .when(!worker.active, |d| {
                 d.border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.4)))
+                    .hover(|d| d.bg(p.worktree_sidebar_accent))
             })
             .when(session.is_some(), gpui::Styled::cursor_pointer)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -449,7 +487,7 @@ impl Shell {
                     div()
                         .flex_none()
                         .text_size(ui::TEXT_XS)
-                        .text_color(p.muted_foreground)
+                        .text_color(p.muted_foreground.opacity(0.85))
                         .child(note),
                 )
             })
@@ -466,7 +504,7 @@ impl Shell {
                         .flex()
                         .items_center()
                         .gap_0p5()
-                        .text_size(ui::TEXT_2XS)
+                        .text_size(ui::TEXT_3XS)
                         .text_color(p.muted_foreground)
                         .child(ui::icons::svg_box(
                             ui::icons::FOLDER_SVG,
@@ -474,6 +512,18 @@ impl Shell {
                             p.muted_foreground,
                         ))
                         .child(div().min_w_0().truncate().child(repo)),
+                )
+            })
+            .when_some(age, |d, age| {
+                let age_sel = format!("bot-worker-age-{}", worker.key);
+                d.child(
+                    div()
+                        .debug_selector(move || age_sel.clone())
+                        .flex_none()
+                        .text_size(ui::TEXT_3XS)
+                        .line_height(gpui::relative(1.))
+                        .text_color(p.muted_foreground)
+                        .child(age),
                 )
             })
     }
@@ -510,6 +560,44 @@ impl Shell {
         })
         .detach();
     }
+}
+
+/// Orca `BotChatMenuItems`: shared by right-click context menu and hover `⋯` dropdown.
+fn bot_chat_menu(
+    menu: PopupMenu,
+    this: gpui::WeakEntity<Shell>,
+    host: krill_app::hosts::HostId,
+    bot_id: krill_proto::bots::BotId,
+    session: SessionId,
+    home: bool,
+) -> PopupMenu {
+    let open_this = this.clone();
+    let open_host = host.clone();
+    let open_bot = bot_id.clone();
+    let menu = menu.item(
+        PopupMenuItem::new(text::SB_OPEN.get())
+            .icon(gpui_component::Icon::default().data(ui::icons::ARROW_UP_RIGHT_SVG))
+            .on_click(move |_, _, cx| {
+                open_this
+                    .update(cx, |s, cx| {
+                        s.open_bot_session_on(&open_host, &open_bot, session, cx);
+                    })
+                    .ok();
+            }),
+    );
+    if home {
+        return menu;
+    }
+    menu.separator().item(
+        PopupMenuItem::new(text::SB_DELETE_CHAT.get())
+            .icon(gpui_component::Icon::default().data(ui::icons::TRASH_SVG))
+            .on_click(move |_, _, cx| {
+                this.update(cx, |s, cx| {
+                    s.stop_bot_chat_on(&host, bot_id.clone(), session, cx);
+                })
+                .ok();
+            }),
+    )
 }
 
 /// Orca `BotChatPaging`'s links.

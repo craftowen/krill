@@ -18,7 +18,13 @@ use krill_proto::control::AgentState;
 
 use super::{Shell, ShellAction, now_secs};
 
-pub(super) const AVATAR: f32 = 36.;
+pub(super) const AVATAR: f32 = 32.;
+
+/// Orca `--color-worktree-sidebar-divider`: 15% foreground mixed over `--worktree-sidebar-border`.
+fn worktree_sidebar_divider(p: &ui::Palette) -> gpui::Hsla {
+    p.worktree_sidebar_border
+        .blend(p.worktree_sidebar_foreground.opacity(0.15))
+}
 
 /// Orca `BotRowStatus`: the avatar shows exceptions; working shows at the row's end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,9 +384,9 @@ impl Shell {
             .flex_none()
             // Orca caps the section at 40% of the sidebar; the bot list scrolls inside it.
             .max_h(gpui::relative(0.4))
-            // Orca SidebarBotsSplit: `border-b pb-2`, the Bots / Projects divider.
+            // Orca SidebarBotsSplit: `border-b pb-2` with `worktree-sidebar-divider` tone.
             .border_b_1()
-            .border_color(p.worktree_sidebar_border)
+            .border_color(worktree_sidebar_divider(p))
             .pb_2()
             .min_h_0()
             .w_full()
@@ -438,7 +444,7 @@ impl Shell {
         let view_opts = self.bot_view(cx);
         let order = view::arrange(&arrange_bots, view_opts);
         let entries = view::arrange_entries(&arrange_bots, &arrange_groups, view_opts);
-        if let Some(search) = self.render_bot_search(&order, p, cx) {
+        if let Some(search) = self.render_bot_search(&order, &facts, p, cx) {
             let searching = !self.bot_ui.query.trim().is_empty();
             section = section.child(search);
             if searching {
@@ -457,7 +463,8 @@ impl Shell {
             .pl_1()
             .pr_1()
             .flex()
-            .flex_col();
+            .flex_col()
+            .gap_0p5();
         if entries.is_empty() {
             list = list.child(
                 div()
@@ -514,6 +521,7 @@ impl Shell {
             .when(has_children && !folded, |d| {
                 d.child(
                     div()
+                        .mt_0p5()
                         .when(bot.paused, |d| d.opacity(0.6))
                         .child(self.render_bot_sidebar_chats(bot, facts, p, cx)),
                 )
@@ -596,6 +604,11 @@ impl Shell {
             None
         };
         let hover = self.bot_hover_card(bot, facts, cx.weak_entity(), cx);
+        let badge_bg = if facts.active {
+            p.worktree_sidebar_active()
+        } else {
+            p.worktree_sidebar
+        };
 
         div()
             .id(SharedString::from(row_id))
@@ -606,12 +619,12 @@ impl Shell {
             .focus_visible(|d| d.border_color(p.ring))
             .aria_label(bot.name.clone())
             .when(has_children, |d| d.aria_expanded(!folded))
-            // Orca workspace card surface: `ml-1 pr-1.5 rounded-lg border`, `pt/pb/pl-1.25`.
+            // Orca workspace card surface: `ml-1 pr-1.5 rounded-lg (8px) border`, `pt/pb/pl-1.25`.
             .ml_1()
             .pl(px(5.))
             .pr_1p5()
             .py(px(5.))
-            .rounded(ui::RADIUS_LG)
+            .rounded(ui::RADIUS_MD)
             .border_1()
             .overflow_hidden()
             .flex()
@@ -639,8 +652,8 @@ impl Shell {
                     .relative()
                     .mr_2()
                     .flex_none()
-                    .child(self.bot_avatar(bot, AVATAR, ui::RADIUS_MD, p))
-                    .children(avatar_badge(facts.status, stop_tip.is_some(), p, cx)),
+                    .child(self.bot_avatar(bot, AVATAR, ui::RADIUS_SM, p))
+                    .children(avatar_badge(facts.status, stop_tip, badge_bg, p, cx)),
             )
             .child(
                 div()
@@ -676,7 +689,7 @@ impl Shell {
                                                 .debug_selector(move || age_sel.clone())
                                                 .ml_auto()
                                                 .flex_none()
-                                                .text_size(ui::TEXT_2XS)
+                                                .text_size(ui::TEXT_3XS)
                                                 .line_height(gpui::relative(1.))
                                                 .text_color(p.muted_foreground)
                                                 .child(age),
@@ -690,13 +703,14 @@ impl Shell {
             .context_menu(self.bot_row_menu(bot, facts, cx.weak_entity()))
     }
 
-    /// Orca `BotRowLineView`: the line's words (place in the foreground), or the bot's purpose.
+    /// Orca `BotRowLineView` + `BotUpNextCount`: optional host icon, place in foreground + words
+    /// (or purpose fallback), and trailing unseen suggestions badge.
     fn render_bot_line(
         &self,
         bot: &SidebarBot,
         facts: &BotFacts,
         p: &'static ui::Palette,
-        cx: &gpui::App,
+        cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         let (place, words): (Option<String>, String) = if let Some(limit) = &facts.limit {
             (limit.place.clone(), limit.text())
@@ -707,17 +721,92 @@ impl Shell {
                 .map_or_else(|| (None, bot.description.clone()), line_words)
         };
         let remote_label = (!bot.host.is_local()).then(|| self.host_display_label(&bot.host, cx));
-        if words.is_empty() && place.is_none() && remote_label.is_none() {
+        let up_next = if bot.paused {
+            0
+        } else {
+            self.bot_ui
+                .up_next_unseen
+                .get(&(bot.host.clone(), bot.id.clone()))
+                .copied()
+                .unwrap_or(0)
+        };
+        if words.is_empty() && place.is_none() && remote_label.is_none() && up_next == 0 {
             return None;
         }
-        let summary = match place {
-            Some(place) => format!("{place} · {words}"),
-            None => words,
-        };
-        let display = match remote_label.as_ref() {
-            Some(host) if summary.is_empty() => host.to_string(),
-            Some(host) => format!("{host} · {summary}"),
-            None => summary,
+        let host_tip: Option<SharedString> = remote_label
+            .as_ref()
+            .map(|host| text::SB_RUNS_ON.format(&[("host", host.as_ref())]).into());
+        let up_next_el: Option<gpui::Stateful<gpui::Div>> = (up_next > 0).then(|| {
+            let tip: SharedString = if up_next == 1 {
+                text::SB_UP_NEXT_NEW_ONE.get().into()
+            } else {
+                text::SB_UP_NEXT_NEW_MANY
+                    .format(&[("n", &up_next.to_string())])
+                    .into()
+            };
+            let tip_tt = tip.clone();
+            let bot_host = bot.host.clone();
+            let bot_id = bot.id.clone();
+            let sel = format!("bot-row-up-next-{}", bot.id.as_str());
+            let elem_id = if bot.host.is_local() {
+                sel.clone()
+            } else {
+                format!("bot-row-up-next-{}-{}", bot.host.as_key(), bot.id.as_str())
+            };
+            div()
+                .id(SharedString::from(elem_id))
+                .debug_selector(move || sel.clone())
+                .role(gpui::Role::Button)
+                .aria_label(tip)
+                .flex_none()
+                .px_1()
+                .py(px(1.))
+                .mx(px(-2.))
+                .rounded(ui::RADIUS_XS)
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .text_color(p.muted_foreground)
+                .hover(|d| d.bg(p.accent.opacity(0.6)).text_color(p.foreground))
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip_tt.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_bot_home_panel_on(&bot_host, &bot_id, cx);
+                }))
+                .child(
+                    gpui_component::Icon::new(gpui_kit_assets::IconName::Lightbulb)
+                        .size(px(12.))
+                        .text_color(p.muted_foreground),
+                )
+                .child(up_next.to_string())
+        });
+        let text_el: gpui::Div = match place {
+            Some(place) => div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .whitespace_nowrap()
+                .when(facts.unread, |d| d.text_color(p.foreground))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.foreground)
+                        .child(place),
+                )
+                .child(" · ")
+                .child(div().min_w_0().truncate().child(words)),
+            None => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .when(facts.unread, |d| d.text_color(p.foreground))
+                .child(words),
         };
         Some(
             div()
@@ -728,22 +817,35 @@ impl Shell {
                 .text_size(ui::TEXT_SM)
                 .line_height(px(16.))
                 .text_color(p.muted_foreground)
-                // A paired server's bot: a server glyph + host name, and full details in the hover card.
-                .when(remote_label.is_some(), |d| {
-                    d.child(ui::icons::svg_box(
-                        ui::icons::SERVER_SVG,
-                        ui::ICON_XS,
-                        p.muted_foreground,
-                    ))
+                // A paired server's bot: a server glyph, its name in tooltip & hover card.
+                .when_some(host_tip, |d, tip| {
+                    let host_sel = format!("bot-row-host-{}", bot.id.as_str());
+                    let host_elem_id = if bot.host.is_local() {
+                        host_sel.clone()
+                    } else {
+                        format!("bot-row-host-{}-{}", bot.host.as_key(), bot.id.as_str())
+                    };
+                    let tip_tt = tip.clone();
+                    d.child(
+                        div()
+                            .id(SharedString::from(host_elem_id))
+                            .debug_selector(move || host_sel.clone())
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tip_tt.clone())
+                                    .build(window, cx)
+                            })
+                            .child(ui::icons::svg_box(
+                                ui::icons::SERVER_SVG,
+                                ui::ICON_XS,
+                                p.muted_foreground,
+                            )),
+                    )
                 })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .when(facts.unread, |d| d.text_color(p.foreground))
-                        .child(display),
-                ),
+                .child(text_el)
+                .children(up_next_el),
         )
     }
 
@@ -846,11 +948,14 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label(aria_label)
             .aria_expanded(!folded)
-            // `-mt/-mb-1.25 -mr-1.5 min-w-10 px-1.5 gap-0.5`: full height, flush right.
+            // `-mt/-mb-1.25 -mr-1.5`: full height, flush right. Matches Orca's narrow-sidebar
+            // `min-w-6 px-1` when no live mark is shown so the row age aligns near the right edge,
+            // and expands to align the live spinner column with `render_row_working_mark`.
             .my(px(-5.))
             .mr(px(-6.))
-            .min_w(px(40.))
-            .px_1p5()
+            .min_w(if mark.is_some() { px(38.) } else { px(22.) })
+            .when(mark.is_some(), gpui::Styled::px_1p5)
+            .when(mark.is_none(), gpui::Styled::px_1)
             .self_stretch()
             .flex()
             .items_center()
@@ -1006,13 +1111,17 @@ impl Shell {
                 } else {
                     text::SB_MARK_UNREAD.get()
                 })
-                .icon(gpui_component::Icon::default().data(ui::icons::BELL_SVG))
+                .icon(gpui_component::Icon::new(if unread {
+                    gpui_kit_assets::IconName::BellOff
+                } else {
+                    gpui_kit_assets::IconName::Bell
+                }))
                 .disabled(sessions.is_empty())
                 .on_click(read),
             );
             menu.separator().item(
                 PopupMenuItem::new(text::SB_DELETE.get())
-                    .icon(IconName::Delete)
+                    .icon(gpui_component::Icon::default().data(ui::icons::TRASH_SVG))
                     .on_click(delete),
             )
         }
@@ -1140,8 +1249,10 @@ impl Shell {
         .detach();
     }
 
-    /// Orca `BotHoverDetails` + `BotHoverNeedsYou`, opened on pointer rest.
-    fn bot_hover_card(
+    /// Orca `BotHoverDetails` + `BotHoverNeedsYou` (`#47939` compact hover card), opened on
+    /// pointer rest: 40 px avatar, inline host icon (`Laptop`/`Server` 12 px) + 13 px semibold
+    /// name, status icon + text, top-right `House` 14 px Home button, inline latest line, Needs you.
+    pub(super) fn bot_hover_card(
         &self,
         bot: &SidebarBot,
         facts: &BotFacts,
@@ -1154,7 +1265,8 @@ impl Shell {
             .avatars
             .get(&(bot.host.clone(), bot.id.clone()))
             .and_then(|(_, img)| img.clone());
-        let host_label = (!bot.host.is_local()).then(|| self.host_display_label(&bot.host, cx));
+        let is_remote = !bot.host.is_local();
+        let host_label = self.host_display_label(&bot.host, cx);
         let state: String = if bot.paused {
             text::PAUSED_BADGE.get().to_owned()
         } else {
@@ -1166,8 +1278,8 @@ impl Shell {
                 _ => text::BP_IDLE.get().to_owned(),
             }
         };
-        let working = facts.status == RowStatus::Working && !bot.paused;
-        // Orca `BotHoverLatestLine`: the row's line whole; Needs you names its asks below.
+        let status_kind = facts.status;
+        // Orca `BotHoverLatestLine`: the row's line whole with markdown stripped; Needs you names its asks below.
         let latest = match &facts.line {
             None | Some(RowLine::Paused | RowLine::NeedYouElsewhere(_)) => None,
             Some(line) => {
@@ -1178,13 +1290,11 @@ impl Shell {
                     _ => None,
                 };
                 Some(line_words(line)).map(|(place, words)| {
-                    (
-                        age,
-                        match place {
-                            Some(place) => format!("{place} · {words}"),
-                            None => words,
-                        },
-                    )
+                    let raw = match place {
+                        Some(place) => format!("{place} · {words}"),
+                        None => words,
+                    };
+                    (age, view::strip_inline_markdown(&raw))
                 })
             }
         };
@@ -1250,6 +1360,47 @@ impl Shell {
                 };
                 let home_label = text::SB_OPEN_HOME.format(&[("name", &bot.name)]);
                 let shown = asks.len().min(3);
+                let host_svg = if is_remote {
+                    ui::icons::SERVER_SVG
+                } else {
+                    ui::icons::LAPTOP_SVG
+                };
+                let host_tip = host_label.clone();
+                let status_icon: AnyElement = if bot.paused {
+                    gpui_component::Icon::new(IconName::Pause)
+                        .size(px(12.))
+                        .text_color(p.muted_foreground)
+                        .into_any_element()
+                } else {
+                    match status_kind {
+                        RowStatus::Working => ui::status::status_glyph(
+                            AgentState::Working,
+                            false,
+                            ui::status::Size::Md,
+                            cx,
+                        )
+                        .into_any_element(),
+                        RowStatus::Permission => ui::status::status_glyph(
+                            AgentState::Waiting,
+                            false,
+                            ui::status::Size::Md,
+                            cx,
+                        )
+                        .into_any_element(),
+                        RowStatus::Active | RowStatus::Inactive => div()
+                            .size_3()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(ui::icons::svg_box(
+                                ui::icons::CIRCLE_SVG,
+                                8.,
+                                p.muted_foreground,
+                            ))
+                            .into_any_element(),
+                    }
+                };
                 div()
                     .id("bot-hover-card")
                     .debug_selector(|| "bot-hover-card".into())
@@ -1260,23 +1411,51 @@ impl Shell {
                         div()
                             .flex()
                             .items_start()
-                            .gap_3()
+                            .gap(px(10.))
                             .child(avatar_tile(&bot, avatar_img.clone(), cx))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .pt_0p5()
+                                    .self_center()
                                     .flex()
                                     .flex_col()
                                     .gap_1()
                                     .child(
                                         div()
-                                            .truncate()
-                                            .text_size(ui::TEXT_MD)
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(p.foreground)
-                                            .child(bot.name.clone()),
+                                            .flex()
+                                            .min_w_0()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .id("bot-hover-host-icon")
+                                                    .debug_selector(|| "bot-hover-host-icon".into())
+                                                    .flex_none()
+                                                    .flex()
+                                                    .items_center()
+                                                    .tooltip(move |window, cx| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            host_tip.clone(),
+                                                        )
+                                                        .build(window, cx)
+                                                    })
+                                                    .child(ui::icons::svg_box(
+                                                        host_svg,
+                                                        ui::ICON_XS,
+                                                        p.muted_foreground,
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_size(ui::TEXT_MD)
+                                                    .line_height(px(16.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(p.foreground)
+                                                    .child(bot.name.clone()),
+                                            ),
                                     )
                                     .child(
                                         div()
@@ -1285,56 +1464,33 @@ impl Shell {
                                             .items_center()
                                             .gap_1p5()
                                             .text_size(ui::TEXT_SM)
+                                            .line_height(px(16.))
                                             .text_color(p.muted_foreground)
-                                            .when(working, |d| {
-                                                d.child(ui::status::status_glyph(
-                                                    AgentState::Working,
-                                                    false,
-                                                    ui::status::Size::Md,
-                                                    cx,
-                                                ))
-                                            })
+                                            .child(status_icon)
                                             .child(div().min_w_0().truncate().child(state.clone())),
-                                    )
-                                    .when_some(host_label.clone(), |d, host| {
-                                        d.child(
-                                            div()
-                                                .flex()
-                                                .min_w_0()
-                                                .items_center()
-                                                .gap_1()
-                                                .text_size(ui::TEXT_SM)
-                                                .text_color(p.muted_foreground)
-                                                .child(ui::icons::svg_box(
-                                                    ui::icons::SERVER_SVG,
-                                                    ui::ICON_XS,
-                                                    p.muted_foreground,
-                                                ))
-                                                .child(
-                                                    div().truncate().child(
-                                                        krill_app::i18n::catalog::bots::NB_RUNS_LINE
-                                                            .format(&[
-                                                                ("host", &host),
-                                                                ("agent", &bot.agent_id),
-                                                            ]),
-                                                    ),
-                                                ),
-                                        )
-                                    }),
+                                    ),
                             )
                             .child(
-                                gpui_component::button::Button::new("bot-hover-open-home")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(
-                                        gpui_component::Icon::default().data(ui::icons::HOUSE_SVG),
-                                    )
-                                    .accessibility_label(home_label.clone())
-                                    .tooltip(home_label)
-                                    .on_click(open_home.clone()),
+                                div().mt(px(-2.)).mr(px(-4.)).flex_none().child(
+                                    gpui_component::button::Button::new("bot-hover-open-home")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            gpui_component::Icon::default()
+                                                .data(ui::icons::HOUSE_SVG)
+                                                .size(px(14.)),
+                                        )
+                                        .accessibility_label(home_label.clone())
+                                        .tooltip(home_label)
+                                        .on_click(open_home.clone()),
+                                ),
                             ),
                     )
                     .when_some(latest.clone(), |d, (age, line)| {
+                        let text_line = match age {
+                            Some(age) => format!("{age} · {line}"),
+                            None => line,
+                        };
                         d.child(
                             div()
                                 .mt(px(10.))
@@ -1344,14 +1500,7 @@ impl Shell {
                                 .text_size(ui::TEXT_SM)
                                 .text_color(p.foreground)
                                 .line_clamp(3)
-                                .when_some(age, |d, age| {
-                                    d.child(
-                                        div()
-                                            .text_color(p.muted_foreground)
-                                            .child(format!("{age} · ")),
-                                    )
-                                })
-                                .child(line),
+                                .child(text_line),
                         )
                     })
                     .when(show_needs, |d| {
@@ -1478,7 +1627,7 @@ impl Shell {
 
     /// Opens the bot's page with its Home tab showing, where Needs you leads (Orca
     /// `openBotHomePanelFromSidebar`).
-    fn open_bot_home_panel_on(
+    pub(super) fn open_bot_home_panel_on(
         &mut self,
         host: &krill_app::hosts::HostId,
         bot_id: &BotId,
@@ -1494,7 +1643,7 @@ impl Shell {
     }
 }
 
-/// The 56 px picture of the hover card (`size-14 rounded-lg`).
+/// The 40 px picture of the compact hover card (`size-10 rounded-lg`, Orca `#47939`).
 fn avatar_tile(
     bot: &SidebarBot,
     upload: Option<std::sync::Arc<gpui::Image>>,
@@ -1504,8 +1653,8 @@ fn avatar_tile(
         &bot.avatar,
         upload,
         &bot.name,
-        px(56.),
-        ui::RADIUS_LG,
+        px(40.),
+        ui::RADIUS_MD,
         ui::palette(cx),
     )
 }
@@ -1528,19 +1677,22 @@ pub(super) const fn bot_fold_mark(
 }
 
 /// Orca `BotAvatarStatusBadge`: needs-you, paused or a usage-limit stop on the picture's
-/// corner, centred 3 px in from it, on a disc of the row's own colour.
-// ponytail: a painted disc stands in for Orca's mask cutout (gpui has no masks), so a hovered
-// row shows the sidebar colour around the badge; draw a mask if that ever reads wrong.
+/// corner, centred 3 px in from it, on a disc matching the row surface.
 pub(super) fn avatar_badge(
     status: RowStatus,
-    stopped: bool,
+    stop_tip: Option<String>,
+    surface_bg: gpui::Hsla,
     p: &'static ui::Palette,
     cx: &gpui::App,
-) -> Option<gpui::Div> {
-    let glyph = if stopped {
-        ui::icons::svg_box(ui::icons::GAUGE_SVG, ui::ICON_XS, p.warning)
+) -> Option<gpui::Stateful<gpui::Div>> {
+    let (id, glyph, tip) = if let Some(tip) = stop_tip {
+        (
+            "bot-avatar-badge-limit",
+            ui::icons::svg_box(ui::icons::GAUGE_SVG, ui::ICON_XS, p.warning),
+            Some(SharedString::from(tip)),
+        )
     } else {
-        match status {
+        let g = match status {
             RowStatus::Permission => {
                 ui::status::status_glyph(AgentState::Waiting, false, ui::status::Size::Md, cx)
             }
@@ -1548,19 +1700,26 @@ pub(super) fn avatar_badge(
                 ui::status::status_glyph(AgentState::Exited, false, ui::status::Size::Md, cx)
             }
             RowStatus::Working | RowStatus::Active => return None,
-        }
+        };
+        ("bot-avatar-badge-status", g, None)
     };
     Some(
         div()
+            .id(id)
             .absolute()
-            .right(px(-3.))
-            .bottom(px(-3.))
+            .right(px(-2.))
+            .bottom(px(-2.))
             .size(px(14.))
             .rounded_full()
-            .bg(p.worktree_sidebar)
+            .bg(surface_bg)
             .flex()
             .items_center()
             .justify_center()
+            .when_some(tip, |d, tip| {
+                d.tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+            })
             .child(glyph),
     )
 }

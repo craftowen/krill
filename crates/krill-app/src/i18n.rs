@@ -1207,6 +1207,19 @@ catalog! {
         GRP_BACK_ITEMS => ("그룹 항목으로", "Back to Group"),
         GRP_SEND_FAILED => ("메시지를 보내지 못했습니다: {err}", "Could not send message: {err}"),
         GRP_NO_MENTIONED_HINT => ("멘션된 봇이 없어 응답이 실행되지 않았습니다.", "No bots matched that mention."),
+        // Domain A — Bots sidebar 1:1 parity
+        SB_SECTION_TITLE => ("Bots", "Bots"),
+        SB_HOME_CHAT_EXACT => ("Home Chat", "Home Chat"),
+        SB_RUNS_ON => ("{host}에서 실행 중", "Runs on {host}"),
+        SB_UP_NEXT_NEW_ONE => ("새 제안 1개 · 클릭해 보기", "1 new suggestion · click to see"),
+        SB_UP_NEXT_NEW_MANY => ("새 제안 {n}개 · 클릭해 보기", "{n} new suggestions · click to see"),
+        SB_SCROLL_LEFT => ("왼쪽으로 스크롤 · 숨겨진 봇 {n}개", "Scroll left · {n} hidden"),
+        SB_SCROLL_RIGHT => ("오른쪽으로 스크롤 · 숨겨진 봇 {n}개", "Scroll right · {n} hidden"),
+        SB_CHAT_ACTIONS => ("채팅 작업", "Chat actions"),
+        SB_HANDED_OVER => ("인계됨", "handed over"),
+        SB_DISCONNECTED => ("연결 끊김", "Disconnected"),
+        SB_UNREAD => ("읽지 않음", "Unread"),
+        SB_START_FROM_SCRATCH => ("처음부터 시작", "Start from scratch"),
     }
     other_os {
         REVEAL => ("파일 탐색기에서 보기", "Show in File Explorer"),

@@ -111,9 +111,9 @@ impl Shell {
                 div()
                     .pr_0p5()
                     .text_size(ui::TEXT_XS)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(p.muted_foreground.opacity(0.8))
-                    .child(krill_app::i18n::catalog::sidebar::NAV_BOTS.get()),
+                    .child(text::SB_SECTION_TITLE.get()),
             );
         // Orca `SectionCollapseAllButton`: right after the title, shown while the header is
         // hovered.
@@ -127,11 +127,15 @@ impl Shell {
                         Button::new("bots-collapse-all")
                             .ghost()
                             .xsmall()
-                            .icon(gpui_component::Icon::default().data(if all_folded {
-                                ui::icons::CHEVRONS_UP_DOWN_SVG
-                            } else {
-                                ui::icons::CHEVRONS_DOWN_UP_SVG
-                            }))
+                            .icon(
+                                gpui_component::Icon::default()
+                                    .data(if all_folded {
+                                        ui::icons::CHEVRONS_UP_DOWN_SVG
+                                    } else {
+                                        ui::icons::CHEVRONS_DOWN_UP_SVG
+                                    })
+                                    .size(px(14.)),
+                            )
                             .accessibility_label(fold_all_label)
                             .tooltip(fold_all_label)
                             .debug_selector(|| "bots-collapse-all".into())
@@ -147,7 +151,8 @@ impl Shell {
             .id("bots-section-header")
             .debug_selector(|| "bots-section-header".into())
             .group("bots-section-header")
-            // Orca SidebarSectionHeader: `h-8 px-2 gap-1.5`, a fold chevron before the title.
+            // Orca SidebarSectionHeader: `mt-2 h-8 px-2 gap-1.5`, a fold chevron before the title.
+            .mt_1()
             .h(ui::SIDEBAR_HEADER_HEIGHT)
             .px_2()
             .flex()
@@ -169,7 +174,7 @@ impl Shell {
                             .ghost()
                             .xsmall()
                             .toggled(searching)
-                            .icon(IconName::Search)
+                            .icon(gpui_component::Icon::new(IconName::Search).size(px(14.)))
                             .accessibility_label(text::SB_SEARCH.get())
                             .when(!searching, |b| b.tooltip(text::SB_SEARCH.get()))
                             .debug_selector(|| "bots-section-search".into())
@@ -189,7 +194,7 @@ impl Shell {
         Button::new("bots-section-new")
             .ghost()
             .xsmall()
-            .icon(IconName::Plus)
+            .icon(gpui_component::Icon::new(IconName::Plus).size(px(14.)))
             .accessibility_label(text::SB_NEW_MENU.get())
             .tooltip(text::SB_NEW_MENU.get())
             .debug_selector(|| "bots-section-new".into())
@@ -202,7 +207,7 @@ impl Shell {
                 };
                 menu.item(
                     PopupMenuItem::new(text::SB_NEW_BOT.get())
-                        .icon(IconName::Plus)
+                        .icon(gpui_component::Icon::default().data(ui::icons::BOT_SVG))
                         .on_click(act(|s, _, cx| s.request_new_bot(None, None, cx))),
                 )
                 .item(
@@ -256,7 +261,11 @@ impl Shell {
                     .ghost()
                     .xsmall()
                     .toggled(active > 0)
-                    .icon(gpui_component::Icon::default().data(ui::icons::SLIDERS_HORIZONTAL_SVG))
+                    .icon(
+                        gpui_component::Icon::default()
+                            .data(ui::icons::SLIDERS_HORIZONTAL_SVG)
+                            .size(px(14.)),
+                    )
                     .accessibility_label(label.clone())
                     .tooltip(text::SBO_TITLE.get())
                     .dropdown_menu(move |menu, window, cx| {
@@ -285,34 +294,99 @@ impl Shell {
             })
     }
 
-    /// Collapsed section: up to five round avatars, then `+N` (attention, working, then unread
-    /// first, like Orca), kept flush next to the `Bots` label (`justify-start`, Orca #45567).
-    /// Unread bots carry the blue Projects unread dot (`490ec49b` / `#47122`).
+    /// Orca `BotCollapsedPreview` + `bot-preview-indicators` (`#47622`, `#47884`):
+    /// virtualized horizontal face track with left/right overflow edge controls (`BotPreviewEdge`),
+    /// clipped edge-peek avatars suppressing pips, active bot `ring-sidebar-foreground` ring,
+    /// and hover card details. Kept flush next to the `Bots` label (`justify_start`).
     fn render_collapsed_faces(
         &self,
-        p: &ui::Palette,
+        p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let focused = self.focused_session();
-        let mut bots: Vec<(&SidebarBot, super::rows::BotFacts)> = self
+        let mut bots: Vec<(
+            usize,
+            &SidebarBot,
+            super::rows::BotFacts,
+            Option<view::PreviewSignal>,
+        )> = self
             .sidebar_bots
             .iter()
-            .map(|b| {
+            .enumerate()
+            .map(|(idx, b)| {
                 let bot_focused = focused
                     .as_ref()
                     .and_then(|(h, id)| (*h == b.host).then_some(*id));
-                (b, self.bot_facts(b, bot_focused, cx))
+                let facts = self.bot_facts(b, bot_focused, cx);
+                let needs_you = facts.needs_you || b.attention > 0;
+                let working = !b.paused
+                    && (facts.status == super::rows::RowStatus::Working || b.working() > 0);
+                let signal = view::PreviewSignal::from_flags(needs_you, facts.unread, working);
+                (idx, b, facts, signal)
             })
             .collect();
-        bots.sort_by_key(|(b, f)| {
-            let needs_you = f.needs_you || b.attention > 0;
-            let working =
-                !b.paused && (f.status == super::rows::RowStatus::Working || b.working() > 0);
-            (!needs_you, !working, !f.unread)
-        });
-        let shown = bots.len().min(5);
-        let mut inner = div().flex().items_center();
-        for (i, (bot, facts)) in bots.iter().take(shown).enumerate() {
+        bots.sort_by_key(|(idx, _, _, signal)| (view::PreviewSignal::rank(*signal), *idx));
+
+        let available_px = (self.layout.sidebar_width - 88.).max(64.);
+        let win =
+            view::compute_collapsed_track(bots.len(), self.bot_ui.preview_offset, available_px);
+
+        let edge_signal = |slice: &[(
+            usize,
+            &SidebarBot,
+            super::rows::BotFacts,
+            Option<view::PreviewSignal>,
+        )]|
+         -> (Option<view::PreviewSignal>, usize) {
+            let best = slice.iter().filter_map(|(_, _, _, sig)| *sig).min();
+            let attention = slice
+                .iter()
+                .filter(|(_, _, _, sig)| *sig == Some(view::PreviewSignal::Attention))
+                .count();
+            (best, attention)
+        };
+
+        let mut track = div()
+            .h(px(view::PREVIEW_TRACK_HEIGHT))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .overflow_hidden();
+
+        if win.before > 0 {
+            let (sig, attn) = edge_signal(&bots[..win.before]);
+            let next_offset = win.offset.saturating_sub(win.page_step);
+            track = track.child(render_preview_edge(
+                -1,
+                win.before,
+                attn,
+                sig,
+                p,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.bot_ui.preview_offset = next_offset;
+                    cx.notify();
+                }),
+                cx,
+            ));
+        }
+
+        let mut strip = div()
+            .h_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(view::PREVIEW_FACE_GAP))
+            .px(px(view::PREVIEW_TRACK_INSET))
+            .overflow_hidden();
+
+        for (idx, (_, bot, facts, signal)) in bots
+            .iter()
+            .enumerate()
+            .take(win.end_visible)
+            .skip(win.first_visible)
+        {
+            let clipped = idx < win.first_full || idx >= win.end_full;
             let host = bot.host.clone();
             let id = bot.id.clone();
             let sel = format!("bots-collapsed-{}", bot.id.as_str());
@@ -321,94 +395,78 @@ impl Shell {
             } else {
                 format!("bots-collapsed-{}-{}", bot.host.as_key(), bot.id.as_str())
             };
-            let needs_you = facts.needs_you || bot.attention > 0;
-            let working = !bot.paused
-                && (facts.status == super::rows::RowStatus::Working || bot.working() > 0);
-            let pip: Option<gpui::AnyElement> = if needs_you {
-                let pip_sel = format!("bots-collapsed-waiting-{}", bot.id.as_str());
-                Some(
-                    div()
-                        .debug_selector(move || pip_sel.clone())
-                        .absolute()
-                        .right(px(-2.))
-                        .bottom(px(-2.))
-                        .size(px(12.))
-                        .rounded_full()
-                        .bg(p.worktree_sidebar)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(ui::status::status_glyph(
-                            krill_proto::control::AgentState::Waiting,
-                            false,
-                            ui::status::Size::Sm,
-                            cx,
-                        ))
-                        .into_any_element(),
-                )
-            } else if working {
-                let pip_sel = format!("bots-collapsed-working-{}", bot.id.as_str());
-                Some(
-                    div()
-                        .debug_selector(move || pip_sel.clone())
-                        .absolute()
-                        .right(px(-2.))
-                        .bottom(px(-2.))
-                        .size(px(12.))
-                        .rounded_full()
-                        .bg(p.worktree_sidebar)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(ui::status::status_glyph_slot(
-                            krill_proto::control::AgentState::Working,
-                            false,
-                            ui::status::Size::Sm,
-                            Some(&self.bot_ui.spinners),
-                            cx,
-                        ))
-                        .into_any_element(),
-                )
-            } else if facts.unread {
-                let pip_sel = format!("bots-collapsed-unread-{}", bot.id.as_str());
-                Some(
-                    ui::status::unread_alert_dot(p.worktree_sidebar, cx)
-                        .debug_selector(move || pip_sel.clone())
-                        .absolute()
-                        .right(px(-2.))
-                        .bottom(px(-2.))
-                        .into_any_element(),
-                )
-            } else {
+            let pip: Option<gpui::AnyElement> = if clipped {
                 None
+            } else {
+                render_preview_pip(bot.id.as_str(), *signal, &self.bot_ui.spinners, p, cx)
             };
-            inner = inner.child(
-                div()
-                    .id(SharedString::from(elem_id))
-                    .debug_selector(move || sel.clone())
-                    .relative()
-                    .when(i > 0, |d| d.ml(px(-4.)))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(p.sidebar)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.bot_ui.collapsed = false;
-                        this.open_bot_home_on(&host, id.clone(), None, cx);
-                    }))
-                    .child(self.bot_avatar(bot, 20., px(10.), p))
-                    .children(pip),
-            );
+            let hover = self.bot_hover_card(bot, facts, cx.weak_entity(), cx);
+            let is_current = facts.active;
+            let face = div()
+                .id(SharedString::from(elem_id))
+                .debug_selector(move || sel.clone())
+                .role(gpui::Role::Button)
+                .aria_label(bot.name.clone())
+                .relative()
+                .flex_none()
+                .rounded_full()
+                .border_2()
+                .border_color(if is_current {
+                    p.sidebar_foreground
+                } else {
+                    p.sidebar
+                })
+                .when(!is_current, |d| d.hover(|d| d.border_color(p.ring)))
+                .cursor_pointer()
+                .hoverable_tooltip(hover)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.bot_ui.collapsed = false;
+                    this.open_bot_home_on(&host, id.clone(), None, cx);
+                }))
+                .child(self.bot_avatar(
+                    bot,
+                    view::PREVIEW_FACE_SIZE,
+                    px(view::PREVIEW_FACE_SIZE / 2.),
+                    p,
+                ))
+                .children(pip);
+
+            if clipped {
+                let clip_sel = format!("bots-collapsed-clipped-{}", bot.id.as_str());
+                strip = strip.child(
+                    div()
+                        .debug_selector(move || clip_sel.clone())
+                        .flex_none()
+                        .w(px(10.))
+                        .overflow_hidden()
+                        .opacity(0.55)
+                        .child(face),
+                );
+            } else {
+                strip = strip.child(face);
+            }
         }
-        if bots.len() > shown {
-            inner = inner.child(
-                div()
-                    .ml_1()
-                    .text_size(ui::TEXT_2XS)
-                    .text_color(p.muted_foreground)
-                    .child(format!("+{}", bots.len() - shown)),
-            );
+        track = track.child(strip);
+
+        if win.after > 0 {
+            let (sig, attn) = edge_signal(&bots[bots.len() - win.after..]);
+            let next_offset = (win.offset + win.page_step).min(win.max_offset);
+            track = track.child(render_preview_edge(
+                1,
+                win.after,
+                attn,
+                sig,
+                p,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.bot_ui.preview_offset = next_offset;
+                    cx.notify();
+                }),
+                cx,
+            ));
         }
+
         div()
             .id("bots-collapsed-preview")
             .debug_selector(|| "bots-collapsed-preview".into())
@@ -418,8 +476,9 @@ impl Shell {
             .items_center()
             .justify_start()
             .overflow_hidden()
-            .p_1()
-            .child(inner)
+            .pl_0p5()
+            .pr_1()
+            .child(track)
     }
 
     /// Orca `BotSidebarSearchPanel`: the field under the header, then (with a query) results in
@@ -427,31 +486,45 @@ impl Shell {
     pub(super) fn render_bot_search(
         &self,
         order: &[usize],
+        facts_all: &[super::rows::BotFacts],
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         let (input, _) = self.bot_ui.search.as_ref()?;
-        let field = div()
-            .px_2()
-            .pt_1()
-            .pb_1p5()
-            .child(Input::new(input).small().cleanable(true));
+        let field = div().px_2().pt_1().pb_1p5().child(
+            Input::new(input).small().cleanable(true).prefix(
+                gpui_component::Icon::new(IconName::Search)
+                    .size(px(14.))
+                    .text_color(p.muted_foreground),
+            ),
+        );
         let query = self.bot_ui.query.trim();
         if query.is_empty() {
             return Some(field);
         }
-        let shown: Vec<&SidebarBot> = order.iter().map(|&i| &self.sidebar_bots[i]).collect();
-        let pairs: Vec<(&str, &str)> = shown
+        let shown: Vec<(&SidebarBot, &super::rows::BotFacts)> = order
             .iter()
-            .map(|b| (b.name.as_str(), b.description.as_str()))
+            .map(|&i| (&self.sidebar_bots[i], &facts_all[i]))
+            .collect();
+        let candidates: Vec<view::SearchCandidate<'_>> = shown
+            .iter()
+            .map(|(b, f)| view::SearchCandidate {
+                name: b.name.as_str(),
+                purpose: b.description.as_str(),
+                chats: f
+                    .chats
+                    .iter()
+                    .map(|c| (c.title.as_ref(), c.status.as_deref()))
+                    .collect(),
+            })
             .collect();
         let hidden: Vec<&str> = self
             .sidebar_bots
             .iter()
-            .filter(|b| b.paused && !shown.iter().any(|s| s.host == b.host && s.id == b.id))
+            .filter(|b| b.paused && !shown.iter().any(|(s, _)| s.host == b.host && s.id == b.id))
             .map(|b| b.name.as_str())
             .collect();
-        let (matches, hidden_paused) = view::search(&pairs, &hidden, query);
+        let (matches, hidden_paused) = view::search_with_chats(&candidates, &hidden, query);
         let mut list = div()
             .id("bots-search-results")
             .debug_selector(|| "bots-search-results".into())
@@ -461,10 +534,12 @@ impl Shell {
             .overflow_y_scroll()
             .pb_1()
             .pl_1()
+            .pr_1()
             .flex()
             .flex_col();
         for m in &matches {
-            list = list.child(self.render_bot_search_result(shown[m.index], m, p, cx));
+            let (bot, bot_facts) = shown[m.index];
+            list = list.child(self.render_bot_search_result(bot, bot_facts, m, p, cx));
         }
         let mut group_matches = 0usize;
         for summary in &self.sidebar_groups {
@@ -501,7 +576,7 @@ impl Shell {
                 let faces = krill_app::bots::group_faces::render_group_faces(
                     &face_members,
                     super::rows::AVATAR,
-                    p.sidebar,
+                    p.worktree_sidebar,
                     p,
                 );
                 let sel = format!("bot-group-search-result-{gid}");
@@ -521,17 +596,19 @@ impl Shell {
                         .tab_index(0)
                         .aria_label(group.name.clone())
                         .ml_1()
+                        .mr_1()
                         .pr_1p5()
                         .pt(px(5.))
                         .pb_1p5()
                         .pl_1p5()
-                        .rounded(ui::RADIUS_LG)
+                        .rounded(ui::RADIUS_MD)
                         .border_1()
                         .border_color(ui::TRANSPARENT)
+                        .focus_visible(|d| d.border_color(p.ring))
                         .flex()
                         .items_center()
                         .cursor_pointer()
-                        .hover(|d| d.bg(p.sidebar_accent.opacity(0.4)))
+                        .hover(|d| d.bg(p.worktree_sidebar_accent))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.toggle_bot_search(window, cx);
                             this.bot_ui.collapsed = false;
@@ -639,18 +716,54 @@ impl Shell {
         cx.notify();
     }
 
-    /// Orca `BotSearchResultRow`: picture, the name with its marks, and the purpose words that
-    /// matched (or, for a name match, what the bot is for). Opening it ends the search.
+    /// Orca `BotSearchResultRow` (`#46830`): 32 px picture with status badge, name with marks,
+    /// inset focus ring staying inside the list, and matched purpose / chat title or body snippet.
     fn render_bot_search_result(
         &self,
         bot: &SidebarBot,
+        facts: &super::rows::BotFacts,
         m: &view::SearchMatch,
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let detail = match &m.purpose {
-            Some((snippet, ranges)) => Some(marked(snippet, ranges, p)),
-            None => (!bot.description.is_empty()).then(|| marked(&bot.description, &[], p)),
+        let detail: Option<gpui::Div> = if let Some((snippet, ranges)) = &m.purpose {
+            Some(marked(snippet, ranges, p))
+        } else if let Some((chat_title, snippet, ranges)) = &m.chat_hit {
+            let show_prefix = chat_title != snippet;
+            Some(
+                div()
+                    .flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(ui::icons::svg_box(
+                        ui::icons::MESSAGE_SQUARE_SVG,
+                        11.,
+                        p.muted_foreground,
+                    ))
+                    .when(show_prefix, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(chat_title.clone()),
+                        )
+                        .child("·")
+                    })
+                    .child(marked(snippet, ranges, p)),
+            )
+        } else if !bot.description.is_empty() {
+            Some(marked(&bot.description, &[], p))
+        } else {
+            None
+        };
+        let stop_tip = facts.limit.as_ref().map(|l| l.tip(&bot.agent_id));
+        let badge_status = if facts.status == super::rows::RowStatus::Inactive {
+            super::rows::RowStatus::Active
+        } else {
+            facts.status
         };
         let host = bot.host.clone();
         let id = bot.id.clone();
@@ -670,19 +783,21 @@ impl Shell {
             .role(gpui::Role::Button)
             .tab_index(0)
             .aria_label(bot.name.clone())
-            // Orca: the workspace card surface, `pt-1.25 pb-1.5 pl-1.5`.
+            // Orca #46830: card surface + inset focus ring kept inside the scroll list.
             .ml_1()
+            .mr_1()
             .pr_1p5()
             .pt(px(5.))
             .pb_1p5()
             .pl_1p5()
-            .rounded(ui::RADIUS_LG)
+            .rounded(ui::RADIUS_MD)
             .border_1()
             .border_color(ui::TRANSPARENT)
+            .focus_visible(|d| d.border_color(p.ring))
             .flex()
             .items_center()
             .cursor_pointer()
-            .hover(|d| d.bg(p.sidebar_accent.opacity(0.4)))
+            .hover(|d| d.bg(p.worktree_sidebar_accent))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_bot_search(window, cx);
                 this.bot_ui.collapsed = false;
@@ -690,9 +805,18 @@ impl Shell {
             }))
             .child(
                 div()
+                    .relative()
                     .mr_2()
+                    .flex_none()
                     .when(bot.paused, |d| d.opacity(0.6))
-                    .child(self.bot_avatar(bot, super::rows::AVATAR, ui::RADIUS_MD, p)),
+                    .child(self.bot_avatar(bot, super::rows::AVATAR, ui::RADIUS_SM, p))
+                    .children(super::rows::avatar_badge(
+                        badge_status,
+                        stop_tip,
+                        p.worktree_sidebar,
+                        p,
+                        cx,
+                    )),
             )
             .child(
                 div()
@@ -728,6 +852,207 @@ impl Shell {
                     }),
             )
     }
+}
+
+/// Orca `BotPreviewPip` (`#47884`): status hint pip on a fully-visible collapsed face.
+fn render_preview_pip(
+    bot_id: &str,
+    signal: Option<view::PreviewSignal>,
+    spinners: &ui::status::SpinnerSlots,
+    p: &'static ui::Palette,
+    cx: &gpui::App,
+) -> Option<gpui::AnyElement> {
+    match signal? {
+        view::PreviewSignal::Attention => {
+            let pip_sel = format!("bots-collapsed-waiting-{bot_id}");
+            Some(
+                div()
+                    .debug_selector(move || pip_sel.clone())
+                    .absolute()
+                    .right(px(-3.))
+                    .bottom(px(-3.))
+                    .size(px(14.))
+                    .rounded_full()
+                    .bg(p.worktree_sidebar)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(ui::status::status_glyph(
+                        krill_proto::control::AgentState::Waiting,
+                        false,
+                        ui::status::Size::Sm,
+                        cx,
+                    ))
+                    .into_any_element(),
+            )
+        }
+        view::PreviewSignal::Unread => {
+            let pip_sel = format!("bots-collapsed-unread-{bot_id}");
+            Some(
+                ui::status::unread_alert_dot(p.worktree_sidebar, cx)
+                    .debug_selector(move || pip_sel.clone())
+                    .absolute()
+                    .right(px(-2.))
+                    .bottom(px(-2.))
+                    .into_any_element(),
+            )
+        }
+        view::PreviewSignal::Working => {
+            let pip_sel = format!("bots-collapsed-working-{bot_id}");
+            Some(
+                div()
+                    .debug_selector(move || pip_sel.clone())
+                    .absolute()
+                    .right(px(-3.))
+                    .bottom(px(-3.))
+                    .size(px(12.))
+                    .rounded_full()
+                    .bg(p.worktree_sidebar)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(ui::status::status_glyph_slot(
+                        krill_proto::control::AgentState::Working,
+                        false,
+                        ui::status::Size::Sm,
+                        Some(spinners),
+                        cx,
+                    ))
+                    .into_any_element(),
+            )
+        }
+    }
+}
+
+/// Orca `BotPreviewEdge` (`#47622`, `#47884`): left/right overflow paging button with direction
+/// chevron, hidden count badge, tooltip, and edge status hint pip.
+fn render_preview_edge(
+    direction: i8,
+    count: usize,
+    attention: usize,
+    signal: Option<view::PreviewSignal>,
+    p: &'static ui::Palette,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let sel = if direction < 0 {
+        "bots-collapsed-edge-left"
+    } else {
+        "bots-collapsed-edge-right"
+    };
+    let action = if direction < 0 {
+        text::SB_SCROLL_LEFT.format(&[("n", &count.to_string())])
+    } else {
+        text::SB_SCROLL_RIGHT.format(&[("n", &count.to_string())])
+    };
+    let hint = if attention > 0 {
+        Some(if attention == 1 {
+            text::SB_NEEDS_YOU_ONE.format(&[("n", "1")])
+        } else {
+            text::SB_NEEDS_YOU_MANY.format(&[("n", &attention.to_string())])
+        })
+    } else if signal == Some(view::PreviewSignal::Unread) {
+        Some(text::SB_UNREAD.get().to_owned())
+    } else if signal == Some(view::PreviewSignal::Working) {
+        Some(text::STATUS_WORKING.get().to_owned())
+    } else {
+        None
+    };
+    let tip: SharedString = match hint {
+        Some(h) => format!("{action} · {h}").into(),
+        None => action.into(),
+    };
+    let tip_tt = tip.clone();
+    let chevron = if direction < 0 {
+        gpui_kit_assets::IconName::ChevronLeft
+    } else {
+        gpui_kit_assets::IconName::ChevronRight
+    };
+    let mut edge_pip: Option<gpui::AnyElement> = match signal {
+        Some(view::PreviewSignal::Attention) => Some(
+            div()
+                .flex_none()
+                .size(px(11.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(ui::status::status_glyph(
+                    krill_proto::control::AgentState::Waiting,
+                    false,
+                    ui::status::Size::Sm,
+                    cx,
+                ))
+                .into_any_element(),
+        ),
+        Some(view::PreviewSignal::Unread) => Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .child(ui::status::unread_alert_dot(p.worktree_sidebar, cx))
+                .into_any_element(),
+        ),
+        Some(view::PreviewSignal::Working) => Some(
+            div()
+                .flex_none()
+                .size(px(11.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    gpui_component::Icon::new(gpui_kit_assets::IconName::CircleDashed)
+                        .size(px(10.))
+                        .text_color(p.agent_working()),
+                )
+                .into_any_element(),
+        ),
+        None => None,
+    };
+    div()
+        .id(sel)
+        .debug_selector(move || sel.into())
+        .role(gpui::Role::Button)
+        .aria_label(tip)
+        .flex_none()
+        .h_full()
+        .px_1()
+        .rounded(ui::RADIUS_XS)
+        .bg(p.worktree_sidebar.opacity(0.92))
+        .text_color(p.worktree_sidebar_foreground.opacity(0.85))
+        .hover(|d| {
+            d.bg(p.worktree_sidebar_accent)
+                .text_color(p.worktree_sidebar_foreground)
+        })
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_0p5()
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip_tt.clone()).build(window, cx)
+        })
+        .on_click(on_click)
+        .when(direction < 0, |d| {
+            d.child(gpui_component::Icon::new(chevron).size(px(10.)))
+                .child(
+                    div()
+                        .text_size(ui::TEXT_3XS)
+                        .line_height(gpui::relative(1.))
+                        .child(count.to_string()),
+                )
+                .children(edge_pip.take())
+        })
+        .when(direction > 0, |d| {
+            d.children(edge_pip.take())
+                .child(
+                    div()
+                        .text_size(ui::TEXT_3XS)
+                        .line_height(gpui::relative(1.))
+                        .child(format!("+{count}")),
+                )
+                .child(gpui_component::Icon::new(chevron).size(px(10.)))
+        })
 }
 
 /// Text with Orca's find-match marks (`bg-search-match/25`) on `ranges`.
