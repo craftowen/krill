@@ -166,6 +166,10 @@ pub(super) fn split_gutter(
 impl Shell {
     #[must_use]
     pub(super) fn workspace_stage(&self) -> WorkspaceStage {
+        // Orca bot chat pages render flush on `--chat-canvas` with no rounded outer card border.
+        if self.focused_bot().is_some() || self.focused_bot_group().is_some() {
+            return WorkspaceStage::Flush;
+        }
         if self.role == WindowRole::Main && !self.layout.tabs().is_empty() {
             WorkspaceStage::CardStage
         } else {

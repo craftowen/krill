@@ -384,6 +384,9 @@ impl Shell {
                 agent_state,
                 cx,
             ),
+            work_run::DisplayRow::QuestionBatch { items } => {
+                self.render_question_batch(pane, session, items, cx)
+            }
             work_run::DisplayRow::WorkRun(run) => {
                 self.render_work_run(pane, session, run, is_last_row, agent_state, cx)
             }
@@ -396,6 +399,9 @@ impl Shell {
                 }
                 _ => Self::render_item_note(pane, row_ix, note, joins_activity_below, cx),
             },
+            work_run::DisplayRow::BotCard { abs_idx, card } => {
+                self.render_bot_chat_card(pane, session, *abs_idx, card, joins_activity_below, cx)
+            }
             work_run::DisplayRow::TurnBar {
                 user_abs_idx,
                 worked_secs,
@@ -419,43 +425,21 @@ impl Shell {
                 joins_activity_below,
                 cx,
             ),
-            work_run::DisplayRow::UnreadDivider { first_abs_idx } => {
-                let palette = ui::palette(cx);
-                div()
-                    .id(SharedString::from(format!(
-                        "chat-unread-divider-{}-{first_abs_idx}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-unread-divider".into())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .justify_center()
-                    .py_1p5()
-                    .child(
-                        div()
-                            .w_full()
-                            .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().flex_1().h_px().bg(palette.primary.opacity(0.4)))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(palette.primary.opacity(0.14))
-                                    .text_size(ui::TEXT_2XS)
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(palette.primary)
-                                    .child(ctext::UNREAD_DIVIDER.get()),
-                            )
-                            .child(div().flex_1().h_px().bg(palette.primary.opacity(0.4))),
-                    )
-                    .into_any_element()
-            }
+            work_run::DisplayRow::ContextCleared { abs_idx } => Self::render_divider_row(
+                SharedString::from(format!("chat-context-cleared-{}-{abs_idx}", pane.get())),
+                "chat-context-cleared-divider",
+                ctext::CONTEXT_CLEARED.get(),
+                cx,
+            ),
+            work_run::DisplayRow::UnreadDivider { first_abs_idx } => Self::render_divider_row(
+                SharedString::from(format!(
+                    "chat-unread-divider-{}-{first_abs_idx}",
+                    pane.get()
+                )),
+                "chat-unread-divider",
+                ctext::UNREAD_DIVIDER.get(),
+                cx,
+            ),
         };
         if is_find_match {
             let palette = ui::palette(cx);
@@ -503,152 +487,167 @@ impl Shell {
         let progress = run.progress_label(run_is_live);
         let failed = run.failed_count_label();
         let diff_summary = run.diff_summary_label();
-        let elapsed = self
+        let run_elapsed_secs = self
             .chat
             .logs
             .get(&key)
-            .and_then(|log| log.run_elapsed_secs(run_span.start(), std::time::Instant::now()))
-            .map(work_run::format_elapsed_secs);
+            .and_then(|log| log.run_elapsed_secs(run_span.start(), std::time::Instant::now()));
+        let elapsed = run_elapsed_secs.map(work_run::format_elapsed_secs);
+        // Orca `NativeChatToolRun` / `NativeChatWorkingStatus`: when collapsed and settled, show
+        // a quiet `"16s 작업 완료 >"` line instead of verbose icon + file/command chain + check.
+        let quiet_collapsed = !run_is_live && !run_expanded && run.counts.errors == 0;
+        let collapsed_label = if quiet_collapsed {
+            if let Some(secs) = run_elapsed_secs {
+                ctext::WORKED_FOR.format(&[("time", &work_run::format_turn_duration(secs))])
+            } else {
+                header_text.clone()
+            }
+        } else {
+            header_text.clone()
+        };
 
         let item_selector = format!("chat-item-{}-{}", pane.get(), run_span.start());
         let debug_selector = item_selector.clone();
-        let mut container = div()
-            .id(SharedString::from(item_selector))
-            .debug_selector(move || debug_selector.clone())
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .id(SharedString::from(format!(
-                        "chat-work-run-{}-{}",
-                        pane.get(),
-                        run_span.start()
-                    )))
-                    .debug_selector(|| "chat-work-run-toggle".into())
-                    .role(gpui::Role::Button)
-                    .aria_label(if run_expanded {
-                        ctext::RUN_HIDE.get()
-                    } else {
-                        ctext::RUN_SHOW.get()
-                    })
-                    .aria_expanded(run_expanded)
-                    .tab_index(0)
-                    .cursor_pointer()
-                    .rounded(ui::RADIUS_SM)
-                    .hover(|s| s.bg(palette.muted.opacity(0.6)))
-                    .focus_visible(|s| s.bg(palette.muted.opacity(0.6)))
-                    .w_full()
-                    .min_w_0()
-                    .min_h(gpui::px(28.))
-                    .px_1p5()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(log) = this
-                            .chat
-                            .logs
-                            .get_mut(&(this.layout.host(pane).clone(), session))
-                        {
-                            log.toggle_run(run_span);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .child(if run_is_live {
-                                ui::status::status_glyph(
-                                    krill_proto::control::AgentState::Working,
-                                    false,
-                                    ui::status::Size::Sm,
-                                    cx,
-                                )
-                                .into_any_element()
-                            } else {
-                                gpui_component::Icon::new(run.header_icon())
-                                    .with_size(ui::ICON_MD)
-                                    .text_color(if run.counts.errors > 0 {
-                                        palette.destructive
-                                    } else {
-                                        muted_fg
-                                    })
+        let mut container =
+            div()
+                .id(SharedString::from(item_selector))
+                .debug_selector(move || debug_selector.clone())
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-work-run-{}-{}",
+                            pane.get(),
+                            run_span.start()
+                        )))
+                        .debug_selector(|| "chat-work-run-toggle".into())
+                        .role(gpui::Role::Button)
+                        .aria_label(if run_expanded {
+                            ctext::RUN_HIDE.get()
+                        } else {
+                            ctext::RUN_SHOW.get()
+                        })
+                        .aria_expanded(run_expanded)
+                        .tab_index(0)
+                        .cursor_pointer()
+                        .rounded(ui::RADIUS_SM)
+                        .hover(|s| s.bg(palette.muted.opacity(0.6)))
+                        .focus_visible(|s| s.bg(palette.muted.opacity(0.6)))
+                        .w_full()
+                        .min_w_0()
+                        .min_h(gpui::px(26.))
+                        .px_1p5()
+                        .py_0p5()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(log) = this
+                                .chat
+                                .logs
+                                .get_mut(&(this.layout.host(pane).clone(), session))
+                            {
+                                log.toggle_run(run_span);
+                            }
+                            cx.notify();
+                        }))
+                        .when(!quiet_collapsed, |row| {
+                            row.child(div().flex_none().flex().items_center().child(
+                                if run_is_live {
+                                    ui::status::status_glyph(
+                                        krill_proto::control::AgentState::Working,
+                                        false,
+                                        ui::status::Size::Sm,
+                                        cx,
+                                    )
                                     .into_any_element()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(ui::TEXT_XS)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(if run_is_live { fg } else { muted_fg })
-                            .child(header_text),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .children(failed.map(|label| {
-                                div()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(palette.destructive)
-                                    .child(label)
-                            }))
-                            .children(diff_summary.map(|label| {
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "chat-work-run-diff-{}-{}",
-                                        pane.get(),
-                                        run_span.start()
-                                    )))
-                                    .debug_selector(|| "chat-work-run-diff-summary".into())
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(muted_fg)
-                                    .child(label)
-                            }))
-                            .children(progress.map(|label| {
-                                div()
-                                    .font_family(ui::FONT_MONO)
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(muted_fg)
-                                    .child(label)
-                            }))
-                            .children((!run_is_live).then(|| {
-                                gpui_component::Icon::new(IconName::Check)
-                                    .with_size(ui::ICON_XS)
-                                    .text_color(if run.counts.errors > 0 {
-                                        palette.destructive
-                                    } else {
-                                        muted_fg
-                                    })
-                            }))
-                            .children(elapsed.map(|label| {
-                                div()
-                                    .font_family(ui::FONT_MONO)
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(muted_fg)
-                                    .child(label)
-                            }))
-                            .child(
-                                gpui_component::Icon::new(if run_expanded {
-                                    IconName::ChevronDown
                                 } else {
-                                    IconName::ChevronRight
+                                    gpui_component::Icon::new(run.header_icon())
+                                        .with_size(ui::ICON_MD)
+                                        .text_color(if run.counts.errors > 0 {
+                                            palette.destructive
+                                        } else {
+                                            muted_fg
+                                        })
+                                        .into_any_element()
+                                },
+                            ))
+                        })
+                        .child(
+                            div()
+                                .when(quiet_collapsed && diff_summary.is_none(), |d| {
+                                    d.min_w_0().truncate()
                                 })
-                                .with_size(ui::ICON_XS)
-                                .text_color(muted_fg),
-                            ),
-                    ),
-            );
+                                .when(!quiet_collapsed || diff_summary.is_some(), |d| {
+                                    d.flex_1().min_w_0().truncate()
+                                })
+                                .text_size(if quiet_collapsed {
+                                    ui::TEXT_SM
+                                } else {
+                                    ui::TEXT_XS
+                                })
+                                .font_weight(if quiet_collapsed {
+                                    gpui::FontWeight::NORMAL
+                                } else {
+                                    gpui::FontWeight::MEDIUM
+                                })
+                                .text_color(if run_is_live { fg } else { muted_fg })
+                                .child(collapsed_label),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .children(failed.map(|label| {
+                                    div()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(palette.destructive)
+                                        .child(label)
+                                }))
+                                .children(diff_summary.map(|label| {
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "chat-work-run-diff-{}-{}",
+                                            pane.get(),
+                                            run_span.start()
+                                        )))
+                                        .debug_selector(|| "chat-work-run-diff-summary".into())
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(muted_fg)
+                                        .child(label)
+                                }))
+                                .when(!quiet_collapsed, |d| {
+                                    d.children(progress.map(|label| {
+                                        div()
+                                            .font_family(ui::FONT_MONO)
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(muted_fg)
+                                            .child(label)
+                                    }))
+                                    .children(elapsed.map(|label| {
+                                        div()
+                                            .font_family(ui::FONT_MONO)
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(muted_fg)
+                                            .child(label)
+                                    }))
+                                })
+                                .child(
+                                    gpui_component::Icon::new(if run_expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .with_size(ui::ICON_XS)
+                                    .text_color(muted_fg),
+                                ),
+                        ),
+                );
         if run_expanded {
             let mut body_col = div()
                 .ml(gpui::px(7.))
@@ -1138,13 +1137,23 @@ impl Shell {
 
         match item.kind {
             ChatItemKind::User => {
+                // Automation result / wait inline rows and bot-created receipts.
+                if let Some(inline) = super::bot_rows::parse_automation_inline_row(&item.text) {
+                    return Self::render_automation_inline_row(
+                        pane, abs_idx, &inline, &item.at, cx,
+                    );
+                }
+                if let Some((bot_name, bot_id)) = super::bot_rows::parse_bot_created_row(&item.text)
+                {
+                    return Self::render_bot_created_row(pane, abs_idx, &bot_name, bot_id, cx);
+                }
                 // A turn one of the bot's schedules started reads as Orca's automation run row.
                 if let Some(name) = self.chat_bot(&key).and_then(|bot| {
                     super::bot_rows::scheduled_run(&item.text, &bot.schedules).map(str::to_owned)
                 }) {
                     return self.render_scheduled_run(pane, session, abs_idx, &name, item, cx);
                 }
-                let item_text = item.text.as_str();
+                let (sender_tag, item_text) = super::bot_rows::parse_prompt_sender_tag(&item.text);
                 let image_paths = super::images::item_image_paths(item);
                 let image_numbers = super::images::image_numbers(&item.text, image_paths.len());
                 let is_remote = self.layout.host(pane).is_remote();
@@ -1161,14 +1170,19 @@ impl Shell {
                         }
                     })
                     .collect();
+                let gallery = (!resolved_paths.is_empty())
+                    .then(|| self.collect_chat_gallery_images(&key, is_remote));
                 let images = self
                     .chat_message_images(
                         &format!("chat-item-{}-{abs_idx}", pane.get()),
                         &resolved_paths,
                         &image_numbers,
+                        gallery.as_ref(),
                         cx,
                     )
                     .map(gpui::Styled::mb_0p5);
+                let sender_tag_el =
+                    sender_tag.map(|tag| Self::render_prompt_sender_tag(&tag, palette));
                 let has_text = !item_text.trim().is_empty();
                 let foldable = is_user_prompt_foldable(item_text);
                 let prompt_expanded = self
@@ -1293,6 +1307,7 @@ impl Shell {
                     .flex_col()
                     .items_end()
                     .gap_0p5()
+                    .children(sender_tag_el)
                     .child(bubble)
                     .children(has_meta.then(|| {
                         div()
@@ -1421,11 +1436,26 @@ impl Shell {
                         this.fork_pane_session(pane, cx);
                     }))
                 });
+                let retry_key = key.clone();
+                let retry_button = Button::new(SharedString::from(format!(
+                    "chat-retry-{}-{abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-retry-item".into())
+                .icon(IconName::RotateCcw)
+                .tooltip(ctext::RETRY_TURN.get())
+                .accessibility_label(ctext::RETRY_TURN.get())
+                .ghost()
+                .small()
+                .text_color(muted_fg)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.retry_assistant_turn(&retry_key, abs_idx, window, cx);
+                }));
                 let meta_group =
                     SharedString::from(format!("chat-assistant-row-{}-{abs_idx}", pane.get()));
 
-                // Orca's `NativeChatAgentControls`: Copy, Fork, scroll to top, the time. Shown on
-                // the latest response, on hover elsewhere.
+                // Orca's `NativeChatAgentControls`: Copy, Quote, Retry, Fork, scroll to top, time.
+                // Shown on the latest response, on hover elsewhere.
                 let assistant_el = div()
                     .id(SharedString::from(item_selector))
                     .debug_selector(move || debug_selector.clone())
@@ -1447,6 +1477,7 @@ impl Shell {
                             })
                             .children(copy_button)
                             .children(quote_button)
+                            .child(retry_button)
                             .children(fork_button)
                             .children(open_file_button)
                             .child(scroll_top_btn)
@@ -1629,6 +1660,7 @@ impl Shell {
         }
 
         let is_request = matches!(item.kind, ChatItemKind::Question | ChatItemKind::Permission);
+        let is_question = item.kind == ChatItemKind::Question;
         let role_label = match item.kind {
             ChatItemKind::Question => ctext::QUESTION.get(),
             ChatItemKind::Permission => ctext::PERMISSION.get(),
@@ -1647,30 +1679,105 @@ impl Shell {
         let disabled = !current
             || submission.is_some_and(Submission::blocks_input)
             || self.chat.prompt_tasks.contains_key(&key);
-        let card_border = if is_request && current {
-            palette.agent_question
+        // Orca `#47564`: a pending question reads as waiting (orange `agent_question`), never red blocked.
+        let card_border = if is_question && current {
+            palette.agent_question.opacity(0.65)
+        } else if is_request && current {
+            palette.primary.opacity(0.32)
         } else {
             border
         };
 
         let is_plan_approval = item.kind == ChatItemKind::Permission
             && item.tool_name.eq_ignore_ascii_case("ExitPlanMode");
+        // Orca `#47117`: Bash/shell approval renders the command cleanly without duplicating description.
+        let shell_approval = (item.kind == ChatItemKind::Permission)
+            .then(|| {
+                work_run::parse_shell_approval_detail(&item.text, &item.tool_name, &item.title)
+            })
+            .flatten();
+        // Orca `#47164` & `#47222`: active permission card gets a focus handle so Enter approves the
+        // default answer while ignoring held-key auto-repeat (`e.is_held`).
+        let approval_focus =
+            (item.kind == ChatItemKind::Permission && current && !disabled).then(|| {
+                self.chat
+                    .approval_focus
+                    .entry((key.clone(), answer_key.clone()))
+                    .or_insert_with(|| cx.focus_handle())
+                    .clone()
+            });
+        let header_icon = if is_question {
+            IconName::MessageCircleQuestionMark
+        } else if item.kind == ChatItemKind::Permission {
+            IconName::ShieldQuestionMark
+        } else {
+            IconName::Terminal
+        };
+        let header_icon_color = if is_question {
+            palette.agent_question
+        } else if item.kind == ChatItemKind::Permission && current {
+            palette.warning
+        } else {
+            muted_fg
+        };
+
         let mut card = div()
             .id(SharedString::from(item_selector))
             .debug_selector(move || debug_selector.clone())
             .w_full()
             .min_w_0()
             .overflow_hidden()
-            .p_3()
-            .rounded(ui::RADIUS_MD)
+            .rounded(ui::RADIUS_XL)
             .border_1()
             .border_color(card_border)
-            .bg(palette.card)
+            .bg(if is_request {
+                palette.chat_composer_surface()
+            } else {
+                palette.card
+            })
             .flex()
             .flex_col()
-            .gap_2()
+            .when_some(approval_focus.clone(), |d, handle| {
+                let enter_req = request.clone();
+                let esc_req = request.clone();
+                d.track_focus(&handle).on_key_down(cx.listener(
+                    move |this, e: &gpui::KeyDownEvent, _, cx| {
+                        // `#47222`: ignore held Enter or Space auto-repeat on prompt card buttons.
+                        if e.is_held && matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if e.keystroke.modifiers.modified() {
+                            return;
+                        }
+                        match e.keystroke.key.as_str() {
+                            "enter" => {
+                                this.approve_chat_permission(enter_req.clone(), true, cx);
+                                cx.stop_propagation();
+                            }
+                            "escape" => {
+                                this.approve_chat_permission(esc_req.clone(), false, cx);
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    },
+                ))
+            })
             .child(
+                // Orca `NativeChatQuestionCardHeader` / approval header band (no top step bar `#47959`).
                 div()
+                    .debug_selector(|| "chat-prompt-card-header".into())
+                    .min_h(gpui::px(36.))
+                    .px_3p5()
+                    .py_1()
+                    .bg(if is_question {
+                        palette.agent_question.opacity(0.09)
+                    } else if is_request {
+                        palette.primary.opacity(0.07)
+                    } else {
+                        ui::transparent()
+                    })
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1680,15 +1787,28 @@ impl Shell {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(fg)
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(if item.title.is_empty() {
-                                SharedString::from(role_label)
-                            } else {
-                                SharedString::from(format!("{role_label} • {}", item.title))
-                            }),
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                gpui_component::Icon::new(header_icon)
+                                    .with_size(ui::ICON_MD)
+                                    .text_color(header_icon_color),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_SM)
+                                    .text_color(fg)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(if item.title.is_empty() {
+                                        SharedString::from(role_label)
+                                    } else {
+                                        SharedString::from(format!("{role_label} · {}", item.title))
+                                    }),
+                            ),
                     )
                     .children(is_plan_approval.then(|| {
                         div()
@@ -1718,13 +1838,50 @@ impl Shell {
             )))
             .w_full()
             .min_w_0()
-            .max_h(gpui::px(288.))
+            .max_h(gpui::px(300.))
             .overflow_y_scroll()
+            .px_3p5()
+            .pt_3()
+            .pb_3()
             .flex()
             .flex_col()
-            .gap_2();
+            .gap_2p5();
 
-        if !item.text.trim().is_empty() {
+        if let Some(shell_detail) = shell_approval {
+            scroll_body = scroll_body
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-shell-approval-cmd-{}-{abs_idx}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-shell-approval-cmd".into())
+                        .w_full()
+                        .min_w_0()
+                        .rounded(ui::RADIUS_SM)
+                        .border_1()
+                        .border_color(border)
+                        .bg(palette.muted.opacity(0.5))
+                        .px_2p5()
+                        .py_2()
+                        .font_family(ui::FONT_MONO)
+                        .text_size(ui::TEXT_SM)
+                        .text_color(fg)
+                        .whitespace_normal()
+                        .child(shell_detail.command),
+                )
+                .children(shell_detail.other_arguments.map(|other| {
+                    div()
+                        .debug_selector(|| "chat-shell-approval-args".into())
+                        .w_full()
+                        .min_w_0()
+                        .font_family(ui::FONT_MONO)
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .whitespace_normal()
+                        .child(other)
+                }));
+        } else if !item.text.trim().is_empty() {
             let body = self.append_chat_segments(
                 div()
                     .w_full()
@@ -1746,14 +1903,19 @@ impl Shell {
                     markdown: false,
                     stream_fade: false,
                     full_width: true,
-                    text_size: ui::TEXT_MD,
+                    text_size: if is_question {
+                        ui::TEXT_HEADING
+                    } else {
+                        ui::TEXT_MD
+                    },
                     text_color: fg,
                     epoch,
                     palette,
                 },
                 cx,
             );
-            scroll_body = scroll_body.child(body);
+            scroll_body = scroll_body
+                .child(body.when(is_question, |d| d.font_weight(gpui::FontWeight::SEMIBOLD)));
         }
 
         if is_request {
@@ -2307,7 +2469,8 @@ impl Shell {
                 pane.get()
             )))
             .debug_selector(|| "chat-notice".into())
-            .when(joins_activity_below, gpui::Styled::pb_1)
+            // Orca `#46806` / `#46659`: fixed 6px gap between adjacent 1-line activity/message rows.
+            .when(joins_activity_below, |d| d.pb(gpui::px(6.)))
             .when(!joins_activity_below, gpui::Styled::pb_4)
             .w_full()
             .min_w_0()
@@ -2434,7 +2597,8 @@ impl Shell {
                 pane.get()
             )))
             .debug_selector(|| "chat-item-note".into())
-            .when(joins_activity_below, gpui::Styled::pb_1)
+            // Orca `#46806` / `#46659`: fixed 6px gap between adjacent 1-line activity rows.
+            .when(joins_activity_below, |d| d.pb(gpui::px(6.)))
             .when(!joins_activity_below, gpui::Styled::pb_4)
             .w_full()
             .min_w_0()
@@ -2949,13 +3113,21 @@ impl Shell {
     }
 
     /// Orca's `BotHomeBanner`: the bot's face and name in a pill over its Home chat; it opens the
-    /// bot's page in the right panel.
+    /// bot's page in the right panel. Automatically hidden at pane widths `<= 264px` (`bot-home-banner.css`).
     fn render_bot_home_banner(
         &self,
         pane: super::super::PaneId,
         key: &ChatKey,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if self
+            .chat
+            .pane_widths
+            .get(&pane)
+            .is_some_and(|w| *w <= gpui::px(264.))
+        {
+            return None;
+        }
         let bot = self
             .chat_bot(key)
             .filter(|bot| bot.home_session().is_some_and(|h| h.session_id == key.1))?;
@@ -3639,11 +3811,14 @@ impl Shell {
             .map(|a| Some(a.preview_path().to_path_buf()))
             .collect();
         let pending_numbers: Vec<usize> = (1..=pending_images.len()).collect();
+        let gallery = (!pending_images.is_empty())
+            .then(|| self.collect_chat_gallery_images(&key, self.layout.host(pane).is_remote()));
         let image_strip = self
             .chat_message_images(
                 &format!("chat-pending-{pending_id}-{}", pane.get()),
                 &pending_images,
                 &pending_numbers,
+                gallery.as_ref(),
                 cx,
             )
             .map(gpui::Styled::mb_0p5);
@@ -3861,7 +4036,10 @@ impl Shell {
                                 .run_elapsed_secs(run.span.start(), std::time::Instant::now())
                                 .map(work_run::format_elapsed_secs),
                             work_run::DisplayRow::Item { .. }
+                            | work_run::DisplayRow::QuestionBatch { .. }
                             | work_run::DisplayRow::UnreadDivider { .. }
+                            | work_run::DisplayRow::ContextCleared { .. }
+                            | work_run::DisplayRow::BotCard { .. }
                             | work_run::DisplayRow::ItemNote { .. }
                             | work_run::DisplayRow::Notice { .. }
                             | work_run::DisplayRow::TurnBar { .. } => None,
@@ -3890,9 +4068,15 @@ impl Shell {
             self.ensure_question_other_input(&key, &answer_key, window, cx);
         }
 
-        let home_pill = self
-            .chat_bot(&key)
-            .is_some_and(|bot| bot.home_session().is_some_and(|h| h.session_id == key.1));
+        let narrow_pane = self
+            .chat
+            .pane_widths
+            .get(&pane)
+            .is_some_and(|w| *w <= gpui::px(264.));
+        let home_pill = !narrow_pane
+            && self
+                .chat_bot(&key)
+                .is_some_and(|bot| bot.home_session().is_some_and(|h| h.session_id == key.1));
         let mut feed = div()
             .id(SharedString::from(format!(
                 "desktop-chat-feed-{}",
@@ -3941,14 +4125,20 @@ impl Shell {
             .map(|bot| {
                 let avatar = self.bot_avatar(bot, 56., ui::RADIUS_XL, palette);
                 let name = [("name", bot.name.as_str())];
-                // Orca: the first paragraph of its SOUL.md, until then its own greeting.
+                // Orca `BotHomeChat` / `BotFirstScreen`: avatar + bot name only (no greeting suffix)
+                // + SOUL.md first paragraph in muted_foreground.
                 let subtitle = self
                     .chat
                     .bot_souls
                     .get(&(host.clone(), bot.id.clone()))
                     .cloned()
                     .unwrap_or_else(|| ctext::BOT_EMPTY_SUBTITLE.format(&name));
-                (avatar, ctext::BOT_EMPTY_TITLE.format(&name), subtitle)
+                let agent_label = super::composer::agent_display_name(
+                    krill_proto::agent::canonical_id(&bot.agent_id),
+                );
+                let first_setup =
+                    !bound && agent_state == krill_proto::control::AgentState::Working;
+                (avatar, bot.name.clone(), subtitle, agent_label, first_setup)
             });
         if display_feed.is_empty() && pending_len == 0 {
             let badge_bg = if poll_failed {
@@ -3994,14 +4184,16 @@ impl Shell {
                     .gap_3()
                     .p_6()
                     .map(|empty| match persona {
-                        // Orca: a chat in a bot's home greets as the bot (picture, name, SOUL.md line).
-                        Some((avatar, title, subtitle)) => empty
+                        // Orca `BotHomeChat` / `BotFirstScreen` / `BotHowToAsk`: 56px avatar,
+                        // bot name only, SOUL.md first paragraph, and optional first-run steps.
+                        Some((avatar, title, subtitle, agent_label, first_setup)) => empty
                             .child(avatar)
                             .child(
                                 div()
+                                    .debug_selector(|| "chat-bot-empty-name".into())
                                     .text_align(gpui::TextAlign::Center)
-                                    .text_size(ui::TEXT_LG)
-                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_size(ui::TEXT_XL)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(palette.foreground)
                                     .child(title),
                             )
@@ -4011,8 +4203,38 @@ impl Shell {
                                     .text_align(gpui::TextAlign::Center)
                                     .text_size(ui::TEXT_SM)
                                     .text_color(muted_fg)
-                                    .child(subtitle),
-                            ),
+                                    .child(if first_setup {
+                                        ctext::BOT_FIRST_SUBTITLE
+                                            .format(&[("agent", agent_label.as_str())])
+                                    } else {
+                                        subtitle
+                                    }),
+                            )
+                            .when(first_setup, |d| {
+                                d.child(Self::render_bot_first_screen_steps(
+                                    &agent_label,
+                                    palette,
+                                    cx,
+                                ))
+                            })
+                            .when(!first_setup, |d| {
+                                d.child(
+                                    div()
+                                        .debug_selector(|| "chat-bot-how-to-ask".into())
+                                        .mt_1()
+                                        .max_w(gpui::px(384.))
+                                        .rounded(ui::RADIUS_MD)
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(palette.muted.opacity(0.35))
+                                        .px_3()
+                                        .py_2()
+                                        .text_align(gpui::TextAlign::Center)
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(muted_fg)
+                                        .child(ctext::BOT_HOW_TO_ASK_HINT.get()),
+                                )
+                            }),
                         None => empty
                             .child(
                                 div()
@@ -4155,6 +4377,14 @@ impl Shell {
                 }
             }
             if user_turns.len() >= 4 {
+                // Orca `NativeChatMessageRail` (`#47553`): light the turn whose row is at or
+                // immediately above the viewport top, even when scroll stops between two rows.
+                let scroll_top_row = list_state.logical_scroll_top().item_ix;
+                let active_turn_num = user_turns
+                    .iter()
+                    .rfind(|(_, row_ix, _)| *row_ix <= scroll_top_row)
+                    .or_else(|| user_turns.first())
+                    .map(|(n, _, _)| *n);
                 let sampled: Vec<(usize, usize, String)> = if user_turns.len() <= 16 {
                     user_turns
                 } else {
@@ -4166,10 +4396,11 @@ impl Shell {
                         })
                         .collect()
                 };
+                let roomy = sampled.len() <= 10;
                 feed = feed.child(
                     div()
                         .absolute()
-                        .right_2()
+                        .right_2p5()
                         .top_16()
                         .bottom_4()
                         .flex()
@@ -4181,17 +4412,12 @@ impl Shell {
                                     pane.get()
                                 )))
                                 .debug_selector(|| "chat-turn-minimap".into())
-                                .rounded_full()
-                                .border_1()
-                                .border_color(border)
-                                .bg(palette.popover.opacity(0.9))
-                                .shadow_lg()
-                                .px_1()
-                                .py_1p5()
+                                .w_6()
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .gap_1()
+                                .opacity(0.45)
+                                .hover(|s| s.opacity(1.0))
                                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
@@ -4208,25 +4434,45 @@ impl Shell {
                                         };
                                         let id =
                                             format!("chat-minimap-turn-{}-{turn_num}", pane.get());
-                                        ui::button_with_tooltip(
-                                            Button::new(SharedString::from(id.clone()))
-                                                .debug_selector(move || {
-                                                    format!("chat-minimap-turn-{turn_num}")
-                                                })
-                                                .label(turn_num.to_string())
-                                                .rounded_full()
-                                                .ghost()
-                                                .xsmall()
-                                                .on_click(cx.listener(move |_, _, _, cx| {
-                                                    jump_list.scroll_to(gpui::ListOffset {
-                                                        item_ix: row_ix,
-                                                        offset_in_item: gpui::px(0.),
-                                                    });
-                                                    cx.notify();
-                                                })),
-                                            id,
-                                            tip,
-                                        )
+                                        let lit = active_turn_num == Some(turn_num);
+                                        // Contiguous vertical padding (no gap) so the pointer never
+                                        // falls between two ticks (`NativeChatMessageRail.tsx`).
+                                        div()
+                                            .id(SharedString::from(id.clone()))
+                                            .debug_selector(move || {
+                                                format!("chat-minimap-turn-{turn_num}")
+                                            })
+                                            .w_full()
+                                            .when(roomy, gpui::Styled::py_1)
+                                            .when(!roomy, gpui::Styled::py_0p5)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .tooltip(move |window, cx| {
+                                                ui::tooltip_view(
+                                                    id.clone(),
+                                                    tip.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                jump_list.scroll_to(gpui::ListOffset {
+                                                    item_ix: row_ix,
+                                                    offset_in_item: gpui::px(0.),
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                div()
+                                                    .h(gpui::px(3.))
+                                                    .rounded_full()
+                                                    .when(lit, |b| b.w_5().bg(palette.foreground))
+                                                    .when(!lit, |b| {
+                                                        b.w_3().bg(palette.foreground.opacity(0.5))
+                                                    }),
+                                            )
                                     },
                                 )),
                         ),
@@ -4270,13 +4516,45 @@ impl Shell {
             }
         }
 
+        // Orca `#47164`: when an active permission card appears and the composer isn't already
+        // focused with user typing, focus the permission card once so Enter picks its default answer.
+        if self.layout.focused() == Some(pane)
+            && !gpui::Focusable::focus_handle(input_state.read(cx), cx).is_focused(window)
+            && input_state.read(cx).value().trim().is_empty()
+            && !self.chat.finds.contains_key(&key)
+        {
+            for row in display_feed.rows().iter().rev() {
+                if let work_run::DisplayRow::Item { abs_idx, item } = row
+                    && item.kind == ChatItemKind::Permission
+                {
+                    let req = self.chat_request_identity(pane, session, *abs_idx, item);
+                    if self.chat_request_is_current(&req, cx) {
+                        let focus_key = (key.clone(), req.key.clone());
+                        if self.chat.approval_auto_focused.insert(focus_key.clone()) {
+                            let handle = self
+                                .chat
+                                .approval_focus
+                                .entry(focus_key)
+                                .or_insert_with(|| cx.focus_handle())
+                                .clone();
+                            window.focus(&handle, cx);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         // Orca's `BotServerOutageCard` stands where the composer was while its server is down.
         self.sync_chat_image_tokens(&key, &input_state, window, cx);
+        self.ensure_agy_version(cx);
         let composer = match self.render_bot_outage_card(&key, cx) {
             Some(card) => card,
             None => self.render_chat_composer(pane, key.clone(), &input_state, cx),
         };
         let paused_banner = self.render_bot_paused_banner(&key, cx);
+        let worker_auto_close_banner = self.render_worker_auto_close_banner(&key, cx);
+        let resume_toast = self.render_resume_toast(&key, cx);
         let home_banner = self.render_bot_home_banner(pane, &key, cx);
 
         let live_line = (agent_state == krill_proto::control::AgentState::Working)
@@ -4462,6 +4740,30 @@ impl Shell {
 
         let in_card = self.workspace_stage() == super::super::pane_frame::WorkspaceStage::CardStage;
         let overlay_weak = cx.weak_entity();
+        let width_tracker = {
+            let weak = cx.weak_entity();
+            gpui::canvas(
+                move |bounds, _, cx| {
+                    let w = bounds.size.width;
+                    weak.update(cx, |this, cx| {
+                        let prev = this.chat.pane_widths.get(&pane).copied();
+                        let crossed =
+                            prev.is_none_or(|p| (p <= gpui::px(264.)) != (w <= gpui::px(264.)));
+                        if prev != Some(w) {
+                            this.chat.pane_widths.insert(pane, w);
+                            if crossed {
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .inset_0()
+        };
+
         let inner = div()
             .id(SharedString::from(format!(
                 "desktop-chat-overlay-surface-{}",
@@ -4493,8 +4795,10 @@ impl Shell {
             .context_menu(move |menu, _, cx| {
                 super::super::terminal_menu::build_chat_overlay(menu, &overlay_weak, pane, cx)
             })
-            // Orca: the paused banner spans the bot's page above the chat and its header controls.
+            .child(width_tracker)
+            // Orca: paused banner and temporary worker auto-close banner sit above the chat.
             .children(paused_banner)
+            .children(worker_auto_close_banner)
             .child(
                 div()
                     .relative()
@@ -4505,6 +4809,7 @@ impl Shell {
                     .flex_col()
                     .child(feed)
                     .children(self.render_chat_prompt_notices(&key, cx))
+                    .children(resume_toast)
                     .children(turn_status_line)
                     .child(composer)
                     .children(home_banner)
@@ -4546,6 +4851,1431 @@ impl Shell {
                 .child(inner)
                 .into_any_element(),
         )
+    }
+
+    /// Orca `NativeChatDividerRow.tsx`: thin 1px `border` rules on both sides + quiet `12px`
+    /// `muted_foreground` plain text centered with no pill background.
+    fn render_divider_row(
+        id: SharedString,
+        selector: &'static str,
+        label: &'static str,
+        cx: &gpui::App,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        div()
+            .id(id)
+            .debug_selector(move || selector.into())
+            .aria_label(label)
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .py_2()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().flex_1().h_px().bg(palette.border))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(palette.muted_foreground)
+                            .child(label),
+                    )
+                    .child(div().flex_1().h_px().bg(palette.border)),
+            )
+            .into_any_element()
+    }
+
+    /// Orca `BotFirstScreen.tsx` setup steps card shown while a new bot starts its first session.
+    fn render_bot_first_screen_steps(
+        agent_label: &str,
+        palette: &ui::Palette,
+        cx: &gpui::App,
+    ) -> gpui::Stateful<gpui::Div> {
+        let muted = palette.muted_foreground;
+        div()
+            .id("chat-bot-first-screen")
+            .debug_selector(|| "chat-bot-first-screen".into())
+            .mt_3()
+            .w(gpui::px(384.))
+            .max_w_full()
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.card)
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .text_size(ui::TEXT_LG)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        gpui_component::Icon::new(IconName::Check)
+                            .with_size(ui::ICON_MD)
+                            .text_color(palette.success),
+                    )
+                    .child(
+                        div()
+                            .text_color(palette.foreground)
+                            .child(ctext::BOT_FIRST_STEP_CREATE.get()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ui::status::status_glyph(
+                        krill_proto::control::AgentState::Working,
+                        false,
+                        ui::status::Size::Sm,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_color(palette.foreground)
+                            .child(ctext::BOT_FIRST_STEP_START.format(&[("agent", agent_label)])),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        gpui_component::Icon::new(IconName::Circle)
+                            .with_size(ui::ICON_MD)
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .child(ctext::BOT_FIRST_STEP_REPLY.get()),
+                    ),
+            )
+    }
+
+    /// Orca `NativeChatWorkerAutoCloseBanner` (`#43521`): in-flow top banner for temporary
+    /// orchestration workers with a `Keep open` action.
+    fn render_worker_auto_close_banner(
+        &self,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.chat.worker_keep_open.contains(&key.1) {
+            return None;
+        }
+        let store = self.orch_snapshot_for(&key.0)?;
+        let dispatch = store.dispatches.iter().find(|d| {
+            d.session_id == Some(key.1.0)
+                && matches!(
+                    d.status,
+                    krill_proto::orchestration::DispatchStatus::Active
+                        | krill_proto::orchestration::DispatchStatus::Succeeded
+                        | krill_proto::orchestration::DispatchStatus::Failed
+                        | krill_proto::orchestration::DispatchStatus::Stopped
+                )
+        })?;
+        let palette = ui::palette(cx);
+        let label = if dispatch.ended_at_ms.is_some() {
+            ctext::WORKER_AUTO_CLOSE_DONE.get().to_owned()
+        } else {
+            ctext::WORKER_AUTO_CLOSE_TITLE.format(&[("time", "5m")])
+        };
+        let session = key.1;
+        Some(
+            div()
+                .id("chat-worker-auto-close-banner")
+                .debug_selector(|| "chat-worker-auto-close-banner".into())
+                .role(gpui::Role::Status)
+                .flex_none()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2p5()
+                .border_b_1()
+                .border_color(palette.border)
+                .bg(palette.muted.opacity(0.45))
+                .py_1p5()
+                .pr_2()
+                .pl_3()
+                .text_size(ui::TEXT_SM)
+                .child(
+                    gpui_component::Icon::new(IconName::Timer)
+                        .with_size(ui::ICON_MD)
+                        .text_color(palette.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(palette.foreground)
+                        .child(label),
+                )
+                .child(
+                    Button::new("chat-worker-keep-open")
+                        .debug_selector(|| "chat-worker-keep-open".into())
+                        .label(ctext::WORKER_KEEP_OPEN.get())
+                        .outline()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chat.worker_keep_open.insert(session);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Orca `#47859`: resume toast whose primary Resume button is filled with `theme_accent`.
+    fn render_resume_toast(&self, key: &ChatKey, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (toast_key, detail) = self.chat.resume_toast.as_ref()?;
+        if toast_key != key {
+            return None;
+        }
+        let palette = ui::palette(cx);
+        let accent = palette.theme_accent();
+        let text = if detail.is_empty() {
+            ctext::RESUME_TOAST_TITLE.get().to_owned()
+        } else {
+            detail.clone()
+        };
+        let resume_key = key.clone();
+        Some(
+            div()
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .pt_1()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("chat-resume-toast")
+                        .debug_selector(|| "chat-resume-toast".into())
+                        .w_full()
+                        .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                        .rounded(ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(palette.border)
+                        .bg(palette.popover)
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(ui::TEXT_SM)
+                                .text_color(palette.foreground)
+                                .child(text),
+                        )
+                        .child(
+                            div()
+                                .id("chat-resume-toast-btn")
+                                .debug_selector(|| "chat-resume-toast-btn".into())
+                                .role(gpui::Role::Button)
+                                .cursor_pointer()
+                                .rounded(ui::RADIUS_SM)
+                                .bg(accent)
+                                .hover(|s| s.opacity(0.9))
+                                .px_2p5()
+                                .py_1()
+                                .text_size(ui::TEXT_XS)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(palette.primary_foreground)
+                                .child(ctext::RESUME_TOAST_BTN.get())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.chat.resume_toast = None;
+                                    this.continue_after_rate_limit(&resume_key, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("chat-resume-toast-dismiss")
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chat.resume_toast = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Orca `NativeChatTypedByTag` / `NativeChatConnectorAskerTag` above a user bubble.
+    fn render_prompt_sender_tag(
+        tag: &super::bot_rows::PromptSenderTag,
+        palette: &ui::Palette,
+    ) -> gpui::Div {
+        let (icon, label) = match tag {
+            super::bot_rows::PromptSenderTag::TypedBy(name) => (
+                IconName::UserRound,
+                ctext::TYPED_BY_LABEL.format(&[("name", name.as_str())]),
+            ),
+            super::bot_rows::PromptSenderTag::ConnectorAsker { source, name } => (
+                IconName::Plug,
+                ctext::CONNECTOR_ASKER_LABEL
+                    .format(&[("source", source.as_str()), ("name", name.as_str())]),
+            ),
+        };
+        div()
+            .debug_selector(|| "chat-prompt-sender-tag".into())
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .text_size(ui::TEXT_2XS)
+            .text_color(palette.muted_foreground)
+            .child(
+                gpui_component::Icon::new(icon)
+                    .with_size(ui::ICON_XS)
+                    .text_color(palette.muted_foreground),
+            )
+            .child(label)
+    }
+
+    /// Orca `NativeChatAutomationResultRow` & `NativeChatWaitRow`.
+    fn render_automation_inline_row(
+        pane: super::super::PaneId,
+        abs_idx: usize,
+        row: &super::bot_rows::AutomationInlineRow,
+        at: &str,
+        cx: &gpui::App,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        let time = Self::chat_message_time(pane, abs_idx, at, muted);
+        let (icon, lead, detail) = match row {
+            super::bot_rows::AutomationInlineRow::Result { name, summary } => (
+                IconName::CircleCheck,
+                format!("{} · {name}", ctext::AUTOMATION_RESULT_LABEL.get()),
+                summary.clone(),
+            ),
+            super::bot_rows::AutomationInlineRow::Wait { label } => (
+                IconName::Hourglass,
+                ctext::AUTOMATION_WAIT_LABEL.get().to_owned(),
+                label.clone(),
+            ),
+        };
+        div()
+            .id(SharedString::from(format!(
+                "chat-automation-inline-{}-{abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-automation-inline".into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb(gpui::px(6.))
+                    .min_h(gpui::px(24.))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(muted)
+                    .child(
+                        gpui_component::Icon::new(icon)
+                            .with_size(ui::ICON_MD)
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(palette.foreground)
+                            .child(lead),
+                    )
+                    .when(!detail.is_empty(), |d| {
+                        d.child(div().flex_1().min_w_0().truncate().child(detail))
+                    })
+                    .children(time),
+            )
+            .into_any_element()
+    }
+
+    /// Orca `NativeChatBotCreatedRow`: quiet event row naming a newly created bot.
+    fn render_bot_created_row(
+        pane: super::super::PaneId,
+        abs_idx: usize,
+        bot_name: &str,
+        bot_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        div()
+            .id(SharedString::from(format!(
+                "chat-bot-created-{}-{abs_idx}",
+                pane.get()
+            )))
+            .debug_selector(|| "chat-bot-created".into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb(gpui::px(6.))
+                    .min_h(gpui::px(24.))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(muted)
+                    .child(
+                        gpui_component::Icon::new(IconName::Bot)
+                            .with_size(ui::ICON_MD)
+                            .text_color(muted),
+                    )
+                    .child(div().flex_none().child(ctext::BOT_CREATED_LABEL.get()))
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded(ui::RADIUS_SM)
+                            .bg(palette.foreground.opacity(0.07))
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(palette.foreground)
+                            .child(bot_name.to_owned()),
+                    )
+                    .children(bot_id.map(|id| {
+                        Button::new(SharedString::from(format!(
+                            "chat-bot-created-open-{}-{abs_idx}",
+                            pane.get()
+                        )))
+                        .label(ctext::OFFER_OPEN.get())
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Ok(bot_id) = krill_proto::bots::BotId::new(&id) {
+                                let host = this.layout.host(pane).clone();
+                                this.open_bot_home_on(&host, bot_id, None, cx);
+                            }
+                        }))
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Orca `NativeChatQuestionCard` for multi-question batches (`#46963`, `#47959`, `#42789`,
+    /// `#47564`, `#42515`): shows 1 question at a time with ONLY header title + `· N of M` + `‹ ›`
+    /// arrows (no top step bar), orange waiting tone, and `Skip` submitting already-answered steps.
+    fn render_question_batch(
+        &mut self,
+        pane: super::super::PaneId,
+        session: SessionId,
+        items: &[(usize, Arc<ChatItem>)],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((first_abs_idx, _)) = items.first() else {
+            return div().into_any_element();
+        };
+        let first_abs_idx = *first_abs_idx;
+        let total = items.len();
+        let key = (self.layout.host(pane).clone(), session);
+        let batch_key = (key.clone(), first_abs_idx);
+        let step_idx = self
+            .chat
+            .question_batch_step
+            .get(&batch_key)
+            .copied()
+            .unwrap_or(0)
+            .min(total.saturating_sub(1));
+        let (abs_idx, item) = &items[step_idx];
+        let abs_idx = *abs_idx;
+        let palette = ui::palette(cx);
+        let fg = palette.foreground;
+        let muted = palette.muted_foreground;
+        let request = self.chat_request_identity(pane, session, abs_idx, item);
+        let current = self.chat_request_is_current(&request, cx);
+        let saved_answers = self
+            .chat
+            .question_batch_answers
+            .get(&batch_key)
+            .cloned()
+            .unwrap_or_default();
+        let current_picks = saved_answers.get(&step_idx).cloned().unwrap_or_default();
+        let current_answered = !current_picks.is_empty();
+        let any_answered = saved_answers.values().any(|v| !v.is_empty());
+        let is_last = step_idx + 1 >= total;
+        let header_title = if item.title.trim().is_empty() {
+            ctext::QUESTION.get().to_owned()
+        } else {
+            item.title.clone()
+        };
+        let count_text = format!(
+            "· {}",
+            ctext::QUESTION_STEP_OF.format(&[
+                ("cur", &(step_idx + 1).to_string()),
+                ("total", &total.to_string()),
+            ])
+        );
+
+        let prev_key = batch_key.clone();
+        let next_key = batch_key.clone();
+        // Header band: NO segmented top step bar (`#47959`) — only icon, title, `· N of M`, check, `‹ ›`.
+        let header = div()
+            .debug_selector(|| "chat-question-batch-header".into())
+            .min_h(gpui::px(36.))
+            .py_1()
+            .pr_1p5()
+            .pl_3p5()
+            .bg(palette.agent_question.opacity(0.09))
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .text_size(ui::TEXT_SM)
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(fg)
+            .child(
+                gpui_component::Icon::new(IconName::MessageCircleQuestionMark)
+                    .with_size(ui::ICON_MD)
+                    .text_color(palette.agent_question),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_baseline()
+                    .gap_1()
+                    .child(div().min_w_0().truncate().child(header_title))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(count_text),
+                    ),
+            )
+            .when(current_answered, |d| {
+                d.child(
+                    gpui_component::Icon::new(IconName::Check)
+                        .with_size(ui::ICON_XS)
+                        .text_color(palette.success),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                Button::new(SharedString::from(format!(
+                    "chat-qbatch-prev-{}-{first_abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-question-step-prev".into())
+                .icon(IconName::ChevronLeft)
+                .tooltip(ctext::QUESTION_PREV.get())
+                .ghost()
+                .xsmall()
+                .disabled(step_idx == 0)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.chat
+                        .question_batch_step
+                        .insert(prev_key.clone(), step_idx.saturating_sub(1));
+                    cx.notify();
+                })),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "chat-qbatch-next-{}-{first_abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-question-step-next".into())
+                .icon(IconName::ChevronRight)
+                .tooltip(ctext::QUESTION_NEXT.get())
+                .ghost()
+                .xsmall()
+                .disabled(is_last)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.chat
+                        .question_batch_step
+                        .insert(next_key.clone(), (step_idx + 1).min(total - 1));
+                    cx.notify();
+                })),
+            );
+
+        let mut opts_col = div().w_full().min_w_0().flex().flex_col().gap_1p5();
+        for (opt_idx, opt) in item.options.iter().enumerate() {
+            let selected = current_picks.contains(&opt_idx);
+            let pick_key = batch_key.clone();
+            let multi = item.multi_select;
+            let opt_border = if selected {
+                palette.agent_question
+            } else {
+                palette.border
+            };
+            let opt_bg = if selected {
+                palette.agent_question.opacity(0.10)
+            } else {
+                palette.muted.opacity(0.35)
+            };
+            opts_col = opts_col.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-qbatch-opt-{}-{first_abs_idx}-{step_idx}-{opt_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(move || format!("chat-question-batch-option-{opt_idx}"))
+                    .w_full()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .rounded(ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(opt_border)
+                    .bg(opt_bg)
+                    .hover(|s| s.bg(palette.muted.opacity(0.65)))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let entry = this
+                            .chat
+                            .question_batch_answers
+                            .entry(pick_key.clone())
+                            .or_default()
+                            .entry(step_idx)
+                            .or_default();
+                        if multi {
+                            if let Some(pos) = entry.iter().position(|&v| v == opt_idx) {
+                                entry.remove(pos);
+                            } else {
+                                entry.push(opt_idx);
+                            }
+                        } else {
+                            *entry = vec![opt_idx];
+                            if step_idx + 1 < total {
+                                this.chat
+                                    .question_batch_step
+                                    .insert(pick_key.clone(), step_idx + 1);
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(ui::SPACE_4)
+                            .flex_none()
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if selected {
+                                palette.agent_question
+                            } else {
+                                muted
+                            })
+                            .child(if multi {
+                                if selected {
+                                    "✓".to_owned()
+                                } else {
+                                    "□".to_owned()
+                                }
+                            } else {
+                                (opt_idx + 1).to_string()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_SM)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(fg)
+                                    .child(opt.label.clone()),
+                            )
+                            .when(!opt.description.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(muted)
+                                        .child(opt.description.clone()),
+                                )
+                            }),
+                    ),
+            );
+        }
+
+        let skip_key = batch_key.clone();
+        let submit_key = batch_key.clone();
+        let submit_items = items.to_vec();
+        let skip_items = items.to_vec();
+        // `#42789`: Skipping on the last step sends any already-answered steps instead of dropping them.
+        let skip_label = if is_last && any_answered && !current_answered {
+            ctext::SUBMIT.format(&[("n", &saved_answers.len().to_string())])
+        } else {
+            ctext::QUESTION_SKIP.get().to_owned()
+        };
+        let footer = div()
+            .border_t_1()
+            .border_color(palette.border)
+            .px_3p5()
+            .py_2()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new(SharedString::from(format!(
+                    "chat-qbatch-skip-{}-{first_abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-question-batch-skip".into())
+                .label(skip_label)
+                .outline()
+                .small()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !is_last {
+                        this.chat
+                            .question_batch_step
+                            .insert(skip_key.clone(), step_idx + 1);
+                        cx.notify();
+                    } else if let Some(answers) =
+                        this.chat.question_batch_answers.get(&skip_key).cloned()
+                    {
+                        // Submit the latest answered question from the batch (`#42789`).
+                        if let Some((&ans_step, picks)) =
+                            answers.iter().rev().find(|(_, v)| !v.is_empty())
+                            && let Some((ans_abs, ans_item)) = skip_items.get(ans_step)
+                        {
+                            let req = this.chat_request_identity(pane, session, *ans_abs, ans_item);
+                            this.answer_chat_question(
+                                req,
+                                picks.clone(),
+                                ans_item.multi_select,
+                                cx,
+                            );
+                        }
+                    }
+                })),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "chat-qbatch-confirm-{}-{first_abs_idx}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-question-batch-confirm".into())
+                .label(if is_last {
+                    ctext::OTHER_SUBMIT.get()
+                } else {
+                    ctext::QUESTION_NEXT_BTN.get()
+                })
+                .primary()
+                .small()
+                .disabled(!current_answered && !any_answered)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !is_last {
+                        this.chat
+                            .question_batch_step
+                            .insert(submit_key.clone(), step_idx + 1);
+                        cx.notify();
+                    } else if let Some(answers) =
+                        this.chat.question_batch_answers.get(&submit_key).cloned()
+                        && let Some((&ans_step, picks)) =
+                            answers.iter().rev().find(|(_, v)| !v.is_empty())
+                        && let Some((ans_abs, ans_item)) = submit_items.get(ans_step)
+                    {
+                        let req = this.chat_request_identity(pane, session, *ans_abs, ans_item);
+                        this.answer_chat_question(req, picks.clone(), ans_item.multi_select, cx);
+                    }
+                })),
+            );
+
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "chat-question-batch-{}-{first_abs_idx}",
+                                pane.get()
+                            )))
+                            .debug_selector(|| "chat-question-batch".into())
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .rounded(ui::RADIUS_XL)
+                            .border_1()
+                            .border_color(if current {
+                                palette.agent_question.opacity(0.65)
+                            } else {
+                                palette.border
+                            })
+                            .bg(palette.chat_composer_surface())
+                            .flex()
+                            .flex_col()
+                            .child(header)
+                            .child(
+                                // Unified `pt_3()` top padding matching single-question cards (`#47959`).
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .px_3p5()
+                                    .pt_3()
+                                    .pb_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2p5()
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_HEADING)
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(fg)
+                                            .child(item.text.clone()),
+                                    )
+                                    .child(opts_col),
+                            )
+                            .child(footer),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Orca `NativeChatCardFrame.tsx`: shared rounded-xl card frame used by all bot offer & setup cards.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "card frame slots mirror NativeChatCardFrame.tsx"
+    )]
+    fn render_chat_card_frame(
+        id: SharedString,
+        selector: &'static str,
+        avatar: Option<AnyElement>,
+        heading: &str,
+        status: Option<(&'static str, gpui::Hsla)>,
+        title: &str,
+        body: Option<AnyElement>,
+        footer: Option<AnyElement>,
+        palette: &ui::Palette,
+    ) -> AnyElement {
+        let muted = palette.muted_foreground;
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                    .pb_4()
+                    .child(
+                        div()
+                            .id(id)
+                            .debug_selector(move || selector.into())
+                            .w_full()
+                            .min_w_0()
+                            .rounded(ui::RADIUS_XL)
+                            .border_1()
+                            .border_color(palette.border)
+                            .bg(palette.muted)
+                            .text_size(ui::TEXT_LG)
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .p_3()
+                                    .children(avatar.map(|a| div().flex_none().mt_0p5().child(a)))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .items_baseline()
+                                                    .gap_x_2()
+                                                    .text_size(ui::TEXT_SM)
+                                                    .text_color(muted)
+                                                    .child(heading.to_owned())
+                                                    .children(status.map(|(text, color)| {
+                                                        div()
+                                                            .ml_auto()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_1p5()
+                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                            .text_color(color)
+                                                            .child(
+                                                                div()
+                                                                    .size_1p5()
+                                                                    .rounded_full()
+                                                                    .bg(color),
+                                                            )
+                                                            .child(text)
+                                                    })),
+                                            )
+                                            .when(!title.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                        .text_color(palette.foreground)
+                                                        .child(title.to_owned()),
+                                                )
+                                            })
+                                            .children(body),
+                                    ),
+                            )
+                            .children(footer.map(|footer| {
+                                div()
+                                    .border_t_1()
+                                    .border_color(palette.border)
+                                    .px_3()
+                                    .py_2()
+                                    .child(footer)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Renders Orca bot offer/setup cards (`ConnectorOfferCard`, `GoogleOfferCard`, `ToolAddedCard`,
+    /// `WebhookSetupCard`, `ImportPlanCard`/`ImportDoneCard`, `SignInOffer`).
+    fn render_bot_chat_card(
+        &mut self,
+        pane: super::super::PaneId,
+        _session: SessionId,
+        abs_idx: usize,
+        card: &work_run::BotChatCard,
+        joins_activity_below: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = ui::palette(cx);
+        let muted = palette.muted_foreground;
+        let resolution = self.chat.resolved_bot_cards.get(card.card_id()).copied();
+        let card_avatar = |icon: IconName, color: gpui::Hsla| {
+            div()
+                .size_8()
+                .rounded_full()
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.card)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    gpui_component::Icon::new(icon)
+                        .with_size(ui::ICON_LG)
+                        .text_color(color),
+                )
+                .into_any_element()
+        };
+
+        match card {
+            work_run::BotChatCard::ToolAdded {
+                card_id,
+                tool_name,
+                subtitle,
+            } => {
+                let removed = resolution == Some(super::BotCardResolution::Removed);
+                let remove_id = card_id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-tool-added-{}-{abs_idx}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-tool-added-card".into())
+                    .when(joins_activity_below, |d| d.pb(gpui::px(6.)))
+                    .when(!joins_activity_below, gpui::Styled::pb_4)
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                            .min_h(gpui::px(24.))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(muted)
+                            .child(
+                                gpui_component::Icon::new(IconName::Wrench)
+                                    .with_size(ui::ICON_MD)
+                                    .text_color(muted),
+                            )
+                            .child(div().flex_none().child(if removed {
+                                ctext::CARD_TOOL_REMOVED.get()
+                            } else {
+                                ctext::CARD_TOOL_ADDED.get()
+                            }))
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .rounded(ui::RADIUS_SM)
+                                    .bg(palette.foreground.opacity(0.07))
+                                    .text_size(ui::TEXT_XS)
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(palette.foreground)
+                                    .child(tool_name.clone()),
+                            )
+                            .when(!subtitle.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(format!("· {subtitle}")),
+                                )
+                            })
+                            .when(!removed, |d| {
+                                d.child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-tool-remove-{}-{abs_idx}",
+                                        pane.get()
+                                    )))
+                                    .label(ctext::CARD_TOOL_REMOVE.get())
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.chat.resolved_bot_cards.insert(
+                                            remove_id.clone(),
+                                            super::BotCardResolution::Removed,
+                                        );
+                                        cx.notify();
+                                    })),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
+            work_run::BotChatCard::ConnectorOffer {
+                card_id,
+                service,
+                title,
+                description,
+            } => {
+                let status = match resolution {
+                    Some(super::BotCardResolution::Connected) => {
+                        Some((ctext::CARD_CONNECTOR_CONNECTED.get(), palette.success))
+                    }
+                    Some(super::BotCardResolution::Dismissed) => {
+                        Some((ctext::OFFER_DISMISSED.get(), muted))
+                    }
+                    _ => None,
+                };
+                let footer = (resolution.is_none()).then(|| {
+                    let dismiss_id = card_id.clone();
+                    let connect_id = card_id.clone();
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new(SharedString::from(format!("chat-conn-dismiss-{card_id}")))
+                                .label(ctext::OFFER_NOT_NOW.get())
+                                .outline()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.chat.resolved_bot_cards.insert(
+                                        dismiss_id.clone(),
+                                        super::BotCardResolution::Dismissed,
+                                    );
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("chat-conn-accept-{card_id}")))
+                                .label(
+                                    ctext::CARD_CONNECTOR_CONNECT
+                                        .format(&[("service", service.as_str())]),
+                                )
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.chat.resolved_bot_cards.insert(
+                                        connect_id.clone(),
+                                        super::BotCardResolution::Connected,
+                                    );
+                                    if this.panel_collapsed {
+                                        this.toggle_panel(cx);
+                                    }
+                                    this.bot_ui.panel.tab =
+                                        super::super::bot_panel::BotPanelTab::Connectors;
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element()
+                });
+                let body = (!description.is_empty()).then(|| {
+                    div()
+                        .mt_0p5()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .child(description.clone())
+                        .into_any_element()
+                });
+                let shown_title = if title.is_empty() { service } else { title };
+                Self::render_chat_card_frame(
+                    SharedString::from(format!("chat-connector-offer-{card_id}")),
+                    "chat-connector-offer-card",
+                    Some(card_avatar(IconName::Plug, palette.foreground)),
+                    ctext::CARD_CONNECTOR_HEADING.get(),
+                    status,
+                    shown_title,
+                    body,
+                    footer,
+                    palette,
+                )
+            }
+            work_run::BotChatCard::GoogleOffer {
+                card_id,
+                title,
+                description,
+            } => {
+                let status = match resolution {
+                    Some(super::BotCardResolution::Connected) => {
+                        Some((ctext::CARD_CONNECTOR_CONNECTED.get(), palette.success))
+                    }
+                    Some(super::BotCardResolution::Dismissed) => {
+                        Some((ctext::OFFER_DISMISSED.get(), muted))
+                    }
+                    _ => None,
+                };
+                let footer = (resolution.is_none()).then(|| {
+                    let dismiss_id = card_id.clone();
+                    let connect_id = card_id.clone();
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "chat-google-dismiss-{card_id}"
+                            )))
+                            .label(ctext::OFFER_NOT_NOW.get())
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.chat.resolved_bot_cards.insert(
+                                        dismiss_id.clone(),
+                                        super::BotCardResolution::Dismissed,
+                                    );
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "chat-google-connect-{card_id}"
+                            )))
+                            .label(ctext::CARD_GOOGLE_CONNECT.get())
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.chat.resolved_bot_cards.insert(
+                                        connect_id.clone(),
+                                        super::BotCardResolution::Connected,
+                                    );
+                                    if this.panel_collapsed {
+                                        this.toggle_panel(cx);
+                                    }
+                                    this.bot_ui.panel.tab =
+                                        super::super::bot_panel::BotPanelTab::Connectors;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .into_any_element()
+                });
+                let body = (!description.is_empty()).then(|| {
+                    div()
+                        .mt_0p5()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .child(description.clone())
+                        .into_any_element()
+                });
+                Self::render_chat_card_frame(
+                    SharedString::from(format!("chat-google-offer-{card_id}")),
+                    "chat-google-offer-card",
+                    Some(card_avatar(IconName::Mail, palette.foreground)),
+                    ctext::CARD_GOOGLE_HEADING.get(),
+                    status,
+                    title,
+                    body,
+                    footer,
+                    palette,
+                )
+            }
+            work_run::BotChatCard::WebhookSetup {
+                card_id,
+                title,
+                url,
+                description,
+            } => {
+                let copied = resolution == Some(super::BotCardResolution::Copied);
+                let copy_id = card_id.clone();
+                let copy_url = url.clone();
+                let body = div()
+                    .mt_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(!description.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(ui::TEXT_SM)
+                                .text_color(muted)
+                                .child(description.clone()),
+                        )
+                    })
+                    .when(!url.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .rounded(ui::RADIUS_SM)
+                                .border_1()
+                                .border_color(palette.border)
+                                .bg(palette.card)
+                                .px_2()
+                                .py_1()
+                                .font_family(ui::FONT_MONO)
+                                .text_size(ui::TEXT_XS)
+                                .text_color(palette.foreground)
+                                .truncate()
+                                .child(url.clone()),
+                        )
+                    })
+                    .into_any_element();
+                let footer = (!url.is_empty()).then(|| {
+                    div()
+                        .flex()
+                        .justify_end()
+                        .child(
+                            Button::new(SharedString::from(format!("chat-webhook-copy-{card_id}")))
+                                .icon(if copied {
+                                    IconName::Check
+                                } else {
+                                    IconName::Copy
+                                })
+                                .label(if copied {
+                                    ctext::COPIED.get()
+                                } else {
+                                    ctext::CARD_WEBHOOK_COPY_URL.get()
+                                })
+                                .outline()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copy_url.clone(),
+                                    ));
+                                    this.chat
+                                        .resolved_bot_cards
+                                        .insert(copy_id.clone(), super::BotCardResolution::Copied);
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element()
+                });
+                Self::render_chat_card_frame(
+                    SharedString::from(format!("chat-webhook-setup-{card_id}")),
+                    "chat-webhook-setup-card",
+                    Some(card_avatar(IconName::Webhook, palette.foreground)),
+                    ctext::CARD_WEBHOOK_HEADING.get(),
+                    Some((ctext::CARD_WEBHOOK_READY.get(), palette.success)),
+                    title,
+                    Some(body),
+                    footer,
+                    palette,
+                )
+            }
+            work_run::BotChatCard::ImportPlan {
+                card_id,
+                source,
+                bot_name,
+                summary,
+            } => {
+                let status = match resolution {
+                    Some(super::BotCardResolution::Done) => {
+                        Some((ctext::OFFER_CREATED.get(), palette.success))
+                    }
+                    Some(super::BotCardResolution::Dismissed) => {
+                        Some((ctext::OFFER_DISMISSED.get(), muted))
+                    }
+                    _ => None,
+                };
+                let footer = (resolution.is_none()).then(|| {
+                    let dismiss_id = card_id.clone();
+                    let confirm_id = card_id.clone();
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "chat-import-cancel-{card_id}"
+                            )))
+                            .label(ctext::OFFER_NOT_NOW.get())
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.chat.resolved_bot_cards.insert(
+                                        dismiss_id.clone(),
+                                        super::BotCardResolution::Dismissed,
+                                    );
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "chat-import-confirm-{card_id}"
+                            )))
+                            .label(ctext::CARD_IMPORT_CONFIRM.get())
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.chat
+                                        .resolved_bot_cards
+                                        .insert(confirm_id.clone(), super::BotCardResolution::Done);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .into_any_element()
+                });
+                let body = (!summary.is_empty()).then(|| {
+                    div()
+                        .mt_0p5()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .child(summary.clone())
+                        .into_any_element()
+                });
+                let heading = if source.is_empty() {
+                    ctext::CARD_IMPORT_PLAN_HEADING.get().to_owned()
+                } else {
+                    format!("{} · {source}", ctext::CARD_IMPORT_PLAN_HEADING.get())
+                };
+                Self::render_chat_card_frame(
+                    SharedString::from(format!("chat-import-plan-{card_id}")),
+                    "chat-import-plan-card",
+                    Some(card_avatar(IconName::Download, palette.foreground)),
+                    &heading,
+                    status,
+                    bot_name,
+                    body,
+                    footer,
+                    palette,
+                )
+            }
+            work_run::BotChatCard::ImportDone {
+                card_id,
+                bot_name,
+                summary,
+            } => {
+                let body = (!summary.is_empty()).then(|| {
+                    div()
+                        .mt_0p5()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .child(summary.clone())
+                        .into_any_element()
+                });
+                Self::render_chat_card_frame(
+                    SharedString::from(format!("chat-import-done-{card_id}")),
+                    "chat-import-done-card",
+                    Some(card_avatar(IconName::BadgeCheck, palette.success)),
+                    ctext::CARD_IMPORT_DONE_HEADING.get(),
+                    Some((ctext::OFFER_CREATED.get(), palette.success)),
+                    bot_name,
+                    body,
+                    None,
+                    palette,
+                )
+            }
+            work_run::BotChatCard::SignInOffer {
+                card_id,
+                provider,
+                description,
+            } => {
+                let footer = div()
+                    .flex()
+                    .justify_end()
+                    .child(
+                        Button::new(SharedString::from(format!("chat-signin-offer-{card_id}")))
+                            .icon(IconName::LogIn)
+                            .label(ctext::CARD_SIGNIN_BTN.get())
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_settings(
+                                    krill_app::settings::AdminTab::Accounts,
+                                    Some(window),
+                                    cx,
+                                );
+                            })),
+                    )
+                    .into_any_element();
+                let body = (!description.is_empty()).then(|| {
+                    div()
+                        .mt_0p5()
+                        .text_size(ui::TEXT_SM)
+                        .text_color(muted)
+                        .child(description.clone())
+                        .into_any_element()
+                });
+                Self::render_chat_card_frame(
+                    SharedString::from(format!("chat-signin-card-{card_id}")),
+                    "chat-sign-in-offer-card",
+                    Some(card_avatar(IconName::KeyRound, palette.warning)),
+                    ctext::CARD_SIGNIN_HEADING.get(),
+                    None,
+                    provider,
+                    body,
+                    Some(footer),
+                    palette,
+                )
+            }
+        }
     }
 }
 

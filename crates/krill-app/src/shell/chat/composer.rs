@@ -73,6 +73,7 @@ pub(super) fn short_model_name(text: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn effort_bars(effort: &str) -> Option<usize> {
     match effort {
         "minimal" | "low" => Some(1),
@@ -101,25 +102,6 @@ pub(super) fn effort_text(effort: &str) -> String {
 
 fn model_is_selected(active: Option<&str>, id: &str) -> bool {
     active.is_some_and(|active| active == id || active.starts_with(&format!("claude-{id}-")))
-}
-
-fn effort_bars_icon(palette: &ui::Palette, filled: usize) -> gpui::Div {
-    div()
-        .flex()
-        .items_end()
-        .gap(px(1.))
-        .h(px(11.))
-        .children((0..5u8).map(|bar| {
-            div()
-                .w(px(2.))
-                .h(px(3. + f32::from(bar) * 2.))
-                .rounded(px(1.))
-                .bg(if usize::from(bar) < filled {
-                    palette.foreground
-                } else {
-                    palette.border
-                })
-        }))
 }
 
 fn composer_popup(palette: &ui::Palette) -> gpui::Div {
@@ -265,9 +247,9 @@ impl Shell {
         } else {
             "Agent".to_string()
         };
-        let filled_bars = show_effort
-            .then(|| current_effort.and_then(effort_bars))
-            .flatten();
+        let effort_label = current_effort
+            .filter(|e| !e.trim().is_empty())
+            .map(effort_text);
 
         let context_ring = meta.and_then(|m| m.context_percent).map(|pct| {
             let color = if pct >= 85 {
@@ -413,6 +395,8 @@ impl Shell {
                     pane.get()
                 )))
                 .debug_selector(|| "chat-model-picker".into())
+                // Orca `#47587`: clicking or dragging the picker's scrollbar must not close it.
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
                     this.chat.model_picker.remove(&close_key);
                     this.chat.model_picker_selected.remove(&close_key);
@@ -425,6 +409,7 @@ impl Shell {
                             "chat-model-list-{}",
                             pane.get()
                         )))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .max_h(px(220.))
                         .overflow_y_scroll()
                         .flex()
@@ -885,6 +870,8 @@ impl Shell {
             .get(&key)
             .map(|log| log.queued_prompts.iter().cloned().collect())
             .unwrap_or_default();
+        let is_working_now = agent_state == krill_proto::control::AgentState::Working;
+        // Orca `#47346`: queued rows keep Steer always visible and reveal Edit & Delete on hover.
         let queued_strip = (!queued_prompts.is_empty()).then(|| {
             let q_key = key.clone();
             div()
@@ -894,16 +881,23 @@ impl Shell {
                 )))
                 .debug_selector(|| "chat-queued-strip".into())
                 .w_full()
+                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
                 .min_w_0()
+                .mb_1p5()
+                .rounded(ui::RADIUS_LG)
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.chat_composer_surface())
+                .overflow_hidden()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .px_1()
-                .pb_1()
-                .children(queued_prompts.into_iter().map(|queued| {
+                .children(queued_prompts.into_iter().enumerate().map(|(idx, queued)| {
                     let cancel_key = q_key.clone();
+                    let edit_key = q_key.clone();
+                    let steer_key = q_key.clone();
                     let q_id = queued.id;
-                    let preview: String = queued.display_text.trim().chars().take(72).collect();
+                    let row_group = SharedString::from(format!("chat-queued-row-{q_id}"));
+                    let preview: String = queued.display_text.trim().chars().take(96).collect();
                     let label = if preview.is_empty() {
                         let n = queued.attachments.len();
                         let msg = if n == 1 {
@@ -918,18 +912,16 @@ impl Shell {
                     div()
                         .id(SharedString::from(format!("chat-queued-{q_id}")))
                         .debug_selector(|| "chat-queued-item".into())
+                        .group(row_group.clone())
                         .w_full()
                         .min_w_0()
-                        .px_2()
-                        .py_1()
-                        .rounded(ui::RADIUS_MD)
-                        .border_1()
-                        .border_color(palette.border)
-                        .bg(palette.muted)
+                        .when(idx > 0, |d| d.border_t_1().border_color(palette.border))
+                        .px_2p5()
+                        .py_1p5()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap_2()
+                        .gap_1p5()
                         .child(
                             div()
                                 .min_w_0()
@@ -938,42 +930,94 @@ impl Shell {
                                 .items_center()
                                 .gap_1p5()
                                 .child(
-                                    div()
-                                        .flex_none()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded(ui::RADIUS_SM)
-                                        .bg(palette.primary.opacity(0.14))
-                                        .text_size(ui::TEXT_2XS)
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(palette.primary)
-                                        .child(ctext::QUEUE_HINT.get()),
+                                    Icon::new(gpui_kit_assets::IconName::ListEnd)
+                                        .size(px(ui::ICON_MD))
+                                        .text_color(muted_fg),
                                 )
                                 .child(
                                     div()
                                         .min_w_0()
                                         .flex_1()
                                         .truncate()
-                                        .text_size(ui::TEXT_XS)
+                                        .text_size(ui::TEXT_SM)
                                         .text_color(palette.foreground)
                                         .child(label),
                                 ),
                         )
                         .child(
-                            Button::new(SharedString::from(format!("chat-queued-cancel-{q_id}")))
-                                .debug_selector(|| "chat-queued-cancel".into())
-                                .icon(IconName::Close)
-                                .tooltip(ctext::REMOVE_QUEUED.get())
-                                .xsmall()
-                                .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_queued_chat_prompt(&cancel_key, q_id, cx);
-                                })),
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_0p5()
+                                // Edit & Delete reveal on hover (`#47346`).
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_0p5()
+                                        .opacity(0.)
+                                        .group_hover(row_group.clone(), |s| s.opacity(1.))
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "chat-queued-edit-{q_id}"
+                                            )))
+                                            .debug_selector(|| "chat-queued-edit".into())
+                                            .icon(gpui_kit_assets::IconName::Pencil)
+                                            .tooltip(ctext::EDIT_QUEUED.get())
+                                            .xsmall()
+                                            .ghost()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.edit_queued_chat_prompt(
+                                                    &edit_key, q_id, window, cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "chat-queued-cancel-{q_id}"
+                                            )))
+                                            .debug_selector(|| "chat-queued-cancel".into())
+                                            .icon(gpui_kit_assets::IconName::Trash)
+                                            .tooltip(ctext::REMOVE_QUEUED.get())
+                                            .xsmall()
+                                            .ghost()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_queued_chat_prompt(
+                                                    &cancel_key,
+                                                    q_id,
+                                                    cx,
+                                                );
+                                            })),
+                                        ),
+                                )
+                                // Steer stays visible on every queued row (`#47346`).
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-queued-steer-{q_id}"
+                                    )))
+                                    .debug_selector(|| "chat-queued-steer".into())
+                                    .icon(if is_working_now {
+                                        gpui_kit_assets::IconName::CornerDownRight
+                                    } else {
+                                        gpui_kit_assets::IconName::Send
+                                    })
+                                    .label(if is_working_now {
+                                        ctext::STEER_HINT.get()
+                                    } else {
+                                        ctext::QUEUED_SEND_NOW.get()
+                                    })
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.steer_queued_chat_prompt(&steer_key, q_id, window, cx);
+                                    })),
+                                ),
                         )
                 }))
         });
 
-        // Orca's bot chat: its permission mode in the toolbar and where it runs under the card.
+        // Orca's bot chat: icon-only permission picker in toolbar + host/folder/agy footer below.
         let bot = self.chat_bot(&key).map(|bot| {
             let path = bot
                 .workspace
@@ -990,9 +1034,140 @@ impl Shell {
             );
             (bot.id.clone(), bot.permission, folder, path)
         });
-        let permission_chip = bot.as_ref().map(|(bot_id, permission, _, _)| {
+        let permission_picker_open = self.chat.permission_picker.contains(&key);
+        let permission_popover = (permission_picker_open)
+            .then(|| {
+                let (bot_id, current_perm, _, _) = bot.as_ref()?;
+                let close_key = key.clone();
+                let full_bot = bot_id.clone();
+                let ask_bot = bot_id.clone();
+                let full_key = key.clone();
+                let ask_key = key.clone();
+                let is_full = *current_perm == krill_proto::agent::Permission::Yolo;
+                Some(
+                    composer_popup(palette)
+                        .id(SharedString::from(format!(
+                            "chat-permission-popover-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-permission-popover".into())
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                            this.chat.permission_picker.remove(&close_key);
+                            cx.notify();
+                        }))
+                        .child(
+                            popup_row(
+                                palette,
+                                SharedString::from(format!("chat-perm-opt-full-{}", pane.get())),
+                                true,
+                            )
+                            .debug_selector(|| "chat-perm-opt-full".into())
+                            .py_1p5()
+                            .h_auto()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .text_color(palette.warning)
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .child(
+                                                Icon::default()
+                                                    .data(ui::icons::SHIELD_ALERT_SVG)
+                                                    .size(px(ui::ICON_MD)),
+                                            )
+                                            .child(ctext::PERMISSION_FULL_ACCESS.get()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(muted_fg)
+                                            .child(ctext::PERMISSION_FULL_ACCESS_DESC.get()),
+                                    ),
+                            )
+                            .when(is_full, |r| {
+                                r.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.chat.permission_picker.remove(&full_key);
+                                    this.set_bot_permission(
+                                        full_bot.clone(),
+                                        krill_proto::agent::Permission::Yolo,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                        .child(
+                            popup_row(
+                                palette,
+                                SharedString::from(format!("chat-perm-opt-ask-{}", pane.get())),
+                                true,
+                            )
+                            .debug_selector(|| "chat-perm-opt-ask".into())
+                            .py_1p5()
+                            .h_auto()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .child(
+                                                Icon::default()
+                                                    .data(ui::icons::HAND_SVG)
+                                                    .size(px(ui::ICON_MD)),
+                                            )
+                                            .child(ctext::PERMISSION_ASK.get()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(muted_fg)
+                                            .child(ctext::PERMISSION_ASK_DESC.get()),
+                                    ),
+                            )
+                            .when(!is_full, |r| {
+                                r.child(Icon::new(IconName::Check).size(px(ui::ICON_SM)))
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.chat.permission_picker.remove(&ask_key);
+                                    this.set_bot_permission(
+                                        ask_bot.clone(),
+                                        krill_proto::agent::Permission::Manual,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        ),
+                )
+            })
+            .flatten();
+        // Orca `NativeChatPermissionModePicker` `appearance="icon"`: icon + chevron only, tooltip names mode.
+        let permission_chip = bot.as_ref().map(|(_, permission, _, _)| {
             let full = *permission == krill_proto::agent::Permission::Yolo;
-            let (icon, label, tip) = if full {
+            let (icon, label, desc) = if full {
                 (
                     ui::icons::SHIELD_ALERT_SVG,
                     ctext::PERMISSION_FULL_ACCESS.get(),
@@ -1005,76 +1180,301 @@ impl Shell {
                     ctext::PERMISSION_ASK_DESC.get(),
                 )
             };
-            let bot_host = key.0.clone();
-            let bot_id = bot_id.clone();
+            let tip = format!("{label} · {desc}");
+            let perm_key = key.clone();
+            let icon_color = if full { palette.warning } else { muted_fg };
+            div()
+                .id(SharedString::from(format!(
+                    "chat-composer-permission-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-composer-permission".into())
+                .aria_label(label)
+                .cursor_pointer()
+                .h(px(24.))
+                .px_1p5()
+                .rounded(ui::RADIUS_SM)
+                .hover(|s| s.bg(palette.secondary))
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.chat.quick_menu.remove(&perm_key);
+                    this.chat.model_picker.remove(&perm_key);
+                    if !this.chat.permission_picker.remove(&perm_key) {
+                        this.chat.permission_picker.insert(perm_key.clone());
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    Icon::default()
+                        .data(icon)
+                        .size(px(ui::ICON_MD))
+                        .text_color(icon_color),
+                )
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(10.))
+                        .text_color(muted_fg),
+                )
+        });
+
+        let agy_chip = self.chat_is_agy(&key, cx).then(|| {
+            let agy_label = match &self.chat.agy_version {
+                Some(ver) => ctext::AGY_PROGRAM_YOUR_VER.format(&[("version", ver.as_str())]),
+                None => ctext::AGY_PROGRAM_YOUR.get().to_owned(),
+            };
+            let agy_key = key.clone();
             Button::new(SharedString::from(format!(
-                "chat-composer-permission-{}",
+                "chat-composer-agy-auth-{}",
                 pane.get()
             )))
-            .debug_selector(|| "chat-composer-permission".into())
-            .icon(Icon::default().data(icon).size(px(ui::ICON_MD)))
-            .label(label)
+            .debug_selector(|| "chat-composer-agy-auth".into())
+            .icon(
+                Icon::new(gpui_kit_assets::IconName::SquareTerminal)
+                    .size(px(ui::ICON_XS))
+                    .text_color(muted_fg),
+            )
+            .label(agy_label)
             .dropdown_caret(true)
-            .tooltip(tip)
             .ghost()
             .xsmall()
-            .when(full, |b| b.text_color(palette.warning))
+            .text_color(muted_fg)
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_bot_settings_in_panel_on(&bot_host, &bot_id, cx);
+                this.chat.quick_menu.remove(&agy_key);
+                this.chat.model_picker.remove(&agy_key);
+                this.chat.permission_picker.remove(&agy_key);
+                if !this.chat.agy_auth_picker.remove(&agy_key) {
+                    this.chat.agy_auth_picker.insert(agy_key.clone());
+                }
+                cx.notify();
             }))
         });
-        let workspace_footer = bot.map(|(_, _, folder, path)| {
-            let path_text = path.map(|p| p.display().to_string()).unwrap_or_default();
-            let folder_label = format!("{folder} · {}", ctext::WORKSPACE_FOLDER.get());
-            let host_label = self.chat_host_label(&key.0, cx);
-            let folder_el = if path_text.is_empty() {
-                div()
-                    .id(SharedString::from(format!(
-                        "chat-composer-folder-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-composer-folder".into())
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .text_size(ui::TEXT_2XS)
-                    .text_color(muted_fg)
-                    .child(
-                        Icon::default()
-                            .data(ui::icons::FOLDER_SVG)
-                            .size(px(ui::ICON_XS)),
-                    )
-                    .child(div().truncate().child(folder_label))
-                    .into_any_element()
-            } else {
-                ui::button_with_tooltip(
-                    Button::new(SharedString::from(format!(
-                        "chat-composer-folder-{}",
-                        pane.get()
-                    )))
-                    .debug_selector(|| "chat-composer-folder".into())
-                    .icon(
-                        Icon::default()
-                            .data(ui::icons::FOLDER_SVG)
-                            .size(px(ui::ICON_XS)),
-                    )
-                    .label(folder_label)
-                    .ghost()
-                    .xsmall()
-                    .on_click({
-                        let path_text = path_text.clone();
-                        move |_, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                path_text.clone(),
-                            ));
-                        }
-                    }),
-                    format!("chat-composer-folder-tip-{}", pane.get()),
-                    path_text,
-                )
-                .into_any_element()
+
+        let agy_auth_popover = self.chat.agy_auth_picker.contains(&key).then(|| {
+            let close_key = key.clone();
+            let settings_key = key.clone();
+            let program = match &self.chat.agy_version {
+                Some(ver) => ctext::AGY_PROGRAM_YOUR_VER.format(&[("version", ver.as_str())]),
+                None => ctext::AGY_PROGRAM_YOUR.get().to_owned(),
             };
+            composer_popup_at(palette, true)
+                .id(SharedString::from(format!(
+                    "chat-agy-auth-popover-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-agy-auth-popover".into())
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    this.chat.agy_auth_picker.remove(&close_key);
+                    cx.notify();
+                }))
+                .child(popup_heading(palette, ctext::AGY_AUTH_TITLE.get()))
+                .child(
+                    div()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(ui::RADIUS_SM)
+                        .bg(palette.muted.opacity(0.45))
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Check)
+                                .size(px(ui::ICON_SM))
+                                .text_color(palette.foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_SM)
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(palette.foreground)
+                                        .child(ctext::AGY_AUTH_ITEM.get()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(muted_fg)
+                                        .child(ctext::AGY_AUTH_HINT.get()),
+                                ),
+                        ),
+                )
+                .child(div().h_px().w_full().my_0p5().bg(palette.border))
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .child(ctext::AGY_AUTH_RUNS_ON.format(&[("program", program.as_str())])),
+                )
+                .child(
+                    popup_row(
+                        palette,
+                        SharedString::from(format!("chat-agy-auth-settings-{}", pane.get())),
+                        true,
+                    )
+                    .gap_2()
+                    .justify_start()
+                    .child(
+                        Icon::new(gpui_kit_assets::IconName::Settings2)
+                            .size(px(ui::ICON_MD))
+                            .text_color(muted_fg),
+                    )
+                    .child(ctext::AGY_AUTH_SETTINGS.get())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.chat.agy_auth_picker.remove(&settings_key);
+                        this.open_settings(
+                            krill_app::settings::AdminTab::Accounts,
+                            Some(window),
+                            cx,
+                        );
+                    })),
+                )
+        });
+
+        let resume_search_popover = self.chat.resume_search.get(&key).cloned().map(|query| {
+            let q_lower = query.to_lowercase();
+            let close_key = key.clone();
+            let sidebar = self.sidebar.read(cx);
+            let matches: Vec<(krill_app::hosts::HostId, SessionId, String, String)> = sidebar
+                .connected_sessions()
+                .filter_map(|(h, sid)| {
+                    let s = sidebar.session_on(&h, sid)?;
+                    let title = s
+                        .status
+                        .title
+                        .as_deref()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(&s.status.agent)
+                        .to_owned();
+                    let cwd = s
+                        .cwd
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let agent = s.status.agent.as_str();
+                    let hit = q_lower.is_empty()
+                        || title.to_lowercase().contains(&q_lower)
+                        || cwd.to_lowercase().contains(&q_lower)
+                        || agent.to_lowercase().contains(&q_lower);
+                    hit.then_some((h, sid, title, cwd))
+                })
+                .take(8)
+                .collect();
+            composer_popup(palette)
+                .id(SharedString::from(format!(
+                    "chat-resume-search-popover-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-resume-search-popover".into())
+                .w_full()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    this.chat.resume_search.remove(&close_key);
+                    cx.notify();
+                }))
+                .child(popup_heading(palette, ctext::RESUME_SEARCH_TITLE.get()))
+                .when(matches.is_empty(), |p| {
+                    p.child(
+                        div()
+                            .px_2()
+                            .py_1p5()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(muted_fg)
+                            .child(ctext::AUTOCOMPLETE_EMPTY.get()),
+                    )
+                })
+                .children(matches.into_iter().map(|(h, sid, title, cwd)| {
+                    let pick_key = key.clone();
+                    popup_row(
+                        palette,
+                        SharedString::from(format!("chat-resume-hit-{}-{}", sid.0, pane.get())),
+                        true,
+                    )
+                    .debug_selector(move || format!("chat-resume-hit-{}", sid.0))
+                    .gap_2()
+                    .child(div().min_w_0().truncate().child(title))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(140.))
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(muted_fg)
+                            .child(cwd),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chat.resume_search.remove(&pick_key);
+                        this.open_worker_session_from_dock(h.clone(), sid, cx);
+                    }))
+                }))
+        });
+
+        let workspace_footer = (bot.is_some() || agy_chip.is_some()).then(|| {
+            let host_label = self.chat_host_label(&key.0, cx);
+            let folder_el = bot.map(|(_, _, folder, path)| {
+                let path_text = path.map(|p| p.display().to_string()).unwrap_or_default();
+                // Orca `NativeChatComposerWorkspace.tsx`: plain bot folder shows name only (no "· Folder").
+                let folder_label = folder;
+                if path_text.is_empty() {
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-composer-folder-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-composer-folder".into())
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(muted_fg)
+                        .child(
+                            Icon::default()
+                                .data(ui::icons::FOLDER_SVG)
+                                .size(px(ui::ICON_XS)),
+                        )
+                        .child(div().truncate().child(folder_label))
+                        .into_any_element()
+                } else {
+                    ui::button_with_tooltip(
+                        Button::new(SharedString::from(format!(
+                            "chat-composer-folder-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(|| "chat-composer-folder".into())
+                        .icon(
+                            Icon::default()
+                                .data(ui::icons::FOLDER_SVG)
+                                .size(px(ui::ICON_XS)),
+                        )
+                        .label(folder_label)
+                        .ghost()
+                        .xsmall()
+                        .text_color(muted_fg)
+                        .on_click({
+                            let path_text = path_text.clone();
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    path_text.clone(),
+                                ));
+                            }
+                        }),
+                        format!("chat-composer-folder-tip-{}", pane.get()),
+                        path_text,
+                    )
+                    .into_any_element()
+                }
+            });
             div()
                 .id(SharedString::from(format!(
                     "chat-composer-workspace-{}",
@@ -1090,7 +1490,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .text_size(ui::TEXT_2XS)
+                .text_size(ui::TEXT_XS)
                 .text_color(muted_fg)
                 .child(
                     div()
@@ -1106,8 +1506,51 @@ impl Shell {
                         )
                         .child(div().truncate().child(host_label)),
                 )
-                .child(folder_el)
+                .children(folder_el)
+                .children(agy_chip.map(|chip| {
+                    div()
+                        .ml_auto()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .child(chip)
+                }))
         });
+
+        // Orca `#42129`: typing `/btw` or `/side` shows a gray `Side chat` pill in the composer.
+        let draft_val = input_state.read(cx).value();
+        let is_side_chat = {
+            let t = draft_val.trim_start();
+            t == "/btw" || t.starts_with("/btw ") || t == "/side" || t.starts_with("/side ")
+        };
+        let side_chat_pill = is_side_chat.then(|| {
+            div()
+                .id(SharedString::from(format!(
+                    "chat-side-chat-pill-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-side-chat-pill".into())
+                .flex_none()
+                .self_start()
+                .mx_2()
+                .mt_1()
+                .px_1p5()
+                .py_0p5()
+                .rounded(ui::RADIUS_SM)
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.muted)
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(ui::TEXT_XS)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(muted_fg)
+                .child(Icon::new(gpui_kit_assets::IconName::GitFork).size(px(ui::ICON_XS)))
+                .child(ctext::SIDE_CHAT_PILL.get())
+        });
+
+        let worker_dock = self.render_chat_worker_dock(pane, &key, cx);
         let inner_card = div()
             .id("desktop-chat-composer")
             .debug_selector(|| "desktop-chat-composer".into())
@@ -1301,8 +1744,11 @@ impl Shell {
             .gap_1()
             .children(quick_menu)
             .children(model_picker)
+            .children(permission_popover)
+            .children(agy_auth_popover)
+            .children(resume_search_popover)
             .children(autocomplete_popover)
-            .children(queued_strip)
+            .children(side_chat_pill)
             .children(image_thumbs)
             .children(attachment_chips)
             .child(
@@ -1411,55 +1857,80 @@ impl Shell {
                             .items_center()
                             .gap_2()
                             .child(
-                                Button::new(SharedString::from(format!(
-                                    "chat-composer-model-{}",
-                                    pane.get()
-                                )))
-                                .debug_selector(|| "chat-composer-model".into())
-                                .label(model_label)
-                                .children(
-                                    filled_bars.map(|filled| effort_bars_icon(palette, filled)),
-                                )
-                                .dropdown_caret(true)
-                                .disabled(is_pending)
-                                .ghost()
-                                .xsmall()
-                                .on_mouse_down(gpui::MouseButton::Left, {
-                                    let down_key = key.clone();
-                                    move |_, _, cx| {
-                                        cx.default_global::<DismissedComposerPopovers>()
-                                            .model_picker =
-                                            model_picker_open.then(|| down_key.clone());
-                                    }
-                                })
-                                .on_click(cx.listener({
-                                    let key = key.clone();
-                                    let input_state = input_state.clone();
-                                    move |this, event, window, cx| {
-                                        let dismissed = matches!(event, gpui::ClickEvent::Mouse(_))
-                                            && cx
-                                                .default_global::<DismissedComposerPopovers>()
-                                                .model_picker
-                                                .take()
-                                                .as_ref()
-                                                == Some(&key);
-                                        if dismissed {
-                                            return;
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "chat-composer-model-{}",
+                                        pane.get()
+                                    )))
+                                    .debug_selector(|| "chat-composer-model".into())
+                                    .h(px(24.))
+                                    .px_1p5()
+                                    .rounded(ui::RADIUS_SM)
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .when(!is_pending, |d| {
+                                        d.cursor_pointer().hover(|s| s.bg(palette.secondary))
+                                    })
+                                    .when(is_pending, |d| d.opacity(0.5))
+                                    .on_mouse_down(gpui::MouseButton::Left, {
+                                        let down_key = key.clone();
+                                        move |_, _, cx| {
+                                            cx.default_global::<DismissedComposerPopovers>()
+                                                .model_picker =
+                                                model_picker_open.then(|| down_key.clone());
                                         }
-                                        this.toggle_chat_model_picker(&key, cx);
-                                        if this.chat.model_picker.contains(&key)
-                                            && matches!(event, gpui::ClickEvent::Mouse(_))
-                                            && !input_state
-                                                .read(cx)
-                                                .focus_handle(cx)
-                                                .is_focused(window)
-                                        {
-                                            input_state.update(cx, |state, cx| {
-                                                state.focus(window, cx);
-                                            });
-                                        }
-                                    }
-                                })),
+                                    })
+                                    .when(!is_pending, |d| {
+                                        d.on_click(cx.listener({
+                                            let key = key.clone();
+                                            let input_state = input_state.clone();
+                                            move |this, event, window, cx| {
+                                                let dismissed = matches!(
+                                                    event,
+                                                    gpui::ClickEvent::Mouse(_)
+                                                ) && cx
+                                                    .default_global::<DismissedComposerPopovers>()
+                                                    .model_picker
+                                                    .take()
+                                                    .as_ref()
+                                                    == Some(&key);
+                                                if dismissed {
+                                                    return;
+                                                }
+                                                this.toggle_chat_model_picker(&key, cx);
+                                                if this.chat.model_picker.contains(&key)
+                                                    && matches!(event, gpui::ClickEvent::Mouse(_))
+                                                    && !input_state
+                                                        .read(cx)
+                                                        .focus_handle(cx)
+                                                        .is_focused(window)
+                                                {
+                                                    input_state.update(cx, |state, cx| {
+                                                        state.focus(window, cx);
+                                                    });
+                                                }
+                                            }
+                                        }))
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(palette.foreground)
+                                            .child(model_label),
+                                    )
+                                    .children(effort_label.map(|effort| {
+                                        div()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(muted_fg)
+                                            .child(effort)
+                                    }))
+                                    .child(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(px(11.))
+                                            .text_color(muted_fg),
+                                    ),
                             )
                             .children(context_ring)
                             .children(
@@ -1518,6 +1989,7 @@ impl Shell {
                                 cx,
                             ))
                             .child({
+                                use gpui_component::button::ButtonCustomVariant;
                                 match primary_action {
                                     super::ComposerPrimaryAction::Stop { latched } => Button::new(
                                         SharedString::from(format!(
@@ -1528,20 +2000,34 @@ impl Shell {
                                     .debug_selector(|| "desktop-chat-stop".into())
                                     .icon(
                                         gpui_component::Icon::default()
-                                            .data(ui::icons::STOP_SQUARE_SVG),
+                                            .data(ui::icons::STOP_SQUARE_SVG)
+                                            .size(px(ui::ICON_SM)),
                                     )
                                     .tooltip(if latched {
                                         ctext::STOPPING.get()
                                     } else {
                                         ctext::STOP.get()
                                     })
-                                    .secondary()
+                                    .custom(
+                                        ButtonCustomVariant::new(cx)
+                                            .color(palette.foreground)
+                                            .foreground(palette.background)
+                                            .hover(palette.foreground.opacity(0.88))
+                                            .active(palette.foreground.opacity(0.76)),
+                                    )
+                                    .w(px(28.))
+                                    .h(px(28.))
+                                    .p_0()
                                     .rounded(px(999.))
                                     .disabled(latched)
                                     .on_click(cx.listener(
                                         move |this, event: &gpui::ClickEvent, _, cx| {
                                             if event.click_count() > 1 {
                                                 return;
+                                            }
+                                            // Orca `#47784`: clicking Stop focuses this chat pane.
+                                            if this.layout.focused() != Some(pane) {
+                                                this.change(false, cx, |l| l.focus(pane));
                                             }
                                             this.interrupt_chat_turn(&key, cx);
                                         },
@@ -1552,27 +2038,54 @@ impl Shell {
                                             pane.get()
                                         )))
                                         .debug_selector(|| "desktop-chat-send".into())
-                                        .icon(IconName::ArrowUp)
+                                        .icon(Icon::new(IconName::ArrowUp).size(px(ui::ICON_MD)))
                                         .tooltip(ctext::SEND.get())
-                                        .primary()
+                                        .custom(
+                                            ButtonCustomVariant::new(cx)
+                                                .color(palette.foreground.opacity(0.4))
+                                                .foreground(palette.background)
+                                                .hover(palette.foreground.opacity(0.4))
+                                                .active(palette.foreground.opacity(0.4)),
+                                        )
+                                        .w(px(28.))
+                                        .h(px(28.))
+                                        .p_0()
                                         .rounded(px(999.))
                                         .disabled(true)
                                     }
                                     super::ComposerPrimaryAction::Send { enabled } => {
+                                        let bg = if enabled {
+                                            palette.foreground
+                                        } else {
+                                            palette.foreground.opacity(0.4)
+                                        };
                                         Button::new(SharedString::from(format!(
                                             "desktop-chat-send-{}",
                                             pane.get()
                                         )))
                                         .debug_selector(|| "desktop-chat-send".into())
-                                        .icon(IconName::ArrowUp)
+                                        .icon(Icon::new(IconName::ArrowUp).size(px(ui::ICON_MD)))
                                         .tooltip(ctext::SEND.get())
-                                        .primary()
+                                        .custom(
+                                            ButtonCustomVariant::new(cx)
+                                                .color(bg)
+                                                .foreground(palette.background)
+                                                .hover(palette.foreground.opacity(0.88))
+                                                .active(palette.foreground.opacity(0.76)),
+                                        )
+                                        .w(px(28.))
+                                        .h(px(28.))
+                                        .p_0()
                                         .rounded(px(999.))
                                         .disabled(!enabled)
                                         .on_click(cx.listener(
                                             move |this, event: &gpui::ClickEvent, window, cx| {
                                                 if event.click_count() > 1 {
                                                     return;
+                                                }
+                                                // Orca `#47784`: clicking Send focuses this chat pane.
+                                                if this.layout.focused() != Some(pane) {
+                                                    this.change(false, cx, |l| l.focus(pane));
                                                 }
                                                 this.submit_chat_prompt(&key, window, cx);
                                             },
@@ -1594,6 +2107,8 @@ impl Shell {
             .flex()
             .flex_col()
             .items_center()
+            .children(worker_dock)
+            .children(queued_strip)
             .child(inner_card)
             .children(workspace_footer)
             .into_any_element()
@@ -1710,13 +2225,293 @@ impl Shell {
 }
 
 impl Shell {
-    /// Orca's `NativeChatUsageLimitRow`: the gauge, "{agent} 사용량 한도에 도달했습니다" with when it
-    /// can continue, then Switch account and the auto-continue clock as icon buttons.
+    /// Orca `#47149` + `#47432` + `#47774` + `#47359`: combined worker dock directly above
+    /// the composer. Counts only active workers, shows `Stopped` on stopped workers, shares
+    /// one working spinner, uses full-width row hover, and wraps long task summaries.
+    fn render_chat_worker_dock(
+        &self,
+        pane: PaneId,
+        key: &ChatKey,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use krill_proto::orchestration::DispatchStatus;
+        let orch = self.orch_snapshot_for(&key.0)?;
+        let run_ids: BTreeSet<&str> = orch
+            .runs
+            .iter()
+            .filter(|r| r.coordinator_session_id == Some(key.1.0))
+            .map(|r| r.id.as_str())
+            .collect();
+        if run_ids.is_empty() {
+            return None;
+        }
+        let dispatches: Vec<&krill_proto::orchestration::Dispatch> = orch
+            .dispatches
+            .iter()
+            .filter(|d| {
+                run_ids.contains(d.run_id.as_str())
+                    && !self.chat.worker_dock_cleared.contains(&d.id)
+            })
+            .collect();
+        if dispatches.is_empty() {
+            return None;
+        }
+        let palette = ui::palette(cx);
+        let active_count = dispatches
+            .iter()
+            .filter(|d| d.status == DispatchStatus::Active)
+            .count();
+        let has_settled = dispatches
+            .iter()
+            .any(|d| d.status != DispatchStatus::Active);
+        let expanded = self.chat.worker_dock_expanded.contains(key);
+        let heading = match active_count {
+            0 => ctext::WORKER_DOCK_EMPTY.get().to_owned(),
+            1 => ctext::WORKER_DOCK_COUNT_ONE.get().to_owned(),
+            n => ctext::WORKER_DOCK_COUNT_MANY.format(&[("n", &n.to_string())]),
+        };
+        let settled_ids: Vec<String> = dispatches
+            .iter()
+            .filter(|d| d.status != DispatchStatus::Active)
+            .map(|d| d.id.clone())
+            .collect();
+        let toggle_key = key.clone();
+        let host = key.0.clone();
+
+        let header = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "chat-worker-dock-toggle-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-worker-dock-toggle".into())
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .rounded(ui::RADIUS_SM)
+                    .px_1()
+                    .py_0p5()
+                    .hover(|s| s.bg(palette.secondary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.chat.worker_dock_expanded.remove(&toggle_key) {
+                            this.chat.worker_dock_expanded.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(ui::ICON_XS))
+                        .text_color(palette.muted_foreground),
+                    )
+                    .when(active_count > 0, |d| {
+                        // Orca `#47774`: shared working spinner in the dock header.
+                        d.child(
+                            div()
+                                .debug_selector(|| "chat-worker-dock-spinner".into())
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(palette.agent_working()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .debug_selector(|| "chat-worker-dock-count".into())
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(palette.foreground)
+                            .child(heading),
+                    ),
+            )
+            .when(has_settled, |d| {
+                d.child(
+                    Button::new(SharedString::from(format!(
+                        "chat-worker-dock-clear-{}",
+                        pane.get()
+                    )))
+                    .debug_selector(|| "chat-worker-dock-clear".into())
+                    .label(ctext::WORKER_DOCK_CLEAR_ALL.get())
+                    .ghost()
+                    .xsmall()
+                    .text_color(palette.muted_foreground)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        for id in &settled_ids {
+                            this.chat.worker_dock_cleared.insert(id.clone());
+                        }
+                        cx.notify();
+                    })),
+                )
+            });
+
+        let rows = expanded.then(|| {
+            div()
+                .id(SharedString::from(format!(
+                    "chat-worker-dock-list-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-worker-dock-list".into())
+                .w_full()
+                .min_w_0()
+                .border_t_1()
+                .border_color(palette.border.opacity(0.6))
+                .py_1()
+                .flex()
+                .flex_col()
+                .children(dispatches.iter().enumerate().map(|(ix, d)| {
+                    let (state_label, state_color) = match d.status {
+                        DispatchStatus::Active => {
+                            (ctext::WORKER_STATE_RUNNING.get(), palette.agent_working())
+                        }
+                        DispatchStatus::Stopped | DispatchStatus::Abandoned => {
+                            // Orca `#47432`: explicitly show Stopped for stopped workers.
+                            (ctext::WORKER_STATE_STOPPED.get(), palette.muted_foreground)
+                        }
+                        DispatchStatus::Failed => {
+                            (ctext::WORKER_STATE_FAILED.get(), palette.destructive)
+                        }
+                        DispatchStatus::Succeeded
+                        | DispatchStatus::Released
+                        | DispatchStatus::Retained => {
+                            (ctext::WORKER_STATE_DONE.get(), palette.success)
+                        }
+                    };
+                    let title = if d.worker_name.trim().is_empty() {
+                        d.agent.clone()
+                    } else {
+                        d.worker_name.clone()
+                    };
+                    let detail = d
+                        .summary
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(d.prompt.as_str())
+                        .trim()
+                        .to_owned();
+                    let wsid = d.session_id.map(SessionId);
+                    let row_host = host.clone();
+                    div()
+                        .id(SharedString::from(format!(
+                            "chat-worker-dock-row-{ix}-{}",
+                            pane.get()
+                        )))
+                        .debug_selector(move || format!("chat-worker-dock-row-{ix}"))
+                        .w_full()
+                        .min_w_0()
+                        .px_3()
+                        .py_1()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .hover(|s| s.bg(palette.secondary))
+                        .when_some(wsid, |el, sid| {
+                            el.cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_worker_session_from_dock(row_host.clone(), sid, cx);
+                                }))
+                        })
+                        .child(
+                            div()
+                                .mt(px(5.))
+                                .flex_none()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(state_color),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(ui::TEXT_XS)
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(palette.foreground)
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(ui::TEXT_XS)
+                                                .text_color(state_color)
+                                                .child(state_label),
+                                        ),
+                                )
+                                .when(!detail.is_empty(), |el| {
+                                    // Orca `#47359`: long background task descriptions wrap cleanly.
+                                    el.child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .whitespace_normal()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(palette.muted_foreground)
+                                            .child(detail),
+                                    )
+                                }),
+                        )
+                }))
+        });
+
+        Some(
+            div()
+                .id(SharedString::from(format!(
+                    "chat-worker-dock-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "chat-worker-dock".into())
+                .w_full()
+                .max_w(ui::CHAT_CONTENT_MAX_WIDTH)
+                .min_w_0()
+                .mb_1()
+                .rounded(ui::RADIUS_MD)
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.muted.opacity(0.28))
+                .flex()
+                .flex_col()
+                .child(header)
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// Orca's `NativeChatUsageLimitRow` (`#47079`): the gauge, "{agent} 사용량 한도에 도달했습니다"
+    /// with when it can continue, Switch account, Continue after switch even when reset time is
+    /// unknown, auto-continue clock, and more-options dropdown.
     fn render_rate_limit_banner(&self, key: &ChatKey, cx: &mut Context<Self>) -> AnyElement {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let palette = ui::palette(cx);
         let now = self.chat_now_secs();
         let info = self.chat_limit_info(key, cx);
+        let ready_after_switch = self.rate_limit_ready_after_switch(key, cx);
         let resumable = info.is_some_and(|i| {
             i.reset_at.saturating_sub(now) <= rate_limit::RESET_HORIZON_SECS
                 && rate_limit::reset_clock(i.reset_at).is_some()
@@ -1728,9 +2523,26 @@ impl Shell {
             .get(key)
             .map(|log| log.agent.clone())
             .unwrap_or_default();
-        let (title, status) = rate_limit::banner_words(info, &agent, scheduled.is_some());
+        let (title, status) = if ready_after_switch {
+            (ctext::LIMIT_SWITCHED_READY.get().to_owned(), String::new())
+        } else {
+            rate_limit::banner_words(info, &agent, scheduled.is_some())
+        };
         let muted = palette.muted_foreground;
         let mut tools = div().flex_none().flex().items_center().gap_0p5();
+        if ready_after_switch {
+            let continue_key = key.clone();
+            tools = tools.child(
+                Button::new("chat-rate-limit-continue")
+                    .debug_selector(|| "chat-rate-limit-continue".into())
+                    .label(ctext::LIMIT_CONTINUE_NOW.get())
+                    .primary()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.continue_after_rate_limit(&continue_key, cx);
+                    })),
+            );
+        }
         let alternatives = self
             .sidebar
             .read(cx)
@@ -1773,9 +2585,13 @@ impl Shell {
                                     shell
                                         .update(cx, |this, cx| {
                                             this.cancel_auto_continue(&key, cx);
+                                            if let Some(log) = this.chat.logs.get_mut(&key) {
+                                                log.rate_limit_account_switched = true;
+                                            }
                                             this.sidebar.update(cx, |s, cx| {
                                                 s.switch_session_account(target.clone(), cx);
                                             });
+                                            cx.notify();
                                         })
                                         .ok();
                                 }),
@@ -1819,7 +2635,7 @@ impl Shell {
                         move |this, _, _, cx| this.cancel_auto_continue(&key, cx)
                     })),
             );
-        } else if resumable {
+        } else if resumable && !ready_after_switch {
             tools = tools.child(
                 Button::new("chat-auto-continue-arm")
                     .debug_selector(|| "chat-auto-continue-arm".into())
@@ -1837,6 +2653,42 @@ impl Shell {
                     })),
             );
         }
+        let copy_text = format!("{title} {status}").trim().to_owned();
+        let more_shell = cx.weak_entity();
+        tools = tools.child(
+            Button::new("chat-rate-limit-more")
+                .debug_selector(|| "chat-rate-limit-more".into())
+                .icon(gpui_kit_assets::IconName::Ellipsis)
+                .small()
+                .ghost()
+                .text_color(muted)
+                .dropdown_menu(move |menu, _, _| {
+                    let copy_text = copy_text.clone();
+                    let more_shell = more_shell.clone();
+                    menu.item(PopupMenuItem::new(ctext::LIMIT_COPY_ERROR.get()).on_click(
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_text.clone(),
+                            ));
+                        },
+                    ))
+                    .item(
+                        PopupMenuItem::new(ctext::LIMIT_AUTO_SETTINGS.get()).on_click(
+                            move |_, window, cx| {
+                                more_shell
+                                    .update(cx, |this, cx| {
+                                        this.open_settings(
+                                            krill_app::settings::AdminTab::Accounts,
+                                            Some(window),
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            },
+                        ),
+                    )
+                }),
+        );
         div()
             .id("chat-rate-limit-banner")
             .debug_selector(|| "chat-rate-limit-banner".into())
@@ -1863,13 +2715,15 @@ impl Shell {
                     .flex()
                     .items_start()
                     .gap_2()
-                    .child(
-                        div().flex_none().mt_px().child(
-                            gpui_component::Icon::new(gpui_kit_assets::IconName::Gauge)
-                                .with_size(ui::ICON_LG)
-                                .text_color(palette.warning),
-                        ),
-                    )
+                    .child(div().flex_none().mt_px().child(if ready_after_switch {
+                        gpui_component::Icon::new(gpui_kit_assets::IconName::Check)
+                            .with_size(ui::ICON_LG)
+                            .text_color(palette.success)
+                    } else {
+                        gpui_component::Icon::new(gpui_kit_assets::IconName::Gauge)
+                            .with_size(ui::ICON_LG)
+                            .text_color(palette.warning)
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -1885,15 +2739,19 @@ impl Shell {
                                     .text_color(palette.foreground)
                                     .child(title),
                             )
-                            .child(
-                                div()
-                                    .when(scheduled.is_some(), |d| {
-                                        d.debug_selector(|| "chat-auto-continue-scheduled".into())
-                                    })
-                                    .text_size(ui::TEXT_SM)
-                                    .text_color(muted)
-                                    .child(status),
-                            ),
+                            .when(!status.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .when(scheduled.is_some(), |d| {
+                                            d.debug_selector(|| {
+                                                "chat-auto-continue-scheduled".into()
+                                            })
+                                        })
+                                        .text_size(ui::TEXT_SM)
+                                        .text_color(muted)
+                                        .child(status),
+                                )
+                            }),
                     ),
             )
             .child(tools)

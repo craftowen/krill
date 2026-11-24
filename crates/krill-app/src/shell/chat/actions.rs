@@ -178,17 +178,21 @@ impl Shell {
         {
             return false;
         }
-        // Only the most recent unresolved request, with no later conversation,
-        // can be backed by the current live prompt.
+        // Only the most recent unresolved request (or any step in a trailing consecutive
+        // Question batch), with no later conversation, can be backed by the current live prompt.
         !log.items.iter().skip(index + 1).any(|item| {
-            matches!(
-                item.kind,
-                ChatItemKind::Question
-                    | ChatItemKind::Permission
-                    | ChatItemKind::User
-                    | ChatItemKind::Assistant
-                    | ChatItemKind::ToolResult
-            )
+            if request.item.kind == ChatItemKind::Question && item.kind == ChatItemKind::Question {
+                false
+            } else {
+                matches!(
+                    item.kind,
+                    ChatItemKind::Question
+                        | ChatItemKind::Permission
+                        | ChatItemKind::User
+                        | ChatItemKind::Assistant
+                        | ChatItemKind::ToolResult
+                )
+            }
         })
     }
 

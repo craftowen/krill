@@ -269,10 +269,21 @@ impl Shell {
             .logs
             .get(key)
             .is_some_and(|log| log.meta.rate_limited);
+        let current_account = self.chat_account_id(key, cx);
+        if let Some(log) = self.chat.logs.get_mut(key) {
+            if rate_limited {
+                if log.rate_limited_account.is_none() {
+                    log.rate_limited_account.clone_from(&current_account);
+                }
+            } else {
+                log.rate_limited_account = None;
+                log.rate_limit_account_switched = false;
+            }
+        }
         let now = self.chat_now_secs();
         if let Some(entry) = self.chat.auto_continue.get(key) {
             // Cleared before the reset means someone resolved it; after the reset the timer is due.
-            if self.chat_account_id(key, cx).as_deref() != Some(entry.account_id.as_str())
+            if current_account.as_deref() != Some(entry.account_id.as_str())
                 || (!rate_limited && now < entry.reset_at)
             {
                 self.chat.auto_continue.remove(key);
@@ -295,6 +306,49 @@ impl Shell {
             return;
         }
         self.arm_auto_continue(key, cx);
+    }
+
+    /// Orca `#47079`: switching accounts on a usage-limited chat makes it resumable immediately
+    /// even when the original provider reset time is unknown.
+    pub(super) fn rate_limit_ready_after_switch(&self, key: &ChatKey, cx: &gpui::App) -> bool {
+        let Some(log) = self.chat.logs.get(key) else {
+            return false;
+        };
+        if !log.meta.rate_limited {
+            return false;
+        }
+        if log.rate_limit_account_switched {
+            return true;
+        }
+        let current = self.chat_account_id(key, cx);
+        matches!(
+            (&log.rate_limited_account, current),
+            (Some(prev), Some(curr)) if prev != &curr
+        )
+    }
+
+    /// Sends the manual continue prompt after an account switch or reset (`#47079`).
+    pub(super) fn continue_after_rate_limit(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
+        self.cancel_auto_continue(key, cx);
+        let text = ctext::AUTO_CONTINUE_PROMPT.get().to_owned();
+        let Some(submitted_payload) = build_submitted_chat_payload(&text, &[]) else {
+            return;
+        };
+        self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
+        let id = self.chat.next_pending_id;
+        let log = self.chat.logs.entry(key.clone()).or_default();
+        log.meta.rate_limited = false;
+        log.rate_limited_account = None;
+        log.rate_limit_account_switched = false;
+        log.queued_prompts.push_front(QueuedChatPrompt {
+            id,
+            display_text: text,
+            submitted_payload,
+            attachments: Vec::new(),
+        });
+        self.chat.pending_revision = self.chat.pending_revision.wrapping_add(1);
+        self.flush_queued_chat_prompt_if_ready(key, cx);
+        cx.notify();
     }
 
     fn fire_auto_continue(&mut self, key: &ChatKey, cx: &mut Context<Self>) {

@@ -310,11 +310,15 @@ impl Shell {
     /// A row of message image tiles that open the viewer (Orca `NativeChatImageAttachments`:
     /// `mb-2 flex flex-wrap gap-1.5`, 80 px tiles). Each slot holds a locally readable path or
     /// `None` for an unknown remote image, which stays an icon and does not open.
+    ///
+    /// When `gallery` is supplied (`#47457`), ←/→ in the lightbox step across all images in the
+    /// chat transcript, starting at the clicked tile's position in that gallery.
     pub(super) fn chat_message_images(
         &mut self,
         id_prefix: &str,
         paths: &[Option<PathBuf>],
         numbers: &[usize],
+        gallery: Option<&(Vec<PathBuf>, Vec<usize>)>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Div> {
         if paths.is_empty() {
@@ -346,9 +350,25 @@ impl Shell {
                 || ctext::IMAGE_VIEW.get().to_owned(),
                 |n| ctext::IMAGE_NUMBER.format(&[("number", &n.to_string())]),
             );
-            let open_index = viewer_indices.get(index).copied().flatten();
-            let open_paths = viewer_paths.clone();
-            let open_numbers = viewer_numbers.clone();
+            let (open_paths, open_numbers, open_index) =
+                match (path, viewer_indices.get(index).copied().flatten()) {
+                    (Some(clicked_path), Some(local_idx)) => {
+                        if let Some((all_paths, all_numbers)) = gallery
+                            && all_paths.len() > viewer_paths.len()
+                            && let Some(global_idx) =
+                                all_paths.iter().position(|p| p == clicked_path)
+                        {
+                            (all_paths.clone(), all_numbers.clone(), Some(global_idx))
+                        } else {
+                            (
+                                viewer_paths.clone(),
+                                viewer_numbers.clone(),
+                                Some(local_idx),
+                            )
+                        }
+                    }
+                    _ => (viewer_paths.clone(), viewer_numbers.clone(), None),
+                };
             let tile = image_tile(
                 SharedString::from(format!("{id_prefix}-image-{index}")),
                 &loaded,
