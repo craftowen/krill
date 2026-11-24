@@ -50,12 +50,16 @@ impl Service {
             total: 0,
             complete: false,
             rows: Vec::new(),
+            screen: None,
         };
+        let mut initial_screen = None;
         if req.view == 0 {
-            let Ok((epoch, cutoff, hot)) = tap.history_snapshot(cancelled) else {
+            let Ok(snapshot) = tap.history_snapshot(cancelled) else {
                 reply.status = HistoryViewStatus::Missing;
                 return reply;
             };
+            let (epoch, cutoff, hot) = (snapshot.stamp, snapshot.seq, snapshot.rows);
+            initial_screen = Some(snapshot.screen);
             reply.epoch = epoch;
             let result = (|| -> io::Result<View> {
                 // Retain exact compact rows, not capture_row's spare capacity for
@@ -140,10 +144,12 @@ impl Service {
         let count = usize::from(req.count.clamp(1, krill_proto::screen::MAX_HISTORY_ROWS));
         if let Ok(()) = view.range(req.skip, count, &mut reply, cancelled) {
             reply.status = HistoryViewStatus::Ready;
+            reply.screen = initial_screen;
         } else {
             reply.status = HistoryViewStatus::Missing;
             reply.rows.clear();
             reply.identity = None;
+            reply.screen = None;
         }
         reply.fit();
         reply

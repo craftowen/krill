@@ -46,8 +46,9 @@ use krill_proto::input::{self, InputAck, Journal, Notice, Now};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::roles::{self, FEAT_ROLES};
 use krill_proto::screen::{
-    ApplyError, Attach, Cell, FEAT_SCREEN, Flags, HistoryRequest, HistoryRows, Known, MAX_COLS,
-    MAX_HISTORY_ROWS, MAX_LINES, Msg, Refused, Screen, Source, Stream, Update, View, kind,
+    ApplyError, Attach, Cell, FEAT_SCREEN, Flags, HistoryRequest, HistoryRows, HistoryScreen,
+    Known, MAX_COLS, MAX_HISTORY_ROWS, MAX_LINES, Msg, Refused, Screen, Source, Stream, Update,
+    View, kind,
 };
 
 /// 칸 크기를 아직 재지 못했을 때의 새 세션 크기. 붙은 뒤 [`Pane::fit`]이 칸 크기로 맞춘다.
@@ -1624,11 +1625,21 @@ impl<W: Write> Pane<W> {
         let before = self.history.visible();
         self.history.scroll(lines);
         self.fetch();
+        self.freeze_screen_if_scrolled();
         let changed = self.history.visible() != before || had_mark || had_fetch || view_dropped;
         if changed {
             self.refresh();
         }
         changed
+    }
+
+    fn freeze_screen_if_scrolled(&mut self) {
+        if self.history.visible() > 0
+            && self.history.frozen_screen.is_none()
+            && self.view.screen.lines > 0
+        {
+            self.history.frozen_screen = Some(HistoryScreen::from_screen(&self.view.screen));
+        }
     }
 
     /// 화면 바닥 위로 올린 행 수(0 = 라이브). 셸이 스크롤바·바닥 복귀 배지를 그릴 때 쓴다(OWE-873).
@@ -1640,6 +1651,12 @@ impl<W: Write> Pane<W> {
     /// 받지 않았거나 버린 스크롤백이면 `None`.
     pub fn row(&self, line: i64) -> Option<Vec<Cell>> {
         if let Ok(v) = usize::try_from(line) {
+            if self.history.visible() > 0
+                && let Some(frozen) = &self.history.frozen_screen
+            {
+                return (v < frozen.rows.len().max(usize::from(self.view.screen.lines)))
+                    .then(|| frozen.rows.get(v).cloned().unwrap_or_default());
+            }
             return (v < usize::from(self.view.screen.lines))
                 .then(|| self.view.screen.rows.get(v).cloned().unwrap_or_default());
         }
@@ -1713,21 +1730,29 @@ impl<W: Write> Pane<W> {
                     if self.history.stable.is_some() || self.history.offset > 0 {
                         self.fetch();
                     }
+                    self.freeze_screen_if_scrolled();
                     self.refresh();
                 }
             }
             kind::HISTORY_VIEW_ROWS => {
                 let reply = krill_proto::screen::HistoryViewRows::decode(k, body)?;
                 if let Some(cache) = self.history.stable.as_mut() {
-                    ev.redraw = cache.accept(reply);
+                    let accepted = cache.accept(reply);
+                    ev.redraw = accepted.redraw;
                     ev.history_notice = cache.take_notice().or(ev.history_notice);
                     if cache.is_stopped() {
                         self.history.offset = cache.visible();
                     } else if let Some(total) = cache.complete_total() {
                         self.history.offset = self.history.offset.min(total);
                     }
-                    if self.history.offset == 0 && !cache.is_pending() {
+                    let should_reset = self.history.offset == 0 && !cache.is_pending();
+                    if let Some(screen) = accepted.screen {
+                        self.history.frozen_screen = Some(screen);
+                    }
+                    if should_reset {
                         self.history.reset();
+                    } else {
+                        self.freeze_screen_if_scrolled();
                     }
                     if ev.redraw {
                         self.refresh();
@@ -1748,6 +1773,7 @@ impl<W: Write> Pane<W> {
                         self.history.rows(rows);
                     }
                     self.fetch();
+                    self.freeze_screen_if_scrolled();
                     ev.redraw = self.history.visible() != before;
                     if ev.redraw {
                         self.refresh();
@@ -1893,7 +1919,11 @@ impl<W: Write> Pane<W> {
         let _work = crate::responsiveness::work("pane.refresh");
         let mut s = self.history.compose(&self.view.screen);
         krill_proto::screen::normalize_screen_links(&mut s.rows, &mut s.links);
-        let previous = std::mem::replace(&mut self.shown, Rc::new(s));
+        let previous = if *self.shown == s {
+            Rc::clone(&self.shown)
+        } else {
+            std::mem::replace(&mut self.shown, Rc::new(s))
+        };
         self.search
             .refresh_screen_hit(&self.shown, self.view.revision);
         self.refresh_search_marks(&previous);
@@ -2014,9 +2044,14 @@ impl<W: Write> Pane<W> {
         let offset = rows.rows.len().min(depth.saturating_add(lines / 2));
         let req = self.history.req;
         let prior = std::mem::take(&mut self.history.prior);
+        let frozen_screen = self.history.frozen_screen.take().or_else(|| {
+            (offset > 0 && self.view.screen.lines > 0)
+                .then(|| HistoryScreen::from_screen(&self.view.screen))
+        });
         self.history = History::fixed(rows.rows.clone());
         self.history.req = req;
         self.history.prior = prior;
+        self.history.frozen_screen = frozen_screen;
         self.history.offset = offset;
         self.search.scrolled = true;
         if depth >= 1 && depth <= offset {
@@ -2190,6 +2225,7 @@ enum Phase {
 #[derive(Debug, Clone)]
 pub struct History {
     stable: Option<stable_history::Cache>,
+    frozen_screen: Option<HistoryScreen>,
     /// 화면 바닥 위로 올린 행 수(0 = 라이브). 받은 행보다 클 수 있다(받는 중).
     offset: usize,
     /// 받은 행, 화면 바로 위부터 위로.
@@ -2212,6 +2248,7 @@ impl Default for History {
         Self {
             offset: 0,
             stable: None,
+            frozen_screen: None,
             rows: Vec::new(),
             prior: Vec::new(),
             hot: 0,
@@ -2229,6 +2266,7 @@ impl History {
     fn reset(&mut self) {
         if self.fixed {
             self.offset = 0;
+            self.frozen_screen = None;
             return;
         }
         let prior = std::mem::take(&mut self.prior);
@@ -2461,13 +2499,33 @@ impl History {
         if off == 0 {
             return screen.clone();
         }
+        let bottom_rows = self
+            .frozen_screen
+            .as_ref()
+            .map_or(&screen.rows, |frozen| &frozen.rows);
+        let bottom_links = self
+            .frozen_screen
+            .as_ref()
+            .map_or(&screen.links, |frozen| &frozen.links);
         // 보이는 줄 l은 화면 맨 위에서 l - off번째 줄이다. 음수면 히스토리(화면 바로 위가 0번)에서 off - l - 1번째.
         let pick = |l: usize| {
             if let Some(v) = l.checked_sub(off) {
-                (
-                    screen.rows.get(v).cloned().unwrap_or_default(),
-                    screen.links.get(v).cloned().unwrap_or_default(),
-                )
+                let row = bottom_rows.get(v).cloned().unwrap_or_default();
+                let links = bottom_links
+                    .get(v)
+                    .map(|row_links| {
+                        row_links
+                            .iter()
+                            .filter(|link| {
+                                link.column
+                                    .checked_add(link.cols)
+                                    .is_some_and(|end| end <= screen.cols)
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (row, links)
             } else {
                 (
                     self.row(off - l - 1).cloned().unwrap_or_default(),

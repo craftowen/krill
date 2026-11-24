@@ -1,9 +1,24 @@
 //! Frozen logical coordinates with bounded decoded rows; the shown viewport is always pinned.
 use krill_proto::SessionId;
-use krill_proto::screen::{Cell, HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+use krill_proto::screen::{
+    Cell, HistoryScreen, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+};
 use std::collections::BTreeMap;
 const MAX_ROWS: usize = 4000;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(super) struct Accepted {
+    pub(super) redraw: bool,
+    pub(super) screen: Option<HistoryScreen>,
+}
+
+impl Accepted {
+    const REJECTED: Self = Self {
+        redraw: false,
+        screen: None,
+    };
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct Cache {
@@ -151,9 +166,9 @@ impl Cache {
             .max(1),
         })
     }
-    pub(super) fn accept(&mut self, reply: HistoryViewRows) -> bool {
+    pub(super) fn accept(&mut self, reply: HistoryViewRows) -> Accepted {
         if self.pending != Some(reply.req) {
-            return false;
+            return Accepted::REJECTED;
         }
         self.pending = None;
         if reply.session != self.session
@@ -161,20 +176,20 @@ impl Cache {
             || self.epoch.is_some_and(|epoch| epoch != reply.epoch)
         {
             self.stop(HistoryViewStatus::Invalidated);
-            return false;
+            return Accepted::REJECTED;
         }
         if reply.status != HistoryViewStatus::Ready {
             self.stop(reply.status);
-            return false;
+            return Accepted::REJECTED;
         }
         if reply.view == 0 {
             self.stop(HistoryViewStatus::Invalidated);
-            return false;
+            return Accepted::REJECTED;
         }
         let (Ok(skip), Ok(total)) = (usize::try_from(reply.skip), usize::try_from(reply.total))
         else {
             self.stop(HistoryViewStatus::Capacity);
-            return false;
+            return Accepted::REJECTED;
         };
         if reply
             .identity
@@ -184,7 +199,7 @@ impl Cache {
             || reply.rows.is_empty() && skip < total
         {
             self.stop(HistoryViewStatus::Missing);
-            return false;
+            return Accepted::REJECTED;
         }
         let wanted = if reply.complete {
             self.wanted.min(total)
@@ -208,7 +223,7 @@ impl Cache {
             let i = skip.saturating_add(n);
             if self.rows.get(&i).is_some_and(|old| old != row) {
                 self.stop(HistoryViewStatus::Invalidated);
-                return false;
+                return Accepted::REJECTED;
             }
             if is_pinned(i) {
                 pinned_bytes = pinned_bytes.saturating_add(Self::weight(row));
@@ -216,7 +231,7 @@ impl Cache {
         }
         if pinned_bytes > MAX_BYTES {
             self.stop(HistoryViewStatus::Capacity);
-            return false;
+            return Accepted::REJECTED;
         }
         self.view = reply.view;
         self.epoch = Some(reply.epoch);
@@ -239,7 +254,11 @@ impl Cache {
             }
         }
         self.prune();
-        self.can_compose(self.lines) && (self.shown != before || self.shown == self.wanted)
+        Accepted {
+            redraw: self.can_compose(self.lines)
+                && (self.shown != before || self.shown == self.wanted),
+            screen: reply.screen,
+        }
     }
     fn weight(row: &Vec<Cell>) -> usize {
         row.capacity()
@@ -309,6 +328,7 @@ mod tests {
                         .collect()
                 })
                 .collect(),
+            screen: None,
         }
     }
     #[test]
@@ -317,7 +337,7 @@ mod tests {
         for n in 1u32..=600 {
             let offset = usize::try_from(n).unwrap() * 24;
             if let Some(request) = cache.next(offset, 24, n) {
-                assert!(cache.accept(reply(request)));
+                assert!(cache.accept(reply(request)).redraw);
             }
             assert_eq!(cache.visible(), offset);
             assert!(cache.rows.len() <= MAX_ROWS);
@@ -335,7 +355,7 @@ mod tests {
             "a cache miss cannot move the shown viewport/selection"
         );
         assert_eq!(cache.row(old - 1), Some(&anchor));
-        assert!(cache.accept(reply(request)));
+        assert!(cache.accept(reply(request)).redraw);
         assert_eq!(cache.visible(), 24);
         assert_eq!(
             cache
@@ -362,7 +382,9 @@ mod tests {
             let mut missing = reply(next);
             missing.status = status;
             missing.rows.clear();
-            assert!(!cache.accept(missing));
+            let accepted = cache.accept(missing);
+            assert!(!accepted.redraw);
+            assert!(accepted.screen.is_none());
             assert_eq!(cache.visible(), 24);
             assert_eq!(cache.row(23), Some(&shown));
             assert!(cache.take_notice().is_some());
@@ -374,7 +396,7 @@ mod tests {
         let next = cache.next(512, 24, 2).unwrap();
         let mut changed = reply(next);
         changed.epoch[0] = 1;
-        assert!(!cache.accept(changed));
+        assert!(!cache.accept(changed).redraw);
         assert_eq!(cache.visible(), 24);
         cache.expire();
         assert_eq!(cache.visible(), 24);
@@ -383,31 +405,69 @@ mod tests {
         let next = empty.next(24, 24, 1).unwrap();
         let mut other = reply(next);
         other.session = SessionId(2);
-        assert!(!empty.accept(other));
+        assert!(!empty.accept(other).redraw);
         assert_eq!(empty.visible(), 0);
+    }
+
+    #[test]
+    fn accept_returns_screen_only_for_validated_ready_replies() {
+        let sample_screen = HistoryScreen {
+            rows: vec![vec![Cell {
+                ch: 's',
+                ..Cell::default()
+            }]],
+            links: vec![Vec::new()],
+        };
+        let mut cache = Cache::new(SessionId(1));
+        let req = cache.next(24, 24, 1).unwrap();
+
+        // Stale req is ignored without consuming pending or returning screen.
+        let mut stale = reply(req);
+        stale.req = 999;
+        stale.screen = Some(sample_screen.clone());
+        let accepted = cache.accept(stale);
+        assert!(!accepted.redraw);
+        assert!(accepted.screen.is_none());
+
+        // Valid Ready reply returns screen.
+        let mut ok = reply(req);
+        ok.screen = Some(sample_screen.clone());
+        let accepted = cache.accept(ok);
+        assert!(accepted.redraw);
+        assert_eq!(accepted.screen, Some(sample_screen.clone()));
+
+        // Non-Ready or mismatched reply never returns screen.
+        let req2 = cache.next(512, 24, 2).unwrap();
+        let mut bad = reply(req2);
+        bad.status = HistoryViewStatus::Invalidated;
+        bad.rows.clear();
+        bad.screen = Some(sample_screen);
+        let accepted = cache.accept(bad);
+        assert!(!accepted.redraw);
+        assert!(accepted.screen.is_none());
     }
 
     #[test]
     fn adjacent_scrolls_reuse_prefetch_and_short_source_replies_advance() {
         let mut cache = Cache::new(SessionId(1));
         let request = cache.next(512, 24, 1).unwrap();
-        assert!(cache.accept(reply(request)));
+        assert!(cache.accept(reply(request)).redraw);
         let reverse = cache.next(511, 24, 2).unwrap();
-        assert!(cache.accept(reply(reverse)));
+        assert!(cache.accept(reply(reverse)).redraw);
         for offset in (400..511).rev() {
             assert!(cache.next(offset, 24, 2).is_none());
             assert_eq!(cache.visible(), offset);
         }
         let mut split = Cache::new(SessionId(1));
         let initial = split.next(512, 24, 1).unwrap();
-        assert!(split.accept(reply(initial)));
+        assert!(split.accept(reply(initial)).redraw);
         let first = split.next(511, 24, 2).unwrap();
         let mut short = reply(first);
         short.rows.truncate(64);
-        assert!(!split.accept(short));
+        assert!(!split.accept(short).redraw);
         let second = split.next(511, 24, 3).unwrap();
         assert_eq!(second.skip, first.skip + 64);
-        assert!(split.accept(reply(second)));
+        assert!(split.accept(reply(second)).redraw);
         assert_eq!(split.visible(), 511);
     }
 
@@ -415,7 +475,7 @@ mod tests {
     fn distant_wide_miss_advances_pinned_rows_without_refetching_evicted_prefetch() {
         let mut cache = Cache::new(SessionId(1));
         let initial = cache.next(24, 24, 1).unwrap();
-        assert!(cache.accept(reply(initial)));
+        assert!(cache.accept(reply(initial)).redraw);
         for (req, expected) in [(2, 9976), (3, 9992)] {
             let request = cache.next(10_000, 24, req).unwrap();
             assert_eq!(request.skip, expected);
@@ -466,7 +526,7 @@ mod tests {
         let mut short0 = reply(first);
         short0.total = 9;
         short0.rows.truncate(9);
-        assert!(cache.accept(short0));
+        assert!(cache.accept(short0).redraw);
         assert_eq!(cache.visible(), 9);
 
         let second = cache.next(60, 35, 2).unwrap();
@@ -474,7 +534,7 @@ mod tests {
         let mut short1 = reply(second);
         short1.total = 29;
         short1.rows.truncate(20);
-        assert!(cache.accept(short1));
+        assert!(cache.accept(short1).redraw);
         assert_eq!(cache.visible(), 29);
 
         let third = cache.next(60, 35, 3).unwrap();
@@ -482,7 +542,7 @@ mod tests {
         let mut short2 = reply(third);
         short2.total = 68;
         short2.rows.truncate(39);
-        assert!(cache.accept(short2));
+        assert!(cache.accept(short2).redraw);
         assert_eq!(cache.visible(), 60);
     }
 
@@ -492,7 +552,7 @@ mod tests {
         let initial = cache.next(24, 24, 1).unwrap();
         let mut first = reply(initial);
         first.rows = vec![vec![Cell::default(); usize::from(krill_proto::screen::MAX_COLS)]; 24];
-        assert!(cache.accept(first));
+        assert!(cache.accept(first).redraw);
         assert_eq!(cache.visible(), 24);
 
         // target_start = 100 - 24 = 76, so target_start - shown = 52 (<= 128).
@@ -523,7 +583,7 @@ mod tests {
         let req = cache.next(5, 24, 1).unwrap();
         assert_eq!(req.view, 0);
         assert_eq!(req.skip, 0);
-        assert!(cache.accept(reply(req)));
+        assert!(cache.accept(reply(req)).redraw);
         assert_eq!(cache.visible(), 5);
         assert!(!cache.can_compose(0));
         assert!(cache.can_compose(24));

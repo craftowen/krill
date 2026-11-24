@@ -1,6 +1,13 @@
 //! Snapshot/publication barriers for negotiated history; never used by PTY output/input.
 use super::{Tap, lock};
-use krill_proto::screen::{Cell, HistoryViewRows, HistoryViewStatus, Msg};
+use krill_proto::screen::{Cell, HistoryScreen, HistoryViewRows, HistoryViewStatus, Msg};
+
+pub(crate) struct HistorySnapshot {
+    pub(crate) stamp: [u64; 3],
+    pub(crate) seq: u64,
+    pub(crate) rows: Vec<Vec<Cell>>,
+    pub(crate) screen: HistoryScreen,
+}
 
 impl Tap {
     fn access_history(
@@ -23,11 +30,12 @@ impl Tap {
     pub(crate) fn history_snapshot(
         &self,
         cancelled: &dyn Fn() -> bool,
-    ) -> std::io::Result<([u64; 3], u64, Vec<Vec<Cell>>)> {
-        let (stamp, seq, rows) = {
+    ) -> std::io::Result<HistorySnapshot> {
+        let (stamp, seq, rows, screen) = {
             let _access = self.access_history(cancelled)?;
             let live = lock(&self.0.live);
             let rows = live.engine.snapshot_hot_rows();
+            let screen = HistoryScreen::from_screen(&live.engine.screen());
             let (epoch, seq) = (live.history_epoch, live.seq);
             drop(live);
             let stamp = match self.0.store.as_ref() {
@@ -38,7 +46,7 @@ impl Tap {
                 )?,
                 None => [epoch, 0, 0],
             };
-            (stamp, seq, rows)
+            (stamp, seq, rows, screen)
         };
         // live.seq advances before recorder append/publish. Never freeze a catalog missing that batch.
         let mut out = lock(&self.0.out);
@@ -60,7 +68,12 @@ impl Tap {
             return Err(std::io::ErrorKind::NotFound.into());
         }
         drop(out);
-        Ok((stamp, seq, rows))
+        Ok(HistorySnapshot {
+            stamp,
+            seq,
+            rows,
+            screen,
+        })
     }
     pub(crate) fn publish_history(
         &self,
@@ -75,6 +88,7 @@ impl Tap {
                 reply.status = HistoryViewStatus::Invalidated;
                 reply.rows.clear();
                 reply.identity = None;
+                reply.screen = None;
             }
             send(&reply.encode()?)
         };
