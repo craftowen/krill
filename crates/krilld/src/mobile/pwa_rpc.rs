@@ -578,6 +578,7 @@ pub(super) struct Backend {
     drop_inbox: Option<PathBuf>,
     // ponytail: global drop lock, per-upload locks if concurrent uploads matter
     drop_lock: Mutex<()>,
+    voice_fallback: std::sync::OnceLock<Arc<crate::voice::VoiceService>>,
 }
 type FileStamp = Option<crate::agent::control::cache::Stamp>;
 type SnapshotDependencies = (Vec<PathBuf>, Vec<FileStamp>);
@@ -1081,6 +1082,60 @@ enum Action {
         #[serde(default)]
         allow_deletions: bool,
     },
+    #[serde(rename = "voice.status")]
+    VoiceStatus {},
+    #[serde(rename = "voice.warm")]
+    VoiceWarm {
+        #[serde(default)]
+        target_kind: Option<String>,
+        #[serde(default)]
+        target_id: Option<String>,
+    },
+    #[serde(rename = "voice.transcribe")]
+    VoiceTranscribe {
+        #[serde(default)]
+        audio_wav_b64: Option<String>,
+        #[serde(default)]
+        data_b64: Option<String>,
+        #[serde(default)]
+        upload_id: Option<String>,
+        #[serde(default)]
+        chunk_index: Option<u16>,
+        #[serde(default)]
+        total_chunks: Option<u16>,
+        #[serde(default)]
+        target_kind: Option<String>,
+        #[serde(default)]
+        target_id: Option<String>,
+        #[serde(default)]
+        refine: Option<bool>,
+    },
+    #[serde(rename = "voice.feedback")]
+    VoiceFeedback {
+        before: String,
+        after: String,
+        #[serde(default)]
+        target_kind: Option<String>,
+        #[serde(default)]
+        target_id: Option<String>,
+    },
+    #[serde(rename = "voice.config_get")]
+    VoiceConfigGet {},
+    #[serde(rename = "voice.config_set")]
+    VoiceConfigSet {
+        #[serde(default)]
+        refine_enabled: Option<bool>,
+        #[serde(default)]
+        desktop_shortcut: Option<String>,
+        #[serde(default)]
+        add_pinned: Option<String>,
+        #[serde(default)]
+        remove_pinned: Option<String>,
+        #[serde(default)]
+        ignore_word: Option<String>,
+        #[serde(default)]
+        unignore_word: Option<String>,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1269,6 +1324,17 @@ impl Backend {
             settings_lock: Mutex::default(),
             drop_inbox: krill_proto::os::home_dir().map(|home| krill_proto::drop::inbox_dir(&home)),
             drop_lock: Mutex::default(),
+            voice_fallback: std::sync::OnceLock::new(),
+        }
+    }
+    fn voice_service(&self) -> Arc<crate::voice::VoiceService> {
+        if let Some(reg) = self.registry.upgrade() {
+            reg.voice()
+        } else {
+            Arc::clone(
+                self.voice_fallback
+                    .get_or_init(|| Arc::new(crate::voice::VoiceService::new(self.dir.as_deref()))),
+            )
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -1475,6 +1541,20 @@ impl Backend {
             } => {
                 if text.len() >= krill_proto::input::MAX_INPUT {
                     return Err(invalid());
+                }
+                if !text.trim().is_empty() {
+                    let cwd = self.registry.upgrade().and_then(|reg| {
+                        reg.voice_target_cwd(
+                            krill_proto::voice::VoiceTargetKind::Session,
+                            &session.to_string(),
+                        )
+                    });
+                    self.voice_service().observe_prompt(
+                        krill_proto::voice::VoiceTargetKind::Session,
+                        &session.to_string(),
+                        &text,
+                        cwd,
+                    );
                 }
                 let all_photos: Vec<PreparedPhoto> = photo.into_iter().chain(photos).collect();
                 if all_photos.len() > 4 {
@@ -2847,6 +2927,130 @@ impl Backend {
                     })),
                     _ => Err(invalid()),
                 }
+            }
+            Action::VoiceStatus {} => {
+                let info = self.voice_service().status();
+                Ok(json!({
+                    "available": info.available,
+                    "status": info.status.as_str(),
+                    "app_version": info.app_version,
+                    "engine_ready": info.engine_ready,
+                    "engine_error": info.engine_error,
+                    "refine_available": info.refine_available,
+                    "refine_enabled": info.refine_enabled,
+                    "vocab_count": info.vocab_count,
+                }))
+            }
+            Action::VoiceWarm {
+                target_kind,
+                target_id,
+            } => {
+                let kind = target_kind
+                    .as_deref()
+                    .and_then(krill_proto::voice::VoiceTargetKind::parse_str);
+                let cwd = match (kind, target_id.as_deref()) {
+                    (Some(k), Some(id)) => self
+                        .registry
+                        .upgrade()
+                        .and_then(|reg| reg.voice_target_cwd(k, id)),
+                    _ => None,
+                };
+                let ok = self.voice_service().warm(kind, target_id.as_deref(), cwd);
+                Ok(json!({"ok": ok}))
+            }
+            Action::VoiceTranscribe {
+                audio_wav_b64,
+                data_b64,
+                upload_id,
+                chunk_index,
+                total_chunks,
+                target_kind,
+                target_id,
+                refine,
+            } => {
+                let b64 = data_b64.or(audio_wav_b64).ok_or_else(invalid)?;
+                let wav_chunk = crate::voice::bridge::base64_decode(&b64)?;
+                let kind = target_kind
+                    .as_deref()
+                    .and_then(krill_proto::voice::VoiceTargetKind::parse_str);
+                let reply = self
+                    .voice_service()
+                    .transcribe(crate::voice::TranscribeInput {
+                        audio_wav: wav_chunk,
+                        target_kind: kind,
+                        target_id: target_id.as_deref(),
+                        refine_override: refine,
+                        upload_id: upload_id.as_deref(),
+                        chunk_index: chunk_index.unwrap_or(0),
+                        total_chunks: total_chunks.unwrap_or(1),
+                    })?;
+                match reply {
+                    krill_proto::voice::VoiceReply::ChunkAccepted {
+                        upload_id,
+                        received,
+                        total,
+                    } => Ok(json!({
+                        "chunk_accepted": true,
+                        "upload_id": upload_id,
+                        "received": received,
+                        "total": total,
+                    })),
+                    krill_proto::voice::VoiceReply::Transcribed(res) => Ok(json!({
+                        "silence": res.silence,
+                        "raw": res.raw,
+                        "text": res.text,
+                        "refined": res.refined,
+                        "refine_error": res.refine_error,
+                        "asr_ms": res.asr_ms,
+                        "refine_ms": res.refine_ms,
+                    })),
+                    krill_proto::voice::VoiceReply::Error(msg) => Err(io::Error::other(msg)),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::VoiceFeedback {
+                before,
+                after,
+                target_kind,
+                target_id,
+            } => {
+                if before.len() > krill_proto::voice::MAX_VOICE_TEXT_BYTES
+                    || after.len() > krill_proto::voice::MAX_VOICE_TEXT_BYTES
+                {
+                    return Err(invalid());
+                }
+                let kind = target_kind
+                    .as_deref()
+                    .and_then(krill_proto::voice::VoiceTargetKind::parse_str);
+                let res =
+                    self.voice_service()
+                        .feedback(&before, &after, kind, target_id.as_deref());
+                Ok(json!({
+                    "ok": true,
+                    "learned": res.learned,
+                    "boosted": res.boosted,
+                }))
+            }
+            Action::VoiceConfigGet {} => to_value(self.voice_service().config_get()),
+            Action::VoiceConfigSet {
+                refine_enabled,
+                desktop_shortcut,
+                add_pinned,
+                remove_pinned,
+                ignore_word,
+                unignore_word,
+            } => {
+                let cfg =
+                    self.voice_service()
+                        .config_set(krill_proto::voice::VoiceConfigPatch {
+                            refine_enabled,
+                            desktop_shortcut,
+                            add_pinned,
+                            remove_pinned,
+                            ignore_word,
+                            unignore_word,
+                        })?;
+                to_value(cfg)
             }
         }
     }
@@ -7564,5 +7768,84 @@ mod revision_tests {
         assert!(
             wrapped_ok_len(&bounded_grp) < ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM)
         );
+    }
+
+    #[test]
+    fn voice_mobile_rpc_actions_roundtrip_and_persist_config() {
+        let dir = std::env::temp_dir().join(format!("krill-pwa-voice-rpc-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let backend = Backend::new(
+            Weak::new(),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: 0,
+                build: "test".to_owned(),
+                instance_id: 1,
+            },
+        );
+        // Unknown fields rejected by deny_unknown_fields
+        assert!(serde_json::from_str::<Action>(r#"{"action":"voice.status","extra":1}"#).is_err());
+        // voice.status returns structured payload
+        let st: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"voice.status"}"#)).unwrap();
+        assert_eq!(st["ok"], true);
+        assert!(st["data"]["status"].is_string());
+        assert_eq!(st["data"]["refine_enabled"], true);
+
+        // voice.config_set persists refine_enabled + pinned word and voice.config_get reads it back
+        let set: Value = serde_json::from_str(&backend.request(
+            r#"{"action":"voice.config_set","refine_enabled":false,"add_pinned":"Pipito"}"#,
+        ))
+        .unwrap();
+        assert_eq!(set["ok"], true);
+        assert_eq!(set["data"]["refine_enabled"], false);
+        assert_eq!(set["data"]["pinned_vocab"], json!(["Pipito"]));
+
+        let get: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"voice.config_get"}"#)).unwrap();
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["data"]["refine_enabled"], false);
+        assert_eq!(get["data"]["pinned_vocab"], json!(["Pipito"]));
+
+        // voice.warm returns ok:true without blocking
+        let warm: Value = serde_json::from_str(
+            &backend.request(r#"{"action":"voice.warm","target_kind":"session","target_id":"7"}"#),
+        )
+        .unwrap();
+        assert_eq!(warm["ok"], true);
+        assert_eq!(warm["data"]["ok"], true);
+
+        // voice.feedback boosts corrected word into auto_vocab
+        let fb: Value = serde_json::from_str(
+            &backend.request(
+                r#"{"action":"voice.feedback","before":"크릴 데몬","after":"krilld","target_kind":"session","target_id":"7"}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(fb["ok"], true);
+        assert!(
+            fb["data"]["boosted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "krilld")
+        );
+
+        // voice.transcribe accepts first chunk of multi-chunk upload
+        let chunk: Value = serde_json::from_str(
+            &backend.request(
+                r#"{"action":"voice.transcribe","upload_id":"u1","chunk_index":0,"total_chunks":2,"data_b64":"UklGRg==","target_kind":"bot_chat","target_id":"b1"}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(chunk["ok"], true);
+        assert_eq!(chunk["data"]["chunk_accepted"], true);
+        assert_eq!(chunk["data"]["received"], 1);
+        assert_eq!(chunk["data"]["total"], 2);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

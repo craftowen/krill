@@ -194,7 +194,7 @@ impl BotStore {
             Some(requested) => {
                 validate_bot_slug(requested.as_str())
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-                if bots.iter().any(|b| b.slug == requested) {
+                if slug_is_taken(&self.root, &bots, requested.as_str()) {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         format!("bot slug already exists: {}", requested.as_str()),
@@ -202,7 +202,7 @@ impl BotStore {
                 }
                 requested
             }
-            None => allocate_unique_slug(&bots, &bot_slug_from_name(&name))?,
+            None => allocate_unique_slug(&self.root, &bots, &bot_slug_from_name(&name))?,
         };
         let id = allocate_unique_id(&bots, slug.as_str())?;
 
@@ -1687,7 +1687,7 @@ impl BotStore {
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
             let parsed = BotSlug::new(raw_slug)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-            if bots.iter().any(|b| b.slug == parsed) {
+            if slug_is_taken(&self.root, &bots, parsed.as_str()) {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("bot slug already exists: {}", parsed.as_str()),
@@ -1700,7 +1700,7 @@ impl BotStore {
             } else {
                 pkg.manifest.slug.clone()
             };
-            allocate_unique_slug(&bots, &base_slug)?
+            allocate_unique_slug(&self.root, &bots, &base_slug)?
         };
         let id = allocate_unique_id(&bots, slug.as_str())?;
         let manifest_agent = krill_proto::agent::canonical_id(pkg.manifest.agent_id.trim());
@@ -1961,7 +1961,7 @@ impl BotStore {
             .filter(|_| !force_copy)
             .and_then(|s| BotSlug::new(s).ok())
             .unwrap_or_else(|| bot_slug_from_name(&clean_name));
-        let slug = allocate_unique_slug(bots, &base_slug)?;
+        let slug = allocate_unique_slug(&self.root, bots, &base_slug)?;
         let id = manifest
             .id
             .as_deref()
@@ -2276,15 +2276,36 @@ fn not_found_bot(bot_id: &BotId) -> io::Error {
     )
 }
 
-fn allocate_unique_slug(existing: &[BotConfig], base: &BotSlug) -> io::Result<BotSlug> {
-    if !existing.iter().any(|b| &b.slug == base) {
+/// Returns `true` if `candidate` is already used by an active bot or already exists on disk
+/// under `bots_root` (e.g. a kept home folder from a deleted bot — never reused, matching Orca).
+fn slug_is_taken(bots_root: &Path, existing: &[BotConfig], candidate: &str) -> bool {
+    existing
+        .iter()
+        .any(|b| b.slug.as_str() == candidate || b.folder == candidate)
+        || fs::symlink_metadata(bots_root.join(candidate)).is_ok()
+}
+
+fn allocate_unique_slug(
+    bots_root: &Path,
+    existing: &[BotConfig],
+    base: &BotSlug,
+) -> io::Result<BotSlug> {
+    if !slug_is_taken(bots_root, existing, base.as_str()) {
         return Ok(base.clone());
     }
     for n in 2..=9999_u32 {
-        let candidate = format!("{}-{n}", base.as_str());
+        let suffix = format!("-{n}");
+        let max_prefix = krill_proto::bots::BOT_SLUG_MAX_BYTES.saturating_sub(suffix.len());
+        let prefix = base
+            .as_str()
+            .get(..base.as_str().len().min(max_prefix))
+            .unwrap_or("bot")
+            .trim_end_matches('-');
+        let prefix = if prefix.is_empty() { "bot" } else { prefix };
+        let candidate = format!("{prefix}{suffix}");
         if validate_bot_slug(&candidate).is_ok()
             && let Ok(slug) = BotSlug::new(&candidate)
-            && !existing.iter().any(|b| b.slug == slug)
+            && !slug_is_taken(bots_root, existing, slug.as_str())
         {
             return Ok(slug);
         }
@@ -2292,15 +2313,18 @@ fn allocate_unique_slug(existing: &[BotConfig], base: &BotSlug) -> io::Result<Bo
     Err(io::Error::other("unable to allocate unique bot slug"))
 }
 
+/// Allocates a unique per-instance [`BotId`] (`bot-<slug_prefix>-<12 random hex>`) so recreating
+/// or deleting a bot never reuses an older bot's identity or inherits stale bindings/state.
 fn allocate_unique_id(existing: &[BotConfig], base_slug: &str) -> io::Result<BotId> {
-    let first = format!("bot-{base_slug}");
-    if let Ok(id) = BotId::new(&first)
-        && !existing.iter().any(|b| b.id == id)
-    {
-        return Ok(id);
-    }
-    for n in 2..=9999_u32 {
-        let candidate = format!("bot-{base_slug}-{n}");
+    // Keep prefix <= 40 bytes so `bot-<prefix>-<12hex>` stays <= 57 <= BOT_ID_MAX_BYTES (64).
+    let prefix = base_slug
+        .get(..base_slug.len().min(40))
+        .unwrap_or("bot")
+        .trim_end_matches('-');
+    let prefix = if prefix.is_empty() { "bot" } else { prefix };
+    for _ in 0..32 {
+        let suffix = generate_random_hex(6)?;
+        let candidate = format!("bot-{prefix}-{suffix}");
         if let Ok(id) = BotId::new(&candidate)
             && !existing.iter().any(|b| b.id == id)
         {
@@ -3367,6 +3391,85 @@ mod tests {
         assert_eq!(imported.agent_id, "codex");
         assert_eq!(imported.model, None);
         assert_eq!(imported.effort, None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn korean_bot_recreation_never_reuses_deleted_id_or_kept_home_folder() {
+        let root = temp_dir("korean-recreate");
+        let store = BotStore::new(root.clone());
+        let mk = |name: &str| CreateBotParams {
+            name: name.to_owned(),
+            agent_id: "agy".to_owned(),
+            description: String::new(),
+            emoji: None,
+            avatar: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            workspace: None,
+            template_id: None,
+            initial_soul: None,
+        };
+
+        let first = store.create_bot(mk("쇼핑봇"), 1_000).unwrap();
+        let old_research = store.create_bot(mk("리서치봇"), 2_000).unwrap();
+        assert_eq!(first.slug.as_str(), "bot");
+        assert_eq!(old_research.slug.as_str(), "bot-2");
+        assert_ne!(first.id, old_research.id);
+        store
+            .set_soul(&old_research.id, "# 리서치봇\n\n이전 봇 영혼\n", 2_500)
+            .unwrap();
+        store
+            .append_memory_fact_line(&old_research.id, "이전 봇 기억", Some("2026-11-22"), None)
+            .unwrap();
+
+        // Sidebar "Delete bot" keeps the home folder on disk (`delete_home = false`).
+        store.delete_bot(&old_research.id, false).unwrap();
+        assert!(root.join(old_research.slug.as_str()).is_dir());
+
+        // Creating a new Korean-named bot must NOT reuse `bot-2` or `old_research.id`,
+        // and must NOT inherit the deleted bot's SOUL.md or MEMORY.md.
+        let recreated = store.create_bot(mk("크릴 에러 수정봇"), 3_000).unwrap();
+        assert_ne!(recreated.id, old_research.id);
+        assert_ne!(recreated.slug, old_research.slug);
+        assert_eq!(recreated.slug.as_str(), "bot-3");
+        let new_soul = store.get_soul(&recreated.id).unwrap();
+        assert!(
+            new_soul.contains("크릴 에러 수정봇") && !new_soul.contains("리서치봇"),
+            "new bot must start with clean SOUL.md, got: {new_soul}"
+        );
+        let new_mem = store.get_memory(&recreated.id).unwrap();
+        assert!(
+            !new_mem.contains("이전 봇 기억"),
+            "new bot must not inherit deleted bot memory, got: {new_mem}"
+        );
+        // Kept folder of the deleted bot remains untouched on disk.
+        let kept_soul = fs::read_to_string(root.join("bot-2").join("SOUL.md")).unwrap();
+        assert!(kept_soul.contains("이전 봇 영혼"));
+
+        // Explicit slug matching a kept folder on disk is also rejected.
+        let explicit_err = store
+            .create_bot_v2(
+                CreateBotV2Params {
+                    base: mk("충돌 테스트"),
+                    slug: Some(BotSlug::new("bot-2").unwrap()),
+                    avatar_color: None,
+                    skills: Vec::new(),
+                    events: Vec::new(),
+                },
+                3_500,
+            )
+            .unwrap_err();
+        assert_eq!(explicit_err.kind(), io::ErrorKind::AlreadyExists);
+
+        // Even when `delete_home = true` removes the folder, recreating a bot gets a brand-new BotId.
+        store.delete_bot(&recreated.id, true).unwrap();
+        assert!(!root.join("bot-3").exists());
+        let after_full_delete = store.create_bot(mk("새 한글 봇"), 4_000).unwrap();
+        assert_ne!(after_full_delete.id, recreated.id);
+        assert_ne!(after_full_delete.id, old_research.id);
 
         fs::remove_dir_all(&root).ok();
     }

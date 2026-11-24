@@ -17,6 +17,7 @@ use krill_proto::agent_history::ChatItemKind;
 use krill_proto::bots::{
     BOT_QUIET_MARKER, BotConfig, BotId, BotRpcResponse, BotSessionRefusal, BotSessionSummary,
     MemorySnapshot, build_launch_preamble_in, find_bot_template, init_bot_home,
+    session_belongs_to_bot,
 };
 use krill_proto::hook::HookEvent;
 use krill_proto::orchestration::{MessageType, OrchestrationStore, SendParams};
@@ -263,24 +264,34 @@ impl BotRuntime {
             .map(|b| b.bot_id.clone())
     }
 
-    /// Rehydrates live bindings from `<bots_root>/runtime-bindings.json` and prunes dead sessions.
+    /// Rehydrates live bindings from `<bots_root>/runtime-bindings.json` and prunes dead,
+    /// orphaned (deleted bot), or stale pre-creation bindings.
     pub fn rehydrate_from_disk(&self, store: &BotStore, registry: &Registry) -> usize {
         let Some(ref root) = self.bots_root else {
             return 0;
         };
-        let path = root.join(RUNTIME_BINDINGS_FILE);
-        if ensure_no_symlink_path(root).is_err() || ensure_no_symlink_path(&path).is_err() {
-            return 0;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            return 0;
+        let records = {
+            let _io = lock(&self.bindings_io_lock);
+            let path = root.join(RUNTIME_BINDINGS_FILE);
+            if ensure_no_symlink_path(root).is_err() || ensure_no_symlink_path(&path).is_err() {
+                return 0;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                return 0;
+            };
+            if bytes.len() > MAX_BINDINGS_BYTES {
+                return 0;
+            }
+            let Ok(records) = serde_json::from_slice::<Vec<PersistedBotBinding>>(&bytes) else {
+                return 0;
+            };
+            records
         };
-        if bytes.len() > MAX_BINDINGS_BYTES {
-            return 0;
-        }
-        let Ok(records) = serde_json::from_slice::<Vec<PersistedBotBinding>>(&bytes) else {
-            return 0;
-        };
+
+        let active_bots: Option<HashMap<BotId, BotConfig>> = store
+            .list_bots()
+            .ok()
+            .map(|list| list.into_iter().map(|b| (b.id.clone(), b)).collect());
 
         let mut kept = 0_usize;
         let mut pruned_any = false;
@@ -289,7 +300,12 @@ impl BotRuntime {
             let mut controls = lock(&self.turn_controls);
             let mut meta_map = lock(&self.turn_meta);
             for rec in records {
-                if registry.is_session_live(rec.session_id) {
+                let bot_valid = active_bots.as_ref().is_none_or(|map| {
+                    map.get(&rec.bot_id).is_some_and(|bot| {
+                        session_belongs_to_bot(bot.created_at_ms, rec.created_at_ms)
+                    })
+                });
+                if registry.is_session_live(rec.session_id) && bot_valid {
                     let pid = registry.session_pid(rec.session_id).unwrap_or(rec.pid);
                     let memory = store.get_memory(&rec.bot_id).unwrap_or_default();
                     sessions.entry(rec.session_id).or_insert(BotSessionBinding {
@@ -326,6 +342,28 @@ impl BotRuntime {
             self.persist_bindings();
         }
         kept
+    }
+
+    /// Lists tracked bot sessions validated against active bots in `store`, excluding any
+    /// orphaned bindings from deleted bots or stale sessions predating a bot's creation time.
+    #[must_use]
+    pub fn list_sessions_for_store(
+        &self,
+        store: &BotStore,
+        registry: &Registry,
+        bot_id: Option<&BotId>,
+    ) -> Vec<BotSessionSummary> {
+        let mut sessions = self.list_sessions(registry, bot_id);
+        if let Ok(bots) = store.list_bots() {
+            let by_id: HashMap<BotId, u64> =
+                bots.into_iter().map(|b| (b.id, b.created_at_ms)).collect();
+            sessions.retain(|s| {
+                by_id.get(&s.bot_id).is_some_and(|&bot_created| {
+                    session_belongs_to_bot(bot_created, s.created_at_ms)
+                })
+            });
+        }
+        sessions
     }
 
     /// Lists tracked bot sessions (pruning stale exited entries if desired, returning live state).
@@ -366,19 +404,31 @@ impl BotRuntime {
     /// dedicated group chat sessions so private turns never collide with group or channel threads).
     #[must_use]
     pub fn live_session_for_bot(&self, registry: &Registry, bot_id: &BotId) -> Option<SessionId> {
+        self.live_session_for_bot_since(registry, bot_id, 0)
+    }
+
+    fn live_session_for_bot_since(
+        &self,
+        registry: &Registry,
+        bot_id: &BotId,
+        bot_created_at_ms: u64,
+    ) -> Option<SessionId> {
         let meta_map = lock(&self.turn_meta);
-        let candidates: Vec<SessionId> = lock(&self.sessions)
+        let mut candidates: Vec<(u64, SessionId)> = lock(&self.sessions)
             .iter()
             .filter(|(sid, b)| {
                 &b.bot_id == bot_id
                     && b.link_id.is_none()
+                    && session_belongs_to_bot(bot_created_at_ms, b.created_at_ms)
                     && meta_map.get(sid).is_none_or(|m| m.group_key.is_none())
             })
-            .map(|(&sid, _)| sid)
+            .map(|(&sid, b)| (b.created_at_ms, sid))
             .collect();
         drop(meta_map);
+        candidates.sort_by_key(|(created, _)| std::cmp::Reverse(*created));
         candidates
             .into_iter()
+            .map(|(_, sid)| sid)
             .find(|&sid| registry.is_session_live(sid))
     }
 
@@ -798,7 +848,12 @@ impl BotRuntime {
         prompt: &str,
         now_ms: u64,
     ) -> Result<(SessionId, bool), String> {
-        if let Some(sid) = self.live_session_for_bot(registry, bot_id) {
+        let bot_created_at_ms = store
+            .get_bot(bot_id)
+            .ok()
+            .flatten()
+            .map_or(0, |b| b.created_at_ms);
+        if let Some(sid) = self.live_session_for_bot_since(registry, bot_id, bot_created_at_ms) {
             self.deliver_turn(registry, store, sid, bot_id, prompt)?;
             let _ = now_ms;
             return Ok((sid, false));
@@ -1006,24 +1061,68 @@ impl BotRuntime {
     }
 
     /// Stops and unbinds ALL live sessions for `bot_id` without requiring `bot_id` to still exist
-    /// in `BotStore` (used during `DeleteBot`).
+    /// in `BotStore` (used during `DeleteBot`). Also inspects and purges `runtime-bindings.json`
+    /// directly so a delete racing ahead of `rehydrate_from_disk` still kills and removes every
+    /// persisted session for `bot_id`.
     pub fn stop_all_for_bot(
         &self,
         registry: &Registry,
         relay: &BotToolRelay,
         bot_id: &BotId,
     ) -> usize {
-        let targets: Vec<SessionId> = lock(&self.sessions)
+        let mut targets: Vec<SessionId> = lock(&self.sessions)
             .iter()
             .filter(|(_, b)| &b.bot_id == bot_id)
             .map(|(&sid, _)| sid)
             .collect();
+        let disk_targets = self.purge_persisted_bindings_for_bot(bot_id);
+        for sid in disk_targets {
+            if !targets.contains(&sid) {
+                targets.push(sid);
+            }
+        }
         let count = targets.len();
         for sid in targets {
             registry.kill_bot_session(sid).ok();
             self.on_session_removed(relay, sid);
         }
         count
+    }
+
+    fn purge_persisted_bindings_for_bot(&self, bot_id: &BotId) -> Vec<SessionId> {
+        let Some(ref root) = self.bots_root else {
+            return Vec::new();
+        };
+        let _io = lock(&self.bindings_io_lock);
+        let path = root.join(RUNTIME_BINDINGS_FILE);
+        if ensure_no_symlink_path(root).is_err() || ensure_no_symlink_path(&path).is_err() {
+            return Vec::new();
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return Vec::new();
+        };
+        if bytes.len() > MAX_BINDINGS_BYTES {
+            return Vec::new();
+        }
+        let Ok(mut records) = serde_json::from_slice::<Vec<PersistedBotBinding>>(&bytes) else {
+            return Vec::new();
+        };
+        let mut removed_sids = Vec::new();
+        records.retain(|rec| {
+            if &rec.bot_id == bot_id {
+                removed_sids.push(rec.session_id);
+                false
+            } else {
+                true
+            }
+        });
+        if !removed_sids.is_empty()
+            && let Ok(mut out) = serde_json::to_vec_pretty(&records)
+        {
+            out.push(b'\n');
+            write_atomic_0600(&path, &out).ok();
+        }
+        removed_sids
     }
 
     /// Stops all live sessions for `bot_id` (or a specific `session_id`) so the next run starts clean.
@@ -2377,5 +2476,118 @@ mod tests {
         let guard = lock(&rt.sessions);
         assert!(guard.get(&SessionId(10)).unwrap().explicit_reply_posted);
         assert!(!guard.get(&SessionId(11)).unwrap().explicit_reply_posted);
+    }
+
+    #[test]
+    fn stale_pre_creation_and_orphaned_bindings_are_rejected_and_delete_purges_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("krilld-rt-stale-filter-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+
+        let reg = Arc::new(Registry::new(None, Some(&dir)));
+        let store = BotStore::new(dir.clone());
+        let bot_created_ms = 1_795_438_259_549_u64;
+        let stale_session_ms = 1_795_340_556_317_u64; // 27 hours earlier
+        let fresh_session_ms = 1_795_438_259_692_u64;
+
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "크릴 에러 수정봇".to_owned(),
+                    agent_id: "agy".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                bot_created_ms,
+            )
+            .unwrap();
+        let deleted_bot_id = BotId::new("bot-deleted-old").unwrap();
+
+        let rt = BotRuntime::with_root(dir.clone());
+        {
+            let mut sessions = lock(&rt.sessions);
+            sessions.insert(
+                SessionId(41764),
+                BotSessionBinding {
+                    bot_id: bot.id.clone(),
+                    link_id: None,
+                    memory_snapshot: MemorySnapshot::capture(""),
+                    chat_offset: 0,
+                    explicit_reply_posted: false,
+                    launch_token: None,
+                    pid: 36865,
+                    label: "리서치봇".to_owned(),
+                    created_at_ms: stale_session_ms,
+                    owner_turn_pending: false,
+                    last_prompt: None,
+                },
+            );
+            sessions.insert(
+                SessionId(41801),
+                BotSessionBinding {
+                    bot_id: bot.id.clone(),
+                    link_id: None,
+                    memory_snapshot: MemorySnapshot::capture(""),
+                    chat_offset: 0,
+                    explicit_reply_posted: false,
+                    launch_token: None,
+                    pid: 78853,
+                    label: "크릴 에러 수정봇".to_owned(),
+                    created_at_ms: fresh_session_ms,
+                    owner_turn_pending: false,
+                    last_prompt: None,
+                },
+            );
+            sessions.insert(
+                SessionId(41700),
+                BotSessionBinding {
+                    bot_id: deleted_bot_id.clone(),
+                    link_id: None,
+                    memory_snapshot: MemorySnapshot::capture(""),
+                    chat_offset: 0,
+                    explicit_reply_posted: false,
+                    launch_token: None,
+                    pid: 11111,
+                    label: "삭제된 봇".to_owned(),
+                    created_at_ms: fresh_session_ms,
+                    owner_turn_pending: false,
+                    last_prompt: None,
+                },
+            );
+        }
+        rt.persist_bindings();
+
+        // Validated listing drops both the 27h-old pre-creation binding and the deleted bot's binding.
+        let validated = rt.list_sessions_for_store(&store, &reg, None);
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].session_id, SessionId(41801));
+        assert_eq!(validated[0].bot_id, bot.id);
+
+        // Cold runtime (before `rehydrate_from_disk`) still purges persisted bindings on DeleteBot.
+        let cold_rt = BotRuntime::with_root(dir.clone());
+        let relay = BotToolRelay::new(Arc::new(SecretVault::with_static_key(
+            dir.clone(),
+            [0x11; 32],
+        )));
+        let stopped = cold_rt.stop_all_for_bot(&reg, &relay, &bot.id);
+        assert_eq!(stopped, 2);
+        let remaining: Vec<PersistedBotBinding> =
+            serde_json::from_slice(&fs::read(dir.join(RUNTIME_BINDINGS_FILE)).unwrap()).unwrap();
+        assert!(
+            remaining.iter().all(|r| r.bot_id != bot.id),
+            "deleted bot's persisted bindings must be purged from disk even before rehydration"
+        );
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].bot_id, deleted_bot_id);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

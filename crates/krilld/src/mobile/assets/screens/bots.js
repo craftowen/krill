@@ -901,9 +901,16 @@ t(needsAnswer ? "Send answer" : "Comment"),
 () => submitText(),
 needsAnswer ? "primary small" : "secondary small",
 );
+const sheetVoice = M.voice?.attach?.(input, form, {
+ctx,
+targetKind: "item",
+targetId: () => item.uid,
+rpc: (req) => rpcHost(ctx, item._hostId, req),
+});
 const submitText = () => {
 const text = input.value.trim();
 if (!text) throw Error(t("Comment cannot be empty"));
+sheetVoice?.onSend?.(text);
 return runMutation(
 async () => {
 if (needsAnswer) {
@@ -1135,6 +1142,12 @@ if (ev.key === "Enter" && (ev.isComposing || composing)) ev.preventDefault();
 });
 const controls = el("div", undefined, "bot-item-controls");
 const submit = button(t("Comment"), () => entry.onComment(), "secondary small");
+const cardVoice = M.voice?.attach?.(input, controls, {
+ctx,
+targetKind: "item",
+targetId: () => entry.current?.uid,
+rpc: (req) => rpcHost(ctx, entry.current?._hostId, req),
+});
 const doneBtn = button(t("Done"), () => entry.onDone(), "primary small");
 const snoozeBtn = button(t("Snooze 4h"), () => entry.onSnooze(), "ghost small");
 const cancelBtn = button(t("Cancel item"), () => entry.onCancel(), "ghost small");
@@ -1233,6 +1246,7 @@ entry.submitAnswer = submitAnswer;
 entry.onComment = () => {
 const text = input.value.trim();
 if (!text) throw Error(t("Comment cannot be empty"));
+cardVoice?.onSend?.(text);
 if (entry.current.status === "needs_you") {
 return submitAnswer({ answer_text: text }, true);
 }
@@ -1748,6 +1762,7 @@ const submitGroup = async () => {
 if (!ready() || !activeGroupId) return;
 const text = groupTextarea.value.trim();
 if (!text) throw Error(t("Enter a message"));
+groupVoice?.onSend?.(text);
 const dk = currentGroupDraftKey();
 await rpcHost(ctx, activeGroupHost, {
 action: "bots.groups.send",
@@ -1764,6 +1779,13 @@ await loadGroup(activeGroupId, activeThreadId, activeGroupHost);
 const groupSendBtn = button(t("Send"), submitGroup, "primary small");
 const groupControls = el("div", undefined, "bot-item-controls");
 groupControls.append(groupModeSelect, groupSendBtn);
+const groupVoice = M.voice?.attach?.(groupTextarea, groupControls, {
+ctx,
+targetKind: "group_chat",
+targetId: () => activeGroupId,
+rpc: (req) => rpcHost(ctx, activeGroupHost, req),
+beforeNode: groupSendBtn,
+});
 groupSendForm.addEventListener("submit", (e) => {
 e.preventDefault();
 ctx.act(submitGroup);
@@ -2431,6 +2453,7 @@ const submitReply = async () => {
 if (!ready()) return;
 const text = replyInput.value.trim();
 if (!text) throw Error(t("Enter a reply"));
+replyVoice?.onSend?.(text);
 await ctx.rpc({ action: "bots.reply", bot_id: botId, text });
 if (ctx.signal.aborted) return;
 replyInput.value = "";
@@ -2438,11 +2461,19 @@ ctx.state.drafts?.delete?.(replyDraftKey);
 ctx.toast?.(t("Reply posted"));
 };
 const replyBtn = button(t("Send reply"), submitReply, "secondary small");
+const replyControls = el("div", undefined, "bot-item-controls");
+replyControls.append(replyBtn);
+const replyVoice = M.voice?.attach?.(replyInput, replyControls, {
+ctx,
+targetKind: "bot_chat",
+targetId: () => botId,
+beforeNode: replyBtn,
+});
 replyForm.addEventListener("submit", (e) => {
 e.preventDefault();
 ctx.act(submitReply);
 });
-replyForm.append(replyInput, replyBtn);
+replyForm.append(replyInput, replyControls);
 replyBox.append(replyForm);
 replyDetails.append(replyBox);
 const docSec = el("section", undefined, "bots-section");
@@ -2606,6 +2637,7 @@ input.value = ctx.state.drafts?.get?.(draftKey) || "";
 input.addEventListener("input", () => ctx.state.drafts?.set?.(draftKey, input.value));
 const sendPrompt = async () => {
 const text = input.value.trim();
+if (text) firstChatVoice?.onSend?.(text);
 await startOrOpenBotChat(text || undefined);
 if (!ctx.signal.aborted) {
 input.value = "";
@@ -2625,6 +2657,12 @@ sendPrompt,
 startBtn.disabled = !ready() || chatStarting;
 input.disabled = !ready() || chatStarting;
 row.append(startBtn);
+const firstChatVoice = M.voice?.attach?.(input, row, {
+ctx,
+targetKind: "bot_chat",
+targetId: () => botId,
+beforeNode: startBtn,
+});
 form.append(input, row);
 box.append(form);
 }

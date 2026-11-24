@@ -280,6 +280,8 @@ impl Shell {
                 // Orca expands the section so the new bot's row is visible and active.
                 self.bot_ui.collapsed = false;
                 self.bot_ui.folded.remove(&bot.id);
+                self.bot_ui.panel.settings = None;
+                self.bot_ui.panel.stale = true;
                 let row = krill_app::bots::rpc::sidebar_snapshot(
                     std::slice::from_ref(bot.as_ref()),
                     &[],
@@ -432,7 +434,7 @@ impl Shell {
                                 &host, &bot_id, session_id, pane, bot_folder, cx,
                             );
                         } else {
-                            this.open_bot_session_on(host, &bot_id, session_id, cx);
+                            this.open_bot_session_on(&host, &bot_id, session_id, cx);
                         }
                         this.refresh_bots_badge(cx);
                     }
@@ -511,32 +513,64 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let host = self.launch_host.clone();
-        self.open_bot_session_on(host, bot_id, session, cx);
+        self.open_bot_session_on(&host, bot_id, session, cx);
     }
 
     pub(super) fn open_bot_session_on(
         &mut self,
-        host: HostId,
+        host: &HostId,
         bot_id: &BotId,
         session: krill_proto::SessionId,
         cx: &mut Context<Self>,
     ) {
-        if host == self.launch_host
-            && let Some(meta) = self
-                .sidebar_bots
-                .iter()
-                .find(|b| &b.id == bot_id)
-                .map(SidebarBot::session_meta)
-        {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let bot = (*host == self.launch_host)
+            .then(|| self.sidebar_bots.iter().find(|b| &b.id == bot_id).cloned())
+            .flatten();
+        if let Some(meta) = bot.as_ref().map(SidebarBot::session_meta) {
             self.sidebar.update(cx, |sb, cx| {
                 sb.register_bot_session(host.clone(), session, meta, cx);
             });
         }
+        let known_folder = self
+            .sidebar
+            .read(cx)
+            .folder_on(host, session)
+            .map(std::path::Path::to_path_buf);
+        let bot_folder = bot
+            .as_ref()
+            .and_then(|b| Self::bot_folder_on(host, b))
+            .or_else(|| {
+                bot.as_ref()
+                    .and_then(|b| b.workspace.as_deref())
+                    .map(std::path::PathBuf::from)
+            });
         let deferred = self.layout_loading;
-        self.open_session_on(host, session, cx);
+        self.open_session_on(host.clone(), session, cx);
         if deferred {
             self.restore_session_chat = true;
         } else if let Some(pane) = self.layout.focused() {
+            if known_folder.is_none()
+                && let Some(folder) = bot_folder
+                && self.layout.session(pane) == Some(session)
+                && self.layout.host(pane) == host
+            {
+                self.change(true, cx, |l| {
+                    let mut launch =
+                        l.launch(pane)
+                            .cloned()
+                            .unwrap_or(krill_proto::control::Create {
+                                account: None,
+                                program: krill_proto::control::Program::Login,
+                                cwd: Vec::new(),
+                                cols: krill_app::pane::SIZE.0,
+                                rows: krill_app::pane::SIZE.1,
+                            });
+                    launch.cwd = folder.as_os_str().as_bytes().to_vec();
+                    l.set_launch(pane, launch);
+                });
+                self.sync_diff_workspace(cx);
+            }
             self.set_pane_chat_view(pane, true, cx);
         }
     }

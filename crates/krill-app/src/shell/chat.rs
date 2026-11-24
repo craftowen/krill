@@ -3000,6 +3000,11 @@ impl Shell {
             self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
             let queued_id = self.chat.next_pending_id;
             self.record_chat_prompt_history(key, &display_text);
+            self.notify_voice_sent(
+                &super::voice::VoiceComposerTarget::Chat(key.clone()),
+                &display_text,
+                cx,
+            );
             input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
             self.chat.draft_attachments.remove(key);
             self.chat.image_tokens.remove(key);
@@ -3078,6 +3083,11 @@ impl Shell {
         self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
         let pending_id = self.chat.next_pending_id;
         self.record_chat_prompt_history(key, &display_text);
+        self.notify_voice_sent(
+            &super::voice::VoiceComposerTarget::Chat(key.clone()),
+            &display_text,
+            cx,
+        );
         input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
         self.chat.draft_attachments.remove(key);
         self.chat.image_tokens.remove(key);

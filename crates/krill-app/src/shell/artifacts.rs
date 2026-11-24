@@ -328,13 +328,7 @@ impl Shell {
                     sb.register_bot_session(host.clone(), ev.session_id, meta, cx);
                 });
             }
-            let deferred = this.layout_loading;
-            this.open_session_on(host, ev.session_id, cx);
-            if deferred {
-                this.restore_session_chat = true;
-            } else if let Some(pane) = this.layout.focused() {
-                this.set_pane_chat_view(pane, true, cx);
-            }
+            this.open_bot_session_on(&host, &ev.bot_id, ev.session_id, cx);
         })
         .detach();
         cx.subscribe(

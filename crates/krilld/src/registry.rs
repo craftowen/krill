@@ -213,6 +213,7 @@ pub struct Registry {
     self_ref: OnceLock<std::sync::Weak<Self>>,
     bots: OnceLock<Arc<crate::bots::BotsManager>>,
     bots_boot_started: OnceLock<()>,
+    voice: OnceLock<Arc<crate::voice::VoiceService>>,
     orch_signal: (Mutex<u64>, std::sync::Condvar),
     orch_cache: Mutex<orch_cache::Cache>,
     orch_mail_notified_done: Mutex<BTreeMap<IdleMailScope, MailEpochState>>,
@@ -307,6 +308,7 @@ impl Registry {
             self_ref: OnceLock::new(),
             bots: OnceLock::new(),
             bots_boot_started: OnceLock::new(),
+            voice: OnceLock::new(),
             orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             orch_cache: Mutex::default(),
             orch_mail_notified_done: Mutex::default(),
@@ -1475,6 +1477,17 @@ impl Registry {
                     Err(Failure::Denied)
                 }
             }
+            Request::Voice(req) => {
+                if peer.scope.full() {
+                    let voice = self.voice();
+                    let reply =
+                        voice.handle_request(req, |kind, id| self.voice_target_cwd(kind, id));
+                    Ok(Reply::Voice(reply))
+                } else {
+                    peer.deny("voice", &self.audit);
+                    Err(Failure::Denied)
+                }
+            }
         };
         r.unwrap_or_else(Reply::Failed)
     }
@@ -2540,6 +2553,12 @@ impl Registry {
         if let Some(dir) = state_dir.as_deref() {
             krill_proto::git::record_session_prompt_from_hook(dir, id, payload, event_id).ok();
         }
+        self.voice().observe_prompt(
+            krill_proto::voice::VoiceTargetKind::Session,
+            &id.0.to_string(),
+            &prompt,
+            self.session_cwd(id),
+        );
         if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
             return;
         }
@@ -3754,6 +3773,30 @@ impl Registry {
             self.agents
                 .bind_discovered_session(id, &sid, Some(path.as_path()));
         }
+        if !snapshot.items.is_empty() {
+            use krill_proto::agent_history::ChatItemKind;
+            let turns: Vec<(String, String)> = snapshot
+                .items
+                .iter()
+                .filter_map(|item| match item.kind {
+                    ChatItemKind::User if !item.text.trim().is_empty() => {
+                        Some(("user".to_owned(), item.text.clone()))
+                    }
+                    ChatItemKind::Assistant if !item.text.trim().is_empty() => {
+                        Some(("assistant".to_owned(), item.text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !turns.is_empty() {
+                self.voice().observe_turns(
+                    krill_proto::voice::VoiceTargetKind::Session,
+                    &id.0.to_string(),
+                    &turns,
+                    self.session_cwd(id),
+                );
+            }
+        }
         snapshot
     }
 
@@ -3919,6 +3962,12 @@ impl Registry {
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
         self.acknowledge_retained_handoff(session);
         if submit && let Ok(text) = std::str::from_utf8(bytes) {
+            self.voice().observe_prompt(
+                krill_proto::voice::VoiceTargetKind::Session,
+                &session.0.to_string(),
+                text,
+                self.session_cwd(session),
+            );
             if let Some(bots) = self.bots.get() {
                 bots.on_owner_prompt_submitted(session, text);
             }
@@ -4075,6 +4124,60 @@ impl Registry {
             .get_or_init(|| crate::bots::BotsManager::new(dir, weak_reg)))
     }
 
+    /// Krill + Pipito 로컬 음성 서비스를 반환한다. 첫 접근 시 기존 프롬프트·워크스페이스·봇 이름으로 백그라운드 시드한다.
+    pub fn voice(&self) -> Arc<crate::voice::VoiceService> {
+        let svc = Arc::clone(
+            self.voice
+                .get_or_init(|| Arc::new(crate::voice::VoiceService::new(self.dir.as_deref()))),
+        );
+        if let Some(dir) = self.state_dir() {
+            let mut prompts = Vec::new();
+            let histories = krill_proto::git::load_session_prompt_histories(&dir);
+            for history in histories.values() {
+                for turn in &history.turns {
+                    if !turn.text.trim().is_empty() {
+                        prompts.push(turn.text.clone());
+                    }
+                }
+            }
+            let mut names = Vec::new();
+            {
+                let st = lock(&self.state);
+                for entry in st.sessions.values() {
+                    if let Some(name) = entry.cwd.file_name().and_then(|s| s.to_str()) {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+            if let Some(bots) = self.bots_if_initialized()
+                && let krill_proto::bots::BotRpcResponse::Bots(list) = bots.handle_rpc_for_peer(
+                    self,
+                    None,
+                    true,
+                    krill_proto::bots::BotRpcRequest::ListBots,
+                )
+            {
+                for bot in list {
+                    names.push(bot.name);
+                }
+            }
+            svc.bootstrap_once(prompts, names);
+        }
+        svc
+    }
+
+    pub(crate) fn voice_target_cwd(
+        &self,
+        kind: krill_proto::voice::VoiceTargetKind,
+        id: &str,
+    ) -> Option<PathBuf> {
+        if kind != krill_proto::voice::VoiceTargetKind::Session {
+            return None;
+        }
+        let sid = id.trim().parse::<u64>().ok()?;
+        self.session_cwd(SessionId(sid))
+    }
+
     /// Dispatches a [`krill_proto::bots::BotRpcRequest`] carrying connection peer/observer context.
     fn on_bot_rpc_for_peer(
         &self,
@@ -4082,14 +4185,70 @@ impl Registry {
         is_observer: bool,
         req: krill_proto::bots::BotRpcRequest,
     ) -> krill_proto::bots::BotRpcResponse {
+        use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
+        use krill_proto::voice::VoiceTargetKind;
+        // 봇 채팅·그룹 채팅·항목 댓글 제출 시 자동 단어장 및 문맥 캐시 갱신(비차단).
+        match &req {
+            BotRpcRequest::AddItemComment { item_id, text, .. }
+            | BotRpcRequest::AnswerBotItem {
+                item_id,
+                answer_text: Some(text),
+                ..
+            } => {
+                self.voice()
+                    .observe_prompt(VoiceTargetKind::Item, item_id, text, None);
+            }
+            BotRpcRequest::SendGroupMessage { group_id, text, .. }
+            | BotRpcRequest::SendGroupMessageWithAudience { group_id, text, .. } => {
+                self.voice()
+                    .observe_prompt(VoiceTargetKind::GroupChat, group_id, text, None);
+            }
+            BotRpcRequest::PostBotReply { bot_id, text, .. } => {
+                self.voice()
+                    .observe_prompt(VoiceTargetKind::BotChat, bot_id.as_str(), text, None);
+            }
+            _ => {}
+        }
         let peer_session = match peer.scope {
             Scope::Session(sid) => Some(sid),
             Scope::Full | Scope::Restricted => None,
         };
-        match self.bots() {
+        let resp = match self.bots() {
             Ok(mgr) => mgr.handle_rpc_for_peer(self, peer_session, is_observer, req),
-            Err(msg) => krill_proto::bots::BotRpcResponse::Error(msg),
+            Err(msg) => BotRpcResponse::Error(msg),
+        };
+        if let BotRpcResponse::GroupView(ref view) = resp {
+            let turns: Vec<(String, String)> = view
+                .messages
+                .iter()
+                .filter(|m| !m.body.trim().is_empty())
+                .map(|m| (m.sender_name.clone(), m.body.clone()))
+                .collect();
+            if !turns.is_empty() {
+                self.voice().observe_turns(
+                    VoiceTargetKind::GroupChat,
+                    &view.group.id,
+                    &turns,
+                    None,
+                );
+            }
+        } else if let BotRpcResponse::GroupRoom(ref room) = resp {
+            let turns: Vec<(String, String)> = room
+                .messages
+                .iter()
+                .filter(|m| !m.body.trim().is_empty())
+                .map(|m| (m.sender_name.clone(), m.body.clone()))
+                .collect();
+            if !turns.is_empty() {
+                self.voice().observe_turns(
+                    VoiceTargetKind::GroupChat,
+                    &room.group.id,
+                    &turns,
+                    None,
+                );
+            }
         }
+        resp
     }
 
     /// Runs periodic bot tasks (memory tidy, look around, bot cron schedules, lazy poller reconcile)
@@ -5585,8 +5744,10 @@ fn read_only(req: &Request) -> bool {
             )
             | Request::RemoteFs(_)
             | Request::Bot(_)
+            | Request::Voice(_)
     ) && !matches!(req, Request::RemoteFs(r) if !r.is_read_only())
         && !matches!(req, Request::Bot(r) if !r.is_read_only())
+        && !matches!(req, Request::Voice(r) if !r.is_read_only())
 }
 
 #[cfg(test)]
