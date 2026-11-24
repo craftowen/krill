@@ -410,6 +410,10 @@ impl Shell {
             self.ensure_bot_chat_search(window, cx);
         }
         let host = bot.host.clone();
+        self.bot_ui
+            .panel
+            .deleted_chats
+            .retain(|(h, sid)| h != &host || bot.sessions.iter().any(|s| s.session_id == *sid));
         let detail = match (tab, self.bot_ui.panel.settings) {
             (BotPanelTab::Home, Some(page)) => Some(page),
             (BotPanelTab::Home, None) => Some(DetailTab::Items),
@@ -2007,6 +2011,10 @@ impl Shell {
             return;
         };
         let host_owned = host.clone();
+        let rollback_deleted = match &request {
+            BotRpcRequest::StopBotSession { session_id, .. } => Some(*session_id),
+            _ => None,
+        };
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -2014,7 +2022,14 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
+                    if let Some(sid) = rollback_deleted {
+                        this.bot_ui
+                            .panel
+                            .deleted_chats
+                            .remove(&(host_owned.clone(), sid));
+                    }
                     this.notice = Some(err);
+                    cx.notify();
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
             })

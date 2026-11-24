@@ -785,6 +785,10 @@ impl BotsManager {
         if let Some(g) = self.google_poller.get() {
             g.stop();
         }
+        google::cancel_all_google_oauth();
+        if let Some(oauth) = self.mcp_oauth.get() {
+            oauth.cancel_all();
+        }
         if let Some(t) = self.tracker_poller.get() {
             t.stop();
         }
@@ -988,12 +992,23 @@ impl BotsManager {
                 google::cancel_google_oauth(&bot_id);
                 self.runtime
                     .stop_all_for_bot(registry, &self.tool_relay, &bot_id);
+                google::cancel_google_oauth(&bot_id);
+                if let Some(oauth) = self.mcp_oauth.get() {
+                    oauth.cancel_bot(&bot_id);
+                }
                 lock(&self.active_cron_sessions).retain(|(bid, _), _| bid != &bot_id);
                 match self.store.delete_bot_with_cleanup(&bot_id, delete_home) {
                     Ok((removed, removed_group_ids)) => {
                         self.groups.on_bot_deleted(&bot_id, &removed_group_ids);
                         self.items.delete_bot_items(&bot_id).ok();
-                        let extra_refs = collect_bot_secret_refs(&removed);
+                        let mut extra_refs = collect_bot_secret_refs(&removed);
+                        if let Ok(remaining_bots) = self.store.list_bots() {
+                            let in_use: std::collections::HashSet<String> = remaining_bots
+                                .iter()
+                                .flat_map(collect_bot_secret_refs)
+                                .collect();
+                            extra_refs.retain(|r| !in_use.contains(r));
+                        }
                         self.secrets.delete_bot_secrets(&bot_id, &extra_refs).ok();
                         self.tool_relay.unregister_bot(&bot_id);
                         composio::cleanup_composio_bot(
@@ -1147,7 +1162,7 @@ impl BotsManager {
                 Err(MemoryUpdateError::Io(err)) => BotRpcResponse::Error(err.to_string()),
             },
             BotRpcRequest::ForgetMemoryFact { bot_id, fact } => {
-                match self.store.forget_memory_fact(&bot_id, &fact) {
+                match self.store.forget_memory_fact(&bot_id, &fact, &memory_actor) {
                     Ok((content, removed_count)) => {
                         self.runtime.refresh_memory_snapshot(&bot_id, &content);
                         BotRpcResponse::MemoryUpdated {
@@ -1584,18 +1599,25 @@ impl BotsManager {
                 sender,
                 text,
                 reply_mode,
-            } => match self.groups.prepare_message_dispatch(
-                &self.store,
-                &group_id,
-                thread_id.as_deref(),
-                &sender,
-                &text,
-                reply_mode,
-                ts,
-            ) {
-                Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            } => {
+                let effective_sender = if sender.trim().is_empty() {
+                    caller_bot.as_ref().map_or("", |(bid, _)| bid.as_str())
+                } else {
+                    sender.as_str()
+                };
+                match self.groups.prepare_message_dispatch(
+                    &self.store,
+                    &group_id,
+                    thread_id.as_deref(),
+                    effective_sender,
+                    &text,
+                    reply_mode,
+                    ts,
+                ) {
+                    Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::StopGroup {
                 group_id,
                 thread_id,
@@ -1652,18 +1674,25 @@ impl BotsManager {
                 sender,
                 text,
                 audience,
-            } => match self.groups.prepare_message_dispatch_with_audience(
-                &self.store,
-                &group_id,
-                thread_id.as_deref(),
-                &sender,
-                &text,
-                audience,
-                ts,
-            ) {
-                Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
-                Err(err) => BotRpcResponse::Error(err.to_string()),
-            },
+            } => {
+                let effective_sender = if sender.trim().is_empty() {
+                    caller_bot.as_ref().map_or("", |(bid, _)| bid.as_str())
+                } else {
+                    sender.as_str()
+                };
+                match self.groups.prepare_message_dispatch_with_audience(
+                    &self.store,
+                    &group_id,
+                    thread_id.as_deref(),
+                    effective_sender,
+                    &text,
+                    audience,
+                    ts,
+                ) {
+                    Ok(plan) => self.execute_group_dispatch(registry, plan, ts),
+                    Err(err) => BotRpcResponse::Error(err.to_string()),
+                }
+            }
             BotRpcRequest::StopGroupMember {
                 group_id,
                 thread_id,
@@ -3208,9 +3237,10 @@ impl BuiltinMcpHandler for DaemonBuiltinMcpHandler {
                     .get("fact")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "missing required 'fact'".to_owned())?;
+                let memory_actor = format!("bot:{}", ctx.bot_id.as_str());
                 let (content, removed_count) = mgr
                     .store
-                    .forget_memory_fact(&ctx.bot_id, fact)
+                    .forget_memory_fact(&ctx.bot_id, fact, &memory_actor)
                     .map_err(|e| e.to_string())?;
                 mgr.runtime.refresh_memory_snapshot(&ctx.bot_id, &content);
                 Ok(json!({ "removed_count": removed_count, "content": content }).to_string())
@@ -5936,6 +5966,120 @@ mod tests {
             },
         );
         assert!(matches!(del_resp, BotRpcResponse::Deleted { .. }));
+
+        mgr.shutdown();
+        fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn s1_07_10_shared_secrets_and_forget_actor() {
+        use krill_proto::bots::CreateBotParams;
+
+        let state =
+            std::env::temp_dir().join(format!("krill-bots-swarm-s1-{}", std::process::id()));
+        fs::remove_dir_all(&state).ok();
+        fs::create_dir_all(&state).unwrap();
+        let reg = Arc::new(Registry::new(None, Some(&state)));
+        let mgr = BotsManager::new(state.clone(), Arc::downgrade(&reg));
+
+        let create_params = |name: &str| CreateBotParams {
+            name: name.to_owned(),
+            agent_id: "claude".to_owned(),
+            description: String::new(),
+            emoji: None,
+            avatar: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            workspace: None,
+            template_id: None,
+            initial_soul: None,
+        };
+        let bot_a = mgr.store.create_bot(create_params("Alpha"), 1_000).unwrap();
+        let bot_b = mgr.store.create_bot(create_params("Beta"), 1_001).unwrap();
+
+        // S1-07: DeleteBot must NOT wipe a shared secret_ref still referenced by another bot.
+        mgr.secrets
+            .set_ref("shared:org-token", Zeroizing::new("secret-val".to_owned()))
+            .unwrap();
+        let mut slack_cfg = BotConnectorConfig::default();
+        slack_cfg.slack.bot_token_secret_ref = Some("shared:org-token".to_owned());
+        mgr.store
+            .set_connector_config(&bot_a.id, slack_cfg.clone(), 1_010)
+            .unwrap();
+        mgr.store
+            .set_connector_config(&bot_b.id, slack_cfg, 1_011)
+            .unwrap();
+
+        // S1-10: ForgetMemoryFact from a bot session records `bot:<id>`, not `"owner"`.
+        mgr.store
+            .append_memory_fact_line(
+                &bot_b.id,
+                "Release target is v0.3.26",
+                Some("2026-11-24"),
+                None,
+            )
+            .unwrap();
+        let beta_sid = SessionId(777);
+        lock(mgr.runtime.sessions_for_test()).insert(
+            beta_sid,
+            crate::bots::runtime::BotSessionBinding {
+                bot_id: bot_b.id.clone(),
+                link_id: None,
+                memory_snapshot: krill_proto::bots::MemorySnapshot::capture(
+                    &mgr.store.get_memory(&bot_b.id).unwrap(),
+                ),
+                chat_offset: 0,
+                explicit_reply_posted: false,
+                launch_token: None,
+                pid: 0,
+                label: "Beta".to_owned(),
+                created_at_ms: 1_020,
+                owner_turn_pending: false,
+                last_prompt: None,
+            },
+        );
+        let forget_res = mgr.handle_rpc_for_peer(
+            &reg,
+            Some(beta_sid),
+            false,
+            BotRpcRequest::ForgetMemoryFact {
+                bot_id: bot_b.id.clone(),
+                fact: "Release target is v0.3.26".to_owned(),
+            },
+        );
+        assert!(matches!(
+            forget_res,
+            BotRpcResponse::MemoryUpdated {
+                removed_count: 1,
+                ..
+            }
+        ));
+        let hist = mgr.store.get_memory_history(&bot_b.id, Some(10)).unwrap();
+        let forget_entry = hist
+            .iter()
+            .find(|e| e.action == "forget")
+            .expect("forget history");
+        assert_eq!(forget_entry.actor, format!("bot:{}", bot_b.id.as_str()));
+
+        // Now delete bot_a and confirm bot_b's shared secret survives.
+        let del = mgr.handle_rpc(
+            &reg,
+            BotRpcRequest::DeleteBot {
+                bot_id: bot_a.id.clone(),
+                delete_home: true,
+            },
+        );
+        assert!(matches!(del, BotRpcResponse::Deleted { .. }));
+        assert_eq!(
+            mgr.secrets
+                .get_ref("shared:org-token")
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("secret-val"),
+            "shared secret referenced by remaining bot must survive DeleteBot"
+        );
 
         mgr.shutdown();
         fs::remove_dir_all(&state).ok();

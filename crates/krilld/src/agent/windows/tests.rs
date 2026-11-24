@@ -121,7 +121,29 @@ fn opencode_and_agy_keep_their_account_isolation() {
     }
     let command = prepared("agy", dir);
     assert_eq!(value(&command, "SSH_CONNECTION"), Some("krill".into()));
+    assert_eq!(
+        value(&command, "AGY_CLI_FORCE_FILE_TOKEN_STORAGE"),
+        Some("1".into())
+    );
     assert_eq!(value(&command, "ANTIGRAVITY_CLI_HOME"), None);
+
+    // Host default (empty KRILL_ACCOUNT_DIR) must strip both SSH_CONNECTION and
+    // AGY_CLI_FORCE_FILE_TOKEN_STORAGE so host keychain login is never forced into file storage.
+    let mut host_env = env();
+    host_env.retain(|(k, _)| {
+        !k.starts_with(b"KRILL_ACCOUNT_")
+            && !k.eq_ignore_ascii_case(b"SSH_CONNECTION")
+            && !k.eq_ignore_ascii_case(b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE")
+    });
+    host_env.extend([
+        (b"KRILL_ACCOUNT_PROVIDER".to_vec(), b"agy".to_vec()),
+        (b"KRILL_ACCOUNT_DIR".to_vec(), Vec::new()),
+        (b"SSH_CONNECTION".to_vec(), b"krill".to_vec()),
+        (b"AGY_CLI_FORCE_FILE_TOKEN_STORAGE".to_vec(), b"1".to_vec()),
+    ]);
+    let host_cmd = super::command(std::env::current_exe().unwrap().as_os_str(), host_env).unwrap();
+    assert_eq!(value(&host_cmd, "SSH_CONNECTION"), None);
+    assert_eq!(value(&host_cmd, "AGY_CLI_FORCE_FILE_TOKEN_STORAGE"), None);
 }
 
 #[test]

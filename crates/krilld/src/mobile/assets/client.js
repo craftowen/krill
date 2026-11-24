@@ -1262,6 +1262,8 @@
             "repo_icons.read",
             "bots.soul.get",
             "bots.memory.get",
+            "voice.status",
+            "voice.config_get",
           ].includes(request?.action);
       let credentials = options.credentials,
         pair = options.pair,

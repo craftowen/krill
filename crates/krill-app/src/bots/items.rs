@@ -94,6 +94,9 @@ pub(super) enum LinkKindChoice {
 pub(super) struct FailedComment {
     pub id: u64,
     pub text: String,
+    pub is_answer: bool,
+    pub option_index: Option<u32>,
+    pub ask_step_key: Option<(String, u64)>,
 }
 
 #[derive(Default)]
@@ -203,6 +206,12 @@ impl ItemsState {
         if let Some(bot_id) = items.first().map(|i| i.owner_bot_id.clone()) {
             self.items_cache.insert(bot_id, items.clone());
         }
+        self.items = items;
+        self.bump_items_rev();
+    }
+
+    pub(super) fn set_items_for_bot(&mut self, bot_id: &BotId, items: Vec<BotItem>) {
+        self.items_cache.insert(bot_id.clone(), items.clone());
         self.items = items;
         self.bump_items_rev();
     }
@@ -1148,9 +1157,9 @@ impl View {
         &mut self,
         item_uid: &str,
         text: String,
-        _is_answer: bool,
-        _option_index: Option<u32>,
-        _ask_step_key: Option<(String, u64)>,
+        is_answer: bool,
+        option_index: Option<u32>,
+        ask_step_key: Option<(String, u64)>,
         _cx: &mut Context<Self>,
     ) {
         self.items.next_failed_id = self.items.next_failed_id.wrapping_add(1);
@@ -1159,7 +1168,13 @@ impl View {
             .failed_comments
             .entry(item_uid.to_owned())
             .or_default()
-            .push(FailedComment { id, text });
+            .push(FailedComment {
+                id,
+                text,
+                is_answer,
+                option_index,
+                ask_step_key,
+            });
     }
 
     pub(super) fn upsert_item(&mut self, updated: BotItem, _bot_id: &BotId) {
@@ -1174,18 +1189,42 @@ impl View {
         } else if self.group_panel.active && self.group_panel.member_ids.contains(&owner_id) {
             self.group_panel.all_items.insert(0, updated.clone());
         }
-        if let Some(slot) = self.items.items.iter_mut().find(|i| i.uid == updated.uid) {
-            *slot = updated;
-        } else {
-            self.items.items.insert(0, updated);
-        }
         if self.selected_bot_id.as_ref() == Some(&owner_id) {
+            if let Some(slot) = self.items.items.iter_mut().find(|i| i.uid == updated.uid) {
+                *slot = updated;
+            } else {
+                self.items.items.insert(0, updated);
+            }
             self.items
                 .items_cache
                 .insert(owner_id.clone(), self.items.items.clone());
+            self.items.bump_items_rev();
+            self.sync_open_items_for_bot(&owner_id);
+        } else {
+            // User switched away from `owner_id` while the item mutation RPC was in flight.
+            // Update cached items and `all_open_items` in place without polluting the active bot's
+            // `self.items.items` or wiping `owner_id`'s other open items.
+            if let Some(cached) = self.items.items_cache.get_mut(&owner_id) {
+                if let Some(slot) = cached.iter_mut().find(|i| i.uid == updated.uid) {
+                    *slot = updated.clone();
+                } else {
+                    cached.insert(0, updated.clone());
+                }
+            }
+            if updated.status.is_open() {
+                if let Some(slot) = self
+                    .all_open_items
+                    .iter_mut()
+                    .find(|i| i.uid == updated.uid)
+                {
+                    *slot = updated;
+                } else {
+                    self.all_open_items.push(updated);
+                }
+            } else {
+                self.all_open_items.retain(|i| i.uid != updated.uid);
+            }
         }
-        self.items.bump_items_rev();
-        self.sync_open_items_for_bot(&owner_id);
     }
 
     pub(super) fn render_items_tab(
@@ -2049,5 +2088,44 @@ impl View {
         );
 
         card
+    }
+}
+
+#[cfg(test)]
+mod swarm_regression_tests {
+    use super::*;
+
+    #[test]
+    fn set_items_for_bot_clears_cached_items_when_empty() {
+        let mut state = ItemsState::default();
+        let bot_id = BotId::new("bot-alpha").unwrap();
+        let sample = BotItem {
+            uid: "item-1".to_owned(),
+            number: 1,
+            owner_bot_id: bot_id.clone(),
+            title: "First item".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::Planned,
+            snoozed_until_ms: None,
+            close_note: None,
+            closed_at_ms: None,
+            version: 1,
+            links: Vec::new(),
+            events: Vec::new(),
+            last_activity_at_ms: 1_000,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        state.set_items_for_bot(&bot_id, vec![sample]);
+        assert_eq!(state.items_cache.get(&bot_id).map(Vec::len), Some(1));
+        state.set_items_for_bot(&bot_id, Vec::new());
+        assert_eq!(
+            state.items_cache.get(&bot_id).map(Vec::len),
+            Some(0),
+            "empty ListItems result must overwrite cached items instead of flashing deleted items"
+        );
+        assert!(state.restore_cached(&bot_id));
+        assert!(state.items.is_empty());
     }
 }

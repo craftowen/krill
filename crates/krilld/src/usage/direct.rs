@@ -2341,9 +2341,11 @@ pub(crate) mod agy {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         if ssh_connection {
-            cmd.env("SSH_CONNECTION", "krill");
+            cmd.env("SSH_CONNECTION", "krill")
+                .env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1");
         } else {
-            cmd.env_remove("SSH_CONNECTION");
+            cmd.env_remove("SSH_CONNECTION")
+                .env_remove("AGY_CLI_FORCE_FILE_TOKEN_STORAGE");
         }
         let mut child = crate::child::spawn(crate::child::own_group(&mut cmd))
             .map_err(|_| RunAgyError::Failed)?;
@@ -2524,12 +2526,13 @@ pub(crate) mod agy {
         }"#;
 
         /// 가짜 agy: `--version`은 버전 출력, 그 밖은 인자 검증 뒤 봉투 출력.
-        /// `SSH_CONNECTION=krill`이 아니면 실패하고, `--disable-slash-commands`가 있으면 실패한다.
+        /// `SSH_CONNECTION=krill` 및 `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`이 아니면 실패하고, `--disable-slash-commands`가 있으면 실패한다.
         fn usage_script(version: &str, body: &str) -> String {
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1\" = '--version' ]; then printf '%s\\n' '{version}'; exit 0; fi\n\
                  [ \"$SSH_CONNECTION\" = krill ] || exit 3\n\
+                 [ \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 ] || exit 6\n\
                  case \" $* \" in *'--disable-slash-commands'*) exit 4;; esac\n\
                  case \"$1\" in --gemini_dir=*) shift;; esac\n\
                  [ \"$1 $2 $3 $4 $5 $6\" = '-p /usage --output-format json --print-timeout 20s' ] || exit 5\n\

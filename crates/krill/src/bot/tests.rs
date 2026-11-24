@@ -2595,3 +2595,39 @@ fn items_ls_with_status_filter_and_pagination_computes_accurate_counts_and_curso
             .all(|req| !matches!(req, BotRpcRequest::ListItemsPage { .. }))
     );
 }
+
+#[test]
+fn groups_send_defaults_sender_to_env_bot_id_and_avatar_rpc_fits_frame() {
+    let cmd = parse_command(
+        &s(&["groups", "send", "grp-1", "hello team"]),
+        Some("alpha"),
+    )
+    .unwrap();
+    match cmd {
+        BotCommand::GroupsSend {
+            group_id,
+            sender,
+            text,
+            ..
+        } => {
+            assert_eq!(group_id, "grp-1");
+            assert_eq!(sender.as_deref(), Some("alpha"));
+            assert_eq!(text, "hello team");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    // S1-08: MAX_RPC_AVATAR_PNG_BYTES must fit inside a single ipc::MAX_FRAME.
+    let req = BotRpcRequest::UploadBotAvatar {
+        bot_id: BotId::new("alpha").unwrap(),
+        png_bytes: vec![0u8; krill_proto::bots::MAX_RPC_AVATAR_PNG_BYTES],
+    };
+    let encoded = krill_proto::screen::Msg::encode(&req)
+        .expect("max RPC avatar must fit inside ipc::MAX_FRAME");
+    assert!(
+        encoded.len() <= krill_proto::ipc::MAX_FRAME + 4,
+        "encoded avatar frame ({}) must fit inside ipc::MAX_FRAME + 4 ({})",
+        encoded.len(),
+        krill_proto::ipc::MAX_FRAME + 4
+    );
+}

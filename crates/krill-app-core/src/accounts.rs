@@ -1093,10 +1093,10 @@ fn terminal_login_command_unix(account: &AccountInfo) -> String {
         }
         ProviderKind::Antigravity | ProviderKind::Gemini => {
             if account.host_default {
-                "agy".into()
+                "env -u SSH_CONNECTION -u AGY_CLI_FORCE_FILE_TOKEN_STORAGE agy".into()
             } else {
                 format!(
-                    "env SSH_CONNECTION=krill agy --gemini_dir={}",
+                    "env SSH_CONNECTION=krill AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1 agy --gemini_dir={}",
                     quote(
                         &Path::new(&account.profile_dir)
                             .join(".gemini")

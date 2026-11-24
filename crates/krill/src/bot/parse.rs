@@ -775,7 +775,7 @@ pub(crate) fn parse_command(
         "reply" => parse_reply(rest, default_bot),
         "offer" => parse_offer(rest, default_bot),
         "send" => parse_send(rest, default_bot),
-        "groups" | "group" => parse_groups(rest),
+        "groups" | "group" => parse_groups(rest, default_bot),
         "connectors" | "connector" => parse_connectors(rest, default_bot),
         "tracker-default" => parse_tracker_default(rest),
         "composio" => parse_composio(rest, default_bot),
@@ -2543,7 +2543,7 @@ fn parse_reply_mode(raw: &str) -> Result<BotGroupReplyMode, CliError> {
     }
 }
 
-fn parse_groups(args: &[String]) -> Result<BotCommand, CliError> {
+fn parse_groups(args: &[String], default_bot: Option<&str>) -> Result<BotCommand, CliError> {
     let Some((first, tail)) = args.split_first() else {
         return Ok(BotCommand::GroupsList { json: false });
     };
@@ -2785,7 +2785,7 @@ fn parse_groups(args: &[String]) -> Result<BotCommand, CliError> {
             Ok(BotCommand::GroupsSend {
                 group_id,
                 thread_id,
-                sender,
+                sender: sender.or_else(|| default_bot.map(ToOwned::to_owned)),
                 text,
                 reply_mode,
                 json,

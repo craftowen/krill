@@ -221,7 +221,7 @@ fn agy_terminal_login_preserves_literal_profile_and_never_uses_login_subcommand(
     let root = std::env::temp_dir().join(format!("krill-agy-command-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let exe = root.join("agy");
-    std::fs::write(&exe, "#!/bin/sh\n[ \"$SSH_CONNECTION\" = krill ] && [ \"$#\" = 1 ] && [ \"$1\" = \"--gemini_dir=$EXPECTED_PROFILE/.gemini\" ]\n").unwrap();
+    std::fs::write(&exe, "#!/bin/sh\n[ \"$SSH_CONNECTION\" = krill ] && [ \"$AGY_CLI_FORCE_FILE_TOKEN_STORAGE\" = 1 ] && [ \"$#\" = 1 ] && [ \"$1\" = \"--gemini_dir=$EXPECTED_PROFILE/.gemini\" ]\n").unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut account = AccountInfo {
         usage: krill_proto::usage::Snapshot::default(),
@@ -258,7 +258,10 @@ fn agy_terminal_login_preserves_literal_profile_and_never_uses_login_subcommand(
         "interactive agy must not run behind hidden pipes"
     );
     account.host_default = true;
-    assert_eq!(super::terminal_login_command(&account), "agy");
+    assert_eq!(
+        super::terminal_login_command(&account),
+        "env -u SSH_CONNECTION -u AGY_CLI_FORCE_FILE_TOKEN_STORAGE agy"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

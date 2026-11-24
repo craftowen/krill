@@ -481,7 +481,9 @@ impl View {
                     ("app", bot_import_app_label(pick.app)),
                 ]);
                 self.screen = super::Screen::Detail;
-                self.selected_bot_id = Some(existing.id.clone());
+                if host == self.host {
+                    self.selected_bot_id = Some(existing.id.clone());
+                }
                 cx.emit(OpenBotHome {
                     bot_id: existing.id,
                     kickoff: Some(draft),

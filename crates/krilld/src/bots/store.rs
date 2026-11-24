@@ -27,12 +27,12 @@ use krill_proto::bots::{
     BotScheduleConfig, BotSettingsExtras, BotSlug, BotSuggestion, CreateBotParams,
     CreateBotV2Params, DefaultTrackerBots, ExternalBotCandidate, ExternalBotSourceApp,
     ExternalConversationLink, ExternalSource, FieldPatch, LookAroundEvery, MAX_AVATAR_PNG_BYTES,
-    MAX_RPC_ZIP_BYTES, MemoryDeletionViolation, TidyEvery, UpdateBotExtrasParams, UpdateBotParams,
-    append_memory_fact, assert_bot_owns_home, bot_slug_from_name, default_mascot,
-    discover_external_bots as proto_discover_external_bots, export_bot_home_zip, find_bot_mcp_app,
-    find_bot_template, forget_memory_fact, import_bot_zip, init_bot_home, materialize_bot_skills,
-    soul_description, strip_png_metadata, validate_bot_name, validate_bot_slug,
-    validate_memory_edit,
+    MAX_RPC_AVATAR_PNG_BYTES, MAX_RPC_ZIP_BYTES, MemoryDeletionViolation, TidyEvery,
+    UpdateBotExtrasParams, UpdateBotParams, append_memory_fact, assert_bot_owns_home,
+    bot_slug_from_name, default_mascot, discover_external_bots as proto_discover_external_bots,
+    export_bot_home_zip, find_bot_mcp_app, find_bot_template, forget_memory_fact, import_bot_zip,
+    init_bot_home, materialize_bot_skills, soul_description, strip_png_metadata, validate_bot_name,
+    validate_bot_slug, validate_memory_edit,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use krill_proto::os::{canonicalize, write_atomic_0600};
@@ -411,7 +411,7 @@ impl BotStore {
         png_bytes: &[u8],
         now_ms: u64,
     ) -> io::Result<BotAvatarData> {
-        if png_bytes.is_empty() || png_bytes.len() > MAX_AVATAR_PNG_BYTES {
+        if png_bytes.is_empty() || png_bytes.len() > MAX_RPC_AVATAR_PNG_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "avatar PNG size is invalid",
@@ -454,7 +454,7 @@ impl BotStore {
         let avatar_path = home.join(AVATAR_FILE);
         ensure_no_symlink_path(&avatar_path)?;
         let meta = fs::symlink_metadata(&avatar_path)?;
-        if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_AVATAR_PNG_BYTES {
+        if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_RPC_AVATAR_PNG_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "avatar PNG exceeds size limit",
@@ -1076,7 +1076,12 @@ impl BotStore {
     }
 
     /// Explicitly removes matching fact line(s) from `<home>/MEMORY.md`.
-    pub fn forget_memory_fact(&self, bot_id: &BotId, fact: &str) -> io::Result<(String, usize)> {
+    pub fn forget_memory_fact(
+        &self,
+        bot_id: &BotId,
+        fact: &str,
+        actor: &str,
+    ) -> io::Result<(String, usize)> {
         let _guard = lock(&self.io_lock);
         let bots: Vec<BotConfig> = self.read_bots()?;
         let bot = bots
@@ -1098,7 +1103,7 @@ impl BotStore {
             memory_history::record_change(
                 &home,
                 bot_id,
-                "owner",
+                actor,
                 "forget",
                 &old,
                 &updated,
@@ -2990,7 +2995,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MemoryUpdateError::DeletionBlocked(_)));
         let (after_forget, removed) = store
-            .forget_memory_fact(&created.id, "Repo is craftowen/krill")
+            .forget_memory_fact(&created.id, "Repo is craftowen/krill", "owner")
             .unwrap();
         assert_eq!(removed, 1);
         assert!(!after_forget.contains("Repo is craftowen/krill"));
