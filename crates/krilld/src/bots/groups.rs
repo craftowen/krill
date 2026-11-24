@@ -888,6 +888,27 @@ impl GroupCoordinator {
         Ok(stopped)
     }
 
+    /// Rebinds active group turns when a bot session hands off to a new session on account switch.
+    pub(crate) fn rebind_session(&self, old: SessionId, new: SessionId) {
+        let _io = lock(&self.io_lock);
+        if self.ensure_loaded_locked().is_err() {
+            return;
+        }
+        let mut guard = lock(&self.state);
+        if let Some(data) = guard.as_mut() {
+            let mut changed = false;
+            for turn in &mut data.turns {
+                if turn.session_id == old {
+                    turn.session_id = new;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.persist_locked(data).ok();
+            }
+        }
+    }
+
     pub(crate) fn on_session_removed(&self, session_id: SessionId) {
         let _io = lock(&self.io_lock);
         if self.ensure_loaded_locked().is_err() {

@@ -1619,6 +1619,8 @@ catalog! {
         STALE_ACCOUNT_BANNER => ("{prev} 계정으로 실행 중입니다. {next} 계정으로 전환할 수 있습니다.", "Running on {prev}, switch to {next}"),
         STALE_ACCOUNT_SWITCH_BTN => ("전환", "Switch"),
         STALE_ACCOUNT_KEEP_BTN => ("유지", "Keep"),
+        ACCOUNT_SWITCHING_BANNER => ("{next} 계정으로 전환 중입니다...", "Switching to {next}..."),
+        ACCOUNT_SWITCHING_AFTER_TURN_BANNER => ("현재 응답이 끝나면 {next} 계정으로 전환합니다.", "Will switch to {next} once the current turn finishes."),
         LAUNCHER_TAB_TITLE => ("새 탭", "New tab"),
         LAUNCHER_SEARCH_PLACEHOLDER => ("에이전트 및 파일 검색", "Search agents and files"),
         LAUNCHER_NEW_NAMED_AGENT => ("새 {agent} 에이전트", "New {agent} agent"),

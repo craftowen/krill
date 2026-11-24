@@ -1031,6 +1031,162 @@ fn bot_chat_hides_preamble_turn_and_interleaves_item_notes_by_turn_time() {
 }
 
 #[test]
+fn bot_item_notes_do_not_jump_or_vanish_when_prompt_submitted() {
+    use krill_proto::bots::BotItemStatus;
+    let user = |text: &str, at: &str| {
+        Arc::new(ChatItem {
+            kind: ChatItemKind::User,
+            text: text.into(),
+            at: at.into(),
+            ..Default::default()
+        })
+    };
+    let reply = |text: &str, at: &str| {
+        Arc::new(ChatItem {
+            kind: ChatItemKind::Assistant,
+            text: text.into(),
+            at: at.into(),
+            ..Default::default()
+        })
+    };
+    let note = |at_ms: u64, title: &str| {
+        Arc::new(work_run::ItemNote {
+            at_ms,
+            actor: work_run::NoteActor::Bot,
+            action: work_run::NoteAction::Status(BotItemStatus::Done),
+            title: title.into(),
+            status: BotItemStatus::Done,
+            detail: String::new(),
+        })
+    };
+    let shape_of = |feed: &work_run::DisplayFeed| -> Vec<String> {
+        feed.rows()
+            .iter()
+            .map(|row| match row {
+                work_run::DisplayRow::Item { item, .. } => item.text.clone(),
+                work_run::DisplayRow::ItemNote { note, .. } => format!("note:{}", note.title),
+                _ => "other".into(),
+            })
+            .collect()
+    };
+
+    // Real timestamps mirroring bot-5: Turn 1 (12:52:50Z), Turn 2 (14:42:54Z),
+    // Item notes at 20:04:48.458Z (05:04 KST), Turn 3 submitted at 22:51:49Z.
+    let t1_ms = 1_795_438_370_876_u64;
+    let t2_ms = 1_795_444_974_785_u64;
+    let note_ms = 1_795_464_288_458_u64;
+    let t3_ms = 1_795_474_309_176_u64;
+
+    let notes = [note(note_ms, "done")];
+    let stamp = |at_ms: u64, text: &str| work_run::TurnStamp {
+        at_ms,
+        text: text.into(),
+    };
+    let empty_obs = std::collections::BTreeMap::new();
+
+    // Case 1: SessionPromptHistory ALREADY recorded Turn 3 before ChatPoll loaded User #3.
+    // Even without item.at, text-matching prevents note from disappearing above Turn 2!
+    let items_before_u3 = vec![
+        user("swarm sweep", ""),
+        reply("working", ""),
+        user("status report", ""),
+        reply("all done", ""),
+    ];
+    let turns_with_t3 = [
+        stamp(t3_ms, "check screenshot"),
+        stamp(t2_ms, "status report"),
+        stamp(t1_ms, "swarm sweep"),
+    ];
+    let feed_ahead = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_before_u3,
+        None,
+        &notes,
+        &turns_with_t3,
+        &empty_obs,
+        None,
+    );
+    assert_eq!(
+        shape_of(&feed_ahead),
+        [
+            "swarm sweep",
+            "working",
+            "status report",
+            "all done",
+            "note:done"
+        ],
+        "ahead-of-transcript prompt history must not pull Turn 2's notes up above Turn 2"
+    );
+
+    // Case 2: ChatPoll loaded incremental User #3 (empty item.at, observed at t3_ms) BEFORE
+    // SessionPromptHistory reloaded Turn 3 (still only [t2, t1]).
+    // Note must stay right above User #3, NEVER jump below User #3!
+    let items_with_u3 = vec![
+        user("swarm sweep", "2026-11-23T12:52:50Z"),
+        reply("working", "2026-11-23T12:53:00Z"),
+        user("status report", "2026-11-23T14:42:54Z"),
+        reply("all done", "2026-11-23T20:04:40Z"),
+        user("check screenshot", ""),
+    ];
+    let mut obs_u3 = std::collections::BTreeMap::new();
+    obs_u3.insert(4, t3_ms);
+    let turns_stale = [stamp(t2_ms, "status report"), stamp(t1_ms, "swarm sweep")];
+    let feed_behind = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_with_u3,
+        None,
+        &notes,
+        &turns_stale,
+        &obs_u3,
+        None,
+    );
+    let expected_with_u3 = [
+        "swarm sweep",
+        "working",
+        "status report",
+        "all done",
+        "note:done",
+        "check screenshot",
+    ];
+    assert_eq!(
+        shape_of(&feed_behind),
+        expected_with_u3,
+        "stale prompt history must not push Turn 2's notes below newly polled User #3"
+    );
+
+    // Case 3: Both transcript and prompt history synced -> identical placement.
+    let feed_synced = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_with_u3,
+        None,
+        &notes,
+        &turns_with_t3,
+        &obs_u3,
+        None,
+    );
+    assert_eq!(shape_of(&feed_synced), expected_with_u3);
+
+    // Case 4: Prompt history empty (e.g. >5 turns or post-account-switch) -> item.at anchors notes.
+    let items_all_timed = vec![
+        user("swarm sweep", "2026-11-23T12:52:50Z"),
+        reply("working", "2026-11-23T12:53:00Z"),
+        user("status report", "2026-11-23T14:42:54Z"),
+        reply("all done", "2026-11-23T20:04:40Z"),
+        user("check screenshot", "2026-11-23T22:51:48Z"),
+    ];
+    let feed_at_only = work_run::DisplayFeed::project_with_turn_stamps(
+        0,
+        &items_all_timed,
+        None,
+        &notes,
+        &[],
+        &empty_obs,
+        None,
+    );
+    assert_eq!(shape_of(&feed_at_only), expected_with_u3);
+}
+
+#[test]
 fn chat_page_parses_timestamps_and_remote_autocomplete_items_validate_paths() {
     let page_json = serde_json::json!({
         "ok": true,

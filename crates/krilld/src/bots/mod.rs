@@ -359,6 +359,55 @@ impl BotsManager {
         .ok();
     }
 
+    /// Prepares bot launch inputs when `old` is a bot session switching accounts to `new`.
+    pub(crate) fn prepare_account_switch_launch(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        launch_cwd: &std::path::Path,
+    ) -> Result<Option<runtime::BotAccountSwitchLaunch>, String> {
+        self.runtime.prepare_account_switch_launch(
+            &self.store,
+            &self.secrets,
+            &self.tool_relay,
+            &self.composio_base_url,
+            old,
+            new,
+            launch_cwd,
+        )
+    }
+
+    /// Rebinds a bot session across runtime bindings, active group turns, and cron tracking.
+    /// Returns `Some(ReboundBotSession)` if `old` was bound to a bot.
+    pub(crate) fn rebind_session(
+        &self,
+        old: SessionId,
+        new: SessionId,
+        new_pid: u32,
+        new_token: Option<zeroize::Zeroizing<String>>,
+    ) -> Option<runtime::ReboundBotSession> {
+        let rebound = self.runtime.rebind_session(old, new, new_pid, new_token)?;
+        self.groups.rebind_session(old, new);
+        for sid in lock(&self.active_cron_sessions).values_mut() {
+            if *sid == old {
+                *sid = new;
+            }
+        }
+        Some(rebound)
+    }
+
+    /// Revokes an ephemeral bot tool relay launch token.
+    pub(crate) fn revoke_launch_token(&self, token: Option<&zeroize::Zeroizing<String>>) {
+        if let Some(tok) = token {
+            self.tool_relay.revoke_token(tok.as_str());
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn runtime_for_test(&self) -> &runtime::BotRuntime {
+        &self.runtime
+    }
+
     /// Session cleanup hook forwarded from [`Registry::remove`].
     pub fn on_session_removed(&self, session_id: SessionId) {
         self.runtime

@@ -23,6 +23,7 @@ pub(super) struct State {
 struct HostProfiles {
     features: u64,
     pending: BTreeSet<SessionId>,
+    pending_targets: BTreeMap<SessionId, String>,
     spinner_grace: BTreeMap<SessionId, SpinnerGrace>,
     accounts: Arc<AccountsSnapshot>,
     replacements: BTreeMap<SessionId, SessionId>,
@@ -136,7 +137,12 @@ impl State {
             fallback.missing_polls = fallback.missing_polls.saturating_add(1);
             fallback.missing_polls <= 1
         });
-        let listed = |id: &SessionId| snapshot.sessions.iter().any(|s| s.id == *id);
+        let listed = |id: &SessionId| {
+            snapshot
+                .sessions
+                .iter()
+                .any(|s| s.id == *id && !s.is_exited())
+        };
         let awaiting = pending.iter().any(|id| !listed(id));
         let ids = snapshot.sessions.iter().map(|s| s.id);
         let held = match &state.seen {
@@ -330,6 +336,9 @@ impl Sidebar {
                         titles.insert(to, title);
                     }
                 }
+                if let Some(hist) = self.prompt_histories.remove(&handoff.from) {
+                    self.prompt_histories.entry(to).or_insert(hist);
+                }
             }
             changed = true;
         }
@@ -361,6 +370,74 @@ impl Sidebar {
             .hosts
             .get(host)
             .is_some_and(|state| state.is_pending(session))
+    }
+
+    /// Friendly label of the account `session` is currently switching to (either in-flight RPC
+    /// or daemon-reported pending handoff).
+    pub fn session_account_switching_target(
+        &self,
+        host: &HostId,
+        session: SessionId,
+    ) -> Option<String> {
+        let state = self.profiles.hosts.get(host)?;
+        let target_id = state
+            .pending_targets
+            .get(&session)
+            .map(String::as_str)
+            .or_else(|| {
+                state
+                    .accounts
+                    .details
+                    .handoffs
+                    .iter()
+                    .find(|handoff| {
+                        handoff.from == session && handoff.to.is_none() && handoff.error.is_none()
+                    })
+                    .map(|handoff| handoff.account_id.as_str())
+            })?;
+        let display = state
+            .accounts
+            .accounts
+            .iter()
+            .find(|a| a.id == target_id)
+            .and_then(|a| {
+                a.email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        let label = a.label.trim();
+                        (!label.is_empty()).then_some(label)
+                    })
+            })
+            .unwrap_or(target_id);
+        Some(display.to_owned())
+    }
+
+    /// Marks `session` pending an account switch before a bulk/modal RPC returns so the pane
+    /// cannot be pruned if the old session exits before the handoff snapshot arrives.
+    pub fn mark_session_account_pending(
+        &mut self,
+        host: HostId,
+        session: SessionId,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self
+            .profiles
+            .snapshot(&host, self.snapshot_for(&host))
+            .sessions
+            .iter()
+            .find(|s| s.id == session)
+            .cloned();
+        let state = self.profiles.hosts.entry(host.clone()).or_default();
+        if let Some(row) = row {
+            state.remember(&row);
+        }
+        state.pending.insert(session);
+        state.pending_targets.insert(session, account_id);
+        self.start_spinner_grace(host, session, cx);
+        cx.notify();
     }
 
     pub(super) fn session_account_loading(&self, host: &HostId, session: SessionId) -> bool {
@@ -565,6 +642,7 @@ impl Sidebar {
     ) {
         if let Some(state) = self.profiles.hosts.get_mut(host) {
             state.pending.remove(&session);
+            state.pending_targets.remove(&session);
             let removed = !state.is_pending(session) && state.fallback.remove(&session).is_some();
             self.reconcile_spinner_grace(host, cx);
             if removed {
@@ -596,6 +674,9 @@ impl Sidebar {
         let state = self.profiles.hosts.entry(target.host.clone()).or_default();
         state.remember(&row);
         state.pending.insert(target.session);
+        state
+            .pending_targets
+            .insert(target.session, target.account_id.clone());
         self.start_spinner_grace(target.host.clone(), target.session, cx);
         cx.emit(target);
         cx.notify();

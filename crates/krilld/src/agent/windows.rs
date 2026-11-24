@@ -121,8 +121,10 @@ pub fn run(mut args: impl Iterator<Item = OsString>, then_shell: bool) -> ExitCo
 const FALLBACK_SHELL_REMOVED_ENVS: &[&str] = &[
     "KRILL_ACCOUNT_PROVIDER",
     "KRILL_ACCOUNT_DIR",
+    "KRILL_OPENCODE_INSTRUCTIONS_DIR",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
+    "OPENCODE_CONFIG_DIR",
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "OPENCODE_DB",
@@ -149,6 +151,7 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
     let provider =
         ProviderKind::parse(std::str::from_utf8(&value(b"KRILL_ACCOUNT_PROVIDER")).ok()?);
     let dir = value(b"KRILL_ACCOUNT_DIR");
+    let opencode_instructions_dir = value(b"KRILL_OPENCODE_INSTRUCTIONS_DIR");
     if let Some(provider) = provider {
         env.retain(|(key, _)| {
             !key.eq_ignore_ascii_case(provider.env_var().as_bytes())
@@ -183,10 +186,14 @@ pub(super) fn command(program: &OsStr, mut env: Vec<(Vec<u8>, Vec<u8>)>) -> Opti
                 _ => env.push((provider.env_var().as_bytes().to_vec(), dir)),
             }
         }
+        if provider == ProviderKind::OpenCode && !opencode_instructions_dir.is_empty() {
+            env.push((b"OPENCODE_CONFIG_DIR".to_vec(), opencode_instructions_dir));
+        }
     }
     env.retain(|(key, _)| {
         !key.eq_ignore_ascii_case(b"KRILL_ACCOUNT_PROVIDER")
             && !key.eq_ignore_ascii_case(b"KRILL_ACCOUNT_DIR")
+            && !key.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
     });
     let path = env
         .iter()

@@ -626,6 +626,7 @@ fn recovery_keeps_only_remaining_unconfirmed_replacement_without_publishing_comp
                 original: SessionId(7),
                 session: SessionId(8),
                 disposition: ReplacementDisposition::Unresolved,
+                bot_grant_token: None,
             };
         }
         assert!(!lock(&reg.state).closing.contains(&SessionId(8)));
@@ -2577,6 +2578,7 @@ fn replacement_journals_are_independent_and_legacy_record_is_preserved() {
         original: SessionId(7),
         session: SessionId(8),
         disposition: ReplacementDisposition::Committed,
+        bot_grant_token: None,
     });
     assert!(!replacement_journal(&root, SessionId(8)).exists());
     assert!(replacement_journal(&root, SessionId(9)).exists());
@@ -2816,6 +2818,7 @@ fn unreadable_replacement_evidence_is_preserved_and_blocks_new_spawns() {
         original: SessionId(7),
         session: SessionId(8),
         disposition: ReplacementDisposition::Unresolved,
+        bot_grant_token: None,
     });
     assert!(path.exists());
     fs::remove_file(&path).unwrap();
@@ -3306,6 +3309,7 @@ fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_
         original: SessionId(7),
         session: SessionId(8),
         disposition: ReplacementDisposition::Retained { persisted: false },
+        bot_grant_token: None,
     });
     assert!(journal.exists());
     assert!(lock(&reg.state).sessions.contains_key(&SessionId(8)));
@@ -3317,6 +3321,7 @@ fn retained_replacement_disposition_unlinks_journal_only_when_persisted_without_
         original: SessionId(7),
         session: SessionId(8),
         disposition: ReplacementDisposition::Retained { persisted: true },
+        bot_grant_token: None,
     });
     assert!(!journal.exists());
     assert!(lock(&reg.state).sessions.contains_key(&SessionId(8)));
@@ -4409,4 +4414,275 @@ fn automatic_switch_does_not_treat_rewritten_old_unbound_session_as_recently_lau
     );
     drop(reg);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bot_session_account_switch_rebinds_bot_runtime_and_preserves_instructions() {
+    use krill_proto::bots::{BotRpcRequest, BotRpcResponse, CreateBotParams, MemorySnapshot};
+
+    let root = Path::new("/tmp").join(format!("kas-bot-agy-rebind-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("from");
+    let to = root.join("to");
+    fs::create_dir_all(&state).unwrap();
+    let sid = "9b230a24-4055-4bdb-8c26-bd8d72c64bc9";
+    let from_agy = from.join(".gemini/antigravity-cli");
+    let to_agy = to.join(".gemini/antigravity-cli");
+    fs::create_dir_all(
+        from_agy
+            .join("brain")
+            .join(sid)
+            .join(".system_generated/logs"),
+    )
+    .unwrap();
+    fs::create_dir_all(from_agy.join("conversations")).unwrap();
+    fs::create_dir_all(from_agy.join("annotations")).unwrap();
+    fs::create_dir_all(&to_agy).unwrap();
+    let tp = from_agy
+        .join("brain")
+        .join(sid)
+        .join(".system_generated/logs/transcript.jsonl");
+    fs::write(&tp, "{\"role\":\"user\",\"content\":\"hello bot\"}\n").unwrap();
+    fs::write(
+        from_agy.join("conversations").join(format!("{sid}.db")),
+        b"SQLite format 3\0fixture-bot-conversation",
+    )
+    .unwrap();
+    fs::write(
+        from_agy.join("annotations").join(format!("{sid}.pbtxt")),
+        b"title: \"bot agy switch\"",
+    )
+    .unwrap();
+    fs::write(
+        to_agy.join("antigravity-oauth-token"),
+        r#"{"access_token":"tok","expiry_date":4102444800000,"email":"craftowen@example.com"}"#,
+    )
+    .unwrap();
+
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Antigravity,
+        "Antigravity #2",
+        Some("craftowen@example.com".into()),
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Antigravity #2")
+        .unwrap()
+        .id
+        .clone();
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master, _old_process) = UnixStream::pair().unwrap();
+    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let old_sid = SessionId(41);
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![Kept {
+                id: old_sid,
+                pid: 4100,
+                status: None,
+                size: None,
+                master: OwnedFd::from(master),
+            }],
+        )),
+        Some(&state),
+    ));
+
+    // Create a live Antigravity bot and bind `old_sid` to it (mirroring real Krill Bots).
+    let bots = reg.bots().expect("init bots manager");
+    let BotRpcResponse::Bot(bot) = bots.handle_rpc(
+        &reg,
+        BotRpcRequest::CreateBot(Box::new(CreateBotParams {
+            name: "크릴".to_owned(),
+            agent_id: "agy".to_owned(),
+            description: "Main assistant".to_owned(),
+            emoji: None,
+            avatar: None,
+            model: None,
+            effort: None,
+            permission_mode: Some(Permission::Yolo),
+            workspace: None,
+            template_id: None,
+            initial_soul: Some("# 크릴\nAlways stay in place.".to_owned()),
+        })),
+    ) else {
+        panic!("expected Bot from CreateBot");
+    };
+    let bot_home = state.join("bots").join(bot.slug.as_str());
+    fs::create_dir_all(&bot_home).unwrap();
+    let old_token = zeroize::Zeroizing::new("old-ephemeral-token".to_owned());
+    lock(bots.runtime_for_test().sessions_for_test()).insert(
+        old_sid,
+        crate::bots::runtime::BotSessionBinding {
+            bot_id: bot.id.clone(),
+            link_id: None,
+            memory_snapshot: MemorySnapshot::capture(""),
+            chat_offset: 0,
+            explicit_reply_posted: false,
+            launch_token: Some(old_token.clone()),
+            pid: 4100,
+            label: "크릴".to_owned(),
+            created_at_ms: 1_795_400_000_000,
+            owner_turn_pending: false,
+            last_prompt: None,
+        },
+    );
+    reg.agents
+        .remember_session(
+            old_sid,
+            &AgentLaunch {
+                profile: "agy".into(),
+                permission: Permission::Yolo,
+            },
+            None,
+            bot_home.as_os_str().as_encoded_bytes().to_vec(),
+            Some(LaunchAccount {
+                id: "agy-old".into(),
+                env_key: "ANTIGRAVITY_CLI_HOME".into(),
+                dir: from.display().to_string(),
+            }),
+        )
+        .unwrap();
+    reg.agents.bind_discovered_session(old_sid, sid, Some(&tp));
+    reg.agents
+        .remember_bot_instructions(old_sid, "You are 크릴")
+        .unwrap();
+
+    let reader = Arc::clone(&reg);
+    let reader_worker =
+        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+    let hook_reg = Arc::clone(&reg);
+    let expected_bot_id = bot.id.as_str().to_owned();
+    let mock = std::thread::spawn(move || {
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req, id, argv, env, ..
+        } = ToHolder::decode(packet.frame()).unwrap()
+        else {
+            panic!("expected replacement spawn");
+        };
+        let argv_str: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let env_get = |key: &[u8]| -> Option<String> {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k.as_slice() == key)
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        };
+        assert!(argv_str.iter().any(|a| a == "--conversation"));
+        assert!(argv_str.iter().any(|a| a == sid));
+        let has_bot_agents_md = argv_str.windows(2).any(|w| {
+            w[0] == "--add-dir"
+                && fs::read_to_string(Path::new(&w[1]).join("AGENTS.md"))
+                    .is_ok_and(|c| c.contains("크릴"))
+        });
+        assert!(
+            has_bot_agents_md,
+            "replacement agy bot must receive --add-dir containing bot AGENTS.md: {argv_str:?}"
+        );
+        assert_eq!(
+            env_get(b"KRILL_BOT_ID").as_deref(),
+            Some(expected_bot_id.as_str())
+        );
+        assert!(env_get(b"KRILL_BOT_HOME").is_some());
+        assert!(env_get(b"KRILL_BOT_TOOLS_URL").is_some());
+        let new_tok = env_get(b"KRILL_BOT_TOOLS_TOKEN").expect("fresh KRILL_BOT_TOOLS_TOKEN");
+        assert_ne!(new_tok, "old-ephemeral-token");
+        assert!(
+            env_get(b"NO_PROXY")
+                .unwrap_or_default()
+                .contains("127.0.0.1")
+        );
+
+        let (master, mut process) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned { req, id, pid: 4200 }.encode().unwrap(),
+                &[master.as_fd()],
+            )
+            .unwrap();
+        process.write_all(b"Antigravity bot resumed > ").unwrap();
+
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap() else {
+            panic!("expected old bot retirement");
+        };
+        assert_eq!(old, old_sid);
+        holder_link
+            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+            .unwrap();
+        // Simulate real daemon exit path (including `on_session_removed` on `old_sid`)!
+        hook_reg.remove(old);
+        lock(&hook_reg.state).exited.insert(old, 0);
+        (id, process)
+    });
+
+    reg.queue_account_switch(ProviderKind::Antigravity, &target);
+    reg.process_account_work_in(&home);
+    let saved = load(Some(&state));
+    let result = saved.get(&old_sid).expect("handoff record");
+    assert!(result.error.is_none(), "handoff failed: {:?}", result.error);
+    let new_sid = result.to.expect("replacement session id");
+    assert_ne!(new_sid, old_sid);
+
+    // 1. Replacement persisted `bot_instructions` and target account on disk.
+    let stored_new = reg.agents.stored(new_sid).unwrap().unwrap();
+    assert_eq!(stored_new.account.unwrap().id, target);
+    assert!(
+        stored_new
+            .bot_instructions
+            .as_deref()
+            .is_some_and(|text| text.contains("크릴")),
+        "replacement agent-launch JSON must keep bot_instructions"
+    );
+
+    // 2. Bot runtime binding moved atomically from `old_sid` -> `new_sid` (surviving `remove(old_sid)`!).
+    assert!(
+        !bots.runtime_for_test().is_bot_session(old_sid),
+        "old bot session must be unbound after retirement"
+    );
+    assert!(
+        bots.runtime_for_test().is_bot_session(new_sid),
+        "replacement session must own the bot runtime binding"
+    );
+    assert_eq!(
+        bots.runtime_for_test().bot_for_session(new_sid),
+        Some(bot.id.clone())
+    );
+
+    // 3. Durable `runtime-bindings.json` records `new_sid` (not `old_sid`) with original `created_at_ms`.
+    let bindings_raw = fs::read_to_string(state.join("bots/runtime-bindings.json")).unwrap();
+    let bindings_json: serde_json::Value = serde_json::from_str(&bindings_raw).unwrap();
+    let arr = bindings_json.as_array().expect("bindings array");
+    assert_eq!(arr.len(), 1, "expected 1 bound bot session: {bindings_raw}");
+    assert_eq!(arr[0]["session_id"].as_u64(), Some(new_sid.0));
+    assert_eq!(arr[0]["bot_id"].as_str(), Some(bot.id.as_str()));
+    assert_eq!(arr[0]["created_at_ms"].as_u64(), Some(1_795_400_000_000));
+
+    let (_id, _proc) = mock.join().unwrap();
+    bots.shutdown();
+    drop(reg);
+    reader_worker.join().ok();
+    fs::remove_dir_all(root).ok();
 }
