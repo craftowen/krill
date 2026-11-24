@@ -938,7 +938,7 @@ fn antigravity_switch_bridges_brain_and_conversations_and_confirms_without_sessi
 }
 
 #[test]
-fn switch_waits_for_working_turn_and_never_injects_continuation() {
+fn switch_waits_for_working_turn_and_auto_continues_only_rate_limited_untouched() {
     use krill_proto::hook::{EventId, HookEvent, Input};
     use std::io::Read as _;
 
@@ -1109,14 +1109,28 @@ fn switch_waits_for_working_turn_and_never_injects_continuation() {
                 .unwrap();
             lock(&hook_reg.state).exited.insert(old, 0);
 
-            process
-                .set_read_timeout(Some(Duration::from_millis(300)))
-                .unwrap();
-            let mut byte = [0; 1];
-            assert!(
-                process.read(&mut byte).is_err(),
-                "held app prompts must never be preceded by synthetic text or Enter"
-            );
+            if rate_limited && !typed {
+                let mut expected = auto_continue::ACCOUNT_CONTINUE_PROMPT.to_vec();
+                expected.push(b'\r');
+                process
+                    .set_read_timeout(Some(Duration::from_secs(6)))
+                    .unwrap();
+                let mut got = vec![0; expected.len()];
+                process.read_exact(&mut got).unwrap();
+                assert_eq!(
+                    got, expected,
+                    "rate-limited switch without user input must auto-continue"
+                );
+            } else {
+                process
+                    .set_read_timeout(Some(Duration::from_millis(900)))
+                    .unwrap();
+                let mut byte = [0; 1];
+                assert!(
+                    process.read(&mut byte).is_err(),
+                    "completed or user-typed session must not receive synthetic continuation (rate_limited={rate_limited}, typed={typed})"
+                );
+            }
             (id, process)
         });
 
@@ -1155,6 +1169,252 @@ fn switch_waits_for_working_turn_and_never_injects_continuation() {
 
         let (_new_id, _process) = mock.join().unwrap();
 
+        reader_worker.join().unwrap();
+        drop(reg);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn interrupted_agy_switch_waits_for_empty_composer_and_auto_continues() {
+    use krill_proto::hook::{EventId, HookEvent, Input};
+    use std::io::Read as _;
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        Working,
+        PostInvocationDip,
+        IdleClean,
+        IdleOldInterrupted,
+    }
+
+    for (tag, case, expect_continue) in [
+        ("working", Case::Working, true),
+        ("dip-interrupted", Case::PostInvocationDip, true),
+        ("idle-clean", Case::IdleClean, false),
+        ("idle-old-interrupted", Case::IdleOldInterrupted, false),
+    ] {
+        let root = Path::new("/tmp").join(format!("kas-agy-continue-{}-{tag}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state = root.join("state");
+        let home = root.join("home");
+        let from_home = root.join("agy-from");
+        let to_home = root.join("agy-to");
+        let sid = "dddddddd-1111-2222-3333-444444444444";
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(from_home.join(".gemini/antigravity-cli/conversations")).unwrap();
+        fs::create_dir_all(to_home.join(".gemini/antigravity-cli")).unwrap();
+        fs::write(
+            from_home
+                .join(".gemini/antigravity-cli/conversations")
+                .join(format!("{sid}.db")),
+            b"SQLite format 3\0fixture-agy-continue",
+        )
+        .unwrap();
+        fs::write(
+            to_home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            r#"{"access_token":"tok","expiry_date":4102444800000,"email":"agy2@example.com"}"#,
+        )
+        .unwrap();
+        let snap = accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Antigravity,
+            "Agy Target",
+            Some("agy2@example.com".into()),
+            to_home.to_str().unwrap(),
+        )
+        .unwrap();
+        let target = snap
+            .accounts
+            .iter()
+            .find(|a| a.label == "Agy Target")
+            .unwrap()
+            .id
+            .clone();
+
+        let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for message in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+                inbox: false,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+        }
+        let (master, mut old_process) = UnixStream::pair().unwrap();
+        if matches!(case, Case::IdleOldInterrupted) {
+            old_process
+                .write_all(
+                    b"\r\n\xe2\x94\x94 Interrupted \xc2\xb7 What should Antigravity CLI do instead?\r\n",
+                )
+                .unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+        let reg = Arc::new(Registry::new(
+            Some((
+                holder,
+                vec![Kept {
+                    id: SessionId(61),
+                    pid: 761,
+                    status: None,
+                    size: None,
+                    master: OwnedFd::from(master),
+                }],
+            )),
+            Some(&state),
+        ));
+        if matches!(case, Case::IdleOldInterrupted) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let seen = lock(&reg.state)
+                    .sessions
+                    .get(&SessionId(61))
+                    .is_some_and(|e| {
+                        e.session
+                            .tap()
+                            .screen_text_and_modes()
+                            .0
+                            .contains(auto_continue::AGY_INTERRUPTED_MARKER)
+                    });
+                if seen {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        reg.agents
+            .remember_session(
+                SessionId(61),
+                &AgentLaunch {
+                    profile: "agy".into(),
+                    permission: Permission::Yolo,
+                },
+                Some(sid.into()),
+                root.as_os_str().as_encoded_bytes().to_vec(),
+                Some(LaunchAccount {
+                    id: "agy-old".into(),
+                    env_key: String::new(),
+                    dir: from_home.display().to_string(),
+                }),
+            )
+            .unwrap();
+        let hook_name = match case {
+            Case::Working => "PreInvocation",
+            Case::PostInvocationDip => "PostInvocation",
+            Case::IdleClean | Case::IdleOldInterrupted => "Stop",
+        };
+        let hook = HookEvent {
+            id: EventId {
+                pid: 761,
+                unix_ns: 10,
+            },
+            ppid: 761,
+            agent: "agy".into(),
+            input: Input::Complete,
+            payload: format!(
+                "{{\"hook_event_name\":\"{hook_name}\",\"conversation_id\":\"{sid}\"}}"
+            )
+            .into_bytes(),
+        };
+        reg.status.hook(&[(SessionId(61), &hook)]).unwrap();
+
+        let reader = Arc::clone(&reg);
+        let reader_worker =
+            std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+        let hook_reg = Arc::clone(&reg);
+        let mock = std::thread::spawn(move || {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, .. } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected replacement spawn");
+            };
+            let (master, mut process) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned { req, id, pid: 861 }.encode().unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            // First emit a loading screen; continuation must wait until the empty composer renders.
+            process.write_all(b"Signing in...\r\n").unwrap();
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap()
+            else {
+                panic!("expected old retirement");
+            };
+            assert_eq!(old, SessionId(61));
+            holder_link
+                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                .unwrap();
+            lock(&hook_reg.state).exited.insert(old, 0);
+
+            std::thread::sleep(Duration::from_millis(350));
+            process
+                .set_read_timeout(Some(Duration::from_millis(150)))
+                .unwrap();
+            let mut early = [0; 1];
+            assert!(
+                process.read(&mut early).is_err(),
+                "continuation must not fire while agy is still on Signing in... ({tag})"
+            );
+
+            // Render Antigravity's resumed TUI with hidden hardware cursor, software INVERSE cursor
+            // on the placeholder, promo banner, and optional Interrupted line.
+            let border = "─".repeat(60);
+            let interrupted_line = if matches!(
+                case,
+                Case::Working | Case::PostInvocationDip | Case::IdleOldInterrupted
+            ) {
+                "└ Interrupted · What should Antigravity CLI do instead?\r\n"
+            } else {
+                ""
+            };
+            let tui = format!(
+                "\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h⚠ Conversation already open\r\n│ Introducing Gemini 4 Neon\r\n│ esc to dismiss\r\n{interrupted_line}{border}\r\n> \x1b[7mA\x1b[27m\x1b[2muto mode: edits & safe commands auto-approved\x1b[0m\r\n{border}\r\n"
+            );
+            process.write_all(tui.as_bytes()).unwrap();
+
+            if expect_continue {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(b"\x1b[200~");
+                expected.extend_from_slice(auto_continue::ACCOUNT_CONTINUE_PROMPT);
+                expected.extend_from_slice(b"\x1b[201~\r");
+                process
+                    .set_read_timeout(Some(Duration::from_secs(6)))
+                    .unwrap();
+                let mut got = vec![0; expected.len()];
+                process.read_exact(&mut got).unwrap();
+                assert_eq!(
+                    got, expected,
+                    "interrupted agy switch must send bracketed continuation prompt ({tag})"
+                );
+            } else {
+                process
+                    .set_read_timeout(Some(Duration::from_millis(900)))
+                    .unwrap();
+                let mut byte = [0; 1];
+                assert!(
+                    process.read(&mut byte).is_err(),
+                    "idle agy switch must not inject continuation ({tag})"
+                );
+            }
+            (id, process)
+        });
+
+        reg.queue_selected_account_switches_in(
+            &[SessionId(61)],
+            ProviderKind::Antigravity,
+            &target,
+            true,
+            &snap,
+            &home,
+        )
+        .unwrap();
+        reg.process_account_work_in(&home);
+        let (_new_id, _process) = mock.join().unwrap();
         reader_worker.join().unwrap();
         drop(reg);
         fs::remove_dir_all(root).unwrap();

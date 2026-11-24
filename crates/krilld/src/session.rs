@@ -570,6 +570,17 @@ impl Tap {
         &self.0.clients
     }
 
+    pub(crate) fn has_clients(&self) -> bool {
+        self.0
+            .clients
+            .lock()
+            .is_ok_and(|clients| clients.has_clients())
+    }
+
+    pub(crate) fn last_input_ns(&self) -> u64 {
+        self.0.live().last_input_ns
+    }
+
     #[cfg_attr(
         windows,
         expect(clippy::unnecessary_wraps, reason = "Unix size queries the kernel")
@@ -909,6 +920,17 @@ impl Tap {
     // 엔진·연결 장부는 잠그지 않으며 다른 입력 대기자는 HUP으로 취소할 수 있다. 세션 쓰기 큐가 생기면 그리로 옮긴다.
     pub fn write_input(&self, bytes: &[u8], peer: Option<BorrowedFd<'_>>) -> io::Result<()> {
         input::write_input(self, bytes, peer)
+    }
+
+    /// Writes `bytes` only if `last_input_ns` still equals `expected_last_input_ns` and no
+    /// bracketed paste is open. Returns `Ok(Some(new_last_input_ns))` when written, or `Ok(None)`
+    /// if newer input arrived first.
+    pub(crate) fn write_input_if_untouched(
+        &self,
+        bytes: &[u8],
+        expected_last_input_ns: u64,
+    ) -> io::Result<Option<u64>> {
+        input::write_input_if_untouched(self, bytes, expected_last_input_ns)
     }
 
     pub(crate) fn write_interrupt(&self, still_working: impl FnOnce() -> bool) -> io::Result<bool> {

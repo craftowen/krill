@@ -31,6 +31,10 @@ struct Entry {
 }
 
 impl Clients {
+    pub(crate) fn has_clients(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     fn owner(&self) -> Option<&Entry> {
         self.entries
             .iter()
