@@ -55,6 +55,7 @@ EFFORT_ORDER.has(String(e || "").toLowerCase()) ? ranked[next++] : e,
 }
 const EFFORT_LABELS = new Map([
 ["none", "None"],
+["off", "Off"],
 ["minimal", "Minimal"],
 ["low", "Low"],
 ["medium", "Medium"],
@@ -498,7 +499,9 @@ const codeWrap = el("div", undefined, "chat-code-wrap"),
 head = el("div", undefined, "chat-code-head"),
 langEl = el(
 "span",
-block.lang === "Code" ? translate("Code") : block.lang,
+block.lang === "Code" || block.lang === "Plain text"
+? translate(block.lang)
+: block.lang,
 "chat-code-lang",
 ),
 actions = el("div", undefined, "chat-code-actions"),
@@ -634,17 +637,29 @@ flushPara();
 return wrap;
 }
 // Plain-language step names let non-developers skim what the agent did without opening tool payloads.
+const TOOL_STEPS = {
+read: ["Read 1 file", "Read {0} files"],
+changed: ["Changed 1 file", "Changed {0} files"],
+searched: ["Searched 1 time", "Searched {0} times"],
+ran: ["Ran 1 command", "Ran {0} commands"],
+other: ["Did 1 other step", "Did {0} other steps"],
+};
 function toolStep(name) {
 const n = String(name || "");
 return /^(read|view|notebookread|read_file)$/i.test(n)
-? "Read {0} file(s)"
+? "read"
 : /edit|write|patch/i.test(n)
-? "Changed {0} file(s)"
+? "changed"
 : /grep|glob|search|find|^ls$/i.test(n)
-? "Searched {0} time(s)"
+? "searched"
 : /bash|shell|exec|command/i.test(n)
-? "Ran {0} command(s)"
-: "Did {0} other step(s)";
+? "ran"
+: "other";
+}
+function formatToolStep(step, n, t) {
+const pair = TOOL_STEPS[step];
+if (!pair) return t(step, n);
+return n === 1 ? t(pair[0]) : t(pair[1], n);
 }
 function firstNonEmptyLine(text) {
 return (
@@ -806,13 +821,17 @@ const ms = /^\d+$/.test(raw)
 : Date.parse(raw);
 return Number.isFinite(ms) && ms > 0 ? ms : null;
 }
-function formatElapsedSecs(secs) {
+function formatElapsedSecs(secs, t) {
 if (!Number.isFinite(secs) || secs < 1) return "";
+const tr =
+typeof t === "function"
+? t
+: (s, ...v) => v.reduce((o, val, i) => o.replaceAll(`{${i}}`, String(val)), s);
 const whole = Math.floor(secs);
-if (whole < 60) return `${whole}s`;
+if (whole < 60) return tr("{0}s", whole);
 const mins = Math.floor(whole / 60),
 rem = String(whole % 60).padStart(2, "0");
-return `${mins}m ${rem}s`;
+return tr("{0}m {1}s", mins, rem);
 }
 function setClass(node, cls, on) {
 if (!node) return;
@@ -899,7 +918,7 @@ feed = el("div", undefined, "chat-feed"),
 composer = el("form", undefined, "chat-composer");
 const statusRow = el("div", undefined, "chat-status-row"),
 statusLine = el("div", undefined, "chat-status"),
-statusBadge = el("span", "IDLE", "badge"),
+statusBadge = el("span", t("Idle"), "badge"),
 statusText = el("span", "", "chat-live-text");
 statusLine.setAttribute("role", "status");
 statusLine.setAttribute("aria-live", "polite");
@@ -1302,7 +1321,7 @@ let elapsedBadge = "";
 if (targetRun.minAtMs !== null) {
 const endMs = isActive ? Date.now() : targetRun.maxAtMs;
 if (endMs !== null && endMs >= targetRun.minAtMs)
-elapsedBadge = formatElapsedSecs((endMs - targetRun.minAtMs) / 1000);
+elapsedBadge = formatElapsedSecs((endMs - targetRun.minAtMs) / 1000, t);
 }
 if (elapsedBadge) targetRun.details.dataset.elapsed = elapsedBadge;
 else delete targetRun.details.dataset.elapsed;
@@ -1312,9 +1331,11 @@ const statusPart = targetRun.errors
 ? t("Tool activity")
 : "",
 stepParts = [
-...[...targetRun.steps].map(([step, n]) => t(step, n)),
+...[...targetRun.steps].map(([step, n]) => formatToolStep(step, n, t)),
 !targetRun.tools && targetRun.thoughts
-? t("Thought {0} time(s)", targetRun.thoughts)
+? targetRun.thoughts === 1
+? t("Thought 1 time")
+: t("Thought {0} times", targetRun.thoughts)
 : !targetRun.tools && !targetRun.thoughts && targetRun.notes
 ? t("Tool activity")
 : "",
@@ -1362,10 +1383,18 @@ targetRun.diffFiles?.size ||
 targetRun.diffAdded ||
 targetRun.diffDeleted
 ) {
-const files = String(targetRun.diffFiles?.size || 1),
+const fileCount = targetRun.diffFiles?.size || 1,
+files = String(fileCount),
 added = String(targetRun.diffAdded || 0),
 deleted = String(targetRun.diffDeleted || 0),
-diffText = t("Changed {0} files (+{1} -{2})", files, added, deleted)
+diffText = t(
+fileCount === 1
+? "Changed 1 file (+{1} -{2})"
+: "Changed {0} files (+{1} -{2})",
+files,
+added,
+deleted,
+)
 .replace("{0}", files)
 .replace("{1}", added)
 .replace("{2}", deleted);
@@ -1605,11 +1634,13 @@ addRow("Model", currentModel ? fullModel(currentModel) : t("Model"));
 addRow("Context used", `${usage}%`);
 const used = status.context?.used ?? status.context?.tokens,
 limit = status.context?.limit ?? status.context?.max;
-if (Number.isFinite(used) && Number.isFinite(limit) && limit > 0)
-addRow(
-"Tokens",
-`${Number(used).toLocaleString()} / ${Number(limit).toLocaleString()}`,
-);
+if (Number.isFinite(used) && Number.isFinite(limit) && limit > 0) {
+const fmtNum = (n) =>
+M.i18n?.formatNumber
+? M.i18n.formatNumber(n)
+: Number(n).toLocaleString(M.i18n?.language || undefined);
+addRow("Tokens", `${fmtNum(used)} / ${fmtNum(limit)}`);
+}
 body.append(group);
 });
 }
@@ -2049,7 +2080,12 @@ typeof item.text === "string" &&
 .slice(0, 80)
 .map((item) => ({
 label: item.text,
-detail: [t(item.kind || "Command"), item.description]
+detail: [
+t(item.kind || "Command"),
+item.scope === "Built-in" && item.description
+? t(item.description)
+: item.description,
+]
 .filter(Boolean)
 .join(" · "),
 text: item.text,

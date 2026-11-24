@@ -39,7 +39,32 @@ port.scrollTop += anchor.node.getBoundingClientRect().top - anchor.top;
 }
 const formatText = (ctx) => (s, ...v) =>
 v.reduce((out, val, i) => out.replaceAll(`{${i}}`, String(val)), ctx.t?.(s, ...v) ?? s);
-const refusalAgentLabel = (agent) => {
+const BOT_EFFORT_LABEL = {
+"": "Default",
+none: "None",
+off: "Off",
+minimal: "Minimal",
+low: "Low",
+medium: "Medium",
+high: "High",
+xhigh: "Extra high",
+max: "Max",
+ultra: "Ultra",
+};
+const LINK_KIND_LABEL = {
+file: "File",
+url: "URL",
+pr: "PR",
+issue: "Issue",
+commit: "Commit",
+branch: "Branch",
+thread: "Thread",
+channel: "Channel",
+message: "Message",
+session: "Session",
+external: "External",
+};
+const refusalAgentLabel = (agent, t) => {
 const id = String(agent || "").trim().toLowerCase();
 if (id === "agy" || id === "antigravity") return "Antigravity";
 if (id === "claude") return "Claude Code";
@@ -48,7 +73,7 @@ if (id === "opencode" || id === "opencode2") return "OpenCode";
 if (id === "cursor") return "Cursor";
 if (id === "hermes") return "Hermes";
 if (id === "gemini") return "Gemini";
-return M.agentName?.(id) || agent || "Agent";
+return M.agentName?.(id) || agent || (t ? t("Agent") : "Agent");
 };
 /** Reads a structured bot chat refusal carried on an RPC error (`e1779f39`, `5fba3d89`). */
 const readBotRefusal = (err) => {
@@ -60,7 +85,7 @@ return candidate && typeof candidate === "object" && typeof candidate.code === "
 /** Formats a bot chat refusal in phone-side words (never calling a paired desktop "this computer"). */
 const mobileBotRefusalText = (refusal, t) => {
 if (!refusal || typeof refusal !== "object") return t("Couldn’t start the chat");
-const agent = refusalAgentLabel(refusal.agent);
+const agent = refusalAgentLabel(refusal.agent, t);
 const detail = typeof refusal.detail === "string" ? refusal.detail.trim() : "";
 switch (refusal.code) {
 case "cli_too_old":
@@ -112,6 +137,16 @@ if (!raw) return t("Request failed. Check the desktop connection and try again."
 if (/os error|sqlite|rusqlite|secrets\.enc|vault|dpapi|\/Users\/|\/home\/|\/var\/|\/tmp\/|\\\\/i.test(raw)) {
 return t("Request failed. Check the desktop connection and try again.");
 }
+const botNotFound = /^bot not found:\s*(.+)$/i.exec(raw);
+if (botNotFound) return t("Bot not found: {0}", botNotFound[1]);
+const itemNotFound = /^bot item not found:\s*(.+)$/i.exec(raw);
+if (itemNotFound) return t("Bot item not found: {0}", itemNotFound[1]);
+const schedNotFound = /^schedule not found:\s*(.+)$/i.exec(raw);
+if (schedNotFound) return t("Schedule not found: {0}", schedNotFound[1]);
+const linkNotFound = /^link not found:\s*(.+)$/i.exec(raw);
+if (linkNotFound) return t("Link not found: {0}", linkNotFound[1]);
+const alreadyRunning = /^(.+) is already running$/i.exec(raw);
+if (alreadyRunning) return t("{0} is already running", alreadyRunning[1]);
 return t(raw);
 };
 const safeHref = (url) => (/^https?:\/\//i.test(String(url || "").trim()) ? String(url).trim() : null);
@@ -164,8 +199,12 @@ d.getFullYear() === now.getFullYear() &&
 d.getMonth() === now.getMonth() &&
 d.getDate() === now.getDate();
 return sameDay
-? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-: d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+? (M.i18n?.formatTime
+? M.i18n.formatTime(d, { hour: "2-digit", minute: "2-digit" })
+: d.toLocaleTimeString(M.i18n?.language || undefined, { hour: "2-digit", minute: "2-digit" }))
+: (M.i18n?.formatDate
+? M.i18n.formatDate(d, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+: d.toLocaleString(M.i18n?.language || undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
 } catch {
 return t("Never");
 }
@@ -328,7 +367,48 @@ a.rel = "noopener noreferrer";
 return a;
 }
 const base = kind === "file" ? raw.split(/[\\/]/).filter(Boolean).pop() || raw : raw;
-return el("span", kind === "file" ? `${t("File")}: ${base}` : `${kind}: ${base}`, "bot-link-chip muted");
+const kindLabel = LINK_KIND_LABEL[kind] ? t(LINK_KIND_LABEL[kind]) : t(kind);
+return el("span", `${kindLabel}: ${base}`, "bot-link-chip muted");
+};
+const formatEventText = (ev, t) => {
+const raw = String(ev?.text || "").trim();
+if (ev?.kind === "status") {
+const target = eventStatusTarget(ev);
+if (target) return t("Status changed to {0}", statusLabel(target, t));
+}
+if (ev?.kind === "snoozed") {
+const m = /^snoozed until (\d+)$/i.exec(raw);
+if (m) return t("Snoozed until {0}", formatTimestamp(Number(m[1]), t));
+}
+if (ev?.kind === "unsnoozed" || raw.toLowerCase() === "unsnoozed") {
+return t("Unsnoozed");
+}
+if (ev?.kind === "edited") {
+if (!raw || raw === "updated item") return t("Updated item");
+if (raw.startsWith("{")) {
+try {
+const parsed = JSON.parse(raw);
+if (Array.isArray(parsed?.fields) && parsed.fields.length) {
+return t("Updated {0}", parsed.fields.map((f) => t(String(f))).join(", "));
+}
+} catch {}
+}
+}
+if (ev?.kind === "linked") {
+const colon = raw.indexOf(":");
+if (colon > 0) {
+const kind = raw.slice(0, colon).trim().toLowerCase();
+const target = raw.slice(colon + 1).trim();
+if (kind === "dispatch") return t("Linked {0}", t("Linked task"));
+const base = kind === "file" ? target.split(/[\\/]/).filter(Boolean).pop() || target : target;
+const kindLabel = LINK_KIND_LABEL[kind] ? t(LINK_KIND_LABEL[kind]) : t(kind);
+return t("Linked {0}", `${kindLabel}: ${base}`);
+}
+}
+if (ev?.kind === "made" && (!raw || raw === "created item")) {
+return t("Created item");
+}
+return raw;
 };
 const botDisplayName = (bots, botId) => bots.find((b) => b.id === botId)?.name || botId;
 function renderAvatar(el, bot, avatarInfo) {
@@ -1115,7 +1195,8 @@ const row = el("div", undefined, `bot-timeline-item${mine ? " mine" : ""}`);
 const head = el("div", undefined, "bot-timeline-head");
 head.append(el("strong", eventActorName(ev, bots, t)), el("span", formatTimestamp(ev.created_at_ms, t)));
 row.append(head);
-if (ev.text) row.append(el("p", ev.text, "bot-timeline-body"));
+const bodyText = formatEventText(ev, t);
+if (bodyText) row.append(el("p", bodyText, "bot-timeline-body"));
 return row;
 });
 timeline.replaceChildren(...rows);
@@ -2496,7 +2577,7 @@ if (botErrors > 0) titleLine.append(el("span", t("Connector error"), "bot-status
 if (showDev && bot._hostName) titleLine.append(el("span", bot._hostName, "device-badge"));
 copy.append(titleLine);
 const liveLine = [
-refusalAgentLabel(bot.agent_id),
+refusalAgentLabel(bot.agent_id, t),
 workingCount > 0
 ? workingCount === 1
 ? t("1 active")
@@ -2558,7 +2639,7 @@ draw();
 function mountBotDetail(root, ctx, t, botId, ready) {
 const { el, button } = ctx;
 const screen = el("section", undefined, "details bots bot-detail bot-workspace screen");
-const header = ctx.header(botId, "/bots");
+const header = ctx.header(botId, "/bots", undefined, { raw: true });
 const headerSub = el("small", "", "header-sub");
 header.querySelector(".header-copy")?.append(headerSub);
 const refreshBtn = button(t("Refresh"), () => load(), "icon-button refresh-button", "activity");
@@ -3197,7 +3278,9 @@ scheduleId: run.id,
 title: cfg?.name || run.id,
 subtitle: run.last_refusal
 ? mobileBotRefusalText(run.last_refusal, t)
-: String(run.last_error || ""),
+: run.last_error
+? safeMsg(run.last_error, t)
+: "",
 });
 }
 }
@@ -3422,7 +3505,9 @@ if (metaParts.length) main.append(el("small", metaParts.join(" · "), "muted"));
 if (failed) {
 const errText = run.last_refusal
 ? mobileBotRefusalText(run.last_refusal, t)
-: String(run.last_error || "");
+: run.last_error
+? safeMsg(run.last_error, t)
+: "";
 main.append(el("small", errText, "account-error"));
 }
 const actions = el("div", undefined, "bots-row-actions");
@@ -3505,7 +3590,13 @@ agentMain.append(
 el("strong", t("Provider & model")),
 el(
 "small",
-[refusalAgentLabel(bot.agent_id), bot.model || t("Default"), bot.effort || null].filter(Boolean).join(" · "),
+[
+refusalAgentLabel(bot.agent_id, t),
+bot.model || t("Default"),
+bot.effort
+? t(BOT_EFFORT_LABEL[String(bot.effort).toLowerCase()] || bot.effort)
+: null,
+].filter(Boolean).join(" · "),
 "muted",
 ),
 );
@@ -3564,7 +3655,7 @@ refreshBtn.disabled = loading || !ready();
 if (bot) {
 const working = botSessions.some((s) => s.live && s.working);
 headerSub.textContent = [
-refusalAgentLabel(bot.agent_id),
+refusalAgentLabel(bot.agent_id, t),
 bot.model || null,
 t(bot.paused ? "Paused" : working ? "Working" : "Active"),
 ]
@@ -3832,7 +3923,7 @@ hostName: h.name || "",
 botId: entry.bot.id,
 scheduleId: run.id,
 title: cfg?.name || run.id,
-detail: run.last_refusal ? mobileBotRefusalText(run.last_refusal, t) : String(run.last_error || ""),
+detail: run.last_refusal ? mobileBotRefusalText(run.last_refusal, t) : run.last_error ? safeMsg(run.last_error, t) : "",
 });
 }
 }

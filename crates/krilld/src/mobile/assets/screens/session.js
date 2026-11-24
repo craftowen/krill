@@ -554,7 +554,7 @@
       name.type = "text";
       name.required = true;
       name.value = cmd?.name || "";
-      name.placeholder = "Orchestrate";
+      name.placeholder = t("Orchestrate");
       name.setAttribute("aria-label", t("Name"));
       text.required = true;
       text.rows = 4;
@@ -947,7 +947,7 @@
             cleanTitle(s.title) ||
               state.titles?.get(s.id) ||
               agentName(sessionAgent(s)) ||
-              "Shell",
+              t("Shell"),
           ),
           sessionAgent(s),
           false,
@@ -956,7 +956,7 @@
       );
     const fresh = tab(
       "Unknown",
-      named(job.agent ? agentName(job.agent) : "Shell"),
+      named(job.agent ? agentName(job.agent) : t("Shell")),
       job.agent,
       true,
       () => {},
@@ -1053,7 +1053,7 @@
     }
     if (!group || !session) {
       root.append(
-        ctx.header("Workspace", "/host/local"),
+        ctx.header(t("Workspace"), "/host/local"),
         el("p", t("Session not found"), "empty"),
         button(t("Open workspaces"), () => go("/host/local"), "primary"),
       );
@@ -1411,7 +1411,7 @@
               cleanTitle(s.title) ||
               titles.get(s.id) ||
               agentName(agent) ||
-              "Shell",
+              t("Shell"),
             n = (seen.get(base) || 0) + 1;
           seen.set(base, n);
           return { s, agent, label: n > 1 ? `${base} ${n}` : base };
@@ -2228,7 +2228,7 @@
             cleanTitle(s.title) ||
             titles.get(s.id) ||
             agentName(agent) ||
-            "Shell",
+            t("Shell"),
           n = (seen.get(base) || 0) + 1;
         seen.set(base, n);
         const label = n > 1 ? `${base} ${n}` : base;
@@ -2279,7 +2279,7 @@
           "aria-label",
           `${label} · ${t(status)} · ${t("Terminal #{0}", s.id)}`,
         );
-        tab.title = `${label} · ${status}`;
+        tab.title = `${label} · ${t(status)}`;
         e.dot.className = `status-dot ${status.toLowerCase()}`;
         e.dot.setAttribute("aria-label", t(status));
         if (e.agent !== agent) {

@@ -808,9 +808,11 @@ test("disconnected Settings control uses automatic diagnostics directly, with En
           ? "기술적 오류 자동 수집"
           : "Automatic technical error collection",
       );
-      const notice = nodes.find(
-        (n) => n.href === "https://krill.page/privacy#mobile-errors",
-      );
+      const expectedPrivacyHref =
+        lang === "ko"
+          ? "https://krill.page/privacy#mobile-errors"
+          : "https://krill.page/en/privacy#mobile-errors";
+      const notice = nodes.find((n) => n.href === expectedPrivacyHref);
       assert(notice);
       assert.equal(
         notice.text,
@@ -828,11 +830,7 @@ test("disconnected Settings control uses automatic diagnostics directly, with En
         (n) => n.dataset.focusKey === "error-reporting",
       );
       assert(aboutToggle);
-      assert(
-        aboutNodes.some(
-          (n) => n.href === "https://krill.page/privacy#mobile-errors",
-        ),
-      );
+      assert(aboutNodes.some((n) => n.href === expectedPrivacyHref));
       assert(
         aboutNodes.some((n) =>
           n.text.includes(
