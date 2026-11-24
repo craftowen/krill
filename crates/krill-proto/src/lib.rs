@@ -44,6 +44,7 @@ pub mod theme;
 pub mod time;
 pub mod usage;
 pub mod user_dirs;
+pub mod voice;
 pub mod worktree_location;
 pub mod worktree_space;
 

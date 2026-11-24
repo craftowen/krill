@@ -5026,8 +5026,10 @@ fn import_bots_domain(
 
 fn allocate_unique_bot_slug(existing: &[BotConfig], bots_root: &Path, base: &BotSlug) -> BotSlug {
     let taken = |cand: &str| {
-        existing.iter().any(|b| b.slug.as_str() == cand)
-            || bots_root.join(cand).join("bot.json").is_file()
+        existing
+            .iter()
+            .any(|b| b.slug.as_str() == cand || b.folder == cand)
+            || fs::symlink_metadata(bots_root.join(cand)).is_ok()
     };
     if !taken(base.as_str()) {
         return base.clone();

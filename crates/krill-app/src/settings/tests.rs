@@ -2161,7 +2161,7 @@ fn shortcuts_and_sidebar_use_readable_labels() {
 fn settings_nav_shows_every_tab_and_subpages_keep_their_parent(cx: &mut TestAppContext) {
     let d = dir("six-tabs");
     init(cx, &d);
-    assert_eq!(AdminTab::ALL.len(), 8);
+    assert_eq!(AdminTab::ALL.len(), 9);
     assert!(
         AdminTab::SUBPAGES
             .iter()

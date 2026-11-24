@@ -159,15 +159,24 @@ impl Shell {
             });
         }
         let session = self.layout.session(pane);
+        // Session ownership takes precedence over `launch.cwd`: a newly opened bot chat tab may
+        // briefly carry the previous tab's inherited `cwd`, and a bot may run in a shared
+        // workspace, so another bot earlier in `sidebar_bots` must never steal the right panel.
+        if let Some(session_id) = session
+            && let Some(bot) = self
+                .sidebar_bots
+                .iter()
+                .find(|b| b.sessions.iter().any(|x| x.session_id == session_id))
+        {
+            return Some(bot);
+        }
         let cwd = {
             use krill_proto::os::ffi::OsStringExt as _;
             std::path::PathBuf::from(std::ffi::OsString::from_vec(self.launch_for(pane).cwd))
         };
         self.sidebar_bots.iter().find(|b| {
-            session.is_some_and(|s| b.sessions.iter().any(|x| x.session_id == s))
-                || self
-                    .bot_folder(b)
-                    .is_some_and(|f| same_bot_folder(&f, &cwd))
+            self.bot_folder(b)
+                .is_some_and(|f| same_bot_folder(&f, &cwd))
         })
     }
 

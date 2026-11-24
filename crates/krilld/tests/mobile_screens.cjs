@@ -1925,5 +1925,107 @@ async function todoUxDacRegressions(){
  assert.equal(K.t('Details ({0})',3),'상세 (3)');
  console.log('PASS To Do D+A+C regressions: action groups, bot context, bots.item.answer, decision_id, multi-select, detail sheet, agy bot, ko i18n, security');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function voicePipitoRegressions(){
+ // 1. WAV encoding, chunked upload & single-frame upload, insertText, and pre-send edit voice.feedback.
+ const f=fixture();
+ const appSrc=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8');
+ assert(appSrc.includes('M.voice='),'app.js exports M.voice');
+ assert(appSrc.includes('voice.warm')&&appSrc.includes('voice.transcribe')&&appSrc.includes('voice.feedback'),'app.js wires voice RPCs');
+ // Extract pure helpers via lightweight VM sandbox
+ const vBox=vm.createContext({
+  btoa:s=>Buffer.from(s,'binary').toString('base64'),
+  atob:s=>Buffer.from(s,'base64').toString('binary'),
+  Float32Array,Uint8Array,ArrayBuffer,DataView,Event:class Event{constructor(t){this.type=t;}},
+  Date,Math,Promise,Error,setInterval,clearInterval,
+  isSecureContext:true,
+  navigator:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[{stop(){}}]})}},
+  AudioContext:class{
+   constructor(){this.sampleRate=48000;this.destination={};}
+   createMediaStreamSource(){return {connect(){},disconnect(){}};}
+   createScriptProcessor(){const p={connect(){},disconnect(){},onaudioprocess:null};setTimeout(()=>p.onaudioprocess?.({inputBuffer:{getChannelData:()=>new Float32Array(480)}}),0);return p;}
+   close(){return Promise.resolve();}
+  },
+ });
+ // Evaluate helper snippet from app.js
+ const startIdx=appSrc.indexOf('const voiceEncodeWav=');
+ const endIdx=appSrc.indexOf('const editable=node=>');
+ assert(startIdx>0&&endIdx>startIdx,'app.js voice helper block found');
+ const snippet=`(()=>{const M=globalThis.KrillMobile={};const el=(t,tx,c)=>({tag:t,textContent:tx||'',className:c||'',children:[],hidden:false,append(...a){this.children.push(...a);},insertBefore(n){this.children.unshift(n);}});const button=(l,fn,c)=>{const b=el('button',l,c);b.action=fn;b.setAttribute=()=>{};return b;};const t=s=>s;\n${appSrc.slice(startIdx,endIdx)}\n})();`;
+ vm.runInContext(snippet,vBox);
+ const V=vBox.KrillMobile.voice;
+ // WAV header verification (48kHz -> 16kHz downsampled)
+ const wav=V.encodeWav([new Float32Array(4800)],48000);
+ assert.equal(Buffer.from(wav.slice(0,4)).toString(),'RIFF');
+ assert.equal(Buffer.from(wav.slice(8,12)).toString(),'WAVE');
+ assert.equal(new DataView(wav.buffer).getUint32(24,true),16000);
+ assert.equal(wav.length,44+1600*2);
+ // Single frame vs chunked upload
+ const rpcCalls=[];
+ const mockRpc=async req=>{
+  rpcCalls.push(req);
+  if(req.action==='voice.transcribe'){
+   if(req.total_chunks>1&&req.chunk_index+1<req.total_chunks)return {chunk_accepted:true};
+   return {silence:false,text:'크릴 데몬 확인'};
+  }
+  return {ok:true};
+ };
+ const res1=await V.transcribeBytes(mockRpc,new Uint8Array(1000),{targetKind:'session',targetId:'7'});
+ assert.equal(res1.text,'크릴 데몬 확인');
+ assert.equal(rpcCalls.at(-1).target_kind,'session');
+ assert(typeof rpcCalls.at(-1).audio_wav_b64==='string');
+ rpcCalls.length=0;
+ const res2=await V.transcribeBytes(mockRpc,new Uint8Array(600*1024),{targetKind:'group_chat',targetId:'g1'});
+ assert.equal(res2.text,'크릴 데몬 확인');
+ assert.equal(rpcCalls.length,3,'600 KiB splits into 3 chunks of 256/256/88 KiB');
+ assert.equal(rpcCalls[0].chunk_index,0);
+ assert.equal(rpcCalls[2].chunk_index,2);
+ assert.equal(rpcCalls[2].total_chunks,3);
+ // Attach to composer, record -> stop -> insert -> edit -> onSend fires voice.feedback
+ const hostNode={children:[],append(...a){this.children.push(...a);},insertBefore(n){this.children.unshift(n);}};
+ const ta={value:'',selectionStart:0,selectionEnd:0,events:[],setSelectionRange(a,b){this.selectionStart=a;this.selectionEnd=b;},dispatchEvent(e){this.events.push(e.type);},focus(){}};
+ rpcCalls.length=0;
+ const ctl=V.attach(ta,hostNode,{ctx:{rpc:mockRpc},targetKind:'bot_chat',targetId:()=>'b1'});
+ const micBtn=ctl.el.children[0];
+ await micBtn.action();
+ await new Promise(r=>setTimeout(r,15));
+ await ctl.stop(false);
+ assert.equal(ta.value,'크릴 데몬 확인');
+ assert(ta.events.includes('input'));
+ assert(rpcCalls.some(c=>c.action==='voice.warm'&&c.target_kind==='bot_chat'&&c.target_id==='b1'));
+ // User edits before send -> voice.feedback fires
+ ctl.onSend('krilld 확인');
+ await new Promise(r=>setTimeout(r,10));
+ assert(rpcCalls.some(c=>c.action==='voice.feedback'&&c.before==='크릴 데몬 확인'&&c.after==='krilld 확인'));
+ // 2. Mobile Settings Voice / Pipito section
+ const voiceSettingsCalls=[];
+ const sf=fixture('settings',{
+  rpc:async req=>{
+   voiceSettingsCalls.push(req);
+   if(req.action==='voice.status')return {available:true,status:'ready',refine_enabled:true,vocab_count:3};
+   if(req.action==='voice.config_get')return {refine_enabled:true,desktop_shortcut:'Alt+Shift+Space',pinned_vocab:['Pipito'],ignored_vocab:[],auto_vocab:[{word:'krilld',count:4,last_seen_ms:1}]};
+   if(req.action==='voice.config_set')return {refine_enabled:req.refine_enabled??true,desktop_shortcut:'Alt+Shift+Space',pinned_vocab:req.add_pinned?['Pipito',req.add_pinned]:['Pipito'],ignored_vocab:[],auto_vocab:[]};
+   return {};
+  },
+ });
+ sf.ctx.connections=[{id:'h1',name:'Mac',active:true,connection:{phase:'ready'},snapshot:{sessions:[]}}];
+ sf.view.update();
+ await sf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert(voiceSettingsCalls.some(c=>c.action==='voice.status'));
+ assert(voiceSettingsCalls.some(c=>c.action==='voice.config_get'));
+ assert(sf.all().some(n=>String(n.textContent||'').includes('Voice / Pipito')));
+ assert(sf.all().some(n=>String(n.textContent||'').includes('Pipito')));
+ assert(sf.all().some(n=>String(n.textContent||'').includes('krilld (4)')));
+ sf.abort.abort();
+ // 3. Korean i18n strings for Voice / Pipito
+ const koBox=vm.createContext({navigator:{language:'ko'}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),koBox);
+ const K=koBox.KrillMobile.i18n;
+ for(const key of ['Voice input','Stop recording','Transcribing…','Voice / Pipito','AI Refine','Pipito not running','Pipito not installed']){
+  assert.notEqual(K.t(key),key,`missing ko translation for "${key}"`);
+ }
+ assert.equal(K.t('Learned words ({0})',5),'자동 학습 단어장 (5)');
+ console.log('PASS Voice / Pipito mobile regressions: WAV encoding, chunked upload, composer insert & feedback, settings UI, ko i18n');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

@@ -1511,6 +1511,12 @@ impl Shell {
                                             )
                                     }),
                             )
+                            .child(self.render_chat_voice_control(
+                                pane,
+                                &key,
+                                matches!(primary_action, super::ComposerPrimaryAction::Sending),
+                                cx,
+                            ))
                             .child({
                                 match primary_action {
                                     super::ComposerPrimaryAction::Stop { latched } => Button::new(

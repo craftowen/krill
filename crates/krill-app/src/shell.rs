@@ -42,6 +42,7 @@ mod split_launcher;
 mod stale_account_banner;
 mod tabs;
 mod terminal_menu;
+mod voice;
 mod workspaces;
 
 // 앱의 마지막 생존 시각 저장.
@@ -826,6 +827,7 @@ pub struct Shell {
     pub(super) sidebar_groups: Vec<krill_proto::bots::BotGroupSummary>,
     /// Orca's sidebar Bots section, New bot and templates dialogs.
     bot_ui: bot_section::BotUi,
+    voice: voice::ShellVoiceState,
     /// Orca's empty split/new-tab pane launcher state, keyed by pane id.
     split_launchers: HashMap<PaneId, split_launcher::SplitLauncher>,
     bots_badge_task: Option<Task<()>>,
@@ -1493,6 +1495,7 @@ impl Shell {
             sidebar_bots: Vec::new(),
             sidebar_groups: Vec::new(),
             bot_ui: bot_section::BotUi::default(),
+            voice: voice::ShellVoiceState::default(),
             split_launchers: HashMap::new(),
             bots_badge_task: None,
             #[cfg(not(test))]
@@ -2189,6 +2192,8 @@ impl Shell {
         self.record_workspace_nav(cx);
         self.sync_focused_session(cx);
         self.refresh_local_state(cx);
+        self.voice.shortcut_loaded = false;
+        self.ensure_voice_shortcut_synced(cx);
         self.files.refocus = true;
         self.focus_modal_or_workspace(window, cx);
         cx.notify();
@@ -9124,6 +9129,14 @@ impl Render for Shell {
             }))
             .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 krill_app::star_nag::record_key_down(&e.keystroke.key, cx);
+                if !this.has_blocking_overlay()
+                    && !this.has_dialog_or_viewer_overlay()
+                    && this.handle_voice_shortcut(e, window, cx)
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.dashboard.is_some()
                     && e.keystroke.key == "escape"
                     && !e.keystroke.modifiers.modified()
