@@ -725,14 +725,25 @@ impl ChatState {
 pub(super) fn local_machine_hostname() -> Option<String> {
     static HOST: OnceLock<Option<String>> = OnceLock::new();
     HOST.get_or_init(|| {
-        let raw = std::process::Command::new("hostname")
-            .arg("-s")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
+        let raw = sysinfo::System::host_name()
+            .or_else(|| {
+                let mut cmd = std::process::Command::new("hostname");
+                #[cfg(not(windows))]
+                cmd.arg("-s");
+                cmd.output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+            })
+            .or_else(|| std::env::var("COMPUTERNAME").ok())
             .or_else(|| std::env::var("HOSTNAME").ok())?;
-        let trimmed = raw.trim().trim_end_matches(".local").trim();
+        let trimmed = raw
+            .trim()
+            .trim_end_matches(".local")
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     })
     .clone()
