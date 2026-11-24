@@ -652,6 +652,10 @@ pub struct Shell {
     local_generation: u64,
     ssh_generation: u64,
     orch_snapshot: Arc<krill_proto::orchestration::OrchestrationStore>,
+    remote_orch_snapshots:
+        HashMap<krill_app::hosts::HostId, Arc<krill_proto::orchestration::OrchestrationStore>>,
+    remote_orch_generations: HashMap<krill_app::hosts::HostId, u64>,
+    remote_orch_in_flight: bool,
     orch_poll: Option<Task<()>>,
     fits: fit::Pending,
     focus: FocusHandle,
@@ -1378,6 +1382,9 @@ impl Shell {
             local_generation: 0,
             ssh_generation: 0,
             orch_snapshot: Arc::default(),
+            remote_orch_snapshots: HashMap::new(),
+            remote_orch_generations: HashMap::new(),
+            remote_orch_in_flight: false,
             orch_poll: None,
             fits: fit::Pending::default(),
             focus: cx.focus_handle(),
@@ -1694,9 +1701,92 @@ impl Shell {
         .detach();
     }
 
+    pub(super) fn orch_snapshot_for(
+        &self,
+        host: &krill_app::hosts::HostId,
+    ) -> Option<&krill_proto::orchestration::OrchestrationStore> {
+        match host {
+            krill_app::hosts::HostId::Local => Some(self.orch_snapshot.as_ref()),
+            krill_app::hosts::HostId::Remote(_) => {
+                self.remote_orch_snapshots.get(host).map(Arc::as_ref)
+            }
+        }
+    }
+
+    pub(super) fn prune_remote_orchestration(&mut self, cx: &mut Context<Self>) {
+        let targets = &self.host_targets;
+        self.remote_orch_snapshots
+            .retain(|host, _| targets.contains_key(host));
+        self.remote_orch_generations
+            .retain(|host, _| targets.contains_key(host));
+        let keep: HashSet<krill_app::hosts::HostId> = targets.keys().cloned().collect();
+        self.sidebar.update(cx, |sb, cx| {
+            sb.retain_remote_orchestration(|h| keep.contains(h), cx);
+        });
+    }
+
+    pub(super) fn fetch_remote_orchestration(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        cx: &mut Context<Self>,
+    ) {
+        if !host.is_remote() || self.remote_orch_in_flight {
+            return;
+        }
+        let Some(target) = self.host_targets.get(&host).cloned() else {
+            return;
+        };
+        let prev_generation = self.remote_orch_generations.get(&host).copied();
+        self.remote_orch_in_flight = true;
+        let fetch_target = target.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    fetch_remote_orchestration_snapshot(&fetch_target, prev_generation)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.remote_orch_in_flight = false;
+                if this.host_targets.get(&host) == Some(&target)
+                    && let Ok(RemoteOrchFetch::Updated { store, generation }) = result
+                {
+                    if let Some(generation) = generation {
+                        this.remote_orch_generations
+                            .insert(host.clone(), generation);
+                    } else {
+                        this.remote_orch_generations.remove(&host);
+                    }
+                    let changed = this
+                        .remote_orch_snapshots
+                        .insert(host.clone(), store.clone())
+                        .as_ref()
+                        != Some(&store);
+                    this.sidebar.update(cx, |sb, cx| {
+                        sb.set_remote_orchestration(host.clone(), store, cx);
+                    });
+                    if changed {
+                        cx.notify();
+                    }
+                }
+                if this.launch_host != host
+                    && this.launch_host.is_remote()
+                    && this.host_targets.contains_key(&this.launch_host)
+                    && !this.remote_orch_snapshots.contains_key(&this.launch_host)
+                {
+                    let next = this.launch_host.clone();
+                    this.fetch_remote_orchestration(next, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Snapshot reads and file locks happen only on this serial background loop.
     fn poll_orchestration(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
+            let mut tick: u64 = 0;
             loop {
                 let Ok((dir, screens, mut previous, old_ports)) = this.read_with(cx, |this, cx| {
                     let cache = this.ports_cache.borrow();
@@ -1765,6 +1855,14 @@ impl Shell {
                             this.orch_snapshot = snapshot;
                             changed = true;
                         }
+                        this.prune_remote_orchestration(cx);
+                        if this.launch_host.is_remote()
+                            && (!this.remote_orch_snapshots.contains_key(&this.launch_host)
+                                || tick.is_multiple_of(3))
+                        {
+                            let host = this.launch_host.clone();
+                            this.fetch_remote_orchestration(host, cx);
+                        }
                         let mut cache = this.ports_cache.borrow_mut();
                         cache.retain(|id, entry| {
                             let retained = this.live.iter().any(|(pane, live)| {
@@ -1798,6 +1896,7 @@ impl Shell {
                 {
                     return;
                 }
+                tick = tick.wrapping_add(1);
                 cx.background_executor().timer(Duration::from_secs(1)).await;
             }
         })
@@ -2974,12 +3073,22 @@ impl Shell {
                             .retain(|(host, _)| !invalidated.contains(host));
                         this.observed_sessions
                             .retain(|(host, _)| !invalidated.contains(host));
+                        this.remote_orch_generations
+                            .retain(|host, _| !invalidated.contains(host));
                     }
                     this.purge_stale_remote_session_authority();
+                    this.prune_remote_orchestration(cx);
                     this.remote_accounts
                         .retain(|host, _| this.host_targets.contains_key(host));
                     this.remote_account_handoff_polls
                         .retain(|host, _| this.host_targets.contains_key(host));
+                    if this.launch_host.is_remote()
+                        && this.host_targets.contains_key(&this.launch_host)
+                        && !this.remote_orch_snapshots.contains_key(&this.launch_host)
+                    {
+                        let host = this.launch_host.clone();
+                        this.fetch_remote_orchestration(host, cx);
+                    }
                     let connected_remotes: Vec<krill_app::hosts::HostId> = this
                         .host_statuses
                         .iter()
@@ -10190,6 +10299,118 @@ fn start_error_text(err: &std::io::Error) -> String {
         text::START_UNKNOWN_AGENT.get().to_owned()
     } else {
         raw
+    }
+}
+
+enum RemoteOrchFetch {
+    Unchanged,
+    Updated {
+        store: Arc<krill_proto::orchestration::OrchestrationStore>,
+        generation: Option<u64>,
+    },
+}
+
+fn fetch_remote_orchestration_snapshot(
+    target: &krill_app::hosts::HostTarget,
+    prev_generation: Option<u64>,
+) -> std::io::Result<RemoteOrchFetch> {
+    use krill_proto::control::{FEAT_CONTROL, Reply, Request};
+    use krill_proto::orchestration::{
+        FEAT_ORCH_SNAPSHOT_PAGE, OrchAction, OrchResponse, OrchestrationStore,
+        SNAPSHOT_CHANGED_ERROR,
+    };
+    use krill_proto::screen::Msg as _;
+    use std::io::Write as _;
+
+    let hello = daemon::client_hello(ClientRole::App, "krill-app-orch");
+    let mut conn = target.connect(&hello).map_err(std::io::Error::other)?;
+    if conn.negotiated.features & FEAT_CONTROL == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote krilld does not support FEAT_CONTROL",
+        ));
+    }
+    let timeout = Duration::from_secs(2);
+    conn.stream.set_read_timeout(Some(timeout))?;
+    conn.stream.set_write_timeout(Some(timeout))?;
+
+    let mut request = |action: &OrchAction| -> std::io::Result<OrchResponse> {
+        let encoded = Request::Orchestration(action.clone())
+            .encode()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        conn.stream.write_all(&encoded)?;
+        let (kind, body) =
+            ipc::read_frame(&mut conn.stream)?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        match Reply::decode(kind, &body)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        {
+            Reply::Orchestration(resp) => Ok(resp),
+            Reply::Failed(failure) => Err(std::io::Error::other(failure.to_string())),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected orchestration reply",
+            )),
+        }
+    };
+
+    if conn.negotiated.features & FEAT_ORCH_SNAPSHOT_PAGE != 0 {
+        let first = request(&OrchAction::SnapshotPage {
+            generation: None,
+            offset: 0,
+        })?;
+        let (mut cached_first, mut fetched_generation) = match first {
+            OrchResponse::SnapshotPage { generation, .. }
+                if prev_generation == Some(generation) =>
+            {
+                return Ok(RemoteOrchFetch::Unchanged);
+            }
+            page @ OrchResponse::SnapshotPage { generation, .. } => (Some(page), Some(generation)),
+            OrchResponse::Error(msg) if msg.contains(SNAPSHOT_CHANGED_ERROR) => (None, None),
+            OrchResponse::Error(msg) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected snapshot page reply",
+                ));
+            }
+        };
+        let store = OrchestrationStore::fetch_paged(|generation, offset| {
+            if generation.is_none()
+                && offset == 0
+                && let Some(page) = cached_first.take()
+            {
+                return Ok(page);
+            }
+            let resp = request(&OrchAction::SnapshotPage { generation, offset })?;
+            if let OrchResponse::SnapshotPage {
+                generation: page_gen,
+                ..
+            } = &resp
+            {
+                fetched_generation = Some(*page_gen);
+            }
+            Ok(resp)
+        })?;
+        return Ok(RemoteOrchFetch::Updated {
+            store: Arc::new(store),
+            generation: fetched_generation,
+        });
+    }
+
+    match request(&OrchAction::SnapshotV2)? {
+        OrchResponse::Snapshot(store) | OrchResponse::SnapshotV2(store) => {
+            Ok(RemoteOrchFetch::Updated {
+                store: Arc::new(store),
+                generation: None,
+            })
+        }
+        OrchResponse::Error(msg) => Err(std::io::Error::other(msg)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected orchestration snapshot reply",
+        )),
     }
 }
 

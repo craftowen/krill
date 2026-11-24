@@ -293,10 +293,11 @@ impl Shell {
         self.launch_host = host.clone();
         if host.is_remote() && self.host_targets.contains_key(&host) {
             self.refresh_accounts_for_host(
-                host,
+                host.clone(),
                 krill_proto::usage::UsageRequest::ListAccounts,
                 cx,
             );
+            self.fetch_remote_orchestration(host, cx);
         }
         self.sync_settings_account_hosts(cx);
         cx.notify();

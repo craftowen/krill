@@ -54,7 +54,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let foldable = !chat.workers.is_empty();
-        let open = foldable && self.bot_ui.open_chats.contains(&chat.session);
+        let chat_key = (self.launch_host.clone(), chat.session);
+        let open = foldable && !self.bot_ui.folded_chats.contains(&chat_key);
         let live = chat.workers.iter().filter(|w| w.live).count();
         let waiting = chat.workers.iter().filter(|w| w.waiting()).count();
         let running = live - waiting;
@@ -94,7 +95,7 @@ impl Shell {
             .focus_visible(|d| d.border_1().border_color(p.ring))
             .aria_label(chat.title.clone())
             .aria_expanded(open)
-            .group(group.clone())
+            .group(group)
             // Orca: `h-6 gap-1.5 rounded-md pr-0.5 pl-1 text-xs text-muted-foreground`.
             .h(px(24.))
             .min_w_0()
@@ -166,11 +167,6 @@ impl Shell {
                                 })
                                 .aria_expanded(open)
                                 .size_4()
-                                // As on the reference: unfolded, the chevron waits for hover.
-                                .when(open, |d| {
-                                    d.invisible()
-                                        .group_hover(group.clone(), gpui::Styled::visible)
-                                })
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -179,8 +175,9 @@ impl Shell {
                                 .hover(|d| d.text_color(p.foreground))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    if !this.bot_ui.open_chats.remove(&fold) {
-                                        this.bot_ui.open_chats.insert(fold);
+                                    let key = (this.launch_host.clone(), fold);
+                                    if !this.bot_ui.folded_chats.remove(&key) {
+                                        this.bot_ui.folded_chats.insert(key);
                                     }
                                     cx.notify();
                                 }))
@@ -225,12 +222,7 @@ impl Shell {
             });
         let mut col = div().flex().flex_col().gap_1().child(row);
         if open {
-            let steps = self
-                .bot_ui
-                .chat_steps
-                .get(&chat.session)
-                .copied()
-                .unwrap_or(0);
+            let steps = self.bot_ui.chat_steps.get(&chat_key).copied().unwrap_or(0);
             let cap = live + FINISHED_SHOWN + steps * STEP;
             let shown = chat.workers.len().min(cap);
             let remaining = chat.workers.len() - shown;
@@ -248,7 +240,11 @@ impl Shell {
                     p,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    *this.bot_ui.chat_steps.entry(fold).or_default() += 1;
+                    *this
+                        .bot_ui
+                        .chat_steps
+                        .entry((this.launch_host.clone(), fold))
+                        .or_default() += 1;
                     cx.notify();
                 }))
             });
@@ -259,7 +255,9 @@ impl Shell {
                     p,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bot_ui.chat_steps.remove(&fold);
+                    this.bot_ui
+                        .chat_steps
+                        .remove(&(this.launch_host.clone(), fold));
                     cx.notify();
                 }))
             });

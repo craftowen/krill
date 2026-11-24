@@ -1203,13 +1203,31 @@ impl View {
     }
 
     /// The workers each of the bot's chats started (Orca's chat tree): the Dispatch links its
-    /// session put on the bot's items, newest first.
+    /// session put on the bot's items, newest first (numeric session IDs only).
     #[must_use]
     pub fn chat_workers(
         &self,
         bot_id: &krill_proto::bots::BotId,
     ) -> Vec<(SessionId, SessionId, u64)> {
         let mut out: Vec<(SessionId, SessionId, u64)> = Vec::new();
+        for (chat, target, at) in self.chat_worker_links(bot_id) {
+            if let LinkedDispatchRef::Session(sid) = target
+                && !out.iter().any(|(_, w, _)| *w == sid)
+            {
+                out.push((chat, sid, at));
+            }
+        }
+        out
+    }
+
+    /// Dispatch references recorded on a bot's items (`dispatch:<session-id>` or
+    /// `dispatch:<disp-id>`), newest first.
+    #[must_use]
+    pub fn chat_worker_links(
+        &self,
+        bot_id: &krill_proto::bots::BotId,
+    ) -> Vec<(SessionId, LinkedDispatchRef, u64)> {
+        let mut out: Vec<(SessionId, LinkedDispatchRef, u64)> = Vec::new();
         for item in self
             .items
             .items
@@ -1226,15 +1244,25 @@ impl View {
                         session_id: Some(chat),
                         ..
                     },
-                    Some(id),
+                    Some(raw),
                 ) = (&e.actor, e.text.strip_prefix("dispatch:"))
                 else {
                     continue;
                 };
-                if let Ok(n) = id.trim().parse::<u64>()
-                    && !out.iter().any(|(_, w, _)| *w == SessionId(n))
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                let target = raw.parse::<u64>().map_or_else(
+                    |_| LinkedDispatchRef::Dispatch(raw.to_owned()),
+                    |n| LinkedDispatchRef::Session(SessionId(n)),
+                );
+                if let Some((_, _, prev_at)) =
+                    out.iter_mut().find(|(c, r, _)| *c == *chat && *r == target)
                 {
-                    out.push((*chat, SessionId(n), e.created_at_ms));
+                    *prev_at = (*prev_at).max(e.created_at_ms);
+                } else {
+                    out.push((*chat, target, e.created_at_ms));
                 }
             }
         }
@@ -1271,6 +1299,13 @@ impl View {
             .cloned()
             .collect()
     }
+}
+
+/// A dispatch reference recorded on a bot item's `Linked` event (`dispatch:<id>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkedDispatchRef {
+    Session(SessionId),
+    Dispatch(String),
 }
 
 /// `owner/repo` of a GitHub URL.
