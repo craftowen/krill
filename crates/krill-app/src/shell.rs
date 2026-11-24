@@ -4510,16 +4510,18 @@ impl Shell {
                 }
             }
         }
-        if self.bot_ui.open_chats.remove(&from) {
-            self.bot_ui.open_chats.insert(to);
+        let from_key = (host.clone(), from);
+        let to_key = (host.clone(), to);
+        if self.bot_ui.folded_chats.remove(&from_key) {
+            self.bot_ui.folded_chats.insert(to_key.clone());
             touched = true;
         }
-        if let Some(steps) = self.bot_ui.chat_steps.remove(&from) {
-            self.bot_ui.chat_steps.insert(to, steps);
+        if let Some(steps) = self.bot_ui.chat_steps.remove(&from_key) {
+            self.bot_ui.chat_steps.insert(to_key.clone(), steps);
             touched = true;
         }
-        if self.bot_ui.panel.chat_unfolded.remove(&from) {
-            self.bot_ui.panel.chat_unfolded.insert(to);
+        if self.bot_ui.panel.chat_folded.remove(&from_key) {
+            self.bot_ui.panel.chat_folded.insert(to_key);
             touched = true;
         }
         if touched {
