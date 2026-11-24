@@ -265,7 +265,7 @@ impl Shell {
     }
 
     /// The Bots view behind the panel bodies on `launch_host`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn bot_panel_view(
         &mut self,
         cx: &mut Context<Self>,

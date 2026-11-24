@@ -352,7 +352,7 @@ impl Shell {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(in crate::shell) fn open_bot_group(
         &mut self,
         group_id: &str,
