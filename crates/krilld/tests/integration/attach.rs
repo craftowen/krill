@@ -724,6 +724,7 @@ fn negotiated_frozen_history_wire_preserves_identity_and_invalidates_on_clear() 
     assert_ne!(opened.view, 0);
     assert_eq!(opened.session, SessionId(71));
     assert_eq!(opened.rows.len(), 4);
+    assert!(opened.screen.is_some());
     let repeated = ask(
         &mut connection,
         HistoryViewRequest {
@@ -735,6 +736,7 @@ fn negotiated_frozen_history_wire_preserves_identity_and_invalidates_on_clear() 
     );
     assert_eq!(repeated.identity, opened.identity);
     assert_eq!(repeated.rows, opened.rows);
+    assert!(repeated.screen.is_none());
     let oldest = ask(
         &mut connection,
         HistoryViewRequest {
@@ -745,6 +747,7 @@ fn negotiated_frozen_history_wire_preserves_identity_and_invalidates_on_clear() 
         },
     );
     assert_eq!(oldest.status, HistoryViewStatus::Ready);
+    assert!(oldest.screen.is_none());
     assert!(oldest.complete);
     assert!(oldest.total > 1_000);
     let row: String = oldest
@@ -1084,6 +1087,80 @@ fn negotiated_history_after_csi_3j_redraw_serves_hot_and_deduplicates_cold() {
     assert_eq!(
         cold.rows.iter().map(|r| row_text(r)).collect::<Vec<_>>(),
         vec!["line-0478", "line-0477", "line-0476", "line-0475"]
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn negotiated_frozen_history_opening_reply_carries_atomic_screen_once() {
+    use krill_proto::screen::{HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+    let dir = tmp("frozen-atomic-screen");
+    let script = "/usr/bin/perl -e '$|=1; for $i (1..49) { printf \"line-%04d\\n\", $i } print \"line-0050\"'";
+    let (mut child, session) = spawn(None, 73, SMALL, script);
+    assert!(child.wait().unwrap().success());
+    let tap = session.tap();
+    tap.wait(|progress| progress.closed);
+    let sock = server(&dir, vec![tap]);
+    let (mut connection, _) = connect(&sock, screen(73, None));
+    connection
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    read_snapshot(&mut connection, &mut View::default());
+    let ask = |connection: &mut UnixStream, request: HistoryViewRequest| {
+        connection.write_all(&request.encode().unwrap()).unwrap();
+        loop {
+            match frame(connection) {
+                (kind::HISTORY_VIEW_ROWS, body) => {
+                    return HistoryViewRows::decode(kind::HISTORY_VIEW_ROWS, &body).unwrap();
+                }
+                (kind::UPDATE | kind::CLOSED, _) => {}
+                (kind, _) => unreachable!("unexpected frame {kind:#04x}"),
+            }
+        }
+    };
+    let row_text = |row: &[krill_proto::screen::Cell]| -> String {
+        row.iter()
+            .filter(|c| !c.flags.contains(krill_proto::screen::Flags::SPACER))
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    };
+
+    let opened = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 1,
+            view: 0,
+            skip: 0,
+            count: 4,
+        },
+    );
+    assert_eq!(opened.status, HistoryViewStatus::Ready);
+    assert_ne!(opened.view, 0);
+    let atomic_screen = opened
+        .screen
+        .as_ref()
+        .expect("opening view reply must carry atomic screen");
+    assert_eq!(atomic_screen.rows.len(), usize::from(SMALL.rows));
+    // SMALL is 24 rows, so line-0027..line-0050 sit on screen and line-0026 is hot[0].
+    assert_eq!(row_text(&opened.rows[0]), "line-0026");
+    assert_eq!(row_text(&atomic_screen.rows[0]), "line-0027");
+    assert_eq!(row_text(atomic_screen.rows.last().unwrap()), "line-0050");
+
+    let follow_up = ask(
+        &mut connection,
+        HistoryViewRequest {
+            req: 2,
+            view: opened.view,
+            skip: 4,
+            count: 4,
+        },
+    );
+    assert_eq!(follow_up.status, HistoryViewStatus::Ready);
+    assert!(
+        follow_up.screen.is_none(),
+        "subsequent range replies must not resend the opening screen"
     );
     fs::remove_dir_all(&dir).ok();
 }

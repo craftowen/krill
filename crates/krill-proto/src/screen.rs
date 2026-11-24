@@ -72,7 +72,9 @@ pub const FEAT_SCREEN: u64 = 1;
 /// Attach-local frozen history ranges with explicit invalidation and bounded decoded caches.
 pub const FEAT_HISTORY_VIEW: u64 = 1 << 24;
 mod history_view;
-pub use history_view::{HistoryIdentity, HistoryViewRequest, HistoryViewRows, HistoryViewStatus};
+pub use history_view::{
+    HistoryIdentity, HistoryScreen, HistoryViewRequest, HistoryViewRows, HistoryViewStatus,
+};
 pub mod agy;
 pub mod prompt;
 pub mod url;

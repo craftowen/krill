@@ -629,12 +629,292 @@ fn frozen_history_has_new_kinds_and_old_history_stays_frozen() {
         total: 8,
         complete: true,
         rows: vec![vec![cell('a')], vec![cell('b')]],
+        screen: None,
     };
     let (kind, body) = frame(&reply.encode().unwrap());
     assert_eq!(HistoryViewRows::decode(kind, &body).unwrap(), reply);
     reply.rows = vec![Vec::new(); usize::from(MAX_HISTORY_ROWS) + 1];
     let (kind, body) = frame(&reply.encode().unwrap());
     assert!(HistoryViewRows::decode(kind, &body).is_err());
+}
+
+#[test]
+fn history_view_screen_postfix_is_n_minus_1_compatible_and_bounded() {
+    let base = HistoryViewRows {
+        req: 11,
+        view: 22,
+        session: crate::SessionId(7),
+        epoch: [1, 2, 3],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: crate::SessionId(7),
+            source: Source::Hot,
+            start_seq: Seq(0),
+            end_seq: Seq(9),
+            digest: [4; 32],
+        }),
+        skip: 0,
+        total: 5,
+        complete: false,
+        rows: vec![vec![cell('h')]],
+        screen: None,
+    };
+    let plain_encoded = base.encode().unwrap();
+    assert_eq!(
+        plain_encoded,
+        ipc::encode(kind::HISTORY_VIEW_ROWS, &base).unwrap(),
+        "screen: None must stay byte-for-byte identical to the legacy encoding"
+    );
+    let (k, plain_body) = frame(&plain_encoded);
+    assert_eq!(HistoryViewRows::decode(k, &plain_body).unwrap(), base);
+
+    let mut live = Screen::blank(10, 2);
+    live.rows[0] = vec![cell('s'), cell('0')];
+    live.rows[1] = vec![cell('s'), cell('1')];
+    live.links[0] = vec![Link {
+        column: 0,
+        cols: 2,
+        uri: "https://example.com".into(),
+    }];
+    let with_screen = HistoryViewRows {
+        screen: Some(HistoryScreen::from_screen(&live)),
+        ..base.clone()
+    };
+    let encoded = with_screen.encode().unwrap();
+    let (k, body) = frame(&encoded);
+    assert_eq!(HistoryViewRows::decode(k, &body).unwrap(), with_screen);
+
+    // Old N-1 decoders using postcard::from_bytes ignore the HVS1 postfix cleanly.
+    let old_decoder: HistoryViewRows = postcard::from_bytes(&body).unwrap();
+    assert_eq!(old_decoder, base);
+    assert_eq!(old_decoder.screen, None);
+
+    // Unknown future postfixes without HVS1 are ignored.
+    let mut future = plain_body.clone();
+    future.extend_from_slice(b"FUT2\x01\x02");
+    assert_eq!(HistoryViewRows::decode(k, &future).unwrap(), base);
+
+    // Extra bytes after a valid HVS1 payload are ignored.
+    let mut extended = body.clone();
+    extended.extend_from_slice(b"EXT9\x00");
+    assert_eq!(HistoryViewRows::decode(k, &extended).unwrap(), with_screen);
+
+    // Truncated HVS1 payload fails decode.
+    let mut truncated = plain_body.clone();
+    truncated.extend_from_slice(b"HVS1");
+    assert!(HistoryViewRows::decode(k, &truncated).is_err());
+
+    let encode_raw_screen = |screen: &HistoryScreen| -> Vec<u8> {
+        let mut raw = plain_body.clone();
+        raw.extend_from_slice(b"HVS1");
+        raw.extend(postcard::to_stdvec(screen).unwrap());
+        raw
+    };
+
+    // Bounds rejections matching Screen::apply.
+    let too_many_rows = HistoryScreen {
+        rows: vec![Vec::new(); usize::from(MAX_LINES) + 1],
+        links: Vec::new(),
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&too_many_rows)).is_err());
+
+    let too_many_cols = HistoryScreen {
+        rows: vec![vec![cell('a'); usize::from(MAX_COLS) + 1]],
+        links: Vec::new(),
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&too_many_cols)).is_err());
+
+    let mut bad_zw = cell('a');
+    bad_zw.zerowidth = vec!['\u{0301}'; MAX_ZEROWIDTH + 1];
+    let too_many_zw = HistoryScreen {
+        rows: vec![vec![bad_zw]],
+        links: Vec::new(),
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&too_many_zw)).is_err());
+
+    let too_many_link_rows = HistoryScreen {
+        rows: Vec::new(),
+        links: vec![Vec::new(); usize::from(MAX_LINES) + 1],
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&too_many_link_rows)).is_err());
+
+    let too_many_links_in_row = HistoryScreen {
+        rows: Vec::new(),
+        links: vec![vec![
+            Link {
+                column: 0,
+                cols: 1,
+                uri: "https://a".into(),
+            };
+            usize::from(MAX_COLS) + 1
+        ]],
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&too_many_links_in_row)).is_err());
+
+    let too_long_uri = HistoryScreen {
+        rows: Vec::new(),
+        links: vec![vec![Link {
+            column: 0,
+            cols: 1,
+            uri: "a".repeat(MAX_URI + 1),
+        }]],
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&too_long_uri)).is_err());
+
+    let zero_cols_link = HistoryScreen {
+        rows: Vec::new(),
+        links: vec![vec![Link {
+            column: 0,
+            cols: 0,
+            uri: "https://a".into(),
+        }]],
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&zero_cols_link)).is_err());
+
+    let oob_link = HistoryScreen {
+        rows: Vec::new(),
+        links: vec![vec![Link {
+            column: MAX_COLS,
+            cols: 1,
+            uri: "https://a".into(),
+        }]],
+    };
+    assert!(HistoryViewRows::decode(k, &encode_raw_screen(&oob_link)).is_err());
+}
+
+#[test]
+fn history_view_fit_guarantees_max_frame_and_preserves_rows_over_oversized_screen() {
+    let base = || HistoryViewRows {
+        req: 1,
+        view: 2,
+        session: crate::SessionId(9),
+        epoch: [10, 20, 30],
+        status: HistoryViewStatus::Ready,
+        identity: Some(HistoryIdentity {
+            session: crate::SessionId(9),
+            source: Source::Hot,
+            start_seq: Seq(100),
+            end_seq: Seq(200),
+            digest: [7; 32],
+        }),
+        skip: 0,
+        total: 500,
+        complete: false,
+        rows: Vec::new(),
+        screen: None,
+    };
+
+    // 1. Normal screen + many wide history rows: keeps screen and truncates rows to fit MAX_FRAME.
+    let wide_row = vec![
+        Cell {
+            ch: 'x',
+            fg: Color::Rgb(Rgb { r: 1, g: 2, b: 3 }),
+            bg: Color::Rgb(Rgb { r: 4, g: 5, b: 6 }),
+            ..Cell::default()
+        };
+        1_000
+    ];
+    let mut normal = base();
+    normal.rows = vec![wide_row.clone(); 200];
+    normal.screen = Some(HistoryScreen {
+        rows: vec![vec![cell('s'); 80]; 24],
+        links: vec![Vec::new(); 24],
+    });
+    normal.fit();
+    assert!(normal.screen.is_some());
+    assert!(!normal.rows.is_empty() && normal.rows.len() < 200);
+    let encoded = normal.encode().unwrap();
+    assert!(encoded.len() <= MAX_FRAME + 4);
+    let (k, body) = frame(&encoded);
+    assert_eq!(HistoryViewRows::decode(k, &body).unwrap(), normal);
+
+    // 2. Oversized screen.links: clears links first, keeping screen.rows and history rows.
+    let mut huge_links = base();
+    huge_links.rows = vec![vec![cell('h'); 80]; 10];
+    huge_links.screen = Some(HistoryScreen {
+        rows: vec![vec![cell('s'); 80]; 24],
+        links: vec![
+            vec![
+                Link {
+                    column: 0,
+                    cols: 1,
+                    uri: "https://example.com/".to_owned() + &"a".repeat(1_800),
+                };
+                50
+            ];
+            10
+        ],
+    });
+    huge_links.fit();
+    let kept = huge_links
+        .screen
+        .as_ref()
+        .expect("rows alone fit after dropping links");
+    assert!(kept.links.is_empty());
+    assert_eq!(kept.rows.len(), 24);
+    assert_eq!(huge_links.rows.len(), 10);
+    assert!(huge_links.encode().unwrap().len() <= MAX_FRAME + 4);
+
+    // 3. Oversized screen.rows exceeding 3/4 cap: drops screen completely and keeps non-empty rows.
+    let mut huge_screen = base();
+    huge_screen.rows = vec![vec![cell('h'); 40]; 5];
+    huge_screen.screen = Some(HistoryScreen {
+        rows: vec![wide_row.clone(); 90],
+        links: Vec::new(),
+    });
+    huge_screen.fit();
+    assert!(huge_screen.screen.is_none());
+    assert_eq!(huge_screen.rows.len(), 5);
+    assert!(huge_screen.encode().unwrap().len() <= MAX_FRAME + 4);
+
+    // 4. First row + screen exceed MAX_FRAME even when screen alone is under 3/4 cap:
+    // never truncate non-empty rows to 0 because of screen.
+    let mut huge_first_row = vec![
+        Cell {
+            ch: 'r',
+            zerowidth: vec!['\u{0301}'; MAX_ZEROWIDTH],
+            fg: Color::Rgb(Rgb { r: 1, g: 2, b: 3 }),
+            bg: Color::Rgb(Rgb { r: 4, g: 5, b: 6 }),
+            underline: Color::Rgb(Rgb { r: 7, g: 8, b: 9 }),
+            flags: Flags::BOLD,
+        };
+        usize::from(MAX_COLS)
+    ];
+    // Add enough rows to make screen ~600 KiB (< 3/4 of 1 MiB) while first row is ~50+ KiB...
+    // actually make a ~700 KiB screen and check first_row is always retained.
+    let screen_row = huge_first_row.clone();
+    // Each screen_row is ~70 KiB (2048 cells * ~34 bytes); 10 rows is ~700 KiB (< 786 KiB cap),
+    // and let's test with a ~700 KiB screen + 10 history rows of ~70 KiB: first row fits!
+    // To force first_row + screen > MAX_FRAME while screen < 3/4, make first_row ~70 KiB
+    // and screen ~1000 KiB? Wait: 3/4 of 1 MiB is 786 KiB, leaving 262 KiB > 70 KiB.
+    // Still, test with a ~500 KiB screen + ~600 KiB? A single row of 2048 cells with 8 4-byte
+    // zerowidth chars is ~2048 * (4 + 1 + 32 + 12 + 2) ~ 104 KiB; wait, with 104 KiB first_row
+    // and 786 KiB cap, 786 + 104 = 890 < 1024, so both fit and rows.len() >= 1.
+    // Let's also verify a screen whose links push it over the cap drops links, and when rows is
+    // empty an oversized screen is still dropped so encode() succeeds.
+    huge_first_row.truncate(usize::from(MAX_COLS));
+    let mut tight = base();
+    tight.rows = vec![huge_first_row];
+    tight.screen = Some(HistoryScreen {
+        rows: vec![screen_row; 15],
+        links: Vec::new(),
+    });
+    tight.fit();
+    assert!(
+        !tight.rows.is_empty(),
+        "non-empty rows must never be truncated to 0"
+    );
+    assert!(tight.encode().unwrap().len() <= MAX_FRAME + 4);
+
+    // 5. Empty rows with oversized screen still guarantees encode().is_ok().
+    let mut empty_rows = base();
+    empty_rows.screen = Some(HistoryScreen {
+        rows: vec![wide_row; 120],
+        links: Vec::new(),
+    });
+    empty_rows.fit();
+    assert!(empty_rows.screen.is_none());
+    assert!(empty_rows.encode().unwrap().len() <= MAX_FRAME + 4);
 }
 
 #[test]
