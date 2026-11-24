@@ -2,14 +2,41 @@
 # 릴리스 후보의 전체 검사. 개발 중에는 AGENTS.md의 영향 범위별 검증을 따른다.
 set -euo pipefail
 cd "${0:A:h}/.."
-if [[ ${1-} == -h || ${1-} == --help ]]; then
-  print "사용: scripts/check.sh [--memory]
+run_memory=0
+target_dir=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      print "사용: scripts/check.sh [--memory] [--target-dir DIR]
   비Cargo 회귀 · fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency)
   --memory          끝에 scripts/memory-gate.sh(MK-066)까지 돈다
+  --target-dir DIR  Cargo 산출물 경로를 환경변수 대신 플래그로 지정(sccache 호환)
   KRILL_TEST_SLOTS  머신 전체 동시 테스트 실행 수(기본: CPU 코어 수 / 4, 최소 1)"
-  exit 0
+      exit 0
+      ;;
+    --memory)
+      run_memory=1
+      shift
+      ;;
+    --target-dir)
+      [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { print -u2 "check.sh: --target-dir requires a directory"; exit 2; }
+      target_dir=$2
+      shift 2
+      ;;
+    *)
+      print -u2 "check.sh: unknown argument: $1"
+      exit 2
+      ;;
+  esac
+done
+cargo_target_args=()
+if [[ -n "$target_dir" ]]; then
+  unset CARGO_TARGET_DIR
+  python3 scripts/check-build-target.py --target-dir "$target_dir"
+  cargo_target_args=(--target-dir "$target_dir")
+else
+  python3 scripts/check-build-target.py
 fi
-python3 scripts/check-build-target.py
 # 테스트 빌드 프로필은 CI(ci-macos.yml)·nightly와 같다. 시간 예산 테스트가 로컬과 CI에서 같은 최적화 수준을 본다.
 export CARGO_PROFILE_TEST_OPT_LEVEL=${CARGO_PROFILE_TEST_OPT_LEVEL:-2} CARGO_PROFILE_TEST_DEBUG=${CARGO_PROFILE_TEST_DEBUG:-line-tables-only}
 # Krill 세션에서 물려받은 운영 상태 폴더·에이전트 설정 경로를 지워 CI와 같은 환경에서 검사한다(F-01).
@@ -43,7 +70,7 @@ for pid name in ${(kv)partpids}; do
 done
 rm -rf $partlog
 [[ $partfail -eq 0 ]] || exit 1
-step "clippy";  run cargo clippy --workspace --all-targets --locked -- -D warnings
+step "clippy";  run cargo clippy "${cargo_target_args[@]}" --workspace --all-targets --locked -- -D warnings
 # 테스트 실행 슬롯(2026-10-15): 워커 20개가 동시에 전체 테스트를 돌리면 load 150~200이 되어 지연 측정 테스트가
 # 결정적으로 실패했다. 빌드는 각자 하고, 실행만 머신 전체에서 KRILL_TEST_SLOTS개까지 동시에 돈다.
 # 기본값은 결정 11-①(2026-10-15)대로 CPU 코어 수 기반: 코어/4(12코어에서 예전 고정값 3과 같다).
@@ -53,9 +80,9 @@ slot(){ local n=${KRILL_TEST_SLOTS:-$(( cores / 4 > 0 ? cores / 4 : 1 ))} k rc; 
 # 테스트 분리: 부하에 민감한 저지연 테스트를 나머지 테스트와 별도 실행한다.
 # 아래 필터는 .config/nextest.toml
 # latency override와 같은 집합이어야 한다(어긋나면 저지연 테스트가 고속 페이즈에서 부하를 맞아 flake 가능).
-step "test build";   run cargo nextest run --workspace --locked --no-tests=pass --no-run
-step "test fast";    slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
-step "test latency"; slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
+step "test build";   run cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-run
+step "test fast";    slot cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
+step "test latency"; slot cargo nextest run "${cargo_target_args[@]}" --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
 # --memory: MK-066 메모리 게이트까지(nightly·선택). 병렬 부하에서 흔들려 기본 경로에는 넣지 않는다.
-if [[ ${1-} == --memory ]]; then step "memory"; run scripts/memory-gate.sh; fi
+if [[ $run_memory -eq 1 ]]; then step "memory"; run scripts/memory-gate.sh; fi
 print -P "%B== check.sh: 전부 통과%b"

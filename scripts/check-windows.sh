@@ -138,11 +138,11 @@ export CFLAGS_x86_64_pc_windows_gnu="--target=x86_64-w64-windows-gnu -isystem \"
 export CXXFLAGS_x86_64_pc_windows_gnu="$CFLAGS_x86_64_pc_windows_gnu"
 # boost 하네스와 같은 BLAKE3 pure 경로. MSVC 크로스 검사에서 어셈블러를 우회하며 GNU에도 유지한다.
 export CARGO_FEATURE_PURE=1
-export CARGO_TARGET_DIR="$build_target"
+unset CARGO_TARGET_DIR
 if [[ ${#packages[@]} -eq 0 ]]; then packages=( --workspace ); fi
 subcommand=check
 if $clippy; then subcommand=clippy; fi
 # Bash 3.2 + nounset에서도 빈 배열을 안전하게 처리한다.
-args=( "$subcommand" --locked --target x86_64-pc-windows-gnu --all-targets "${packages[@]}" )
+args=( "$subcommand" --locked --target x86_64-pc-windows-gnu --target-dir "$build_target" --all-targets "${packages[@]}" )
 if $clippy; then args+=( -- -D warnings ); fi
 exec cargo "${args[@]}"
