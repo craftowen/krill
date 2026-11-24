@@ -11,10 +11,10 @@ install_app=
 repo=
 usage() {
     echo "usage: $0 [--profile release|dev] [--output DIR] [--bin-dir DIR] [--bump patch|minor|major] [--repo OWNER/REPO] [--install [APP_PATH]]"
-    echo "--bin-dir: 빌드를 생략하고 지정한 디렉터리의 다섯 바이너리를 패키징한다."
-    echo "--bump: Cargo.toml [workspace.package].version을 SemVer 규칙으로 올리고 Cargo.lock을 갱신한다."
-    echo "--repo: GitHub Releases 자동 업데이트 대상 저장소(기본: origin 원격 또는 craftowen/krill)."
-    echo "--install: 기존 .app 디렉터리 inode를 보존한 채 제자리 업데이트한다(기본: /Applications/Krill.app)."
+    echo "--bin-dir: Skip building and package the five prebuilt binaries from DIR."
+    echo "--bump: Increment Cargo.toml [workspace.package].version using SemVer and refresh Cargo.lock."
+    echo "--repo: Target GitHub Releases repository for auto-updates (default: origin remote or craftowen/krill)."
+    echo "--install: Update an existing .app bundle in place while preserving directory inodes (default: /Applications/Krill.app)."
 }
 fail() { echo "$*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
@@ -195,7 +195,7 @@ done
 cp -X "$root/packaging/macos/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 [ -f "$root/packaging/macos/krill-chime.caf" ] || fail "missing sound: $root/packaging/macos/krill-chime.caf"
 cp -X "$root/packaging/macos/krill-chime.caf" "$app/Contents/Resources/krill-chime.caf"
-# Standard macOS InfoPlist localization; retain Korean plist fallback values.
+# Standard macOS InfoPlist localization; English fallback values live in Info.plist.
 for language in en ko; do
     strings="$root/packaging/macos/$language.lproj/InfoPlist.strings"
     [ -f "$strings" ] || fail "missing localization: $strings"
@@ -221,10 +221,11 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>KrillUpdateURL</key><string>$update_url</string>
     <key>KrillUpdateDesignatedRequirement</key><string>identifier &quot;dev.krill.app&quot; and certificate root = H&quot;$cert_sha1&quot;</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Krill contributors</string>
     <key>NSDocumentsFolderUsageDescription</key><string>Krill accesses files in your Documents folder for workspaces and agent sessions.</string>
     <key>NSDesktopFolderUsageDescription</key><string>Krill accesses files on your Desktop for workspaces and agent sessions.</string>
     <key>NSDownloadsFolderUsageDescription</key><string>Krill accesses files in your Downloads folder for workspaces and agent sessions.</string>
-    <key>NSMicrophoneUsageDescription</key><string>A program running in a Krill terminal wants to use the microphone.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Krill uses the microphone for voice dictation and programs running in a Krill terminal.</string>
     <key>NSCameraUsageDescription</key><string>A program running in a Krill terminal wants to use the camera.</string>
     <key>NSAppleEventsUsageDescription</key><string>A program running in a Krill terminal wants to control another app.</string>
 </dict></plist>

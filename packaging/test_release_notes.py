@@ -90,8 +90,29 @@ class NotesTests(unittest.TestCase):
                                  "--tag", "v9.8.7", "--repo", "example/krill", "--root", str(self.root)],
                                 check=True, capture_output=True, text=True)
         self.assertTrue(result.stdout.startswith("# Krill v9.8.7\n"))
+        self.assertIn("[Failure guarantees (Korean)]", result.stdout)
         self.assertEqual(result.stderr, "")
         self.assertEqual(list(self.notes.iterdir()), [])
+
+    def test_english_highlights_guard_rejects_hangul_unless_explicitly_allowed(self):
+        release_notes.check_english_highlights("## Highlights\n\n- Fixed locale detection.\n")
+        (self.notes / "v9.8.7.md").write_text("# Krill v9.8.7\n\n- 한국어 요약입니다.\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "must be written in English.*line 3"):
+            self.render()
+        cli_fail = subprocess.run(
+            [sys.executable, str(ROOT / "packaging/release_notes.py"),
+             "--tag", "v9.8.7", "--repo", "example/krill", "--root", str(self.root)],
+            capture_output=True, text=True)
+        self.assertNotEqual(cli_fail.returncode, 0)
+        self.assertIn("must be written in English", cli_fail.stderr)
+        legacy = release_notes.render(self.root, "v9.8.7", "example/krill", allow_non_english=True)
+        self.assertIn("한국어 요약입니다.", legacy)
+        cli_ok = subprocess.run(
+            [sys.executable, str(ROOT / "packaging/release_notes.py"),
+             "--tag", "v9.8.7", "--repo", "example/krill", "--root", str(self.root),
+             "--allow-non-english"],
+            check=True, capture_output=True, text=True)
+        self.assertIn("한국어 요약입니다.", cli_ok.stdout)
 
 
 class PublicationBranchTests(unittest.TestCase):

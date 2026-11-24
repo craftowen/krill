@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $installer = Join-Path $PSScriptRoot 'install.ps1'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('krill-installer-test-' + [guid]::NewGuid().ToString('N'))
 $savedEnv = @{}
-foreach ($key in @('OS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_ARCHITEW6432', 'LOCALAPPDATA')) {
+foreach ($key in @('OS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_ARCHITEW6432', 'LOCALAPPDATA', 'KRILL_LANG', 'KRILL_FORCE_UI', 'KRILL_INSTALL_UI', 'KRILL_INSTALL_ANIMATE', 'NO_COLOR')) {
     $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
 }
 $state = @{ Requests = 0; Assets = @(); Checksum = ""; Fixture = "" }
@@ -33,6 +33,7 @@ try {
     $env:PROCESSOR_ARCHITECTURE = 'AMD64'
     $env:PROCESSOR_ARCHITEW6432 = ''
     $env:LOCALAPPDATA = $root
+    $env:KRILL_LANG = 'en'
     New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/x64') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $root 'source/Krill/arm64') -Force | Out-Null
     foreach ($name in @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64/OpenConsole.exe', 'arm64/OpenConsole.exe')) {
@@ -235,7 +236,55 @@ namespace KrillTest {
     $incomplete = Join-Path $root 'incomplete.zip'
     Compress-Archive -Path (Join-Path $root 'source/Krill') -DestinationPath $incomplete
     Reject 'incomplete' 'missing krilld.exe' @{ Zip = $incomplete }
-    'Windows installer: download, offline install, collision preservation and rejection cases passed.'
+
+    # Locale and i18n UI contracts: English must emit zero Hangul and link krill.page/en;
+    # Korean must emit localized Trench UI with accurate required file count (7) and link krill.page.
+    function Capture-InstallerUi([string]$Lang, [string]$Dest, $Extra = @{}) {
+        $prevLang = $env:KRILL_LANG
+        $prevForce = $env:KRILL_FORCE_UI
+        $prevAnim = $env:KRILL_INSTALL_ANIMATE
+        $prevNoColor = $env:NO_COLOR
+        $origErr = [Console]::Error
+        $writer = New-Object IO.StringWriter
+        try {
+            $env:KRILL_LANG = $Lang
+            $env:KRILL_FORCE_UI = '1'
+            $env:KRILL_INSTALL_ANIMATE = '0'
+            $env:NO_COLOR = '1'
+            [Console]::SetError($writer)
+            Install $Dest $Extra
+            return $writer.ToString()
+        } finally {
+            [Console]::SetError($origErr)
+            $writer.Dispose()
+            $env:KRILL_LANG = $prevLang
+            $env:KRILL_FORCE_UI = $prevForce
+            $env:KRILL_INSTALL_ANIMATE = $prevAnim
+            $env:NO_COLOR = $prevNoColor
+        }
+    }
+
+    $enUi = Capture-InstallerUi 'en-US' (Join-Path $root 'ui-en') @{ Zip = $state.Fixture }
+    Assert ($enUi -notmatch '[\uAC00-\uD7A3]') "English UI emitted Hangul: $enUi"
+    Assert ($enUi -match 'verified 7 required files') "English UI missing accurate file count: $enUi"
+    Assert ($enUi -match 'Installed' -and $enUi -match 'Start') "English UI missing completion labels: $enUi"
+
+    $koUi = Capture-InstallerUi 'ko-KR' (Join-Path $root 'ui-ko') @{ Zip = $state.Fixture }
+    $koDone = [regex]::Unescape('\uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4')
+    $koCount7 = [regex]::Unescape('7\uC885')
+    $koCount5 = [regex]::Unescape('5\uC885')
+    Assert ($koUi.Contains($koDone)) "Korean UI missing completion label: $koUi"
+    Assert ($koUi.Contains($koCount7) -and -not $koUi.Contains($koCount5)) "Korean UI file count mismatch: $koUi"
+
+    $state.Assets = @()
+    $env:KRILL_LANG = 'en-US'
+    Reject 'unreleased-en' 'https://krill\.page/en'
+    $env:KRILL_LANG = 'ko-KR'
+    Reject 'unreleased-ko' 'https://krill\.page(?!/en)'
+    $env:KRILL_LANG = 'en'
+    $state.Assets = @($package, $shaAsset)
+
+    'Windows installer: download, offline install, collision preservation, i18n and rejection cases passed.'
 } finally {
     foreach ($key in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($key, $savedEnv[$key], 'Process') }
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue

@@ -11,7 +11,7 @@ Start with the [README](README.md) and [Getting started](GETTING_STARTED.md), th
 3. Validate the affected scope as described below. Fill in the PR template with the tested commit, commands, results, and any limitations.
 4. Maintainers integrate completed work into `dev`. Only changes pushed to remote `dev` participate in the nightly release process; uncommitted work, local-only commits, and unmerged feature branches do not. Publishing and protected-ref pushes require explicit authorization; opening a PR is not authorization for an agent to release.
 
-Install the pre-push hooks once per clone with `scripts/install-hooks.sh`. An explicitly authorized protected-ref push records the actual instruction and reason in `KRILL_ALLOW_PROTECTED_PUSH='<user instruction and reason>'`; do not set this as a routine bypass. The [nightly release process](packaging/README.md#야간-자동-배포) pins remote revisions in a separate clone and retains the previous release when its gates fail.
+Install the pre-push hooks once per clone with `scripts/install-hooks.sh`. An explicitly authorized protected-ref push records the actual instruction and reason in `KRILL_ALLOW_PROTECTED_PUSH='<user instruction and reason>'`; do not set this as a routine bypass. The [nightly release process](packaging/README.md#야간-자동-배포) (Korean) pins remote revisions in a separate clone and retains the previous release when its gates fail.
 
 ## Checks by change scope
 
@@ -37,7 +37,7 @@ Use the [source walkthrough](GETTING_STARTED.md#build-from-source-on-macos). Rus
 ## Code and review rules
 
 - Declare dependency versions only in root `[workspace.dependencies]`; commit `Cargo.lock` and use `--locked`.
-- Keep PTY ownership in `krill-holder`. App or daemon failure must not close live sessions; check the documented [failure boundaries](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범).
+- Keep PTY ownership in `krill-holder`. App or daemon failure must not close live sessions; check the documented [failure boundaries](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) (Korean).
 - Do not use `unwrap`, `expect`, `panic!`, `todo!`, or `dbg!` in non-test code; narrowly justified invariants use `#[expect(..., reason = "...")]`.
 - Limit `unsafe` to holder/daemon FFI modules and the app's platform modules. Every unsafe block needs a `// SAFETY:` explanation.
 - UI work follows `docs/STYLEGUIDE.md` and `krill_app::ui` tokens/primitives. Display only implemented functionality.

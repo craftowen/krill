@@ -13,6 +13,51 @@
 #    bash packaging/install.sh --commit <sha> [--prefix ~/.local]
 set -euo pipefail
 
+# Detect Korean locale: POSIX env vars first; if all unset on macOS, check AppleLanguages.
+UI_KO=0
+_krill_locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+if [[ -n "${_krill_locale}" ]]; then
+    case "${_krill_locale}" in
+        ko*|KO*) UI_KO=1 ;;
+    esac
+elif [[ "$(uname -s)" == "Darwin" ]] && command -v defaults >/dev/null 2>&1; then
+    _apple_lang="$(defaults read -g AppleLanguages 2>/dev/null | awk 'NR==2 { gsub(/[",[:space:]]/, ""); print; exit }' || true)"
+    case "${_apple_lang}" in
+        ko*|KO*) UI_KO=1 ;;
+    esac
+fi
+msg() {
+    if [[ "${UI_KO}" -eq 1 ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+
+usage() {
+    printf '%s\n' \
+        "$(msg "Krill 설치 스크립트" "Krill installer")" \
+        "" \
+        "$(msg "1) 기본 모드(인자 없음 또는 --release [TAG]):" "1) Default mode (no args or --release [TAG]):")" \
+        "$(msg "   GitHub Releases에서 서명된 Krill.app 번들(ZIP + .sha256)을 내려받아 SHA-256·codesign 검증 후" "   Downloads the signed Krill.app bundle (ZIP + .sha256) from GitHub Releases, verifies SHA-256")" \
+        "$(msg "   /Applications/Krill.app 설치, Gatekeeper 격리 속성 정리, ~/.local/bin/krill 연결, 앱 실행까지 수행합니다." "   and code signature, installs /Applications/Krill.app, removes quarantine, links ~/.local/bin/krill, and opens the app.")" \
+        "   curl -fsSL https://krill.page/install.sh | bash" \
+        "   gh release download -R craftowen/krill -p install.sh -O - | bash" \
+        "" \
+        "$(msg "2) 소스 모드(CLI + 데몬/홀더만 설치, GUI 앱 미포함):" "2) Source mode (installs CLI + daemon/holder only, no GUI app):")" \
+        "$(msg "   bash packaging/install.sh --source-dir <krill 체크아웃>" "   bash packaging/install.sh --source-dir <krill checkout>")" \
+        "   bash packaging/install.sh --tag main [--prefix ~/.local]" \
+        "   bash packaging/install.sh --commit <sha> [--prefix ~/.local]" \
+        "" \
+        "$(msg "옵션:" "Options:")" \
+        "$(msg "  --release [TAG]     릴리스 번들 설치(기본: latest)" "  --release [TAG]     Install release bundle (default: latest)")" \
+        "$(msg "  --from-source       main 브랜치에서 CLI·데몬 소스 빌드" "  --from-source       Build CLI/daemon from source (main branch)")" \
+        "$(msg "  --source-dir DIR    로컬 체크아웃에서 소스 빌드" "  --source-dir DIR    Build from a local checkout")" \
+        "$(msg "  --tag TAG           지정 태그에서 소스 빌드" "  --tag TAG           Build from a Git tag")" \
+        "$(msg "  --commit SHA        지정 커밋에서 소스 빌드" "  --commit SHA        Build from a Git commit")" \
+        "$(msg "  --prefix DIR        CLI 설치 경로(기본: ~/.local)" "  --prefix DIR        CLI prefix (default: ~/.local)")" \
+        "$(msg "  --app-dir DIR       앱 번들 설치 디렉터리(기본: /Applications)" "  --app-dir DIR       App bundle directory (default: /Applications)")" \
+        "$(msg "  --repo OWNER/REPO   GitHub 저장소(기본: craftowen/krill)" "  --repo OWNER/REPO   GitHub repository (default: craftowen/krill)")" \
+        "$(msg "  --no-open           설치 후 앱을 자동으로 열지 않음" "  --no-open           Do not open the app after installing")" \
+        "$(msg "  -h, --help          이 도움말 표시" "  -h, --help          Show this help message")"
+}
+
 PREFIX="${HOME}/.local"
 APP_DIR="/Applications"
 MODE="release"
@@ -46,7 +91,7 @@ while [[ $# -gt 0 ]]; do
         --app-dir) APP_DIR="${2:?}"; shift 2 ;;
         --repo) REPO="${2:?}"; shift 2 ;;
         --no-open) NO_OPEN=1; shift 1 ;;
-        -h|--help) sed -n '1,14p' "$0"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -155,14 +200,6 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-# 터미널 로캘이 한국어일 때만 한글로 안내한다. 그 밖은 영어다.
-case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
-    ko*|KO*) UI_KO=1 ;;
-    *) UI_KO=0 ;;
-esac
-msg() {
-    if [[ "${UI_KO}" -eq 1 ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
-}
 UI_WORK="$(msg '작업' 'working')"
 UI_FAILED="$(msg '실패' 'failed')"
 UI_ABORTED="$(msg '설치를 중단했습니다' 'Installation stopped')"
@@ -266,7 +303,7 @@ if [[ "${MODE}" == "release" ]]; then
         *) echo "unsupported architecture: ${ARCH}" >&2; exit 2 ;;
     esac
 
-    ui_intro "macOS · ${ARCH} · release: ${VALUE}"
+    ui_intro "$(msg "macOS · ${ARCH} · 릴리스: ${VALUE}" "macOS · ${ARCH} · release: ${VALUE}")"
 
     ZIP_PATTERN="Krill-*-${ARCH}-adhoc.zip"
     SHA_PATTERN="Krill-*-${ARCH}-adhoc.zip.sha256"
@@ -298,7 +335,9 @@ if [[ "${MODE}" == "release" ]]; then
         done
         if [[ -z "${GH_BIN}" ]]; then
             ui_step_fail "01" "06" "$(msg "릴리스 다운로드 경로를 확인하지 못했습니다" "Couldn't find the release download path")" "$(msg "gh CLI가 없습니다 (brew install gh && gh auth login)" "gh CLI not found (brew install gh && gh auth login)")"
-            echo "error: release download failed and 'gh' CLI was not found (install via 'brew install gh && gh auth login')." >&2
+            if [[ "${UI}" -eq 0 ]]; then
+                echo "error: release download failed and 'gh' CLI was not found (install via 'brew install gh && gh auth login')." >&2
+            fi
             exit 1
         fi
         ui_step_done "01" "06" "$(msg "확인" "Checked")" "$(msg "릴리스 다운로드 경로 확인 (gh CLI · ${VALUE})" "Release download path found (gh CLI, ${VALUE})")"
@@ -323,8 +362,10 @@ if [[ "${MODE}" == "release" ]]; then
             done
         fi
         if [[ -z "${GH_BIN}" ]]; then
-            ui_step_fail "02" "06" "$(msg "번들 다운로드에 실패했습니다" "Bundle download failed")" "$(msg "gh CLI를 찾을 수 없습니다" "gh CLI not found")"
-            echo "error: release download failed and 'gh' CLI was not found (install via 'brew install gh && gh auth login')." >&2
+            ui_step_fail "02" "06" "$(msg "번들 다운로드에 실패했습니다" "Bundle download failed")" "$(msg "gh CLI가 없습니다 (brew install gh && gh auth login)" "gh CLI not found (brew install gh && gh auth login)")"
+            if [[ "${UI}" -eq 0 ]]; then
+                echo "error: release download failed and 'gh' CLI was not found (install via 'brew install gh && gh auth login')." >&2
+            fi
             exit 1
         fi
         if [[ "${VALUE}" != "latest" ]]; then
@@ -352,8 +393,10 @@ if [[ "${MODE}" == "release" ]]; then
 
     ZIP_FILE="$(echo "${WORK}"/Krill-*-"${ARCH}"-adhoc.zip)"
     if [[ ! -f "${ZIP_FILE}" ]]; then
-        ui_step_fail "02" "06" "$(msg "내려받은 번들 파일을 찾을 수 없습니다" "Downloaded bundle file not found")"
-        echo "downloaded zip not found in ${WORK}" >&2
+        ui_step_fail "02" "06" "$(msg "내려받은 번들 파일을 찾을 수 없습니다" "Downloaded bundle file not found")" "${WORK}"
+        if [[ "${UI}" -eq 0 ]]; then
+            echo "downloaded zip not found in ${WORK}" >&2
+        fi
         exit 1
     fi
     ZIP_BYTES="$(/usr/bin/stat -f%z "${ZIP_FILE}" 2>/dev/null || echo 0)"
@@ -378,7 +421,9 @@ if [[ "${MODE}" == "release" ]]; then
     APP_SRC="${WORK}/unpacked/Krill.app"
     if [[ ! -d "${APP_SRC}" ]]; then
         ui_step_fail "04" "06" "$(msg "아카이브 내부에 Krill.app이 없습니다" "Krill.app not found in the archive")"
-        echo "Krill.app not found in archive" >&2
+        if [[ "${UI}" -eq 0 ]]; then
+            echo "Krill.app not found in archive" >&2
+        fi
         exit 1
     fi
     /usr/bin/xattr -dr com.apple.quarantine "${APP_SRC}" 2>/dev/null || true
@@ -467,21 +512,25 @@ for root, dirs, files in os.walk(dst, topdown=False):
         printf '    %s%s → open "%s"%s\n' "${C_MUTED}" "$(msg '시작          ' 'Start         ')" "${APP_DST}" "${C_RESET}" >&2
     fi
 
-    echo "Installed Krill v${VERSION} to ${APP_DST} (CLI: ${BIN}/krill)"
+    if [[ "${UI}" -eq 0 || ! -t 1 ]]; then
+        echo "Installed Krill v${VERSION} to ${APP_DST} (CLI: ${BIN}/krill)"
+    fi
     exit 0
 fi
 
 command -v cargo >/dev/null || { echo "cargo not found (need 1.98+)" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 not found" >&2; exit 2; }
 
-ui_intro "macOS · arm64 · source (${MODE}: ${VALUE})"
+ui_intro "$(msg "macOS · arm64 · 소스 (${MODE}: ${VALUE})" "macOS · arm64 · source (${MODE}: ${VALUE})")"
 
 SRC=""
 if [[ "${MODE}" == "dir" ]]; then
     ui_step_start "01" "04" "$(msg "소스 체크아웃 확인 중" "Checking the source checkout")"
     if [[ ! -f "${VALUE}/Cargo.toml" || ! -d "${VALUE}/crates/krill" ]]; then
         ui_step_fail "01" "04" "$(msg "유효한 Krill 소스 체크아웃이 아닙니다" "Not a valid Krill source checkout")" "${VALUE}"
-        echo "not a krill checkout: ${VALUE}" >&2
+        if [[ "${UI}" -eq 0 ]]; then
+            echo "not a krill checkout: ${VALUE}" >&2
+        fi
         exit 2
     fi
     SRC="${VALUE}"
@@ -501,10 +550,14 @@ else
     TAR_BYTES="$(wc -c < "${TARBALL}" | tr -d ' ')"
     TAR_SHA="$(shasum -a 256 "${TARBALL}" | cut -d' ' -f1)"
     ui_step_done "01" "04" "$(msg "수신" "Received")" "$(msg "소스 아카이브 다운로드 완료 (${TAR_BYTES} bytes)" "Source archive downloaded (${TAR_BYTES} bytes)")"
-    echo "downloaded ${TARBALL} (${TAR_BYTES} bytes)"
-    echo "sha256: ${TAR_SHA}"
+    if [[ "${UI}" -eq 0 || ! -t 1 ]]; then
+        echo "downloaded ${TARBALL} (${TAR_BYTES} bytes)"
+        echo "sha256: ${TAR_SHA}"
+    else
+        printf '    sha256: %s\n' "${TAR_SHA}" >&2
+    fi
     if [[ -t 0 ]]; then
-        read -r -p "continue with build? [y/N] " answer
+        read -r -p "$(msg "빌드를 계속할까요? [y/N] " "Continue with build? [y/N] ")" answer
         [[ "${answer}" == "y" || "${answer}" == "Y" ]] || exit 1
     fi
     mkdir -p "${WORK}/src"
@@ -521,7 +574,9 @@ if [[ -e "${SRC}/.git" ]]; then
     fi
     if [[ -n "${CHECKOUT_STATUS}" ]]; then
         ui_step_fail "02" "04" "$(msg "커밋되지 않은 변경 사항이 있어 빌드를 거부합니다" "Refusing to build with uncommitted changes")"
-        echo "dirty checkout, refusing" >&2
+        if [[ "${UI}" -eq 0 ]]; then
+            echo "dirty checkout, refusing" >&2
+        fi
         exit 2
     fi
 fi
@@ -594,11 +649,14 @@ fi
 if [[ "${UI}" -eq 1 ]]; then
     TOTAL_ELAPSED="$(fmt_elapsed_cs "$(now_cs)" "${INSTALL_START_CS}")"
     printf '%s │%s\n' "${C_MUTED}" "${C_RESET}" >&2
-    printf " %s└  ${UI_INSTALLED} (CLI-only)%s  %s/  %s%s\n" \
-        "${C_SUCCESS}" "${C_RESET}" "${C_MUTED}" "${TOTAL_ELAPSED}" "${C_RESET}" >&2
+    printf " %s└  ${UI_INSTALLED} (%s)%s  %s/  %s%s\n" \
+        "${C_SUCCESS}" "$(msg 'CLI 전용' 'CLI-only')" "${C_RESET}" "${C_MUTED}" "${TOTAL_ELAPSED}" "${C_RESET}" >&2
     printf '    %s%s  → %s/{krill,krill-holder,krilld}%s\n' "${C_FG}" "$(msg '경로' 'Path')" "${BIN}" "${C_RESET}" >&2
     printf '    %sPATH  → export PATH="%s:$PATH"%s\n' "${C_MUTED}" "${BIN}" "${C_RESET}" >&2
+    printf '    %s%s%s\n' "${C_MUTED}" "$(msg 'GUI 앱은 packaging/README.md (bundle.sh)를 참고하세요.' 'For the GUI app, follow packaging/README.md (Korean) (bundle.sh).')" "${C_RESET}" >&2
 fi
 
-echo "done. export PATH=\"${BIN}:\$PATH\""
-echo "CLI-only installation. For the GUI app, follow packaging/README.md (bundle.sh)."
+if [[ "${UI}" -eq 0 || ! -t 1 ]]; then
+    echo "done. export PATH=\"${BIN}:\$PATH\""
+    echo "CLI-only installation. For the GUI app, follow packaging/README.md (Korean) (bundle.sh)."
+fi

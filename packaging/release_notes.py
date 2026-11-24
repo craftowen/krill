@@ -7,7 +7,26 @@ import re
 import sys
 
 
-def render(root, tag, repository):
+HANGUL_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")
+
+
+def find_hangul_lines(text):
+    """Return 1-based (line_number, line) pairs containing Korean Hangul."""
+    return [(number, line) for number, line in enumerate(text.splitlines(), 1) if HANGUL_RE.search(line)]
+
+
+def check_english_highlights(text, source="release notes"):
+    """Reject Hangul in English GitHub Release highlight files."""
+    hits = find_hangul_lines(text)
+    if hits:
+        lineno, _ = hits[0]
+        raise ValueError(
+            f"{source} must be written in English (found Hangul on line {lineno}); "
+            "place Korean summaries in docs/releases/ko.json"
+        )
+
+
+def render(root, tag, repository, *, allow_non_english=False):
     """Prefer exact-tag notes while always retaining the public support boundaries."""
     if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag):
         raise ValueError("expected a release tag such as v0.1.38")
@@ -24,6 +43,8 @@ def render(root, tag, repository):
         highlights = notes.read_text(encoding="utf-8").strip()
         if not highlights:
             raise ValueError(f"tag-specific release notes are empty: {notes}")
+        if not allow_non_english:
+            check_english_highlights(highlights, source=str(notes))
     else:
         highlights = (
             "No release-specific highlights were supplied for this tag. "
@@ -43,7 +64,7 @@ A native Rust workspace for parallel AI coding agents, persistent terminal sessi
 - Intel Macs, Linux, Windows 10 on ARM, and 32-bit Windows are outside this public preview's supported desktop scope. Check the assets attached to this release for actual download availability; source or packaging code is not a download promise.
 - **Session continuity:** app quit/restart can reconnect to running sessions while the holder and daemon remain alive. A daemon crash can lose bytes read but not yet recorded and mark a Gap. Rebooting or losing both session services ends the old processes; saved history or agent conversation resume is a separate form of recovery.
 
-[Installation and requirements]({url}/blob/{tag}/README.md) · [Failure guarantees]({url}/blob/{tag}/docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) · [Security reporting]({url}/blob/{tag}/SECURITY.md)
+[Installation and requirements]({url}/blob/{tag}/README.md) · [Failure guarantees (Korean)]({url}/blob/{tag}/docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) · [Security reporting]({url}/blob/{tag}/SECURITY.md)
 
 ## Release highlights
 
@@ -61,9 +82,11 @@ def main(argv=None):
     parser.add_argument("--tag", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--allow-non-english", action="store_true",
+                        help="allow Hangul in legacy tag-specific highlight files")
     args = parser.parse_args(argv)
     try:
-        text = render(args.root, args.tag, args.repo)
+        text = render(args.root, args.tag, args.repo, allow_non_english=args.allow_non_english)
     except (OSError, UnicodeError, ValueError) as error:
         parser.error(str(error))
     sys.stdout.write(text)

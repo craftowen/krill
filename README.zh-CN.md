@@ -101,7 +101,7 @@
 ### 1. 比应用活得更久的会话
 退出、崩溃或更新 `krill-app` 时，Agent 仍在后台继续工作。重新打开应用（或运行 `krill attach <id>`）即可回放保留的关键帧和 `zstd` 回滚缓冲片段；如果超出保留范围，会显示明确的 `Gap` 标记。
 
-[架构 §4.1 →](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)
+[架构 §4.1 →](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)（韩文）
 
 </td>
 <td width="50%" valign="top">
@@ -135,11 +135,11 @@
 <td width="50%" valign="top">
 
 ### 5. 移动端 E2EE 伴侣（PWA）
-在 **Settings → Mobile** 中扫描二维码，即可通过手机浏览器或主屏幕 Web 应用（PWA）监控 Agent 的实时状态并打开终端。通过 Relay 或 Tailscale 连接，并使用端到端 **ChaCha20-Poly1305**（`HKDF-SHA256`）加密。
+在 Mac 或 Windows 应用的 **Settings → Mobile** 中扫描二维码，即可通过手机浏览器或主屏幕 Web 应用（PWA）监控 Agent 的实时状态并打开终端。通过 Relay 或 Tailscale 连接，并使用端到端 **ChaCha20-Poly1305**（`HKDF-SHA256`）加密。
 
 选择托管 Relay 时，需要在桌面端使用 Google 登录。手机打开 PWA 时无需登录，通过二维码配对或已保存的设备密钥进行认证。
 
-[移动端设置 →](https://krill.page/en/docs)
+[移动端设置 →](https://krill.page/en/docs#mobile)
 
 </td>
 <td width="50%" valign="top">
@@ -190,7 +190,7 @@
 
 ```sh
 curl -fsSL https://krill.page/install.sh -o /tmp/krill-install.sh
-# Review the installer before running it.
+# 运行前请先审查安装脚本。
 bash /tmp/krill-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 krill --help
@@ -218,17 +218,19 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\krill-install.ps1"
 |---|---|---|
 | **macOS，Apple Silicon（`arm64`）** | 主要桌面平台 | 发布版应用和 CLI，或从源码构建 |
 | **Windows，`x64`** | 原生桌面预览版；除已记录的 Windows Server 虚拟机测试外，桌面 GUI、交互式登录、睡眠和重启行为仍需验证 | Windows 发布版 ZIP 和 PowerShell 安装程序 |
-| **移动端（iOS / Android）** | 通过二维码配对的配套 Web 应用（PWA），经 Relay 或 Tailscale 连接（ChaCha20-Poly1305 E2EE） | 在 Mac 应用的 **Settings → Mobile** 中扫描二维码（无应用商店版本） |
+| **移动端（iOS / Android）** | 通过二维码配对的配套 Web 应用（PWA），经 Relay 或 Tailscale 连接（ChaCha20-Poly1305 E2EE） | 在 Mac 或 Windows 应用的 **Settings → Mobile** 中扫描二维码（无应用商店版本） |
 | **macOS，Intel（`x86_64`）** | 本次公开预览不支持 | 不提供受支持的发布包，也不承诺源码安装 |
 | **Linux** | 本次公开预览不支持 | 不承诺提供 Linux 桌面版或可下载的远程主机软件包 |
 | **Windows 11，ARM64** | 通过 Windows 11 x64 仿真运行 `x64` 软件包；没有原生 ARM64 版本 | 相同的 Windows 发布版 ZIP 和 PowerShell 安装程序 |
 | **Windows 10 on ARM / 32 位 Windows** | 不支持 | 没有发布包 |
 
+仓库中包含 Linux 实现或打包实验代码并不意味着提供受支持的下载包。各平台的故障保障与验证范围以[架构 §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)（韩文）为准。
+
 ---
 
 ## 首次成功运行会话
 
-1. 打开 Krill，使用 **Open folder…** 选择一个本地 Git 仓库。如果界面是韩文，请选择 **설정 → 모양 → 언어 → English**（Settings → Appearance → Language）。
+1. 打开 Krill，使用 **Open folder…** 选择一个本地 Git 仓库。首次启动时，Krill 会自动跟随你的操作系统语言（非韩语系统默认为英文），你也可以随时在 **Settings → Appearance → Language** 中切换。
 2. 打开 **New session**（`+`）菜单并选择 **Terminal**，或选择已安装并完成认证的 Agent，例如 Claude Code 或 Codex。让 Agent 检查这个仓库。
 3. 在侧边栏使用 **New worktree**，输入一个唯一的名称，然后选择 **Create**。批准前先审查设置脚本，或选择 **Skip setup**。在那里启动第二个 Agent，让它独立工作。
 4. 用 `krill ls` 记下会话 ID。保留会话标签页，退出并重新打开应用；确认运行中的会话以相同的 ID 重新连接。显式关闭会话标签页或窗格会终止该会话。
@@ -245,7 +247,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\krill-install.ps1"
 | **`krilld` 崩溃** | 可以继续运行，因为 holder 保留着 PTY 和句柄 | 已读取但尚未记录的字节可能丢失；恢复时会标记 `Gap` |
 | **两个会话服务都停止，或机器重启** | 无法存活 | 已保存的历史记录并不是运行中的进程；恢复 Agent 对话是单独的操作 |
 
-这是跨应用重启的连续性，并不能防止所有形式的数据丢失。各平台的恢复方式和验证限制定义于[架构 §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)。
+这是跨应用重启的连续性，并不能防止所有形式的数据丢失。各平台的恢复方式和验证限制定义于[架构 §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)（韩文）。
 
 ---
 
@@ -261,6 +263,4 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\krill-install.ps1"
 
 ## 许可证
 
-Apache-2.0：[LICENSE](LICENSE)，Copyright 2026 Krill contributors。请参阅[第三方声明](THIRD_PARTY_NOTICES.md)和[许可证记录](docs/licensing/README.md)。贡献时请勿阅读或复制 Zed 的 GPL-3.0 `terminal` 或 `terminal_view` 代码；如有获准复用 Orca 源码的情况，请按[贡献指南](CONTRIBUTING.md)中的说明注明出处。
-
-使用指标默认开启，且不会弹出同意对话框：随机安装 ID、首次启动、应用启动次数、每日交互、版本、操作系统和架构。提示词、终端输出、命令、项目路径和账号信息不在收集范围内。运行 `krill telemetry disable` 可停止收集；`DO_NOT_TRACK=1` 同样可以关闭。发送状态和运营方设置请参阅[使用指标](services/telemetry/CLIENT.md)。错误报告是单独的设置，默认关闭。
+Apache-2.0：[LICENSE](LICENSE)，Copyright 2026 Krill contributors。请参阅[第三方声明](THIRD_PARTY_NOTICES.md)和[许可证记录](docs/licensing/README.md)（韩文）。贡献时请勿阅读或复制 Zed 的 GPL-3.0 `terminal` 或 `terminal_view` 代码；如有获准复用 Orca 源码的情况，请按[贡献指南](CONTRIBUTING.md)中的说明注明出处。

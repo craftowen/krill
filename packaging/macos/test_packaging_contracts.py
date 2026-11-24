@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -168,6 +169,18 @@ sys.exit(int(os.environ.get('FAKE_STATUS', '0')))
         self.assertFalse((self.root / "apps").exists())
 
 
+HANGUL_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7A3]")
+HANGUL_ESCAPE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})")
+
+
+def contains_hangul_escape(text):
+    for match in HANGUL_ESCAPE_RE.finditer(text):
+        code = int(match.group(1), 16)
+        if 0xAC00 <= code <= 0xD7A3 or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+            return True
+    return False
+
+
 class InstallerLanguageTests(unittest.TestCase):
     def test_korean_text_only_goes_through_the_locale_switch(self):
         lines = (PACKAGING / "install.sh").read_text(encoding="utf-8").splitlines()
@@ -176,6 +189,79 @@ class InstallerLanguageTests(unittest.TestCase):
                 continue
             if any("\uac00" <= char <= "\ud7a3" for char in line):
                 self.assertIn("msg ", line, f"install.sh:{number}")
+
+    def test_install_sh_help_emits_zero_hangul_in_c_locale(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("LC_ALL", "LC_MESSAGES", "LANG")}
+        env["LANG"] = "C"
+        result = subprocess.run(["bash", str(PACKAGING / "install.sh"), "--help"],
+                                env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--release", result.stdout)
+        self.assertFalse(HANGUL_RE.search(result.stdout + result.stderr),
+                         f"install.sh --help leaked Hangul under LANG=C:\n{result.stdout}")
+
+    def test_install_sh_help_emits_korean_in_ko_locale(self):
+        env = dict(os.environ, LC_ALL="ko_KR.UTF-8", LANG="ko_KR.UTF-8")
+        result = subprocess.run(["bash", str(PACKAGING / "install.sh"), "--help"],
+                                env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, HANGUL_RE)
+
+    def test_install_sh_uses_apple_languages_when_posix_locale_unset(self):
+        with tempfile.TemporaryDirectory(prefix="krill-apple-lang-") as tmp:
+            fake = Path(tmp)
+            executable(fake / "uname", '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; else echo arm64; fi\n')
+            executable(fake / "defaults", '#!/bin/sh\nprintf "(\\n    \\"%s\\"\\n)\\n" "$FAKE_APPLE_LANG"\n')
+            base_env = {k: v for k, v in os.environ.items() if k not in ("LC_ALL", "LC_MESSAGES", "LANG")}
+            base_env["PATH"] = str(fake) + os.pathsep + base_env.get("PATH", "")
+
+            ko_res = subprocess.run(["bash", str(PACKAGING / "install.sh"), "--help"],
+                                    env=dict(base_env, FAKE_APPLE_LANG="ko-KR"),
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(ko_res.returncode, 0, ko_res.stderr)
+            self.assertRegex(ko_res.stdout, HANGUL_RE)
+
+            en_res = subprocess.run(["bash", str(PACKAGING / "install.sh"), "--help"],
+                                    env=dict(base_env, FAKE_APPLE_LANG="en-US"),
+                                    capture_output=True, text=True, timeout=20)
+            self.assertEqual(en_res.returncode, 0, en_res.stderr)
+            self.assertFalse(HANGUL_RE.search(en_res.stdout + en_res.stderr),
+                             f"install.sh --help leaked Hangul under AppleLanguages=en-US:\n{en_res.stdout}")
+
+    def test_bundle_sh_help_is_english(self):
+        result = subprocess.run(["bash", str(PACKAGING / "bundle.sh"), "--help"],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--bin-dir:", result.stdout)
+        self.assertFalse(HANGUL_RE.search(result.stdout + result.stderr),
+                         f"bundle.sh --help leaked Hangul:\n{result.stdout}")
+
+    def test_windows_installer_i18n_contract(self):
+        raw = (PACKAGING / "windows" / "install.ps1").read_bytes()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "install.ps1 must stay BOM-free")
+        text = raw.decode("ascii")  # PS 5.1 BOM-free safety: 7-bit ASCII only.
+        self.assertIn("$env:KRILL_LANG", text)
+        self.assertIn("[Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'ko'", text)
+        self.assertIn("function Get-KrillMsg(", text)
+        self.assertIn("https://krill.page/en", text)
+        self.assertIn("https://krill.page", text)
+        self.assertIn("$required.Count", text)
+        self.assertNotIn(r"5\uC885", text)
+
+        lines = text.splitlines()
+        msg_calls = 0
+        for number, line in enumerate(lines, 1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if contains_hangul_escape(line):
+                self.assertIn("Get-KrillMsg", line, f"windows/install.ps1:{number} has unguarded Korean escape")
+            for match in re.finditer(r"Get-KrillMsg\s+'([^']*)'\s+'([^']*)'", line):
+                msg_calls += 1
+                _ko, en = match.group(1), match.group(2)
+                self.assertTrue(en.strip(), f"windows/install.ps1:{number} empty English fallback")
+                self.assertFalse(contains_hangul_escape(en), f"windows/install.ps1:{number} Korean escape in English arg")
+        self.assertGreaterEqual(msg_calls, 25, "expected localized Get-KrillMsg calls across windows/install.ps1")
 
 
 class VerificationTests(unittest.TestCase):
@@ -315,7 +401,8 @@ if '--force' in sys.argv:
                 self.assertEqual((app / relative).read_bytes(), (unpacked / "Krill.app" / relative).read_bytes())
                 contents = subprocess.check_output(["/usr/bin/plutil", "-convert", "xml1", "-o", "-", str(app / relative)])
                 localized = plistlib.loads(contents)
-                self.assertEqual(set(localized), {"NSDocumentsFolderUsageDescription", "NSDesktopFolderUsageDescription", "NSDownloadsFolderUsageDescription",
+                self.assertEqual(set(localized), {"NSHumanReadableCopyright",
+                                                  "NSDocumentsFolderUsageDescription", "NSDesktopFolderUsageDescription", "NSDownloadsFolderUsageDescription",
                                                   "NSMicrophoneUsageDescription", "NSCameraUsageDescription", "NSAppleEventsUsageDescription"})
                 for key, value in localized.items():
                     self.assertTrue(value)
