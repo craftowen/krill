@@ -4,7 +4,7 @@
 
 근거 및 출처: Orca 레포지토리(`.ref/orca/docs/STYLEGUIDE.md`, `.ref/orca/src/renderer/src/assets/main.css`, `.ref/orca/src/renderer/src/components/ui/*`, `.ref/orca/src/shared/terminal-themes/defaults.ts`, Copyright (c) 2026 Lovecast Inc., MIT License)의 검증된 디자인 토큰·컴포넌트 문법·UX 원칙을 순수 Rust(`gpui` + `gpui-component`) 체계로 이식했다.
 
-**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **색·브랜드·카피 톤은 Krill 고유다** — 무채색 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 3분절 스피너는 Orca에 없다.
+**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **색·브랜드·카피 톤은 Krill 고유다** — 무채색 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 테이퍼드 코멧 링 스피너는 Orca에 없다.
 
 ---
 
@@ -279,9 +279,9 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
   - **코랄 규칙**: 코랄은 Krill 자신(브랜드 마크)에만 쓴다. 상태 의미(오류·경고·작업 중)에 쓰지 않는다 — `destructive`·탭 Red와 색상각이 9~13°밖에 차이 나지 않아 색약 사용자가 혼동한다. 버튼 채움·포커스 링·선택 배경에도 쓰지 않는다. 예외는 터미널 `Krill Deep` 커서 하나다.
 - **UI 아이콘**: `gpui-component`의 Lucide 아이콘(`IconName`)과 `ui/icons.rs`의 Lucide SVG 상수를 사용한다. 다른 아이콘 세트를 섞지 않는다.
 - **상태 글리프 (`ui::status::status_glyph`)**:
-  - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 12스텝)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전한다.
-  - 작업 중 스피너 모양은 Orca 3/4 링 대신 **120° 간격 3분절 아크**(크릴 등갑 모티프, `RING_SVG`)다.
-  - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 분절 아크가 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
+  - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 30fps 연속 회전)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전하며, 창이 비활성화되면 0fps 정적 링으로 멈춰 GPU·배터리 부하를 없앤다.
+  - 작업 중 스피너 모양은 Orca 3/4 링 대신 **테이퍼드 코멧 링**(은은한 배경 트랙 + 연속 알파 꼬리 + 둥근 선두, `RING_SVG`)이다.
+  - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 코멧 꼬리가 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`, 0fps)으로 대체한다.
 - **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 간격을 두고 나란히 그리고 나머지는 `+N`으로 축약한다. 세션 목록을 펼치면 요약 바는 세션 개수와 접기 화살표로 바뀐다. 접힘·펼침 모두 요약 바와 그룹에 별도 배경·테두리를 두지 않는다(알약 없음). 행 호버·선택과 활성 워크트리 표면(`worktree_sidebar` 배경 + `worktree_sidebar_border` 1px)은 유지한다.
 - **사이드바 카드 배지**: `기본` 표시와 배지 줄(체크포인트·호스트·이슈·포트·PR)은 배경·테두리 없는 `TEXT_XS` `muted_foreground` 글자다(포트만 `success`). 세션 행은 상태 글리프·에이전트 아이콘·제목·경과 시간만 상시 보이고, 계정 라벨이 없는 계정 전환 버튼은 행 호버 때만 보인다.
 

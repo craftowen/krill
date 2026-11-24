@@ -508,6 +508,7 @@ mod tests {
             sidebar: cx.new(|_| Sidebar::new_loaded(None)),
             renders: 0,
         });
+        cx.update(|window, _| window.activate_window());
         let sidebar = parent.read_with(cx, |p, _| p.sidebar.clone());
         sidebar.update(cx, |s, cx| {
             s.snapshot = Snapshot {

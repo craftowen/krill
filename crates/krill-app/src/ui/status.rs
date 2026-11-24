@@ -22,15 +22,19 @@ use super::{
     theme::{AGENT_UNREAD, STATUS_GROUP_GAP, STATUS_GROUP_ICON},
 };
 
-/// 작업 중 스피너: 120° 간격 3분절 아크(크릴 등갑 모티프, 분절마다 80° + 틈 40°). 선 굵기는 6px 링에서 읽히게 굵게 잡았다.
-const RING_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="7" xmlns="http://www.w3.org/2000/svg"><path d="M14.91 4.01A8.5 8.5 0 0 1 20.37 13.48"/><path d="M17.46 18.51A8.5 8.5 0 0 1 6.54 18.51"/><path d="M3.63 13.48A8.5 8.5 0 0 1 9.09 4.01"/></svg>"#;
-/// 접근성 감속(reduce motion)에서는 멈춘 분절 아크가 고장처럼 보여 닫힌 링을 그린다(Orca와 같은 의도).
-const RING_FULL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="7" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8.5"/></svg>"#;
+/// 작업 중 스피너(B안 테이퍼드 코멧 링): 은은한 배경 트랙 원(`0.22`) 위로 꼬리(`0.04`)에서
+/// 둥근 선두(`1.0`)까지 폭과 불투명도가 연속 증가하는 정적 SVG다. GPUI가 단일 채널 알파 마스크로
+/// 1회 래스터라이즈해 GPU 회전 변환(`Transformation::rotate`)만으로 돌린다.
+const RING_SVG: &[u8] = br##"<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="c1" gradientUnits="userSpaceOnUse" x1="20.31" y1="9.77" x2="13.49" y2="20.47"><stop offset="0%" stop-color="#000" stop-opacity="0.04"/><stop offset="100%" stop-color="#000" stop-opacity="0.24"/></linearGradient><linearGradient id="c2" gradientUnits="userSpaceOnUse" x1="13.49" y1="20.47" x2="3.43" y2="12.75"><stop offset="0%" stop-color="#000" stop-opacity="0.24"/><stop offset="100%" stop-color="#000" stop-opacity="0.64"/></linearGradient><linearGradient id="c3" gradientUnits="userSpaceOnUse" x1="3.43" y1="12.75" x2="12.00" y2="3.40"><stop offset="0%" stop-color="#000" stop-opacity="0.64"/><stop offset="100%" stop-color="#000" stop-opacity="1"/></linearGradient></defs><circle cx="12" cy="12" r="8.6" stroke="#000" stroke-width="2.4" stroke-opacity="0.22"/><path d="M20.86 9.63C22.29 14.52 18.77 20.41 13.57 21.39L13.27 19.57C17.49 18.98 20.79 14.26 19.75 9.92Z" fill="url(#c1)"/><path d="M13.65 21.38C8.47 22.43 2.67 18.27 2.11 12.78L4.75 12.57C4.93 16.61 9.11 20.17 13.33 19.56Z" fill="url(#c2)"/><path d="M2.11 12.87C1.50 7.41 6.29 1.81 12.00 1.68L12.00 5.12C8.20 4.99 4.54 8.62 4.75 12.63Z" fill="url(#c3)"/><circle cx="12" cy="3.4" r="1.72" fill="#000"/></svg>"##;
+/// 접근성 감속(reduce motion)에서는 멈춘 코멧 꼬리가 고장처럼 보이지 않도록 닫힌 정적 링을 그린다.
+const RING_FULL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8.6"/></svg>"#;
 /// Lucide `bell`(ISC License)을 채운 모양. 미확인 완료 표시.
 const BELL_FILLED_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg>"#;
 
-/// 1초에 한 바퀴, 12스텝. 모든 스피너가 앱 공용 시계(`repeat_synced`)를 따라 같은 위상으로 돈다.
-const SPIN_STEPS: f32 = 12.;
+/// 1초에 한 바퀴, 30fps 연속 회전. 모든 스피너가 앱 공용 시계(`repeat_synced`)로 같은 위상을 공유하고
+/// 비활성 창에서는 0fps 정적 링으로 멈춰 GPU·배터리 부하를 억제한다.
+const SPIN_FPS: f32 = 30.;
+const SPIN_DURATION: Duration = Duration::from_secs(1);
 
 /// 워크트리 행에 보이는 상태 묶음 수와 묶음마다 나란히 그리는 에이전트 아이콘 수.
 pub const MAX_GROUPS: usize = 3;
@@ -71,12 +75,17 @@ impl Size {
         }
     }
 
-    /// 스피너 링·점 지름.
+    /// 유휴 상태 점 지름.
     const fn inner(self) -> f32 {
         match self {
             Self::Sm => 6.,
             Self::Md => 8.,
         }
+    }
+
+    /// 작업 중 코멧 스피너 지름. 질문·체크 아이콘과 시각 무게를 맞추고 소형에서도 꼬리 대비를 확보한다.
+    const fn spinner(self) -> f32 {
+        self.outer()
     }
 }
 
@@ -184,16 +193,90 @@ pub fn spinner_overlay(slots: &SpinnerSlots) -> impl gpui::IntoElement {
 }
 
 fn spinning_ring(size_px: f32, color: Hsla) -> AnyElement {
-    icon(RING_SVG, size_px, color)
-        .with_animation(
-            "agent-spinner",
-            Animation::new(Duration::from_secs(1))
-                .repeat_synced()
-                .with_max_fps(SPIN_STEPS)
-                .with_easing(|t| (t * SPIN_STEPS).floor() / SPIN_STEPS),
-            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-        )
-        .into_any_element()
+    ActiveCometSpinner { size_px, color }.into_any_element()
+}
+
+/// 창 활성 상태와 감속 설정을 프레임 레이아웃 시점에 확인하는 저부하 스피너 요소.
+///
+/// - 활성 창 + 일반 모션: 정적 코멧 SVG(`RING_SVG`)를 30fps 공용 시계(`repeat_synced`)로 GPU 회전.
+/// - 비활성 창: 애니메이션을 붙이지 않은 정적 코멧 링(0fps, 타이머·GPU 깨움 0).
+///   GPUI의 창 활성화 콜백이 `window.refresh()`를 부르므로 포커스가 돌아오면 즉시 회전을 재개한다.
+/// - 감속 모드(`cx.reduce_motion()`): 닫힌 정적 링(`RING_FULL_SVG`, 0fps).
+struct ActiveCometSpinner {
+    size_px: f32,
+    color: Hsla,
+}
+
+impl gpui::IntoElement for ActiveCometSpinner {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for ActiveCometSpinner {
+    type RequestLayoutState = AnyElement;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _global_id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut gpui::Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let mut child = if cx.reduce_motion() {
+            icon(RING_FULL_SVG, self.size_px, self.color).into_any_element()
+        } else if window.is_window_active() {
+            icon(RING_SVG, self.size_px, self.color)
+                .with_animation(
+                    "agent-spinner",
+                    Animation::new(SPIN_DURATION)
+                        .repeat_synced()
+                        .with_max_fps(SPIN_FPS),
+                    |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                )
+                .into_any_element()
+        } else {
+            icon(RING_SVG, self.size_px, self.color).into_any_element()
+        };
+        let layout_id = child.request_layout(window, cx);
+        (layout_id, child)
+    }
+
+    fn prepaint(
+        &mut self,
+        _global_id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut gpui::Window,
+        cx: &mut App,
+    ) {
+        child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        (): &mut Self::PrepaintState,
+        window: &mut gpui::Window,
+        cx: &mut App,
+    ) {
+        child.paint(window, cx);
+    }
 }
 
 fn glyph_frame(
@@ -215,7 +298,7 @@ fn glyph_frame(
     let color = agent_state_color(state, cx);
     frame.child(match glyph(state) {
         Glyph::Spinner if cx.reduce_motion() => {
-            icon(RING_FULL_SVG, size.inner(), color).into_any_element()
+            icon(RING_FULL_SVG, size.spinner(), color).into_any_element()
         }
         Glyph::Spinner => match slots {
             Some(slots) => {
@@ -230,10 +313,10 @@ fn glyph_frame(
                     },
                     |_, (), _, _| {},
                 )
-                .size(px(size.inner()))
+                .size(px(size.spinner()))
                 .into_any_element()
             }
-            None => spinning_ring(size.inner(), color),
+            None => spinning_ring(size.spinner(), color),
         },
         Glyph::Question => Icon::new(IconName::MessageCircleQuestionMark)
             .with_size(px(size.outer()))
@@ -540,6 +623,8 @@ pub fn continue_chip_visible(
 
 #[cfg(test)]
 mod tests {
+    use gpui::AppContext as _;
+
     use super::*;
 
     #[test]
@@ -639,15 +724,189 @@ mod tests {
         assert_eq!(glyph(AgentState::Unknown), Glyph::Dot);
     }
 
-    /// 스피너는 120° 간격 3분절 아크, 감속 대체는 닫힌 링.
+    /// 테이퍼드 코멧 링 SVG가 GPUI의 실제 resvg 알파 마스크에서 단조 증가하는 꼬리→선두 알파를 만들고,
+    /// 감속 대체는 닫힌 정적 링인지 검증한다.
     #[test]
-    fn spinner_is_three_segment_arc_and_reduce_motion_is_closed_ring() {
+    fn comet_spinner_svg_has_tapered_alpha_mask_and_reduce_motion_is_closed_ring() {
         let ring = std::str::from_utf8(RING_SVG).unwrap();
         assert!(ring.starts_with("<svg") && ring.ends_with("</svg>"));
-        assert_eq!(ring.matches("<path").count(), 3);
-        assert_eq!(ring.matches("A8.5 8.5 0 0 1").count(), 3);
+        assert_eq!(ring.matches("<linearGradient").count(), 3);
+        assert!(ring.contains("stroke-opacity=\"0.22\""));
         let full = std::str::from_utf8(RING_FULL_SVG).unwrap();
         assert!(full.contains("<circle"));
+
+        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(()));
+        let parsed = renderer.parse_svg(RING_SVG).unwrap();
+        let dim: usize = 96;
+        let dim_px = gpui::DevicePixels(96);
+        let image = renderer
+            .render_parsed(
+                &parsed,
+                gpui::SvgSize::ExactSize(gpui::size(dim_px, dim_px)),
+            )
+            .unwrap();
+        let bytes = image.as_bytes(0).unwrap();
+        let alpha_at =
+            |buf: &[u8], px_x: usize, px_y: usize| -> u8 { buf[(px_y * dim + px_x) * 4 + 3] };
+
+        // 96px(24px × 4) 좌표계 반지름 8.6 궤도 상 알파: 중심(0) < 빈 트랙(1:30) < 꼬리(4:30) < 중간(7:30) < 선두(12:00)
+        let center = alpha_at(bytes, 48, 48);
+        let track = alpha_at(bytes, 72, 24); // (18.0, 6.0) ~45 deg (track only)
+        let tail = alpha_at(bytes, 72, 72); // (18.0, 18.0) ~135 deg (c1)
+        let mid = alpha_at(bytes, 24, 72); // (6.0, 18.0) ~225 deg (c2)
+        let head = alpha_at(bytes, 48, 14); // (12.0, 3.5) 0 deg (head cap)
+
+        assert_eq!(center, 0, "spinner center must stay hollow");
+        assert!(
+            track > 30 && track < 80,
+            "background track alpha expected ~56 (0.22), got {track}"
+        );
+        assert!(
+            tail > track,
+            "tail ({tail}) must exceed track alone ({track})"
+        );
+        assert!(mid > tail + 30, "mid ({mid}) must ramp above tail ({tail})");
+        assert!(
+            head >= 245,
+            "head cap must reach full opacity (~255), got {head}"
+        );
+
+        let full_parsed = renderer.parse_svg(RING_FULL_SVG).unwrap();
+        let full_img = renderer
+            .render_parsed(
+                &full_parsed,
+                gpui::SvgSize::ExactSize(gpui::size(dim_px, dim_px)),
+            )
+            .unwrap();
+        let full_bytes = full_img.as_bytes(0).unwrap();
+        assert_eq!(alpha_at(full_bytes, 48, 48), 0);
+        assert!(alpha_at(full_bytes, 48, 14) >= 245);
+        assert!(alpha_at(full_bytes, 72, 24) >= 245);
+    }
+
+    #[gpui::test]
+    fn unfocused_window_pauses_spinner_at_zero_fps_and_resumes_on_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct SpinnerHost {
+            slots: SpinnerSlots,
+            renders: usize,
+        }
+        impl gpui::Render for SpinnerHost {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.renders += 1;
+                self.slots.clear();
+                div()
+                    .size(px(80.))
+                    .child(status_glyph(AgentState::Working, false, Size::Md, cx))
+                    .child(status_glyph_slot(
+                        AgentState::Working,
+                        false,
+                        Size::Sm,
+                        Some(&self.slots),
+                        cx,
+                    ))
+                    .child(spinner_overlay(&self.slots))
+            }
+        }
+        struct OtherWindow;
+        impl gpui::Render for OtherWindow {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                div()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (view, vcx) = cx.add_window_view(|_, _| SpinnerHost {
+            slots: SpinnerSlots::default(),
+            renders: 0,
+        });
+        vcx.run_until_parked();
+
+        // 1) 초기 비활성 창: 1초 동안 0fps(추가 렌더 0회).
+        let inactive_before = view.read_with(vcx, |v, _| v.renders);
+        for _ in 0..10 {
+            vcx.executor().advance_clock(Duration::from_millis(100));
+            vcx.run_until_parked();
+        }
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.renders),
+            inactive_before,
+            "unfocused window must not schedule spinner frames"
+        );
+
+        // 2) 창 활성화: 즉시 30fps 회전 재개.
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        let active_before = view.read_with(vcx, |v, _| v.renders);
+        for _ in 0..12 {
+            vcx.executor().advance_clock(Duration::from_millis(50));
+            vcx.run_until_parked();
+        }
+        assert!(
+            view.read_with(vcx, |v, _| v.renders) >= active_before + 10,
+            "active window must resume smooth 30fps ticking"
+        );
+
+        // 3) 다른 창으로 포커스 이탈: 최대 1회 잔여 틱 이후 완전 0fps 정지.
+        let other = cx.add_window(|_, _| OtherWindow);
+        cx.update_window(other.into(), |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        let paused_at = view.read_with(cx, |v, _| v.renders);
+        for _ in 0..10 {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            view.read_with(cx, |v, _| v.renders),
+            paused_at,
+            "deactivated window must stop scheduling spinner ticks"
+        );
+    }
+
+    #[gpui::test]
+    fn reduce_motion_renders_static_ring_at_zero_fps(cx: &mut gpui::TestAppContext) {
+        struct Host {
+            renders: usize,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.renders += 1;
+                div().child(status_glyph(AgentState::Working, false, Size::Md, cx))
+            }
+        }
+
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, vcx) = cx.add_window_view(|_, _| Host { renders: 0 });
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+
+        let before = view.read_with(vcx, |v, _| v.renders);
+        for _ in 0..10 {
+            vcx.executor().advance_clock(Duration::from_millis(100));
+            vcx.run_until_parked();
+        }
+        assert_eq!(
+            view.read_with(vcx, |v, _| v.renders),
+            before,
+            "reduce_motion must keep active window spinner at 0fps"
+        );
     }
 
     #[gpui::test]
