@@ -1405,10 +1405,11 @@ impl Sidebar {
         remote: &super::RemoteHost,
         collapsed: &BTreeSet<PathBuf>,
     ) -> Vec<Row> {
+        let host_id = HostId::Remote(remote.id.clone());
         let pending: Vec<_> = self
             .pending_worktrees
             .iter()
-            .filter(|p| p.host == HostId::Remote(remote.id.clone()))
+            .filter(|p| p.host == host_id)
             .cloned()
             .collect();
         let ctx = WorktreeContext {
@@ -1421,6 +1422,7 @@ impl Sidebar {
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
+            bot_worktrees: self.remote_bot_worktrees.get(&host_id),
             // Lineage belongs to the local store. Matching absolute paths on a remote
             // host do not make them descendants of local worktrees.
             sleeping_worktrees: Some(&self.sleeping_worktrees),
@@ -1430,7 +1432,7 @@ impl Sidebar {
             ..WorktreeContext::default()
         };
         rows_with_options(
-            &self.ordered_snapshot(&HostId::Remote(remote.id.clone()), &remote.snapshot),
+            &self.ordered_snapshot(&host_id, &remote.snapshot),
             &self.prefs,
             collapsed,
             &self.collapsed_groups,

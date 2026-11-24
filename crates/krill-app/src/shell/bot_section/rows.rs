@@ -119,6 +119,40 @@ fn ms_of_ns(ns: u64) -> u64 {
     ns / 1_000_000
 }
 
+fn meaningful_worker_title(session: Option<&krill_app::sidebar::Session>) -> Option<String> {
+    const BARE_AGENTS: &[&str] = &[
+        "agy",
+        "claude",
+        "claude code",
+        "codex",
+        "opencode",
+        "cursor",
+        "gemini",
+        "shell",
+        "zsh",
+        "bash",
+    ];
+    let session = session?;
+    let title = session.status.title.as_deref()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let agent = session.status.agent.trim();
+    if BARE_AGENTS.iter().any(|g| title.eq_ignore_ascii_case(g))
+        || (!agent.is_empty() && title.eq_ignore_ascii_case(agent))
+    {
+        return None;
+    }
+    Some(title.to_owned())
+}
+
+fn sort_and_dedup_workers(workers: &mut Vec<WorkerFacts>) {
+    // Orca: a worker waiting on the owner leads, then running ones, then newest.
+    workers.sort_by_key(|w| (!w.waiting(), !w.live, std::cmp::Reverse(w.at_ms)));
+    let mut seen = std::collections::HashSet::new();
+    workers.retain(|w| w.session.is_none_or(|sid| seen.insert(sid)));
+}
+
 impl Shell {
     pub(super) fn bot_facts(
         &self,
@@ -129,13 +163,11 @@ impl Shell {
         let host = &self.launch_host;
         let sidebar = self.sidebar.read(cx);
         let hide_sleeping = self.bot_view(cx).hide_sleeping_workers;
-        let local = host.is_local();
-        let orch = &self.orch_snapshot;
+        let orch = self.orch_snapshot_for(host);
         let worker_of = |d: &krill_proto::orchestration::Dispatch| -> WorkerFacts {
             let session = d
                 .session_id
                 .map(SessionId)
-                .filter(|_| local)
                 .and_then(|id| sidebar.session_on(host, id));
             let path = session
                 .and_then(|s| s.worktree.as_deref().or(s.cwd.as_deref()))
@@ -143,16 +175,38 @@ impl Shell {
                     || std::path::PathBuf::from(&d.cwd),
                     std::path::Path::to_path_buf,
                 );
-            let title = path
+            let repo_path = sidebar.repo_for_worktree_on(host, &path);
+            let path_name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| d.worker_name.clone());
-            let repo = sidebar
-                .repo_for_worktree_on(host, &path)
+                .filter(|n| !n.is_empty());
+            let meaningful_title = meaningful_worker_title(session);
+            let worker_name = (!d.worker_name.trim().is_empty()).then(|| d.worker_name.clone());
+            let in_repo_root = repo_path
+                .as_deref()
+                .is_some_and(|repo| krill_proto::path::equivalent(repo, &path));
+            let title = if in_repo_root {
+                meaningful_title
+                    .or(worker_name)
+                    .or(path_name)
+                    .unwrap_or_else(|| d.worker_name.clone())
+            } else {
+                path_name
+                    .or(meaningful_title)
+                    .or(worker_name)
+                    .unwrap_or_else(|| d.worker_name.clone())
+            };
+            let repo = repo_path
+                .as_deref()
                 .and_then(|r| r.file_name().map(|n| n.to_string_lossy().into_owned()));
-            let live = d.status == krill_proto::orchestration::DispatchStatus::Active
-                && session.is_some_and(|s| !s.is_exited());
+            let live = session.is_some_and(|s| {
+                !s.is_exited()
+                    && (d.status == krill_proto::orchestration::DispatchStatus::Active
+                        || matches!(
+                            s.status.state,
+                            AgentState::Working | AgentState::Waiting | AgentState::Blocked
+                        ))
+            });
             WorkerFacts {
                 key: d.id.clone(),
                 session: session.map(|s| s.id),
@@ -173,9 +227,9 @@ impl Shell {
             }
         };
         let workers_of = |coordinator: SessionId| -> Vec<WorkerFacts> {
-            if !local {
+            let Some(orch) = orch else {
                 return Vec::new();
-            }
+            };
             let mut out: Vec<WorkerFacts> = orch
                 .runs
                 .iter()
@@ -184,8 +238,7 @@ impl Shell {
                 .map(worker_of)
                 .filter(|w| !hide_sleeping || w.live || w.active)
                 .collect();
-            // Orca: a worker waiting on the owner leads, then running ones, then newest.
-            out.sort_by_key(|w| (!w.waiting(), !w.live, std::cmp::Reverse(w.at_ms)));
+            sort_and_dedup_workers(&mut out);
             out
         };
         let chats: Vec<ChatFacts> = bot
@@ -225,7 +278,7 @@ impl Shell {
             .collect();
         // Workers of this bot's closed chats that still run.
         let listed: std::collections::HashSet<u64> = chats.iter().map(|c| c.session.0).collect();
-        let stray: Vec<WorkerFacts> = if local {
+        let mut stray: Vec<WorkerFacts> = orch.map_or_else(Vec::new, |orch| {
             orch.runs
                 .iter()
                 .filter_map(|r| r.coordinator_session_id.map(|sid| (r, sid)))
@@ -239,9 +292,8 @@ impl Shell {
                 .map(worker_of)
                 .filter(|w| w.live || w.active)
                 .collect()
-        } else {
-            Vec::new()
-        };
+        });
+        sort_and_dedup_workers(&mut stray);
         let workers = chats.iter().flat_map(|c| &c.workers).chain(&stray);
         let waiting_workers = workers.clone().filter(|w| w.waiting()).count();
         let working_workers = workers

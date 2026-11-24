@@ -79,8 +79,8 @@ pub(super) struct BotPanel {
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
     pub chat_search_lang: Option<krill_app::i18n::Language>,
     pub chat_query: String,
-    /// Chats unfolded to show their workers (every chat starts folded, as in Orca).
-    pub chat_unfolded: std::collections::BTreeSet<krill_proto::SessionId>,
+    /// Chats the user explicitly folded (chats with workers start open).
+    pub chat_folded: std::collections::BTreeSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     /// What the header last drew from `view`: its filter, whether an item is open, the
     /// automations' line ("Idle · next 8:00 PM · Look around", with its narrow form), the
     /// settings subpage crumb, and the group panel filter state/counts.
@@ -1045,8 +1045,13 @@ impl Shell {
                     .when(foldable, |d| {
                         d.child(
                             div()
-                                .id(SharedString::from(format!("bot-chat-fold-{}", session.0)))
-                                .debug_selector(move || format!("bot-chat-fold-{}", session.0))
+                                .id(SharedString::from(format!(
+                                    "bot-panel-chat-fold-{}",
+                                    session.0
+                                )))
+                                .debug_selector(move || {
+                                    format!("bot-panel-chat-fold-{}", session.0)
+                                })
                                 .role(gpui::Role::Button)
                                 .aria_expanded(open)
                                 .aria_label(if open {
@@ -1076,8 +1081,9 @@ impl Shell {
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    if !this.bot_ui.panel.chat_unfolded.remove(&session) {
-                                        this.bot_ui.panel.chat_unfolded.insert(session);
+                                    let key = (this.launch_host.clone(), session);
+                                    if !this.bot_ui.panel.chat_folded.remove(&key) {
+                                        this.bot_ui.panel.chat_folded.insert(key);
                                     }
                                     cx.notify();
                                 })),
@@ -1185,8 +1191,8 @@ impl Shell {
     /// Orca's `BotChatTreeWorkerRow`: the worker's state, its title and age; a click opens it.
     fn render_bot_chat_worker(
         &self,
-        bot: &SidebarBot,
         worker: krill_proto::SessionId,
+        fallback_name: Option<String>,
         at_ms: u64,
         now: u64,
         p: &ui::Palette,
@@ -1199,9 +1205,9 @@ impl Shell {
         let title = session
             .and_then(|s| s.status.title.clone())
             .filter(|t| !t.trim().is_empty())
+            .or(fallback_name)
             .unwrap_or_else(|| format!("#{}", worker.0));
         let id = SharedString::from(format!("bot-chat-worker-{}", worker.0));
-        let open_id = bot.id.clone();
         div()
             .id(id.clone())
             .debug_selector(move || id.to_string())
@@ -1240,7 +1246,7 @@ impl Shell {
                     .child(krill_app::jump::format_age_secs(at_ms / 1000, now)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_bot_session(&open_id, worker, cx);
+                this.open_session_on(host.clone(), worker, cx);
             }))
     }
 
@@ -1277,12 +1283,13 @@ impl Shell {
             );
         let now = super::bot_section::now_secs();
         let host = self.launch_host.clone();
-        let workers = self
+        let orch = self.orch_snapshot_for(&host);
+        let linked_workers = self
             .bot_ui
             .panel
             .view
             .as_ref()
-            .map(|v| v.read(cx).chat_workers(&bot.id))
+            .map(|v| v.read(cx).chat_worker_links(&bot.id))
             .unwrap_or_default();
         let mut list = div()
             .id("bot-chats-list")
@@ -1303,39 +1310,100 @@ impl Shell {
                 .read(cx)
                 .session_on(&host, session)
                 .map(|x| x.status.state);
-            let mine: Vec<_> = workers
-                .iter()
-                .filter(|(chat, ..)| *chat == session)
-                .map(|(_, w, at)| (*w, *at))
+            let mut by_session: std::collections::HashMap<
+                krill_proto::SessionId,
+                (u64, Option<String>),
+            > = std::collections::HashMap::new();
+            let mut record = |worker: krill_proto::SessionId, at: u64, name: Option<String>| {
+                by_session
+                    .entry(worker)
+                    .and_modify(|(prev_at, prev_name)| {
+                        *prev_at = (*prev_at).max(at);
+                        if prev_name.is_none() {
+                            prev_name.clone_from(&name);
+                        }
+                    })
+                    .or_insert((at, name));
+            };
+            if let Some(orch) = orch {
+                for run in orch
+                    .runs
+                    .iter()
+                    .filter(|r| r.coordinator_session_id == Some(session.0))
+                {
+                    for d in orch.dispatches.iter().filter(|d| d.run_id == run.id) {
+                        let Some(wsid) = d.session_id.map(krill_proto::SessionId) else {
+                            continue;
+                        };
+                        let at_ms = self
+                            .sidebar
+                            .read(cx)
+                            .session_on(&host, wsid)
+                            .map(|x| x.status.since_unix_ns / 1_000_000)
+                            .filter(|&at| at > 0)
+                            .unwrap_or_else(|| d.ended_at_ms.unwrap_or(d.started_at_ms));
+                        let name =
+                            (!d.worker_name.trim().is_empty()).then(|| d.worker_name.clone());
+                        record(wsid, at_ms, name);
+                    }
+                }
+            }
+            for (chat, target, at) in &linked_workers {
+                if *chat != session {
+                    continue;
+                }
+                match target {
+                    krill_app::bots::LinkedDispatchRef::Session(wsid) => {
+                        record(*wsid, *at, None);
+                    }
+                    krill_app::bots::LinkedDispatchRef::Dispatch(disp_id) => {
+                        if let Some(d) =
+                            orch.and_then(|o| o.dispatches.iter().find(|d| d.id == *disp_id))
+                            && let Some(wsid) = d.session_id.map(krill_proto::SessionId)
+                        {
+                            let at_ms = (*at).max(d.ended_at_ms.unwrap_or(d.started_at_ms));
+                            let name =
+                                (!d.worker_name.trim().is_empty()).then(|| d.worker_name.clone());
+                            record(wsid, at_ms, name);
+                        }
+                    }
+                }
+            }
+            let mut mine: Vec<(krill_proto::SessionId, u64, Option<String>)> = by_session
+                .into_iter()
+                .map(|(wsid, (at, name))| (wsid, at, name))
                 .collect();
+            mine.sort_by_key(|(wsid, at, _)| (std::cmp::Reverse(*at), std::cmp::Reverse(wsid.0)));
             let running = mine
                 .iter()
-                .filter(|(w, _)| {
+                .filter(|(w, ..)| {
                     self.sidebar
                         .read(cx)
                         .session_on(&host, *w)
                         .is_some_and(|x| {
-                            matches!(x.status.state, krill_proto::control::AgentState::Working)
+                            !x.is_exited()
+                                && matches!(
+                                    x.status.state,
+                                    krill_proto::control::AgentState::Working
+                                )
                         })
                 })
                 .count();
-            let open = self.bot_ui.panel.chat_unfolded.contains(&session);
-            list = list.child(self.render_bot_chat_row(
-                bot,
-                s,
-                &title,
-                state,
-                running,
-                !mine.is_empty(),
-                open,
-                now,
-                p,
-                cx,
-            ));
+            let foldable = !mine.is_empty();
+            let open = foldable
+                && !self
+                    .bot_ui
+                    .panel
+                    .chat_folded
+                    .contains(&(host.clone(), session));
+            list =
+                list.child(self.render_bot_chat_row(
+                    bot, s, &title, state, running, foldable, open, now, p, cx,
+                ));
             if open {
                 let mut tree = div().mb_1().ml_6().flex().flex_col();
-                for (worker, at) in mine {
-                    tree = tree.child(self.render_bot_chat_worker(bot, worker, at, now, p, cx));
+                for (worker, at, name) in mine {
+                    tree = tree.child(self.render_bot_chat_worker(worker, name, at, now, p, cx));
                 }
                 list = list.child(tree);
             }
