@@ -83,14 +83,90 @@ impl PictureError {
     }
 }
 
-/// Turns a PNG, JPEG, WebP or GIF into the picture krilld stores, as Orca does: honour the
-/// camera orientation, crop the centre square, scale it to 512 px and save it as PNG.
+const ICNS_HEADER_BYTES: usize = 8;
+
+/// Whether `bytes` begins with the macOS `.icns` container magic (`"icns"`).
+#[must_use]
+pub fn has_icns_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && &bytes[..4] == b"icns"
+}
+
+fn read_png_dimensions(entry: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if entry.len() < 24 || entry[..8] != PNG_SIG || &entry[12..16] != b"IHDR" {
+        return None;
+    }
+    let ihdr_len = u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]);
+    if ihdr_len < 13 {
+        return None;
+    }
+    let w = u32::from_be_bytes([entry[16], entry[17], entry[18], entry[19]]);
+    let h = u32::from_be_bytes([entry[20], entry[21], entry[22], entry[23]]);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+fn fits_avatar_better(side: u32, best_side: u32) -> bool {
+    if best_side >= PICTURE_SIDE {
+        side >= PICTURE_SIDE && side < best_side
+    } else {
+        side > best_side
+    }
+}
+
+/// Extracts the best PNG entry from a macOS `.icns` bundle (`#46782` / Orca `bot-avatar-icns.ts`):
+/// smallest PNG covering 512px, else largest PNG; skips legacy ARGB / JPEG 2000 entries.
+#[must_use]
+pub fn avatar_png_from_icns(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < ICNS_HEADER_BYTES || !has_icns_magic(bytes) {
+        return None;
+    }
+    let end = usize::try_from(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])).ok()?;
+    if end < ICNS_HEADER_BYTES || end > bytes.len() {
+        return None;
+    }
+    let mut best: Option<&[u8]> = None;
+    let mut best_side: u32 = 0;
+    let mut offset = ICNS_HEADER_BYTES;
+    while offset < end {
+        if end - offset < ICNS_HEADER_BYTES {
+            return None;
+        }
+        let len = usize::try_from(u32::from_be_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]))
+        .ok()?;
+        if len < ICNS_HEADER_BYTES || len > end - offset {
+            return None;
+        }
+        let entry = &bytes[offset + ICNS_HEADER_BYTES..offset + len];
+        if let Some((w, h)) = read_png_dimensions(entry) {
+            let side = w.min(h);
+            if side > 0 && fits_avatar_better(side, best_side) {
+                best = Some(entry);
+                best_side = side;
+            }
+        }
+        offset += len;
+    }
+    best
+}
+
+/// Turns a PNG, JPEG, WebP, GIF or PNG-backed `.icns` into the picture krilld stores, as Orca
+/// does: honour the camera orientation, crop the centre square, scale it to 512 px and save as PNG.
 pub fn prepare_picture(bytes: &[u8]) -> Result<Vec<u8>, PictureError> {
     use image::ImageDecoder as _;
 
     if bytes.len() > PICTURE_MAX_BYTES {
         return Err(PictureError::TooBig);
     }
+    let bytes = if has_icns_magic(bytes) {
+        avatar_png_from_icns(bytes).ok_or(PictureError::Unreadable)?
+    } else {
+        bytes
+    };
     let too_big_or_unreadable = |e: image::ImageError| match e {
         image::ImageError::Limits(_) => PictureError::TooBig,
         _ => PictureError::Unreadable,
@@ -689,5 +765,59 @@ mod tests {
             prepare_picture(&vec![0; PICTURE_MAX_BYTES + 1]),
             Err(PictureError::TooBig)
         );
+    }
+
+    #[test]
+    fn icns_extracts_best_png_entry_and_prepares_avatar() {
+        let make_png = |side: u32, color: [u8; 3]| {
+            let img = image::RgbImage::from_pixel(side, side, image::Rgb(color));
+            let mut out = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        let pack_icns = |entries: &[([u8; 4], &[u8])]| {
+            let total: usize = 8 + entries
+                .iter()
+                .map(|(_, data)| 8 + data.len())
+                .sum::<usize>();
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(b"icns");
+            buf.extend_from_slice(&(u32::try_from(total).unwrap()).to_be_bytes());
+            for (kind, data) in entries {
+                buf.extend_from_slice(kind);
+                buf.extend_from_slice(&(u32::try_from(8 + data.len()).unwrap()).to_be_bytes());
+                buf.extend_from_slice(data);
+            }
+            buf
+        };
+
+        let png256 = make_png(256, [255, 0, 0]);
+        let png512 = make_png(512, [0, 255, 0]);
+        let png1024 = make_png(1024, [0, 0, 255]);
+        let icns = pack_icns(&[
+            (*b"ic07", b"not-a-png-legacy-entry"),
+            (*b"ic08", &png256),
+            (*b"ic10", &png1024),
+            (*b"ic09", &png512),
+        ]);
+        // Smallest >= 512 wins over both 256 and 1024.
+        assert_eq!(avatar_png_from_icns(&icns), Some(png512.as_slice()));
+        let prepared = prepare_picture(&icns).unwrap();
+        let decoded = image::load_from_memory_with_format(&prepared, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (512, 512));
+        assert!(decoded.get_pixel(256, 256)[1] > 200);
+
+        // Without any >= 512 entry, largest < 512 wins.
+        let icns_small = pack_icns(&[(*b"ic08", &png256)]);
+        assert_eq!(avatar_png_from_icns(&icns_small), Some(png256.as_slice()));
+
+        // PNG-less or malformed bundle returns Unreadable.
+        let icns_no_png = pack_icns(&[(*b"is32", b"raw-legacy-argb")]);
+        assert_eq!(avatar_png_from_icns(&icns_no_png), None);
+        assert_eq!(prepare_picture(&icns_no_png), Err(PictureError::Unreadable));
+        assert_eq!(avatar_png_from_icns(b"icns\x00\x00\x00\x04"), None);
     }
 }

@@ -488,7 +488,7 @@ impl Shell {
                     .child(
                         div()
                             .truncate()
-                            .text_size(ui::TEXT_SM)
+                            .text_size(ui::TEXT_MD)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.sidebar_foreground)
                             .child(group.name.clone()),
@@ -496,7 +496,7 @@ impl Shell {
                     .child(
                         div()
                             .truncate()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(if need_count > 0 {
                                 p.sidebar_foreground
                             } else {

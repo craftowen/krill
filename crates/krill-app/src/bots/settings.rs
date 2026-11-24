@@ -76,6 +76,10 @@ pub(super) struct SettingsState {
     /// Each bot's Items, Look around and Memory upkeep presets, as krilld last answered.
     pub(super) extras: BTreeMap<BotId, krill_proto::bots::BotSettingsExtras>,
     pub(super) extras_task: Option<gpui::Task<()>>,
+    /// Inline bot rename input inside Settings root top card (`BotNameInlineEdit`).
+    pub(super) inline_name_editing: bool,
+    pub(super) inline_name_input: Option<Entity<InputState>>,
+    pub(super) inline_name_sub: Option<gpui::Subscription>,
 }
 
 impl SettingsState {
@@ -90,6 +94,9 @@ impl SettingsState {
         self.history_open = None;
         self.topic_open = None;
         self.tools_adding = false;
+        self.inline_name_editing = false;
+        self.inline_name_input = None;
+        self.inline_name_sub = None;
     }
 
     pub(super) fn sync_from_bot(&mut self, bot: &BotConfig) {
@@ -119,6 +126,7 @@ impl SettingsState {
             || opt_input_composing(self.sched_prompt_input.as_ref(), window, app)
             || opt_input_composing(self.look_focus_input.as_ref(), window, app)
             || opt_input_composing(self.memory_add_input.as_ref(), window, app)
+            || opt_input_composing(self.inline_name_input.as_ref(), window, app)
     }
 
     pub(super) fn refresh_placeholders(&self, window: &mut Window, cx: &mut Context<View>) {
@@ -259,7 +267,7 @@ impl View {
         .detach();
     }
 
-    fn pick_and_upload_avatar(
+    pub(super) fn pick_and_upload_avatar(
         &mut self,
         bot_id: BotId,
         window: &mut Window,
@@ -320,6 +328,10 @@ impl View {
                     Ok((updated, image)) => {
                         this.settings.avatar_cache.insert(updated.id.clone(), image);
                         this.upsert_bot_config(updated);
+                        // Orca #47278: drop cached avatars for bots no longer in the list.
+                        let live: std::collections::HashSet<&BotId> =
+                            this.bots.iter().map(|b| &b.id).collect();
+                        this.settings.avatar_cache.retain(|id, _| live.contains(id));
                         this.notice = Some(SharedString::from(text::SAVED.get()));
                     }
                     Err(err) => {

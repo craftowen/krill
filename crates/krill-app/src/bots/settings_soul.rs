@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea};
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
+use gpui_component::{ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _};
 use krill_proto::bots::{
     BOT_MEMORY_INDEX_LINE_CAP, BotConfig, BotMemoryHistoryEntry, append_memory_fact,
     count_memory_lines, parse_memory_facts,
@@ -143,6 +143,12 @@ impl View {
                 .into_any_element()
         };
         let save_bot = bot.id.clone();
+        let dark = cx.theme().mode.is_dark();
+        let active_pill_bg = if dark {
+            p.foreground.opacity(0.14)
+        } else {
+            p.background
+        };
         let mode_tab = |id: &'static str, label: &'static str, on: bool| {
             div()
                 .id(id)
@@ -156,7 +162,7 @@ impl View {
                 .cursor_pointer()
                 .map(|d| {
                     if on {
-                        d.bg(p.background).text_color(p.foreground)
+                        d.bg(active_pill_bg).text_color(p.foreground)
                     } else {
                         d.text_color(p.muted_foreground)
                             .hover(|d| d.text_color(p.foreground))
@@ -184,14 +190,14 @@ impl View {
                         div()
                             .truncate()
                             .font_family(ui::FONT_MONO)
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.foreground.opacity(0.85))
                             .child(SOUL_FILE),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(ui::TEXT_2XS)
+                            .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
                             .child(status),
                     ),
@@ -204,7 +210,7 @@ impl View {
                     .items_center()
                     .rounded(ui::RADIUS_SM)
                     .bg(p.foreground.opacity(0.06))
-                    .text_size(ui::TEXT_2XS)
+                    .text_size(ui::TEXT_XS)
                     .child(
                         mode_tab("bot-soul-read", text::SV_SOUL_READ.get(), !editing).on_click(
                             cx.listener(move |this, _, _, cx| {
@@ -308,7 +314,7 @@ impl View {
             .justify_between()
             .border_t_1()
             .border_color(p.border.opacity(0.6))
-            .text_size(ui::TEXT_2XS)
+            .text_size(ui::TEXT_XS)
             .text_color(p.muted_foreground)
             .child(
                 text::SV_SOUL_STATS
@@ -402,6 +408,12 @@ impl View {
         self.ensure_memory_add_input(window, cx);
         let facts = parse_memory_facts(&self.soul_memory.memory_loaded);
         let history = self.settings.memory_history_tab;
+        let dark = cx.theme().mode.is_dark();
+        let active_pill_bg = if dark {
+            p.foreground.opacity(0.14)
+        } else {
+            p.background
+        };
         let tab = |id: &'static str, on: bool| {
             div()
                 .id(id)
@@ -413,12 +425,12 @@ impl View {
                 .justify_center()
                 .gap_1()
                 .rounded(px(5.))
-                .text_size(ui::TEXT_XS)
+                .text_size(ui::TEXT_SM)
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
                 .map(|d| {
                     if on {
-                        d.bg(p.background).text_color(p.foreground)
+                        d.bg(active_pill_bg).text_color(p.foreground)
                     } else {
                         d.text_color(p.muted_foreground)
                             .hover(|d| d.text_color(p.foreground))
@@ -441,7 +453,7 @@ impl View {
                                 .px(px(6.))
                                 .rounded_full()
                                 .bg(p.foreground.opacity(0.08))
-                                .text_size(ui::TEXT_2XS)
+                                .text_size(ui::TEXT_3XS)
                                 .text_color(p.muted_foreground)
                                 .child(facts.len().to_string()),
                         )
@@ -567,7 +579,7 @@ impl View {
                 div()
                     .px_3()
                     .py_3()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(text::SV_MEMORY_EMPTY.get()),
             );
@@ -760,7 +772,7 @@ impl View {
         if entries.is_empty() {
             return div()
                 .px_1()
-                .text_size(ui::TEXT_XS)
+                .text_size(ui::TEXT_SM)
                 .text_color(p.muted_foreground)
                 .child(text::SV_HIST_EMPTY.get());
         }
@@ -830,6 +842,11 @@ impl View {
                         .min_w_0()
                         .child(l.trim().trim_start_matches(['-', '*']).trim().to_owned()),
                 )
+        };
+        let diff_bg = if cx.theme().mode.is_dark() {
+            p.background.opacity(0.5)
+        } else {
+            p.foreground.opacity(0.045)
         };
         div()
             .id(SharedString::from(format!("bot-history-{}", e.entry_id)))
@@ -916,7 +933,7 @@ impl View {
                         .child(
                             div()
                                 .rounded(ui::RADIUS_SM)
-                                .bg(p.foreground.opacity(0.045))
+                                .bg(diff_bg)
                                 .p_2()
                                 .flex()
                                 .flex_col()

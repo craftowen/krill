@@ -8,11 +8,12 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement as _,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px, relative,
+    AnyElement, App, AppContext as _, Context, FontWeight, InteractiveElement as _,
+    IntoElement as _, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Icon, IconName, Sizable as _};
 use krill_proto::agent::Permission;
@@ -172,7 +173,7 @@ impl Row {
     }
 }
 
-/// A switch for a row's end, as Orca's compact `BotSettingsSwitch`.
+/// A standard switch for subpage rows (32×18px track, 14px thumb).
 pub(super) fn row_switch(
     p: &ui::Palette,
     id: impl Into<SharedString>,
@@ -181,6 +182,17 @@ pub(super) fn row_switch(
     toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     ui::switch(p, id, on, false, toggle).aria_label(label.into())
+}
+
+/// A compact switch for Settings root rows (24×14px track, 10px thumb — Orca `BotSettingsSwitch`).
+pub(super) fn row_switch_compact(
+    p: &ui::Palette,
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    on: bool,
+    toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    ui::switch_compact(p, id, on, false, toggle).aria_label(label.into())
 }
 
 /// Orca's `xs` select trigger: the value, a caret, and a checked menu of `choices`.
@@ -517,14 +529,18 @@ impl View {
                 div()
                     .truncate()
                     .text_size(ui::TEXT_MD)
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(if !compact || has_detail {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
                     .line_height(px(18.))
                     .text_color(p.foreground)
                     .child(title.clone()),
             )
             .children(detail.map(|d| {
                 div()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .line_height(px(16.))
                     .text_color(p.muted_foreground)
                     .map(|el| if wrap_detail { el } else { el.truncate() })
@@ -537,7 +553,7 @@ impl View {
                 .h(px(16.))
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_size(ui::TEXT_XS)
+                .text_size(ui::TEXT_SM)
                 .line_height(px(16.))
                 .text_color(p.muted_foreground)
                 .child(v)
@@ -687,7 +703,7 @@ impl View {
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
-                                .text_size(ui::TEXT_XS)
+                                .text_size(ui::TEXT_SM)
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(p.muted_foreground)
                                 .children(title),
@@ -699,7 +715,7 @@ impl View {
             .children(foot.map(|f| {
                 div()
                     .px_3()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .line_height(px(17.))
                     .text_color(p.muted_foreground)
                     .child(f)
@@ -738,10 +754,78 @@ impl View {
     ) -> gpui::Stateful<gpui::Div> {
         let ent = cx.entity();
         let bot = bot.clone();
-        row_switch(p, id, label, on, move |checked, _, cx| {
+        row_switch_compact(p, id, label, on, move |checked, _, cx| {
             let params = make(&bot, checked);
             ent.update(cx, |this, cx| this.patch_bot(params, cx));
         })
+    }
+
+    fn start_inline_name_edit(
+        &mut self,
+        bot: &BotConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = bot.name.clone();
+        let input = cx.new(|cx| {
+            let mut st =
+                InputState::new(window, cx).placeholder(text::FIELD_NAME_PLACEHOLDER.get());
+            st.set_value(initial, window, cx);
+            st
+        });
+        self.settings.inline_name_sub =
+            Some(
+                cx.subscribe_in(&input, window, |this, ent, ev: &InputEvent, window, cx| {
+                    if !matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        return;
+                    }
+                    if matches!(ev, InputEvent::PressEnter { .. })
+                        && crate::jump::entity_input_is_composing(ent, window, cx)
+                    {
+                        return;
+                    }
+                    this.commit_inline_name_edit(cx);
+                }),
+            );
+        input.update(cx, |s, cx| s.focus(window, cx));
+        self.settings.inline_name_input = Some(input);
+        self.settings.inline_name_editing = true;
+        cx.notify();
+    }
+
+    fn commit_inline_name_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.inline_name_editing {
+            return;
+        }
+        let typed = self
+            .settings
+            .inline_name_input
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_owned())
+            .unwrap_or_default();
+        self.settings.inline_name_editing = false;
+        self.settings.inline_name_input = None;
+        self.settings.inline_name_sub = None;
+        if !typed.is_empty()
+            && let Some(bot) = self.selected_bot().cloned()
+            && typed != bot.name
+        {
+            self.patch_bot(
+                UpdateBotParams {
+                    name: Some(typed),
+                    ..patch(&bot)
+                },
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn cancel_inline_name_edit(&mut self, cx: &mut Context<Self>) {
+        self.settings.inline_name_editing = false;
+        self.settings.inline_name_input = None;
+        self.settings.inline_name_sub = None;
+        cx.notify();
     }
 
     pub(super) fn render_settings_root(
@@ -752,6 +836,49 @@ impl View {
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_settings_extras(&bot.id, cx);
         let upload = self.settings.avatar_cache.get(&bot.id).cloned();
+        let pic_bot_id = bot.id.clone();
+        let rename_bot = bot.clone();
+        let name_slot: AnyElement = if self.settings.inline_name_editing
+            && let Some(input) = &self.settings.inline_name_input
+        {
+            div()
+                .id("bot-settings-name-edit")
+                .debug_selector(|| "bot-settings-name-edit".into())
+                .flex_1()
+                .min_w_0()
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
+                        cx.stop_propagation();
+                        this.cancel_inline_name_edit(cx);
+                    }
+                }))
+                .child(Input::new(input).small())
+                .into_any_element()
+        } else {
+            div()
+                .id("bot-settings-name-btn")
+                .debug_selector(|| "bot-settings-name-btn".into())
+                .role(gpui::Role::Button)
+                .tab_index(0)
+                .aria_label(text::SV_RENAME_HINT.get())
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .rounded(ui::RADIUS_XS)
+                .px_1()
+                .ml(px(-4.))
+                .cursor_pointer()
+                .hover(|d| d.bg(p.accent.opacity(0.6)))
+                .text_size(ui::TEXT_LG)
+                .font_weight(FontWeight::SEMIBOLD)
+                .line_height(px(20.))
+                .text_color(p.foreground)
+                .child(bot.name.clone())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_inline_name_edit(&rename_bot, window, cx);
+                }))
+                .into_any_element()
+        };
         let card = div()
             .w_full()
             .rounded(ui::RADIUS_LG)
@@ -760,30 +887,36 @@ impl View {
             .flex()
             .items_center()
             .gap(px(10.))
-            .child(avatar::render(
-                &avatar::Avatar::of(bot),
-                upload,
-                &bot.name,
-                px(32.),
-                ui::RADIUS_MD,
-                p,
-            ))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(ui::TEXT_LG)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .line_height(px(20.))
-                    .text_color(p.foreground)
-                    .child(bot.name.clone()),
+                    .id("bot-settings-picture-btn")
+                    .debug_selector(|| "bot-settings-picture-btn".into())
+                    .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .aria_label(text::SV_CHANGE_PICTURE.get())
+                    .flex_none()
+                    .rounded(ui::RADIUS_MD)
+                    .cursor_pointer()
+                    .hover(|d| d.opacity(0.85))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick_and_upload_avatar(pic_bot_id.clone(), window, cx);
+                    }))
+                    .child(avatar::render(
+                        &avatar::Avatar::of(bot),
+                        upload,
+                        &bot.name,
+                        px(32.),
+                        ui::RADIUS_MD,
+                        p,
+                    )),
             )
+            .child(name_slot)
             .child(
                 Button::new("bot-settings-share")
                     .debug_selector(|| "bot-settings-share".into())
                     .ghost()
                     .xsmall()
+                    .size(px(28.))
                     .icon(
                         Icon::default()
                             .data(ui::icons::SHARE_2_SVG)
@@ -894,13 +1027,6 @@ impl View {
                 },
                 cx,
             )),
-            Row::new(
-                "bot-settings-schedules",
-                Some(ui::icons::CALENDAR_CLOCK_SVG),
-                text::SV_SCHEDULES.get(),
-            )
-            .value(Some(count(bot.schedules.len())))
-            .opens(Open::Page(SettingsPage::Schedules)),
         ];
 
         let stale_bot = bot.clone();
@@ -919,10 +1045,7 @@ impl View {
                     .into_iter()
                     .map(|s| (s, stale_label(s).into()))
                     .collect(),
-                |b| {
-                    b.small()
-                        .debug_selector(|| "bot-settings-items-stale-select".into())
-                },
+                |b| b.debug_selector(|| "bot-settings-items-stale-select".into()),
                 move |choice, _, cx| {
                     ent.update(cx, |this, cx| {
                         this.update_settings_extras(
@@ -1000,6 +1123,7 @@ impl View {
                 Some(ui::icons::SHARE_2_SVG),
                 text::SV_SHARING.get(),
             )
+            .value(Some(text::SV_SHARING_OFF.get()))
             .opens(Open::Page(SettingsPage::Sharing)),
         ];
 
