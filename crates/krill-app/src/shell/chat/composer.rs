@@ -79,7 +79,7 @@ fn effort_bars(effort: &str) -> Option<usize> {
         "minimal" | "low" => Some(1),
         "medium" => Some(2),
         "high" => Some(3),
-        "xhigh" => Some(4),
+        "xhigh" | "very_high" | "very-high" => Some(4),
         "max" | "ultra" => Some(5),
         _ => None,
     }
@@ -91,7 +91,7 @@ pub(super) fn effort_text(effort: &str) -> String {
         "low" => ctext::EFFORT_LOW.get().to_owned(),
         "medium" => ctext::EFFORT_MEDIUM.get().to_owned(),
         "high" => ctext::EFFORT_HIGH.get().to_owned(),
-        "xhigh" => ctext::EFFORT_XHIGH.get().to_owned(),
+        "xhigh" | "very_high" | "very-high" => ctext::EFFORT_XHIGH.get().to_owned(),
         "max" => ctext::EFFORT_MAX.get().to_owned(),
         "ultra" => ctext::EFFORT_ULTRA.get().to_owned(),
         "none" => ctext::EFFORT_NONE.get().to_owned(),
@@ -169,7 +169,7 @@ pub(super) fn effort_rank(raw: &str) -> usize {
         "low" => 2,
         "medium" => 3,
         "high" => 4,
-        "xhigh" | "x-high" | "extra-high" => 5,
+        "xhigh" | "x-high" | "extra-high" | "very_high" | "very-high" => 5,
         "max" => 6,
         "ultra" => 7,
         _ => usize::MAX,
@@ -1019,17 +1019,29 @@ impl Shell {
 
         // Orca's bot chat: icon-only permission picker in toolbar + host/folder/agy footer below.
         let bot = self.chat_bot(&key).map(|bot| {
+            let bot_home_dir = Self::bot_folder_on(&key.0, bot);
             let path = bot
                 .workspace
                 .as_deref()
                 .map(std::path::PathBuf::from)
-                .or_else(|| Self::bot_folder_on(&key.0, bot));
+                .or_else(|| bot_home_dir.clone());
             let folder = bot.workspace.as_deref().map_or_else(
                 || bot.name.clone(),
                 |w| {
-                    std::path::Path::new(w)
+                    let wp = std::path::Path::new(w);
+                    let base = wp
                         .file_name()
-                        .map_or_else(|| w.to_owned(), |n| n.to_string_lossy().into_owned())
+                        .map_or_else(|| w.to_owned(), |n| n.to_string_lossy().into_owned());
+                    let is_own_folder = bot_home_dir
+                        .as_deref()
+                        .is_some_and(|home| krill_proto::path::equivalent(home, wp))
+                        || base == bot.slug
+                        || base == bot.id.as_str();
+                    if is_own_folder {
+                        bot.name.clone()
+                    } else {
+                        base
+                    }
                 },
             );
             (bot.id.clone(), bot.permission, folder, path)
@@ -2784,6 +2796,8 @@ mod name_tests {
         assert!(model_is_selected(Some("opus"), "opus"));
         assert!(!model_is_selected(Some("claude-opus-5-5"), "sonnet"));
         assert_eq!(effort_bars("high"), Some(3));
+        assert_eq!(effort_bars("very_high"), Some(4));
+        assert_eq!(effort_rank("very_high"), effort_rank("xhigh"));
         assert_eq!(effort_bars("unknown"), None);
     }
 

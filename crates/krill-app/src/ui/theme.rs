@@ -398,10 +398,14 @@ impl Palette {
         }
     }
 
-    /// Orca `--tab-inactive` (`card` / `#171717`).
+    /// Orca `--tab-inactive`: 다크 `card`(`#171717`), 라이트 `color-mix(in srgb, foreground 4%, card)`(`#f5f5f5`).
     #[must_use]
-    pub const fn tab_inactive(&self) -> Hsla {
-        self.card
+    pub fn tab_inactive(&self) -> Hsla {
+        if self.is_dark() {
+            self.card
+        } else {
+            color_mix(self.foreground, 0.04, self.card)
+        }
     }
 
     /// Orca `[data-worktree-card-active='primary']` 배경: 왼쪽 사이드바 위 선택 카드 표면.
@@ -1309,6 +1313,12 @@ mod tests {
             assert_eq!(cx.theme().sidebar, LIGHT.sidebar);
             assert_eq!(cx.theme().tab_bar, LIGHT.tab_bar());
             assert_eq!(cx.theme().tab_active, LIGHT.tab_active());
+            assert_eq!(cx.theme().tab, LIGHT.tab_inactive());
+            assert_ne!(
+                LIGHT.tab_active(),
+                LIGHT.tab_inactive(),
+                "Light Mode active and inactive tabs must remain visually distinct"
+            );
             assert_ne!(cx.theme().button, cx.theme().button_hover);
             assert_ne!(cx.theme().button_hover, cx.theme().button_active);
             assert_ne!(cx.theme().button_primary, cx.theme().button_primary_hover);

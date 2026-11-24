@@ -3706,6 +3706,14 @@ fn remote_bot_without_workspace_footer_does_not_overwrite_clipboard_and_efforts_
         ctext::EFFORT_MINIMAL.get()
     );
     assert_eq!(composer::effort_text("ultra"), ctext::EFFORT_ULTRA.get());
+    assert_eq!(
+        composer::effort_text("very_high"),
+        ctext::EFFORT_XHIGH.get()
+    );
+    assert_eq!(
+        composer::effort_text("very-high"),
+        ctext::EFFORT_XHIGH.get()
+    );
     assert_eq!(composer::effort_text("none"), ctext::EFFORT_NONE.get());
     assert_eq!(composer::effort_text("off"), ctext::EFFORT_OFF.get());
 
