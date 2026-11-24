@@ -15,7 +15,8 @@ use gpui_component::{Selectable as _, Sizable as _};
 
 use super::theme::{
     FONT_MONO, MODAL_BACKDROP, Palette, RADIUS_MD, RADIUS_SM, RADIUS_XS, SPACE_2, SPACE_4,
-    SWITCH_HEIGHT, SWITCH_THUMB, SWITCH_WIDTH, TEXT_2XS, TEXT_SM, TEXT_XS,
+    SWITCH_COMPACT_HEIGHT, SWITCH_COMPACT_THUMB, SWITCH_COMPACT_WIDTH, SWITCH_HEIGHT, SWITCH_THUMB,
+    SWITCH_WIDTH, TEXT_2XS, TEXT_SM, TEXT_XS,
 };
 
 /// 테두리 있는 카드(섹션·그룹 내용 묶음, Orca `Card` / `Inset hairline` 대응).
@@ -204,10 +205,9 @@ pub fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button
     Button::new(id).small().ghost().label(label)
 }
 
-/// 불리언(켜기/끄기) 토글 스위치(Orca `SettingsSwitch` / `Switch` 대응, OWE-793).
+/// 불리언(켜기/끄기) 토글 스위치(Orca `SettingsSwitch` / `ui/switch.tsx` 대응).
 ///
-/// 2버튼(`켜기`/`끄기`) 나열 대신 단일 알약 트랙(36×20px)과 원형 썸(14px)으로
-/// 현재 활성 상태와 클릭 시 반전 동작을 일관되게 표현한다.
+/// 슬림 알약 트랙(32×18px)과 원형 썸(14px)으로 현재 활성 상태와 클릭 시 반전 동작을 표현한다.
 pub fn switch(
     p: &Palette,
     id: impl Into<SharedString>,
@@ -215,26 +215,78 @@ pub fn switch(
     disabled: bool,
     on_toggle: impl Fn(bool, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
+    switch_sized(
+        p,
+        id,
+        checked,
+        disabled,
+        SWITCH_WIDTH,
+        SWITCH_HEIGHT,
+        SWITCH_THUMB,
+        on_toggle,
+    )
+}
+
+/// 콤팩트 불리언 토글 스위치(Orca `Switch size="sm"` `24×14px` / `10px` 썸 대응).
+pub fn switch_compact(
+    p: &Palette,
+    id: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+    on_toggle: impl Fn(bool, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    switch_sized(
+        p,
+        id,
+        checked,
+        disabled,
+        SWITCH_COMPACT_WIDTH,
+        SWITCH_COMPACT_HEIGHT,
+        SWITCH_COMPACT_THUMB,
+        on_toggle,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared switch primitive parameterized by Orca default vs compact size"
+)]
+fn switch_sized(
+    p: &Palette,
+    id: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+    width: Pixels,
+    height: Pixels,
+    thumb: Pixels,
+    on_toggle: impl Fn(bool, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
     let thumb_id: SharedString = format!("{id}-thumb").into();
     let thumb_selector = thumb_id.clone();
-    let track_bg = if checked { p.primary } else { p.muted };
-    let track_border = if checked { p.primary } else { p.border };
+    let track_bg = if checked { p.primary } else { p.input };
+    let track_border = if checked {
+        p.primary
+    } else {
+        super::theme::TRANSPARENT
+    };
     let hover_bg = if checked {
         p.primary.opacity(0.88)
     } else {
-        p.accent
+        p.foreground.opacity(0.22)
     };
     let active_bg = if checked {
         p.primary.opacity(0.75)
     } else {
-        p.accent.opacity(0.8)
+        p.foreground.opacity(0.28)
     };
     let thumb_bg = if checked {
         p.primary_foreground
+    } else if p.is_dark() {
+        p.foreground.opacity(0.9)
     } else {
-        p.muted_foreground
+        p.background
     };
     div()
         .id(ElementId::Name(id.clone()))
@@ -247,9 +299,9 @@ pub fn switch(
             gpui::Toggled::False
         })
         .flex_none()
-        .w(SWITCH_WIDTH)
-        .h(SWITCH_HEIGHT)
-        .p(px(2.))
+        .w(width)
+        .h(height)
+        .p(px(1.))
         .rounded_full()
         .border_1()
         .border_color(track_border)
@@ -279,10 +331,48 @@ pub fn switch(
             div()
                 .id(ElementId::Name(thumb_id))
                 .debug_selector(move || thumb_selector.to_string())
-                .size(SWITCH_THUMB)
+                .size(thumb)
                 .rounded_full()
                 .bg(thumb_bg),
         )
+}
+
+/// Orca `formatShortTimeAgo` (`src/renderer/src/lib/short-time-ago.ts` 1:1):
+/// 콤팩트 상대 시각(`now`, `13m`, `1h`, `18h`, `1d`, `2w`, `3mo`, `1y`).
+#[must_use]
+pub fn format_short_time_ago(ts_ms: u64, now_ms: u64) -> String {
+    format_short_time_ago_secs(ts_ms / 1000, now_ms / 1000)
+}
+
+/// 초 단위 타임스탬프용 콤팩트 상대 시각(`now`, `13m`, `1h`, `1d`, `2w`, `3mo`, `1y`).
+#[must_use]
+pub fn format_short_time_ago_secs(ts_secs: u64, now_secs: u64) -> String {
+    let diff = now_secs.saturating_sub(ts_secs);
+    let mins = diff / 60;
+    if mins < 1 {
+        return "now".to_owned();
+    }
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{days}d");
+    }
+    let weeks = days / 7;
+    if weeks < 4 {
+        return format!("{weeks}w");
+    }
+    let months = days / 30;
+    if months < 12 {
+        return format!("{months}mo");
+    }
+    let years = days / 365;
+    format!("{years}y")
 }
 
 /// 다중 선택지(2~4개) 세그먼트 컨트롤 트랙(Orca `SegmentedControl` 대응, OWE-793).
@@ -1161,5 +1251,42 @@ mod tests {
         vcx.run_until_parked();
         // 두 상태의 세그먼트가 한 컨트롤 안에 그려졌으면 렌더 경로가 동작한 것이다.
         assert!(vcx.debug_bounds("seg-probe-root").is_some());
+    }
+
+    #[test]
+    fn short_time_ago_matches_orca_format() {
+        let now = 1_700_000_000_u64;
+        assert_eq!(super::format_short_time_ago_secs(now, now), "now");
+        assert_eq!(super::format_short_time_ago_secs(now + 10, now), "now");
+        assert_eq!(super::format_short_time_ago_secs(now - 59, now), "now");
+        assert_eq!(super::format_short_time_ago_secs(now - 60, now), "1m");
+        assert_eq!(super::format_short_time_ago_secs(now - 13 * 60, now), "13m");
+        assert_eq!(super::format_short_time_ago_secs(now - 59 * 60, now), "59m");
+        assert_eq!(super::format_short_time_ago_secs(now - 3600, now), "1h");
+        assert_eq!(
+            super::format_short_time_ago_secs(now - 18 * 3600, now),
+            "18h"
+        );
+        assert_eq!(super::format_short_time_ago_secs(now - 86_400, now), "1d");
+        assert_eq!(
+            super::format_short_time_ago_secs(now - 6 * 86_400, now),
+            "6d"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs(now - 7 * 86_400, now),
+            "1w"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs(now - 30 * 86_400, now),
+            "1mo"
+        );
+        assert_eq!(
+            super::format_short_time_ago_secs(now - 365 * 86_400, now),
+            "1y"
+        );
+        assert_eq!(
+            super::format_short_time_ago((now - 120) * 1000, now * 1000),
+            "2m"
+        );
     }
 }

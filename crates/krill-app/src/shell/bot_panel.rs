@@ -40,12 +40,12 @@ impl BotPanelTab {
         }
     }
 
-    fn icon(self) -> &'static [u8] {
+    fn icon(self) -> gpui_kit_assets::IconName {
         match self {
-            Self::Home => ui::icons::HOUSE_SVG,
-            Self::Connectors => ui::icons::PLUG_SVG,
-            Self::Chats => ui::icons::MESSAGE_SQUARE_SVG,
-            Self::Files => ui::icons::FILES_SVG,
+            Self::Home => gpui_kit_assets::IconName::House,
+            Self::Connectors => gpui_kit_assets::IconName::Plug,
+            Self::Chats => gpui_kit_assets::IconName::MessagesSquare,
+            Self::Files => gpui_kit_assets::IconName::Files,
         }
     }
 
@@ -59,8 +59,6 @@ impl BotPanelTab {
     }
 }
 
-/// Below this panel width only the current tab keeps its name (Orca hides labels when narrow).
-const LABELLED_TABS_MIN_WIDTH: f32 = 360.;
 /// At or below this width the header says the short "Next 8:00 PM" (Orca `@max-[284px]`).
 const NARROW_HEADER_WIDTH: f32 = 284.;
 
@@ -418,16 +416,16 @@ impl Shell {
             .font_family(ui::FONT_UI)
             .text_size(ui::TEXT_SM)
             .text_color(p.sidebar_foreground)
-            .child(self.render_bot_panel_tabs(bot, width < LABELLED_TABS_MIN_WIDTH, p, cx))
+            .child(self.render_bot_panel_tabs(bot, p, cx))
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
 
-    /// Orca's labelled bot tabs, with the needs-you count on Home.
+    /// Orca's labelled bot tabs (`activity-bar-buttons.tsx` + `BotActivityPanel.tsx`),
+    /// always showing icon + text label on all 4 tabs, with the white needs-you circle on Home.
     fn render_bot_panel_tabs(
         &self,
         bot: &SidebarBot,
-        compact: bool,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -445,7 +443,7 @@ impl Shell {
         for tab in BotPanelTab::ALL {
             let active = tab == current;
             let selector = tab.selector();
-            // Orca's count pill: a filled circle, the number in the background color.
+            // Orca's count pill: 16px filled white circle with dark count text.
             let badge = (tab == BotPanelTab::Home && bot.attention > 0).then(|| {
                 div()
                     .debug_selector(|| "bot-panel-home-badge".into())
@@ -458,11 +456,16 @@ impl Shell {
                     .px_1()
                     .rounded_full()
                     .bg(p.foreground)
-                    .text_size(ui::TEXT_2XS)
+                    .text_size(ui::TEXT_3XS)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.background)
                     .child(bot.attention.to_string())
             });
+            let fg = if active {
+                p.foreground
+            } else {
+                p.muted_foreground
+            };
             tabs = tabs.child(
                 div()
                     .id(selector)
@@ -474,33 +477,23 @@ impl Shell {
                     .tab_stop(active)
                     .focus_visible(|d| d.border_1().border_color(p.ring))
                     .relative()
-                    .h(px(24.))
+                    .h(px(26.))
                     .px_1p5()
                     .flex_shrink_0()
-                    .rounded(ui::RADIUS_XS)
+                    .rounded(ui::RADIUS_SM)
                     .cursor_pointer()
-                    .when(active, |d| d.bg(p.sidebar_accent))
-                    .hover(|d| d.bg(p.sidebar_accent))
+                    .when(active, |d| d.bg(p.foreground.opacity(0.10)))
+                    .when(!active, |d| {
+                        d.hover(|d| d.bg(p.foreground.opacity(0.05)).text_color(p.foreground))
+                    })
                     .flex()
                     .items_center()
                     .gap_1()
                     .text_size(ui::TEXT_SM)
-                    .text_color(if active {
-                        p.sidebar_accent_foreground
-                    } else {
-                        p.muted_foreground
-                    })
-                    .child(
-                        Icon::default()
-                            .data(tab.icon())
-                            .size(px(ui::ICON_SM))
-                            .text_color(if active {
-                                p.sidebar_accent_foreground
-                            } else {
-                                p.muted_foreground
-                            }),
-                    )
-                    .when(active || !compact, |d| d.child(tab.label()))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg)
+                    .child(Icon::new(tab.icon()).size(px(ui::ICON_SM)).text_color(fg))
+                    .child(tab.label())
                     .children(badge)
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(tab.label()).build(window, cx)
@@ -1000,7 +993,7 @@ impl Shell {
         } else {
             s.link_id.clone().unwrap_or_default().into()
         };
-        let age = krill_app::jump::format_age_secs(s.created_at_ms / 1000, now);
+        let age = ui::format_short_time_ago_secs(s.created_at_ms / 1000, now);
         div()
             .id(id.clone())
             .debug_selector(move || id.to_string())
@@ -1252,7 +1245,7 @@ impl Shell {
                     .flex_none()
                     .text_size(ui::TEXT_2XS)
                     .text_color(p.muted_foreground)
-                    .child(krill_app::jump::format_age_secs(at_ms / 1000, now)),
+                    .child(ui::format_short_time_ago_secs(at_ms / 1000, now)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_session_on(host.clone(), worker, cx);

@@ -263,7 +263,9 @@ fn default_terminal_theme_dark() -> String {
 }
 
 fn default_terminal_theme_light() -> String {
-    crate::ui::DEFAULT_TERMINAL_THEME_LIGHT.to_owned()
+    crate::ui::LightUiTheme::default()
+        .terminal_theme_name()
+        .to_owned()
 }
 
 /// 기본 터미널 커서 모양(OWE-658). `krill_proto::screen::CursorShape`는 와이어 타입이라 설정용 이름을 따로 둔다.

@@ -77,8 +77,7 @@ impl Shell {
         } else if chat.working && (!foldable || open) {
             None
         } else {
-            (chat.at_ms > 0)
-                .then(|| krill_app::jump::format_age_secs(chat.at_ms / 1000, now_secs()))
+            (chat.at_ms > 0).then(|| ui::format_short_time_ago_secs(chat.at_ms / 1000, now_secs()))
         };
         let id = SharedString::from(format!("bot-chat-{}", chat.session.0));
         let bot_id = bot.id.clone();
@@ -108,8 +107,10 @@ impl Shell {
             .text_size(ui::TEXT_SM)
             .text_color(p.muted_foreground)
             .cursor_pointer()
-            .when(chat.active, |d| d.bg(p.sidebar_accent))
-            .when(!chat.active, |d| d.hover(|d| d.bg(p.sidebar_accent)))
+            .when(chat.active, |d| d.bg(p.worktree_sidebar_accent))
+            .when(!chat.active, |d| {
+                d.hover(|d| d.bg(p.worktree_sidebar_accent))
+            })
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 if e.click_count() <= 1 {
                     this.open_bot_session(&bot_id, session, cx);
@@ -324,7 +325,7 @@ impl Shell {
                         .bottom(px(-4.))
                         .size(px(9.))
                         .rounded_full()
-                        .bg(p.sidebar)
+                        .bg(p.worktree_sidebar)
                         .flex()
                         .items_center()
                         .justify_center()

@@ -7250,9 +7250,9 @@ impl Shell {
             .flex()
             .items_center()
             .gap_1()
-            .bg(p.sidebar)
+            .bg(p.worktree_sidebar)
             .border_b_1()
-            .border_color(p.sidebar_border)
+            .border_color(p.worktree_sidebar_border)
             .text_color(p.muted_foreground)
             .child(
                 div()
@@ -7265,7 +7265,7 @@ impl Shell {
                     .gap_1p5()
                     .text_size(krill_app::ui::TEXT_SM)
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(p.sidebar_foreground)
+                    .text_color(p.worktree_sidebar_foreground)
                     .child(
                         krill_app::ui::icons::krill_brand_icon(krill_app::ui::ICON_MD, p)
                             .debug_selector(|| "titlebar-brand-mark".into()),
@@ -9479,7 +9479,8 @@ impl Render for Shell {
                                 .flex_none()
                                 .w(px(sidebar_width))
                                 .h_full()
-                                .bg(sidebar_bg)
+                                .bg(p.worktree_sidebar)
+                                .text_color(p.worktree_sidebar_foreground)
                                 .flex()
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))
