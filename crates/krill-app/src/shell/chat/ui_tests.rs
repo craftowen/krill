@@ -3714,6 +3714,7 @@ fn remote_bot_without_workspace_footer_does_not_overwrite_clipboard_and_efforts_
         s.launch_host = remote.clone();
         s.layout.set_host(pane, remote.clone());
         let mut bot = bot_for(SESSION, false);
+        bot.host = remote.clone();
         bot.workspace = None;
         s.sidebar_bots = vec![bot];
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("keep-me".into()));

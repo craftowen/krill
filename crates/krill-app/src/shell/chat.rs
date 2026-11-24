@@ -1307,12 +1307,11 @@ impl Shell {
     /// another chat the changes it made. The bot's items are read again every few seconds.
     pub(super) fn sync_bot_item_notes(&mut self, key: &ChatKey, cx: &mut Context<Self>) {
         const REFRESH: Duration = Duration::from_secs(5);
-        if key.0 == self.launch_host
-            && let Some(live_bot) = self
-                .sidebar_bots
-                .iter()
-                .find(|b| b.sessions.iter().any(|s| s.session_id == key.1))
-                .cloned()
+        if let Some(live_bot) = self
+            .sidebar_bots
+            .iter()
+            .find(|b| b.host == key.0 && b.sessions.iter().any(|s| s.session_id == key.1))
+            .cloned()
         {
             self.chat.cached_bots.insert(key.clone(), live_bot);
         }
@@ -1337,6 +1336,15 @@ impl Shell {
             && let Some(rpc) = self.bot_rpc_on(&key.0)
         {
             let id = bot_id;
+            #[cfg(test)]
+            let target: Option<krill_app::hosts::HostTarget> = None;
+            #[cfg(not(test))]
+            let target = self.target_for_host(&key.0).or_else(|| {
+                key.0
+                    .is_local()
+                    .then(|| krill_app::hosts::HostTarget::local_dev().ok())
+                    .flatten()
+            });
             let task_bot_key = bot_key.clone();
             let task = cx.spawn(async move |this, cx| {
                 use krill_proto::bots::{BotRpcRequest, BotRpcResponse};
@@ -1344,20 +1352,46 @@ impl Shell {
                 let (items, soul, memory, offers) = cx
                     .background_executor()
                     .spawn(async move {
-                        (
-                            rpc(&BotRpcRequest::ListItems {
+                        let reqs = [
+                            BotRpcRequest::ListItems {
                                 bot_id: Some(bot.clone()),
                                 include_closed: true,
-                            }),
-                            rpc(&BotRpcRequest::GetSoul {
+                            },
+                            BotRpcRequest::GetSoul {
                                 bot_id: bot.clone(),
-                            }),
-                            rpc(&BotRpcRequest::GetMemoryHistory {
+                            },
+                            BotRpcRequest::GetMemoryHistory {
                                 bot_id: bot.clone(),
                                 limit: Some(50),
-                            }),
-                            rpc(&BotRpcRequest::ListBotOffers { bot_id: bot }),
-                        )
+                            },
+                            BotRpcRequest::ListBotOffers { bot_id: bot },
+                        ];
+                        match krill_app::bots::rpc::call_checked_batch_on(
+                            target.as_ref(),
+                            &rpc,
+                            &reqs,
+                            None,
+                        ) {
+                            Ok(mut slots) if slots.len() == 4 => {
+                                let offers = slots.pop().unwrap_or_else(|| Err(String::new()));
+                                let memory = slots.pop().unwrap_or_else(|| Err(String::new()));
+                                let soul = slots.pop().unwrap_or_else(|| Err(String::new()));
+                                let items = slots.pop().unwrap_or_else(|| Err(String::new()));
+                                (items, soul, memory, offers)
+                            }
+                            Ok(_) => (
+                                Err(String::new()),
+                                Err(String::new()),
+                                Err(String::new()),
+                                Err(String::new()),
+                            ),
+                            Err(err) => (
+                                Err(err.clone()),
+                                Err(err.clone()),
+                                Err(err.clone()),
+                                Err(err),
+                            ),
+                        }
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -1425,13 +1459,10 @@ impl Shell {
 
     /// The bot whose chat this is (Orca's bot chat: persona, permission chip, its folder).
     pub(super) fn chat_bot(&self, key: &ChatKey) -> Option<&krill_app::bots::SidebarBot> {
-        if key.0 == self.launch_host {
-            return self
-                .sidebar_bots
-                .iter()
-                .find(|b| b.sessions.iter().any(|s| s.session_id == key.1));
-        }
-        self.chat.cached_bots.get(key)
+        self.sidebar_bots
+            .iter()
+            .find(|b| b.host == key.0 && b.sessions.iter().any(|s| s.session_id == key.1))
+            .or_else(|| self.chat.cached_bots.get(key))
     }
 
     pub(super) fn chat_host_label(

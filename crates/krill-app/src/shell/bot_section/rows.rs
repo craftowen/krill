@@ -160,7 +160,7 @@ impl Shell {
         focused: Option<SessionId>,
         cx: &gpui::App,
     ) -> BotFacts {
-        let host = &self.launch_host;
+        let host = &bot.host;
         let sidebar = self.sidebar.read(cx);
         let hide_sleeping = self.bot_view(cx).hide_sleeping_workers;
         let orch = self.orch_snapshot_for(host);
@@ -397,14 +397,16 @@ impl Shell {
             }
             return section.into_any_element();
         }
-        let focused = self
-            .focused_session()
-            .filter(|(host, _)| *host == self.launch_host)
-            .map(|(_, s)| s);
+        let focused = self.focused_session();
         let facts: Vec<BotFacts> = self
             .sidebar_bots
             .iter()
-            .map(|b| self.bot_facts(b, focused, cx))
+            .map(|b| {
+                let bot_focused = focused
+                    .as_ref()
+                    .and_then(|(h, s)| (*h == b.host).then_some(*s));
+                self.bot_facts(b, bot_focused, cx)
+            })
             .collect();
         let group_facts: Vec<super::group_rows::GroupFacts> = self
             .sidebar_groups
@@ -500,7 +502,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let has_children = !facts.chats.is_empty() || !facts.stray.is_empty();
-        let folded = self.bot_ui.folded.contains(&bot.id);
+        let folded = self
+            .bot_ui
+            .folded
+            .contains(&(bot.host.clone(), bot.id.clone()));
         div()
             .w_full()
             .flex()
@@ -525,16 +530,25 @@ impl Shell {
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let row_id = format!("bot-row-{}", bot.id.as_str());
-        let row_sel = row_id.clone();
-        let group = SharedString::from(format!("bot-row-group-{}", bot.id.as_str()));
+        let row_sel = format!("bot-row-{}", bot.id.as_str());
+        let row_id = if bot.host.is_local() {
+            row_sel.clone()
+        } else {
+            format!("bot-row-{}-{}", bot.host.as_key(), bot.id.as_str())
+        };
+        let group = SharedString::from(if bot.host.is_local() {
+            format!("bot-row-group-{}", bot.id.as_str())
+        } else {
+            format!("bot-row-group-{}-{}", bot.host.as_key(), bot.id.as_str())
+        });
+        let open_host = bot.host.clone();
         let open_id = bot.id.clone();
         let renaming = self
             .bot_ui
             .renaming
             .as_ref()
-            .filter(|(id, _, _)| *id == bot.id)
-            .map(|(_, input, _)| input.clone());
+            .filter(|(host, id, _, _)| *host == bot.host && *id == bot.id)
+            .map(|(_, _, input, _)| input.clone());
         let now = now_secs();
         let age = match &facts.line {
             Some(RowLine::Activity { at: Some(at), .. }) => {
@@ -564,7 +578,7 @@ impl Shell {
                 .child(bot.name.clone())
                 .into_any_element(),
         };
-        let line = self.render_bot_line(bot, facts, p);
+        let line = self.render_bot_line(bot, facts, p, cx);
         // Orca #46717: working shows once at the row's end — on the fold strip when the bot has
         // one, else in its own trailing slot lined up with fold rows' marks.
         let bot_working = !bot.paused && facts.status == RowStatus::Working;
@@ -615,9 +629,9 @@ impl Shell {
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                 // A double click's second click renames, as Orca's.
                 if e.click_count() > 1 {
-                    this.start_bot_rename(&open_id, window, cx);
+                    this.start_bot_rename_on(&open_host, &open_id, window, cx);
                 } else {
-                    this.open_bot_home(open_id.clone(), None, cx);
+                    this.open_bot_home_on(&open_host, open_id.clone(), None, cx);
                 }
             }))
             .child(
@@ -630,10 +644,11 @@ impl Shell {
             )
             .child(
                 div()
-                    .id(SharedString::from(format!(
-                        "bot-row-body-{}",
-                        bot.id.as_str()
-                    )))
+                    .id(SharedString::from(if bot.host.is_local() {
+                        format!("bot-row-body-{}", bot.id.as_str())
+                    } else {
+                        format!("bot-row-body-{}-{}", bot.host.as_key(), bot.id.as_str())
+                    }))
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -681,6 +696,7 @@ impl Shell {
         bot: &SidebarBot,
         facts: &BotFacts,
         p: &'static ui::Palette,
+        cx: &gpui::App,
     ) -> Option<gpui::Div> {
         let (place, words): (Option<String>, String) = if let Some(limit) = &facts.limit {
             (limit.place.clone(), limit.text())
@@ -690,10 +706,19 @@ impl Shell {
                 .as_ref()
                 .map_or_else(|| (None, bot.description.clone()), line_words)
         };
-        let remote = !self.launch_host.is_local();
-        if words.is_empty() && place.is_none() && !remote {
+        let remote_label = (!bot.host.is_local()).then(|| self.host_display_label(&bot.host, cx));
+        if words.is_empty() && place.is_none() && remote_label.is_none() {
             return None;
         }
+        let summary = match place {
+            Some(place) => format!("{place} · {words}"),
+            None => words,
+        };
+        let display = match remote_label.as_ref() {
+            Some(host) if summary.is_empty() => host.to_string(),
+            Some(host) => format!("{host} · {summary}"),
+            None => summary,
+        };
         Some(
             div()
                 .flex()
@@ -703,8 +728,8 @@ impl Shell {
                 .text_size(ui::TEXT_SM)
                 .line_height(px(16.))
                 .text_color(p.muted_foreground)
-                // A paired server's bot: a server glyph, its name in the hover card.
-                .when(remote, |d| {
+                // A paired server's bot: a server glyph + host name, and full details in the hover card.
+                .when(remote_label.is_some(), |d| {
                     d.child(ui::icons::svg_box(
                         ui::icons::SERVER_SVG,
                         ui::ICON_XS,
@@ -717,10 +742,7 @@ impl Shell {
                         .min_w_0()
                         .truncate()
                         .when(facts.unread, |d| d.text_color(p.foreground))
-                        .child(match place {
-                            Some(place) => format!("{place} · {words}"),
-                            None => words,
-                        }),
+                        .child(display),
                 ),
         )
     }
@@ -771,7 +793,7 @@ impl Shell {
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let fold_id = bot.id.clone();
+        let fold_key = (bot.host.clone(), bot.id.clone());
         let name = bot.name.clone();
         let mut workers = facts
             .chats
@@ -810,8 +832,13 @@ impl Shell {
             base_label
         };
         let mark_sel = format!("bot-fold-mark-{}", bot.id.as_str());
+        let fold_elem_id = if bot.host.is_local() {
+            format!("bot-fold-{}", bot.id.as_str())
+        } else {
+            format!("bot-fold-{}-{}", bot.host.as_key(), bot.id.as_str())
+        };
         div()
-            .id(SharedString::from(format!("bot-fold-{}", bot.id.as_str())))
+            .id(SharedString::from(fold_elem_id))
             .debug_selector({
                 let sel = format!("bot-fold-{}", bot.id.as_str());
                 move || sel.clone()
@@ -834,8 +861,8 @@ impl Shell {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                if !this.bot_ui.folded.remove(&fold_id) {
-                    this.bot_ui.folded.insert(fold_id.clone());
+                if !this.bot_ui.folded.remove(&fold_key) {
+                    this.bot_ui.folded.insert(fold_key.clone());
                 }
                 cx.notify();
             }))
@@ -889,7 +916,7 @@ impl Shell {
     + 'static {
         let menu_bot = bot.clone();
         let folder = self.bot_folder(bot);
-        let local = self.launch_host.is_local();
+        let host = bot.host.clone();
         let unread = facts.unread;
         let sessions: Vec<SessionId> = facts.chats.iter().map(|c| c.session).collect();
         move |menu, _, _| {
@@ -900,31 +927,35 @@ impl Shell {
                     this.update(cx, |s, cx| f(s, window, cx)).ok();
                 }
             };
+            let rename_host = host.clone();
             let id = bot.id.clone();
             let rename = act(Box::new(move |s, window, cx| {
-                s.start_bot_rename(&id, window, cx);
+                s.start_bot_rename_on(&rename_host, &id, window, cx);
             }));
+            let settings_host = host.clone();
             let id = bot.id.clone();
             let settings = act(Box::new(move |s, window, cx| {
-                if !s.open_bot_settings_in_panel(&id, cx) {
-                    s.open_bot(Some(id.clone()), Some(window), cx);
+                if !s.open_bot_settings_in_panel_on(&settings_host, &id, cx) {
+                    s.open_bot_on(&settings_host, Some(id.clone()), Some(window), cx);
                 }
             }));
+            let pause_host = host.clone();
             let id = bot.id.clone();
             let paused = bot.paused;
             let pause = act(Box::new(move |s, _, cx| {
-                s.set_bot_paused(id.clone(), !paused, cx);
+                s.set_bot_paused_on(&pause_host, id.clone(), !paused, cx);
             }));
+            let read_host = host.clone();
             let ids = sessions.clone();
             let read = act(Box::new(move |s, _, cx| {
-                let host = s.launch_host.clone();
                 let ids = ids.clone();
+                let read_host = read_host.clone();
                 s.sidebar.update(cx, |sb, cx| {
                     for id in &ids {
                         if unread {
-                            sb.mark_session_read(&host, *id, cx);
+                            sb.mark_session_read(&read_host, *id, cx);
                         } else {
-                            sb.mark_session_unread(&host, *id, cx);
+                            sb.mark_session_unread(&read_host, *id, cx);
                         }
                     }
                 });
@@ -969,18 +1000,16 @@ impl Shell {
                         }),
                 );
             }
-            if local {
-                menu = menu.item(
-                    PopupMenuItem::new(if unread {
-                        text::SB_MARK_READ.get()
-                    } else {
-                        text::SB_MARK_UNREAD.get()
-                    })
-                    .icon(gpui_component::Icon::default().data(ui::icons::BELL_SVG))
-                    .disabled(sessions.is_empty())
-                    .on_click(read),
-                );
-            }
+            menu = menu.item(
+                PopupMenuItem::new(if unread {
+                    text::SB_MARK_READ.get()
+                } else {
+                    text::SB_MARK_UNREAD.get()
+                })
+                .icon(gpui_component::Icon::default().data(ui::icons::BELL_SVG))
+                .disabled(sessions.is_empty())
+                .on_click(read),
+            );
             menu.separator().item(
                 PopupMenuItem::new(text::SB_DELETE.get())
                     .icon(IconName::Delete)
@@ -990,17 +1019,23 @@ impl Shell {
     }
 
     /// Orca `WorktreeTitleInlineRename` on the bot row: Enter saves, Escape or leaving cancels.
-    pub(super) fn start_bot_rename(
+    pub(super) fn start_bot_rename_on(
         &mut self,
+        host: &krill_app::hosts::HostId,
         bot_id: &BotId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(bot) = self.sidebar_bots.iter().find(|b| &b.id == bot_id) else {
+        let Some(bot) = self
+            .sidebar_bots
+            .iter()
+            .find(|b| &b.host == host && &b.id == bot_id)
+        else {
             return;
         };
         let name = bot.name.clone();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let host_owned = host.clone();
         let id = bot_id.clone();
         let sub = cx.subscribe_in(
             &input,
@@ -1015,7 +1050,7 @@ impl Shell {
                     }
                     let name = input.read(cx).value().trim().to_owned();
                     this.bot_ui.renaming = None;
-                    this.rename_bot(id.clone(), name, cx);
+                    this.rename_bot_on(&host_owned, id.clone(), name, cx);
                 }
                 InputEvent::Blur => {
                     this.bot_ui.renaming = None;
@@ -1028,23 +1063,39 @@ impl Shell {
             s.focus(window, cx);
             s.select_all(window, cx);
         });
-        self.bot_ui.renaming = Some((bot_id.clone(), input, sub));
+        self.bot_ui.renaming = Some((host.clone(), bot_id.clone(), input, sub));
         cx.notify();
     }
 
-    fn rename_bot(&mut self, bot_id: BotId, name: String, cx: &mut Context<Self>) {
-        let Some(rpc) = self.bot_rpc() else {
+    fn rename_bot_on(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        bot_id: BotId,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         let unchanged = self
             .sidebar_bots
             .iter()
-            .any(|b| b.id == bot_id && b.name == name);
+            .any(|b| b.host == host_owned && b.id == bot_id && b.name == name);
         if name.is_empty() || unchanged {
             cx.notify();
             return;
         }
-        if let Some(b) = self.sidebar_bots.iter_mut().find(|b| b.id == bot_id) {
+        if let Some(b) = self
+            .sidebar_bots
+            .iter_mut()
+            .find(|b| b.host == host_owned && b.id == bot_id)
+        {
+            b.name.clone_from(&name);
+        }
+        if let Some(entry) = self.bot_ui.hosts.get_mut(&host_owned)
+            && let Some(b) = entry.snapshot.bots.iter_mut().find(|b| b.id == bot_id)
+        {
             b.name.clone_from(&name);
         }
         cx.notify();
@@ -1082,7 +1133,7 @@ impl Shell {
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })
@@ -1101,9 +1152,9 @@ impl Shell {
         let avatar_img = self
             .bot_ui
             .avatars
-            .get(&bot.id)
+            .get(&(bot.host.clone(), bot.id.clone()))
             .and_then(|(_, img)| img.clone());
-        let host_label = (!self.launch_host.is_local()).then(|| self.bot_host_label(cx));
+        let host_label = (!bot.host.is_local()).then(|| self.host_display_label(&bot.host, cx));
         let state: String = if bot.paused {
             text::PAUSED_BADGE.get().to_owned()
         } else {
@@ -1174,6 +1225,7 @@ impl Shell {
         let items = bot.items_need_you;
         let total = asks.len() + items;
         let show_needs = !bot.paused && total > 0;
+        let home_host = bot.host.clone();
         let home_id = bot.id.clone();
         move |window, cx| {
             let bot = bot.clone();
@@ -1183,14 +1235,17 @@ impl Shell {
             let latest = latest.clone();
             let asks = asks.clone();
             let this = this.clone();
+            let home_host = home_host.clone();
             let home_id = home_id.clone();
             gpui_component::tooltip::Tooltip::element(move |_, cx| {
                 let p = ui::palette(cx);
                 let open_home = {
                     let this = this.clone();
+                    let host = home_host.clone();
                     let id = home_id.clone();
                     move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
-                        this.update(cx, |s, cx| s.open_bot_home_panel(&id, cx)).ok();
+                        this.update(cx, |s, cx| s.open_bot_home_panel_on(&host, &id, cx))
+                            .ok();
                     }
                 };
                 let home_label = text::SB_OPEN_HOME.format(&[("name", &bot.name)]);
@@ -1423,8 +1478,13 @@ impl Shell {
 
     /// Opens the bot's page with its Home tab showing, where Needs you leads (Orca
     /// `openBotHomePanelFromSidebar`).
-    fn open_bot_home_panel(&mut self, bot_id: &BotId, cx: &mut Context<Self>) {
-        self.open_bot_home(bot_id.clone(), None, cx);
+    fn open_bot_home_panel_on(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        bot_id: &BotId,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_bot_home_on(host, bot_id.clone(), None, cx);
         if self.panel_collapsed {
             self.toggle_panel(cx);
         }

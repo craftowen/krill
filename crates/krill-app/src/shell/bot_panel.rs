@@ -13,6 +13,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use krill_app::bots::{DetailTab, SidebarBot};
+use krill_app::hosts::HostId;
 use krill_app::i18n::catalog::bots as text;
 use krill_app::ui;
 use krill_proto::bots::{BotId, BotRpcRequest, BotSessionSummary};
@@ -71,7 +72,7 @@ pub(super) struct BotPanel {
     /// The Bots view drawn as the Home, Connectors and settings bodies.
     pub view: Option<Entity<krill_app::bots::View>>,
     /// What `view` was last told to show, so a render doesn't repeat it.
-    pub shown: Option<(BotId, DetailTab)>,
+    pub shown: Option<(HostId, BotId, DetailTab)>,
     /// The bot list changed since `view` last loaded it.
     pub stale: bool,
     pub chat_search: Option<(Entity<InputState>, Subscription)>,
@@ -84,7 +85,7 @@ pub(super) struct BotPanel {
     /// settings subpage crumb, and the group panel filter state/counts.
     pub home_chrome: HomeChrome,
     /// A draft for this bot's Home Chat composer, put in once its chat is on screen.
-    pub pending_draft: Option<(BotId, String)>,
+    pub pending_draft: Option<(HostId, BotId, String)>,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -140,20 +141,23 @@ impl Shell {
     /// The bot owning `pane`: its explicit split launcher binding, one of its live chats,
     /// a session/terminal running in its folder, or a file inside its folder.
     pub(super) fn bot_for_pane(&self, pane: krill_app::layout::PaneId) -> Option<&SidebarBot> {
+        let pane_host = self.layout.host(pane);
         if let Some(bot_id) = self
             .split_launchers
             .get(&pane)
             .and_then(|l| l.bot_id.as_ref())
         {
-            return self.sidebar_bots.iter().find(|b| &b.id == bot_id);
-        }
-        if self.layout.host(pane) != &self.launch_host {
-            return None;
+            return self
+                .sidebar_bots
+                .iter()
+                .find(|b| &b.host == pane_host && &b.id == bot_id);
         }
         if let Some(file) = self.layout.file(pane) {
             return self.sidebar_bots.iter().find(|b| {
-                self.bot_folder(b)
-                    .is_some_and(|f| path_within_bot_folder(file, &f))
+                &b.host == pane_host
+                    && self
+                        .bot_folder(b)
+                        .is_some_and(|f| path_within_bot_folder(file, &f))
             });
         }
         let session = self.layout.session(pane);
@@ -161,10 +165,9 @@ impl Shell {
         // briefly carry the previous tab's inherited `cwd`, and a bot may run in a shared
         // workspace, so another bot earlier in `sidebar_bots` must never steal the right panel.
         if let Some(session_id) = session
-            && let Some(bot) = self
-                .sidebar_bots
-                .iter()
-                .find(|b| b.sessions.iter().any(|x| x.session_id == session_id))
+            && let Some(bot) = self.sidebar_bots.iter().find(|b| {
+                &b.host == pane_host && b.sessions.iter().any(|x| x.session_id == session_id)
+            })
         {
             return Some(bot);
         }
@@ -173,8 +176,10 @@ impl Shell {
             std::path::PathBuf::from(std::ffi::OsString::from_vec(self.launch_for(pane).cwd))
         };
         self.sidebar_bots.iter().find(|b| {
-            self.bot_folder(b)
-                .is_some_and(|f| same_bot_folder(&f, &cwd))
+            &b.host == pane_host
+                && self
+                    .bot_folder(b)
+                    .is_some_and(|f| same_bot_folder(&f, &cwd))
         })
     }
 
@@ -185,13 +190,17 @@ impl Shell {
         self.bot_for_pane(pane)
     }
 
-    /// Opens Bot settings in the right sidebar when `bot_id` is the bot page on screen.
-    pub(super) fn open_bot_settings_in_panel(
+    /// Opens Bot settings in the right sidebar when `(host, bot_id)` is the bot page on screen.
+    pub(super) fn open_bot_settings_in_panel_on(
         &mut self,
+        host: &HostId,
         bot_id: &BotId,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.focused_bot().is_none_or(|b| &b.id != bot_id) {
+        if self
+            .focused_bot()
+            .is_none_or(|b| &b.host != host || &b.id != bot_id)
+        {
             return false;
         }
         if self.panel_collapsed {
@@ -203,24 +212,38 @@ impl Shell {
         true
     }
 
-    /// The Bots view behind the panel bodies, built once per host (once its connection is up).
+    /// The Bots view behind the panel bodies on `launch_host`.
+    #[cfg(test)]
     pub(super) fn bot_panel_view(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<Entity<krill_app::bots::View>> {
+        let host = self.launch_host.clone();
+        self.bot_panel_view_on(&host, cx)
+    }
+
+    /// The Bots view behind the panel bodies, built once per host (once its connection is up).
+    pub(super) fn bot_panel_view_on(
+        &mut self,
+        host: &HostId,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<krill_app::bots::View>> {
         if let Some(view) = &self.bot_ui.panel.view
-            && view.read(cx).host() == &self.launch_host
+            && view.read(cx).host() == host
         {
             return Some(view.clone());
         }
         #[cfg(test)]
         let view = {
-            let rpc = self.bot_rpc()?;
-            cx.new(|cx| krill_app::bots::View::with_rpc(rpc, None, cx).into_panel())
+            let rpc = self.bot_rpc_on(host)?;
+            let host_owned = host.clone();
+            cx.new(|cx| {
+                krill_app::bots::View::with_rpc_on_host(host_owned, rpc, None, cx).into_panel()
+            })
         };
         #[cfg(not(test))]
         let view = {
-            let host = self.launch_host.clone();
+            let host = host.clone();
             let target = self.target_for_host(&host);
             // A remote host still connecting has no target yet; don't fall back to this Mac.
             if !host.is_local() && target.is_none() {
@@ -233,9 +256,11 @@ impl Shell {
         // when those change, not on every change inside the view.
         cx.subscribe(
             &view,
-            |this, _, ev: &krill_app::bots::DraftInHomeChat, cx| {
-                this.bot_ui.panel.pending_draft = Some((ev.bot_id.clone(), ev.text.clone()));
-                this.open_bot_home(ev.bot_id.clone(), None, cx);
+            |this, view, ev: &krill_app::bots::DraftInHomeChat, cx| {
+                let host = view.read(cx).host().clone();
+                this.bot_ui.panel.pending_draft =
+                    Some((host.clone(), ev.bot_id.clone(), ev.text.clone()));
+                this.open_bot_home_on(&host, ev.bot_id.clone(), None, cx);
             },
         )
         .detach();
@@ -288,16 +313,19 @@ impl Shell {
 
     /// Puts a pending draft in the bot's Home Chat composer once that chat is the focused pane.
     fn apply_pending_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((bot_id, _)) = &self.bot_ui.panel.pending_draft else {
+        let Some((host, bot_id, _)) = &self.bot_ui.panel.pending_draft else {
             return;
         };
         let Some(pane) = self.layout.focused() else {
             return;
         };
+        if self.layout.host(pane) != host {
+            return;
+        }
         let home = self
             .sidebar_bots
             .iter()
-            .find(|b| &b.id == bot_id)
+            .find(|b| &b.host == host && &b.id == bot_id)
             .and_then(SidebarBot::home_session)
             .map(|h| h.session_id);
         if home.is_none() || self.layout.session(pane) != home {
@@ -306,7 +334,7 @@ impl Shell {
         let Some(key) = self.chat_key(pane) else {
             return;
         };
-        let Some((_, draft)) = self.bot_ui.panel.pending_draft.take() else {
+        let Some((_, _, draft)) = self.bot_ui.panel.pending_draft.take() else {
             return;
         };
         let input = self.ensure_chat_input(key, window, cx);
@@ -329,6 +357,7 @@ impl Shell {
         if tab == BotPanelTab::Chats {
             self.ensure_bot_chat_search(window, cx);
         }
+        let host = bot.host.clone();
         let detail = match (tab, self.bot_ui.panel.settings) {
             (BotPanelTab::Home, Some(page)) => Some(page),
             (BotPanelTab::Home, None) => Some(DetailTab::Items),
@@ -336,12 +365,11 @@ impl Shell {
             _ => None,
         };
         let view = detail.and_then(|page| {
-            let view = self.bot_panel_view(cx)?;
+            let view = self.bot_panel_view_on(&host, cx)?;
             if std::mem::take(&mut self.bot_ui.panel.stale) {
                 view.update(cx, krill_app::bots::View::reload);
             }
             // The bot's chats waiting on the owner are Home's asks.
-            let host = self.launch_host.clone();
             let states: std::collections::BTreeMap<_, _> = bot
                 .sessions
                 .iter()
@@ -353,7 +381,7 @@ impl Shell {
                 })
                 .collect();
             view.update(cx, |v, cx| v.set_session_states(states, cx));
-            let want = (bot.id.clone(), page);
+            let want = (host.clone(), bot.id.clone(), page);
             if self.bot_ui.panel.shown.as_ref() != Some(&want) {
                 // Held back by unsaved Soul edits: ask again next time instead of showing the
                 // other bot under this one's page.
@@ -366,15 +394,20 @@ impl Shell {
         // Switching bots while on the Chats tab still needs `view` synced so `chat_workers(&bot.id)`
         // reflects the focused bot rather than a previous bot or group panel.
         if tab == BotPanelTab::Chats
-            && let Some(view) = self.bot_panel_view(cx)
+            && let Some(view) = self.bot_panel_view_on(&host, cx)
         {
             if std::mem::take(&mut self.bot_ui.panel.stale) {
                 view.update(cx, krill_app::bots::View::reload);
             }
-            if self.bot_ui.panel.shown.as_ref().map(|(id, _)| id) != Some(&bot.id)
-                && view.update(cx, |v, cx| v.show_in_panel(&bot.id, DetailTab::Items, cx))
+            let same_bot = self
+                .bot_ui
+                .panel
+                .shown
+                .as_ref()
+                .is_some_and(|(h, id, _)| h == &host && id == &bot.id);
+            if !same_bot && view.update(cx, |v, cx| v.show_in_panel(&bot.id, DetailTab::Items, cx))
             {
-                self.bot_ui.panel.shown = Some((bot.id.clone(), DetailTab::Items));
+                self.bot_ui.panel.shown = Some((host, bot.id.clone(), DetailTab::Items));
             }
         }
         let body: AnyElement = match tab {
@@ -654,6 +687,7 @@ impl Shell {
             )
         });
         let paused = bot.paused;
+        let pause_host = bot.host.clone();
         let pause_id = bot.id.clone();
         let folder = self.bot_folder(bot);
         let this = cx.weak_entity();
@@ -721,6 +755,7 @@ impl Shell {
                     .accessibility_label(text::BP_MORE.get())
                     .dropdown_menu(move |menu, _, _| {
                         let this = this.clone();
+                        let host = pause_host.clone();
                         let id = pause_id.clone();
                         let menu = menu.item(
                             PopupMenuItem::new(if paused {
@@ -734,8 +769,10 @@ impl Shell {
                                 IconName::Pause
                             })
                             .on_click(move |_, _, cx| {
-                                this.update(cx, |s, cx| s.set_bot_paused(id.clone(), !paused, cx))
-                                    .ok();
+                                this.update(cx, |s, cx| {
+                                    s.set_bot_paused_on(&host, id.clone(), !paused, cx);
+                                })
+                                .ok();
                             }),
                         );
                         // Orca's Share bot… publishes a link through its cloud; Krill shares the
@@ -939,24 +976,28 @@ impl Shell {
         let focused = self
             .layout
             .focused()
-            .and_then(|pane| self.layout.session(pane));
-        let active = focused == Some(s.session_id);
+            .and_then(|pane| Some((self.layout.host(pane), self.layout.session(pane)?)));
+        let active = focused == Some((&bot.host, s.session_id));
         let session = s.session_id;
         let live = s.live;
         let home = s.link_id.is_none();
         let id = SharedString::from(format!("bot-panel-chat-{}", s.session_id.0));
         let group: SharedString = format!("bot-chat-{}", s.session_id.0).into();
+        let open_host = bot.host.clone();
+        let fold_host = bot.host.clone();
         let open_id = bot.id.clone();
         let menu = {
             let this = cx.weak_entity();
+            let menu_host = bot.host.clone();
             let menu_bot = bot.id.clone();
             move |menu: gpui_component::menu::PopupMenu| {
                 let action = |req: fn(BotId, krill_proto::SessionId) -> BotRpcRequest| {
                     let this = this.clone();
+                    let host = menu_host.clone();
                     let bot = menu_bot.clone();
                     move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
                         this.update(cx, |s, cx| {
-                            s.run_bot_chat_action(req(bot.clone(), session), cx);
+                            s.run_bot_chat_action_on(&host, req(bot.clone(), session), cx);
                         })
                         .ok();
                     }
@@ -1023,7 +1064,7 @@ impl Shell {
             .when(active, |d| d.bg(p.sidebar_accent))
             .hover(|d| d.bg(p.sidebar_accent))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_bot_session(&open_id, session, cx);
+                this.open_bot_session_on(&open_host, &open_id, session, cx);
             }))
             .context_menu(move |m, _, _| menu(m))
             .child(
@@ -1090,7 +1131,7 @@ impl Shell {
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    let key = (this.launch_host.clone(), session);
+                                    let key = (fold_host.clone(), session);
                                     if !this.bot_ui.panel.chat_folded.remove(&key) {
                                         this.bot_ui.panel.chat_folded.insert(key);
                                     }
@@ -1198,8 +1239,10 @@ impl Shell {
     }
 
     /// Orca's `BotChatTreeWorkerRow`: the worker's state, its title and age; a click opens it.
+    #[expect(clippy::too_many_arguments, reason = "worker row render inputs")]
     fn render_bot_chat_worker(
         &self,
+        host: &HostId,
         worker: krill_proto::SessionId,
         fallback_name: Option<String>,
         at_ms: u64,
@@ -1207,7 +1250,7 @@ impl Shell {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let host = self.launch_host.clone();
+        let host = host.clone();
         let sidebar = self.sidebar.read(cx);
         let session = sidebar.session_on(&host, worker);
         let state = session.map_or(krill_proto::control::AgentState::Exited, |s| s.status.state);
@@ -1266,6 +1309,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let q = self.bot_ui.panel.chat_query.trim().to_lowercase();
+        let new_host = bot.host.clone();
         let new_id = bot.id.clone();
         let search = self.bot_ui.panel.chat_search.as_ref().map(|(input, _)| {
             div()
@@ -1285,13 +1329,19 @@ impl Shell {
                 ui::secondary("bot-chats-new", text::BP_NEW_CHAT.get())
                     .debug_selector(|| "bot-chats-new".into())
                     .icon(IconName::Plus)
-                    .disabled(bot.paused || self.bot_ui.opening.contains(&bot.id))
+                    .disabled(
+                        bot.paused
+                            || self
+                                .bot_ui
+                                .opening
+                                .contains(&(bot.host.clone(), bot.id.clone())),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.start_bot_session(new_id.clone(), None, cx);
+                        this.start_bot_session_on(&new_host, new_id.clone(), None, cx);
                     })),
             );
         let now = super::bot_section::now_secs();
-        let host = self.launch_host.clone();
+        let host = bot.host.clone();
         let orch = self.orch_snapshot_for(&host);
         let linked_workers = self
             .bot_ui
@@ -1412,7 +1462,8 @@ impl Shell {
             if open {
                 let mut tree = div().mb_1().ml_6().flex().flex_col();
                 for (worker, at, name) in mine {
-                    tree = tree.child(self.render_bot_chat_worker(worker, name, at, now, p, cx));
+                    tree = tree
+                        .child(self.render_bot_chat_worker(&host, worker, name, at, now, p, cx));
                 }
                 list = list.child(tree);
             }
@@ -1469,10 +1520,16 @@ impl Shell {
     }
 
     /// Stop, run again or take over: one krilld call, then the sidebar poll catches up.
-    fn run_bot_chat_action(&mut self, request: BotRpcRequest, cx: &mut Context<Self>) {
-        let Some(rpc) = self.bot_rpc() else {
+    fn run_bot_chat_action_on(
+        &mut self,
+        host: &HostId,
+        request: BotRpcRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -1482,7 +1539,7 @@ impl Shell {
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })

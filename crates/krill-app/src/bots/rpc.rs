@@ -1,10 +1,11 @@
 // Adapted from Orca (Copyright (c) 2026 Lovecast Inc., MIT License).
 //! Non-blocking RPC transport, response validation, avatar/session metadata, and CSV helpers for Krill Bots UI.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Write as _};
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
 use krill_proto::bots::{
@@ -14,9 +15,10 @@ use krill_proto::bots::{
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole, FEAT_BOTS};
+use krill_proto::os::net::UnixStream;
 use krill_proto::screen::Msg as _;
 
-use crate::hosts::HostTarget;
+use crate::hosts::{HostId, HostTarget};
 use crate::i18n::catalog::bots as text;
 use crate::layout::TabColor;
 
@@ -185,9 +187,252 @@ pub fn decode_png_avatar(bytes: &[u8]) -> Result<Arc<gpui::Image>, String> {
     )))
 }
 
-/// Default read timeout for bot daemon RPC calls (longer for OAuth/sync/tidy/look-around).
+/// Default read timeout for slow/mutating bot daemon RPC calls (OAuth/sync/tidy/look-around/spawn).
 const BOT_RPC_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tighter read timeout for lightweight read-only daemon state queries (prevents hung remote polls).
+const BOT_RPC_FAST_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const BOT_RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum idle persistent control connections kept per host target.
+const MAX_IDLE_CONNS_PER_HOST: usize = 2;
+/// Drop pooled idle bot connections after this duration so stale remote streams don't linger.
+const POOL_IDLE_TTL: Duration = Duration::from_secs(60);
+/// Pipeline read-only frames in one `write_all` only when total encoded payload stays small,
+/// preventing socket send-buffer deadlocks on large bodies.
+const MAX_PIPELINE_WRITE_BYTES: usize = 16 * 1024;
+/// Maximum number of `GetBotAvatar` frames pipelined in one round-trip.
+const AVATAR_PIPELINE_CHUNK: usize = 4;
+
+/// Pool lookup key that intentionally excludes `RemoteConnector` so transport resources are not retained.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PoolKey {
+    host: HostId,
+    socket: PathBuf,
+    allow_local_launch: bool,
+}
+
+impl PoolKey {
+    fn of(target: &HostTarget) -> Self {
+        Self {
+            host: target.host().clone(),
+            socket: target.socket().to_owned(),
+            allow_local_launch: target.allow_local_launch(),
+        }
+    }
+}
+
+struct PooledConn {
+    stream: UnixStream,
+    epoch: u64,
+    idle_since: Instant,
+}
+
+type PoolMap = Mutex<BTreeMap<PoolKey, VecDeque<PooledConn>>>;
+
+fn connection_pool() -> &'static PoolMap {
+    static POOL: OnceLock<PoolMap> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Drops any idle pooled bot RPC connections for `host` (call on host disconnect/target change).
+pub fn invalidate_host_connections(host: &HostId) {
+    if let Ok(mut pool) = connection_pool().lock() {
+        pool.retain(|key, _| &key.host != host);
+    }
+}
+
+fn checkout_pooled_conn(target: &HostTarget) -> Option<PooledConn> {
+    let key = PoolKey::of(target);
+    let epoch = target.transport_epoch();
+    let now = Instant::now();
+    let mut pool = connection_pool().lock().ok()?;
+    let queue = pool.get_mut(&key)?;
+    while let Some(conn) = queue.pop_front() {
+        if conn.epoch == epoch && now.saturating_duration_since(conn.idle_since) < POOL_IDLE_TTL {
+            if queue.is_empty() {
+                pool.remove(&key);
+            }
+            return Some(conn);
+        }
+    }
+    pool.remove(&key);
+    None
+}
+
+fn return_pooled_conn(target: &HostTarget, stream: UnixStream, epoch: u64) {
+    if !target.is_current() || target.transport_epoch() != epoch {
+        return;
+    }
+    let key = PoolKey::of(target);
+    let Ok(mut pool) = connection_pool().lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let queue = pool.entry(key).or_default();
+    queue.retain(|c| {
+        c.epoch == epoch && now.saturating_duration_since(c.idle_since) < POOL_IDLE_TTL
+    });
+    while queue.len() >= MAX_IDLE_CONNS_PER_HOST {
+        queue.pop_back();
+    }
+    queue.push_front(PooledConn {
+        stream,
+        epoch,
+        idle_since: now,
+    });
+}
+
+fn read_timeout_for(req: &BotRpcRequest) -> Duration {
+    if !req.is_read_only() {
+        return BOT_RPC_READ_TIMEOUT;
+    }
+    match req {
+        BotRpcRequest::ListAgentModels { .. }
+        | BotRpcRequest::ImportExternalBots { .. }
+        | BotRpcRequest::McpOAuthStatus { .. }
+        | BotRpcRequest::ListComposioConnections { .. } => BOT_RPC_READ_TIMEOUT,
+        _ => BOT_RPC_FAST_READ_TIMEOUT,
+    }
+}
+
+fn is_transient_stream_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+fn connect_bot_stream(target: &HostTarget) -> io::Result<(UnixStream, u64)> {
+    let hello = daemon::client_hello(ClientRole::App, "krill-app-bots");
+    let epoch = target.transport_epoch();
+    let conn = target.connect(&hello).map_err(io::Error::other)?;
+    let need = FEAT_CONTROL | FEAT_BOTS;
+    if conn.negotiated.features & need != need {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            unsupported_error(&conn.server.build),
+        ));
+    }
+    Ok((conn.stream, epoch))
+}
+
+/// Sends one or more `BotRpcRequest` frames on an open control stream.
+/// When every frame fits inside [`MAX_PIPELINE_WRITE_BYTES`], writes all frames in a single
+/// `write_all` so remote hosts pay only one network RTT instead of N sequential RTTs.
+fn exchange_batch_on_stream(
+    sock: &mut UnixStream,
+    reqs: &[BotRpcRequest],
+    read_timeout: Duration,
+) -> io::Result<Vec<Result<BotRpcResponse, String>>> {
+    sock.set_read_timeout(Some(read_timeout)).ok();
+    sock.set_write_timeout(Some(BOT_RPC_WRITE_TIMEOUT)).ok();
+
+    let mut encoded = Vec::with_capacity(reqs.len());
+    let mut total_bytes = 0usize;
+    for req in reqs {
+        let frame = Request::Bot(req.clone()).encode()?;
+        total_bytes = total_bytes.saturating_add(frame.len());
+        encoded.push(frame);
+    }
+
+    let mut replies = Vec::with_capacity(reqs.len());
+    if encoded.len() > 1 && total_bytes <= MAX_PIPELINE_WRITE_BYTES {
+        let mut combined = Vec::with_capacity(total_bytes);
+        for frame in &encoded {
+            combined.extend_from_slice(frame);
+        }
+        sock.write_all(&combined)?;
+        for _ in 0..encoded.len() {
+            let (kind, body) = ipc::read_frame(sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+            match Reply::decode(kind, &body)? {
+                Reply::Bot(resp) => replies.push(Ok(resp)),
+                Reply::Failed(failure) => replies.push(Err(failure.to_string())),
+                _ => return Err(io::ErrorKind::InvalidData.into()),
+            }
+        }
+    } else {
+        for frame in &encoded {
+            sock.write_all(frame)?;
+            let (kind, body) = ipc::read_frame(sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+            match Reply::decode(kind, &body)? {
+                Reply::Bot(resp) => replies.push(Ok(resp)),
+                Reply::Failed(failure) => replies.push(Err(failure.to_string())),
+                _ => return Err(io::ErrorKind::InvalidData.into()),
+            }
+        }
+    }
+    Ok(replies)
+}
+
+/// Executes a batch of `BotRpcRequest`s against `target` using a pooled persistent control
+/// connection and pipelining when possible.
+///
+/// If a reused pooled connection fails with a transient stream error and all requests are
+/// read-only, transparently reconnects once on a fresh stream.
+pub fn call_daemon_bot_batch(
+    target: &HostTarget,
+    reqs: &[BotRpcRequest],
+) -> io::Result<Vec<Result<BotRpcResponse, String>>> {
+    if reqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !target.is_current() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let read_timeout = reqs
+        .iter()
+        .map(read_timeout_for)
+        .max()
+        .unwrap_or(BOT_RPC_FAST_READ_TIMEOUT);
+    let all_read_only = reqs.iter().all(BotRpcRequest::is_read_only);
+
+    let (mut stream, mut epoch, mut from_pool) = if let Some(pooled) = checkout_pooled_conn(target)
+    {
+        (pooled.stream, pooled.epoch, true)
+    } else {
+        let (stream, epoch) = connect_bot_stream(target)?;
+        (stream, epoch, false)
+    };
+
+    let mut result = exchange_batch_on_stream(&mut stream, reqs, read_timeout);
+    if let Err(ref err) = result
+        && from_pool
+        && all_read_only
+        && is_transient_stream_error(err)
+        && target.is_current()
+    {
+        drop(stream);
+        let (fresh_stream, fresh_epoch) = connect_bot_stream(target)?;
+        stream = fresh_stream;
+        epoch = fresh_epoch;
+        from_pool = false;
+        result = exchange_batch_on_stream(&mut stream, reqs, read_timeout);
+    }
+
+    if !target.is_current() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    match result {
+        Ok(replies) => {
+            target.record_outcome(true, None);
+            return_pooled_conn(target, stream, epoch);
+            Ok(replies)
+        }
+        Err(err) => {
+            if !from_pool
+                && err.kind() != io::ErrorKind::Unsupported
+                && err.kind() != io::ErrorKind::Interrupted
+            {
+                target.record_outcome(false, Some(&err));
+            }
+            Err(err)
+        }
+    }
+}
 
 /// Builds a live daemon RPC caller talking to `krilld` via `Request::Bot` / `Reply::Bot`.
 #[must_use]
@@ -199,31 +444,59 @@ pub fn daemon_bot_rpc(target: Option<HostTarget>) -> BotRpcCall {
     Arc::new(move |req| call_daemon_bot(target.as_ref(), req).map_err(|e| e.to_string()))
 }
 
+/// Builds a live daemon RPC caller bound to `host`, refusing to fall back to the local daemon
+/// when `host` is remote and no `target` is currently available.
+#[must_use]
+pub fn daemon_bot_rpc_for_host(host: &HostId, target: Option<HostTarget>) -> BotRpcCall {
+    if host.is_remote() && target.is_none() {
+        return Arc::new(|_| Err(text::DAEMON_UNAVAILABLE.get().to_owned()));
+    }
+    daemon_bot_rpc(target)
+}
+
 fn call_daemon_bot(target: Option<&HostTarget>, req: &BotRpcRequest) -> io::Result<BotRpcResponse> {
-    let hello = daemon::client_hello(ClientRole::App, "krill-app-bots");
     let resolved = match target {
         Some(t) => t.clone(),
         None => HostTarget::local_dev()?,
     };
-    let conn = resolved.connect(&hello).map_err(io::Error::other)?;
-    let need = FEAT_CONTROL | FEAT_BOTS;
-    if conn.negotiated.features & need != need {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            unsupported_error(&conn.server.build),
-        ));
+    let mut replies = call_daemon_bot_batch(&resolved, std::slice::from_ref(req))?;
+    match replies.pop() {
+        Some(Ok(resp)) => Ok(resp),
+        Some(Err(msg)) => Err(io::Error::other(msg)),
+        None => Err(io::ErrorKind::InvalidData.into()),
     }
-    let mut sock = conn.stream;
-    sock.set_read_timeout(Some(BOT_RPC_READ_TIMEOUT)).ok();
-    sock.set_write_timeout(Some(BOT_RPC_WRITE_TIMEOUT)).ok();
-    let frame = Request::Bot(req.clone()).encode()?;
-    sock.write_all(&frame)?;
-    let (kind, body) = ipc::read_frame(&mut sock)?.ok_or(io::ErrorKind::UnexpectedEof)?;
-    match Reply::decode(kind, &body)? {
-        Reply::Bot(resp) => Ok(resp),
-        Reply::Failed(failure) => Err(io::Error::other(failure.to_string())),
-        _ => Err(io::ErrorKind::InvalidData.into()),
+}
+
+/// Executes `reqs` as a single pipelined daemon batch when `target` is `Some`, or sequentially
+/// through `fallback` otherwise (mock RPCs pass `target = None`). Promotes
+/// [`BotRpcResponse::Error`] and [`BotRpcResponse::SessionRefused`] per slot just like
+/// [`call_checked_on`].
+pub fn call_checked_batch_on(
+    target: Option<&HostTarget>,
+    fallback: &BotRpcCall,
+    reqs: &[BotRpcRequest],
+    host_name: Option<&str>,
+) -> Result<Vec<Result<BotRpcResponse, String>>, String> {
+    if reqs.is_empty() {
+        return Ok(Vec::new());
     }
+    if let Some(target) = target {
+        let raw = call_daemon_bot_batch(target, reqs).map_err(|e| e.to_string())?;
+        return Ok(raw
+            .into_iter()
+            .map(|slot| match slot {
+                Ok(BotRpcResponse::Error(msg)) | Err(msg) => Err(msg),
+                Ok(BotRpcResponse::SessionRefused(refusal)) => {
+                    Err(bot_refusal_text(&refusal, host_name))
+                }
+                Ok(other) => Ok(other),
+            })
+            .collect());
+    }
+    Ok(reqs
+        .iter()
+        .map(|req| call_checked_on(fallback, req, host_name))
+        .collect())
 }
 
 /// Start of the error a daemon without bots answers with; [`unsupported_version`] reads it back.
@@ -340,6 +613,8 @@ pub fn runtime_models(runtime_id: &str) -> Vec<BotAgentModel> {
 /// One bot row in the main window sidebar's Bots section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarBot {
+    /// Which Krill host owns and runs this bot (`Local` or `Remote(id)`).
+    pub host: HostId,
     pub id: BotId,
     pub name: String,
     pub emoji: Option<String>,
@@ -407,6 +682,17 @@ pub fn sidebar_snapshot(
     access: &[BotAccessRequest],
     sessions: &[BotSessionSummary],
 ) -> SidebarSnapshot {
+    sidebar_snapshot_on(&HostId::Local, bots, items, access, sessions)
+}
+
+#[must_use]
+pub fn sidebar_snapshot_on(
+    host: &HostId,
+    bots: &[BotConfig],
+    items: &[BotItem],
+    access: &[BotAccessRequest],
+    sessions: &[BotSessionSummary],
+) -> SidebarSnapshot {
     let needs: Vec<&BotId> = items
         .iter()
         .filter(|item| item.status == BotItemStatus::NeedsYou)
@@ -436,6 +722,7 @@ pub fn sidebar_snapshot(
                     .collect();
                 live.sort_by_key(|s| (s.link_id.is_some(), std::cmp::Reverse(s.created_at_ms)));
                 SidebarBot {
+                    host: host.clone(),
                     id: bot.id.clone(),
                     name: bot.name.clone(),
                     emoji: bot.emoji.clone().filter(|e| !e.trim().is_empty()),
@@ -495,49 +782,32 @@ pub struct SidebarState {
     pub avatars: Vec<(BotId, u64, Vec<u8>)>,
 }
 
-/// Reads bots, open items, access requests and bot sessions for the sidebar, listing bots once.
-/// Uploaded pictures are read only for bots whose config time isn't in `known_avatars`.
-/// `None` when the bot list is unavailable, so the caller keeps what it last showed instead of
-/// flashing an empty section.
-#[must_use]
-pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
-    call: &BotRpcCall,
-    known_avatars: &HashMap<BotId, u64, S>,
-) -> Option<SidebarState> {
-    let Ok(BotRpcResponse::Bots(bots)) = call(&BotRpcRequest::ListBots) else {
-        return None;
-    };
-    let items = match call(&BotRpcRequest::ListItems {
-        bot_id: None,
-        include_closed: false,
-    }) {
-        Ok(BotRpcResponse::Items(items)) => items,
-        _ => Vec::new(),
-    };
-    let access = match call(&BotRpcRequest::ListAccessRequests { bot_id: None }) {
-        Ok(BotRpcResponse::AccessRequests(reqs)) => reqs,
-        _ => Vec::new(),
-    };
-    let summaries = match call(&BotRpcRequest::ListBotSessions { bot_id: None }) {
-        Ok(BotRpcResponse::BotSessions(list)) => list,
-        _ => Vec::new(),
-    };
-    let groups = match call(&BotRpcRequest::ListGroupSummaries) {
-        Ok(BotRpcResponse::GroupSummaries(groups)) => groups,
-        _ => match call(&BotRpcRequest::ListGroups) {
-            Ok(BotRpcResponse::Groups(raw)) => raw
-                .into_iter()
-                .map(|group| krill_proto::bots::BotGroupSummary {
-                    group,
-                    reply_audience: krill_proto::bots::BotGroupReplyAudience::default(),
-                    threads: Vec::new(),
-                    latest_message: None,
-                    active_turns: Vec::new(),
-                })
-                .collect(),
-            _ => Vec::new(),
-        },
-    };
+/// Failure classification when refreshing one host's sidebar bots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarFetchError {
+    /// Host's `krilld` does not advertise `FEAT_BOTS` (contains daemon version or `""`).
+    Unsupported(String),
+    /// Transient transport/timeout/RPC error — keep previously loaded bots and retry with backoff.
+    Transient(String),
+}
+
+fn classify_sidebar_error(err: String) -> SidebarFetchError {
+    if let Some(version) = unsupported_version(&err) {
+        SidebarFetchError::Unsupported(version.to_owned())
+    } else {
+        SidebarFetchError::Transient(err)
+    }
+}
+
+fn build_sidebar_state(
+    host: &HostId,
+    bots: &[BotConfig],
+    items: &[BotItem],
+    access: &[BotAccessRequest],
+    summaries: &[BotSessionSummary],
+    groups: Vec<krill_proto::bots::BotGroupSummary>,
+    avatars: Vec<(BotId, u64, Vec<u8>)>,
+) -> SidebarState {
     let metas: HashMap<&BotId, (u64, BotSessionMeta)> = bots
         .iter()
         .map(|b| (&b.id, (b.created_at_ms, BotSessionMeta::from_bot(b))))
@@ -550,6 +820,217 @@ pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
                 .then(|| (s.session_id, meta.clone()))
         })
         .collect();
+    SidebarState {
+        snapshot: sidebar_snapshot_on(host, bots, items, access, summaries),
+        groups,
+        sessions,
+        avatars,
+    }
+}
+
+fn wrap_legacy_groups(
+    raw: Vec<krill_proto::bots::BotGroupChat>,
+) -> Vec<krill_proto::bots::BotGroupSummary> {
+    raw.into_iter()
+        .map(|group| krill_proto::bots::BotGroupSummary {
+            group,
+            reply_audience: krill_proto::bots::BotGroupReplyAudience::default(),
+            threads: Vec::new(),
+            latest_message: None,
+            active_turns: Vec::new(),
+        })
+        .collect()
+}
+
+/// Pipelined, single-connection sidebar state fetch for a live [`HostTarget`].
+///
+/// Pipelines `ListBots`, `ListItems`, `ListAccessRequests`, `ListBotSessions`, and
+/// `ListGroupSummaries` in one round-trip over a pooled control connection, falling back to
+/// `ListGroups` only when an older daemon rejects `ListGroupSummaries`. Never substitutes empty
+/// collections on a transport error (preserving previously loaded chats and badges).
+pub fn fetch_sidebar_state_for_target<S: std::hash::BuildHasher>(
+    host: &HostId,
+    target: &HostTarget,
+    known_avatars: &HashMap<BotId, u64, S>,
+) -> Result<SidebarState, SidebarFetchError> {
+    let primary = [
+        BotRpcRequest::ListBots,
+        BotRpcRequest::ListItems {
+            bot_id: None,
+            include_closed: false,
+        },
+        BotRpcRequest::ListAccessRequests { bot_id: None },
+        BotRpcRequest::ListBotSessions { bot_id: None },
+        BotRpcRequest::ListGroupSummaries,
+    ];
+    let mut replies = call_daemon_bot_batch(target, &primary)
+        .map_err(|e| classify_sidebar_error(e.to_string()))?
+        .into_iter();
+
+    let bots = match replies.next() {
+        Some(Ok(BotRpcResponse::Bots(bots))) => bots,
+        Some(Ok(BotRpcResponse::Error(msg)) | Err(msg)) => {
+            return Err(classify_sidebar_error(msg));
+        }
+        other => {
+            return Err(SidebarFetchError::Transient(format!(
+                "unexpected ListBots reply: {other:?}"
+            )));
+        }
+    };
+    let items = match replies.next() {
+        Some(Ok(BotRpcResponse::Items(items))) => items,
+        Some(Ok(BotRpcResponse::Ok)) => Vec::new(),
+        Some(Ok(BotRpcResponse::Error(msg)) | Err(msg)) => {
+            return Err(SidebarFetchError::Transient(msg));
+        }
+        other => {
+            return Err(SidebarFetchError::Transient(format!(
+                "unexpected ListItems reply: {other:?}"
+            )));
+        }
+    };
+    let access = match replies.next() {
+        Some(Ok(BotRpcResponse::AccessRequests(reqs))) => reqs,
+        Some(Ok(BotRpcResponse::Ok)) => Vec::new(),
+        Some(Ok(BotRpcResponse::Error(msg)) | Err(msg)) => {
+            return Err(SidebarFetchError::Transient(msg));
+        }
+        other => {
+            return Err(SidebarFetchError::Transient(format!(
+                "unexpected ListAccessRequests reply: {other:?}"
+            )));
+        }
+    };
+    let summaries = match replies.next() {
+        Some(Ok(BotRpcResponse::BotSessions(list))) => list,
+        Some(Ok(BotRpcResponse::Ok)) => Vec::new(),
+        Some(Ok(BotRpcResponse::Error(msg)) | Err(msg)) => {
+            return Err(SidebarFetchError::Transient(msg));
+        }
+        other => {
+            return Err(SidebarFetchError::Transient(format!(
+                "unexpected ListBotSessions reply: {other:?}"
+            )));
+        }
+    };
+    let groups = match replies.next() {
+        Some(Ok(BotRpcResponse::GroupSummaries(groups))) => groups,
+        Some(Ok(BotRpcResponse::Ok)) => Vec::new(),
+        // Older `FEAT_BOTS` daemon predates `ListGroupSummaries` (answers BadRequest): fall back
+        // once to `ListGroups` on the same pooled connection.
+        Some(Err(_) | Ok(BotRpcResponse::Error(_))) => {
+            match call_daemon_bot_batch(target, &[BotRpcRequest::ListGroups])
+                .map_err(|e| SidebarFetchError::Transient(e.to_string()))?
+                .into_iter()
+                .next()
+            {
+                Some(Ok(BotRpcResponse::Groups(raw))) => wrap_legacy_groups(raw),
+                Some(Ok(BotRpcResponse::Ok)) => Vec::new(),
+                Some(Ok(BotRpcResponse::Error(msg)) | Err(msg)) => {
+                    return Err(SidebarFetchError::Transient(msg));
+                }
+                other => {
+                    return Err(SidebarFetchError::Transient(format!(
+                        "unexpected ListGroups reply: {other:?}"
+                    )));
+                }
+            }
+        }
+        other => {
+            return Err(SidebarFetchError::Transient(format!(
+                "unexpected ListGroupSummaries reply: {other:?}"
+            )));
+        }
+    };
+
+    let missing_avatars: Vec<(BotId, u64)> = bots
+        .iter()
+        .filter(|b| super::avatar::Avatar::of(b) == super::avatar::Avatar::Upload)
+        .filter(|b| known_avatars.get(&b.id) != Some(&b.updated_at_ms))
+        .map(|b| (b.id.clone(), b.updated_at_ms))
+        .collect();
+    let mut avatars = Vec::with_capacity(missing_avatars.len());
+    for chunk in missing_avatars.chunks(AVATAR_PIPELINE_CHUNK) {
+        let reqs: Vec<BotRpcRequest> = chunk
+            .iter()
+            .map(|(bot_id, _)| BotRpcRequest::GetBotAvatar {
+                bot_id: bot_id.clone(),
+            })
+            .collect();
+        // A transient transport error fetching avatars should not discard the bot list itself;
+        // omit them so the next refresh retries cleanly.
+        let Ok(chunk_replies) = call_daemon_bot_batch(target, &reqs) else {
+            break;
+        };
+        for ((bot_id, updated_at_ms), reply) in chunk.iter().zip(chunk_replies) {
+            match reply {
+                Ok(BotRpcResponse::BotAvatar(data)) => {
+                    avatars.push((bot_id.clone(), *updated_at_ms, data.png_bytes));
+                }
+                // Missing/unreadable avatar file on daemon: cache empty so we stop re-fetching
+                // until `updated_at_ms` changes.
+                Ok(BotRpcResponse::Error(_) | BotRpcResponse::Ok) => {
+                    avatars.push((bot_id.clone(), *updated_at_ms, Vec::new()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(build_sidebar_state(
+        host, &bots, &items, &access, &summaries, groups, avatars,
+    ))
+}
+
+/// Reads bots, open items, access requests and bot sessions for the sidebar via an injectable
+/// [`BotRpcCall`] (used by tests and mock transports).
+pub fn fetch_sidebar_state_detailed_with_rpc<S: std::hash::BuildHasher>(
+    host: &HostId,
+    call: &BotRpcCall,
+    known_avatars: &HashMap<BotId, u64, S>,
+) -> Result<SidebarState, SidebarFetchError> {
+    let bots = match call(&BotRpcRequest::ListBots) {
+        Ok(BotRpcResponse::Bots(bots)) => bots,
+        Ok(BotRpcResponse::Error(msg)) | Err(msg) => return Err(classify_sidebar_error(msg)),
+        other => {
+            return Err(SidebarFetchError::Transient(format!(
+                "unexpected ListBots reply: {other:?}"
+            )));
+        }
+    };
+    let items = match call(&BotRpcRequest::ListItems {
+        bot_id: None,
+        include_closed: false,
+    }) {
+        Ok(BotRpcResponse::Items(items)) => items,
+        Ok(BotRpcResponse::Error(msg)) | Err(msg) => {
+            return Err(SidebarFetchError::Transient(msg));
+        }
+        _ => Vec::new(),
+    };
+    let access = match call(&BotRpcRequest::ListAccessRequests { bot_id: None }) {
+        Ok(BotRpcResponse::AccessRequests(reqs)) => reqs,
+        Ok(BotRpcResponse::Error(msg)) | Err(msg) => {
+            return Err(SidebarFetchError::Transient(msg));
+        }
+        _ => Vec::new(),
+    };
+    let summaries = match call(&BotRpcRequest::ListBotSessions { bot_id: None }) {
+        Ok(BotRpcResponse::BotSessions(list)) => list,
+        Ok(BotRpcResponse::Error(msg)) | Err(msg) => {
+            return Err(SidebarFetchError::Transient(msg));
+        }
+        _ => Vec::new(),
+    };
+    let groups = match call(&BotRpcRequest::ListGroupSummaries) {
+        Ok(BotRpcResponse::GroupSummaries(groups)) => groups,
+        Ok(BotRpcResponse::Ok) => Vec::new(),
+        _ => match call(&BotRpcRequest::ListGroups) {
+            Ok(BotRpcResponse::Groups(raw)) => wrap_legacy_groups(raw),
+            _ => Vec::new(),
+        },
+    };
     let avatars = bots
         .iter()
         .filter(|b| super::avatar::Avatar::of(b) == super::avatar::Avatar::Upload)
@@ -565,12 +1046,21 @@ pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
             (b.id.clone(), b.updated_at_ms, png)
         })
         .collect();
-    Some(SidebarState {
-        snapshot: sidebar_snapshot(&bots, &items, &access, &summaries),
-        groups,
-        sessions,
-        avatars,
-    })
+    Ok(build_sidebar_state(
+        host, &bots, &items, &access, &summaries, groups, avatars,
+    ))
+}
+
+/// Reads bots, open items, access requests and bot sessions for the sidebar, listing bots once.
+/// Uploaded pictures are read only for bots whose config time isn't in `known_avatars`.
+/// `None` when the bot list is unavailable, so the caller keeps what it last showed instead of
+/// flashing an empty section.
+#[must_use]
+pub fn fetch_sidebar_state<S: std::hash::BuildHasher>(
+    call: &BotRpcCall,
+    known_avatars: &HashMap<BotId, u64, S>,
+) -> Option<SidebarState> {
+    fetch_sidebar_state_detailed_with_rpc(&HostId::Local, call, known_avatars).ok()
 }
 
 /// Canonical scoped keychain secret reference (`<bot_id>:<key>`) aligned with daemon `SecretVault::scoped_ref`.
@@ -626,4 +1116,414 @@ pub fn format_csv_i64s(items: &[i64]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use krill_proto::bots::{BotAvatarData, BotGroupChat, BotRpcRequest, BotRpcResponse};
+    use krill_proto::control::{Failure, Reply, Request};
+    use krill_proto::ipc::{ClientHello, ServerHello};
+    use krill_proto::os::net::UnixListener;
+
+    use super::*;
+
+    type MockBotHandler = Arc<dyn Fn(usize, &BotRpcRequest) -> Option<Reply> + Send + Sync>;
+
+    static TEST_SOCK_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct MockBotDaemon {
+        socket: PathBuf,
+        accepted: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockBotDaemon {
+        #[expect(clippy::expect_used, reason = "test helper binds ephemeral socket")]
+        fn start(features: u64, build: &str, handler: MockBotHandler) -> Self {
+            let seq = TEST_SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+            let socket = std::env::temp_dir()
+                .join(format!("krill-bot-rpc-{}-{seq}.sock", std::process::id()));
+            std::fs::remove_file(&socket).ok();
+            let listener = UnixListener::bind(&socket).expect("bind unix socket");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let accepted_bg = Arc::clone(&accepted);
+            let stop_bg = Arc::clone(&stop);
+            let build = build.to_owned();
+            let thread = std::thread::spawn(move || {
+                while !stop_bg.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let conn_idx = accepted_bg.fetch_add(1, Ordering::AcqRel) + 1;
+                            let handler = Arc::clone(&handler);
+                            let build_conn = build.clone();
+                            std::thread::spawn(move || {
+                                stream.set_nonblocking(false).ok();
+                                stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                                let hello = ServerHello {
+                                    proto_min: ipc::PROTO_MIN,
+                                    proto_max: ipc::PROTO_MAX,
+                                    features,
+                                    build: build_conn,
+                                    instance_id: 99,
+                                };
+                                let Ok(hello_frame) = hello.encode() else {
+                                    return;
+                                };
+                                if stream.write_all(&hello_frame).is_err() {
+                                    return;
+                                }
+                                let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) else {
+                                    return;
+                                };
+                                if ClientHello::decode(kind, &body).is_err() {
+                                    return;
+                                }
+                                while let Ok(Some((k, payload))) = ipc::read_frame(&mut stream) {
+                                    let Ok(Request::Bot(bot_req)) = Request::decode(k, &payload)
+                                    else {
+                                        break;
+                                    };
+                                    let Some(reply) = handler(conn_idx, &bot_req) else {
+                                        // Simulate abrupt connection drop mid-stream.
+                                        break;
+                                    };
+                                    let Ok(frame) = reply.encode() else {
+                                        break;
+                                    };
+                                    if stream.write_all(&frame).is_err() {
+                                        break;
+                                    }
+                                    stream.flush().ok();
+                                }
+                            });
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                socket,
+                accepted,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn target(&self, id: &str) -> HostTarget {
+            HostTarget::remote(id, self.socket.clone())
+        }
+    }
+
+    impl Drop for MockBotDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            UnixStream::connect(&self.socket).ok();
+            if let Some(t) = self.thread.take() {
+                t.join().ok();
+            }
+            std::fs::remove_file(&self.socket).ok();
+        }
+    }
+
+    #[test]
+    fn pooled_connection_reused_and_sidebar_fetch_pipelines_over_single_stream() {
+        let mut mascot_bot = BotConfig::new(
+            BotId::new("bot-mascot").unwrap(),
+            "Mascot Bot",
+            "claude",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        mascot_bot.avatar = Some("A1".to_owned());
+
+        let mut upload_bot = BotConfig::new(
+            BotId::new("bot-upload").unwrap(),
+            "Upload Bot",
+            "claude",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        upload_bot.avatar = Some(crate::bots::avatar::UPLOAD_AVATAR.to_owned());
+        upload_bot.updated_at_ms = 42;
+
+        let avatar_calls = Arc::new(AtomicUsize::new(0));
+        let avatar_calls_bg = Arc::clone(&avatar_calls);
+        let bots = vec![mascot_bot.clone(), upload_bot.clone()];
+        let session = BotSessionSummary {
+            session_id: SessionId(701),
+            bot_id: mascot_bot.id.clone(),
+            link_id: None,
+            pid: 500,
+            live: true,
+            working: false,
+            label: "Home".to_owned(),
+            created_at_ms: 1_700_000_000_100,
+        };
+        let sessions = vec![session];
+
+        let daemon = MockBotDaemon::start(
+            FEAT_CONTROL | FEAT_BOTS,
+            "0.3.24+test",
+            Arc::new(move |_conn, req| {
+                let resp = match req {
+                    BotRpcRequest::ListBots => BotRpcResponse::Bots(bots.clone()),
+                    BotRpcRequest::ListItems { .. } => BotRpcResponse::Items(Vec::new()),
+                    BotRpcRequest::ListAccessRequests { .. } => {
+                        BotRpcResponse::AccessRequests(Vec::new())
+                    }
+                    BotRpcRequest::ListBotSessions { .. } => {
+                        BotRpcResponse::BotSessions(sessions.clone())
+                    }
+                    BotRpcRequest::ListGroupSummaries => BotRpcResponse::GroupSummaries(Vec::new()),
+                    BotRpcRequest::GetBotAvatar { bot_id } => {
+                        avatar_calls_bg.fetch_add(1, Ordering::AcqRel);
+                        assert_eq!(
+                            bot_id, &upload_bot.id,
+                            "built-in mascot must never trigger GetBotAvatar"
+                        );
+                        BotRpcResponse::BotAvatar(BotAvatarData {
+                            bot_id: bot_id.clone(),
+                            mime: "image/png".to_owned(),
+                            png_bytes: vec![0x89, b'P', b'N', b'G'],
+                        })
+                    }
+                    _ => BotRpcResponse::Ok,
+                };
+                Some(Reply::Bot(resp))
+            }),
+        );
+
+        let host_id = "pool-reuse-macmini";
+        let host = HostId::Remote(host_id.to_owned());
+        let target = daemon.target(host_id);
+        invalidate_host_connections(&host);
+
+        let first = fetch_sidebar_state_for_target(&host, &target, &HashMap::new())
+            .expect("first pipelined sidebar fetch");
+        assert_eq!(first.snapshot.bots.len(), 2);
+        assert!(first.snapshot.bots.iter().all(|b| b.host == host));
+        assert_eq!(first.sessions.len(), 1);
+        assert_eq!(first.avatars.len(), 1);
+        assert_eq!(avatar_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            daemon.accepted.load(Ordering::Acquire),
+            1,
+            "all sidebar RPCs + avatar batch must share 1 connection"
+        );
+
+        let known: HashMap<BotId, u64> = first
+            .avatars
+            .iter()
+            .map(|(id, at, _)| (id.clone(), *at))
+            .collect();
+        let second = fetch_sidebar_state_for_target(&host, &target, &known)
+            .expect("second pooled sidebar fetch");
+        assert_eq!(second.snapshot.bots.len(), 2);
+        assert!(second.avatars.is_empty());
+        assert_eq!(
+            avatar_calls.load(Ordering::Acquire),
+            1,
+            "known avatar timestamp must skip re-fetch"
+        );
+        assert_eq!(
+            daemon.accepted.load(Ordering::Acquire),
+            1,
+            "second refresh must reuse the pooled connection with zero new handshakes"
+        );
+
+        invalidate_host_connections(&host);
+        let third = fetch_sidebar_state_for_target(&host, &target, &known)
+            .expect("post-invalidation fetch");
+        assert_eq!(third.snapshot.bots.len(), 2);
+        assert_eq!(
+            daemon.accepted.load(Ordering::Acquire),
+            2,
+            "invalidate_host_connections must drop pooled streams"
+        );
+        invalidate_host_connections(&host);
+    }
+
+    #[test]
+    fn pooled_connection_retries_once_on_stale_eof_for_read_only_only() {
+        let conn1_reqs = Arc::new(AtomicUsize::new(0));
+        let conn1_reqs_bg = Arc::clone(&conn1_reqs);
+        let daemon = MockBotDaemon::start(
+            FEAT_CONTROL | FEAT_BOTS,
+            "0.3.24+test",
+            Arc::new(move |conn, req| match (conn, req) {
+                (1, BotRpcRequest::ListBots) => {
+                    let n = conn1_reqs_bg.fetch_add(1, Ordering::AcqRel);
+                    if n == 0 {
+                        Some(Reply::Bot(BotRpcResponse::Bots(Vec::new())))
+                    } else {
+                        // Drop conn #1 when reused from the pool.
+                        None
+                    }
+                }
+                (2, BotRpcRequest::ListBots) => Some(Reply::Bot(BotRpcResponse::Bots(Vec::new()))),
+                (2, BotRpcRequest::DeleteBot { .. }) => {
+                    // Drop conn #2 mid-mutation: client MUST NOT retry a mutating RPC.
+                    None
+                }
+                _ => Some(Reply::Bot(BotRpcResponse::Ok)),
+            }),
+        );
+
+        let host_id = "pool-retry-macmini";
+        let host = HostId::Remote(host_id.to_owned());
+        let target = daemon.target(host_id);
+        invalidate_host_connections(&host);
+
+        // Prime pool with conn #1.
+        let r1 = call_daemon_bot_batch(&target, &[BotRpcRequest::ListBots]).expect("prime");
+        assert_eq!(r1.len(), 1);
+        assert_eq!(daemon.accepted.load(Ordering::Acquire), 1);
+
+        // Reuse dead conn #1 on a read-only call -> must retry transparently on conn #2.
+        let r2 = call_daemon_bot_batch(&target, &[BotRpcRequest::ListBots])
+            .expect("read-only must retry once on fresh connection");
+        assert_eq!(r2.len(), 1);
+        assert_eq!(daemon.accepted.load(Ordering::Acquire), 2);
+
+        // Mutating call on pooled conn #2 that drops mid-flight -> MUST error, NOT open conn #3.
+        let mut_res = call_daemon_bot_batch(
+            &target,
+            &[BotRpcRequest::DeleteBot {
+                bot_id: BotId::new("bot-x").unwrap(),
+                delete_home: false,
+            }],
+        );
+        assert!(mut_res.is_err(), "dropped mutation must return error");
+        assert_eq!(
+            daemon.accepted.load(Ordering::Acquire),
+            2,
+            "mutating RPC must never auto-retry on a fresh connection"
+        );
+        invalidate_host_connections(&host);
+    }
+
+    #[test]
+    fn remote_host_without_target_never_falls_back_to_local_daemon() {
+        let rpc = daemon_bot_rpc_for_host(&HostId::Remote("offline-macmini".into()), None);
+        let err = rpc(&BotRpcRequest::ListBots).expect_err("must fail without remote target");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn sidebar_fetch_classifies_unsupported_transient_and_legacy_groups() {
+        // 1. Missing FEAT_BOTS -> SidebarFetchError::Unsupported(version)
+        let old_daemon = MockBotDaemon::start(
+            FEAT_CONTROL,
+            "0.3.6+old",
+            Arc::new(|_, _| Some(Reply::Failed(Failure::BadRequest))),
+        );
+        let old_host = HostId::Remote("old-macmini".into());
+        let err = fetch_sidebar_state_for_target(
+            &old_host,
+            &old_daemon.target("old-macmini"),
+            &HashMap::new(),
+        )
+        .expect_err("missing FEAT_BOTS");
+        assert_eq!(err, SidebarFetchError::Unsupported("0.3.6".to_owned()));
+
+        // 2. Partial sub-RPC failure (ListBotSessions error) -> Transient (never wipes sessions)
+        let bot = BotConfig::new(BotId::new("bot-1").unwrap(), "Shop", "claude", 1_000).unwrap();
+        let bots_for_partial = vec![bot.clone()];
+        let partial_daemon = MockBotDaemon::start(
+            FEAT_CONTROL | FEAT_BOTS,
+            "0.3.24+test",
+            Arc::new(move |_, req| match req {
+                BotRpcRequest::ListBots => {
+                    Some(Reply::Bot(BotRpcResponse::Bots(bots_for_partial.clone())))
+                }
+                BotRpcRequest::ListItems { .. } => {
+                    Some(Reply::Bot(BotRpcResponse::Items(Vec::new())))
+                }
+                BotRpcRequest::ListAccessRequests { .. } => {
+                    Some(Reply::Bot(BotRpcResponse::AccessRequests(Vec::new())))
+                }
+                BotRpcRequest::ListBotSessions { .. } => {
+                    Some(Reply::Bot(BotRpcResponse::Error("db busy".into())))
+                }
+                BotRpcRequest::ListGroupSummaries => {
+                    Some(Reply::Bot(BotRpcResponse::GroupSummaries(Vec::new())))
+                }
+                _ => Some(Reply::Bot(BotRpcResponse::Ok)),
+            }),
+        );
+        let partial_host = HostId::Remote("partial-macmini".into());
+        let err = fetch_sidebar_state_for_target(
+            &partial_host,
+            &partial_daemon.target("partial-macmini"),
+            &HashMap::new(),
+        )
+        .expect_err("partial sub-RPC error must fail batch instead of returning empty sessions");
+        assert!(matches!(err, SidebarFetchError::Transient(_)));
+        invalidate_host_connections(&partial_host);
+
+        // 3. Legacy daemon without ListGroupSummaries falls back to ListGroups on same pooled stream
+        let legacy_called = Arc::new(AtomicUsize::new(0));
+        let legacy_called_bg = Arc::clone(&legacy_called);
+        let bots_for_legacy = vec![bot.clone()];
+        let legacy_group = BotGroupChat {
+            id: "grp-legacy".into(),
+            name: "Ops".into(),
+            bot_ids: vec![bot.id.clone()],
+            description: String::new(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        let legacy_daemon = MockBotDaemon::start(
+            FEAT_CONTROL | FEAT_BOTS,
+            "0.3.20+legacy",
+            Arc::new(move |_, req| match req {
+                BotRpcRequest::ListBots => {
+                    Some(Reply::Bot(BotRpcResponse::Bots(bots_for_legacy.clone())))
+                }
+                BotRpcRequest::ListItems { .. } => {
+                    Some(Reply::Bot(BotRpcResponse::Items(Vec::new())))
+                }
+                BotRpcRequest::ListAccessRequests { .. } => {
+                    Some(Reply::Bot(BotRpcResponse::AccessRequests(Vec::new())))
+                }
+                BotRpcRequest::ListBotSessions { .. } => {
+                    Some(Reply::Bot(BotRpcResponse::BotSessions(Vec::new())))
+                }
+                BotRpcRequest::ListGroupSummaries => Some(Reply::Failed(Failure::BadRequest)),
+                BotRpcRequest::ListGroups => {
+                    legacy_called_bg.fetch_add(1, Ordering::AcqRel);
+                    Some(Reply::Bot(BotRpcResponse::Groups(vec![
+                        legacy_group.clone(),
+                    ])))
+                }
+                _ => Some(Reply::Bot(BotRpcResponse::Ok)),
+            }),
+        );
+        let legacy_host = HostId::Remote("legacy-macmini".into());
+        let state = fetch_sidebar_state_for_target(
+            &legacy_host,
+            &legacy_daemon.target("legacy-macmini"),
+            &HashMap::new(),
+        )
+        .expect("legacy group fallback must succeed");
+        assert_eq!(legacy_called.load(Ordering::Acquire), 1);
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].group.id, "grp-legacy");
+        assert_eq!(
+            legacy_daemon.accepted.load(Ordering::Acquire),
+            1,
+            "legacy ListGroups fallback must reuse the same pooled connection"
+        );
+        invalidate_host_connections(&legacy_host);
+    }
 }

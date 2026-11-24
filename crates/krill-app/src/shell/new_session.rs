@@ -290,15 +290,19 @@ impl Shell {
         host: krill_app::hosts::HostId,
         cx: &mut Context<Self>,
     ) {
-        self.launch_host = host.clone();
-        if host.is_remote() && self.host_targets.contains_key(&host) {
+        let is_remote = host.is_remote();
+        let has_target = is_remote && self.host_targets.contains_key(&host);
+        self.launch_host = host;
+        let current = self.launch_host.clone();
+        if has_target {
             self.refresh_accounts_for_host(
-                host.clone(),
+                current.clone(),
                 krill_proto::usage::UsageRequest::ListAccounts,
                 cx,
             );
-            self.fetch_remote_orchestration(host, cx);
+            self.fetch_remote_orchestration(current.clone(), cx);
         }
+        self.refresh_bots_for_host(&current, true, cx);
         self.sync_settings_account_hosts(cx);
         cx.notify();
     }

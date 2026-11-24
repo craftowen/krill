@@ -637,7 +637,7 @@ fn group_page_turns_peer_handoff_reply_picker_and_panel_filters(cx: &mut TestApp
     // Delete confirmation modal sends `DeleteGroup`.
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            s.bot_ui.delete_group = Some(group);
+            s.bot_ui.delete_group = Some((krill_app::hosts::HostId::Local, group));
             cx.notify();
         });
     });
@@ -1591,5 +1591,280 @@ fn opening_new_bot_from_existing_bot_tab_switches_right_panel_and_folder(cx: &mu
             assert_eq!(s.bot_for_pane(pane).map(|b| &b.id), Some(&cfg_fixer.id));
             cx.notify();
         });
+    });
+}
+
+#[gpui::test]
+fn remote_bots_load_and_open_while_launch_host_is_local_with_zero_local_bots(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse};
+
+    let (view, cx) = open(cx, state_path("remote-bots-load-with-empty-local"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+
+    let remote_host = HostId::Remote("iroh:macmini".to_owned());
+    let mut remote_cfg = BotConfig::new(
+        BotId::new("bot-shop").unwrap(),
+        "쇼핑봇",
+        "claude",
+        1_700_000_000_000,
+    )
+    .unwrap();
+    remote_cfg.avatar = Some("B1".to_owned());
+    let remote_session = BotSessionSummary {
+        session_id: SessionId(901),
+        bot_id: remote_cfg.id.clone(),
+        link_id: None,
+        pid: 42,
+        live: true,
+        working: false,
+        label: "쇼핑봇".to_owned(),
+        created_at_ms: 1_700_000_001_000,
+    };
+
+    let local_rpc: krill_app::bots::BotRpcCall = Arc::new(|req| match req {
+        BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(Vec::new())),
+        BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(Vec::new())),
+        BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(Vec::new())),
+        BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(Vec::new())),
+        BotRpcRequest::ListGroupSummaries => Ok(BotRpcResponse::GroupSummaries(Vec::new())),
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    let remote_bots_rpc = vec![remote_cfg.clone()];
+    let remote_sessions_rpc = vec![remote_session];
+    let remote_rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| match req {
+        BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(remote_bots_rpc.clone())),
+        BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(Vec::new())),
+        BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(Vec::new())),
+        BotRpcRequest::ListBotSessions { .. } => {
+            Ok(BotRpcResponse::BotSessions(remote_sessions_rpc.clone()))
+        }
+        BotRpcRequest::ListGroupSummaries => Ok(BotRpcResponse::GroupSummaries(Vec::new())),
+        BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(Vec::new())),
+        BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(Vec::new())),
+        BotRpcRequest::GetMemoryHistory { .. } => Ok(BotRpcResponse::MemoryHistory(Vec::new())),
+        BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(Vec::new())),
+        BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+            Ok(BotRpcResponse::Text(String::new()))
+        }
+        _ => Ok(BotRpcResponse::Ok),
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.link = crate::shell::Link::Up;
+            s.launch_host = HostId::Local;
+            s.panel_collapsed = false;
+            s.bot_rpc_overrides.insert(HostId::Local, local_rpc);
+            s.bot_rpc_overrides.insert(remote_host.clone(), remote_rpc);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "iroh:macmini",
+                    HostStatus::Connected,
+                    sidebar::Snapshot::default(),
+                    cx,
+                );
+            });
+            s.refresh_bots_badge(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Must render the remote bot instead of the empty onboarding card while launch_host == Local.
+    assert!(
+        cx.debug_bounds("bots-empty-card").is_none(),
+        "must not show empty onboarding card when a connected remote host has bots"
+    );
+    assert!(
+        cx.debug_bounds("bot-row-bot-shop").is_some(),
+        "remote bot row must appear in sidebar even while launch_host is Local"
+    );
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.launch_host, HostId::Local);
+        assert_eq!(s.sidebar_bots.len(), 1);
+        assert_eq!(s.sidebar_bots[0].host, remote_host);
+        assert_eq!(s.sidebar_bots[0].name, "쇼핑봇");
+    });
+
+    // Clicking the remote bot row opens its session on the remote host and shows its right panel.
+    click(cx, "bot-row-bot-shop");
+    assert!(
+        cx.debug_bounds("bot-panel").is_some(),
+        "right-hand BotPanel must appear for remote bot even while launch_host is Local"
+    );
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let pane = s.layout.focused().expect("focused pane");
+        assert_eq!(s.layout.host(pane), &remote_host);
+        assert_eq!(s.layout.session(pane), Some(SessionId(901)));
+        assert_eq!(
+            s.focused_bot().map(|b| (&b.host, &b.id)),
+            Some((&remote_host, &remote_cfg.id))
+        );
+        let panel = s.bot_ui.panel.view.clone().expect("remote panel view");
+        assert_eq!(panel.read(cx).host(), &remote_host);
+        assert_eq!(
+            panel.read(cx).selected_bot().map(|b| &b.id),
+            Some(&remote_cfg.id)
+        );
+    });
+}
+
+#[gpui::test]
+fn transient_remote_error_preserves_bots_and_unsupported_host_is_cached(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use krill_app::hosts::{HostId, HostStatus};
+    use krill_proto::bots::{BotConfig, BotRpcRequest, BotRpcResponse};
+
+    let (view, cx) = open(
+        cx,
+        state_path("remote-bots-error-preserve-and-unsupported-cache"),
+    );
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+
+    let good_host = HostId::Remote("iroh:macmini".to_owned());
+    let old_host = HostId::Remote("iroh:old-mini".to_owned());
+    let fail_good = Arc::new(AtomicBool::new(false));
+    let fail_good_bg = Arc::clone(&fail_good);
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    let old_calls_bg = Arc::clone(&old_calls);
+
+    let cfg = BotConfig::new(BotId::new("bot-shop").unwrap(), "쇼핑봇", "claude", 1_000).unwrap();
+    let good_rpc: krill_app::bots::BotRpcCall = Arc::new(move |req| {
+        if fail_good_bg.load(Ordering::Acquire) {
+            return Err("transient stream reset".to_owned());
+        }
+        match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![cfg.clone()])),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(Vec::new())),
+            BotRpcRequest::ListAccessRequests { .. } => {
+                Ok(BotRpcResponse::AccessRequests(Vec::new()))
+            }
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(Vec::new())),
+            BotRpcRequest::ListGroupSummaries => Ok(BotRpcResponse::GroupSummaries(Vec::new())),
+            _ => Ok(BotRpcResponse::Ok),
+        }
+    });
+    let old_rpc: krill_app::bots::BotRpcCall = Arc::new(move |_| {
+        old_calls_bg.fetch_add(1, Ordering::AcqRel);
+        Err("krilld does not support FEAT_BOTS (krilld 0.3.6)".to_owned())
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.bot_rpc_overrides.insert(good_host.clone(), good_rpc);
+            s.bot_rpc_overrides.insert(old_host.clone(), old_rpc);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "iroh:macmini",
+                    HostStatus::Connected,
+                    sidebar::Snapshot::default(),
+                    cx,
+                );
+                sb.set_remote_snapshot_for_test(
+                    "iroh:old-mini",
+                    HostStatus::Connected,
+                    sidebar::Snapshot::default(),
+                    cx,
+                );
+            });
+            s.refresh_bots_badge(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("bot-row-bot-shop").is_some());
+    assert_eq!(old_calls.load(Ordering::Acquire), 1);
+
+    // Flip macmini into transient failure and force another refresh:
+    // - macmini's previously loaded bot must be preserved (never wiped)
+    // - old-mini (cached unsupported) must NOT be polled again
+    fail_good.store(true, Ordering::Release);
+    cx.update(|_, cx| {
+        view.update(cx, Shell::refresh_bots_badge);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("bot-row-bot-shop").is_some(),
+        "transient RPC error must preserve last-known remote bots"
+    );
+    assert_eq!(
+        old_calls.load(Ordering::Acquire),
+        1,
+        "host lacking FEAT_BOTS must stay cached and skip subsequent polls"
+    );
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.sidebar_bots.len(), 1);
+        assert_eq!(s.sidebar_bots[0].host, good_host);
+        assert!(s.bot_ui.hosts[&good_host].consecutive_failures >= 1);
+        assert!(s.bot_ui.hosts[&old_host].unsupported.is_some());
+    });
+}
+
+#[gpui::test]
+fn same_bot_id_across_hosts_coexists_and_badge_update_is_host_scoped(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus};
+
+    let (view, cx) = open(cx, state_path("multi-host-same-bot-id-isolation"));
+    cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+
+    let remote_host = HostId::Remote("iroh:macmini".to_owned());
+    let local_bot = bot(
+        "shared",
+        "Local Shared",
+        "Local copy",
+        vec![chat("shared", 10, "Local")],
+    );
+    let mut remote_bot = bot(
+        "shared",
+        "Remote Shared",
+        "Remote copy",
+        vec![chat("shared", 20, "Remote")],
+    );
+    remote_bot.host = remote_host.clone();
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "iroh:macmini",
+                    HostStatus::Connected,
+                    sidebar::Snapshot::default(),
+                    cx,
+                );
+            });
+            s.apply_sidebar_bots_for_host(&HostId::Local, 1, vec![local_bot], cx);
+            s.apply_sidebar_bots_for_host(&remote_host, 2, vec![remote_bot], cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.sidebar_bots.len(), 2);
+        assert_eq!(s.bots_attention_count, 3);
+    });
+
+    // Updating Local's bots (e.g. via BadgeChanged from the modal) must NOT wipe Remote's bots.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.apply_sidebar_bots_for_host(&HostId::Local, 0, Vec::new(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.sidebar_bots.len(), 1);
+        assert_eq!(s.sidebar_bots[0].host, remote_host);
+        assert_eq!(s.sidebar_bots[0].name, "Remote Shared");
+        assert_eq!(s.bots_attention_count, 2);
     });
 }

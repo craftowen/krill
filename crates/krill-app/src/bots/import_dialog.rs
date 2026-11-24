@@ -190,7 +190,7 @@ impl View {
                 rpc: if id == &self.host {
                     self.rpc.clone()
                 } else {
-                    super::daemon_bot_rpc(target.clone())
+                    super::daemon_bot_rpc_for_host(id, target.clone())
                 },
             })
             .collect();
