@@ -1670,12 +1670,17 @@ fn new_bot_dialog_saves_the_mascot_and_clears_unchecked_template_skills(cx: &mut
     });
     vcx.run_until_parked();
     let reqs = state.lock().unwrap().requests.clone();
+    let expected_name = super::templates::localized_template_name(tpl);
+    let expected_slug = krill_proto::bots::bot_slug_from_name(tpl.name);
     assert!(reqs.iter().any(|r| matches!(
         r,
         BotRpcRequest::CreateBotV2(p)
             if p.base.template_id.as_deref() == Some("pr-review")
                 && p.base.avatar.as_deref() == Some(tpl.mascot)
-                && p.base.name == tpl.name
+                && p.base.name == expected_name
+                && (expected_name == tpl.name
+                    || p.slug.as_ref().map(krill_proto::bots::BotSlug::as_str)
+                        == Some(expected_slug.as_str()))
     )));
     // krilld would otherwise fill the template's skills back in.
     assert!(reqs.iter().any(|r| matches!(
@@ -2497,11 +2502,6 @@ fn settings_rows_open_their_own_pages(cx: &mut TestAppContext) {
             "bot-settings-memory-upkeep-open",
             "bot-settings-tidy-up-page",
             text::SV_MEMORY_UPKEEP.get(),
-        ),
-        (
-            "bot-settings-schedules",
-            "bot-settings-schedules-page",
-            text::SV_SCHEDULES.get(),
         ),
         (
             "bot-settings-soul",
@@ -3476,11 +3476,11 @@ fn bot_home_and_group_all_clear_show_avatar_above_folded_groups_and_hide_when_pa
         vcx.debug_bounds("bot-group-all-clear").is_some(),
         "Group panel should render AllClear with default filters and only Planned items"
     );
-    let grp_avatar = vcx
-        .debug_bounds("bot-group-all-clear-avatar")
-        .expect("group AllClear avatar");
-    assert_eq!(grp_avatar.size.width, px(40.));
-    assert_eq!(grp_avatar.size.height, px(40.));
+    // Orca #47436: BotItemsAllClear is a single muted line with no 40px avatar cluster.
+    assert!(
+        vcx.debug_bounds("bot-group-all-clear-avatar").is_none(),
+        "Group panel AllClear should not render a 40px avatar cluster"
+    );
 }
 
 /// Commit 6 (`d6cc2684`): an agent's long asking comment above an open question is shown whole

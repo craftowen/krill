@@ -447,7 +447,11 @@ impl Shell {
             .map_or_else(|| fallback_agent_display_name(agent_id), str::to_owned)
     }
 
-    fn launcher_default_agent_label(&self, agent_id: Option<&str>) -> String {
+    fn launcher_default_agent_label(&self, pane: PaneId, agent_id: Option<&str>) -> String {
+        if let Some(bot) = self.bot_for_pane(pane) {
+            return krill_app::i18n::catalog::bots::SV_NEW_CHAT_WITH_BOT
+                .format(&[("bot", &bot.name)]);
+        }
         match agent_id.filter(|id| !id.trim().is_empty()) {
             Some(id) => {
                 let name = self.launcher_agent_display_name(id);
@@ -458,9 +462,29 @@ impl Shell {
     }
 
     fn launcher_agent_profiles(&self, pane: PaneId, cx: &App) -> Vec<(String, String)> {
+        let local = !self.layout.host(pane).is_remote();
+        let bot_agent = self
+            .bot_for_pane(pane)
+            .map(|b| krill_proto::agent::canonical_id(&b.agent_id).to_owned());
         if let Some(settings) = &self.agents
             && !settings.profiles.is_empty()
         {
+            // Orca `#47382`: list only enabled/installed agents (always keep the bot's own agent).
+            let filtered: Vec<(String, String)> = settings
+                .profiles
+                .iter()
+                .filter(|p| {
+                    !local
+                        || bot_agent.as_deref().is_some_and(|ba| {
+                            krill_proto::agent::canonical_id(&p.id).eq_ignore_ascii_case(ba)
+                        })
+                        || krill_app::accounts::installed::agent_maybe_installed(cx, &p.id)
+                })
+                .map(|p| (p.id.clone(), p.name.clone()))
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
+            }
             return settings
                 .profiles
                 .iter()
@@ -481,7 +505,7 @@ impl Shell {
         let query = launcher.query.trim();
         if query.is_empty() {
             let default_agent_id = self.launcher_default_agent_id(pane, cx);
-            let label = self.launcher_default_agent_label(default_agent_id.as_deref());
+            let label = self.launcher_default_agent_label(pane, default_agent_id.as_deref());
             return vec![
                 LauncherRow::DefaultAgent {
                     agent_id: default_agent_id.unwrap_or_default(),
@@ -881,7 +905,7 @@ impl Shell {
                         _ => {}
                     }
                 }
-                let row_el = Self::render_launcher_row(
+                let row_el = self.render_launcher_row(
                     id,
                     idx,
                     row,
@@ -1098,6 +1122,7 @@ impl Shell {
         reason = "Renders one launcher row with shared pane, selection, profiles, shortcuts and palette context"
     )]
     fn render_launcher_row(
+        &self,
         pane: PaneId,
         index: usize,
         row: &LauncherRow,
@@ -1156,7 +1181,9 @@ impl Shell {
 
         match row {
             LauncherRow::DefaultAgent { agent_id, label } => {
-                let icon = if agent_id.is_empty() {
+                let icon = if let Some(bot) = self.bot_for_pane(pane) {
+                    self.bot_avatar(bot, ui::ICON_LG, px(4.), p)
+                } else if agent_id.is_empty() {
                     ui::icons::svg_box(ui::icons::BOT_SVG, ui::ICON_LG, p.muted_foreground)
                         .into_any_element()
                 } else {
@@ -1425,7 +1452,12 @@ mod tests {
         assert_ne!(focused, original_pane);
         assert!(is_launcher, "split pane in bot workspace opens launcher");
         assert!(
-            matches!(rows.first(), Some(LauncherRow::DefaultAgent { agent_id, .. }) if agent_id == "claude")
+            matches!(
+                rows.first(),
+                Some(LauncherRow::DefaultAgent { agent_id, label })
+                    if agent_id == "claude" && label.contains("KrillBot")
+            ),
+            "bot split launcher prioritizes New chat with {{bot}}: {rows:?}"
         );
         assert!(matches!(rows.get(1), Some(LauncherRow::Terminal)));
 

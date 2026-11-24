@@ -158,13 +158,13 @@ impl View {
                     .child(
                         div()
                             .text_size(ui::TEXT_LG)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(p.foreground)
                             .child(title.to_owned()),
                     )
                     .children(description.map(|d| {
                         div()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(d)
                     })),
@@ -205,7 +205,7 @@ impl View {
                     )
                     .children(description.into_iter().map(|d| {
                         div()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(d)
                     })),
@@ -223,6 +223,7 @@ impl View {
         let runtime = bot.agent_id.clone();
         let this = cx.weak_entity();
         let switch_bot = bot.clone();
+        let enabled_runtimes = super::pickers::available_runtimes(self.host.is_local(), cx);
         let runtime_button = Button::new("bot-settings-agent-runtime")
             .debug_selector(|| "bot-settings-agent-runtime".into())
             .outline()
@@ -246,9 +247,16 @@ impl View {
             .dropdown_menu(move |mut menu, _, _| {
                 let current_canon = krill_proto::agent::canonical_id(&switch_bot.agent_id);
                 for rt in BOT_RUNTIMES {
+                    let is_current = current_canon == rt.id;
+                    // Orca #47382: show only enabled/installed agents (always keep the bot's current agent).
+                    if !is_current
+                        && !enabled_runtimes.is_empty()
+                        && !enabled_runtimes.contains(&rt.id)
+                    {
+                        continue;
+                    }
                     let this = this.clone();
                     let bot = switch_bot.clone();
-                    let is_current = current_canon == rt.id;
                     menu = menu.item(
                         PopupMenuItem::new(rt.label())
                             .icon(ui::icons::agent_menu_icon(rt.id))
@@ -283,6 +291,7 @@ impl View {
             _ => runtime_models(runtime_canon),
         };
         let current = bot.model.clone().filter(|m| !m.trim().is_empty());
+        let has_model_override = current.is_some();
         let model_label = current.as_deref().map_or_else(
             || text::MODEL_DEFAULT.get().to_owned(),
             |id| {
@@ -375,6 +384,8 @@ impl View {
             },
         );
 
+        let has_overrides = has_model_override || !effort.is_empty();
+        let reset_bot = bot.clone();
         let body = div()
             .w_full()
             .rounded(ui::RADIUS_LG)
@@ -397,7 +408,7 @@ impl View {
                     )
                     .child(
                         div()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .line_height(px(16.))
                             .text_color(p.muted_foreground)
                             .child(text::SV_AGENT_DESC.get()),
@@ -411,7 +422,36 @@ impl View {
                     .child(div().flex_1().min_w(px(120.)).child(runtime_button))
                     .child(div().flex_1().min_w(px(120.)).child(model_button))
                     .child(div().flex_1().min_w(px(120.)).child(effort_select)),
-            );
+            )
+            .child(if has_overrides {
+                div()
+                    .id("bot-settings-agent-use-defaults")
+                    .debug_selector(|| "bot-settings-agent-use-defaults".into())
+                    .role(gpui::Role::Button)
+                    .tab_index(0)
+                    .self_start()
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .underline()
+                    .hover(|d| d.text_color(p.foreground))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let params = UpdateBotParams {
+                            model: krill_proto::bots::FieldPatch::Clear,
+                            effort: krill_proto::bots::FieldPatch::Clear,
+                            ..patch(&reset_bot)
+                        };
+                        this.patch_bot(params, cx);
+                    }))
+                    .child(text::NB_USE_CHAT_DEFAULTS.get())
+                    .into_any_element()
+            } else {
+                div()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .child(text::NB_USING_CHAT_DEFAULT.get())
+                    .into_any_element()
+            });
         Self::settings_screen("bot-settings-agent-page").child(body)
     }
 
@@ -689,7 +729,7 @@ impl View {
         if !look.enabled {
             section = section.child(
                 div()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(text::SV_LOOK_ON_DESC.get()),
             );
@@ -769,10 +809,13 @@ impl View {
         .on_click(cx.listener(move |this, _, _, cx| {
             this.run_look_around(look_bot.clone(), cx);
         }));
+        let every_desc: SharedString = text::SV_LOOK_EVERY_DESC
+            .format(&[("agent", &runtime_display_label(&bot.agent_id))])
+            .into();
         section = section
             .child(Self::settings_form_row(
                 text::SV_HOW_OFTEN.get(),
-                Vec::new(),
+                vec![every_desc],
                 Some(every.into_any_element()),
                 p,
             ))
@@ -803,7 +846,7 @@ impl View {
                     )
                     .child(
                         div()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(text::SV_LOOK_FOCUS_DESC.get()),
                     ),
@@ -886,7 +929,7 @@ impl View {
         if status.auto_disabled || !tidy.enabled {
             section = section.child(
                 div()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(if status.auto_disabled {
                         text::SV_TIDY_TURNED_OFF.get()
@@ -987,7 +1030,7 @@ impl View {
                         )
                         .child(
                             div()
-                                .text_size(ui::TEXT_XS)
+                                .text_size(ui::TEXT_SM)
                                 .text_color(p.muted_foreground)
                                 .child(last_line)
                                 .when_some(
@@ -1068,7 +1111,7 @@ impl View {
                     .child(
                         div()
                             .text_size(ui::TEXT_XL)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(p.foreground)
                             .child(title),
                     )
@@ -1087,7 +1130,7 @@ impl View {
                         .gap_1p5()
                         .child(
                             div()
-                                .text_size(ui::TEXT_XS)
+                                .text_size(ui::TEXT_SM)
                                 .text_color(p.muted_foreground)
                                 .child(text::SV_TIDY_TIDIED.get()),
                         )
@@ -1101,7 +1144,7 @@ impl View {
             })
             .child(
                 div()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(if run.undone {
                         text::SV_TIDY_UNDONE.get()
@@ -1258,9 +1301,14 @@ impl View {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(p.muted_foreground)
+                            .child(ui::icons::svg_icon(
+                                ui::icons::PLUG_SVG,
+                                ui::ICON_SM,
+                                p.muted_foreground,
+                            ))
                             .child(div().truncate().child(title)),
                     )
                     .child(
@@ -1416,7 +1464,7 @@ impl View {
                         )
                         .child(
                             div()
-                                .text_size(ui::TEXT_XS)
+                                .text_size(ui::TEXT_SM)
                                 .text_color(p.muted_foreground)
                                 .child(detail),
                         ),
@@ -1474,7 +1522,7 @@ impl View {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(p.muted_foreground)
                             .child(text::SV_WHO_HEADING.format(&[("name", &bot.name)])),
@@ -1482,13 +1530,13 @@ impl View {
                     .child(
                         div()
                             .text_size(ui::TEXT_LG)
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(p.foreground)
                             .child(summary),
                     )
                     .child(
                         div()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(control),
                     ),
@@ -1506,7 +1554,7 @@ impl View {
                         .gap_3()
                         .child(
                             div()
-                                .text_size(ui::TEXT_XS)
+                                .text_size(ui::TEXT_SM)
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(p.muted_foreground)
                                 .child(text::SV_WHO_ADVICE.get()),
@@ -1519,38 +1567,136 @@ impl View {
     fn render_skills_page(
         bot: &BotConfig,
         p: &ui::Palette,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let rows: Vec<Row> = bot
-            .skills
-            .iter()
-            .map(|s| {
-                Row::new(
-                    SharedString::from(format!("bot-skill-{s}")),
-                    Some(ui::icons::BOOK_OPEN_SVG),
-                    s.clone(),
-                )
-            })
-            .collect();
         let header = Self::subsection_header(
             text::SV_SKILLS.get(),
             Some(text::SV_SKILLS_DESC.get().into()),
             None,
             p,
         );
-        let screen = Self::settings_screen("bot-settings-skills-page").child(header);
-        if rows.is_empty() {
-            return screen.child(
+        let count_label = if bot.skills.is_empty() {
+            text::SV_NONE.get().to_owned()
+        } else {
+            text::SV_COUNT.format(&[("n", &bot.skills.len().to_string())])
+        };
+        let mut card = div()
+            .w_full()
+            .overflow_hidden()
+            .rounded(ui::RADIUS_XL)
+            .border_1()
+            .border_color(p.border)
+            .bg(p.card)
+            .flex()
+            .flex_col()
+            .child(
                 div()
-                    .px_1()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::SV_NONE.get()),
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(32.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(ui::RADIUS_MD)
+                            .bg(p.muted)
+                            .child(
+                                Icon::default()
+                                    .data(ui::icons::BOT_SVG)
+                                    .size(px(ui::ICON_LG))
+                                    .text_color(p.muted_foreground),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.foreground)
+                                    .child(text::SV_SKILLS_OWN.format(&[("name", &bot.name)])),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_SM)
+                                    .text_color(p.muted_foreground)
+                                    .child(if bot.skills.is_empty() {
+                                        text::SV_SKILLS_NONE_DESC.get().to_owned()
+                                    } else {
+                                        count_label.clone()
+                                    }),
+                            ),
+                    )
+                    .when(bot.skills.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(ui::TEXT_SM)
+                                .text_color(p.muted_foreground)
+                                .child(count_label.clone()),
+                        )
+                    }),
             );
+        if !bot.skills.is_empty() {
+            let mut list = div()
+                .w_full()
+                .border_t_1()
+                .border_color(p.border)
+                .px_4()
+                .py_2p5()
+                .flex()
+                .flex_col()
+                .gap_2();
+            for s in &bot.skills {
+                let desc = krill_proto::bots::find_bot_skill(s).map(|sk| {
+                    super::templates::localized_skill_description(sk.name, sk.description)
+                });
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("bot-skill-{s}")))
+                        .flex()
+                        .items_start()
+                        .gap_2p5()
+                        .child(
+                            Icon::default()
+                                .data(ui::icons::BOOK_OPEN_SVG)
+                                .size(px(ui::ICON_MD))
+                                .mt(px(2.))
+                                .text_color(p.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(ui::TEXT_MD)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.foreground)
+                                        .child(super::templates::localized_skill_title(s)),
+                                )
+                                .children(desc.map(|d| {
+                                    div()
+                                        .text_size(ui::TEXT_SM)
+                                        .text_color(p.muted_foreground)
+                                        .child(d)
+                                })),
+                        ),
+                );
+            }
+            card = card.child(list);
         }
-        screen.child(Self::render_inset_group(
-            None, None, rows, None, false, p, cx,
-        ))
+        Self::settings_screen("bot-settings-skills-page")
+            .child(div().flex().flex_col().gap_3().child(header).child(card))
     }
 
     fn render_sharing_page(
@@ -1620,48 +1766,59 @@ impl View {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let row =
-            |id: SharedString, icon: AnyElement, title: SharedString, detail: Option<String>| {
-                div()
-                    .id(id)
-                    .w_full()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size(px(32.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(ui::RADIUS_MD)
-                            .bg(p.muted)
-                            .child(icon),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(ui::TEXT_LG)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(p.foreground)
-                                    .child(title),
-                            )
-                            .children(detail.map(|d| {
-                                div()
-                                    .truncate()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(d)
-                            })),
-                    )
-            };
+        let row = |id: SharedString,
+                   icon: AnyElement,
+                   dashed_icon: bool,
+                   title: SharedString,
+                   detail: Option<String>| {
+            div()
+                .id(id)
+                .w_full()
+                .px_4()
+                .py_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .size(px(32.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(ui::RADIUS_MD)
+                        .map(|d| {
+                            if dashed_icon {
+                                d.border_1()
+                                    .border_dashed()
+                                    .border_color(p.muted_foreground.opacity(0.45))
+                            } else {
+                                d.bg(p.muted)
+                            }
+                        })
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(ui::TEXT_LG)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(title),
+                        )
+                        .children(detail.map(|d| {
+                            div()
+                                .truncate()
+                                .text_size(ui::TEXT_SM)
+                                .text_color(p.muted_foreground)
+                                .child(d)
+                        })),
+                )
+        };
         let wrench = || {
             Icon::default()
                 .data(ui::icons::WRENCH_SVG)
@@ -1687,6 +1844,7 @@ impl View {
                 .child(row(
                     SharedString::from(format!("bot-tool-{i}")),
                     wrench(),
+                    false,
                     t.name.clone().into(),
                     detail,
                 ))
@@ -1704,6 +1862,7 @@ impl View {
                 .size(px(ui::ICON_LG))
                 .text_color(p.muted_foreground)
                 .into_any_element(),
+                true,
                 text::SV_TOOLS_ADD.get().into(),
                 None,
             )

@@ -10,7 +10,7 @@ use gpui::{
     AnyElement, Context, ListAlignment, ListState, SharedString, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+use gpui_component::{Icon, IconName, Sizable as _};
 use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemStatus, BotRpcRequest, BotRpcResponse};
 
 use super::home::{
@@ -653,43 +653,19 @@ impl View {
                     .into_any_element()
             }
             GroupListRow::AllClear => {
-                let dark = cx.theme().mode.is_dark();
-                let members: Vec<(&BotConfig, Option<std::sync::Arc<gpui::Image>>)> = self
-                    .group_panel
-                    .member_ids
-                    .iter()
-                    .filter_map(|bid| {
-                        self.bots
-                            .iter()
-                            .find(|b| &b.id == bid)
-                            .map(|bot| (bot, self.settings.avatar_cache.get(&bot.id).cloned()))
-                    })
-                    .collect();
-                let faces = super::group_faces::render_group_config_faces_grayscale(
-                    &members, 40., p.sidebar, dark, p,
-                );
+                // Orca `#47436` (`BotItemsAllClear.tsx`): left-aligned 1-line muted status at
+                // the list's top edge (panel header already shows the group's faces).
                 div()
                     .id("bot-group-all-clear")
                     .debug_selector(|| "bot-group-all-clear".into())
                     .role(gpui::Role::Status)
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
+                    .min_w_0()
                     .px_2()
-                    .py_3()
-                    .text_center()
-                    .child(
-                        div()
-                            .debug_selector(|| "bot-group-all-clear-avatar".into())
-                            .child(faces),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_SM)
-                            .text_color(p.muted_foreground)
-                            .child(text::HM_ALL_CLEAR.get()),
-                    )
+                    .py_1()
+                    .text_size(ui::TEXT_MD)
+                    .line_height(px(20.))
+                    .text_color(p.muted_foreground)
+                    .child(text::HM_ALL_CLEAR.get())
                     .into_any_element()
             }
             GroupListRow::BucketHeader {

@@ -140,9 +140,14 @@ impl BotAgentSetup {
         };
         let active = hosts[0].clone();
         let local = active.id.is_local();
-        let runtime = available_runtimes(local, cx)
-            .into_iter()
-            .next()
+        let runtimes = available_runtimes(local, cx);
+        let default_agent = crate::settings::current(cx).default_agent;
+        let preferred = krill_proto::agent::canonical_id(&default_agent);
+        let runtime = runtimes
+            .iter()
+            .copied()
+            .find(|id| *id == preferred)
+            .or_else(|| runtimes.first().copied())
             .unwrap_or("claude");
         let mut me = Self {
             host_id: active.id,
@@ -221,14 +226,25 @@ impl BotAgentSetup {
         self.host_is_local = choice.id.is_local();
         self.host_id = choice.id;
         let runtimes = available_runtimes(self.host_is_local, cx);
-        if !runtimes.contains(&self.runtime)
-            && let Some(first) = runtimes.first()
-        {
-            self.set_runtime(first, lens, cx);
-        } else {
+        if runtimes.contains(&self.runtime) {
             self.model = None;
             self.effort = None;
             self.load_models(lens, cx);
+        } else {
+            let default_agent = crate::settings::current(cx).default_agent;
+            let preferred = krill_proto::agent::canonical_id(&default_agent);
+            if let Some(next) = runtimes
+                .iter()
+                .copied()
+                .find(|id| *id == preferred)
+                .or_else(|| runtimes.first().copied())
+            {
+                self.set_runtime(next, lens, cx);
+            } else {
+                self.model = None;
+                self.effort = None;
+                self.load_models(lens, cx);
+            }
         }
         cx.notify();
     }

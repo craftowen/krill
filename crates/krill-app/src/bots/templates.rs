@@ -8,11 +8,17 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{IconName, Sizable as _};
-use krill_proto::bots::{BUILTIN_BOT_TEMPLATES, BotTemplate, BotTemplateCategory};
+use gpui_component::{Icon, IconName, Sizable as _};
+use krill_proto::bots::{
+    BUILTIN_BOT_TEMPLATES, BotTemplate, BotTemplateCategory, BotTemplateEvent, BotTemplateSchedule,
+    find_bot_skill,
+};
 
 use super::avatar;
-use crate::i18n::catalog::bots as text;
+use crate::i18n::{
+    self, Language, bot_skill_ko, bot_template_event_ko, bot_template_ko, bot_template_schedule_ko,
+    catalog::bots as text,
+};
 use crate::ui;
 
 /// Orca `w-[min(1080px,100vw-2rem)] h-[min(780px,100vh-2rem)]`.
@@ -29,8 +35,135 @@ pub enum Event {
     Close,
 }
 
+fn is_korean() -> bool {
+    i18n::language() == Language::Ko
+}
+
+#[must_use]
+pub fn localized_template_name(tpl: &BotTemplate) -> &'static str {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return ko.name;
+    }
+    tpl.name
+}
+
+#[must_use]
+pub fn localized_template_description(tpl: &BotTemplate) -> &'static str {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return ko.description;
+    }
+    tpl.description
+}
+
+#[must_use]
+pub fn localized_template_first_chat(tpl: &BotTemplate) -> &'static str {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return ko.first_chat;
+    }
+    tpl.first_chat
+}
+
+#[must_use]
+pub fn localized_template_watches(tpl: &BotTemplate, fallback: Option<String>) -> Option<String> {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return Some(ko.watches.to_owned());
+    }
+    fallback
+}
+
+#[must_use]
+pub fn localized_template_does(tpl: &BotTemplate, fallback: Option<String>) -> Option<String> {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return Some(ko.does.to_owned());
+    }
+    fallback
+}
+
+#[must_use]
+pub fn localized_template_reports(tpl: &BotTemplate, fallback: Option<String>) -> Option<String> {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return Some(ko.reports.to_owned());
+    }
+    fallback
+}
+
+#[must_use]
+pub fn localized_template_needs_setup(tpl: &BotTemplate) -> Option<&'static str> {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return ko.needs_setup.or(tpl.needs_setup);
+    }
+    tpl.needs_setup
+}
+
+#[must_use]
+pub fn localized_template_examples(tpl: &BotTemplate) -> [&'static str; 2] {
+    if is_korean()
+        && let Some(ko) = bot_template_ko(tpl.id)
+    {
+        return ko.examples;
+    }
+    tpl.example
+}
+
+#[must_use]
+pub fn localized_schedule(
+    tpl_id: &str,
+    sched: &BotTemplateSchedule,
+) -> (&'static str, &'static str) {
+    if is_korean()
+        && let Some(ko) = bot_template_schedule_ko(tpl_id, sched.id)
+    {
+        return ko;
+    }
+    (sched.when, sched.what)
+}
+
+#[must_use]
+pub fn localized_event_name(tpl_id: &str, ev: &BotTemplateEvent) -> &'static str {
+    if is_korean()
+        && let Some(ko) = bot_template_event_ko(tpl_id, ev.id)
+    {
+        return ko;
+    }
+    ev.name
+}
+
+#[must_use]
+pub fn localized_skill_title(skill_id: &str) -> String {
+    if is_korean()
+        && let Some((title, _)) = bot_skill_ko(skill_id)
+    {
+        return format!("{title} ({skill_id})");
+    }
+    skill_id.to_owned()
+}
+
+#[must_use]
+pub fn localized_skill_description(skill_id: &str, fallback: &'static str) -> &'static str {
+    if is_korean()
+        && let Some((_, desc)) = bot_skill_ko(skill_id)
+    {
+        return desc;
+    }
+    fallback
+}
+
 /// Templates matching `category` and every word of `query` (name, line, category, connectors,
-/// skills, id), in catalog order.
+/// skills, id — both English and Korean), in catalog order.
 #[must_use]
 pub fn filter_templates(
     category: Option<BotTemplateCategory>,
@@ -51,6 +184,12 @@ pub fn filter_templates(
                 tpl.id,
                 category_label(tpl.category)
             );
+            if let Some(ko) = bot_template_ko(tpl.id) {
+                hay.push(' ');
+                hay.push_str(ko.name);
+                hay.push(' ');
+                hay.push_str(ko.description);
+            }
             for c in tpl.connectors {
                 hay.push(' ');
                 hay.push_str(super::View::source_label(*c));
@@ -58,6 +197,10 @@ pub fn filter_templates(
             for s in tpl.skills {
                 hay.push(' ');
                 hay.push_str(s);
+                if let Some((title, _)) = bot_skill_ko(s) {
+                    hay.push(' ');
+                    hay.push_str(title);
+                }
             }
             let hay = hay.to_lowercase();
             q.split_whitespace().all(|term| hay.contains(term))
@@ -99,6 +242,35 @@ impl std::fmt::Debug for Templates {
             .field("category", &self.category)
             .field("selected", &self.selected)
             .finish_non_exhaustive()
+    }
+}
+
+fn category_icon(cat: Option<BotTemplateCategory>, color: gpui::Hsla) -> gpui::AnyElement {
+    match cat {
+        None => ui::icons::svg_icon(ui::icons::LAYOUT_TEMPLATE_SVG, ui::ICON_XS, color)
+            .into_any_element(),
+        Some(BotTemplateCategory::Coding) => {
+            ui::icons::svg_icon(ui::icons::SQUARE_TERMINAL_SVG, ui::ICON_XS, color)
+                .into_any_element()
+        }
+        Some(BotTemplateCategory::Releases) => {
+            ui::icons::svg_icon(ui::icons::SPARKLES_SVG, ui::ICON_XS, color).into_any_element()
+        }
+        Some(BotTemplateCategory::Support) => Icon::new(gpui_kit_assets::IconName::MessagesSquare)
+            .with_size(ui::ICON_XS)
+            .text_color(color)
+            .into_any_element(),
+        Some(BotTemplateCategory::Planning) => Icon::new(IconName::FileText)
+            .with_size(ui::ICON_XS)
+            .text_color(color)
+            .into_any_element(),
+        Some(BotTemplateCategory::Ops) => {
+            ui::icons::svg_icon(ui::icons::WRENCH_SVG, ui::ICON_XS, color).into_any_element()
+        }
+        Some(BotTemplateCategory::Personal) => Icon::new(IconName::User)
+            .with_size(ui::ICON_XS)
+            .text_color(color)
+            .into_any_element(),
     }
 }
 
@@ -238,7 +410,15 @@ impl Templates {
     }
 
     fn render_chips(&self, p: &ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let chip = |id: SharedString, label: &'static str, active: bool| {
+        let chip = |id: SharedString,
+                    cat: Option<BotTemplateCategory>,
+                    label: &'static str,
+                    active: bool| {
+            let fg = if active {
+                p.accent_foreground
+            } else {
+                p.muted_foreground
+            };
             div()
                 .id(id.clone())
                 .debug_selector(move || id.to_string())
@@ -252,6 +432,7 @@ impl Templates {
                 .border_1()
                 .flex()
                 .items_center()
+                .gap_1p5()
                 .text_size(ui::TEXT_SM)
                 .cursor_pointer()
                 .when(active, |d| {
@@ -265,11 +446,13 @@ impl Templates {
                         .text_color(p.muted_foreground)
                         .hover(|d| d.bg(p.accent.opacity(0.5)))
                 })
+                .child(category_icon(cat, fg))
                 .child(label)
         };
         let mut row = div().flex().flex_wrap().gap_1p5().child(
             chip(
                 "bot-tpl-cat-all".into(),
+                None,
                 text::CAT_ALL.get(),
                 self.category.is_none(),
             )
@@ -280,6 +463,7 @@ impl Templates {
             row = row.child(
                 chip(
                     format!("bot-tpl-cat-{cat:?}").to_lowercase().into(),
+                    Some(cat),
                     category_label(cat),
                     self.category == Some(cat),
                 )
@@ -298,11 +482,13 @@ impl Templates {
         let current = self.selected == Some(tpl.id);
         let id = SharedString::from(format!("bot-tpl-{}", tpl.id));
         let use_id = SharedString::from(format!("bot-tpl-use-{}", tpl.id));
+        let name = localized_template_name(tpl);
+        let desc = localized_template_description(tpl);
         div()
             .id(id.clone())
             .debug_selector(move || id.to_string())
             .role(gpui::Role::ListItem)
-            .aria_label(tpl.name)
+            .aria_label(name)
             .group("bot-tpl-row")
             .w_full()
             .px_2()
@@ -340,7 +526,7 @@ impl Templates {
                                     .text_size(ui::TEXT_LG)
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(p.foreground)
-                                    .child(tpl.name),
+                                    .child(name),
                             )
                             .when(tpl.needs_setup.is_some(), |d| {
                                 d.child(ui::badge(
@@ -355,7 +541,7 @@ impl Templates {
                             .truncate()
                             .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
-                            .child(tpl.description),
+                            .child(desc),
                     ),
             )
             .child(
@@ -368,7 +554,7 @@ impl Templates {
                     .child(
                         ui::secondary(use_id.clone(), text::TPL_USE.get())
                             .xsmall()
-                            .accessibility_label(text::TPL_USE_NAMED.format(&[("name", tpl.name)]))
+                            .accessibility_label(text::TPL_USE_NAMED.format(&[("name", name)]))
                             .debug_selector(move || use_id.to_string())
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.stop_propagation();
@@ -450,9 +636,13 @@ impl Templates {
                 div()
                     .py_2()
                     .bg(p.popover)
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .text_size(ui::TEXT_SM)
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(p.muted_foreground)
+                    .child(category_icon(Some(*cat), p.muted_foreground))
                     .child(category_label(*cat)),
             );
             for tpl in in_cat {
@@ -468,6 +658,11 @@ impl Templates {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let name = localized_template_name(tpl);
+        let desc = localized_template_description(tpl);
+        let first_chat = localized_template_first_chat(tpl);
+        let needs_setup = localized_template_needs_setup(tpl);
+        let examples = localized_template_examples(tpl);
         let section = |title: &'static str| {
             div()
                 .text_size(ui::TEXT_SM)
@@ -531,7 +726,7 @@ impl Templates {
                                                 div()
                                                     .text_size(ui::TEXT_XL)
                                                     .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(tpl.name),
+                                                    .child(name),
                                             )
                                             .when(tpl.needs_setup.is_some(), |d| {
                                                 d.child(ui::badge(
@@ -543,8 +738,16 @@ impl Templates {
                                     )
                                     .child(
                                         div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
                                             .text_size(ui::TEXT_SM)
                                             .text_color(p.muted_foreground)
+                                            .child(
+                                                Icon::new(IconName::CircleCheck)
+                                                    .with_size(ui::ICON_XS)
+                                                    .text_color(p.muted_foreground),
+                                            )
                                             .child(text::TPL_BY_KRILL.format(&[(
                                                 "category",
                                                 category_label(tpl.category),
@@ -552,7 +755,7 @@ impl Templates {
                                     ),
                             ),
                     )
-                    .child(div().text_size(ui::TEXT_LG).child(tpl.description))
+                    .child(div().text_size(ui::TEXT_LG).child(desc))
                     .child(
                         ui::primary("bot-tpl-use-detail", text::TPL_USE_TEMPLATE.get())
                             .debug_selector(|| "bot-tpl-use-detail".into())
@@ -588,13 +791,13 @@ impl Templates {
                                     .text_size(ui::TEXT_SM)
                                     .text_color(p.muted_foreground)
                                     .child(template_mascot(tpl, 16., ui::RADIUS_XS, p))
-                                    .child(text::TPL_IN_ITS_CHAT.format(&[("name", tpl.name)])),
+                                    .child(text::TPL_IN_ITS_CHAT.format(&[("name", name)])),
                             )
                             .children(
-                                tpl.example
-                                    .iter()
+                                examples
+                                    .into_iter()
                                     .filter(|l| !l.is_empty())
-                                    .map(|line| div().text_size(ui::TEXT_LG).child(*line)),
+                                    .map(|line| div().text_size(ui::TEXT_LG).child(line)),
                             ),
                     )
                     .child(
@@ -607,16 +810,16 @@ impl Templates {
                                 div()
                                     .text_size(ui::TEXT_LG)
                                     .text_color(p.muted_foreground)
-                                    .child(tpl.first_chat),
+                                    .child(first_chat),
                             ),
                     )
-                    .children(tpl.needs_setup.map(|note| {
+                    .children(needs_setup.map(|note| {
                         div()
                             .p_3()
                             .rounded(ui::RADIUS_MD)
                             .border_1()
-                            .border_color(p.warning.opacity(0.4))
-                            .bg(p.warning.opacity(0.08))
+                            .border_color(p.border)
+                            .bg(p.muted.opacity(0.4))
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -633,7 +836,25 @@ impl Templates {
                             div()
                                 .flex()
                                 .flex_col()
-                                .child(section(text::NB_COMES_WITH.get()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(section(text::NB_COMES_WITH.get()))
+                                        .child(ui::button_with_tooltip(
+                                            Button::new("bot-tpl-comes-with-info")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(
+                                                    Icon::new(IconName::Info)
+                                                        .with_size(ui::ICON_XS)
+                                                        .text_color(p.muted_foreground),
+                                                ),
+                                            "bot-tpl-comes-with-info",
+                                            text::TPL_COMES_WITH_INFO.get(),
+                                        )),
+                                )
                                 .children(comes_with),
                         )
                     }),
@@ -681,16 +902,20 @@ pub(super) fn comes_with_rows(
     let svg = |icon: &'static [u8]| {
         ui::icons::svg_icon(icon, ui::ICON_LG, p.muted_foreground).into_any_element()
     };
-    let status = |s: &'static str| {
+    let status = |s: &'static str, emphasize: bool| {
         div()
-            .text_size(ui::TEXT_XS)
-            .text_color(p.muted_foreground)
+            .text_size(ui::TEXT_SM)
+            .text_color(if emphasize {
+                p.foreground
+            } else {
+                p.muted_foreground
+            })
             .child(s)
             .into_any_element()
     };
     let row = |icon: gpui::AnyElement,
-               title: &'static str,
-               detail: Option<&'static str>,
+               title: SharedString,
+               detail: Option<SharedString>,
                trailing: Option<gpui::AnyElement>| {
         div()
             .w_full()
@@ -724,30 +949,38 @@ pub(super) fn comes_with_rows(
             .with_size(ui::ICON_LG)
             .text_color(p.muted_foreground)
             .into_any_element();
-        rows.push(row(book, skill, None, skill_trailing(skill)));
+        let detail = find_bot_skill(skill)
+            .map(|s| localized_skill_description(s.name, s.description).into());
+        rows.push(row(
+            book,
+            localized_skill_title(skill).into(),
+            detail,
+            skill_trailing(skill),
+        ));
     }
     for s in tpl.schedules {
+        let (when, what) = localized_schedule(tpl.id, s);
         rows.push(row(
             svg(ui::icons::CLOCK_SVG),
-            s.when,
-            Some(s.what),
-            Some(status(text::NB_OFF.get())),
+            when.into(),
+            Some(what.into()),
+            Some(status(text::NB_OFF.get(), false)),
         ));
     }
     for e in tpl.events {
         rows.push(row(
             svg(ui::icons::ZAP_SVG),
-            e.name,
+            localized_event_name(tpl.id, e).into(),
             None,
-            Some(status(text::NB_FIRST_CHAT.get())),
+            Some(status(text::NB_FIRST_CHAT.get(), false)),
         ));
     }
     for c in tpl.connectors {
         rows.push(row(
             svg(ui::icons::PLUG_SVG),
-            super::View::source_label(*c),
+            super::View::source_label(*c).into(),
             None,
-            Some(status(text::NB_NOT_CONNECTED.get())),
+            Some(status(text::NB_NOT_CONNECTED.get(), true)),
         ));
     }
     rows
@@ -917,5 +1150,48 @@ mod tests {
                 || t.skills.iter().any(|s| s.contains("slack"))
         }));
         assert!(filter_templates(None, "zzzz-no-such-template").is_empty());
+    }
+
+    #[test]
+    fn all_builtin_templates_have_korean_translations_and_search() {
+        for tpl in BUILTIN_BOT_TEMPLATES {
+            assert!(
+                bot_template_ko(tpl.id).is_some(),
+                "missing Korean translation for template {}",
+                tpl.id
+            );
+            for sched in tpl.schedules {
+                assert!(
+                    bot_template_schedule_ko(tpl.id, sched.id).is_some(),
+                    "missing Korean schedule translation for {}:{}",
+                    tpl.id,
+                    sched.id
+                );
+            }
+            for ev in tpl.events {
+                assert!(
+                    bot_template_event_ko(tpl.id, ev.id).is_some(),
+                    "missing Korean event translation for {}:{}",
+                    tpl.id,
+                    ev.id
+                );
+            }
+            for skill in tpl.skills {
+                assert!(
+                    bot_skill_ko(skill).is_some(),
+                    "missing Korean skill translation for {skill}"
+                );
+            }
+        }
+        assert!(
+            filter_templates(None, "이메일")
+                .iter()
+                .any(|t| t.id == "email-digest")
+        );
+        assert!(
+            filter_templates(None, "버그 조사")
+                .iter()
+                .any(|t| t.id == "bug-investigation")
+        );
     }
 }

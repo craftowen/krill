@@ -237,6 +237,21 @@ fn merge_polled_room(
     polled
 }
 
+fn invalidate_rooms_map(
+    rooms: &mut HashMap<GroupRoomKey, RoomState>,
+    host: Option<&HostId>,
+    group_ids: Option<&[String]>,
+) {
+    let targeted = group_ids.filter(|ids| !ids.is_empty());
+    for (k, room) in rooms.iter_mut() {
+        if host.is_none_or(|h| &k.host == h)
+            && targeted.is_none_or(|ids| ids.iter().any(|id| id == &k.group_id))
+        {
+            room.last_poll_ms = 0;
+        }
+    }
+}
+
 impl Shell {
     pub(super) fn is_group_pane(&self, pane: PaneId) -> bool {
         self.layout.group_pane(pane).is_some()
@@ -284,11 +299,17 @@ impl Shell {
     }
 
     pub(super) fn invalidate_group_room(&mut self, host: &HostId, group_id: &str) {
-        for (k, room) in &mut self.bot_ui.group_chat.rooms {
-            if &k.host == host && k.group_id == group_id {
-                room.last_poll_ms = 0;
-            }
-        }
+        self.invalidate_group_rooms(Some(host), Some(&[group_id.to_owned()]));
+    }
+
+    /// Orca `#47523`: refresh only the specific group rooms whose state changed instead of
+    /// polling every open room; `None` or an empty list invalidates all rooms on the host.
+    pub(super) fn invalidate_group_rooms(
+        &mut self,
+        host: Option<&HostId>,
+        group_ids: Option<&[String]>,
+    ) {
+        invalidate_rooms_map(&mut self.bot_ui.group_chat.rooms, host, group_ids);
     }
 
     pub(super) fn close_panes_for_group(
@@ -1294,7 +1315,7 @@ impl Shell {
             .size_full()
             .min_w_0()
             .min_h_0()
-            .bg(p.background)
+            .bg(p.chat_canvas())
             .text_color(p.foreground)
             .flex()
             .flex_col()
@@ -1367,7 +1388,7 @@ impl Shell {
                 .get(&(key.host.clone(), id.clone()))
                 .and_then(|(_, img)| img.clone())
         });
-        let faces = group_faces::render_group_faces(&face_members, 28., p.background, p);
+        let faces = group_faces::render_group_faces(&face_members, 28., p.chat_canvas(), p);
         let threads = room.map_or(&[][..], |r| r.threads.as_slice());
         let active_tid = room
             .and_then(|r| r.active_thread_id.as_deref())
@@ -1684,7 +1705,7 @@ impl Shell {
         now: u64,
         p: &ui::Palette,
     ) -> gpui::Stateful<gpui::Div> {
-        let age = krill_app::jump::format_age_secs(msg.created_at_ms / 1000, now / 1000);
+        let age = ui::format_short_time_ago_secs(msg.created_at_ms / 1000, now / 1000);
         div()
             .id(SharedString::from(format!("grp-owner-{}", msg.message_id)))
             .w_full()
@@ -1769,7 +1790,7 @@ impl Shell {
         } else if !is_member {
             text::GRP_MEMBER_REMOVED.get().to_owned()
         } else {
-            krill_app::jump::format_age_secs(msg.created_at_ms / 1000, now / 1000)
+            ui::format_short_time_ago_secs(msg.created_at_ms / 1000, now / 1000)
         };
 
         let msg_id_toggle = msg.message_id.clone();
@@ -2380,7 +2401,7 @@ impl Shell {
         });
 
         let summary = reply_picker_summary(audience, draft, members);
-        let picker_label = format!("{}: {summary}", text::GRP_REPLIES_PREFIX.get());
+        let prefix_label = format!("{}:", text::GRP_REPLIES_PREFIX.get());
         let this_picker = cx.weak_entity();
         let key_picker = key.clone();
         let members_picker = members.to_vec();
@@ -2398,10 +2419,14 @@ impl Shell {
                 .flex()
                 .items_center()
                 .gap_1()
-                .text_size(ui::TEXT_XS)
-                .text_color(p.muted_foreground)
-                .child(picker_label)
-                .child(Icon::new(IconName::ChevronDown).size(px(12.))),
+                .text_size(ui::TEXT_SM)
+                .child(div().text_color(p.muted_foreground).child(prefix_label))
+                .child(div().text_color(p.foreground).child(summary))
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(12.))
+                        .text_color(p.muted_foreground),
+                ),
         )
         .dropdown_menu(move |mut menu, _, _| {
             menu = menu.item(menu_heading(text::GRP_REPLY_PICKER_TITLE.get()));
@@ -2480,8 +2505,8 @@ impl Shell {
             .p_2p5()
             .rounded(ui::RADIUS_XL)
             .border_1()
-            .border_color(p.border)
-            .bg(p.card)
+            .border_color(p.chat_composer_border())
+            .bg(p.chat_composer_surface())
             .flex()
             .flex_col()
             .gap_1p5()
@@ -2549,7 +2574,7 @@ impl Shell {
             .px_4()
             .pt_1()
             .pb_3()
-            .bg(p.background)
+            .bg(p.chat_canvas())
             .flex()
             .flex_col()
             .children(mention_menu)
@@ -2757,5 +2782,48 @@ mod tests {
             format_elapsed(125_000),
             text::GRP_ELAPSED_MIN_SEC.format(&[("m", "2"), ("s", "5")])
         );
+    }
+
+    #[test]
+    fn targeted_group_invalidation_only_resets_changed_rooms() {
+        let mut rooms = HashMap::new();
+        let k1 = GroupRoomKey {
+            host: HostId::Local,
+            group_id: "grp-a".to_owned(),
+            thread_id: None,
+        };
+        let k2 = GroupRoomKey {
+            host: HostId::Local,
+            group_id: "grp-b".to_owned(),
+            thread_id: None,
+        };
+        rooms.insert(
+            k1.clone(),
+            RoomState {
+                last_poll_ms: 9_999,
+                ..RoomState::default()
+            },
+        );
+        rooms.insert(
+            k2.clone(),
+            RoomState {
+                last_poll_ms: 9_999,
+                ..RoomState::default()
+            },
+        );
+
+        invalidate_rooms_map(
+            &mut rooms,
+            Some(&HostId::Local),
+            Some(&["grp-a".to_owned()]),
+        );
+        assert_eq!(rooms[&k1].last_poll_ms, 0);
+        assert_eq!(
+            rooms[&k2].last_poll_ms, 9_999,
+            "unrelated group room must not be invalidated (#47523)"
+        );
+
+        invalidate_rooms_map(&mut rooms, None, None);
+        assert_eq!(rooms[&k2].last_poll_ms, 0);
     }
 }

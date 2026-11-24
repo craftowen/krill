@@ -498,7 +498,7 @@ impl Render for BotGroupMembersDialog {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .text_size(ui::TEXT_XS)
+                            .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
                             .child(
                                 div()
@@ -518,7 +518,7 @@ impl Render for BotGroupMembersDialog {
             )
             .children(need_more_label.map(|msg| {
                 div()
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.muted_foreground)
                     .child(msg)
             }))
@@ -528,7 +528,7 @@ impl Render for BotGroupMembersDialog {
                     .py_2()
                     .rounded(ui::RADIUS_MD)
                     .bg(p.warning.opacity(0.12))
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.warning)
                     .child(msg)
             }));

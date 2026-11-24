@@ -116,6 +116,10 @@ pub struct PictureState {
 impl Drop for PictureState {
     fn drop(&mut self) {
         self.cancel_running_generation();
+        // Orca #47278: release uploaded/generated PNG buffers and decoded GPUI images promptly.
+        self.custom = None;
+        self.gen_made = None;
+        self.intake = IntakeLine::Hint;
     }
 }
 
@@ -340,6 +344,13 @@ impl PictureState {
             || super::opt_textarea_composing(self.gen_input.as_ref(), window, app)
     }
 
+    /// Whether the active picture supports mascot look controls (background swatches/outfits).
+    /// Orca #47301: uploaded and generated pictures hide color/outfit controls and mascot-only notes.
+    #[must_use]
+    pub fn picture_takes_look(&self) -> bool {
+        matches!(self.current_face(), PictureFace::Mascot(_))
+    }
+
     pub fn open_popover<E: 'static>(
         &mut self,
         open: bool,
@@ -362,6 +373,13 @@ impl PictureState {
             self.hex_open = false;
             self.gen_editing = false;
             self.cancel_running_generation();
+            // Orca #47278: drop superseded upload snapshots and unused generated images once closed.
+            if matches!(self.intake, IntakeLine::Saved { .. }) {
+                self.intake = IntakeLine::Hint;
+            }
+            if !self.showing_custom {
+                self.gen_made = None;
+            }
         }
         cx.notify();
     }
@@ -964,7 +982,7 @@ impl PictureState {
         cx: &mut Context<E>,
     ) -> gpui::Div {
         let on_generate = self.current_face() == PictureFace::Generate;
-        let showing_custom = self.current_face() == PictureFace::Custom;
+        let takes_look = self.picture_takes_look();
         let gen_folded = self.is_gen_folded();
         let hide_upload_while_typing =
             on_generate && !gen_folded && matches!(self.intake, IntakeLine::Hint);
@@ -979,7 +997,7 @@ impl PictureState {
             .flex()
             .flex_col()
             .child(self.render_carousel(lens, p, window, cx))
-            .when(!on_generate && !showing_custom, |d| {
+            .when(takes_look, |d| {
                 d.child(self.render_swatches(lens, p, window, cx))
             })
             .children(gen_section)

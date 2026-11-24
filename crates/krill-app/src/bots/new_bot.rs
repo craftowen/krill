@@ -21,8 +21,9 @@ use krill_proto::bots::BotAgentModel;
 use krill_proto::bots::ExternalBotCandidate;
 use krill_proto::bots::{
     BOT_PROPOSAL_PURPOSE_MAX, BotConfig, BotImportNudgeInfo, BotProposal, BotRpcRequest,
-    BotRpcResponse, BotTemplate, CreateBotParams, CreateBotV2Params, ExternalBotSourceApp,
-    bot_import_nudge, find_bot_skill, proposal_identity, proposal_soul, template_proposal,
+    BotRpcResponse, BotSlug, BotTemplate, CreateBotParams, CreateBotV2Params, ExternalBotSourceApp,
+    bot_import_nudge, bot_slug_from_name, find_bot_skill, proposal_identity, proposal_soul,
+    template_proposal,
 };
 
 use super::avatar::{self, PictureError};
@@ -107,6 +108,59 @@ pub struct NewBot {
     _subs: Vec<Subscription>,
 }
 
+/// Orca `#47421`: when a template bot keeps its localized template name (with optional numeric
+/// suffix like `"PR 리뷰 2"`), derive the folder slug from the English template name so folder
+/// paths stay ASCII and predictable rather than collapsing to `"bot"`.
+#[must_use]
+pub fn template_bot_slug(tpl: &BotTemplate, name: &str, taken_names: &[String]) -> Option<BotSlug> {
+    let localized = super::templates::localized_template_name(tpl);
+    if localized.eq_ignore_ascii_case(tpl.name) {
+        return None;
+    }
+    let trimmed = name.trim();
+    let suffix = if trimmed.eq_ignore_ascii_case(localized) {
+        ""
+    } else {
+        trimmed
+            .strip_prefix(localized)
+            .and_then(|s| s.strip_prefix(' '))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+    };
+    let english = if suffix.is_empty() {
+        tpl.name.to_owned()
+    } else {
+        format!("{} {suffix}", tpl.name)
+    };
+    let base = bot_slug_from_name(&english);
+    let mut taken_slugs: std::collections::HashSet<String> = taken_names
+        .iter()
+        .map(|n| bot_slug_from_name(n).as_str().to_owned())
+        .collect();
+    for existing in taken_names {
+        let ex = existing.trim();
+        if ex.eq_ignore_ascii_case(localized) {
+            taken_slugs.insert(bot_slug_from_name(tpl.name).as_str().to_owned());
+        } else if let Some(rest) = ex
+            .strip_prefix(localized)
+            .and_then(|s| s.strip_prefix(' '))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            taken_slugs.insert(
+                bot_slug_from_name(&format!("{} {rest}", tpl.name))
+                    .as_str()
+                    .to_owned(),
+            );
+        }
+    }
+    if !taken_slugs.contains(base.as_str()) {
+        return Some(base);
+    }
+    let root = bot_slug_from_name(tpl.name);
+    (2..=taken_slugs.len() + 2)
+        .map(|n| bot_slug_from_name(&format!("{} {n}", root.as_str())))
+        .find(|cand| !taken_slugs.contains(cand.as_str()))
+}
+
 impl NewBot {
     pub fn new(
         hosts: Vec<HostChoice>,
@@ -115,8 +169,19 @@ impl NewBot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let proposal = template.map(template_proposal);
-        let origin = template.map(|t| text::NB_FROM_TEMPLATE.format(&[("template", t.name)]));
+        let proposal = template.map(|t| {
+            let mut prop = template_proposal(t);
+            super::templates::localized_template_name(t).clone_into(&mut prop.name);
+            super::templates::localized_template_description(t).clone_into(&mut prop.purpose);
+            prop.watches = super::templates::localized_template_watches(t, prop.watches);
+            prop.does = super::templates::localized_template_does(t, prop.does);
+            prop.reports = super::templates::localized_template_reports(t, prop.reports);
+            prop
+        });
+        let origin = template.map(|t| {
+            text::NB_FROM_TEMPLATE
+                .format(&[("template", super::templates::localized_template_name(t))])
+        });
         Self::new_with_proposal(hosts, taken_names, template, proposal, origin, window, cx)
     }
 
@@ -555,6 +620,7 @@ impl NewBot {
             (clip_chars(&raw_purpose, PURPOSE_MAX).to_owned(), None)
         };
 
+        let slug = template.and_then(|tpl| template_bot_slug(tpl, &name, &self.taken_names));
         CreateBotV2Params {
             base: CreateBotParams {
                 name,
@@ -569,7 +635,7 @@ impl NewBot {
                 template_id: template.map(|t| t.id.to_owned()),
                 initial_soul,
             },
-            slug: None,
+            slug,
             avatar_color,
             skills: self.skills.iter().map(|s| (*s).to_owned()).collect(),
             events: Vec::new(),
@@ -971,7 +1037,7 @@ impl NewBot {
                             p,
                         ));
                     }
-                    if let Some(note) = tpl.needs_setup {
+                    if let Some(note) = super::templates::localized_template_needs_setup(tpl) {
                         list = list.child(template_part_row(
                             Icon::new(IconName::CircleAlert)
                                 .size(px(ui::ICON_MD))
@@ -1018,7 +1084,10 @@ impl NewBot {
                     let mut list = div().flex().flex_col().gap_1();
                     for skill_id in tpl.skills {
                         let checked = this.skills.contains(skill_id);
-                        let desc = find_bot_skill(skill_id).map(|s| s.description.to_owned());
+                        let desc = find_bot_skill(skill_id).map(|s| {
+                            super::templates::localized_skill_description(s.name, s.description)
+                                .to_owned()
+                        });
                         let sid = *skill_id;
                         let view = cx.weak_entity();
                         let toggle = ui::switch(
@@ -1038,7 +1107,7 @@ impl NewBot {
                                 p.muted_foreground,
                             )
                             .into_any_element(),
-                            (*skill_id).to_owned(),
+                            super::templates::localized_skill_title(skill_id),
                             desc,
                             Some(toggle),
                             p,
@@ -1068,6 +1137,7 @@ impl NewBot {
                 Box::new(move |_, p, _| {
                     let mut list = div().flex().flex_col().gap_1();
                     for s in tpl.schedules {
+                        let (when, what) = super::templates::localized_schedule(tpl.id, s);
                         let st = div()
                             .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
@@ -1080,8 +1150,8 @@ impl NewBot {
                                 p.muted_foreground,
                             )
                             .into_any_element(),
-                            s.what.to_owned(),
-                            Some(s.when.to_owned()),
+                            what.to_owned(),
+                            Some(when.to_owned()),
                             Some(st),
                             p,
                         ));
@@ -1122,7 +1192,7 @@ impl NewBot {
                                 p.muted_foreground,
                             )
                             .into_any_element(),
-                            ev.name.to_owned(),
+                            super::templates::localized_event_name(tpl.id, ev).to_owned(),
                             None,
                             Some(st),
                             p,
@@ -1630,5 +1700,25 @@ mod tests {
         assert_eq!(unique_name("New bot", &[]), "New bot");
         let taken = vec!["new bot".to_owned(), "New bot 2".to_owned()];
         assert_eq!(unique_name("New bot", &taken), "New bot 3");
+    }
+
+    #[test]
+    fn template_bot_slug_keeps_english_folder_for_korean_template_names() {
+        let tpl = krill_proto::bots::find_bot_template("bug-investigation").unwrap();
+        if crate::i18n::language() == crate::i18n::Language::Ko {
+            assert_eq!(
+                template_bot_slug(tpl, "버그 조사", &[])
+                    .as_ref()
+                    .map(BotSlug::as_str),
+                Some("bug-investigation")
+            );
+            assert_eq!(
+                template_bot_slug(tpl, "버그 조사 2", &["버그 조사".to_owned()])
+                    .as_ref()
+                    .map(BotSlug::as_str),
+                Some("bug-investigation-2")
+            );
+            assert_eq!(template_bot_slug(tpl, "커스텀 이름", &[]), None);
+        }
     }
 }
