@@ -147,6 +147,29 @@ pub(super) fn looked_text(at: u64, now: u64) -> String {
     }
 }
 
+/// Orca's `NativeChatMessageTimestamp` for item headers, activity rows, and comment cards:
+/// `"오전 12:07"` / `"12:07 AM"` today, `"어제 오후 9:52"` / `"Yesterday 9:52 PM"` yesterday,
+/// `"11월 20일 오후 9:52"` / `"Nov 20, 9:52 PM"` earlier.
+pub(super) fn activity_timestamp(at: u64, now: u64) -> String {
+    activity_timestamp_in(at, now, local_offset_secs(now), language())
+}
+
+pub(super) fn activity_timestamp_in(at: u64, now: u64, offset: i64, lang: Language) -> String {
+    if at == 0 {
+        return String::new();
+    }
+    let c = local(at, offset).1;
+    let time = clock(&c, false, lang);
+    match day_of(at, now, offset) {
+        0 => time,
+        1 => text::YESTERDAY_AT.format_in(lang, &[("time", &time)]),
+        _ => {
+            let date = month_day(&c, lang);
+            text::DATE_TIME.format_in(lang, &[("date", &date), ("time", &time)])
+        }
+    }
+}
+
 /// Orca's `botQuietLine`: "Running {name}" while an automation runs, else "Idle · next 8:00 PM ·
 /// Look around"; the second string is what a narrow panel says instead ("Next 8:00 PM").
 pub(super) fn quiet_line(

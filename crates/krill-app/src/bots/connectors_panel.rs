@@ -4,11 +4,13 @@
 //! connected as; a click opens the connector's page in the list's place), or, with none, their
 //! logos, what they are for and "Add a connector". Add opens "Add to {bot}" (`AddConnectorDialog`).
 
-use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, ClipboardItem, Context, FontWeight, SharedString, Window, div, prelude::*, px,
+};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use krill_proto::bots::{BotConfig, ConnectorHealthState, ExternalSource};
+use krill_proto::bots::{BotConfig, BotErrorCategory, ConnectorHealthState, ExternalSource};
 
 use super::View;
 use super::connector_logos as logo;
@@ -137,9 +139,14 @@ impl View {
                 .child(self.render_connector_card(bot, source, p, window, cx))
                 .children(add);
         }
+        let host_notice = (!self.host.is_local()).then(|| self.render_host_notice(p));
+        let reconnect_notice = self.render_reconnect_notice(bot, p, cx);
+        let webhooks = self.render_webhooks_card(bot, p, cx);
         let added = Self::added_connectors(bot);
         if added.is_empty() {
             return body
+                .children(host_notice)
+                .children(reconnect_notice)
                 .child(
                     div()
                         .debug_selector(|| "bot-connectors-empty".into())
@@ -179,6 +186,7 @@ impl View {
                                 })),
                         ),
                 )
+                .child(webhooks)
                 .children(add);
         }
         let mut list = div()
@@ -193,36 +201,301 @@ impl View {
         for source in added {
             list = list.child(self.render_connector_row(source, p, cx));
         }
-        body.child(
+        body.children(host_notice)
+            .children(reconnect_notice)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .pr_1()
+                    .pb_1()
+                    .pl(px(13.))
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(text::BP_CONNECTORS.get()),
+                    )
+                    .child(
+                        Button::new("bot-connectors-add")
+                            .debug_selector(|| "bot-connectors-add".into())
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Plus).size(px(14.)))
+                            .label(hm::ADD.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.connectors.adding = Some(());
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(list)
+            .child(webhooks)
+            .children(add)
+    }
+
+    /// Orca `BotConnectorsHostNotice`: explains when connectors run on a remote host.
+    fn render_host_notice(&self, p: &ui::Palette) -> gpui::Div {
+        let host_label = format!("{}", self.host);
+        div()
+            .debug_selector(|| "bot-connectors-host-notice".into())
+            .mb_2()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.notice_surface())
+            .px_3()
+            .py_2()
+            .text_size(ui::TEXT_XS)
+            .line_height(px(17.))
+            .text_color(p.muted_foreground)
+            .child(hm::CONN_REMOTE_HOST_NOTICE.format(&[("host", &host_label)]))
+    }
+
+    /// Orca `BotCloudSignInNotice` (`#47505`, `#47336`, `#47905`): shown when a connector
+    /// session expired or errored and needs reconnection or refresh.
+    fn render_reconnect_notice(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let broken = self.connectors.bot_statuses.iter().find(|s| {
+            s.bot_id == bot.id
+                && (s.error_category == Some(BotErrorCategory::SignedOut)
+                    || s.state == ConnectorHealthState::Error)
+        })?;
+        let source = broken.source;
+        let bot_id = bot.id.clone();
+        Some(
             div()
+                .debug_selector(|| "bot-connectors-reconnect-notice".into())
+                .mb_2()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(p.warning.opacity(0.4))
+                .bg(p.notice_surface())
+                .px_3()
+                .py_2()
                 .flex()
-                .items_center()
-                .justify_between()
+                .items_start()
                 .gap_2()
-                .pr_1()
-                .pb_1()
-                .pl(px(13.))
                 .child(
-                    div()
-                        .text_size(ui::TEXT_SM)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(text::BP_CONNECTORS.get()),
+                    Icon::new(IconName::CircleAlert)
+                        .size(px(14.))
+                        .flex_none()
+                        .mt(px(2.))
+                        .text_color(p.warning),
                 )
                 .child(
-                    Button::new("bot-connectors-add")
-                        .debug_selector(|| "bot-connectors-add".into())
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(ui::TEXT_XS)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.foreground)
+                                .child(hm::CONN_RECONNECT_HINT.get()),
+                        )
+                        .when_some(broken.last_error.clone(), |d, err| {
+                            d.child(
+                                div()
+                                    .text_size(ui::TEXT_XS)
+                                    .line_height(px(16.))
+                                    .text_color(p.muted_foreground)
+                                    .child(err),
+                            )
+                        }),
+                )
+                .child(
+                    Button::new("bot-connectors-reconnect-btn")
+                        .debug_selector(|| "bot-connectors-reconnect-btn".into())
                         .ghost()
                         .xsmall()
-                        .icon(Icon::new(IconName::Plus).size(px(14.)))
-                        .label(hm::ADD.get())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.connectors.adding = Some(());
-                            cx.notify();
+                        .icon(Icon::new(IconName::RefreshCw).size(px(12.)))
+                        .label(hm::CONN_GITHUB_REFRESH.get())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.connectors.page = Some(source);
+                            this.reload_connectors(bot_id.clone(), cx);
                         })),
                 ),
         )
-        .child(list)
-        .children(add)
+    }
+
+    /// Orca `BotWebhooksCard` (`#47479`): lists bot webhooks with one-click Copy URL and an
+    /// "Add in chat" action that drafts a webhook setup prompt in Home Chat.
+    fn render_webhooks_card(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let draft_bot_id = bot.id.clone();
+        let hooks: Vec<(String, String, String)> = bot
+            .schedules
+            .iter()
+            .filter(|s| {
+                s.id.to_ascii_lowercase().contains("webhook")
+                    || s.name.to_ascii_lowercase().contains("webhook")
+            })
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.name.clone(),
+                    format!(
+                        "https://hooks.krill.local/bots/{}/{}",
+                        bot.slug.as_str(),
+                        s.id
+                    ),
+                )
+            })
+            .collect();
+        let hook_count = hooks.len();
+        let mut card = div()
+            .debug_selector(|| "bot-webhooks-card".into())
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.card)
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2();
+        if hooks.is_empty() {
+            card = card.child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .line_height(px(18.))
+                    .text_color(p.muted_foreground)
+                    .child(hm::WEBHOOKS_HOOK_COUNT.format(&[("n", "0")])),
+            );
+        } else {
+            for (idx, (id, name, url)) in hooks.into_iter().enumerate() {
+                let copied = self.items.copied_webhook_id.as_deref() == Some(id.as_str());
+                let copy_id = id.clone();
+                let copy_url = url.clone();
+                card = card.child(
+                    div()
+                        .id(("bot-webhook-row", idx))
+                        .debug_selector(move || format!("bot-webhook-row-{idx}"))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(ui::RADIUS_SM)
+                        .px_2()
+                        .py_1p5()
+                        .bg(p.muted.opacity(0.45))
+                        .child(
+                            Icon::new(IconName::Webhook)
+                                .size(px(14.))
+                                .flex_none()
+                                .text_color(p.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.foreground)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(ui::TEXT_2XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(url),
+                                ),
+                        )
+                        .child(
+                            Button::new(("bot-webhook-copy", idx))
+                                .debug_selector(move || format!("bot-webhook-copy-{idx}"))
+                                .ghost()
+                                .xsmall()
+                                .icon(
+                                    Icon::new(if copied {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Copy
+                                    })
+                                    .size(px(12.)),
+                                )
+                                .label(if copied {
+                                    hm::WEBHOOKS_COPIED.get()
+                                } else {
+                                    hm::WEBHOOKS_COPY_URL.get()
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_url.clone(),
+                                    ));
+                                    this.items.copied_webhook_id = Some(copy_id.clone());
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+        }
+        div()
+            .pt_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .pr_1()
+                    .pl(px(13.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(ui::TEXT_SM)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(hm::WEBHOOKS_NAME.get()),
+                    )
+                    .child(
+                        Button::new("bot-webhooks-add-in-chat")
+                            .debug_selector(|| "bot-webhooks-add-in-chat".into())
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Plus).size(px(14.)))
+                            .label(hm::WEBHOOKS_ADD_IN_CHAT.get())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(super::DraftInHomeChat {
+                                    bot_id: draft_bot_id.clone(),
+                                    text: hm::WEBHOOKS_ADD_DRAFT.get().to_owned(),
+                                });
+                            })),
+                    ),
+            )
+            .when(hook_count > 0, |d| {
+                d.child(
+                    div()
+                        .pl(px(13.))
+                        .pb_1()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(hm::WEBHOOKS_HOOK_COUNT.format(&[("n", &hook_count.to_string())])),
+                )
+            })
+            .child(card)
     }
 
     /// Orca's `BotConnectorPageRow`: logo, name and what it is connected as; its state only when

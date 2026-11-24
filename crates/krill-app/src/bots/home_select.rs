@@ -57,11 +57,13 @@ pub(super) fn select_rows(
     }
 }
 
-/// The Cancel dialog's state: the items it cancels and the reason input.
-pub(super) struct CancelAsk {
+/// The Waiting status note dialog's state (Orca `BotItemStatusNoteDialog`, `#47308`/`#47309`).
+/// Cancel happens immediately without a dialog (`#47934`); only Waiting asks what it waits on.
+pub(super) struct WaitAsk {
     pub bot_id: BotId,
     pub uids: Vec<String>,
     pub titles: Vec<String>,
+    pub initial_note: Option<String>,
     pub input: Option<gpui::Entity<InputState>>,
 }
 
@@ -171,7 +173,50 @@ impl View {
                 } else {
                     hm::MOVE_MANY.format(&[("n", &count.to_string())])
                 });
+                let existing_wait = if items.len() == 1 {
+                    items
+                        .first()
+                        .and_then(super::home::waiting_note)
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
                 for status in STATUSES {
+                    if status == BotItemStatus::Planned {
+                        let (this_w, bot_w, all_w, existing_w) = (
+                            this.clone(),
+                            bot.clone(),
+                            all.clone(),
+                            existing_wait.clone(),
+                        );
+                        let wait_glyph = PopupMenuItem::element(move |_, cx| {
+                            let p = ui::palette(cx);
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(16.))
+                                        .flex()
+                                        .justify_center()
+                                        .child(super::home::waiting_icon(p)),
+                                )
+                                .child(hm::STATUS_WAITING.get())
+                        });
+                        menu = menu.item(wait_glyph.on_click(move |_, _, cx| {
+                            this_w
+                                .update(cx, |v, cx| {
+                                    v.ask_waiting(
+                                        bot_w.clone(),
+                                        all_w.clone(),
+                                        existing_w.clone(),
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        }));
+                    }
                     let (this, bot, all) = (this.clone(), bot.clone(), all.clone());
                     let name = if status == BotItemStatus::Canceled {
                         text::HM_CANCELED_ITEM.get()
@@ -196,11 +241,8 @@ impl View {
                     menu = menu.item(glyph.on_click(move |_, _, cx| {
                         this.update(cx, |v, cx| {
                             let uids: Vec<String> = all.iter().map(|(u, _)| u.clone()).collect();
-                            if status == BotItemStatus::Canceled {
-                                v.ask_cancel(bot.clone(), all.clone(), cx);
-                            } else {
-                                v.set_items_status(bot.clone(), &uids, status, cx);
-                            }
+                            // Orca #47934: Cancel (and every non-Waiting move) happens at once.
+                            v.set_items_status(bot.clone(), &uids, status, cx);
                         })
                         .ok();
                     }));
@@ -305,42 +347,70 @@ impl View {
         menu
     }
 
-    /// Opens the Cancel dialog for these items (uid, title).
-    pub(super) fn ask_cancel(
+    /// Opens the Waiting note dialog for these items (`#47308`/`#47309`).
+    pub(super) fn ask_waiting(
         &mut self,
         bot_id: BotId,
         items: Vec<(String, String)>,
+        initial_note: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let (uids, titles) = items.into_iter().unzip();
-        self.items.cancel_ask = Some(CancelAsk {
+        self.items.cancel_ask = Some(WaitAsk {
             bot_id,
             uids,
             titles,
+            initial_note,
             input: None,
         });
         cx.notify();
     }
 
-    fn submit_cancel(&mut self, cx: &mut Context<Self>) {
+    fn submit_wait(&mut self, cx: &mut Context<Self>) {
         let Some(ask) = self.items.cancel_ask.as_ref() else {
             return;
         };
-        let reason = ask
+        let note = ask
             .input
             .as_ref()
             .map(|i| i.read(cx).value().trim().to_owned())
             .unwrap_or_default();
-        if reason.is_empty() {
+        if note.is_empty() {
             return;
         }
         let Some(ask) = self.items.cancel_ask.take() else {
             return;
         };
-        self.cancel_items(ask.bot_id, &ask.uids, &reason, cx);
+        self.set_items_waiting(ask.bot_id, &ask.uids, &note, cx);
     }
 
-    /// Cancels these items with `reason` as their close note: the bot sees it, nothing is deleted.
+    /// Marks these items as Waiting with what they wait on (`waiting:<note>`).
+    pub(super) fn set_items_waiting(
+        &mut self,
+        bot_id: BotId,
+        uids: &[String],
+        note: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let encoded = super::home::encode_waiting_note(note);
+        let params = uids
+            .iter()
+            .map(|uid| UpdateBotItemParams {
+                item_id: uid.clone(),
+                title: None,
+                description: None,
+                done_means: None,
+                status: Some(BotItemStatus::Planned),
+                comment: None,
+                decisions: Vec::new(),
+                close_note: Some(encoded.clone()),
+                snoozed_until_ms: FieldPatch::Unchanged,
+            })
+            .collect();
+        self.update_items_batch(bot_id, params, cx);
+    }
+
+    /// Cancels these items with `reason` as their close note (used by Stale's "Cancel all").
     pub(super) fn cancel_items(
         &mut self,
         bot_id: BotId,
@@ -365,29 +435,47 @@ impl View {
         self.update_items_batch(bot_id, params, cx);
     }
 
-    /// Orca's `BotItemCancelDialog` over the window, while open.
+    /// Alias kept for `group_panel.rs` (Domain D) so the Waiting dialog renders there too.
     pub(super) fn render_cancel_ask(
         &mut self,
         p: &ui::Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        self.render_wait_ask(p, window, cx)
+    }
+
+    /// Orca's `BotItemStatusNoteDialog` over the window while setting Waiting (`#47308`/`#47309`).
+    pub(super) fn render_wait_ask(
+        &mut self,
+        p: &ui::Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let ask = self.items.cancel_ask.as_mut()?;
+        let initial = ask.initial_note.clone();
         let input = ask
             .input
             .get_or_insert_with(|| {
-                let input =
-                    cx.new(|cx| InputState::new(window, cx).placeholder(hm::CANCEL_REASON.get()));
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder(hm::WAIT_ON_PLACEHOLDER.get())
+                });
                 cx.observe(&input, |_, _, cx| cx.notify()).detach();
-                input.update(cx, |s, cx| s.focus(window, cx));
+                input.update(cx, |s, cx| {
+                    if let Some(text) = initial {
+                        s.set_value(text, window, cx);
+                    }
+                    s.focus(window, cx);
+                });
                 input
             })
             .clone();
         let count = ask.uids.len();
         let title = if count == 1 {
-            hm::CANCEL_TITLE_ONE.format(&[("title", ask.titles.first().map_or("", String::as_str))])
+            hm::WAIT_ON_TITLE_ONE
+                .format(&[("title", ask.titles.first().map_or("", String::as_str))])
         } else {
-            hm::CANCEL_TITLE_MANY.format(&[("n", &count.to_string())])
+            hm::WAIT_ON_TITLE_MANY.format(&[("n", &count.to_string())])
         };
         let ready = !input.read(cx).value().trim().is_empty();
         let close = cx.listener(|this, _, _, cx| {
@@ -395,8 +483,8 @@ impl View {
             cx.notify();
         });
         let dialog = div()
-            .id("bot-cancel-ask")
-            .debug_selector(|| "bot-cancel-ask".into())
+            .id("bot-wait-ask")
+            .debug_selector(|| "bot-wait-ask".into())
             .role(gpui::Role::Dialog)
             .aria_label(SharedString::from(title.clone()))
             .w(px(384.))
@@ -414,26 +502,14 @@ impl View {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_action(
                 cx.listener(|this, _: &gpui_component::input::Enter, _, cx| {
-                    this.submit_cancel(cx);
+                    this.submit_wait(cx);
                 }),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_LG)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_SM)
-                            .text_color(p.muted_foreground)
-                            .child(hm::CANCEL_WHY.get()),
-                    ),
+                    .text_size(ui::TEXT_LG)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
             )
             .child(Input::new(&input))
             .child(
@@ -442,27 +518,20 @@ impl View {
                     .justify_end()
                     .gap_2()
                     .child(
-                        ui::ghost("bot-cancel-keep", hm::KEEP.get())
+                        ui::ghost("bot-wait-cancel", hm::WAIT_ON_CANCEL.get())
                             .small()
                             .on_click(close),
                     )
                     .child(
-                        ui::primary(
-                            "bot-cancel-confirm",
-                            if count == 1 {
-                                hm::CANCEL_CONFIRM_ONE.get().to_owned()
-                            } else {
-                                hm::CANCEL_CONFIRM_MANY.format(&[("n", &count.to_string())])
-                            },
-                        )
-                        .small()
-                        .disabled(!ready)
-                        .on_click(cx.listener(|this, _, _, cx| this.submit_cancel(cx))),
+                        ui::primary("bot-wait-confirm", hm::WAIT_ON_CONFIRM.get())
+                            .small()
+                            .disabled(!ready)
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_wait(cx))),
                     ),
             );
         let backdrop = ui::modal_focus_scope(
             div()
-                .id("bot-cancel-ask-backdrop")
+                .id("bot-wait-ask-backdrop")
                 .size_full()
                 .flex()
                 .items_center()

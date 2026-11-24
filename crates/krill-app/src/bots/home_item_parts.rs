@@ -23,7 +23,7 @@ use krill_proto::bots::{
 use super::home::grouped;
 use super::rpc::call_checked;
 use super::{OpenSession, View, now_unix_ms};
-use crate::i18n::catalog::{bot_home as hm, bots as text};
+use crate::i18n::catalog::bot_home as hm;
 use crate::pull_request::Status as PrStatus;
 use crate::ui;
 
@@ -253,7 +253,7 @@ impl View {
         if session.is_some() && session == home {
             return ItemChat {
                 session,
-                title: text::SB_HOME_CHAT.get().to_owned(),
+                title: hm::CHAT_HOME_TITLE.get().to_owned(),
                 home: true,
             };
         }
@@ -313,9 +313,11 @@ impl View {
         }
     }
 
-    /// Orca's `BotItemStepper`: "N / M", then ↑ ↓ and the divider, in the comment box's tool row.
+    /// Orca's `BotItemStepper`: compact `^ v` + divider in the single-line comment pill (and
+    /// `"N / M"` when replying/multiline), matching `owner-orca-reference.png`.
     pub(super) fn render_stepper(
         &self,
+        show_counter: bool,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -331,8 +333,8 @@ impl View {
             Button::new(id)
                 .debug_selector(move || id.into())
                 .ghost()
-                .small()
-                .icon(Icon::new(icon).size(px(16.)))
+                .xsmall()
+                .icon(Icon::new(icon).size(px(14.)).text_color(p.muted_foreground))
                 .tooltip(format!("{label}  {keys}"))
                 .accessibility_label(label)
         };
@@ -344,28 +346,29 @@ impl View {
                 ("index", &index.to_string()),
                 ("total", &total.to_string()),
             ])))
-            .my(px(-4.))
-            .min_w_0()
-            .flex_1()
+            .when(show_counter, |d| d.flex_1().min_w_0())
+            .when(!show_counter, gpui::Styled::flex_none)
             .flex()
             .items_center()
             .gap_0p5()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .justify_end()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .px_1()
-                            .whitespace_nowrap()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(format!("{index} / {total}")),
-                    ),
-            )
+            .when(show_counter && total > 0, |d| {
+                d.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .justify_end()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .px_1()
+                                .whitespace_nowrap()
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(format!("{index} / {total}")),
+                        ),
+                )
+            })
             .child(
                 arrow(
                     "bot-item-prev",
@@ -386,7 +389,7 @@ impl View {
                 .disabled(index >= total)
                 .on_click(cx.listener(|this, _, _, cx| this.step_item(1, cx))),
             )
-            .child(div().mx_2().h(px(16.)).w(px(1.)).flex_none().bg(p.border))
+            .child(div().mx_1().h(px(16.)).w(px(1.)).flex_none().bg(p.border))
     }
 
     /// Orca's item chords: Esc and ⌘[ (or ⌥←) go back, ⌥⌘↑ / ⌥⌘↓ step, even while typing.
@@ -488,8 +491,9 @@ impl View {
         }
     }
 
-    /// Orca's `BotItemLinkChips`: a chip per link, a worker's with its state and Stop while it
-    /// runs, a PR's with its title and state; finished workers go last.
+    /// Orca's `BotItemLinkChips`: full-width stacked PR/worker cards matching
+    /// `owner-orca-reference.png` (PR merge/open/closed icon + title + `#N`, worker state +
+    /// title + Stop while running; finished workers go last; >2 links expand via `+N more`).
     pub(super) fn render_link_chips(
         &self,
         bot: &BotConfig,
@@ -510,32 +514,34 @@ impl View {
         };
         let mut links: Vec<(usize, &BotItemLink)> = item.links.iter().enumerate().collect();
         links.sort_by_key(|(_, l)| settled(l));
-        let mut row = div()
+        let expand_key = format!("links:{}", item.uid);
+        let expanded = self.items.open_changes.contains(&expand_key);
+        let visible_cap = if expanded { links.len() } else { 2 };
+        let hidden_count = links.len().saturating_sub(visible_cap);
+        let mut col = div()
             .debug_selector(|| "bot-item-link-chips".into())
-            .max_h(px(52.))
-            .overflow_hidden()
+            .w_full()
             .flex()
-            .flex_wrap()
-            .gap_1();
-        for (i, link) in links {
-            let chip = |id: SharedString| {
+            .flex_col()
+            .gap_1()
+            .pt_0p5();
+        for (i, link) in links.into_iter().take(visible_cap) {
+            let card = |id: SharedString| {
                 div()
                     .id(id)
-                    .h(px(24.))
-                    .max_w(px(240.))
+                    .w_full()
+                    .h(px(28.))
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap_1p5()
-                    .px_1p5()
+                    .gap_2()
+                    .px(px(10.))
                     .rounded(ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(p.border)
-                    .bg(p.background)
+                    .bg(p.muted.opacity(0.75))
                     .text_size(ui::TEXT_XS)
                     .text_color(p.foreground)
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.sidebar_accent))
+                    .hover(|d| d.bg(p.muted))
             };
             let el = match link {
                 BotItemLink::Dispatch(id) => {
@@ -552,28 +558,29 @@ impl View {
                         .into_any_element()
                     } else if s.is_some() {
                         Icon::new(IconName::CircleCheck)
-                            .size(px(12.))
+                            .size(px(14.))
                             .text_color(p.success)
                             .into_any_element()
                     } else {
                         Icon::new(IconName::CircleSlash)
-                            .size(px(12.))
+                            .size(px(14.))
                             .text_color(p.muted_foreground)
                             .into_any_element()
                     };
                     let (open_bot, sid) = (bot.id.clone(), s.map(|s| s.session_id));
                     let (stop_bot, stop_sid) = (bot.id.clone(), sid);
-                    chip(format!("bot-item-link-{i}").into())
-                        .pr(px(2.))
+                    card(format!("bot-item-link-{i}").into())
+                        .when(running, |d| d.pr(px(4.)))
                         .child(
                             div()
                                 .size(px(14.))
+                                .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .child(icon),
                         )
-                        .child(div().min_w_0().truncate().child(title.clone()))
+                        .child(div().flex_1().min_w_0().truncate().child(title.clone()))
                         .when(running, |d| {
                             d.child(
                                 Button::new(("bot-item-worker-stop", i))
@@ -614,11 +621,11 @@ impl View {
                         .or_else(|| number.map(|n| hm::PR_NUMBER.format(&[("n", n)])))
                         .unwrap_or_else(|| url.clone());
                     let status = read.and_then(|r| r.status.clone());
-                    let color = match status {
-                        Some(PrStatus::Open) => p.success,
-                        Some(PrStatus::Merged) => p.primary,
-                        Some(PrStatus::Closed) => p.destructive,
-                        _ => p.muted_foreground,
+                    let (icon_name, color) = match status {
+                        Some(PrStatus::Merged) => (IconName::GitMerge, p.success),
+                        Some(PrStatus::Open) => (IconName::GitPullRequest, p.success),
+                        Some(PrStatus::Closed) => (IconName::GitPullRequestClosed, p.destructive),
+                        _ => (IconName::GitPullRequest, p.muted_foreground),
                     };
                     let tip = [
                         Some(
@@ -636,20 +643,21 @@ impl View {
                     .join(" · ");
                     let tip = format!("{label} · {tip}");
                     let open = url.clone();
-                    chip(format!("bot-item-link-{i}").into())
+                    card(format!("bot-item-link-{i}").into())
                         .child(
-                            Icon::new(IconName::GitPullRequest)
+                            Icon::new(icon_name)
                                 .size(px(14.))
+                                .flex_none()
                                 .text_color(color),
                         )
-                        .child(div().min_w_0().truncate().child(label))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
                         .children(
                             number
                                 .filter(|_| read.is_some_and(|r| !r.title.is_empty()))
                                 .map(|n| {
                                     div()
                                         .flex_none()
-                                        .text_size(ui::TEXT_2XS)
+                                        .text_size(ui::TEXT_XS)
                                         .text_color(p.muted_foreground)
                                         .child(format!("#{n}"))
                                 }),
@@ -668,13 +676,14 @@ impl View {
                         .trim_start_matches("https://")
                         .trim_start_matches("http://")
                         .to_owned();
-                    chip(format!("bot-item-link-{i}").into())
+                    card(format!("bot-item-link-{i}").into())
                         .child(
                             Icon::new(IconName::Globe)
                                 .size(px(14.))
+                                .flex_none()
                                 .text_color(p.muted_foreground),
                         )
-                        .child(div().min_w_0().truncate().child(label))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
                         .on_click(move |_, _, cx| {
                             if open.starts_with("https://") || open.starts_with("http://") {
                                 cx.open_url(&open);
@@ -684,14 +693,16 @@ impl View {
                 }
                 BotItemLink::File(v) => {
                     let path = v.trim().to_owned();
-                    chip(format!("bot-item-link-{i}").into())
+                    card(format!("bot-item-link-{i}").into())
                         .child(
                             Icon::new(IconName::File)
                                 .size(px(14.))
+                                .flex_none()
                                 .text_color(p.muted_foreground),
                         )
                         .child(
                             div()
+                                .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .child(path.rsplit(['/', '\\']).next().unwrap_or(&path).to_owned()),
@@ -704,9 +715,30 @@ impl View {
                         .into_any_element()
                 }
             };
-            row = row.child(el);
+            col = col.child(el);
         }
-        row
+        if hidden_count > 0 {
+            let toggle_key = expand_key;
+            col = col.child(
+                div()
+                    .id("bot-item-links-more")
+                    .debug_selector(|| "bot-item-links-more".into())
+                    .self_start()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(ui::RADIUS_XS)
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.bg(p.muted.opacity(0.6)).text_color(p.foreground))
+                    .child(hm::MORE_LINKS.format(&[("n", &hidden_count.to_string())]))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.items.open_changes.insert(toggle_key.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        col
     }
 
     /// Stops a worker session from its chip.
@@ -850,11 +882,19 @@ impl View {
     }
 
     /// A linked worker's Activity lines: "Worker started:" where it was linked, and "Worker
-    /// finished:" once its session is no longer working.
+    /// finished:" / "Worker stopped:" once its session is no longer working, with timestamp and
+    /// stop reason (Orca `#47543`).
+    #[expect(
+        clippy::type_complexity,
+        reason = "compact internal tuple for worker started + optional finished/stopped state"
+    )]
     pub(super) fn worker_lines(
         &self,
         event: &BotItemEvent,
-    ) -> Option<(String, Option<(bool, String)>)> {
+    ) -> Option<(
+        String,
+        Option<(bool, String, Option<u64>, Option<&'static str>)>,
+    )> {
         let id = event.text.strip_prefix("dispatch:")?.trim();
         let s = id.parse::<u64>().ok().and_then(|n| {
             self.bot_sessions
@@ -864,8 +904,33 @@ impl View {
         let title = worker_title(s, id);
         let finished = match s {
             Some(s) if s.live && s.working => None,
-            Some(_) => Some((false, title.clone())),
-            None => Some((true, title.clone())),
+            Some(s) if !s.live => {
+                let reason = if self.host.is_local() {
+                    Some(hm::WORKER_STOP_NO_SESSION.get())
+                } else {
+                    Some(hm::WORKER_STOP_OFFLINE.get())
+                };
+                Some((
+                    true,
+                    title.clone(),
+                    Some(s.created_at_ms.max(event.created_at_ms)),
+                    reason,
+                ))
+            }
+            Some(s) => Some((
+                false,
+                title.clone(),
+                Some(s.created_at_ms.max(event.created_at_ms)),
+                None,
+            )),
+            None => {
+                let reason = if self.host.is_local() {
+                    Some(hm::WORKER_STOP_NO_SESSION.get())
+                } else {
+                    Some(hm::WORKER_STOP_OFFLINE.get())
+                };
+                Some((true, title.clone(), Some(event.created_at_ms), reason))
+            }
         };
         Some((title, finished))
     }
@@ -1077,34 +1142,33 @@ impl View {
                 ask.decisions.clone(),
                 kept.clone(),
             );
+            // Orca `#47206` & `#47904`: "N answers not sent yet, send anyway" skips remaining
+            // unanswered questions and posts the held picks immediately.
             out = out.child(
                 div()
                     .mt_3()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap_2()
-                    .text_size(ui::TEXT_MD)
+                    .gap_1p5()
+                    .text_size(ui::TEXT_SM)
                     .line_height(px(19.))
                     .text_color(p.muted_foreground)
                     .child(if held_count == 1 {
-                        hm::HELD_ONE.get().to_owned()
+                        hm::HELD_SEND_ANYWAY_ONE.get().to_owned()
                     } else {
-                        hm::HELD_MANY.format(&[("n", &held_count.to_string())])
+                        hm::HELD_SEND_ANYWAY_MANY.format(&[("n", &held_count.to_string())])
                     })
                     .child(
                         div()
                             .id("bot-item-send-held")
                             .debug_selector(|| "bot-item-send-held".into())
-                            .flex()
-                            .items_center()
-                            .gap_1()
                             .cursor_pointer()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(p.foreground)
-                            .hover(gpui::Styled::underline)
-                            .child(Icon::new(IconName::ArrowUp).size(px(14.)))
-                            .child(hm::SEND_NOW.get())
+                            .underline()
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.items.skipped_asks.insert(k.clone());
                                 this.send_held_answers(
                                     uid.clone(),
                                     &k,
@@ -1115,7 +1179,8 @@ impl View {
                                     None,
                                     cx,
                                 );
-                            })),
+                            }))
+                            .child(hm::SEND_ANYWAY.get()),
                     ),
             );
         }
@@ -1842,5 +1907,190 @@ mod tests {
         vcx.run_until_parked();
         assert_eq!(comments.lock().unwrap().as_slice(), ["Side note only"]);
         assert_eq!(answers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn domain_c_waiting_note_and_skipped_ask_helpers() {
+        use std::collections::BTreeSet;
+
+        use krill_proto::bots::{BotId, BotItemStatus};
+
+        let encoded = super::super::home::encode_waiting_note("CI build");
+        assert_eq!(encoded, "waiting:CI build");
+        let bot_id = BotId::new("bot-w").unwrap();
+        let ask = BotItemEvent {
+            id: 50,
+            item_uid: "w1".to_owned(),
+            kind: BotItemEventKind::Commented,
+            actor: BotItemActor::Bot {
+                bot_id: bot_id.clone(),
+                session_id: None,
+            },
+            text: "Need a call.".to_owned(),
+            decisions: vec![d("First?"), d("Second?")],
+            created_at_ms: 1_700_000_000_000,
+        };
+        let item = BotItem {
+            uid: "w1".to_owned(),
+            number: 7,
+            owner_bot_id: bot_id,
+            title: "Wait test".to_owned(),
+            description: None,
+            done_means: None,
+            status: BotItemStatus::Planned,
+            close_note: Some(encoded),
+            links: vec![],
+            events: vec![ask],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: 1_700_000_000_000,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+            closed_at_ms: None,
+        };
+        assert_eq!(super::super::home::waiting_note(&item), Some("CI build"));
+
+        // Orca `#47904`: skipping an ask closes waiting_question_with_skipped immediately.
+        let mut needs_item = item.clone();
+        needs_item.status = BotItemStatus::NeedsYou;
+        let empty = BTreeSet::new();
+        assert_eq!(
+            super::super::home_item::waiting_question_with_skipped(&needs_item, &empty)
+                .map(|e| e.id),
+            Some(50)
+        );
+        let skipped = BTreeSet::from([("w1".to_owned(), 50)]);
+        assert!(
+            super::super::home_item::waiting_question_with_skipped(&needs_item, &skipped).is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn domain_c_item_detail_wait_card_failed_comment_superseded_and_webhooks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+
+        use gpui::px;
+        use krill_proto::bots::{
+            BotConfig, BotId, BotItemStatus, BotRpcRequest, BotRpcResponse, BotScheduleConfig,
+        };
+
+        let bot_id = BotId::new("bot-c").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "KrillBot", "agy", 1_700_000_000_000).unwrap();
+        bot.schedules.push(BotScheduleConfig {
+            id: "webhook-deploy".to_owned(),
+            name: "Deploy webhook".to_owned(),
+            cron: "0 * * * *".to_owned(),
+            prompt: "Handle deploy webhook".to_owned(),
+            enabled: true,
+            timezone: None,
+        });
+        let item = BotItem {
+            uid: "item-c".to_owned(),
+            number: 27,
+            owner_bot_id: bot_id.clone(),
+            title: "Domain C parity check".to_owned(),
+            description: Some("Full markdown description.".to_owned()),
+            done_means: None,
+            status: BotItemStatus::NeedsYou,
+            close_note: Some("waiting:Waiting on reviewer".to_owned()),
+            links: vec![BotItemLink::Pr(
+                "https://github.com/craftowen/krill/pull/212".to_owned(),
+            )],
+            events: vec![
+                BotItemEvent {
+                    id: 1,
+                    item_uid: "item-c".to_owned(),
+                    kind: BotItemEventKind::Commented,
+                    actor: BotItemActor::Bot {
+                        bot_id: bot_id.clone(),
+                        session_id: None,
+                    },
+                    text: "Old question".to_owned(),
+                    decisions: vec![d("Old Q?")],
+                    created_at_ms: 1_700_000_000_000,
+                },
+                BotItemEvent {
+                    id: 2,
+                    item_uid: "item-c".to_owned(),
+                    kind: BotItemEventKind::Commented,
+                    actor: BotItemActor::Bot {
+                        bot_id: bot_id.clone(),
+                        session_id: None,
+                    },
+                    text: "Newer question".to_owned(),
+                    decisions: vec![d("New Q?")],
+                    created_at_ms: 1_700_000_005_000,
+                },
+            ],
+            snoozed_until_ms: None,
+            version: 1,
+            last_activity_at_ms: 1_700_000_005_000,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_005_000,
+            closed_at_ms: None,
+        };
+        let bot_rpc = bot.clone();
+        let item_rpc = item.clone();
+        let rpc: super::super::BotRpcCall = Arc::new(move |req| match req {
+            BotRpcRequest::ListBots => Ok(BotRpcResponse::Bots(vec![bot_rpc.clone()])),
+            BotRpcRequest::ListItems { .. } => Ok(BotRpcResponse::Items(vec![item_rpc.clone()])),
+            BotRpcRequest::ListBotSessions { .. } => Ok(BotRpcResponse::BotSessions(vec![])),
+            BotRpcRequest::ConnectorStatus { .. } => Ok(BotRpcResponse::ConnectorStatuses(vec![])),
+            BotRpcRequest::ListAccessRequests { .. } => Ok(BotRpcResponse::AccessRequests(vec![])),
+            BotRpcRequest::GetBotUpcoming { .. } => Ok(BotRpcResponse::Upcoming(
+                krill_proto::bots::BotUpcoming::default(),
+            )),
+            BotRpcRequest::GetSoul { .. } | BotRpcRequest::GetMemory { .. } => {
+                Ok(BotRpcResponse::Text(String::new()))
+            }
+            BotRpcRequest::ListMemoryTopics { .. } => Ok(BotRpcResponse::MemoryTopics(vec![])),
+            BotRpcRequest::ListSuggestions { .. } => Ok(BotRpcResponse::Suggestions(vec![])),
+            _ => Ok(BotRpcResponse::Ok),
+        });
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::ui::apply(gpui_component::ThemeMode::Dark, cx);
+        });
+        let (view, vcx) = cx.add_window_view(|_, cx| View::with_rpc(rpc, None, cx).into_panel());
+        vcx.simulate_resize(gpui::size(px(380.), px(960.)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Items, cx);
+                v.open_home_item("item-c".to_owned(), cx);
+                v.record_failed_comment(
+                    "item-c",
+                    "Refused answer draft".to_owned(),
+                    false,
+                    None,
+                    None,
+                    cx,
+                );
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+
+        // Superseded older ask (#47869), Wait card (#47308/#47309), failed comment (#47485),
+        // full-width link chips, and bottom dictate/send buttons all render cleanly.
+        assert!(vcx.debug_bounds("bot-item-ask-replaced-1").is_some());
+        assert!(vcx.debug_bounds("bot-item-wait-card").is_some());
+        assert!(vcx.debug_bounds("bot-item-failed-comment-1").is_some());
+        assert!(vcx.debug_bounds("bot-item-link-chips").is_some());
+        assert!(vcx.debug_bounds("bot-item-comment-dictate").is_some());
+        assert!(vcx.debug_bounds("bot-item-comment-send").is_some());
+
+        // Connectors tab shows Webhooks card with Copy URL (#47479).
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.show_in_panel(&bot_id, super::super::DetailTab::Connectors, cx);
+            });
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("bot-webhooks-card").is_some());
+        assert!(vcx.debug_bounds("bot-webhook-copy-0").is_some());
     }
 }

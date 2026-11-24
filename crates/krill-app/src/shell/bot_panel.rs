@@ -14,11 +14,55 @@ use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use krill_app::bots::{DetailTab, SidebarBot};
 use krill_app::hosts::HostId;
-use krill_app::i18n::catalog::bots as text;
+use krill_app::i18n::catalog::{bot_home as hm, bots as text};
 use krill_app::ui;
 use krill_proto::bots::{BotId, BotRpcRequest, BotSessionSummary};
 
 use super::Shell;
+
+/// Compact Chats threshold (Orca `@max-[240px]`): hides New chat text label and shortens badges.
+const COMPACT_CHATS_WIDTH: f32 = 240.;
+/// Default worker rows per chat before "Show N more" (Orca `BotChatTreeGroup`).
+const DEFAULT_CHAT_WORKERS: usize = 5;
+/// Default older chats shown after Home Chat before "Show N older" (Orca `BotChatsPanel`).
+const DEFAULT_OLDER_CHATS: usize = 8;
+
+fn format_worker_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn chat_origin_icon(home: bool, link_id: Option<&str>, color: gpui::Hsla) -> AnyElement {
+    if home {
+        return ui::icons::svg_icon(ui::icons::BOT_HOME_SVG, ui::ICON_XS, color).into_any_element();
+    }
+    let link = link_id.unwrap_or_default().to_ascii_lowercase();
+    if link.starts_with("schedule:") || link.starts_with("cron:") || link.starts_with("automation:")
+    {
+        return Icon::new(gpui_kit_assets::IconName::CalendarClock)
+            .size(px(ui::ICON_XS))
+            .text_color(color)
+            .into_any_element();
+    }
+    if link.starts_with("github:") || link.starts_with("pr:") {
+        return Icon::new(gpui_kit_assets::IconName::GitPullRequest)
+            .size(px(ui::ICON_XS))
+            .text_color(color)
+            .into_any_element();
+    }
+    if link.starts_with("webhook:") || link.starts_with("linear:") || link.starts_with("slack:") {
+        return Icon::new(gpui_kit_assets::IconName::Plug)
+            .size(px(ui::ICON_XS))
+            .text_color(color)
+            .into_any_element();
+    }
+    ui::icons::svg_icon(ui::icons::MESSAGE_SQUARE_SVG, ui::ICON_XS, color).into_any_element()
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum BotPanelTab {
@@ -80,6 +124,14 @@ pub(super) struct BotPanel {
     pub chat_query: String,
     /// Chats the user explicitly folded (chats with workers start open).
     pub chat_folded: std::collections::BTreeSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
+    /// Per-chat visible worker cap (Orca `BotChatTreeGroup` "Show N more" / "Show fewer").
+    pub chat_worker_limits:
+        std::collections::HashMap<(krill_app::hosts::HostId, krill_proto::SessionId), usize>,
+    /// Older chats visible cap beyond Home Chat (`0` = `DEFAULT_OLDER_CHATS`).
+    pub older_chats_limit: usize,
+    /// Chats deleted locally via `#47339` until the next sidebar poll confirms removal.
+    pub deleted_chats:
+        std::collections::HashSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     /// What the header last drew from `view`: its filter, whether an item is open, the
     /// automations' line ("Idle · next 8:00 PM · Look around", with its narrow form), the
     /// settings subpage crumb, and the group panel filter state/counts.
@@ -105,7 +157,7 @@ pub(super) fn chat_title(bot: &SidebarBot, s: &BotSessionSummary) -> SharedStrin
         .home_session()
         .is_some_and(|h| h.session_id == s.session_id)
     {
-        return text::SB_HOME_CHAT.get().into();
+        return hm::CHAT_HOME_TITLE.get().into();
     }
     let label = s.label.trim();
     if !label.is_empty() && label != bot.name.trim() {
@@ -381,8 +433,27 @@ impl Shell {
                 })
                 .collect();
             view.update(cx, |v, cx| v.set_session_states(states, cx));
+            let (activity, attention) = Self::bot_activity(bot);
+            view.update(cx, |v, cx| {
+                v.set_home_header_meta(
+                    bot.id.clone(),
+                    width <= NARROW_HEADER_WIDTH,
+                    activity,
+                    attention,
+                    bot.working(),
+                    bot.attention,
+                    None,
+                    cx,
+                );
+            });
             let want = (host.clone(), bot.id.clone(), page);
             if self.bot_ui.panel.shown.as_ref() != Some(&want) {
+                // Orca `#47162`: show cached items immediately before the daemon refresh finishes.
+                if self.bot_ui.panel.shown.as_ref().map(|(h, id, _)| (h, id))
+                    != Some((&host, &bot.id))
+                {
+                    view.update(cx, |v, cx| v.hydrate_cached_items(&bot.id, cx));
+                }
                 // Held back by unsaved Soul edits: ask again next time instead of showing the
                 // other bot under this one's page.
                 if view.update(cx, |v, cx| v.show_in_panel(&bot.id, page, cx)) {
@@ -411,20 +482,30 @@ impl Shell {
             }
         }
         let body: AnyElement = match tab {
-            BotPanelTab::Files => self.diff.clone().into_any_element(),
-            BotPanelTab::Chats => self.render_bot_chats(bot, p, cx).into_any_element(),
+            BotPanelTab::Files => div()
+                .size_full()
+                .bg(p.sidebar)
+                .child(self.diff.clone())
+                .into_any_element(),
+            BotPanelTab::Chats => self.render_bot_chats(bot, width, p, cx).into_any_element(),
             BotPanelTab::Connectors => div().size_full().children(view).into_any_element(),
             BotPanelTab::Home => {
                 if let Some(page) = self.bot_ui.panel.settings {
                     Self::render_bot_settings_page(bot, page, view, p, cx).into_any_element()
                 } else {
                     // An open item takes Home's place, header and all (Orca's item pane).
+                    // Once `view` has loaded the bot, `BotPanelHeader` renders inside Home's
+                    // scroller (`BotActivityPanel.tsx` L188); keep shell's fallback header only
+                    // while loading.
                     let item_open = view.as_ref().is_some_and(|v| v.read(cx).home_item_open());
+                    let view_renders_header = view
+                        .as_ref()
+                        .is_some_and(|v| v.read(cx).home_renders_header(&bot.id));
                     div()
                         .size_full()
                         .flex()
                         .flex_col()
-                        .when(!item_open, |d| {
+                        .when(!item_open && !view_renders_header, |d| {
                             d.child(self.render_bot_panel_header(
                                 bot,
                                 view.as_ref(),
@@ -965,9 +1046,11 @@ impl Shell {
         s: &BotSessionSummary,
         title: &SharedString,
         state: Option<krill_proto::control::AgentState>,
+        waiting_workers: usize,
         running: usize,
         foldable: bool,
         open: bool,
+        compact: bool,
         now: u64,
         p: &ui::Palette,
         cx: &mut Context<Self>,
@@ -1002,6 +1085,20 @@ impl Shell {
                         .ok();
                     }
                 };
+                let open_this = this.clone();
+                let open_host = menu_host.clone();
+                let open_bot = menu_bot.clone();
+                let menu = menu.item(
+                    PopupMenuItem::new(hm::CHAT_OPEN.get())
+                        .icon(Icon::new(gpui_kit_assets::IconName::ArrowUpRight))
+                        .on_click(move |_, _, cx| {
+                            open_this
+                                .update(cx, |s, cx| {
+                                    s.open_bot_session_on(&open_host, &open_bot, session, cx);
+                                })
+                                .ok();
+                        }),
+                );
                 let menu = if live {
                     menu.item(
                         PopupMenuItem::new(text::CHAT_STOP_BTN.get())
@@ -1014,20 +1111,45 @@ impl Shell {
                 } else {
                     menu
                 };
-                menu.item(
-                    PopupMenuItem::new(text::CHAT_RUN_AGAIN_BTN.get())
-                        .icon(IconName::Redo)
-                        .on_click(action(|bot_id, session_id| {
-                            BotRpcRequest::SendBotRunAgain { bot_id, session_id }
-                        })),
-                )
-                .item(
-                    PopupMenuItem::new(text::CHAT_TAKEOVER_BTN.get())
-                        .icon(IconName::ArrowRight)
-                        .on_click(action(|bot_id, session_id| {
-                            BotRpcRequest::TakeOverWorkspace { bot_id, session_id }
-                        })),
-                )
+                let menu = menu
+                    .item(
+                        PopupMenuItem::new(text::CHAT_RUN_AGAIN_BTN.get())
+                            .icon(IconName::Redo)
+                            .on_click(action(|bot_id, session_id| {
+                                BotRpcRequest::SendBotRunAgain { bot_id, session_id }
+                            })),
+                    )
+                    .item(
+                        PopupMenuItem::new(text::CHAT_TAKEOVER_BTN.get())
+                            .icon(IconName::ArrowRight)
+                            .on_click(action(|bot_id, session_id| {
+                                BotRpcRequest::TakeOverWorkspace { bot_id, session_id }
+                            })),
+                    );
+                // Orca `#47339`: Delete chat for non-Home chats.
+                if home {
+                    menu
+                } else {
+                    let del_this = this.clone();
+                    let del_host = menu_host.clone();
+                    let del_bot = menu_bot.clone();
+                    menu.separator().item(
+                        PopupMenuItem::new(hm::CHAT_DELETE.get())
+                            .icon(Icon::new(gpui_kit_assets::IconName::Trash))
+                            .on_click(move |_, _, cx| {
+                                del_this
+                                    .update(cx, |s, cx| {
+                                        s.delete_bot_chat_on(
+                                            &del_host,
+                                            del_bot.clone(),
+                                            session,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            }),
+                    )
+                }
             }
         };
         let menu2 = menu.clone();
@@ -1036,12 +1158,39 @@ impl Shell {
             Some(AgentState::Waiting | AgentState::Blocked) => (Some(text::BP_WAITING.get()), true),
             _ => (None, false),
         };
+        let is_new = !home && now.saturating_sub(s.created_at_ms / 1000) < 600;
         let preview: SharedString = if home {
             text::BP_SAY_HI.format(&[("name", &bot.name)]).into()
         } else {
             s.link_id.clone().unwrap_or_default().into()
         };
         let age = ui::format_short_time_ago_secs(s.created_at_ms / 1000, now);
+        let status_dot: Option<AnyElement> = if s.working {
+            Some(
+                ui::status::status_glyph(AgentState::Working, false, ui::status::Size::Sm, cx)
+                    .into_any_element(),
+            )
+        } else if matches!(state, Some(AgentState::Waiting | AgentState::Blocked))
+            || waiting_workers > 0
+        {
+            Some(
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(p.agent_question)
+                    .into_any_element(),
+            )
+        } else if s.live && !home {
+            Some(
+                div()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(p.success)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         div()
             .id(id.clone())
             .debug_selector(move || id.to_string())
@@ -1082,16 +1231,32 @@ impl Shell {
                             .when(foldable, |d| {
                                 d.group_hover(group.clone(), gpui::Styled::invisible)
                             })
-                            .child(ui::icons::svg_icon(
-                                if home {
-                                    ui::icons::BOT_HOME_SVG
-                                } else {
-                                    ui::icons::MESSAGE_SQUARE_SVG
-                                },
-                                ui::ICON_XS,
+                            .child(chat_origin_icon(
+                                home,
+                                s.link_id.as_deref(),
                                 p.muted_foreground,
                             )),
                     )
+                    .when(!open, |d| {
+                        d.when_some(status_dot, |d, dot| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .bottom(px(0.))
+                                    .left(px(-1.))
+                                    .size(px(10.))
+                                    .rounded_full()
+                                    .bg(p.sidebar)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(foldable, |d| {
+                                        d.group_hover(group.clone(), gpui::Styled::invisible)
+                                    })
+                                    .child(dot),
+                            )
+                        })
+                    })
                     .when(foldable, |d| {
                         d.child(
                             div()
@@ -1158,10 +1323,27 @@ impl Shell {
                                     .min_w_0()
                                     .truncate()
                                     .text_size(ui::TEXT_MD)
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .font_weight(if live_strong || waiting_workers > 0 {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
                                     .text_color(p.sidebar_foreground)
                                     .child(title.clone()),
                             )
+                            .when(is_new, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .rounded(ui::RADIUS_XS)
+                                        .border_1()
+                                        .border_color(p.input)
+                                        .px_1()
+                                        .text_size(ui::TEXT_3XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(hm::CHAT_NEW_TAG.get()),
+                                )
+                            })
                             .child(div().flex_1())
                             .child(
                                 div()
@@ -1214,6 +1396,25 @@ impl Shell {
                                     .when(live_strong, |d| d.text_color(p.sidebar_foreground))
                                     .child(t)
                             }))
+                            .when(waiting_workers > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_color(p.agent_question)
+                                        .child(
+                                            div().size(px(7.)).rounded_full().bg(p.agent_question),
+                                        )
+                                        .child(if compact {
+                                            waiting_workers.to_string()
+                                        } else {
+                                            hm::CHAT_WAITING_COUNT
+                                                .format(&[("n", &waiting_workers.to_string())])
+                                        }),
+                                )
+                            })
                             .when(running > 0, |d| {
                                 d.child(
                                     div()
@@ -1227,10 +1428,12 @@ impl Shell {
                                             ui::status::Size::Sm,
                                             cx,
                                         ))
-                                        .child(
+                                        .child(if compact {
+                                            running.to_string()
+                                        } else {
                                             text::BP_RUNNING_COUNT
-                                                .format(&[("n", &running.to_string())]),
-                                        ),
+                                                .format(&[("n", &running.to_string())])
+                                        }),
                                 )
                             }),
                     ),
@@ -1238,7 +1441,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Orca's `BotChatTreeWorkerRow`: the worker's state, its title and age; a click opens it.
+    /// Orca's `BotChatTreeWorkerRow`: the worker's state, its title and live elapsed / waiting
+    /// / age meta; a click opens it.
     #[expect(clippy::too_many_arguments, reason = "worker row render inputs")]
     fn render_bot_chat_worker(
         &self,
@@ -1250,15 +1454,44 @@ impl Shell {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        use krill_proto::control::AgentState;
         let host = host.clone();
         let sidebar = self.sidebar.read(cx);
         let session = sidebar.session_on(&host, worker);
-        let state = session.map_or(krill_proto::control::AgentState::Exited, |s| s.status.state);
+        let state = session.map_or(AgentState::Exited, |s| s.status.state);
+        let is_waiting = matches!(state, AgentState::Waiting | AgentState::Blocked);
+        let is_running = session.is_some_and(|s| !s.is_exited() && state == AgentState::Working);
         let title = session
             .and_then(|s| s.status.title.clone())
             .filter(|t| !t.trim().is_empty())
             .or(fallback_name)
             .unwrap_or_else(|| format!("#{}", worker.0));
+        let meta = if is_waiting {
+            (text::HM_STATUS_NEEDS_YOU.get().to_owned(), true)
+        } else if is_running {
+            let started_secs = session
+                .map(|s| s.status.since_unix_ns / 1_000_000_000)
+                .filter(|&s| s > 0)
+                .unwrap_or(at_ms / 1000);
+            (
+                format_worker_elapsed(now.saturating_sub(started_secs)),
+                false,
+            )
+        } else {
+            (ui::format_short_time_ago_secs(at_ms / 1000, now), false)
+        };
+        let state_glyph: AnyElement = if is_waiting {
+            div()
+                .size(px(7.))
+                .rounded_full()
+                .bg(p.agent_question)
+                .into_any_element()
+        } else if let Some(s) = session {
+            ui::status::status_glyph_for(&s.status, false, ui::status::Size::Sm, None, cx)
+                .into_any_element()
+        } else {
+            ui::status::status_glyph(state, false, ui::status::Size::Sm, cx).into_any_element()
+        };
         let id = SharedString::from(format!("bot-chat-worker-{}", worker.0));
         div()
             .id(id.clone())
@@ -1274,13 +1507,14 @@ impl Shell {
             .px_2()
             .cursor_pointer()
             .hover(|d| d.bg(p.sidebar_accent))
-            .child(div().w(px(16.)).flex_none().flex().justify_center().child(
-                if let Some(s) = session {
-                    ui::status::status_glyph_for(&s.status, false, ui::status::Size::Sm, None, cx)
-                } else {
-                    ui::status::status_glyph(state, false, ui::status::Size::Sm, cx)
-                },
-            ))
+            .child(
+                div()
+                    .w(px(16.))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(state_glyph),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1293,9 +1527,14 @@ impl Shell {
             .child(
                 div()
                     .flex_none()
+                    .whitespace_nowrap()
                     .text_size(ui::TEXT_2XS)
-                    .text_color(p.muted_foreground)
-                    .child(ui::format_short_time_ago_secs(at_ms / 1000, now)),
+                    .text_color(if meta.1 {
+                        p.agent_question
+                    } else {
+                        p.muted_foreground
+                    })
+                    .child(meta.0),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_session_on(host.clone(), worker, cx);
@@ -1305,18 +1544,51 @@ impl Shell {
     fn render_bot_chats(
         &self,
         bot: &SidebarBot,
+        width: f32,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let compact = width <= COMPACT_CHATS_WIDTH;
         let q = self.bot_ui.panel.chat_query.trim().to_lowercase();
         let new_host = bot.host.clone();
         let new_id = bot.id.clone();
         let search = self.bot_ui.panel.chat_search.as_ref().map(|(input, _)| {
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(Input::new(input).small().cleanable(true))
+            div().flex_1().min_w_0().child(
+                Input::new(input).small().cleanable(true).prefix(
+                    Icon::new(gpui_kit_assets::IconName::Search)
+                        .size(px(14.))
+                        .text_color(p.muted_foreground),
+                ),
+            )
         });
+        let new_disabled = bot.paused
+            || self
+                .bot_ui
+                .opening
+                .contains(&(bot.host.clone(), bot.id.clone()));
+        let new_btn = if compact {
+            Button::new("bot-chats-new")
+                .debug_selector(|| "bot-chats-new".into())
+                .outline()
+                .small()
+                .h(px(28.))
+                .icon(IconName::Plus)
+                .tooltip(text::BP_NEW_CHAT.get())
+                .accessibility_label(text::BP_NEW_CHAT.get())
+                .disabled(new_disabled)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.start_bot_session_on(&new_host, new_id.clone(), None, cx);
+                }))
+        } else {
+            ui::secondary("bot-chats-new", text::BP_NEW_CHAT.get())
+                .debug_selector(|| "bot-chats-new".into())
+                .h(px(28.))
+                .icon(IconName::Plus)
+                .disabled(new_disabled)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.start_bot_session_on(&new_host, new_id.clone(), None, cx);
+                }))
+        };
         let toolbar = div()
             .flex_none()
             .flex()
@@ -1325,21 +1597,7 @@ impl Shell {
             .px_0p5()
             .pb_2()
             .children(search)
-            .child(
-                ui::secondary("bot-chats-new", text::BP_NEW_CHAT.get())
-                    .debug_selector(|| "bot-chats-new".into())
-                    .icon(IconName::Plus)
-                    .disabled(
-                        bot.paused
-                            || self
-                                .bot_ui
-                                .opening
-                                .contains(&(bot.host.clone(), bot.id.clone())),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.start_bot_session_on(&new_host, new_id.clone(), None, cx);
-                    })),
-            );
+            .child(new_btn);
         let now = super::bot_section::now_secs();
         let host = bot.host.clone();
         let orch = self.orch_snapshot_for(&host);
@@ -1357,12 +1615,46 @@ impl Shell {
             .flex()
             .flex_col();
         let mut shown = 0;
-        for s in &bot.sessions {
-            let title = chat_title(bot, s);
-            if !q.is_empty() && !title.to_lowercase().contains(&q) {
-                continue;
+        let mut matched_workers: Vec<(krill_proto::SessionId, u64, Option<String>)> = Vec::new();
+        let visible_sessions: Vec<&BotSessionSummary> = bot
+            .sessions
+            .iter()
+            .filter(|s| {
+                !self
+                    .bot_ui
+                    .panel
+                    .deleted_chats
+                    .contains(&(host.clone(), s.session_id))
+            })
+            .collect();
+        let older_cap = if self.bot_ui.panel.older_chats_limit == 0 {
+            DEFAULT_OLDER_CHATS
+        } else {
+            self.bot_ui.panel.older_chats_limit
+        };
+        let mut older_rendered = 0usize;
+        let mut older_total = 0usize;
+        if !q.is_empty() {
+            let has_chat_match = visible_sessions
+                .iter()
+                .any(|s| chat_title(bot, s).to_lowercase().contains(&q));
+            if has_chat_match {
+                list = list.child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .text_size(ui::TEXT_2XS)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.muted_foreground)
+                        .child(hm::CHAT_CHATS_HEADING.get()),
+                );
             }
-            shown += 1;
+        }
+        for s in visible_sessions {
+            let title = chat_title(bot, s);
+            let is_home = bot
+                .home_session()
+                .is_some_and(|h| h.session_id == s.session_id);
             let session = s.session_id;
             let state = self
                 .sidebar
@@ -1433,6 +1725,32 @@ impl Shell {
                 .map(|(wsid, (at, name))| (wsid, at, name))
                 .collect();
             mine.sort_by_key(|(wsid, at, _)| (std::cmp::Reverse(*at), std::cmp::Reverse(wsid.0)));
+            if !q.is_empty() {
+                for (wsid, at, name) in &mine {
+                    let wtitle = self
+                        .sidebar
+                        .read(cx)
+                        .session_on(&host, *wsid)
+                        .and_then(|x| x.status.title.clone())
+                        .or_else(|| name.clone())
+                        .unwrap_or_else(|| format!("#{}", wsid.0));
+                    if wtitle.to_lowercase().contains(&q)
+                        && !matched_workers.iter().any(|(id, ..)| id == wsid)
+                    {
+                        matched_workers.push((*wsid, *at, name.clone()));
+                    }
+                }
+                if !title.to_lowercase().contains(&q) {
+                    continue;
+                }
+            } else if !is_home {
+                older_total += 1;
+                if older_rendered >= older_cap {
+                    continue;
+                }
+                older_rendered += 1;
+            }
+            shown += 1;
             let running = mine
                 .iter()
                 .filter(|(w, ..)| {
@@ -1448,6 +1766,22 @@ impl Shell {
                         })
                 })
                 .count();
+            let waiting_workers = mine
+                .iter()
+                .filter(|(w, ..)| {
+                    self.sidebar
+                        .read(cx)
+                        .session_on(&host, *w)
+                        .is_some_and(|x| {
+                            !x.is_exited()
+                                && matches!(
+                                    x.status.state,
+                                    krill_proto::control::AgentState::Waiting
+                                        | krill_proto::control::AgentState::Blocked
+                                )
+                        })
+                })
+                .count();
             let foldable = !mine.is_empty();
             let open = foldable
                 && !self
@@ -1455,17 +1789,139 @@ impl Shell {
                     .panel
                     .chat_folded
                     .contains(&(host.clone(), session));
-            list =
-                list.child(self.render_bot_chat_row(
-                    bot, s, &title, state, running, foldable, open, now, p, cx,
-                ));
+            list = list.child(self.render_bot_chat_row(
+                bot,
+                s,
+                &title,
+                state,
+                waiting_workers,
+                running,
+                foldable,
+                open,
+                compact,
+                now,
+                p,
+                cx,
+            ));
             if open {
+                let wcap = self
+                    .bot_ui
+                    .panel
+                    .chat_worker_limits
+                    .get(&(host.clone(), session))
+                    .copied()
+                    .unwrap_or(DEFAULT_CHAT_WORKERS);
+                let total_workers = mine.len();
                 let mut tree = div().mb_1().ml_6().flex().flex_col();
-                for (worker, at, name) in mine {
+                for (worker, at, name) in mine.into_iter().take(wcap) {
                     tree = tree
                         .child(self.render_bot_chat_worker(&host, worker, name, at, now, p, cx));
                 }
+                if total_workers > wcap {
+                    let rem = total_workers - wcap;
+                    let key = (host.clone(), session);
+                    tree = tree.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "bot-chat-workers-more-{}",
+                                session.0
+                            )))
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.text_color(p.sidebar_foreground))
+                            .child(hm::CHAT_SHOW_MORE_WORKERS.format(&[("n", &rem.to_string())]))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.bot_ui
+                                    .panel
+                                    .chat_worker_limits
+                                    .insert(key.clone(), wcap + 10);
+                                cx.notify();
+                            })),
+                    );
+                } else if wcap > DEFAULT_CHAT_WORKERS && total_workers > DEFAULT_CHAT_WORKERS {
+                    let key = (host.clone(), session);
+                    tree = tree.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "bot-chat-workers-less-{}",
+                                session.0
+                            )))
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.text_color(p.sidebar_foreground))
+                            .child(hm::CHAT_SHOW_FEWER.get())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.bot_ui.panel.chat_worker_limits.remove(&key);
+                                cx.notify();
+                            })),
+                    );
+                }
                 list = list.child(tree);
+            }
+        }
+        if q.is_empty() && older_total > older_rendered {
+            let rem = older_total - older_rendered;
+            list = list.child(
+                div()
+                    .id("bot-chats-show-older")
+                    .debug_selector(|| "bot-chats-show-older".into())
+                    .px_2()
+                    .py_1p5()
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.text_color(p.sidebar_foreground))
+                    .child(hm::CHAT_SHOW_OLDER.format(&[("n", &rem.to_string())]))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let base = if this.bot_ui.panel.older_chats_limit == 0 {
+                            DEFAULT_OLDER_CHATS
+                        } else {
+                            this.bot_ui.panel.older_chats_limit
+                        };
+                        this.bot_ui.panel.older_chats_limit = base + 12;
+                        cx.notify();
+                    })),
+            );
+        } else if q.is_empty()
+            && older_cap > DEFAULT_OLDER_CHATS
+            && older_total > DEFAULT_OLDER_CHATS
+        {
+            list = list.child(
+                div()
+                    .id("bot-chats-show-fewer")
+                    .px_2()
+                    .py_1p5()
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .hover(|d| d.text_color(p.sidebar_foreground))
+                    .child(hm::CHAT_SHOW_FEWER.get())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.bot_ui.panel.older_chats_limit = 0;
+                        cx.notify();
+                    })),
+            );
+        }
+        if !q.is_empty() && !matched_workers.is_empty() {
+            shown += matched_workers.len();
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(ui::TEXT_2XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.muted_foreground)
+                    .child(hm::CHAT_WORKERS_HEADING.get()),
+            );
+            for (worker, at, name) in matched_workers {
+                list = list.child(self.render_bot_chat_worker(&host, worker, name, at, now, p, cx));
             }
         }
         if shown == 0 {
@@ -1494,6 +1950,27 @@ impl Shell {
             .flex_col()
             .child(toolbar)
             .child(list)
+    }
+
+    /// Orca `#47339`: closes any open tabs for the chat and stops/removes the bot session.
+    fn delete_bot_chat_on(
+        &mut self,
+        host: &HostId,
+        bot_id: BotId,
+        session_id: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.bot_ui
+            .panel
+            .deleted_chats
+            .insert((host.clone(), session_id));
+        self.close_session_panes(host, session_id, super::close::Policy::Preserve, cx);
+        self.run_bot_chat_action_on(
+            host,
+            BotRpcRequest::StopBotSession { bot_id, session_id },
+            cx,
+        );
+        cx.notify();
     }
 
     fn ensure_bot_chat_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {

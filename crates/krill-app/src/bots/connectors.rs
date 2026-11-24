@@ -8,15 +8,17 @@ use gpui::{
     prelude::*, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{Disableable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, Sizable as _};
+use gpui_kit_assets::IconName;
 use krill_proto::bots::{
     ActsFor, BotAccessRequest, BotAccessRequestStatus, BotConfig, BotConnectorConfig,
-    BotConnectorStatus, BotId, BotRpcRequest, BotRpcResponse, COMPOSIO_CURATED_APPS,
-    ComposioConnectionInfo, ConnectorHealthState, DEFAULT_CONNECTOR_POLL_INTERVAL_SECS,
-    DefaultTrackerBots, ExternalSource, generate_slack_socket_mode_manifest,
+    BotConnectorStatus, BotErrorCategory, BotId, BotRpcRequest, BotRpcResponse,
+    COMPOSIO_CURATED_APPS, ComposioConnectionInfo, ConnectorHealthState,
+    DEFAULT_CONNECTOR_POLL_INTERVAL_SECS, DefaultTrackerBots, ExternalSource,
+    generate_slack_socket_mode_manifest,
 };
 
-use crate::i18n::catalog::bots as text;
+use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
 use super::rpc::{
@@ -1268,10 +1270,16 @@ impl View {
         if let Some(err) = &st.last_error {
             has_any = true;
             let formatted = match st.error_category {
+                Some(BotErrorCategory::SignedOut) => {
+                    format!("{} — {err}", hm::CONN_RECONNECT_HINT.get())
+                }
                 Some(cat) => format!("[{}] {err}", cat.as_str()),
                 None => err.clone(),
             };
             lines = lines.child(ui::error_banner(p, formatted));
+        } else if st.error_category == Some(BotErrorCategory::SignedOut) {
+            has_any = true;
+            lines = lines.child(ui::error_banner(p, hm::CONN_RECONNECT_HINT.get()));
         }
         has_any.then_some(lines)
     }
@@ -2307,6 +2315,12 @@ impl View {
                     ),
             )
             .children(Self::render_connector_status_meta(gg_status, p))
+            .child(
+                div()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(hm::CONN_GOOGLE_NEW_APP_HINT.get()),
+            )
             .child(Self::render_secret_row(
                 p,
                 SecretRowSpec {
@@ -2438,6 +2452,7 @@ impl View {
         let bot_secret = bot.id.clone();
         let bot_clear = bot.id.clone();
         let bot_sync = bot.id.clone();
+        let bot_refresh = bot.id.clone();
         let bot_save = bot.id.clone();
         let bot_default = bot.id.clone();
         let bot_test = bot.id.clone();
@@ -2627,6 +2642,15 @@ impl View {
                                     })),
                             )
                             .child(
+                                ui::ghost("bots-github-refresh", hm::CONN_GITHUB_REFRESH.get())
+                                    .debug_selector(|| "bots-github-refresh".into())
+                                    .icon(Icon::new(IconName::RefreshCw).size(px(12.)))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reload_connectors(bot_refresh.clone(), cx);
+                                    })),
+                            )
+                            .child(
                                 ui::ghost("bots-github-sync", text::SYNC_NOW_BTN.get())
                                     .debug_selector(|| "bots-github-sync".into())
                                     .disabled(busy)
@@ -2668,6 +2692,7 @@ impl View {
         let bot_secret = bot.id.clone();
         let bot_clear = bot.id.clone();
         let bot_sync = bot.id.clone();
+        let bot_refresh = bot.id.clone();
         let bot_save = bot.id.clone();
         let bot_default = bot.id.clone();
         let bot_test = bot.id.clone();
@@ -2823,6 +2848,15 @@ impl View {
                                             ExternalSource::Linear,
                                             cx,
                                         );
+                                    })),
+                            )
+                            .child(
+                                ui::ghost("bots-linear-refresh", hm::CONN_GITHUB_REFRESH.get())
+                                    .debug_selector(|| "bots-linear-refresh".into())
+                                    .icon(Icon::new(IconName::RefreshCw).size(px(12.)))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reload_connectors(bot_refresh.clone(), cx);
                                     })),
                             )
                             .child(

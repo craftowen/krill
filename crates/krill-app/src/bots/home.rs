@@ -14,7 +14,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::SessionId;
 use krill_proto::bots::{BotConfig, BotId, BotItem, BotItemActor, BotItemLink, BotItemStatus};
@@ -40,10 +40,44 @@ pub(super) fn number_column_chars(max_number: u64) -> usize {
     (digits + 1).max(3)
 }
 
+/// Prefix stored in `BotItem::close_note` on open items representing Orca's `Waiting` status
+/// (`#47308`/`#47309`) without altering `BotItemStatus` across other domains.
+pub(super) const WAITING_NOTE_PREFIX: &str = "waiting:";
+
+/// What an open `Waiting` item is waiting on, if any.
+pub(super) fn waiting_note(item: &BotItem) -> Option<&str> {
+    if !item.status.is_open() {
+        return None;
+    }
+    item.close_note
+        .as_deref()
+        .and_then(|n| n.strip_prefix(WAITING_NOTE_PREFIX))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+pub(super) fn encode_waiting_note(note: &str) -> String {
+    format!("{WAITING_NOTE_PREFIX}{}", note.trim())
+}
+
+/// Shell-supplied header context so `BotPanelHeader` renders inside Home's scroller
+/// (`BotActivityPanel.tsx` L188).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HomeHeaderMeta {
+    pub bot_id: Option<BotId>,
+    pub narrow: bool,
+    pub activity: String,
+    pub attention: bool,
+    pub working_count: usize,
+    pub needs_you_count: usize,
+    pub usage_limit_note: Option<String>,
+}
+
 /// Stable identity key for a flattened virtual row, used to preserve the scroll anchor across
 /// item updates and group folds (Orca #45971).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RowAnchor {
+    Header,
     FilterChip,
     AllClear,
     GroupHeader(u8),
@@ -122,10 +156,11 @@ enum HomeNoteKind {
 
 #[derive(Debug, Clone)]
 enum HomeRow {
+    Header,
     FilterChip,
     AllClear,
     GroupHeader {
-        group: Group,
+        bucket: HomeBucket,
         first_group: bool,
         count: usize,
         fresh: usize,
@@ -138,11 +173,11 @@ enum HomeRow {
     },
     Need(Need),
     Item {
-        group: Group,
+        bucket: HomeBucket,
         item_index: usize,
     },
     ShowMore {
-        group: Group,
+        bucket: HomeBucket,
         shown: usize,
         more: usize,
     },
@@ -159,6 +194,7 @@ enum HomeRow {
 struct HomeCacheKey {
     bot_id: BotId,
     paused: bool,
+    header_meta: Option<HomeHeaderMeta>,
     items_rev: u64,
     items_len: usize,
     first_sig: Option<(String, u64)>,
@@ -173,6 +209,7 @@ struct HomeCacheKey {
     seen_mark: u64,
     has_suggestions: bool,
     look_around_running: bool,
+    look_steps_open: bool,
     minute_bucket: u64,
 }
 
@@ -210,7 +247,85 @@ impl Default for HomeListCache {
     }
 }
 
-/// Orca's item groups, in list order.
+/// Home's 7-bucket grouping matching Orca `BOT_ITEM_GROUP_IDS` (includes `Waiting`, `#47308`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeBucket {
+    NeedsYou,
+    Working,
+    Waiting,
+    Planned,
+    Snoozed,
+    Stale,
+    Closed,
+}
+
+impl HomeBucket {
+    const ALL: [Self; 7] = [
+        Self::NeedsYou,
+        Self::Working,
+        Self::Waiting,
+        Self::Planned,
+        Self::Snoozed,
+        Self::Stale,
+        Self::Closed,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs-you",
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Planned => "planned",
+            Self::Snoozed => "snoozed",
+            Self::Stale => "stale",
+            Self::Closed => "closed",
+        }
+    }
+
+    const fn folded_by_default(self) -> bool {
+        matches!(
+            self,
+            Self::Planned | Self::Snoozed | Self::Stale | Self::Closed
+        )
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::NeedsYou => text::HM_STATUS_NEEDS_YOU.get(),
+            Self::Working => text::HM_STATUS_WORKING.get(),
+            Self::Waiting => hm::STATUS_WAITING.get(),
+            Self::Planned => text::HM_STATUS_PLANNED.get(),
+            Self::Snoozed => text::HM_GROUP_SNOOZED.get(),
+            Self::Stale => text::HM_GROUP_STALE.get(),
+            Self::Closed => text::HM_GROUP_CLOSED.get(),
+        }
+    }
+
+    const fn as_group(self) -> Group {
+        match self {
+            Self::NeedsYou => Group::NeedsYou,
+            Self::Working => Group::Working,
+            Self::Waiting | Self::Planned => Group::Planned,
+            Self::Snoozed => Group::Snoozed,
+            Self::Stale => Group::Stale,
+            Self::Closed => Group::Closed,
+        }
+    }
+}
+
+fn home_bucket_of(item: &BotItem, live: bool, stale_days: Option<u64>, now: u64) -> HomeBucket {
+    match item.status {
+        BotItemStatus::Done | BotItemStatus::Canceled => HomeBucket::Closed,
+        _ if is_snoozed(item, now) => HomeBucket::Snoozed,
+        _ if is_stale(item, live, stale_days, now) => HomeBucket::Stale,
+        BotItemStatus::NeedsYou => HomeBucket::NeedsYou,
+        _ if waiting_note(item).is_some() => HomeBucket::Waiting,
+        BotItemStatus::Working => HomeBucket::Working,
+        BotItemStatus::Planned => HomeBucket::Planned,
+    }
+}
+
+/// Orca's item groups, in list order (kept 6-way for `group_panel.rs` compatibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Group {
     NeedsYou,
@@ -247,17 +362,6 @@ impl Group {
             self,
             Self::Planned | Self::Snoozed | Self::Stale | Self::Closed
         )
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::NeedsYou => text::HM_STATUS_NEEDS_YOU.get(),
-            Self::Working => text::HM_STATUS_WORKING.get(),
-            Self::Planned => text::HM_STATUS_PLANNED.get(),
-            Self::Snoozed => text::HM_GROUP_SNOOZED.get(),
-            Self::Stale => text::HM_GROUP_STALE.get(),
-            Self::Closed => text::HM_GROUP_CLOSED.get(),
-        }
     }
 }
 
@@ -348,21 +452,9 @@ pub(super) fn grouped<'a>(
     groups
 }
 
-/// Orca's `formatShortTimeAgo`: now, 6m, 22h, 3d.
+/// Orca's `formatShortTimeAgo`: now, 6m, 22h, 3d (shared Wave 1 formatter).
 pub(super) fn short_age(ts_ms: u64, now_ms: u64) -> String {
-    let delta = now_ms.saturating_sub(ts_ms);
-    if delta < 60_000 {
-        return text::SHORT_AGE_NOW.get().to_owned();
-    }
-    let minutes = delta / 60_000;
-    if minutes < 60 {
-        return text::SHORT_AGE_MIN.format(&[("n", &minutes.to_string())]);
-    }
-    let hours = minutes / 60;
-    if hours < 24 {
-        return text::SHORT_AGE_HOUR.format(&[("n", &hours.to_string())]);
-    }
-    text::SHORT_AGE_DAY.format(&[("n", &(hours / 24).to_string())])
+    ui::format_short_time_ago_secs(ts_ms / 1000, now_ms / 1000)
 }
 
 /// Orca's snooze presets: Later today (6 PM, or three hours out after 5 PM), Tomorrow 9 AM and
@@ -407,24 +499,33 @@ pub(super) fn local_offset_secs(now_ms: u64) -> i64 {
         .map_or(0, i64::from)
 }
 
-/// A wake or event time as the rows say it: `HH:MM` today, else `MM-DD HH:MM`.
-pub(super) fn clock_label(ts_ms: u64, now_ms: u64) -> String {
-    let offset = local_offset_secs(now_ms);
-    let local = |ms: u64| i64::try_from(ms / 1000).unwrap_or(0) + offset;
-    let (t, n) = (local(ts_ms), local(now_ms));
-    let Some(c) = crate::local_time::civil_from_epoch(t) else {
-        return String::new();
-    };
-    if t.div_euclid(86_400) == n.div_euclid(86_400) {
-        format!("{:02}:{:02}", c.hour, c.minute)
-    } else {
-        format!("{:02}-{:02} {:02}:{:02}", c.month, c.day, c.hour, c.minute)
-    }
-}
-
 // Lucide `circle-check` / `circle-slash` at Orca's `absoluteStrokeWidth` 2 px in a 10 px box (4.8 of 24).
 const CIRCLE_CHECK_BOLD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="m8 12 3 3 5-6"/></svg>"#;
 const CIRCLE_SLASH_BOLD_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="9.6"/><path d="M8.5 15.5 15.5 8.5"/></svg>"#;
+// Orca `BotItemStatusIcon` Waiting: 10 px grey ring with its lower half filled.
+const WAITING_HALF_CIRCLE_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4.8" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10"/><path d="M4.4 12a7.6 7.6 0 0 0 15.2 0z" fill="currentColor" stroke="none"/></svg>"#;
+
+pub(super) fn waiting_icon(p: &ui::Palette) -> AnyElement {
+    Icon::default()
+        .data(WAITING_HALF_CIRCLE_SVG)
+        .size(px(10.))
+        .text_color(p.muted_foreground)
+        .into_any_element()
+}
+
+pub(super) fn item_status_icon(
+    item: &BotItem,
+    live: bool,
+    quiet: bool,
+    p: &ui::Palette,
+    cx: &gpui::App,
+) -> AnyElement {
+    if item.status != BotItemStatus::NeedsYou && waiting_note(item).is_some() {
+        waiting_icon(p)
+    } else {
+        status_icon(item.status, live, quiet, p, cx)
+    }
+}
 
 /// Orca's `BotItemStatusIcon`: every glyph in one 10 px box. Planned a dashed ring, In progress a
 /// spinner while its worker runs (a ring otherwise), Needs you an orange dot (grey once stale),
@@ -540,6 +641,54 @@ pub(super) fn section_header(
 }
 
 impl View {
+    /// Supplies live header state from the shell so `BotPanelHeader` scrolls inside Home's list
+    /// (`BotActivityPanel.tsx` L188).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "avoids re-exporting an extra struct through bots/mod.rs"
+    )]
+    pub fn set_home_header_meta(
+        &mut self,
+        bot_id: BotId,
+        narrow: bool,
+        activity: String,
+        attention: bool,
+        working_count: usize,
+        needs_you_count: usize,
+        usage_limit_note: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = HomeHeaderMeta {
+            bot_id: Some(bot_id),
+            narrow,
+            activity,
+            attention,
+            working_count,
+            needs_you_count,
+            usage_limit_note,
+        };
+        if self.items.header_meta.as_ref() != Some(&next) {
+            self.items.header_meta = Some(next);
+            cx.notify();
+        }
+    }
+
+    /// Immediately restores cached items for `bot_id` on bot switch/reopen (`#47162`) so Home
+    /// paints with zero flash while the background refresh runs.
+    pub fn hydrate_cached_items(&mut self, bot_id: &BotId, cx: &mut Context<Self>) {
+        if self.items.restore_cached(bot_id) {
+            cx.notify();
+        }
+    }
+
+    /// True once `View` has loaded `bot_id` and renders `BotPanelHeader` inside Home's scroller.
+    #[must_use]
+    pub fn home_renders_header(&self, bot_id: &BotId) -> bool {
+        self.items.header_meta.is_some()
+            && self.selected_bot().is_some_and(|b| &b.id == bot_id)
+            && !self.home_item_open()
+    }
+
     /// The bot's Home has items: the header shows the filter icon (Orca hides it otherwise).
     #[must_use]
     pub fn home_filter(&self) -> Option<HomeFilter> {
@@ -574,6 +723,7 @@ impl View {
         self.items.open_uid = Some(uid);
         self.items.desc_open = false;
         self.items.open_comments.clear();
+        self.items.asked_here.clear();
         self.items.hover_uid = None;
         cx.notify();
     }
@@ -614,6 +764,7 @@ impl View {
         let next_key = HomeCacheKey {
             bot_id: bot.id.clone(),
             paused: bot.paused,
+            header_meta: self.items.header_meta.clone(),
             items_rev: self.items.items_rev,
             items_len: self.items.items.len(),
             first_sig,
@@ -633,6 +784,7 @@ impl View {
             seen_mark,
             has_suggestions: !self.soul_memory.suggestions.is_empty(),
             look_around_running: self.soul_memory.look_around_running,
+            look_steps_open: self.items.look_steps_open,
             minute_bucket: now / 60_000,
         };
         let upcoming_seen = self.items.upcoming.as_ref().map(|u| u.items_seen_event_id);
@@ -654,8 +806,8 @@ impl View {
             self.items.home_list.rebuild_count += 1;
         }
 
-        // Group indices without cloning `BotItem`s.
-        let mut grouped_indices: [Vec<usize>; 6] = Default::default();
+        // Group indices without cloning `BotItem`s (Orca 7-bucket order with Waiting).
+        let mut grouped_indices: [Vec<usize>; 7] = Default::default();
         let mut max_number = 0u64;
         for (idx, item) in self.items.items.iter().enumerate() {
             max_number = max_number.max(item.number);
@@ -663,11 +815,11 @@ impl View {
                 continue;
             }
             let live = self.item_live(item);
-            let group = group_of(item, live, stale_days, now);
-            grouped_indices[group as usize].push(idx);
+            let bucket = home_bucket_of(item, live, stale_days, now);
+            grouped_indices[bucket as usize].push(idx);
         }
         for (i, indices) in grouped_indices.iter_mut().enumerate() {
-            if i == Group::Snoozed as usize {
+            if i == HomeBucket::Snoozed as usize {
                 indices.sort_by_key(|&idx| {
                     let it = &self.items.items[idx];
                     (it.snoozed_until_ms.unwrap_or(0), Reverse(it.number))
@@ -680,11 +832,11 @@ impl View {
             }
         }
 
-        self.items.shown_order = Group::ALL
+        self.items.shown_order = HomeBucket::ALL
             .iter()
-            .filter(|g| g.folded_by_default() == self.items.folds.contains(g.id()))
-            .flat_map(|g| {
-                grouped_indices[*g as usize]
+            .filter(|b| b.folded_by_default() == self.items.folds.contains(b.id()))
+            .flat_map(|b| {
+                grouped_indices[*b as usize]
                     .iter()
                     .map(|&idx| self.items.items[idx].uid.clone())
             })
@@ -700,30 +852,34 @@ impl View {
         let seen = self.seen_mark(bot);
         let mut rows = Vec::new();
         let mut row_keys = Vec::new();
+        if self.items.header_meta.is_some() {
+            rows.push(HomeRow::Header);
+            row_keys.push(RowAnchor::Header);
+        }
         if filter_on {
             rows.push(HomeRow::FilterChip);
             row_keys.push(RowAnchor::FilterChip);
         }
-        // Orca `eefd93a3` / `#46740`: show the greyed bot avatar above folded groups when nothing
-        // needs attention, nothing is running, and the bot isn't paused.
+        // Orca `#47436`: plain left-aligned line above folded groups when nothing needs attention
+        // and nothing is running (no avatar).
         let all_clear = !self.items.items.is_empty()
             && !filter_on
             && !bot.paused
             && needs.is_empty()
-            && grouped_indices[Group::NeedsYou as usize].is_empty()
-            && grouped_indices[Group::Working as usize].is_empty();
+            && grouped_indices[HomeBucket::NeedsYou as usize].is_empty()
+            && grouped_indices[HomeBucket::Working as usize].is_empty();
         if all_clear {
             rows.push(HomeRow::AllClear);
             row_keys.push(RowAnchor::AllClear);
         }
         let mut first_group = true;
-        for group in Group::ALL {
-            let indices = &grouped_indices[group as usize];
-            if indices.is_empty() && (group != Group::NeedsYou || needs.is_empty()) {
+        for bucket in HomeBucket::ALL {
+            let indices = &grouped_indices[bucket as usize];
+            if indices.is_empty() && (bucket != HomeBucket::NeedsYou || needs.is_empty()) {
                 continue;
             }
-            let open = group.folded_by_default() == self.items.folds.contains(group.id());
-            let fresh = if !open && group == Group::Closed {
+            let open = bucket.folded_by_default() == self.items.folds.contains(bucket.id());
+            let fresh = if !open && bucket == HomeBucket::Closed {
                 indices
                     .iter()
                     .filter(|&&idx| others_last_event(&self.items.items[idx]) > seen)
@@ -732,21 +888,21 @@ impl View {
                 0
             };
             rows.push(HomeRow::GroupHeader {
-                group,
+                bucket,
                 first_group,
                 count: indices.len(),
                 fresh,
-                needs_count: if group == Group::NeedsYou {
+                needs_count: if bucket == HomeBucket::NeedsYou {
                     needs.len()
                 } else {
                     0
                 },
                 open,
             });
-            row_keys.push(RowAnchor::GroupHeader(group as u8));
+            row_keys.push(RowAnchor::GroupHeader(bucket as u8));
             first_group = false;
 
-            if group == Group::Stale && self.items.stale_confirm.is_some() {
+            if bucket == HomeBucket::Stale && self.items.stale_confirm.is_some() {
                 rows.push(HomeRow::StaleConfirm {
                     stale_days: stale_days.unwrap_or(5),
                     item_indices: indices.clone(),
@@ -756,7 +912,7 @@ impl View {
             if !open {
                 continue;
             }
-            if group == Group::NeedsYou {
+            if bucket == HomeBucket::NeedsYou {
                 for need in &needs {
                     row_keys.push(RowAnchor::Need(need.key.clone()));
                     rows.push(HomeRow::Need(need.clone()));
@@ -765,20 +921,24 @@ impl View {
             let shown = self
                 .items
                 .group_shown
-                .get(group.id())
+                .get(bucket.id())
                 .copied()
                 .unwrap_or(GROUP_ROWS);
             for &idx in indices.iter().take(shown) {
                 row_keys.push(RowAnchor::Item(self.items.items[idx].uid.clone()));
                 rows.push(HomeRow::Item {
-                    group,
+                    bucket,
                     item_index: idx,
                 });
             }
             let more = indices.len().saturating_sub(shown);
             if more > 0 {
-                rows.push(HomeRow::ShowMore { group, shown, more });
-                row_keys.push(RowAnchor::ShowMore(group as u8));
+                rows.push(HomeRow::ShowMore {
+                    bucket,
+                    shown,
+                    more,
+                });
+                row_keys.push(RowAnchor::ShowMore(bucket as u8));
             }
         }
         let note = if self.items.items.is_empty() && needs.is_empty() {
@@ -811,6 +971,280 @@ impl View {
         self.items.home_list.number_chars = number_column_chars(max_number);
     }
 
+    /// Orca's `BotPanelHeader` rendered inside Home's scroller (`BotActivityPanel.tsx` L188).
+    fn render_home_header(
+        &self,
+        bot: &BotConfig,
+        p: &ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let meta = self.items.header_meta.clone().unwrap_or_default();
+        let quiet_line = self.home_quiet_line();
+        let automation_running = quiet_line.as_ref().is_some_and(|q| q.2);
+        let quiet = !bot.paused && meta.needs_you_count == 0 && meta.working_count == 0;
+        let status = if let Some(limit) = meta
+            .usage_limit_note
+            .as_ref()
+            .filter(|_| !automation_running && quiet)
+        {
+            limit.clone()
+        } else if quiet || meta.activity.trim().is_empty() {
+            match quiet_line {
+                Some((_, Some(short), _)) if meta.narrow => short,
+                Some((line, ..)) => line,
+                None => text::BP_IDLE.get().to_owned(),
+            }
+        } else {
+            meta.activity.clone()
+        };
+        let state = if meta.needs_you_count > 0 {
+            krill_proto::control::AgentState::Waiting
+        } else if meta.working_count > 0 || (quiet && automation_running) {
+            krill_proto::control::AgentState::Working
+        } else {
+            krill_proto::control::AgentState::Exited
+        };
+        let upload = self.settings.avatar_cache.get(&bot.id).cloned();
+        let avatar_el = super::avatar::render(
+            &super::avatar::Avatar::of(bot),
+            upload,
+            &bot.name,
+            px(36.),
+            px(9.),
+            p,
+        );
+        let show_limit_mark =
+            meta.usage_limit_note.is_some() && quiet && !automation_running && !bot.paused;
+        let face = div()
+            .relative()
+            .flex_none()
+            .child(avatar_el)
+            .when(!bot.paused, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "bot-panel-header-state".into())
+                        .absolute()
+                        .bottom(px(-4.))
+                        .right(px(-4.))
+                        .size(px(14.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(p.sidebar)
+                        .child(if show_limit_mark {
+                            Icon::new(IconName::Gauge)
+                                .size(px(10.))
+                                .text_color(p.warning)
+                                .into_any_element()
+                        } else {
+                            ui::status::status_glyph(state, false, ui::status::Size::Sm, cx)
+                                .into_any_element()
+                        }),
+                )
+            });
+        let filter = self.home_filter().map(|f| {
+            let this = cx.weak_entity();
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    Button::new("bot-panel-filter")
+                        .debug_selector(|| "bot-panel-filter".into())
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::ListFilter))
+                        .tooltip(text::HM_FILTER_LABEL.get())
+                        .accessibility_label(text::HM_FILTER_LABEL.get())
+                        .dropdown_menu(move |menu, _, _| {
+                            let this = this.clone();
+                            let count = f.needs_you.to_string();
+                            menu.item(
+                                PopupMenuItem::element(move |_, cx| {
+                                    let p = ui::palette(cx);
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div().flex_1().child(text::HM_FILTER_NEEDS_YOU.get()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(ui::TEXT_XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(count.clone()),
+                                        )
+                                })
+                                .checked(f.needs_you_only)
+                                .on_click(move |_, _, cx| {
+                                    this.update(cx, |v, cx| {
+                                        v.set_needs_you_only(!f.needs_you_only, cx);
+                                    })
+                                    .ok();
+                                }),
+                            )
+                        }),
+                )
+                .when(f.needs_you_only, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .right(px(4.))
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(p.foreground),
+                    )
+                })
+        });
+        let paused = bot.paused;
+        let bot_id_pause = bot.id.clone();
+        let bot_id_share = bot.id.clone();
+        let folder = self.bot_home_folder(bot);
+        let this = cx.weak_entity();
+        div()
+            .id("bot-panel-header")
+            .debug_selector(|| "bot-panel-header".into())
+            .w_full()
+            .flex_none()
+            .px_2()
+            .pt_1()
+            .pb(px(14.))
+            .flex()
+            .items_center()
+            .gap(if meta.narrow { px(6.) } else { px(10.) })
+            .child(face)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(ui::TEXT_MD)
+                            .line_height(px(20.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.sidebar_foreground)
+                            .child(bot.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(if meta.attention {
+                                p.sidebar_foreground
+                            } else if show_limit_mark {
+                                p.warning
+                            } else {
+                                p.muted_foreground
+                            })
+                            .child(status),
+                    ),
+            )
+            .children(filter)
+            .child(
+                Button::new("bot-panel-settings")
+                    .debug_selector(|| "bot-panel-settings".into())
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Settings)
+                    .tooltip(text::SB_BOT_SETTINGS.get())
+                    .accessibility_label(text::SB_BOT_SETTINGS.get())
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(super::settings_root::OpenSettingsPage(
+                            super::DetailTab::Settings,
+                        ));
+                    })),
+            )
+            .child(
+                Button::new("bot-panel-more")
+                    .debug_selector(|| "bot-panel-more".into())
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Ellipsis)
+                    .tooltip(text::BP_MORE.get())
+                    .accessibility_label(text::BP_MORE.get())
+                    .dropdown_menu(move |menu, _, _| {
+                        let this_pause = this.clone();
+                        let id_pause = bot_id_pause.clone();
+                        let this_share = this.clone();
+                        let id_share = bot_id_share.clone();
+                        let menu = menu
+                            .item(
+                                PopupMenuItem::new(if paused {
+                                    text::SB_RESUME.get()
+                                } else {
+                                    text::SB_PAUSE.get()
+                                })
+                                .icon(if paused {
+                                    IconName::Play
+                                } else {
+                                    IconName::Pause
+                                })
+                                .on_click(move |_, _, cx| {
+                                    this_pause
+                                        .update(cx, |v, cx| {
+                                            v.toggle_bot_paused(id_pause.clone(), !paused, cx);
+                                        })
+                                        .ok();
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(text::BP_SHARE_BOT.get())
+                                    .icon(Icon::new(IconName::Share2))
+                                    .on_click(move |_, _, cx| {
+                                        this_share
+                                            .update(cx, |v, cx| {
+                                                v.export_bot_zip(id_share.clone(), cx);
+                                            })
+                                            .ok();
+                                    }),
+                            );
+                        match folder.clone() {
+                            Some(path) => menu.separator().item(
+                                PopupMenuItem::new(text::SB_COPY_PATH.get())
+                                    .icon(IconName::Copy)
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            path.to_string_lossy().into_owned(),
+                                        ));
+                                    }),
+                            ),
+                            None => menu,
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn toggle_bot_paused(&mut self, bot_id: BotId, paused: bool, cx: &mut Context<Self>) {
+        use krill_proto::bots::{BotRpcRequest, FieldPatch, UpdateBotParams};
+        let params = UpdateBotParams {
+            bot_id,
+            name: None,
+            description: None,
+            emoji: FieldPatch::Unchanged,
+            avatar: FieldPatch::Unchanged,
+            agent_id: None,
+            model: FieldPatch::Unchanged,
+            effort: FieldPatch::Unchanged,
+            permission_mode: None,
+            workspace: FieldPatch::Unchanged,
+            paused: Some(paused),
+            first_run_completed: None,
+            notifications: None,
+            schedules: None,
+            look_around: None,
+            memory_tidy: None,
+            mcp_tools: None,
+        };
+        self.home_rpc(BotRpcRequest::UpdateBot(Box::new(params)), None, cx);
+    }
+
     fn render_home_virtual_row(
         &mut self,
         bot: &BotConfig,
@@ -821,55 +1255,33 @@ impl View {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match row {
+            HomeRow::Header => self.render_home_header(bot, p, cx),
             HomeRow::FilterChip => div()
                 .pb(px(14.))
                 .child(Self::render_filter_chip(p, cx))
                 .into_any_element(),
-            HomeRow::AllClear => {
-                let dark = cx.theme().mode.is_dark();
-                let upload = self.settings.avatar_cache.get(&bot.id).cloned();
-                let face = super::avatar::render_grayscale(
-                    &super::avatar::Avatar::of(bot),
-                    upload,
-                    &bot.name,
-                    px(40.),
-                    px(9.),
-                    dark,
-                    p,
-                );
-                div()
-                    .id("bot-home-all-clear")
-                    .debug_selector(|| "bot-home-all-clear".into())
-                    .role(gpui::Role::Status)
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_3()
-                    .text_center()
-                    .child(
-                        div()
-                            .debug_selector(|| "bot-home-all-clear-avatar".into())
-                            .child(face),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_SM)
-                            .text_color(p.muted_foreground)
-                            .child(text::HM_ALL_CLEAR.get()),
-                    )
-                    .into_any_element()
-            }
+            // Orca `#47436`: left-aligned single plain line with no avatar.
+            HomeRow::AllClear => div()
+                .id("bot-home-all-clear")
+                .debug_selector(|| "bot-home-all-clear".into())
+                .role(gpui::Role::Status)
+                .px_2()
+                .py_1()
+                .mb(px(6.))
+                .text_size(ui::TEXT_MD)
+                .line_height(px(20.))
+                .text_color(p.muted_foreground)
+                .child(text::HM_ALL_CLEAR.get())
+                .into_any_element(),
             HomeRow::GroupHeader {
-                group,
+                bucket,
                 first_group,
                 count,
                 fresh,
                 needs_count,
                 open,
             } => {
-                let group = *group;
+                let bucket = *bucket;
                 let open = *open;
                 let summary = (!open).then(|| {
                     if *fresh > 0 {
@@ -878,22 +1290,22 @@ impl View {
                             count,
                             hm::NEW_COUNT.format(&[("n", &fresh.to_string())])
                         )
-                    } else if group == Group::NeedsYou {
+                    } else if bucket == HomeBucket::NeedsYou {
                         (count + needs_count).to_string()
                     } else {
                         count.to_string()
                     }
                 });
                 let header = section_header(
-                    &format!("bot-home-group-{}", group.id()),
-                    group.title(),
+                    &format!("bot-home-group-{}", bucket.id()),
+                    bucket.title(),
                     open,
                     summary,
                     p,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.items.folds.remove(group.id()) {
-                        this.items.folds.insert(group.id());
+                    if !this.items.folds.remove(bucket.id()) {
+                        this.items.folds.insert(bucket.id());
                     }
                     cx.notify();
                 }));
@@ -903,7 +1315,7 @@ impl View {
                     .flex()
                     .items_center()
                     .child(div().flex_1().min_w_0().child(header))
-                    .when(group == Group::Stale, |d| {
+                    .when(bucket == HomeBucket::Stale, |d| {
                         d.child(
                             ui::ghost("bot-home-stale-cancel", hm::CANCEL_ALL.get())
                                 .xsmall()
@@ -938,7 +1350,7 @@ impl View {
                 .pb_0p5()
                 .child(self.render_need_row(bot, need, p, cx))
                 .into_any_element(),
-            HomeRow::Item { group, item_index } => {
+            HomeRow::Item { bucket, item_index } => {
                 let Some(item) = self.items.items.get(*item_index) else {
                     return div().into_any_element();
                 };
@@ -949,12 +1361,24 @@ impl View {
                 }
                 div()
                     .pb_0p5()
-                    .child(self.render_home_row(bot, item, *group, number_chars, now, p, cx))
+                    .child(self.render_home_row(
+                        bot,
+                        item,
+                        bucket.as_group(),
+                        number_chars,
+                        now,
+                        p,
+                        cx,
+                    ))
                     .into_any_element()
             }
-            HomeRow::ShowMore { group, shown, more } => {
-                let (group, shown, more) = (*group, *shown, *more);
-                let sel = format!("bot-home-show-more-{}", group.id());
+            HomeRow::ShowMore {
+                bucket,
+                shown,
+                more,
+            } => {
+                let (bucket, shown, more) = (*bucket, *shown, *more);
+                let sel = format!("bot-home-show-more-{}", bucket.id());
                 let debug = sel.clone();
                 div()
                     .pb_0p5()
@@ -976,7 +1400,7 @@ impl View {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.items
                                     .group_shown
-                                    .insert(group.id(), shown + GROUP_ROWS.max(more));
+                                    .insert(bucket.id(), shown + GROUP_ROWS.max(more));
                                 cx.notify();
                             })),
                     )
@@ -1237,11 +1661,15 @@ impl View {
         let checkbox = selected || !self.items.selected.is_empty();
         let unseen = others_last_event(item) > self.seen_mark(bot);
         let check_group: SharedString = format!("bot-home-check-{uid}").into();
-        // Needs you's question shows in the row's hover card.
+        // Needs you's question or Waiting's note shows in the row's hover card.
         let question = (group == Group::NeedsYou)
             .then(|| super::home_item::waiting_question(item))
             .flatten()
             .cloned();
+        let wait_text = (question.is_none() && group != Group::Snoozed)
+            .then(|| waiting_note(item))
+            .flatten()
+            .map(str::to_owned);
         let open_uid = uid.clone();
         let hover_uid = uid.clone();
         let mut row = div()
@@ -1279,6 +1707,10 @@ impl View {
                 let title = item.title.clone();
                 d.tooltip(move |window, cx| question_card(&title, &q, window, cx))
             })
+            .when_some(wait_text, |d, note| {
+                let title = item.title.clone();
+                d.tooltip(move |window, cx| wait_hover_card(&title, &note, window, cx))
+            })
             .child(
                 div()
                     .group(check_group.clone())
@@ -1293,7 +1725,7 @@ impl View {
                         div()
                             .when(checkbox, gpui::Styled::invisible)
                             .group_hover(check_group.clone(), gpui::Styled::invisible)
-                            .child(status_icon(item.status, self.item_live(item), quiet, p, cx)),
+                            .child(item_status_icon(item, self.item_live(item), quiet, p, cx)),
                     )
                     .child(
                         div()
@@ -1388,53 +1820,93 @@ impl View {
         };
         let snoozed = is_snoozed(item, now);
         let title = item.title.clone();
+        let initial_wait_note = waiting_note(item).map(str::to_owned);
         let snooze_menu = {
             let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
             move |menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
                 Self::snooze_menu_for(menu, &this, &bot_id, std::slice::from_ref(&uid), snoozed)
             }
         };
-        let more_menu = move |menu: gpui_component::menu::PopupMenu,
-                              _: &mut Window,
-                              _: &mut Context<_>| {
-            let done = {
-                let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
-                PopupMenuItem::new(text::HM_DONE.get())
-                    .icon(IconName::CircleCheck)
+        let more_menu =
+            move |menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
+                let done = {
+                    let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
+                    PopupMenuItem::new(text::HM_DONE.get())
+                        .icon(IconName::CircleCheck)
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |v, cx| {
+                                v.update_item_status(
+                                    bot_id.clone(),
+                                    uid.clone(),
+                                    BotItemStatus::Done,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                        })
+                };
+                let waiting_item = {
+                    let (this, bot_id, uid, title, wait_note) = (
+                        this.clone(),
+                        bot_id.clone(),
+                        uid.clone(),
+                        title.clone(),
+                        initial_wait_note.clone(),
+                    );
+                    PopupMenuItem::element(move |_, cx| {
+                        let p = ui::palette(cx);
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(16.))
+                                    .flex()
+                                    .justify_center()
+                                    .child(waiting_icon(p)),
+                            )
+                            .child(hm::STATUS_WAITING.get())
+                    })
                     .on_click(move |_, _, cx| {
                         this.update(cx, |v, cx| {
-                            v.update_item_status(
+                            v.ask_waiting(
                                 bot_id.clone(),
-                                uid.clone(),
-                                BotItemStatus::Done,
+                                vec![(uid.clone(), title.clone())],
+                                wait_note.clone(),
                                 cx,
                             );
                         })
                         .ok();
                     })
-            };
-            let cancel = {
-                let (this, bot_id, uid, title) =
-                    (this.clone(), bot_id.clone(), uid.clone(), title.clone());
-                PopupMenuItem::new(text::HM_CANCEL_ITEM.get())
-                    .icon(IconName::CircleSlash)
-                    .on_click(move |_, _, cx| {
-                        this.update(cx, |v, cx| {
-                            v.ask_cancel(bot_id.clone(), vec![(uid.clone(), title.clone())], cx);
+                };
+                let cancel = {
+                    let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
+                    PopupMenuItem::new(text::HM_CANCEL_ITEM.get())
+                        .icon(IconName::CircleSlash)
+                        .on_click(move |_, _, cx| {
+                            // Orca #47934: Cancel from row menu takes effect immediately without dialog.
+                            this.update(cx, |v, cx| {
+                                v.update_item_status(
+                                    bot_id.clone(),
+                                    uid.clone(),
+                                    BotItemStatus::Canceled,
+                                    cx,
+                                );
+                            })
+                            .ok();
                         })
-                        .ok();
-                    })
+                };
+                Self::snooze_menu_for(
+                    menu.item(done).item(waiting_item).separator(),
+                    &this,
+                    &bot_id,
+                    std::slice::from_ref(&uid),
+                    snoozed,
+                )
+                .separator()
+                .item(cancel)
             };
-            Self::snooze_menu_for(
-                menu.item(done).separator(),
-                &this,
-                &bot_id,
-                std::slice::from_ref(&uid),
-                snoozed,
-            )
-            .separator()
-            .item(cancel)
-        };
         div()
             .absolute()
             .right(px(4.))
@@ -1475,6 +1947,38 @@ impl View {
                     .dropdown_menu(more_menu),
             )
     }
+}
+
+/// The row's hover card while Waiting: title and what it waits on (Orca `BotItemRow.tsx` L196).
+fn wait_hover_card(
+    title: &str,
+    note: &str,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> gpui::AnyView {
+    let (title, note) = (title.to_owned(), note.to_owned());
+    gpui_component::tooltip::Tooltip::element(move |_, cx| {
+        let p = ui::palette(cx);
+        div()
+            .debug_selector(|| "bot-home-wait-card".into())
+            .max_w(px(300.))
+            .flex()
+            .flex_col()
+            .text_size(ui::TEXT_XS)
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.popover_foreground)
+                    .child(title.clone()),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_color(p.muted_foreground)
+                    .child(note.clone()),
+            )
+    })
+    .build(window, cx)
 }
 
 /// The row's hover card while it needs you: the title, then each question line with its quick
