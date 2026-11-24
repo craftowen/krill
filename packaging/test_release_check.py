@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -86,6 +87,22 @@ class ProofTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "redirect"):
                 rc.target_directory(volume=self.root)
 
+    def test_fingerprint_ignores_cargo_target_dir_but_tracks_compiler_target_flags(self):
+        with patch.object(rc.subprocess, "check_output", return_value="rustc 1.98.1\n"):
+            with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/Volumes/krill-build/targets/a"}, clear=False):
+                fp_a = rc.fingerprint()
+            with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/Volumes/krill-build/targets/b"}, clear=False):
+                fp_b = rc.fingerprint()
+            env_without = dict(os.environ)
+            env_without.pop("CARGO_TARGET_DIR", None)
+            with patch.dict(os.environ, env_without, clear=True):
+                fp_none = rc.fingerprint()
+            with patch.dict(os.environ, {"CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS": "-C target-cpu=native"}, clear=False):
+                fp_flag = rc.fingerprint()
+        self.assertEqual(fp_a, fp_b)
+        self.assertEqual(fp_a, fp_none)
+        self.assertNotEqual(fp_a, fp_flag)
+
 
 class ValidationTests(unittest.TestCase):
     def test_canonical_build_is_tested_without_cargo_rebuilding_it_and_full_gate_resumes(self):
@@ -98,17 +115,29 @@ class ValidationTests(unittest.TestCase):
             calls = []
             state = {"fail_gate": True, "missing": False, "mutate": False}
 
+            seen_envs = []
+
             def run(args, **kwargs):
                 args = list(map(str, args))
                 calls.append(args)
+                seen_envs.append((args, kwargs.get("env")))
                 if args[:3] == ["git", "rev-parse", "HEAD"]:
                     return HEAD
                 if args[:2] == ["cargo", "test"]:
+                    self.assertIn("--target-dir", args)
+                    self.assertEqual(args[args.index("--target-dir") + 1], str(target))
+                    self.assertNotIn("CARGO_TARGET_DIR", kwargs.get("env") or {})
                     name = args[args.index("--test") + 1]
                     return json.dumps({"reason": "compiler-artifact", "target": {"name": name}, "executable": str(target / name)})
                 if args[:2] == ["cargo", "build"]:
+                    self.assertIn("--target-dir", args)
+                    self.assertEqual(args[args.index("--target-dir") + 1], str(target))
+                    self.assertNotIn("CARGO_TARGET_DIR", kwargs.get("env") or {})
                     for name in rc.BINARIES:
                         (target / "release" / name).write_bytes(b"canonical-" + name.encode())
+                if args[:2] == ["/bin/zsh", "scripts/check.sh"]:
+                    self.assertEqual(args[2:], ["--target-dir", str(target)])
+                    self.assertNotIn("CARGO_TARGET_DIR", kwargs.get("env") or {})
                 if args[-1] == "--list":
                     if args[0].endswith("pane_e2e"):
                         return "release_survival::release_app_kill9_survives_and_replays_hash_three_times: test\n"
@@ -132,6 +161,10 @@ class ValidationTests(unittest.TestCase):
                 state["fail_gate"] = False
                 receipt = rc.validate(HEAD, root / "stage2", key)
                 self.assertEqual(sum("scripts/check.sh" in call for call in calls), 1)
+                # Explicit --target-dir works even when CARGO_TARGET_DIR is absent from the environment.
+                with patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}, clear=True):
+                    receipt_explicit = rc.validate(HEAD, root / "stage2b", key, target_dir=target)
+                self.assertEqual(rc.verify(receipt_explicit, HEAD, key, allowed_root=root), root / "stage2b/bin")
                 # B-08: GUI update (vN->vN+1) and krilld kill -9 survival run on the release binaries.
                 self.assertTrue(any(call[0].endswith("fault_ci") and "release_gui_survival_e2e_2_and_3_three_rounds" in call
                                     and "--ignored" in call for call in calls))
@@ -151,13 +184,48 @@ class MobileBrowserGateTests(unittest.TestCase):
     def test_gate_runs_every_real_browser_suite_against_release_binaries_and_restores_env(self):
         release = Path("/tmp/release-bin")
         seen = []
-        with patch.object(rc, "run", lambda args, **kwargs: seen.append((list(args), os.environ["KRILLD_BIN"]))):
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        barrier = threading.Barrier(min(2, rc.MOBILE_BROWSER_JOBS))
+
+        def fake_run(args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                seen.append((list(args), os.environ["KRILLD_BIN"]))
+            try:
+                barrier.wait(timeout=2)
+            except threading.BrokenBarrierError:
+                pass
+            finally:
+                with lock:
+                    active -= 1
+
+        with patch.object(rc, "run", side_effect=fake_run):
             os.environ.pop("KRILLD_BIN", None)
             rc.mobile_browser_gate(release)
-        self.assertEqual([Path(args[1]).name for args, _ in seen], [script for script, *_ in rc.MOBILE_BROWSER_TESTS])
+        self.assertEqual(sorted(Path(args[1]).name for args, _ in seen),
+                         sorted(script for script, *_ in rc.MOBILE_BROWSER_TESTS))
+        self.assertGreaterEqual(peak, 2)
+        self.assertLessEqual(peak, rc.MOBILE_BROWSER_JOBS)
         self.assertTrue(all(binary == str(release / "krilld") for _, binary in seen))
         self.assertNotIn("KRILLD_BIN", os.environ)
         self.assertIn("mobile-real-browser", rc.SCOPE)
+
+    def test_gate_propagates_failure_and_restores_env(self):
+        release = Path("/tmp/release-bin")
+
+        def fail_one(args, **kwargs):
+            if Path(args[1]).name == "mobile_browser.py":
+                raise subprocess.CalledProcessError(1, args)
+
+        os.environ.pop("KRILLD_BIN", None)
+        with patch.object(rc, "run", side_effect=fail_one):
+            with self.assertRaises(subprocess.CalledProcessError):
+                rc.mobile_browser_gate(release)
+        self.assertNotIn("KRILLD_BIN", os.environ)
 
 
 if __name__ == "__main__":

@@ -34,14 +34,18 @@ impl Shell {
     fn bots_all_folded(&self) -> bool {
         self.sidebar_bots
             .iter()
-            .all(|b| self.bot_ui.folded.contains(&b.id))
+            .all(|b| self.bot_ui.folded.contains(&(b.host.clone(), b.id.clone())))
     }
 
     pub(super) fn toggle_fold_all_bots(&mut self, cx: &mut Context<Self>) {
         if self.bots_all_folded() {
             self.bot_ui.folded.clear();
         } else {
-            self.bot_ui.folded = self.sidebar_bots.iter().map(|b| b.id.clone()).collect();
+            self.bot_ui.folded = self
+                .sidebar_bots
+                .iter()
+                .map(|b| (b.host.clone(), b.id.clone()))
+                .collect();
         }
         cx.notify();
     }
@@ -180,7 +184,7 @@ impl Shell {
     }
 
     fn render_bots_new_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let groups_ok = self.sidebar_bots.len() >= 2;
+        let groups_ok = self.default_group_host().is_some();
         let this = cx.weak_entity();
         Button::new("bots-section-new")
             .ghost()
@@ -289,13 +293,16 @@ impl Shell {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let focused = self
-            .focused_session()
-            .and_then(|(h, id)| (h == self.launch_host).then_some(id));
+        let focused = self.focused_session();
         let mut bots: Vec<(&SidebarBot, super::rows::BotFacts)> = self
             .sidebar_bots
             .iter()
-            .map(|b| (b, self.bot_facts(b, focused, cx)))
+            .map(|b| {
+                let bot_focused = focused
+                    .as_ref()
+                    .and_then(|(h, id)| (*h == b.host).then_some(*id));
+                (b, self.bot_facts(b, bot_focused, cx))
+            })
             .collect();
         bots.sort_by_key(|(b, f)| {
             let needs_you = f.needs_you || b.attention > 0;
@@ -306,8 +313,14 @@ impl Shell {
         let shown = bots.len().min(5);
         let mut inner = div().flex().items_center();
         for (i, (bot, facts)) in bots.iter().take(shown).enumerate() {
+            let host = bot.host.clone();
             let id = bot.id.clone();
             let sel = format!("bots-collapsed-{}", bot.id.as_str());
+            let elem_id = if bot.host.is_local() {
+                sel.clone()
+            } else {
+                format!("bots-collapsed-{}-{}", bot.host.as_key(), bot.id.as_str())
+            };
             let needs_you = facts.needs_you || bot.attention > 0;
             let working = !bot.paused
                 && (facts.status == super::rows::RowStatus::Working || bot.working() > 0);
@@ -371,7 +384,7 @@ impl Shell {
             };
             inner = inner.child(
                 div()
-                    .id(SharedString::from(sel.clone()))
+                    .id(SharedString::from(elem_id))
                     .debug_selector(move || sel.clone())
                     .relative()
                     .when(i > 0, |d| d.ml(px(-4.)))
@@ -381,7 +394,7 @@ impl Shell {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.bot_ui.collapsed = false;
-                        this.open_bot_home(id.clone(), None, cx);
+                        this.open_bot_home_on(&host, id.clone(), None, cx);
                     }))
                     .child(self.bot_avatar(bot, 20., px(10.), p))
                     .children(pip),
@@ -435,7 +448,7 @@ impl Shell {
         let hidden: Vec<&str> = self
             .sidebar_bots
             .iter()
-            .filter(|b| b.paused && !shown.iter().any(|s| s.id == b.id))
+            .filter(|b| b.paused && !shown.iter().any(|s| s.host == b.host && s.id == b.id))
             .map(|b| b.name.as_str())
             .collect();
         let (matches, hidden_paused) = view::search(&pairs, &hidden, query);
@@ -455,11 +468,18 @@ impl Shell {
         }
         let mut group_matches = 0usize;
         for summary in &self.sidebar_groups {
+            let group_host = summary.host.clone();
             let group = &summary.group;
+            let host_bots: Vec<SidebarBot> = self
+                .sidebar_bots
+                .iter()
+                .filter(|b| b.host == group_host)
+                .cloned()
+                .collect();
             let name_ranges = view::match_text(&group.name, query);
             let member_match = name_ranges.is_none()
                 && group.bot_ids.iter().any(|bid| {
-                    self.sidebar_bots
+                    host_bots
                         .iter()
                         .find(|b| &b.id == bid)
                         .is_some_and(|b| view::match_text(&b.name, query).is_some())
@@ -470,8 +490,13 @@ impl Shell {
                 let gid = group.id.clone();
                 let face_members = krill_app::bots::group_faces::resolve_members(
                     &group.bot_ids,
-                    &self.sidebar_bots,
-                    &|id| self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone()),
+                    &host_bots,
+                    &|id| {
+                        self.bot_ui
+                            .avatars
+                            .get(&(group_host.clone(), id.clone()))
+                            .and_then(|(_, img)| img.clone())
+                    },
                 );
                 let faces = krill_app::bots::group_faces::render_group_faces(
                     &face_members,
@@ -480,12 +505,17 @@ impl Shell {
                     p,
                 );
                 let sel = format!("bot-group-search-result-{gid}");
+                let elem_id = if group_host.is_local() {
+                    sel.clone()
+                } else {
+                    format!("bot-group-search-result-{}-{gid}", group_host.as_key())
+                };
                 let sel_dbg = sel.clone();
                 let member_names: Vec<&str> =
                     face_members.iter().map(|m| m.bot.name.as_str()).collect();
                 list = list.child(
                     div()
-                        .id(SharedString::from(sel))
+                        .id(SharedString::from(elem_id))
                         .debug_selector(move || sel_dbg.clone())
                         .role(gpui::Role::Button)
                         .tab_index(0)
@@ -505,7 +535,7 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.toggle_bot_search(window, cx);
                             this.bot_ui.collapsed = false;
-                            this.open_bot_group(&gid, None, Some(window), cx);
+                            this.open_bot_group_on(&group_host, &gid, None, Some(window), cx);
                         }))
                         .child(div().mr_2().child(faces))
                         .child(
@@ -622,10 +652,20 @@ impl Shell {
             Some((snippet, ranges)) => Some(marked(snippet, ranges, p)),
             None => (!bot.description.is_empty()).then(|| marked(&bot.description, &[], p)),
         };
+        let host = bot.host.clone();
         let id = bot.id.clone();
         let sel = format!("bot-search-result-{}", bot.id.as_str());
+        let elem_id = if bot.host.is_local() {
+            sel.clone()
+        } else {
+            format!(
+                "bot-search-result-{}-{}",
+                bot.host.as_key(),
+                bot.id.as_str()
+            )
+        };
         div()
-            .id(SharedString::from(sel.clone()))
+            .id(SharedString::from(elem_id))
             .debug_selector(move || sel.clone())
             .role(gpui::Role::Button)
             .tab_index(0)
@@ -646,7 +686,7 @@ impl Shell {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_bot_search(window, cx);
                 this.bot_ui.collapsed = false;
-                this.open_bot_home(id.clone(), None, cx);
+                this.open_bot_home_on(&host, id.clone(), None, cx);
             }))
             .child(
                 div()

@@ -25,16 +25,42 @@ class WorkflowTests(unittest.TestCase):
 
     def test_local_ci_and_nightly_build_tests_with_the_same_profile(self):
         # Test profile optimization is defined centrally in root Cargo.toml ([profile.test] and
-        # [profile.test.package."*"]) so local check.sh and nightly do not override it with env vars.
+        # [profile.test.package."*"]) so local check.sh, CI, and nightly do not override it with env vars.
         cargo = (ROOT / "Cargo.toml").read_text()
+        ci = (ROOT / ".github/workflows/ci-macos.yml").read_text()
         check = (ROOT / "scripts/check.sh").read_text()
         nightly = (ROOT / "packaging/nightly.py").read_text()
         self.assertRegex(cargo, r'(?ms)^\[profile\.test\]\n(?:[^\[]*\n)*?debug\s*=\s*"line-tables-only"')
         self.assertRegex(cargo, r'(?ms)^\[profile\.test\.package\."\*"]\n(?:[^\[]*\n)*?opt-level\s*=\s*2\b')
         for key in ("CARGO_PROFILE_TEST_OPT_LEVEL", "CARGO_PROFILE_TEST_DEBUG"):
             with self.subTest(key=key):
+                self.assertNotRegex(ci, r"\b" + key + r":")
                 self.assertNotRegex(check, r"(?m)^export .*\b" + key + r"=")
                 self.assertNotIn(key + "=", nightly)
+
+    def test_ci_cache_scope_reuse_and_release_audit_contracts(self):
+        macos = (ROOT / ".github/workflows/ci-macos.yml").read_text()
+        windows = (ROOT / ".github/workflows/ci-windows.yml").read_text()
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("branches: [dev, main, 'release/**']", macos)
+        self.assertIn("smoke & cache warm (macos-15)", macos)
+        self.assertIn("python3 packaging/ci_cache_prune.py", macos)
+
+        self.assertIn("branches: [dev, main, 'release/**']", windows)
+        self.assertIn("name: reuse-windows-ci", windows)
+        self.assertIn("ci_evidence.py reuse --workflow ci-windows.yml", windows)
+        self.assertEqual(len(re.findall(r"uses:\s*Swatinem/rust-cache@[0-9a-f]{40}", windows)), 3)
+        self.assertIn("CARGO_PROFILE_RELEASE_LTO=off", windows)
+        self.assertIn("CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16", windows)
+        self.assertIn("python3 packaging/ci_cache_prune.py", windows)
+
+        build_step = release.split("- name: Build release binaries", 1)[1].split("- name: Verify Windows PE", 1)[0]
+        self.assertNotIn("CARGO_PROFILE_RELEASE_LTO", build_step)
+        self.assertNotIn("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", build_step)
+        audit_step = release.split("- name: Verify native Windows audit regressions", 1)[1].split("- name: Fetch pinned ConPTY", 1)[0]
+        self.assertIn("CARGO_PROFILE_RELEASE_LTO: 'off'", audit_step)
+        self.assertIn("CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'", audit_step)
+        self.assertIn("'--target-dir', $auditTarget", audit_step)
 
 
 if __name__ == "__main__":
