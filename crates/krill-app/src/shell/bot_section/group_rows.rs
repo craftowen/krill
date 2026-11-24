@@ -15,6 +15,7 @@ use gpui_component::{IconName, Sizable as _};
 use krill_app::bots::{
     BotGroupMembersDialog, SidebarBot, group_dialog, group_faces, rpc::call_checked,
 };
+use krill_app::hosts::HostId;
 use krill_app::i18n::catalog::bots as text;
 use krill_app::ui;
 use krill_proto::bots::{
@@ -23,7 +24,7 @@ use krill_proto::bots::{
 use krill_proto::control::AgentState;
 
 use super::rows::{AVATAR, RowStatus, avatar_badge};
-use super::{Shell, now_secs};
+use super::{Shell, SidebarGroup, now_secs};
 
 /// Derived sidebar row facts for one group.
 pub(super) struct GroupFacts {
@@ -35,18 +36,44 @@ pub(super) struct GroupFacts {
 }
 
 impl Shell {
-    pub(super) fn bot_group_facts(&self, summary: &BotGroupSummary, cx: &gpui::App) -> GroupFacts {
+    /// Picks a host that has at least 2 bots (preferring `launch_host`), for creating a new group.
+    pub(super) fn default_group_host(&self) -> Option<HostId> {
+        let count_on = |host: &HostId| self.sidebar_bots.iter().filter(|b| &b.host == host).count();
+        if count_on(&self.launch_host) >= 2 {
+            return Some(self.launch_host.clone());
+        }
+        let mut seen = Vec::new();
+        for b in &self.sidebar_bots {
+            if !seen.contains(&b.host) {
+                if count_on(&b.host) >= 2 {
+                    return Some(b.host.clone());
+                }
+                seen.push(b.host.clone());
+            }
+        }
+        None
+    }
+
+    pub(super) fn bot_group_facts(&self, summary: &SidebarGroup, cx: &gpui::App) -> GroupFacts {
         let group = &summary.group;
-        let host = &self.launch_host;
+        let host = &summary.host;
         let sidebar = self.sidebar.read(cx);
         let focused_pane = self.layout.focused();
-        let active = focused_pane
-            .and_then(|p| self.layout.group_pane(p))
-            .is_some_and(|t| t.group_id == group.id);
+        let active = focused_pane.is_some_and(|p| {
+            self.layout.host(p) == host
+                && self
+                    .layout
+                    .group_pane(p)
+                    .is_some_and(|t| t.group_id == group.id)
+        });
 
         let mut member_bots: Vec<&SidebarBot> = Vec::new();
         for bid in &group.bot_ids {
-            if let Some(b) = self.sidebar_bots.iter().find(|b| &b.id == bid) {
+            if let Some(b) = self
+                .sidebar_bots
+                .iter()
+                .find(|b| &b.host == host && &b.id == bid)
+            {
                 member_bots.push(b);
             }
         }
@@ -120,30 +147,44 @@ impl Shell {
 
     pub(super) fn render_group_row(
         &self,
-        summary: &BotGroupSummary,
+        summary: &SidebarGroup,
         facts: &GroupFacts,
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let host = summary.host.clone();
         let group = &summary.group;
         let gid = group.id.clone();
         let gid_click = gid.clone();
-        let row_id = format!("bot-group-row-{gid}");
-        let row_sel = row_id.clone();
+        let click_host = host.clone();
+        let row_sel = format!("bot-group-row-{gid}");
+        let row_id = if host.is_local() {
+            row_sel.clone()
+        } else {
+            format!("bot-group-row-{}-{gid}", host.as_key())
+        };
         let renaming = self
             .bot_ui
             .renaming_group
             .as_ref()
-            .filter(|(id, _, _)| id == &gid)
-            .map(|(_, input, _)| input.clone());
+            .filter(|(h, id, _, _)| *h == host && id == &gid)
+            .map(|(_, _, input, _)| input.clone());
         let now = now_secs();
         let age = (facts.activity_ms > 0)
             .then(|| krill_app::jump::format_age_secs(facts.activity_ms / 1000, now));
 
-        let face_members =
-            group_faces::resolve_members(&group.bot_ids, &self.sidebar_bots, &|id| {
-                self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone())
-            });
+        let host_bots: Vec<SidebarBot> = self
+            .sidebar_bots
+            .iter()
+            .filter(|b| b.host == host)
+            .cloned()
+            .collect();
+        let face_members = group_faces::resolve_members(&group.bot_ids, &host_bots, &|id| {
+            self.bot_ui
+                .avatars
+                .get(&(host.clone(), id.clone()))
+                .and_then(|(_, img)| img.clone())
+        });
         let faces = group_faces::render_group_faces(&face_members, AVATAR, p.sidebar, p);
         let badge = (facts.status == RowStatus::Permission)
             .then(|| avatar_badge(facts.status, false, p, cx))
@@ -174,6 +215,7 @@ impl Shell {
                 .into_any_element(),
         };
 
+        let remote_label = (!host.is_local()).then(|| self.host_display_label(&host, cx));
         let second_line = if let Some(ref line) = facts.preview {
             Some(line.clone())
         } else if !group.description.trim().is_empty() {
@@ -182,21 +224,39 @@ impl Shell {
             let names: Vec<&str> = face_members.iter().map(|m| m.bot.name.as_str()).collect();
             (!names.is_empty()).then(|| names.join(", "))
         };
-        let line_el = second_line.map(|text| {
-            div()
-                .flex()
-                .min_w_0()
-                .items_center()
-                .gap_1p5()
-                .text_size(ui::TEXT_SM)
-                .line_height(px(16.))
-                .text_color(if facts.status == RowStatus::Permission {
-                    p.foreground
-                } else {
-                    p.muted_foreground
-                })
-                .child(div().flex_1().min_w_0().truncate().child(text))
-        });
+        let line_el = match (remote_label.as_ref(), second_line) {
+            (None, None) => None,
+            (remote, line) => {
+                let text = match (remote, line) {
+                    (Some(h), Some(l)) => format!("{h} · {l}"),
+                    (Some(h), None) => h.to_string(),
+                    (None, Some(l)) => l,
+                    (None, None) => String::new(),
+                };
+                Some(
+                    div()
+                        .flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_1p5()
+                        .text_size(ui::TEXT_SM)
+                        .line_height(px(16.))
+                        .text_color(if facts.status == RowStatus::Permission {
+                            p.foreground
+                        } else {
+                            p.muted_foreground
+                        })
+                        .when(remote.is_some(), |d| {
+                            d.child(ui::icons::svg_box(
+                                ui::icons::SERVER_SVG,
+                                ui::ICON_XS,
+                                p.muted_foreground,
+                            ))
+                        })
+                        .child(div().flex_1().min_w_0().truncate().child(text)),
+                )
+            }
+        };
 
         let hover = self.group_hover_card(summary, facts, cx);
 
@@ -228,9 +288,9 @@ impl Shell {
             })
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                 if e.click_count() > 1 {
-                    this.start_group_rename(&gid_click, window, cx);
+                    this.start_group_rename_on(&click_host, &gid_click, window, cx);
                 } else {
-                    this.open_bot_group(&gid_click, None, Some(window), cx);
+                    this.open_bot_group_on(&click_host, &gid_click, None, Some(window), cx);
                 }
             }))
             .child(
@@ -243,7 +303,11 @@ impl Shell {
             )
             .child(
                 div()
-                    .id(SharedString::from(format!("bot-group-row-body-{gid}")))
+                    .id(SharedString::from(if host.is_local() {
+                        format!("bot-group-row-body-{gid}")
+                    } else {
+                        format!("bot-group-row-body-{}-{gid}", host.as_key())
+                    }))
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -288,10 +352,11 @@ impl Shell {
 
     fn group_hover_card(
         &self,
-        summary: &BotGroupSummary,
+        summary: &SidebarGroup,
         facts: &GroupFacts,
         _cx: &gpui::App,
     ) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + Clone + 'static {
+        let host = &summary.host;
         let group = summary.group.clone();
         let preview = facts.preview.clone();
         let age = (facts.activity_ms > 0)
@@ -299,7 +364,12 @@ impl Shell {
         let members: Vec<SidebarBot> = group
             .bot_ids
             .iter()
-            .filter_map(|id| self.sidebar_bots.iter().find(|b| &b.id == id).cloned())
+            .filter_map(|id| {
+                self.sidebar_bots
+                    .iter()
+                    .find(|b| &b.host == host && &b.id == id)
+                    .cloned()
+            })
             .collect();
         let avatars: std::collections::HashMap<BotId, Option<std::sync::Arc<gpui::Image>>> =
             members
@@ -307,7 +377,10 @@ impl Shell {
                 .map(|m| {
                     (
                         m.id.clone(),
-                        self.bot_ui.avatars.get(&m.id).and_then(|(_, i)| i.clone()),
+                        self.bot_ui
+                            .avatars
+                            .get(&(host.clone(), m.id.clone()))
+                            .and_then(|(_, i)| i.clone()),
                     )
                 })
                 .collect();
@@ -403,7 +476,7 @@ impl Shell {
     }
 
     fn group_row_menu(
-        summary: &BotGroupSummary,
+        summary: &SidebarGroup,
         this: gpui::WeakEntity<Self>,
     ) -> impl Fn(
         gpui_component::menu::PopupMenu,
@@ -411,6 +484,7 @@ impl Shell {
         &mut Context<gpui_component::menu::PopupMenu>,
     ) -> gpui_component::menu::PopupMenu
     + 'static {
+        let host = summary.host.clone();
         let group = summary.group.clone();
         let audience = summary.reply_audience.clone();
         move |menu, _, _| {
@@ -418,6 +492,10 @@ impl Shell {
             let t2 = this.clone();
             let t3 = this.clone();
             let t4 = this.clone();
+            let h1 = host.clone();
+            let h2 = host.clone();
+            let h3 = host.clone();
+            let h4 = host.clone();
             let g1 = group.clone();
             let g2 = group.clone();
             let g3 = group.clone();
@@ -429,7 +507,7 @@ impl Shell {
                     .icon(gpui_component::Icon::default().data(ui::icons::USERS_SVG))
                     .on_click(move |_, window, cx| {
                         t1.update(cx, |s, cx| {
-                            s.open_manage_group_dialog(g1.clone(), aud.clone(), window, cx);
+                            s.open_manage_group_dialog_on(&h1, g1.clone(), aud.clone(), window, cx);
                         })
                         .ok();
                     }),
@@ -439,7 +517,7 @@ impl Shell {
                     .icon(IconName::Plus)
                     .on_click(move |_, window, cx| {
                         t2.update(cx, |s, cx| {
-                            s.create_and_open_group_thread(g2.id.clone(), window, cx);
+                            s.create_and_open_group_thread_on(&h2, g2.id.clone(), window, cx);
                         })
                         .ok();
                     }),
@@ -448,7 +526,7 @@ impl Shell {
                 PopupMenuItem::new(text::SB_RENAME.get())
                     .icon(gpui_component::Icon::default().data(ui::icons::PENCIL_SVG))
                     .on_click(move |_, window, cx| {
-                        t4.update(cx, |s, cx| s.start_group_rename(&g4.id, window, cx))
+                        t4.update(cx, |s, cx| s.start_group_rename_on(&h4, &g4.id, window, cx))
                             .ok();
                     }),
             )
@@ -458,7 +536,7 @@ impl Shell {
                     .icon(IconName::Delete)
                     .on_click(move |_, _, cx| {
                         t3.update(cx, |s, cx| {
-                            s.bot_ui.delete_group = Some(g3.clone());
+                            s.bot_ui.delete_group = Some((h3.clone(), g3.clone()));
                             cx.notify();
                         })
                         .ok();
@@ -472,13 +550,23 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(host) = self.default_group_host() else {
+            return;
+        };
         self.bot_ui.group_dialog = None;
-        let bots = self.sidebar_bots.clone();
+        self.bot_ui.group_dialog_host = Some(host.clone());
+        let bots: Vec<SidebarBot> = self
+            .sidebar_bots
+            .iter()
+            .filter(|b| b.host == host)
+            .cloned()
+            .collect();
         let avatars: std::collections::HashMap<_, _> = self
             .bot_ui
             .avatars
             .iter()
-            .map(|(k, (_, img))| (k.clone(), img.clone()))
+            .filter(|((h, _), _)| h == &host)
+            .map(|((_, k), (_, img))| (k.clone(), img.clone()))
             .collect();
         let dialog = cx.new(|cx| BotGroupMembersDialog::new_group(bots, avatars, window, cx));
         let sub = cx.subscribe(&dialog, Self::on_group_dialog_event);
@@ -486,20 +574,28 @@ impl Shell {
         cx.notify();
     }
 
-    pub(in crate::shell) fn open_manage_group_dialog(
+    pub(in crate::shell) fn open_manage_group_dialog_on(
         &mut self,
+        host: &HostId,
         group: BotGroupChat,
         reply_audience: BotGroupReplyAudience,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.bot_ui.group_dialog = None;
-        let bots = self.sidebar_bots.clone();
+        self.bot_ui.group_dialog_host = Some(host.clone());
+        let bots: Vec<SidebarBot> = self
+            .sidebar_bots
+            .iter()
+            .filter(|b| &b.host == host)
+            .cloned()
+            .collect();
         let avatars: std::collections::HashMap<_, _> = self
             .bot_ui
             .avatars
             .iter()
-            .map(|(k, (_, img))| (k.clone(), img.clone()))
+            .filter(|((h, _), _)| h == host)
+            .map(|((_, k), (_, img))| (k.clone(), img.clone()))
             .collect();
         let dialog = cx.new(|cx| {
             BotGroupMembersDialog::manage_members(group, reply_audience, bots, avatars, window, cx)
@@ -515,19 +611,27 @@ impl Shell {
         ev: &group_dialog::Event,
         cx: &mut Context<Self>,
     ) {
+        let dialog_host = self
+            .bot_ui
+            .group_dialog_host
+            .clone()
+            .unwrap_or_else(|| self.launch_host.clone());
         match ev {
             group_dialog::Event::Close => {
                 self.bot_ui.group_dialog = None;
+                self.bot_ui.group_dialog_host = None;
                 cx.notify();
             }
             group_dialog::Event::RequestDelete(group) => {
                 self.bot_ui.group_dialog = None;
-                self.bot_ui.delete_group = Some(group.clone());
+                self.bot_ui.group_dialog_host = None;
+                self.bot_ui.delete_group = Some((dialog_host, group.clone()));
                 cx.notify();
             }
             group_dialog::Event::Create { name, bot_ids } => {
                 self.bot_ui.group_dialog = None;
-                let Some(rpc) = self.bot_rpc() else {
+                self.bot_ui.group_dialog_host = None;
+                let Some(rpc) = self.bot_rpc_on(&dialog_host) else {
                     return;
                 };
                 let name = name.clone();
@@ -550,15 +654,22 @@ impl Shell {
                         match res {
                             Ok(BotRpcResponse::Group(group)) => {
                                 let gid = group.id.clone();
-                                this.sidebar_groups.push(BotGroupSummary {
+                                let summary = BotGroupSummary {
                                     group,
                                     reply_audience: BotGroupReplyAudience::default(),
                                     threads: Vec::new(),
                                     latest_message: None,
                                     active_turns: Vec::new(),
+                                };
+                                this.sidebar_groups.push(SidebarGroup {
+                                    host: dialog_host.clone(),
+                                    summary: summary.clone(),
                                 });
-                                this.open_bot_group(&gid, None, None, cx);
-                                this.refresh_bots_badge(cx);
+                                if let Some(entry) = this.bot_ui.hosts.get_mut(&dialog_host) {
+                                    entry.groups.push(summary);
+                                }
+                                this.open_bot_group_on(&dialog_host, &gid, None, None, cx);
+                                this.refresh_bots_for_host(&dialog_host, true, cx);
                             }
                             Ok(_) => {}
                             Err(err) => this.notice = Some(err),
@@ -576,7 +687,8 @@ impl Shell {
                 reset_reply_audience,
             } => {
                 self.bot_ui.group_dialog = None;
-                let Some(rpc) = self.bot_rpc() else {
+                self.bot_ui.group_dialog_host = None;
+                let Some(rpc) = self.bot_rpc_on(&dialog_host) else {
                     return;
                 };
                 let group_id = group_id.clone();
@@ -616,15 +728,24 @@ impl Shell {
                                 if let Some(s) = this
                                     .sidebar_groups
                                     .iter_mut()
-                                    .find(|s| s.group.id == updated.id)
+                                    .find(|s| s.host == dialog_host && s.group.id == updated.id)
                                 {
                                     s.group = updated.clone();
                                     if reset_aud {
                                         s.reply_audience = BotGroupReplyAudience::Mentions;
                                     }
                                 }
-                                this.invalidate_group_room(&group_id);
-                                this.refresh_bots_badge(cx);
+                                if let Some(entry) = this.bot_ui.hosts.get_mut(&dialog_host)
+                                    && let Some(s) =
+                                        entry.groups.iter_mut().find(|s| s.group.id == updated.id)
+                                {
+                                    s.group = updated;
+                                    if reset_aud {
+                                        s.reply_audience = BotGroupReplyAudience::Mentions;
+                                    }
+                                }
+                                this.invalidate_group_room(&dialog_host, &group_id);
+                                this.refresh_bots_for_host(&dialog_host, true, cx);
                             }
                             Ok(_) => {}
                             Err(err) => this.notice = Some(err),
@@ -638,8 +759,9 @@ impl Shell {
         }
     }
 
-    pub(in crate::shell) fn start_group_rename(
+    pub(in crate::shell) fn start_group_rename_on(
         &mut self,
+        host: &HostId,
         group_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -647,7 +769,7 @@ impl Shell {
         let Some(group) = self
             .sidebar_groups
             .iter()
-            .find(|s| s.group.id == group_id)
+            .find(|s| &s.host == host && s.group.id == group_id)
             .map(|s| s.group.clone())
         else {
             return;
@@ -659,6 +781,7 @@ impl Shell {
             s.set_value(initial, window, cx);
             s
         });
+        let host_sub = host.clone();
         let gid_sub = gid.clone();
         let sub = cx.subscribe_in(
             &input,
@@ -673,7 +796,7 @@ impl Shell {
                     }
                     let next = input.read(cx).value().trim().to_owned();
                     this.bot_ui.renaming_group = None;
-                    this.rename_group_rpc(&gid_sub, &next, cx);
+                    this.rename_group_rpc_on(&host_sub, &gid_sub, &next, cx);
                 }
                 InputEvent::Blur => {
                     this.bot_ui.renaming_group = None;
@@ -683,22 +806,33 @@ impl Shell {
             },
         );
         input.update(cx, |s, cx| s.focus(window, cx));
-        self.bot_ui.renaming_group = Some((gid, input, sub));
+        self.bot_ui.renaming_group = Some((host.clone(), gid, input, sub));
         cx.notify();
     }
 
-    fn rename_group_rpc(&mut self, group_id: &str, new_name: &str, cx: &mut Context<Self>) {
+    fn rename_group_rpc_on(
+        &mut self,
+        host: &HostId,
+        group_id: &str,
+        new_name: &str,
+        cx: &mut Context<Self>,
+    ) {
         let trimmed = new_name.trim();
         if trimmed.is_empty() {
             cx.notify();
             return;
         }
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         let gid = group_id.to_owned();
         let name = trimmed.to_owned();
-        if let Some(s) = self.sidebar_groups.iter_mut().find(|s| s.group.id == gid) {
+        if let Some(s) = self
+            .sidebar_groups
+            .iter_mut()
+            .find(|s| s.host == host_owned && s.group.id == gid)
+        {
             s.group.name.clone_from(&name);
         }
         cx.notify();
@@ -721,12 +855,20 @@ impl Shell {
             this.update(cx, |this, cx| {
                 match res {
                     Ok(BotRpcResponse::Group(updated)) => {
-                        if let Some(s) = this.sidebar_groups.iter_mut().find(|s| s.group.id == gid)
+                        if let Some(s) = this
+                            .sidebar_groups
+                            .iter_mut()
+                            .find(|s| s.host == host_owned && s.group.id == gid)
+                        {
+                            s.group = updated.clone();
+                        }
+                        if let Some(entry) = this.bot_ui.hosts.get_mut(&host_owned)
+                            && let Some(s) = entry.groups.iter_mut().find(|s| s.group.id == gid)
                         {
                             s.group = updated;
                         }
-                        this.invalidate_group_room(&gid);
-                        this.refresh_bots_badge(cx);
+                        this.invalidate_group_room(&host_owned, &gid);
+                        this.refresh_bots_for_host(&host_owned, true, cx);
                     }
                     Ok(_) => {}
                     Err(err) => this.notice = Some(err),
@@ -738,17 +880,23 @@ impl Shell {
         .detach();
     }
 
-    pub(in crate::shell) fn confirm_delete_group(
+    pub(in crate::shell) fn confirm_delete_group_on(
         &mut self,
+        host: &HostId,
         group_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         self.bot_ui.delete_group = None;
-        self.sidebar_groups.retain(|s| s.group.id != group_id);
-        self.close_panes_for_group(&group_id, cx);
+        self.sidebar_groups
+            .retain(|s| !(s.host == host_owned && s.group.id == group_id));
+        if let Some(entry) = self.bot_ui.hosts.get_mut(&host_owned) {
+            entry.groups.retain(|s| s.group.id != group_id);
+        }
+        self.close_panes_for_group(&host_owned, &group_id, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = cx
@@ -759,7 +907,7 @@ impl Shell {
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })
@@ -768,6 +916,7 @@ impl Shell {
 
     pub(super) fn render_group_delete(
         &mut self,
+        host: &HostId,
         group: &BotGroupChat,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -781,6 +930,7 @@ impl Shell {
         if !focus.contains_focused(window, cx) {
             window.focus(&focus, cx);
         }
+        let host_owned = host.clone();
         let id = group.id.clone();
         let card = div()
             .id("bot-group-delete-dialog")
@@ -837,7 +987,7 @@ impl Shell {
                             .label(text::GRP_DELETE_BTN.get())
                             .debug_selector(|| "bot-group-delete-confirm".into())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.confirm_delete_group(id.clone(), cx);
+                                this.confirm_delete_group_on(&host_owned, id.clone(), cx);
                             })),
                     ),
             );

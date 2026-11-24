@@ -655,7 +655,7 @@ pub struct Shell {
     remote_orch_snapshots:
         HashMap<krill_app::hosts::HostId, Arc<krill_proto::orchestration::OrchestrationStore>>,
     remote_orch_generations: HashMap<krill_app::hosts::HostId, u64>,
-    remote_orch_in_flight: bool,
+    remote_orch_in_flight: HashSet<krill_app::hosts::HostId>,
     orch_poll: Option<Task<()>>,
     fits: fit::Pending,
     focus: FocusHandle,
@@ -828,13 +828,12 @@ pub struct Shell {
     /// Rows of the sidebar Bots section, refreshed with the attention badge.
     pub(super) sidebar_bots: Vec<krill_app::bots::SidebarBot>,
     /// Multi-bot group rooms displayed in the sidebar Bots section and right panel.
-    pub(super) sidebar_groups: Vec<krill_proto::bots::BotGroupSummary>,
+    pub(in crate::shell) sidebar_groups: Vec<bot_section::SidebarGroup>,
     /// Orca's sidebar Bots section, New bot and templates dialogs.
     bot_ui: bot_section::BotUi,
     voice: voice::ShellVoiceState,
     /// Orca's empty split/new-tab pane launcher state, keyed by pane id.
     split_launchers: HashMap<PaneId, split_launcher::SplitLauncher>,
-    bots_badge_task: Option<Task<()>>,
     /// Picks up bots made outside the app (`krill bot new` in a pane) for the sidebar.
     #[cfg(not(test))]
     bots_poll: Option<Task<()>>,
@@ -1041,6 +1040,15 @@ impl Shell {
             {
                 this.last_synced_selection = Some(selected.clone());
                 this.launch_host = selected.0;
+            }
+            let connected_remotes: Vec<krill_app::hosts::HostId> = sidebar
+                .read(cx)
+                .connected_remote_hosts()
+                .map(|r| krill_app::hosts::HostId::Remote(r.id.clone()))
+                .collect();
+            if this.bot_ui.last_observed_remotes != connected_remotes {
+                this.bot_ui.last_observed_remotes = connected_remotes;
+                this.refresh_bots_badge(cx);
             }
             this.reconcile_workspace_sessions(cx);
             this.sync_chat_interrupt_latches(cx);
@@ -1384,7 +1392,7 @@ impl Shell {
             orch_snapshot: Arc::default(),
             remote_orch_snapshots: HashMap::new(),
             remote_orch_generations: HashMap::new(),
-            remote_orch_in_flight: false,
+            remote_orch_in_flight: HashSet::new(),
             orch_poll: None,
             fits: fit::Pending::default(),
             focus: cx.focus_handle(),
@@ -1504,7 +1512,6 @@ impl Shell {
             bot_ui: bot_section::BotUi::default(),
             voice: voice::ShellVoiceState::default(),
             split_launchers: HashMap::new(),
-            bots_badge_task: None,
             #[cfg(not(test))]
             bots_poll: None,
             #[cfg(test)]
@@ -1730,14 +1737,14 @@ impl Shell {
         host: krill_app::hosts::HostId,
         cx: &mut Context<Self>,
     ) {
-        if !host.is_remote() || self.remote_orch_in_flight {
+        if !host.is_remote() || self.remote_orch_in_flight.contains(&host) {
             return;
         }
         let Some(target) = self.host_targets.get(&host).cloned() else {
             return;
         };
         let prev_generation = self.remote_orch_generations.get(&host).copied();
-        self.remote_orch_in_flight = true;
+        self.remote_orch_in_flight.insert(host.clone());
         let fetch_target = target.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1747,7 +1754,7 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.remote_orch_in_flight = false;
+                this.remote_orch_in_flight.remove(&host);
                 if this.host_targets.get(&host) == Some(&target)
                     && let Ok(RemoteOrchFetch::Updated { store, generation }) = result
                 {
@@ -1768,14 +1775,6 @@ impl Shell {
                     if changed {
                         cx.notify();
                     }
-                }
-                if this.launch_host != host
-                    && this.launch_host.is_remote()
-                    && this.host_targets.contains_key(&this.launch_host)
-                    && !this.remote_orch_snapshots.contains_key(&this.launch_host)
-                {
-                    let next = this.launch_host.clone();
-                    this.fetch_remote_orchestration(next, cx);
                 }
             })
             .ok();
@@ -1856,12 +1855,21 @@ impl Shell {
                             changed = true;
                         }
                         this.prune_remote_orchestration(cx);
-                        if this.launch_host.is_remote()
-                            && (!this.remote_orch_snapshots.contains_key(&this.launch_host)
-                                || tick.is_multiple_of(3))
-                        {
-                            let host = this.launch_host.clone();
-                            this.fetch_remote_orchestration(host, cx);
+                        let mut orch_hosts: Vec<krill_app::hosts::HostId> = Vec::new();
+                        if this.launch_host.is_remote() {
+                            orch_hosts.push(this.launch_host.clone());
+                        }
+                        for bot in &this.sidebar_bots {
+                            if bot.host.is_remote() && !orch_hosts.contains(&bot.host) {
+                                orch_hosts.push(bot.host.clone());
+                            }
+                        }
+                        for host in orch_hosts {
+                            if !this.remote_orch_snapshots.contains_key(&host)
+                                || tick.is_multiple_of(3)
+                            {
+                                this.fetch_remote_orchestration(host, cx);
+                            }
                         }
                         let mut cache = this.ports_cache.borrow_mut();
                         cache.retain(|id, entry| {
@@ -3069,6 +3077,9 @@ impl Shell {
                         .map(|(host, _)| host)
                         .collect();
                     if !invalidated.is_empty() {
+                        for host in &invalidated {
+                            krill_app::bots::invalidate_host_connections(host);
+                        }
                         this.gone_sessions
                             .retain(|(host, _)| !invalidated.contains(host));
                         this.observed_sessions
@@ -3114,6 +3125,7 @@ impl Shell {
                     this.sync_settings_account_hosts(cx);
                     this.sync(cx);
                     this.sync_diff_workspace(cx);
+                    this.refresh_bots_badge(cx);
                     cx.notify();
                 }
                 if this.host_refresh_again || !this.host_pending_reconnects.is_empty() {
@@ -4498,11 +4510,11 @@ impl Shell {
         from: krill_proto::SessionId,
         to: krill_proto::SessionId,
     ) -> bool {
-        if host != &self.launch_host {
-            return false;
-        }
         let mut touched = false;
         for bot in &mut self.sidebar_bots {
+            if &bot.host != host {
+                continue;
+            }
             for session in &mut bot.sessions {
                 if session.session_id == from {
                     session.session_id = to;
@@ -4510,16 +4522,28 @@ impl Shell {
                 }
             }
         }
-        if self.bot_ui.open_chats.remove(&from) {
-            self.bot_ui.open_chats.insert(to);
+        if let Some(entry) = self.bot_ui.hosts.get_mut(host) {
+            for bot in &mut entry.snapshot.bots {
+                for session in &mut bot.sessions {
+                    if session.session_id == from {
+                        session.session_id = to;
+                        touched = true;
+                    }
+                }
+            }
+        }
+        let from_key = (host.clone(), from);
+        let to_key = (host.clone(), to);
+        if self.bot_ui.folded_chats.remove(&from_key) {
+            self.bot_ui.folded_chats.insert(to_key.clone());
             touched = true;
         }
-        if let Some(steps) = self.bot_ui.chat_steps.remove(&from) {
-            self.bot_ui.chat_steps.insert(to, steps);
+        if let Some(steps) = self.bot_ui.chat_steps.remove(&from_key) {
+            self.bot_ui.chat_steps.insert(to_key.clone(), steps);
             touched = true;
         }
-        if self.bot_ui.panel.chat_unfolded.remove(&from) {
-            self.bot_ui.panel.chat_unfolded.insert(to);
+        if self.bot_ui.panel.chat_folded.remove(&from_key) {
+            self.bot_ui.panel.chat_folded.insert(to_key);
             touched = true;
         }
         if touched {

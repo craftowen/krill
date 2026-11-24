@@ -10,9 +10,9 @@ use gpui_component::{Icon, IconName, Sizable as _};
 use krill_app::bots::{GroupChatScope, GroupItemsFilter, SidebarBot, group_faces};
 use krill_app::i18n::catalog::bots as text;
 use krill_app::ui;
-use krill_proto::bots::BotGroupSummary;
 
 use super::Shell;
+use super::bot_section::SidebarGroup;
 
 fn menu_heading(label: impl Into<SharedString>) -> PopupMenuItem {
     let label = label.into();
@@ -30,31 +30,30 @@ fn menu_heading(label: impl Into<SharedString>) -> PopupMenuItem {
 
 impl Shell {
     /// Returns the group summary if `pane` hosts a Group Chat room page.
-    pub(super) fn group_for_pane(
-        &self,
-        pane: krill_app::layout::PaneId,
-    ) -> Option<&BotGroupSummary> {
+    pub(super) fn group_for_pane(&self, pane: krill_app::layout::PaneId) -> Option<&SidebarGroup> {
         let target = self.layout.group_pane(pane)?;
+        let host = self.layout.host(pane);
         self.sidebar_groups
             .iter()
-            .find(|s| s.group.id == target.group_id)
+            .find(|s| &s.host == host && s.group.id == target.group_id)
     }
 
     /// Returns the focused Group Chat room page, if any (`BotGroupItemsPanel` target).
-    pub(super) fn focused_bot_group(&self) -> Option<&BotGroupSummary> {
+    pub(super) fn focused_bot_group(&self) -> Option<&SidebarGroup> {
         let pane = self.layout.focused()?;
         self.group_for_pane(pane)
     }
 
     pub(super) fn render_bot_group_panel(
         &mut self,
-        summary: &BotGroupSummary,
+        summary: &SidebarGroup,
         width: f32,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let _ = width;
         let p = ui::palette(cx);
+        let host = summary.host.clone();
         let group = &summary.group;
         let thread_ids: Vec<String> = summary
             .threads
@@ -65,14 +64,17 @@ impl Shell {
         // Switching the shared panel view to a group clears single-bot tracking so returning
         // to the previously shown bot always invokes `show_in_panel` again.
         self.bot_ui.panel.shown = None;
-        let view = self.bot_panel_view(cx).inspect(|view| {
+        let view = self.bot_panel_view_on(&host, cx).inspect(|view| {
             if std::mem::take(&mut self.bot_ui.panel.stale) {
                 view.update(cx, krill_app::bots::View::reload);
             }
-            let host = self.launch_host.clone();
             let mut states = std::collections::BTreeMap::new();
             for bid in &group.bot_ids {
-                if let Some(bot) = self.sidebar_bots.iter().find(|b| &b.id == bid) {
+                if let Some(bot) = self
+                    .sidebar_bots
+                    .iter()
+                    .find(|b| b.host == host && &b.id == bid)
+                {
                     for s in &bot.sessions {
                         if let Some(sess) = self.sidebar.read(cx).session_on(&host, s.session_id) {
                             states.insert(s.session_id, sess.status.state);
@@ -149,16 +151,23 @@ impl Shell {
 
     fn render_bot_group_panel_header(
         &self,
-        summary: &BotGroupSummary,
+        summary: &SidebarGroup,
         view: Option<&Entity<krill_app::bots::View>>,
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let host = summary.host.clone();
         let group = &summary.group;
+        let host_bots: Vec<SidebarBot> = self
+            .sidebar_bots
+            .iter()
+            .filter(|b| b.host == host)
+            .cloned()
+            .collect();
         let members: Vec<SidebarBot> = group
             .bot_ids
             .iter()
-            .filter_map(|id| self.sidebar_bots.iter().find(|b| &b.id == id).cloned())
+            .filter_map(|id| host_bots.iter().find(|b| &b.id == id).cloned())
             .collect();
         let need_count: usize = members.iter().map(|b| b.attention).sum();
         let working_count: usize = {
@@ -186,10 +195,12 @@ impl Shell {
             _ => text::BP_IDLE.get().to_owned(),
         };
 
-        let face_members =
-            group_faces::resolve_members(&group.bot_ids, &self.sidebar_bots, &|id| {
-                self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone())
-            });
+        let face_members = group_faces::resolve_members(&group.bot_ids, &host_bots, &|id| {
+            self.bot_ui
+                .avatars
+                .get(&(host.clone(), id.clone()))
+                .and_then(|(_, img)| img.clone())
+        });
         let faces = group_faces::render_group_faces(&face_members, 36., p.sidebar, p);
 
         let this_for_members = cx.weak_entity();
@@ -225,6 +236,7 @@ impl Shell {
                 menu = menu.item(menu_heading(members_count_label.clone()));
                 for (bot, st) in &member_rows {
                     let bid = bot.id.clone();
+                    let bhost = bot.host.clone();
                     let name = bot.name.clone();
                     let st = st.clone();
                     let this = this_for_members.clone();
@@ -257,7 +269,7 @@ impl Shell {
                         })
                         .on_click(move |_, _, cx| {
                             this.update(cx, |s, cx| {
-                                s.open_bot_home(bid.clone(), None, cx);
+                                s.open_bot_home_on(&bhost, bid.clone(), None, cx);
                                 if s.panel_collapsed {
                                     s.toggle_panel(cx);
                                 }
@@ -446,6 +458,8 @@ impl Shell {
         });
 
         let this_more = cx.weak_entity();
+        let host_edit = host.clone();
+        let host_more = host;
         let group_edit = group.clone();
         let group_more = group.clone();
         let group_thread = group.clone();
@@ -501,7 +515,8 @@ impl Shell {
                     .tooltip(text::GRP_MANAGE_MEMBERS.get())
                     .accessibility_label(text::GRP_MANAGE_MEMBERS.get())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_manage_group_dialog(
+                        this.open_manage_group_dialog_on(
+                            &host_edit,
                             group_edit.clone(),
                             reply_aud.clone(),
                             window,
@@ -521,6 +536,9 @@ impl Shell {
                         let t1 = this_more.clone();
                         let t2 = this_more.clone();
                         let t3 = this_more.clone();
+                        let h1 = host_more.clone();
+                        let h2 = host_more.clone();
+                        let h3 = host_more.clone();
                         let g1 = group_more.clone();
                         let g2 = group_thread.clone();
                         let g3 = group_del.clone();
@@ -531,7 +549,8 @@ impl Shell {
                                 .icon(gpui_component::Icon::default().data(ui::icons::USERS_SVG))
                                 .on_click(move |_, window, cx| {
                                     t1.update(cx, |s, cx| {
-                                        s.open_manage_group_dialog(
+                                        s.open_manage_group_dialog_on(
+                                            &h1,
                                             g1.clone(),
                                             aud.clone(),
                                             window,
@@ -546,7 +565,12 @@ impl Shell {
                                 .icon(IconName::Plus)
                                 .on_click(move |_, window, cx| {
                                     t2.update(cx, |s, cx| {
-                                        s.create_and_open_group_thread(g2.id.clone(), window, cx);
+                                        s.create_and_open_group_thread_on(
+                                            &h2,
+                                            g2.id.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     })
                                     .ok();
                                 }),
@@ -557,7 +581,7 @@ impl Shell {
                                 .icon(IconName::Delete)
                                 .on_click(move |_, _, cx| {
                                     t3.update(cx, |s, cx| {
-                                        s.bot_ui.delete_group = Some(g3.clone());
+                                        s.bot_ui.delete_group = Some((h3.clone(), g3.clone()));
                                         cx.notify();
                                     })
                                     .ok();

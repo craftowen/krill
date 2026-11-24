@@ -67,8 +67,10 @@ pub use home::HomeFilter;
 pub use home_item_parts::LinkedDispatchRef;
 
 pub use rpc::{
-    BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarSnapshot,
-    SidebarState, daemon_bot_rpc, fetch_sidebar_state,
+    BOT_RUNTIMES, BotRpcCall, BotRuntimeOption, BotSessionMeta, SidebarBot, SidebarFetchError,
+    SidebarSnapshot, SidebarState, call_checked_batch_on, daemon_bot_rpc, daemon_bot_rpc_for_host,
+    fetch_sidebar_state, fetch_sidebar_state_detailed_with_rpc, fetch_sidebar_state_for_target,
+    invalidate_host_connections,
 };
 use rpc::{call_checked, decode_png_avatar, join_errors, unsupported_version};
 pub use settings_root::{OpenSettingsPage, RequestDeleteBot};
@@ -121,6 +123,7 @@ pub struct OpenBotHome {
 /// Notify the host `Shell` when bots or their attention counts (`needs_you` + pending access) change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadgeChanged {
+    pub host: HostId,
     pub attention_count: usize,
     /// Sidebar Bots section rows, built once per change.
     pub bots: Vec<SidebarBot>,
@@ -275,7 +278,7 @@ impl View {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::build_with_rpc(
-            daemon_bot_rpc(target.clone()),
+            daemon_bot_rpc_for_host(&host, target.clone()),
             false,
             host,
             target,
@@ -288,7 +291,17 @@ impl View {
 
     /// Creates a Bots modal backed by an injectable RPC handler (used by tests).
     pub fn with_rpc(rpc: BotRpcCall, default_cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
-        let mut view = Self::build_with_rpc(rpc, true, HostId::Local, None, default_cwd, cx);
+        Self::with_rpc_on_host(HostId::Local, rpc, default_cwd, cx)
+    }
+
+    /// Creates a Bots modal bound to `host` and backed by an injectable RPC handler (used by tests).
+    pub fn with_rpc_on_host(
+        host: HostId,
+        rpc: BotRpcCall,
+        default_cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::build_with_rpc(rpc, true, host, None, default_cwd, cx);
         view.reload(cx);
         view
     }
@@ -422,7 +435,7 @@ impl View {
         self.host = host;
         self.target.clone_from(&target);
         if target_changed {
-            self.rpc = daemon_bot_rpc(target);
+            self.rpc = daemon_bot_rpc_for_host(&self.host, target);
             self.unsupported = None;
             self.selected_bot_id = None;
             self.bots.clear();
@@ -513,7 +526,8 @@ impl View {
     /// Rows and attention total for the main window sidebar's Bots section.
     #[must_use]
     pub fn sidebar_snapshot(&self) -> SidebarSnapshot {
-        rpc::sidebar_snapshot(
+        rpc::sidebar_snapshot_on(
+            &self.host,
             &self.bots,
             &self.all_open_items,
             &self.all_access_requests,
@@ -527,6 +541,7 @@ impl View {
         }
         let snapshot = self.sidebar_snapshot();
         cx.emit(BadgeChanged {
+            host: self.host.clone(),
             attention_count: snapshot.attention,
             bots: snapshot.bots,
         });
@@ -574,6 +589,17 @@ impl View {
         self.load_gen = self.load_gen.wrapping_add(1);
         let generation = self.load_gen;
         let rpc = self.rpc.clone();
+        let target = (!self.rpc_is_mock)
+            .then(|| {
+                self.target.clone().or_else(|| {
+                    self.host
+                        .is_local()
+                        .then(|| HostTarget::local_dev().ok())
+                        .flatten()
+                })
+            })
+            .flatten();
+        let host_name = self.host_label();
         self.loading = true;
         self.error = None;
         self.notice = None;
@@ -581,18 +607,29 @@ impl View {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let bots = match call_checked(&rpc, &BotRpcRequest::ListBots)? {
+                    let reqs = [
+                        BotRpcRequest::ListBots,
+                        BotRpcRequest::ListItems {
+                            bot_id: None,
+                            include_closed: false,
+                        },
+                        BotRpcRequest::ConnectorStatus { bot_id: None },
+                        BotRpcRequest::ListAccessRequests { bot_id: None },
+                        BotRpcRequest::ToolRelayStatus,
+                        BotRpcRequest::ListBotSessions { bot_id: None },
+                    ];
+                    let mut replies =
+                        call_checked_batch_on(target.as_ref(), &rpc, &reqs, Some(&host_name))?
+                            .into_iter();
+                    let bots = match replies
+                        .next()
+                        .unwrap_or_else(|| Err("missing ListBots".into()))?
+                    {
                         BotRpcResponse::Bots(list) => list,
                         other => return Err(format!("unexpected ListBots response: {other:?}")),
                     };
                     let mut warnings = Vec::new();
-                    let open_items = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListItems {
-                            bot_id: None,
-                            include_closed: false,
-                        },
-                    ) {
+                    let open_items = match replies.next().unwrap_or(Ok(BotRpcResponse::Ok)) {
                         Ok(BotRpcResponse::Items(list)) => list,
                         Ok(BotRpcResponse::Ok) => Vec::new(),
                         Ok(other) => {
@@ -604,10 +641,7 @@ impl View {
                             Vec::new()
                         }
                     };
-                    let statuses = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ConnectorStatus { bot_id: None },
-                    ) {
+                    let statuses = match replies.next().unwrap_or(Ok(BotRpcResponse::Ok)) {
                         Ok(BotRpcResponse::ConnectorStatuses(list)) => list,
                         Ok(BotRpcResponse::Ok) => Vec::new(),
                         Ok(other) => {
@@ -619,10 +653,7 @@ impl View {
                             Vec::new()
                         }
                     };
-                    let access = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListAccessRequests { bot_id: None },
-                    ) {
+                    let access = match replies.next().unwrap_or(Ok(BotRpcResponse::Ok)) {
                         Ok(BotRpcResponse::AccessRequests(list)) => list,
                         Ok(BotRpcResponse::Ok) => Vec::new(),
                         Ok(other) => {
@@ -634,7 +665,7 @@ impl View {
                             Vec::new()
                         }
                     };
-                    let relay = match call_checked(&rpc, &BotRpcRequest::ToolRelayStatus) {
+                    let relay = match replies.next().unwrap_or(Ok(BotRpcResponse::Ok)) {
                         Ok(BotRpcResponse::ToolRelayStatus(st)) => Some(st),
                         Ok(_) => None,
                         Err(e) => {
@@ -642,10 +673,7 @@ impl View {
                             None
                         }
                     };
-                    let sessions = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListBotSessions { bot_id: None },
-                    ) {
+                    let sessions = match replies.next().unwrap_or(Ok(BotRpcResponse::Ok)) {
                         Ok(BotRpcResponse::BotSessions(list)) => Some(list),
                         Ok(_) => None,
                         Err(e) => {
@@ -806,8 +834,21 @@ impl View {
         self.detail_gen = self.detail_gen.wrapping_add(1);
         let generation = self.detail_gen;
         let rpc = self.rpc.clone();
+        let target = (!self.rpc_is_mock)
+            .then(|| {
+                self.target.clone().or_else(|| {
+                    self.host
+                        .is_local()
+                        .then(|| HostTarget::local_dev().ok())
+                        .flatten()
+                })
+            })
+            .flatten();
+        let host_name = self.host_label();
         let bot_cfg = self.bots.iter().find(|b| b.id == bot_id).cloned();
-        let has_avatar = bot_cfg.as_ref().is_some_and(|b| b.avatar.is_some());
+        let has_avatar = bot_cfg
+            .as_ref()
+            .is_some_and(|b| avatar::Avatar::of(b) == avatar::Avatar::Upload);
         let composio_enabled = bot_cfg
             .as_ref()
             .is_some_and(|b| b.connectors.composio.enabled);
@@ -822,156 +863,155 @@ impl View {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
-                    let items_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListItems {
+                    let mut reqs = vec![
+                        BotRpcRequest::ListItems {
                             bot_id: Some(bot_id_bg.clone()),
                             include_closed: true,
                         },
-                    ) {
+                        BotRpcRequest::GetSoul {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                        BotRpcRequest::GetMemory {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                        BotRpcRequest::ConnectorStatus {
+                            bot_id: Some(bot_id_bg.clone()),
+                        },
+                        BotRpcRequest::ListAccessRequests {
+                            bot_id: Some(bot_id_bg.clone()),
+                        },
+                        BotRpcRequest::ToolRelayStatus,
+                        BotRpcRequest::ListBotSessions { bot_id: None },
+                        BotRpcRequest::ListSuggestions {
+                            bot_id: Some(bot_id_bg.clone()),
+                            include_dismissed: false,
+                        },
+                        BotRpcRequest::GetMemoryHistory {
+                            bot_id: bot_id_bg.clone(),
+                            limit: Some(25),
+                        },
+                        BotRpcRequest::GetMemoryTidyStatus {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                        BotRpcRequest::ListMemoryTopics {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                        BotRpcRequest::GetDefaultTrackerBots,
+                        BotRpcRequest::GetBotUpcoming {
+                            bot_id: bot_id_bg.clone(),
+                        },
+                    ];
+                    let composio_idx = composio_enabled.then(|| {
+                        let i = reqs.len();
+                        reqs.push(BotRpcRequest::ListComposioConnections {
+                            bot_id: bot_id_bg.clone(),
+                        });
+                        i
+                    });
+                    let avatar_idx = has_avatar.then(|| {
+                        let i = reqs.len();
+                        reqs.push(BotRpcRequest::GetBotAvatar { bot_id: bot_id_bg });
+                        i
+                    });
+
+                    let mut slots: Vec<Result<BotRpcResponse, String>> =
+                        match call_checked_batch_on(target.as_ref(), &rpc, &reqs, Some(&host_name))
+                        {
+                            Ok(list) => list,
+                            Err(err) => vec![Err(err); reqs.len()],
+                        };
+                    let mut take = |idx: usize| -> Result<BotRpcResponse, String> {
+                        slots.get_mut(idx).map_or_else(
+                            || Err("missing response".into()),
+                            |slot| std::mem::replace(slot, Ok(BotRpcResponse::Ok)),
+                        )
+                    };
+
+                    let items_res = match take(0) {
                         Ok(BotRpcResponse::Items(list)) => Ok(list),
                         Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
                         Ok(other) => Err(format!("unexpected ListItems: {other:?}")),
                         Err(e) => Err(e),
                     };
-                    let soul_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::GetSoul {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                    ) {
+                    let soul_res = match take(1) {
                         Ok(BotRpcResponse::Text(t)) => Ok(Some(t)),
                         Ok(BotRpcResponse::Ok) => Ok(None),
                         Ok(other) => Err(format!("unexpected GetSoul: {other:?}")),
                         Err(e) => Err(e),
                     };
-                    let memory_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::GetMemory {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                    ) {
+                    let memory_res = match take(2) {
                         Ok(BotRpcResponse::Text(t)) => Ok(Some(t)),
                         Ok(BotRpcResponse::Ok) => Ok(None),
                         Ok(other) => Err(format!("unexpected GetMemory: {other:?}")),
                         Err(e) => Err(e),
                     };
-                    let statuses_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ConnectorStatus {
-                            bot_id: Some(bot_id_bg.clone()),
-                        },
-                    ) {
+                    let statuses_res = match take(3) {
                         Ok(BotRpcResponse::ConnectorStatuses(list)) => Ok(list),
                         Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
                         Ok(other) => Err(format!("unexpected ConnectorStatus: {other:?}")),
                         Err(e) => Err(e),
                     };
-                    let access_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListAccessRequests {
-                            bot_id: Some(bot_id_bg.clone()),
-                        },
-                    ) {
+                    let access_res = match take(4) {
                         Ok(BotRpcResponse::AccessRequests(list)) => Ok(list),
                         Ok(BotRpcResponse::Ok) => Ok(Vec::new()),
                         Ok(other) => Err(format!("unexpected ListAccessRequests: {other:?}")),
                         Err(e) => Err(e),
                     };
-                    let relay_res = match call_checked(&rpc, &BotRpcRequest::ToolRelayStatus) {
+                    let relay_res = match take(5) {
                         Ok(BotRpcResponse::ToolRelayStatus(st)) => Ok(Some(st)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
                     };
-                    let sessions_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListBotSessions { bot_id: None },
-                    ) {
+                    let sessions_res = match take(6) {
                         Ok(BotRpcResponse::BotSessions(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
                     };
-                    let suggestions_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListSuggestions {
-                            bot_id: Some(bot_id_bg.clone()),
-                            include_dismissed: false,
-                        },
-                    ) {
+                    let suggestions_res = match take(7) {
                         Ok(BotRpcResponse::Suggestions(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
                     };
-                    let history_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::GetMemoryHistory {
-                            bot_id: bot_id_bg.clone(),
-                            limit: Some(25),
-                        },
-                    ) {
+                    let history_res = match take(8) {
                         Ok(BotRpcResponse::MemoryHistory(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
                     };
-                    let tidy_status_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::GetMemoryTidyStatus {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                    ) {
+                    let tidy_status_res = match take(9) {
                         Ok(BotRpcResponse::MemoryTidyStatus(st)) => Ok(Some(st)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
                     };
-                    let topics_res = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::ListMemoryTopics {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                    ) {
+                    let topics_res = match take(10) {
                         Ok(BotRpcResponse::MemoryTopics(list)) => Ok(Some(list)),
                         Ok(_) => Ok(None),
                         Err(e) => Err(e),
                     };
-                    let tracker_res =
-                        match call_checked(&rpc, &BotRpcRequest::GetDefaultTrackerBots) {
-                            Ok(BotRpcResponse::DefaultTrackerBots(d)) => Ok(Some(d)),
-                            Ok(_) => Ok(None),
-                            Err(e) => Err(e),
-                        };
-                    let composio_res = if composio_enabled {
-                        match call_checked(
-                            &rpc,
-                            &BotRpcRequest::ListComposioConnections {
-                                bot_id: bot_id_bg.clone(),
-                            },
-                        ) {
-                            Ok(BotRpcResponse::ComposioConnections(list)) => Ok(Some(list)),
-                            Ok(_) => Ok(None),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok(None)
+                    let tracker_res = match take(11) {
+                        Ok(BotRpcResponse::DefaultTrackerBots(d)) => Ok(Some(d)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(e),
                     };
-                    let upcoming = match call_checked(
-                        &rpc,
-                        &BotRpcRequest::GetBotUpcoming {
-                            bot_id: bot_id_bg.clone(),
-                        },
-                    ) {
+                    let upcoming = match take(12) {
                         Ok(BotRpcResponse::Upcoming(up)) => Some(up),
                         _ => None,
                     };
-                    let avatar_img = if has_avatar {
-                        match call_checked(&rpc, &BotRpcRequest::GetBotAvatar { bot_id: bot_id_bg })
-                        {
+                    let composio_res = match composio_idx {
+                        Some(idx) => match take(idx) {
+                            Ok(BotRpcResponse::ComposioConnections(list)) => Ok(Some(list)),
+                            Ok(_) => Ok(None),
+                            Err(e) => Err(e),
+                        },
+                        None => Ok(None),
+                    };
+                    let avatar_img = match avatar_idx {
+                        Some(idx) => match take(idx) {
                             Ok(BotRpcResponse::BotAvatar(data)) => {
                                 decode_png_avatar(&data.png_bytes).ok()
                             }
                             _ => None,
-                        }
-                    } else {
-                        None
+                        },
+                        None => None,
                     };
 
                     DetailBundle {

@@ -4,21 +4,22 @@
 //! a right-click menu, and the "Meet your AI teammate" card when there are no bots.
 //! Also hosts the New bot and Bot templates dialogs, and opens a bot's Home Chat.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, FontWeight, Image, KeyDownEvent, MouseButton,
-    SharedString, Subscription, Window, div, prelude::*, px,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{IconName, Sizable as _};
 use krill_app::bots::{SidebarBot, avatar, new_bot, templates};
-use krill_app::hosts::HostId;
+use krill_app::hosts::{HostId, HostTarget};
 use krill_app::i18n::catalog::bots as text;
 use krill_app::ui;
-use krill_proto::bots::{BotId, BotRpcRequest, BotRpcResponse, BotTemplate};
+use krill_proto::bots::{BotGroupSummary, BotId, BotRpcRequest, BotRpcResponse, BotTemplate};
 
 use super::Shell;
 
@@ -32,6 +33,49 @@ mod tests;
 
 /// A right-click menu action on the Shell.
 type ShellAction = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
+
+/// Decoded `avatar.png` cache keyed by `(host, bot_id)`.
+type BotAvatarCache = HashMap<(HostId, BotId), (u64, Option<Arc<Image>>)>;
+
+/// A multi-bot group entry owned by a specific Krill host (`Local` or `Remote`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::shell) struct SidebarGroup {
+    pub host: HostId,
+    pub summary: BotGroupSummary,
+}
+
+impl Deref for SidebarGroup {
+    type Target = BotGroupSummary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.summary
+    }
+}
+
+impl DerefMut for SidebarGroup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.summary
+    }
+}
+
+/// Per-host sidebar bots synchronization state (isolated retries, backoff, and capability cache).
+#[derive(Default)]
+pub(super) struct HostBotsState {
+    pub target: Option<HostTarget>,
+    pub transport_epoch: u64,
+    pub generation: u64,
+    pub in_flight: bool,
+    pub dirty: bool,
+    pub probed: bool,
+    /// Cached daemon version when it lacks `FEAT_BOTS`, plus timestamp of check.
+    pub unsupported: Option<(String, std::time::Instant)>,
+    pub consecutive_failures: u32,
+    pub next_retry_at: Option<std::time::Instant>,
+    pub snapshot: krill_app::bots::SidebarSnapshot,
+    pub groups: Vec<BotGroupSummary>,
+    pub last_error: Option<String>,
+    pub retry_task: Option<Task<()>>,
+}
 
 /// A dialog to build at the start of the next render (it needs the window).
 #[derive(Debug, Clone)]
@@ -47,10 +91,18 @@ pub(super) enum BotDialogRequest {
 #[derive(Default)]
 pub(super) struct BotUi {
     pub collapsed: bool,
+    /// Per-host fetched snapshots, backoff, and capability state.
+    pub hosts: BTreeMap<HostId, HostBotsState>,
+    /// Independent background poll task per host (no host cancels or starves another).
+    pub host_tasks: HashMap<HostId, Task<()>>,
+    /// Last observed list of connected non-suppressed remote hosts from `Sidebar`.
+    pub last_observed_remotes: Vec<HostId>,
+    /// Safety timer so an unreachable remote host never keeps `loaded == false` forever.
+    pub loaded_fallback_task: Option<Task<()>>,
     /// `Some` while the search field is open.
     pub search: Option<(Entity<InputState>, Subscription)>,
     pub query: String,
-    pub folded: HashSet<BotId>,
+    pub folded: HashSet<(HostId, BotId)>,
     /// "Bot options" (sort and hide); read from settings on first use.
     pub view: Option<krill_app::bots::sidebar_view::BotSidebarView>,
     /// Chats whose workers the user explicitly folded (chats with workers start open).
@@ -58,26 +110,28 @@ pub(super) struct BotUi {
     /// "Show more" steps taken per chat.
     pub chat_steps: HashMap<(HostId, krill_proto::SessionId), usize>,
     /// The bot row being renamed in place.
-    pub renaming: Option<(BotId, Entity<InputState>, Subscription)>,
+    pub renaming: Option<(HostId, BotId, Entity<InputState>, Subscription)>,
     /// The group row being renamed in place.
-    pub renaming_group: Option<(String, Entity<InputState>, Subscription)>,
-    /// Decoded `avatar.png` per bot and the config time it belongs to (`None`: unreadable,
+    pub renaming_group: Option<(HostId, String, Entity<InputState>, Subscription)>,
+    /// Decoded `avatar.png` per `(host, bot)` and the config time it belongs to (`None`: unreadable,
     /// so the poll doesn't fetch it again until the bot changes).
-    pub avatars: HashMap<BotId, (u64, Option<Arc<Image>>)>,
+    pub avatars: BotAvatarCache,
     /// The bot list has arrived at least once (no "Meet your AI teammate" flash before it).
     pub loaded: bool,
     /// Bots whose Home Chat is being started, so a double click starts one, not two.
-    pub opening: HashSet<BotId>,
+    pub opening: HashSet<(HostId, BotId)>,
     /// New bot came from the templates gallery: closing it goes back there, like Orca.
     pub back_to_templates: bool,
     pub pending: Option<BotDialogRequest>,
     pub new_bot: Option<(Entity<new_bot::NewBot>, Subscription)>,
     pub templates: Option<(Entity<templates::Templates>, Subscription)>,
     pub group_dialog: Option<(Entity<krill_app::bots::BotGroupMembersDialog>, Subscription)>,
+    /// Which host the currently open New/Manage group dialog targets.
+    pub group_dialog_host: Option<HostId>,
     /// Bot waiting for "Delete bot" confirmation.
     pub delete: Option<SidebarBot>,
     /// Group waiting for "Delete group" confirmation.
-    pub delete_group: Option<krill_proto::bots::BotGroupChat>,
+    pub delete_group: Option<(HostId, krill_proto::bots::BotGroupChat)>,
     pub delete_focus: Option<FocusHandle>,
     pub spinners: ui::status::SpinnerSlots,
     /// The right sidebar of a bot page.
@@ -92,13 +146,6 @@ impl Shell {
         self.bot_rpc_on(&self.launch_host)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "tests have no daemon without an override"
-        )
-    )]
     pub(super) fn bot_rpc_on(&self, host: &HostId) -> Option<krill_app::bots::BotRpcCall> {
         #[cfg(test)]
         {
@@ -109,18 +156,43 @@ impl Shell {
         }
         #[cfg(not(test))]
         {
-            Some(krill_app::bots::daemon_bot_rpc(self.target_for_host(host)))
+            let target = self.target_for_host(host);
+            if host.is_remote() && target.is_none() {
+                return None;
+            }
+            Some(krill_app::bots::daemon_bot_rpc_for_host(host, target))
         }
     }
 
-    pub(super) fn bot_host_label(&self, cx: &App) -> SharedString {
-        match &self.launch_host {
+    pub(super) fn host_display_label(&self, host: &HostId, cx: &App) -> SharedString {
+        match host {
             HostId::Local => text::HOST_LOCAL
                 .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
                 .get()
                 .into(),
             HostId::Remote(id) => self.remote_host_name(id, cx).into(),
         }
+    }
+
+    pub(super) fn bot_host_label(&self, cx: &App) -> SharedString {
+        self.host_display_label(&self.launch_host, cx)
+    }
+
+    /// `<state>/bots/<slug>` for bots on `bot.host` (local only).
+    pub(super) fn bot_folder_on(host: &HostId, bot: &SidebarBot) -> Option<std::path::PathBuf> {
+        host.is_local()
+            .then(krill_proto::daemon::state_dir)
+            .flatten()
+            .map(|state| state.join("bots").join(&bot.slug))
+    }
+
+    /// `<state>/bots/<slug>` for `bot` (local only).
+    #[expect(
+        clippy::unused_self,
+        reason = "keeps consistent shell method call sites across submodules"
+    )]
+    pub(super) fn bot_folder(&self, bot: &SidebarBot) -> Option<std::path::PathBuf> {
+        Self::bot_folder_on(&bot.host, bot)
     }
 
     /// Computers New bot offers: this one and every connected remote host, launch host first.
@@ -151,19 +223,6 @@ impl Shell {
             );
         }
         hosts
-    }
-
-    /// `<state>/bots/<slug>` for bots on `host` (local only).
-    pub(super) fn bot_folder_on(host: &HostId, bot: &SidebarBot) -> Option<std::path::PathBuf> {
-        host.is_local()
-            .then(krill_proto::daemon::state_dir)
-            .flatten()
-            .map(|state| state.join("bots").join(&bot.slug))
-    }
-
-    /// `<state>/bots/<slug>` for bots on this Mac.
-    pub(super) fn bot_folder(&self, bot: &SidebarBot) -> Option<std::path::PathBuf> {
-        Self::bot_folder_on(&self.launch_host, bot)
     }
 
     /// Opens New bot (optionally from a template) on the next render.
@@ -262,51 +321,53 @@ impl Shell {
             new_bot::Event::Created { bot, warning, host } => {
                 self.bot_ui.new_bot = None;
                 self.bot_ui.back_to_templates = false;
-                // The bot lives on the computer picked for it: bots, its chat and the sidebar's
-                // Bots section follow that host from here.
                 if *host != self.launch_host {
                     self.set_launch_host(host.clone(), cx);
-                    self.sidebar_bots.clear();
-                    self.sidebar_groups.clear();
-                    self.bot_ui.avatars.clear();
-                    self.bot_ui.renaming = None;
-                    self.bot_ui.renaming_group = None;
-                    self.bot_ui.panel.shown = None;
-                    self.bot_ui.panel.settings = None;
                 }
                 if let Some(err) = warning {
                     self.notice = Some(err.clone());
                 }
                 // Orca expands the section so the new bot's row is visible and active.
                 self.bot_ui.collapsed = false;
-                self.bot_ui.folded.remove(&bot.id);
+                self.bot_ui.folded.remove(&(host.clone(), bot.id.clone()));
                 self.bot_ui.panel.settings = None;
                 self.bot_ui.panel.stale = true;
-                let row = krill_app::bots::rpc::sidebar_snapshot(
+                let row = krill_app::bots::rpc::sidebar_snapshot_on(
+                    host,
                     std::slice::from_ref(bot.as_ref()),
                     &[],
                     &[],
                     &[],
                 )
                 .bots;
+                let entry = self.bot_ui.hosts.entry(host.clone()).or_default();
+                entry.probed = true;
                 for r in row {
-                    if !self.sidebar_bots.iter().any(|b| b.id == r.id) {
+                    if !entry.snapshot.bots.iter().any(|b| b.id == r.id) {
+                        entry.snapshot.bots.insert(0, r.clone());
+                    }
+                    if !self
+                        .sidebar_bots
+                        .iter()
+                        .any(|b| &b.host == host && b.id == r.id)
+                    {
                         self.sidebar_bots.insert(0, r);
                     }
                 }
                 // No kickoff turn: the chat opens empty and the bot first answers its owner's
                 // first message (its instructions ride in the agent's system prompt).
-                self.open_bot_home(bot.id.clone(), None, cx);
-                self.refresh_bots_badge(cx);
+                self.open_bot_home_on(host, bot.id.clone(), None, cx);
+                self.refresh_bots_for_host(host, true, cx);
                 cx.notify();
             }
         }
     }
 
-    /// Opens a bot's Home Chat: focuses its live session, or starts one (with `kickoff` as
-    /// the first turn for a bot that was just made).
-    pub(super) fn open_bot_home(
+    /// Opens a bot's Home Chat on `host`: focuses its live session, or starts one (with `kickoff`
+    /// as the first turn for a bot that was just made).
+    pub(super) fn open_bot_home_on(
         &mut self,
+        host: &HostId,
         bot_id: BotId,
         kickoff: Option<String>,
         cx: &mut Context<Self>,
@@ -314,44 +375,49 @@ impl Shell {
         if let Some(live) = self
             .sidebar_bots
             .iter()
-            .find(|b| b.id == bot_id)
+            .find(|b| &b.host == host && b.id == bot_id)
             .and_then(SidebarBot::home_session)
         {
             let session = live.session_id;
             if let Some(draft) = kickoff {
-                self.bot_ui.panel.pending_draft = Some((bot_id.clone(), draft));
+                self.bot_ui.panel.pending_draft = Some((host.clone(), bot_id.clone(), draft));
             }
-            self.open_bot_session(&bot_id, session, cx);
+            self.open_bot_session_on(host, &bot_id, session, cx);
             return;
         }
-        self.start_bot_session(bot_id, kickoff, cx);
+        self.start_bot_session_on(host, bot_id, kickoff, cx);
     }
 
-    /// Starts a new chat for a bot (with `kickoff` as its first turn) and opens it.
-    pub(super) fn start_bot_session(
+    /// Starts a new chat for a bot on `host` (with `kickoff` as its first turn) and opens it.
+    pub(super) fn start_bot_session_on(
         &mut self,
+        host: &HostId,
         bot_id: BotId,
         kickoff: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.start_bot_session_in(bot_id, kickoff, None, cx);
+        self.start_bot_session_in_on(host, bot_id, kickoff, None, cx);
     }
 
-    /// Starts a new chat for a bot, filling `target_pane` in place when present (split/tab launcher).
-    pub(super) fn start_bot_session_in(
+    /// Starts a new chat for a bot on `host`, filling `target_pane` in place when present.
+    pub(super) fn start_bot_session_in_on(
         &mut self,
+        host: &HostId,
         bot_id: BotId,
         kickoff: Option<String>,
         target_pane: Option<krill_app::layout::PaneId>,
         cx: &mut Context<Self>,
     ) {
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             if let Some(pane) = target_pane {
                 self.clear_split_launcher_launching(pane);
             }
             return;
         };
-        let bot = self.sidebar_bots.iter().find(|b| b.id == bot_id);
+        let bot = self
+            .sidebar_bots
+            .iter()
+            .find(|b| &b.host == host && b.id == bot_id);
         // krilld won't start a paused bot; say so in the app's words.
         if bot.is_some_and(|b| b.paused) && kickoff.is_none() {
             if let Some(pane) = target_pane {
@@ -361,14 +427,15 @@ impl Shell {
             cx.notify();
             return;
         }
-        if !self.bot_ui.opening.insert(bot_id.clone()) {
+        let opening_key = (host.clone(), bot_id.clone());
+        if !self.bot_ui.opening.insert(opening_key.clone()) {
             if let Some(pane) = target_pane {
                 self.clear_split_launcher_launching(pane);
             }
             return;
         }
         let name = bot.map(|b| b.name.clone()).unwrap_or_default();
-        let host = self.launch_host.clone();
+        let host = host.clone();
         let bot_meta = bot.map(SidebarBot::session_meta);
         let bot_folder = bot.and_then(|b| Self::bot_folder_on(&host, b));
         let host_name: Option<String> = match &host {
@@ -378,7 +445,6 @@ impl Shell {
                 (!label.trim().is_empty() && label != *id).then_some(label)
             }
         };
-        let opening = bot_id.clone();
         cx.spawn(async move |this, cx| {
             let started = cx
                 .background_executor()
@@ -395,7 +461,7 @@ impl Shell {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.bot_ui.opening.remove(&opening);
+                this.bot_ui.opening.remove(&opening_key);
                 if let Some(pane) = target_pane {
                     this.clear_split_launcher_launching(pane);
                 }
@@ -406,25 +472,33 @@ impl Shell {
                         pid,
                     }) => {
                         // Show the new Home Chat under the bot now; the poll fills in the rest.
-                        if this.launch_host == host
-                            && let Some(row) = this.sidebar_bots.iter_mut().find(|b| b.id == bot_id)
+                        let new_summary = krill_proto::bots::BotSessionSummary {
+                            session_id,
+                            bot_id: bot_id.clone(),
+                            link_id: None,
+                            pid,
+                            live: true,
+                            working: false,
+                            label: String::new(),
+                            created_at_ms: now_secs().saturating_mul(1000),
+                        };
+                        if let Some(row) = this
+                            .sidebar_bots
+                            .iter_mut()
+                            .find(|b| b.host == host && b.id == bot_id)
                         {
                             // krilld lists the Home Chat first, then newest.
                             let at = usize::from(row.home_session().is_some());
-                            row.sessions.insert(
-                                at,
-                                krill_proto::bots::BotSessionSummary {
-                                    session_id,
-                                    bot_id: bot_id.clone(),
-                                    link_id: None,
-                                    pid,
-                                    live: true,
-                                    working: false,
-                                    label: String::new(),
-                                    created_at_ms: now_secs().saturating_mul(1000),
-                                },
-                            );
-                        } else if let Some(meta) = bot_meta {
+                            row.sessions.insert(at, new_summary.clone());
+                        }
+                        if let Some(entry) = this.bot_ui.hosts.get_mut(&host)
+                            && let Some(row) =
+                                entry.snapshot.bots.iter_mut().find(|b| b.id == bot_id)
+                        {
+                            let at = usize::from(row.home_session().is_some());
+                            row.sessions.insert(at, new_summary);
+                        }
+                        if let Some(meta) = bot_meta {
                             this.sidebar.update(cx, |sb, cx| {
                                 sb.register_bot_session(host.clone(), session_id, meta, cx);
                             });
@@ -436,7 +510,7 @@ impl Shell {
                         } else {
                             this.open_bot_session_on(&host, &bot_id, session_id, cx);
                         }
-                        this.refresh_bots_badge(cx);
+                        this.refresh_bots_for_host(&host, true, cx);
                     }
                     Ok(_) => {
                         this.notice = Some(text::NB_CREATED_NOT_OPENED.format(&[("name", &name)]));
@@ -461,9 +535,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         use krill_proto::os::ffi::OsStrExt as _;
-        let bot = (*host == self.launch_host)
-            .then(|| self.sidebar_bots.iter().find(|b| &b.id == bot_id).cloned())
-            .flatten();
+        let bot = self
+            .sidebar_bots
+            .iter()
+            .find(|b| &b.host == host && &b.id == bot_id)
+            .cloned();
         if let Some(meta) = bot.as_ref().map(SidebarBot::session_meta) {
             self.sidebar.update(cx, |sb, cx| {
                 sb.register_bot_session(host.clone(), session, meta, cx);
@@ -506,6 +582,7 @@ impl Shell {
     }
 
     /// Shows one of a bot's sessions as a chat tab, labelled with the bot's identity.
+    #[cfg(test)]
     pub(super) fn open_bot_session(
         &mut self,
         bot_id: &BotId,
@@ -524,9 +601,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         use krill_proto::os::ffi::OsStrExt as _;
-        let bot = (*host == self.launch_host)
-            .then(|| self.sidebar_bots.iter().find(|b| &b.id == bot_id).cloned())
-            .flatten();
+        let bot = self
+            .sidebar_bots
+            .iter()
+            .find(|b| &b.host == host && &b.id == bot_id)
+            .cloned();
         if let Some(meta) = bot.as_ref().map(SidebarBot::session_meta) {
             self.sidebar.update(cx, |sb, cx| {
                 sb.register_bot_session(host.clone(), session, meta, cx);
@@ -575,12 +654,28 @@ impl Shell {
         }
     }
 
-    pub(super) fn set_bot_paused(&mut self, bot_id: BotId, paused: bool, cx: &mut Context<Self>) {
-        let Some(rpc) = self.bot_rpc() else {
+    pub(super) fn set_bot_paused_on(
+        &mut self,
+        host: &HostId,
+        bot_id: BotId,
+        paused: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         // Optimistic, like the rest of the sidebar; the poll below corrects a refusal.
-        if let Some(b) = self.sidebar_bots.iter_mut().find(|b| b.id == bot_id) {
+        if let Some(b) = self
+            .sidebar_bots
+            .iter_mut()
+            .find(|b| b.host == host_owned && b.id == bot_id)
+        {
+            b.paused = paused;
+        }
+        if let Some(entry) = self.bot_ui.hosts.get_mut(&host_owned)
+            && let Some(b) = entry.snapshot.bots.iter_mut().find(|b| b.id == bot_id)
+        {
             b.paused = paused;
         }
         cx.notify();
@@ -616,7 +711,7 @@ impl Shell {
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })
@@ -624,12 +719,22 @@ impl Shell {
     }
 
     /// Orca's "Delete bot": removes the bot and keeps its folder (soul and memory stay).
-    pub(super) fn delete_bot_keep_folder(&mut self, bot_id: BotId, cx: &mut Context<Self>) {
-        let Some(rpc) = self.bot_rpc() else {
+    pub(super) fn delete_bot_keep_folder_on(
+        &mut self,
+        host: &HostId,
+        bot_id: BotId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         self.bot_ui.delete = None;
-        self.sidebar_bots.retain(|b| b.id != bot_id);
+        self.sidebar_bots
+            .retain(|b| !(b.host == host_owned && b.id == bot_id));
+        if let Some(entry) = self.bot_ui.hosts.get_mut(&host_owned) {
+            entry.snapshot.bots.retain(|b| b.id != bot_id);
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = cx
@@ -648,7 +753,7 @@ impl Shell {
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })
@@ -672,22 +777,35 @@ impl Shell {
         cx.notify();
     }
 
-    /// Decodes newly read `avatar.png` files (empty = unreadable; remembered so the poll
-    /// doesn't fetch it again until the bot changes) and drops pictures of deleted bots.
-    pub(super) fn store_bot_avatars(&mut self, avatars: Vec<(BotId, u64, Vec<u8>)>) {
+    /// Decodes newly read `avatar.png` files for `host` (empty = unreadable; remembered so the
+    /// poll doesn't fetch it again until the bot changes) and drops pictures of deleted bots.
+    pub(super) fn store_bot_avatars_for_host(
+        &mut self,
+        host: &HostId,
+        avatars: Vec<(BotId, u64, Vec<u8>)>,
+    ) {
         for (id, at, png) in avatars {
             let img = krill_app::bots::rpc::decode_png_avatar(&png).ok();
-            self.bot_ui.avatars.insert(id, (at, img));
+            self.bot_ui.avatars.insert((host.clone(), id), (at, img));
         }
-        let live: HashSet<&BotId> = self.sidebar_bots.iter().map(|b| &b.id).collect();
-        self.bot_ui.avatars.retain(|id, _| live.contains(id));
+        let live: HashSet<&BotId> = self
+            .bot_ui
+            .hosts
+            .get(host)
+            .into_iter()
+            .flat_map(|h| h.snapshot.bots.iter().map(|b| &b.id))
+            .collect();
+        self.bot_ui
+            .avatars
+            .retain(|(h, id), _| h != host || live.contains(id));
     }
 
-    pub(super) fn known_bot_avatars(&self) -> HashMap<BotId, u64> {
+    pub(super) fn known_bot_avatars_for_host(&self, host: &HostId) -> HashMap<BotId, u64> {
         self.bot_ui
             .avatars
             .iter()
-            .map(|(id, (at, _))| (id.clone(), *at))
+            .filter(|((h, _), _)| h == host)
+            .map(|((_, id), (at, _))| (id.clone(), *at))
             .collect()
     }
 
@@ -701,7 +819,7 @@ impl Shell {
         let upload = self
             .bot_ui
             .avatars
-            .get(&bot.id)
+            .get(&(bot.host.clone(), bot.id.clone()))
             .and_then(|(_, img)| img.clone());
         avatar::render(&bot.avatar, upload, &bot.name, px(size), radius, p)
     }
@@ -824,8 +942,8 @@ impl Shell {
         if let Some(bot) = self.bot_ui.delete.clone() {
             out.push(self.render_bot_delete(&bot, window, cx));
         }
-        if let Some(group) = self.bot_ui.delete_group.clone() {
-            out.push(self.render_group_delete(&group, window, cx));
+        if let Some((host, group)) = self.bot_ui.delete_group.clone() {
+            out.push(self.render_group_delete(&host, &group, window, cx));
         }
         out
     }
@@ -848,6 +966,7 @@ impl Shell {
         let path = self
             .bot_folder(bot)
             .map_or_else(|| bot.slug.clone(), |p| p.to_string_lossy().into_owned());
+        let host = bot.host.clone();
         let id = bot.id.clone();
         let card = div()
             .id("bot-delete-dialog")
@@ -902,7 +1021,7 @@ impl Shell {
                             .label(text::SB_DELETE.get())
                             .debug_selector(|| "bot-delete-confirm".into())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.delete_bot_keep_folder(id.clone(), cx);
+                                this.delete_bot_keep_folder_on(&host, id.clone(), cx);
                             })),
                     ),
             );

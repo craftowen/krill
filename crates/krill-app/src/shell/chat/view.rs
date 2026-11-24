@@ -2647,6 +2647,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let bot = self.chat_bot(key).filter(|bot| bot.paused)?;
+        let bot_host = bot.host.clone();
         let bot_id = bot.id.clone();
         let palette = ui::palette(cx);
         Some(
@@ -2686,7 +2687,7 @@ impl Shell {
                         .outline()
                         .xsmall()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_bot_paused(bot_id.clone(), false, cx);
+                            this.set_bot_paused_on(&bot_host, bot_id.clone(), false, cx);
                         })),
                 )
                 .into_any_element(),
@@ -3052,10 +3053,11 @@ impl Shell {
         let palette = ui::palette(cx);
         let muted = palette.muted_foreground;
         let key = (self.layout.host(pane).clone(), session);
-        let created = offer
-            .created
-            .as_ref()
-            .and_then(|id| self.sidebar_bots.iter().find(|b| &b.id == id));
+        let created = offer.created.as_ref().and_then(|id| {
+            self.sidebar_bots
+                .iter()
+                .find(|b| b.host == key.0 && &b.id == id)
+        });
         let face = match created {
             Some(bot) => self.bot_avatar(bot, 32., ui::RADIUS_LG, palette),
             None => krill_app::bots::avatar::render(
@@ -3076,6 +3078,7 @@ impl Shell {
         };
         let offer_id = offer.offer_id.clone();
         let footer = if let Some(bot_id) = offer.created.clone() {
+            let open_host = key.0.clone();
             Some(
                 div().flex().justify_end().child(
                     Button::new("chat-offer-open")
@@ -3084,7 +3087,7 @@ impl Shell {
                         .outline()
                         .small()
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_bot_home(bot_id.clone(), None, cx);
+                            this.open_bot_home_on(&open_host, bot_id.clone(), None, cx);
                         })),
                 ),
             )

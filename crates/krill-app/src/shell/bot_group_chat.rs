@@ -266,10 +266,11 @@ impl Shell {
 
     pub(super) fn group_tab_title(&self, pane: PaneId) -> Option<String> {
         let target = self.layout.group_pane(pane)?;
+        let host = self.layout.host(pane);
         let summary = self
             .sidebar_groups
             .iter()
-            .find(|s| s.group.id == target.group_id);
+            .find(|s| &s.host == host && s.group.id == target.group_id);
         let group_name = summary.map_or(target.group_id.as_str(), |s| s.group.name.as_str());
         if let Some(ref tid) = target.thread_id
             && let Some(thread) =
@@ -282,15 +283,20 @@ impl Shell {
         Some(group_name.to_owned())
     }
 
-    pub(super) fn invalidate_group_room(&mut self, group_id: &str) {
+    pub(super) fn invalidate_group_room(&mut self, host: &HostId, group_id: &str) {
         for (k, room) in &mut self.bot_ui.group_chat.rooms {
-            if k.group_id == group_id {
+            if &k.host == host && k.group_id == group_id {
                 room.last_poll_ms = 0;
             }
         }
     }
 
-    pub(super) fn close_panes_for_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn close_panes_for_group(
+        &mut self,
+        host: &HostId,
+        group_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let matching: Vec<PaneId> = self
             .layout
             .tabs()
@@ -301,9 +307,11 @@ impl Shell {
                 leaves
             })
             .filter(|p| {
-                self.layout
-                    .group_pane(*p)
-                    .is_some_and(|g| g.group_id == group_id)
+                self.layout.host(*p) == host
+                    && self
+                        .layout
+                        .group_pane(*p)
+                        .is_some_and(|g| g.group_id == group_id)
             })
             .collect();
         if matching.is_empty() {
@@ -323,14 +331,27 @@ impl Shell {
         });
     }
 
+    #[cfg(test)]
     pub(in crate::shell) fn open_bot_group(
         &mut self,
+        group_id: &str,
+        thread_id: Option<&str>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.launch_host.clone();
+        self.open_bot_group_on(&host, group_id, thread_id, window, cx);
+    }
+
+    pub(in crate::shell) fn open_bot_group_on(
+        &mut self,
+        host: &HostId,
         group_id: &str,
         thread_id: Option<&str>,
         _window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let host = self.launch_host.clone();
+        let host = host.clone();
         self.dashboard = None;
         self.close_settings(None, cx);
 
@@ -356,7 +377,7 @@ impl Shell {
             .or_else(|| {
                 self.sidebar_groups
                     .iter()
-                    .find(|s| s.group.id == group_id)
+                    .find(|s| s.host == host && s.group.id == group_id)
                     .and_then(|s| s.threads.first().map(|t| t.thread_id.clone()))
             });
         let existing: Option<(PaneId, Option<String>)> =
@@ -415,13 +436,17 @@ impl Shell {
         };
 
         let key = GroupRoomKey {
-            host,
+            host: host.clone(),
             group_id: group_id.to_owned(),
             thread_id: key_thread_id,
         };
         let entry = self.bot_ui.group_chat.rooms.entry(key.clone()).or_default();
         entry.focus_composer = ComposerFocus::Focus;
-        if let Some(summary) = self.sidebar_groups.iter().find(|s| s.group.id == group_id) {
+        if let Some(summary) = self
+            .sidebar_groups
+            .iter()
+            .find(|s| s.host == host && s.group.id == group_id)
+        {
             entry.reply_audience = summary.reply_audience.clone();
         }
         let _ = pane;
@@ -430,15 +455,17 @@ impl Shell {
         cx.notify();
     }
 
-    pub(in crate::shell) fn create_and_open_group_thread(
+    pub(in crate::shell) fn create_and_open_group_thread_on(
         &mut self,
+        host: &HostId,
         group_id: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         let window_handle = window.window_handle();
         let gid = group_id.clone();
         cx.spawn(async move |this, cx| {
@@ -459,8 +486,8 @@ impl Shell {
                     Ok(BotRpcResponse::GroupView(view)) => {
                         let newest = view.threads.first().map(|t| t.thread_id.clone());
                         let _ = window_handle;
-                        this.open_bot_group(&group_id, newest.as_deref(), None, cx);
-                        this.refresh_bots_badge(cx);
+                        this.open_bot_group_on(&host_owned, &group_id, newest.as_deref(), None, cx);
+                        this.refresh_bots_for_host(&host_owned, true, cx);
                     }
                     Ok(_) => {}
                     Err(err) => this.notice = Some(err),
@@ -538,7 +565,11 @@ impl Shell {
 
         // Identify live/waiting/active member sessions to inspect via ChatPoll for turns & ApprovalDock.
         let mut sessions_to_poll: Vec<SessionId> = Vec::new();
-        if let Some(summary) = self.sidebar_groups.iter().find(|s| s.group.id == gid) {
+        if let Some(summary) = self
+            .sidebar_groups
+            .iter()
+            .find(|s| s.host == key.host && s.group.id == gid)
+        {
             for t in &summary.active_turns {
                 if !sessions_to_poll.contains(&t.session_id) {
                     sessions_to_poll.push(t.session_id);
@@ -546,7 +577,11 @@ impl Shell {
             }
             let sidebar = self.sidebar.read(cx);
             for bid in &summary.group.bot_ids {
-                if let Some(bot) = self.sidebar_bots.iter().find(|b| &b.id == bid) {
+                if let Some(bot) = self
+                    .sidebar_bots
+                    .iter()
+                    .find(|b| b.host == key.host && &b.id == bid)
+                {
                     for s in &bot.sessions {
                         let st = sidebar
                             .session_on(&key.host, s.session_id)
@@ -809,7 +844,7 @@ impl Shell {
         if let Some(s) = self
             .sidebar_groups
             .iter_mut()
-            .find(|s| s.group.id == key.group_id)
+            .find(|s| s.host == key.host && s.group.id == key.group_id)
         {
             s.reply_audience = audience.clone();
         }
@@ -1127,7 +1162,7 @@ impl Shell {
         let summary = self
             .sidebar_groups
             .iter()
-            .find(|s| s.group.id == key.group_id)
+            .find(|s| s.host == key.host && s.group.id == key.group_id)
             .cloned();
         let group = self
             .bot_ui
@@ -1142,7 +1177,12 @@ impl Shell {
             .map(|g| {
                 g.bot_ids
                     .iter()
-                    .filter_map(|id| self.sidebar_bots.iter().find(|b| &b.id == id).cloned())
+                    .filter_map(|id| {
+                        self.sidebar_bots
+                            .iter()
+                            .find(|b| b.host == key.host && &b.id == id)
+                            .cloned()
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -1315,8 +1355,17 @@ impl Shell {
     ) -> gpui::Div {
         let title = group.map_or_else(|| key.group_id.clone(), |g| g.name.clone());
         let member_ids: Vec<BotId> = group.map_or_else(Vec::new, |g| g.bot_ids.clone());
-        let face_members = group_faces::resolve_members(&member_ids, &self.sidebar_bots, &|id| {
-            self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone())
+        let host_bots: Vec<SidebarBot> = self
+            .sidebar_bots
+            .iter()
+            .filter(|b| b.host == key.host)
+            .cloned()
+            .collect();
+        let face_members = group_faces::resolve_members(&member_ids, &host_bots, &|id| {
+            self.bot_ui
+                .avatars
+                .get(&(key.host.clone(), id.clone()))
+                .and_then(|(_, img)| img.clone())
         });
         let faces = group_faces::render_group_faces(&face_members, 28., p.background, p);
         let threads = room.map_or(&[][..], |r| r.threads.as_slice());
@@ -1325,6 +1374,8 @@ impl Shell {
             .or(key.thread_id.as_deref());
         let group_clone = group.cloned();
         let aud_clone = audience.clone();
+        let host_thread = key.host.clone();
+        let host_manage = key.host.clone();
         let gid_thread = key.group_id.clone();
 
         let mut thread_strip = div().flex().items_center().gap_1().overflow_hidden();
@@ -1336,6 +1387,7 @@ impl Shell {
                 } else {
                     thr.title.clone()
                 };
+                let open_host = key.host.clone();
                 let gid = key.group_id.clone();
                 let tid = thr.thread_id.clone();
                 thread_strip = thread_strip.child(
@@ -1345,7 +1397,7 @@ impl Shell {
                         .toggled(selected)
                         .label(label)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_bot_group(&gid, Some(&tid), Some(window), cx);
+                            this.open_bot_group_on(&open_host, &gid, Some(&tid), Some(window), cx);
                         })),
                 );
             }
@@ -1412,10 +1464,16 @@ impl Shell {
                                     .format(&[("name", group.map_or("", |g| g.name.as_str()))]),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.create_and_open_group_thread(gid_thread.clone(), window, cx);
+                                this.create_and_open_group_thread_on(
+                                    &host_thread,
+                                    gid_thread.clone(),
+                                    window,
+                                    cx,
+                                );
                             })),
                     )
                     .when_some(group_clone, |d, g| {
+                        let host_manage = host_manage.clone();
                         d.child(
                             Button::new("group-page-manage-members")
                                 .debug_selector(|| "group-page-manage-members".into())
@@ -1424,7 +1482,8 @@ impl Shell {
                                 .icon(IconName::Settings)
                                 .tooltip(text::GRP_MANAGE_MEMBERS.get())
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_manage_group_dialog(
+                                    this.open_manage_group_dialog_on(
+                                        &host_manage,
                                         g.clone(),
                                         aud_clone.clone(),
                                         window,
@@ -1454,10 +1513,18 @@ impl Shell {
 
         if messages.is_empty() {
             let member_ids: Vec<BotId> = group.map_or_else(Vec::new, |g| g.bot_ids.clone());
-            let face_members =
-                group_faces::resolve_members(&member_ids, &self.sidebar_bots, &|id| {
-                    self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone())
-                });
+            let host_bots: Vec<SidebarBot> = self
+                .sidebar_bots
+                .iter()
+                .filter(|b| b.host == key.host)
+                .cloned()
+                .collect();
+            let face_members = group_faces::resolve_members(&member_ids, &host_bots, &|id| {
+                self.bot_ui
+                    .avatars
+                    .get(&(key.host.clone(), id.clone()))
+                    .and_then(|(_, img)| img.clone())
+            });
             let cluster = group_faces::render_group_faces(&face_members, 72., p.background, p);
             let title = group.map_or_else(|| key.group_id.clone(), |g| g.name.clone());
             return div()
@@ -1978,15 +2045,16 @@ impl Shell {
                         )
                     }),
             )
-            .child(
+            .child({
+                let open_host = key.host.clone();
                 Button::new("grp-approval-open-chat")
                     .ghost()
                     .xsmall()
                     .label(text::OPEN_URL_BTN.get())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_bot_session(&bid, sid, cx);
-                    })),
-            );
+                        this.open_bot_session_on(&open_host, &bid, sid, cx);
+                    }))
+            });
 
         let prompt_body = match &active.item {
             Some(item) if item.kind == ChatItemKind::Question && !item.options.is_empty() => {
@@ -2047,16 +2115,17 @@ impl Shell {
                                 .text_color(p.muted_foreground)
                                 .child(text::GRP_QUESTION_OPEN_HINT.get()),
                         )
-                        .child(
+                        .child({
+                            let open_host = key.host.clone();
                             Button::new("grp-dock-open-chat")
                                 .debug_selector(|| "grp-dock-open-chat".into())
                                 .primary()
                                 .xsmall()
                                 .label(text::OPEN_CHAT.get())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_bot_session(&bid_body, sid, cx);
-                                })),
-                        ),
+                                    this.open_bot_session_on(&open_host, &bid_body, sid, cx);
+                                }))
+                        }),
                 ),
             Some(item) => {
                 let k1 = key.clone();
@@ -2495,6 +2564,7 @@ mod tests {
 
     fn sample_bot(id: &str, slug: &str, name: &str) -> SidebarBot {
         SidebarBot {
+            host: HostId::Local,
             id: BotId::new(id).unwrap(),
             name: name.to_owned(),
             emoji: None,

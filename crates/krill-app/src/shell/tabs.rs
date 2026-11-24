@@ -296,10 +296,22 @@ impl Shell {
                 let file_prefix = self.file_tab_prefix(pane);
                 let group_prefix = if is_group {
                     self.group_for_pane(pane).map(|summary| {
+                        let group_host = &summary.host;
+                        let host_bots: Vec<krill_app::bots::SidebarBot> = self
+                            .sidebar_bots
+                            .iter()
+                            .filter(|b| &b.host == group_host)
+                            .cloned()
+                            .collect();
                         let face_members = krill_app::bots::group_faces::resolve_members(
                             &summary.group.bot_ids,
-                            &self.sidebar_bots,
-                            &|id| self.bot_ui.avatars.get(id).and_then(|(_, img)| img.clone()),
+                            &host_bots,
+                            &|id| {
+                                self.bot_ui
+                                    .avatars
+                                    .get(&(group_host.clone(), id.clone()))
+                                    .and_then(|(_, img)| img.clone())
+                            },
                         );
                         let ring_bg = if selected { p.background } else { p.sidebar };
                         krill_app::bots::group_faces::render_group_tab_icon(
@@ -1448,6 +1460,7 @@ impl Shell {
         }
         if let Some(summary) = self.group_for_pane(pane).cloned() {
             item_count.set(item_count.get() + 1);
+            let group_host = summary.host.clone();
             let gid = summary.group.id.clone();
             let new_thread_label = krill_app::i18n::catalog::bots::GRP_NEW_THREAD
                 .format(&[("name", &summary.group.name)]);
@@ -1480,7 +1493,7 @@ impl Shell {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.tab_context_menu = None;
-                        this.create_and_open_group_thread(gid.clone(), window, cx);
+                        this.create_and_open_group_thread_on(&group_host, gid.clone(), window, cx);
                     }))
                     .into_any_element(),
             );

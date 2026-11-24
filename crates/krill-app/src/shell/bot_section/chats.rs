@@ -37,6 +37,7 @@ impl Shell {
         }
         for worker in &facts.stray {
             col = col.child(self.render_worker_line(
+                &bot.host,
                 worker,
                 Some(text::SB_FROM_CLOSED_CHAT.get()),
                 p,
@@ -54,7 +55,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let foldable = !chat.workers.is_empty();
-        let chat_key = (self.launch_host.clone(), chat.session);
+        let host = bot.host.clone();
+        let chat_key = (host.clone(), chat.session);
         let open = foldable && !self.bot_ui.folded_chats.contains(&chat_key);
         let live = chat.workers.iter().filter(|w| w.live).count();
         let waiting = chat.workers.iter().filter(|w| w.waiting()).count();
@@ -80,16 +82,27 @@ impl Shell {
             (chat.at_ms > 0)
                 .then(|| krill_app::jump::format_age_secs(chat.at_ms / 1000, now_secs()))
         };
-        let id = SharedString::from(format!("bot-chat-{}", chat.session.0));
+        let sel = SharedString::from(format!("bot-chat-{}", chat.session.0));
+        let elem_id = SharedString::from(if host.is_local() {
+            format!("bot-chat-{}", chat.session.0)
+        } else {
+            format!("bot-chat-{}-{}", host.as_key(), chat.session.0)
+        });
+        let click_host = host.clone();
         let bot_id = bot.id.clone();
         let session = chat.session;
         let home = chat.home;
         let this = cx.weak_entity();
+        let menu_host = host.clone();
         let menu_bot = bot.id.clone();
-        let group = SharedString::from(format!("bot-chat-group-{}", chat.session.0));
+        let group = SharedString::from(if host.is_local() {
+            format!("bot-chat-group-{}", chat.session.0)
+        } else {
+            format!("bot-chat-group-{}-{}", host.as_key(), chat.session.0)
+        });
         let row = div()
-            .id(id.clone())
-            .debug_selector(move || id.to_string())
+            .id(elem_id)
+            .debug_selector(move || sel.to_string())
             .role(gpui::Role::Button)
             .tab_index(0)
             .focus_visible(|d| d.border_1().border_color(p.ring))
@@ -112,7 +125,7 @@ impl Shell {
             .when(!chat.active, |d| d.hover(|d| d.bg(p.sidebar_accent)))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 if e.click_count() <= 1 {
-                    this.open_bot_session(&bot_id, session, cx);
+                    this.open_bot_session_on(&click_host, &bot_id, session, cx);
                 }
             }))
             .child(self.chat_status_slot(chat, p, cx))
@@ -147,14 +160,17 @@ impl Shell {
                             .children(trailing)
                     })
                     .when(foldable, |d| {
+                        let fold_host = host.clone();
                         let fold = chat.session;
                         let name = chat.title.to_string();
+                        let fold_id = if host.is_local() {
+                            format!("bot-chat-fold-{}", chat.session.0)
+                        } else {
+                            format!("bot-chat-fold-{}-{}", host.as_key(), chat.session.0)
+                        };
                         d.child(
                             div()
-                                .id(SharedString::from(format!(
-                                    "bot-chat-fold-{}",
-                                    chat.session.0
-                                )))
+                                .id(SharedString::from(fold_id))
                                 .debug_selector({
                                     let sel = format!("bot-chat-fold-{}", chat.session.0);
                                     move || sel.clone()
@@ -175,7 +191,7 @@ impl Shell {
                                 .hover(|d| d.text_color(p.foreground))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    let key = (this.launch_host.clone(), fold);
+                                    let key = (fold_host.clone(), fold);
                                     if !this.bot_ui.folded_chats.remove(&key) {
                                         this.bot_ui.folded_chats.insert(key);
                                     }
@@ -195,13 +211,16 @@ impl Shell {
             // Orca `BotChatRowMenu`: Open, then Delete chat (not Home Chat).
             .context_menu(move |menu, _, _| {
                 let open_this = this.clone();
+                let open_host = menu_host.clone();
                 let bot = menu_bot.clone();
                 let menu = menu.item(
                     PopupMenuItem::new(text::SB_OPEN.get())
                         .icon(gpui_component::Icon::default().data(ui::icons::ARROW_UP_RIGHT_SVG))
                         .on_click(move |_, _, cx| {
                             open_this
-                                .update(cx, |s, cx| s.open_bot_session(&bot, session, cx))
+                                .update(cx, |s, cx| {
+                                    s.open_bot_session_on(&open_host, &bot, session, cx);
+                                })
                                 .ok();
                         }),
                 );
@@ -209,13 +228,16 @@ impl Shell {
                     return menu;
                 }
                 let stop_this = this.clone();
+                let stop_host = menu_host.clone();
                 let bot = menu_bot.clone();
                 menu.separator().item(
                     PopupMenuItem::new(text::SB_DELETE_CHAT.get())
                         .icon(IconName::Delete)
                         .on_click(move |_, _, cx| {
                             stop_this
-                                .update(cx, |s, cx| s.stop_bot_chat(bot.clone(), session, cx))
+                                .update(cx, |s, cx| {
+                                    s.stop_bot_chat_on(&stop_host, bot.clone(), session, cx);
+                                })
                                 .ok();
                         }),
                 )
@@ -229,12 +251,18 @@ impl Shell {
             let mut lines = div().ml_3().flex().flex_col().gap_1();
             for (i, w) in chat.workers.iter().enumerate() {
                 if i < shown || w.active {
-                    lines = lines.child(self.render_worker_line(w, None, p, cx));
+                    lines = lines.child(self.render_worker_line(&host, w, None, p, cx));
                 }
             }
             let fold = chat.session;
+            let more_host = host.clone();
             let more = (remaining > 0).then(|| {
                 link(
+                    if host.is_local() {
+                        format!("bot-chat-more-{}", chat.session.0)
+                    } else {
+                        format!("bot-chat-more-{}-{}", host.as_key(), chat.session.0)
+                    },
                     format!("bot-chat-more-{}", chat.session.0),
                     text::SB_SHOW_MORE.format(&[("n", &remaining.min(STEP).to_string())]),
                     p,
@@ -243,21 +271,25 @@ impl Shell {
                     *this
                         .bot_ui
                         .chat_steps
-                        .entry((this.launch_host.clone(), fold))
+                        .entry((more_host.clone(), fold))
                         .or_default() += 1;
                     cx.notify();
                 }))
             });
+            let fewer_host = host.clone();
             let fewer = (steps > 0).then(|| {
                 link(
+                    if host.is_local() {
+                        format!("bot-chat-fewer-{}", chat.session.0)
+                    } else {
+                        format!("bot-chat-fewer-{}-{}", host.as_key(), chat.session.0)
+                    },
                     format!("bot-chat-fewer-{}", chat.session.0),
                     text::SB_SHOW_FEWER.get().to_owned(),
                     p,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bot_ui
-                        .chat_steps
-                        .remove(&(this.launch_host.clone(), fold));
+                    this.bot_ui.chat_steps.remove(&(fewer_host.clone(), fold));
                     cx.notify();
                 }))
             });
@@ -336,12 +368,19 @@ impl Shell {
     /// One worker as Orca's compact workspace line: status, agent, workspace name, project.
     fn render_worker_line(
         &self,
+        host: &krill_app::hosts::HostId,
         worker: &WorkerFacts,
         note: Option<&'static str>,
         p: &'static ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let sel = format!("bot-worker-{}", worker.key);
+        let elem_id = if host.is_local() {
+            sel.clone()
+        } else {
+            format!("bot-worker-{}-{}", host.as_key(), worker.key)
+        };
+        let click_host = host.clone();
         let session = worker.session;
         let state = if worker.live {
             worker.state
@@ -349,7 +388,7 @@ impl Shell {
             AgentState::Done
         };
         div()
-            .id(SharedString::from(sel.clone()))
+            .id(SharedString::from(elem_id))
             .debug_selector(move || sel.clone())
             .role(gpui::Role::Button)
             .aria_label(worker.title.clone())
@@ -376,8 +415,7 @@ impl Shell {
             .when(session.is_some(), gpui::Styled::cursor_pointer)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(session) = session {
-                    let host = this.launch_host.clone();
-                    this.open_session_on(host, session, cx);
+                    this.open_session_on(click_host.clone(), session, cx);
                 }
             }))
             .child(ui::status::status_glyph_slot(
@@ -440,15 +478,17 @@ impl Shell {
     }
 
     /// Orca "Delete chat": ends that chat's session.
-    fn stop_bot_chat(
+    fn stop_bot_chat_on(
         &mut self,
+        host: &krill_app::hosts::HostId,
         bot_id: krill_proto::bots::BotId,
         session_id: SessionId,
         cx: &mut Context<Self>,
     ) {
-        let Some(rpc) = self.bot_rpc() else {
+        let Some(rpc) = self.bot_rpc_on(host) else {
             return;
         };
+        let host_owned = host.clone();
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -463,7 +503,7 @@ impl Shell {
                 if let Err(err) = res {
                     this.notice = Some(err);
                 }
-                this.refresh_bots_badge(cx);
+                this.refresh_bots_for_host(&host_owned, true, cx);
             })
             .ok();
         })
@@ -472,8 +512,12 @@ impl Shell {
 }
 
 /// Orca `BotChatPaging`'s links.
-fn link(id: String, label: String, p: &'static ui::Palette) -> gpui::Stateful<gpui::Div> {
-    let sel = id.clone();
+fn link(
+    id: String,
+    sel: String,
+    label: String,
+    p: &'static ui::Palette,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id))
         .debug_selector(move || sel.clone())

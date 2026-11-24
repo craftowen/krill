@@ -1006,6 +1006,7 @@ impl Shell {
                     ctext::PERMISSION_ASK_DESC.get(),
                 )
             };
+            let bot_host = key.0.clone();
             let bot_id = bot_id.clone();
             Button::new(SharedString::from(format!(
                 "chat-composer-permission-{}",
@@ -1020,7 +1021,7 @@ impl Shell {
             .xsmall()
             .when(full, |b| b.text_color(palette.warning))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_bot_settings_in_panel(&bot_id, cx);
+                this.open_bot_settings_in_panel_on(&bot_host, &bot_id, cx);
             }))
         });
         let workspace_footer = bot.map(|(_, _, folder, path)| {

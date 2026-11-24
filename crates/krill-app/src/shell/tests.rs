@@ -3600,6 +3600,7 @@ fn account_switch_closed_frame_keeps_bot_chat_tab_and_draft_in_place(cx: &mut Te
                 );
             });
             s.sidebar_bots.push(krill_app::bots::SidebarBot {
+                host: krill_app::hosts::HostId::Local,
                 id: bot_id.clone(),
                 name: "크릴".into(),
                 emoji: None,

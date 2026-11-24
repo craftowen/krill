@@ -250,7 +250,7 @@ impl Shell {
             self.new_tab_on_launch_host(cx);
             return;
         };
-        let host = self.launch_host.clone();
+        let host = bot.host.clone();
         let bot_folder = self.bot_folder(&bot);
         let cwd_bytes = bot_folder
             .as_ref()
@@ -309,7 +309,7 @@ impl Shell {
             return;
         }
         if let Some(bot) = self.focused_bot().cloned() {
-            self.start_bot_session(bot.id, None, cx);
+            self.start_bot_session_on(&bot.host, bot.id, None, cx);
             return;
         }
         if self.link == krill_app::link::Link::Up && self.agents.is_some() {
@@ -630,13 +630,17 @@ impl Shell {
             return;
         }
         if let Some(bot) = self.bot_for_pane(pane).cloned() {
-            if self.bot_ui.opening.contains(&bot.id) {
+            if self
+                .bot_ui
+                .opening
+                .contains(&(bot.host.clone(), bot.id.clone()))
+            {
                 return;
             }
             if let Some(launcher) = self.split_launchers.get_mut(&pane) {
                 launcher.launching = true;
             }
-            self.start_bot_session_in(bot.id, None, Some(pane), cx);
+            self.start_bot_session_in_on(&bot.host, bot.id, None, Some(pane), cx);
             return;
         }
         if let Some(agent_id) = self.launcher_default_agent_id(pane, cx) {
@@ -662,13 +666,17 @@ impl Shell {
                 || krill_proto::agent::canonical_id(&bot.agent_id)
                     .eq_ignore_ascii_case(krill_proto::agent::canonical_id(&agent_id)))
         {
-            if self.bot_ui.opening.contains(&bot.id) {
+            if self
+                .bot_ui
+                .opening
+                .contains(&(bot.host.clone(), bot.id.clone()))
+            {
                 return;
             }
             if let Some(launcher) = self.split_launchers.get_mut(&pane) {
                 launcher.launching = true;
             }
-            self.start_bot_session_in(bot.id, None, Some(pane), cx);
+            self.start_bot_session_in_on(&bot.host, bot.id, None, Some(pane), cx);
             return;
         }
         let cwd = self.launcher_cwd(pane);
@@ -1288,6 +1296,7 @@ mod tests {
     fn test_bot(id: &str, slug: &str, home_sid: SessionId) -> SidebarBot {
         let bot_id = BotId::new(id).unwrap();
         SidebarBot {
+            host: HostId::Local,
             id: bot_id.clone(),
             name: "KrillBot".to_owned(),
             emoji: None,
