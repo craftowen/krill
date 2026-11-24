@@ -398,7 +398,7 @@ impl Shell {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn apply_sidebar_bots(
         &mut self,
         attention: usize,
@@ -429,7 +429,7 @@ impl Shell {
         self.apply_sidebar_state_for_host(host, attention, bots, groups, cx);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn apply_sidebar_state(
         &mut self,
         attention: usize,

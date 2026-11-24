@@ -597,7 +597,7 @@ impl Shell {
     }
 
     /// Shows one of a bot's sessions as a chat tab, labelled with the bot's identity.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn open_bot_session(
         &mut self,
         bot_id: &BotId,
