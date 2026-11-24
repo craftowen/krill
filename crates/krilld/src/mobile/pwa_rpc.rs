@@ -569,6 +569,8 @@ pub(super) struct Backend {
     git_cache: Arc<Mutex<HashMap<PathBuf, (Instant, Value)>>>,
     git_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     git_revision: Arc<AtomicU64>,
+    /// 프로젝트 아이콘 비동기 SWR 캐시(스냅샷 응답 0ms 유지 + 콘텐츠 해시 배치 서빙).
+    repo_icons: Arc<super::project_icons::RepoIconCache>,
     snapshot_cache: Mutex<Option<DashboardSnapshot>>,
     /// 스냅샷을 새로 만들 때마다 늘어난다. 늦게 도착한 옛 스냅샷이 새 것을 덮지 않게 한다.
     snapshot_rev: AtomicU64,
@@ -1058,6 +1060,10 @@ enum Action {
         bot_id: String,
         suggestion_id: String,
     },
+    #[serde(rename = "repo_icons.read")]
+    RepoIconsRead {
+        keys: Vec<String>,
+    },
     #[serde(rename = "bots.avatar.read")]
     BotsAvatarRead {
         bot_id: String,
@@ -1318,6 +1324,7 @@ impl Backend {
             git_cache: Arc::default(),
             git_inflight: Arc::default(),
             git_revision: Arc::default(),
+            repo_icons: Arc::default(),
             snapshot_cache: Mutex::default(),
             snapshot_rev: AtomicU64::default(),
             catalog_cache: Mutex::default(),
@@ -2822,6 +2829,13 @@ impl Backend {
                     _ => Err(invalid()),
                 }
             }
+            Action::RepoIconsRead { keys } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                let dashboard = registry.mobile_dashboard_inputs_swr()?;
+                let catalog = self.catalog(&dashboard.repositories);
+                self.repo_icons
+                    .read_batch(&catalog, &keys, self.dir.as_deref())
+            }
             Action::BotsAvatarRead { bot_id } => {
                 self.ensure_bots_active()?;
                 let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
@@ -3495,6 +3509,10 @@ impl Backend {
                 .git_revision
                 .load(Ordering::Relaxed)
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ self
+                .repo_icons
+                .revision()
+                .wrapping_mul(0x517C_C1B7_2722_0A95)
     }
 
     #[cfg(test)]
@@ -3758,10 +3776,13 @@ impl Backend {
                 "state_source":state.source,"state_confidence":state.confidence,
                 "state_since_unix_ns":state.since_unix_ns.to_string()}));
         }
+        let repo_icons = self
+            .repo_icons
+            .resolve_swr(&catalog.icon_targets(), self.dir.as_deref());
         let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "bots":self.snapshot_bots_summary()?,
-            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks, &awake),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true},
+            "repositories":catalog.repositories_json_with_icons(&repo_icons),"workspaces":catalog.workspaces_json_with_icons(&workspace_titles, &ranks, &awake, &repo_icons),"truncated":truncated,
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true,"repo_icons":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value});
         bound_snapshot_payload(&mut data);
@@ -7744,6 +7765,7 @@ mod revision_tests {
             r#"{"action":"bots.suggestions.dismiss","bot_id":"b1","suggestion_id":"sug-1"}"#,
             r#"{"action":"bots.suggestions.start","bot_id":"b1","suggestion_id":"sug-1"}"#,
             r#"{"action":"bots.avatar.read","bot_id":"b1"}"#,
+            r#"{"action":"repo_icons.read","keys":["616263"]}"#,
             r#"{"action":"bots.access.redeem","code":"KRILL-1234"}"#,
         ] {
             let parsed: Result<Action, _> = serde_json::from_str(payload);
@@ -7768,6 +7790,100 @@ mod revision_tests {
         assert!(
             wrapped_ok_len(&bounded_grp) < ipc::MAX_FRAME.saturating_sub(MOBILE_FRAME_HEADROOM)
         );
+    }
+
+    #[test]
+    fn snapshot_and_repo_icons_read_resolve_icons_without_blocking_or_leaking_paths() {
+        let base = std::env::temp_dir().join(format!("mk-pwa-repo-icons-{}", std::process::id()));
+        fs::remove_dir_all(&base).ok();
+        let state_dir = base.join("state");
+        let repo = base.join("krill-demo");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(repo.join("public")).unwrap();
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16"/></svg>"#;
+        let fav = repo.join("public/favicon.svg");
+        fs::write(&fav, svg).unwrap();
+        fs::write(
+            state_dir.join("projects.toml"),
+            format!(
+                r#"[[projects]]
+id = "demo"
+path = "{}"
+display_name = "krill-demo"
+kind = "git"
+[projects.repo_icon]
+kind = "image"
+value = "{}"
+"#,
+                repo.display().to_string().replace('\\', "\\\\"),
+                fav.display().to_string().replace('\\', "\\\\"),
+            ),
+        )
+        .unwrap();
+
+        let registry = Arc::new(Registry::new(None, Some(&state_dir)));
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&state_dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+
+        let rev_before = backend.effective_revision(&registry);
+        // 1. Cold snapshot returns immediately with capability advertised and never leaks local icon path.
+        let first_raw = backend.request(r#"{"action":"snapshot"}"#);
+        let first: Value = serde_json::from_str(&first_raw).unwrap();
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["data"]["capabilities"]["repo_icons"], true);
+        let first_repo = &first["data"]["repositories"][0];
+        assert!(
+            first_repo["icon"].is_null(),
+            "cold snapshot must not block or emit raw local file paths: {first_repo}"
+        );
+        let repo_key = first_repo["key"].as_str().unwrap().to_owned();
+
+        // 2. Background SWR probe resolves the favicon and bumps effective_revision.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (!backend.repo_icons.is_idle() || backend.repo_icons.revision() == 0)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(backend.repo_icons.is_idle());
+        assert_ne!(backend.effective_revision(&registry), rev_before);
+
+        // 3. Warm snapshot emits compact content hash (no raw path, no inline base64).
+        let second_raw = backend.request(r#"{"action":"snapshot"}"#);
+        let second: Value = serde_json::from_str(&second_raw).unwrap();
+        assert_eq!(second["ok"], true);
+        let second_icon = &second["data"]["repositories"][0]["icon"];
+        assert_eq!(second_icon["kind"], "image");
+        let hash = second_icon["hash"].as_str().unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(second_icon.get("value").is_none());
+        assert!(!second_raw.contains("favicon.svg"));
+
+        // 4. Batch RPC serves the SVG payload for the registered key and ignores unknown keys.
+        let read_raw = backend
+            .request(&json!({"action": "repo_icons.read", "keys": [repo_key, "0000"]}).to_string());
+        let read: Value = serde_json::from_str(&read_raw).unwrap();
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["data"]["truncated"], false);
+        let entry = &read["data"]["icons"][&repo_key];
+        assert_eq!(entry["hash"], hash);
+        assert_eq!(entry["mime"], "image/svg+xml");
+        assert_eq!(
+            entry["data_base64"].as_str().unwrap(),
+            crate::mobile::ws::base64(svg, false)
+        );
+        assert!(read["data"]["icons"].get("0000").is_none());
+
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

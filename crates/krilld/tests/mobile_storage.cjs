@@ -94,3 +94,32 @@ test('warm-cache sanitizer preserves bounded catalog facts while stripping secre
  const cold=fixture(database(),f.store);cold.db.stall=true;check(cold.cache.bind(host,auth).peek());cold.cache.close();
  const warm=fixture(f.db);check(await settle(warm,warm.cache.bind(host,auth).hydrate()));warm.cache.close();
 });
+test('warm-cache icon allowlist preserves hex image hashes and Lucide names while stripping paths, secrets and icon cache on clear',async()=>{
+ const f=fixture(),bound=f.cache.bind(host,auth),hash='0123456789abcdef';
+ f.store.set('krill-mobile-repo-icons-v1',JSON.stringify([[hash,'image/png','AA==']]));
+ f.store.set('unrelated','keep');
+ const input={
+  host:{display_name:'Studio',platform:'macos'},
+  sessions:[],
+  repositories:[
+   {key:'img',label:'Img',path:'/img',icon:{kind:'image',hash,value:'/Users/secret/favicon.ico',secret:'SECRET'}},
+   {key:'luc',label:'Luc',path:'/luc',icon:{kind:'lucide',value:'Rocket',extra:'SECRET'}},
+   {key:'bad-img',label:'BadImg',path:'/bad',icon:{kind:'image',hash:'not-hex',value:'https://evil.test/a.png'}},
+   {key:'bad-luc',label:'BadLuc',path:'/bad2',icon:{kind:'lucide',value:'<script>'}},
+  ],
+  workspaces:[{key:'w1',repo_key:'img',label:'main',path:'/img',icon:{kind:'image',hash,secret:'SECRET'}}],
+ };
+ assert.equal(await settle(f,bound.write(input)),true);
+ const persisted=JSON.stringify([...f.db.rows.values()])+f.store.get('krill-mobile-seed-v1:'+host);
+ for(const forbidden of ['SECRET','/Users/secret','evil.test','<script>'])assert(!persisted.includes(forbidden),forbidden);
+ const peeked=bound.peek();
+ assert.deepEqual(plain(peeked.repositories[0].icon),{kind:'image',hash});
+ assert.deepEqual(plain(peeked.repositories[1].icon),{kind:'lucide',value:'Rocket'});
+ assert.equal(peeked.repositories[2].icon,undefined);
+ assert.equal(peeked.repositories[3].icon,undefined);
+ assert.deepEqual(plain(peeked.workspaces[0].icon),{kind:'image',hash});
+ assert.equal(await settle(f,f.cache.clear()),true);
+ assert.equal(f.store.has('krill-mobile-repo-icons-v1'),false);
+ assert.equal(f.store.get('unrelated'),'keep');
+ f.cache.close();
+});

@@ -38,6 +38,7 @@ pub(crate) fn bot_launch_models(
 ) -> krill_proto::bots::BotAgentModels {
     pwa_rpc::composer::launch_models(home, agents, agent)
 }
+mod project_icons;
 mod relay_auth;
 pub mod tailscale_serve;
 mod workspaces;

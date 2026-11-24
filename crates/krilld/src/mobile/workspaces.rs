@@ -1,5 +1,6 @@
 //! 모바일 목록도 데스크톱의 projects.toml·sidebar.bin을 읽는다. 세션 유무는 목록의 조건이 아니다.
 use super::devices::hex;
+use super::project_icons::{MobileIconMeta, RepoIconTarget};
 use krill_proto::control::RepositoryTrees;
 use krill_proto::os::ffi::OsStrExt as _;
 use serde::Deserialize;
@@ -26,6 +27,7 @@ struct Project {
     id: String,
     path: String,
     display_name: String,
+    kind: Option<String>,
     badge_color: Option<String>,
     repo_icon: Option<RepoIcon>,
     pinned: bool,
@@ -140,6 +142,7 @@ pub(super) struct Catalog {
     branches: BTreeMap<PathBuf, String>,
     repo_labels: BTreeMap<PathBuf, String>,
     repo_icons: BTreeMap<PathBuf, RepoIcon>,
+    repo_is_git: BTreeMap<PathBuf, bool>,
     repo_badges: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
     project_order: Vec<PathBuf>,
@@ -414,6 +417,10 @@ impl Catalog {
                     .entry(repo.clone())
                     .or_insert_with(|| dn.to_owned());
             }
+            catalog
+                .repo_is_git
+                .entry(repo.clone())
+                .or_insert_with(|| project.kind.as_deref() != Some("folder"));
             if let Some(icon) = project.repo_icon.as_ref()
                 && !icon.value.trim().is_empty()
             {
@@ -569,7 +576,53 @@ impl Catalog {
             .find(|r| hex(&r.repo) == key)
             .map(|r| r.repo.clone())
     }
+    /// 등록된 저장소들의 아이콘 탐지 대상을 돌려준다.
+    pub fn icon_targets(&self) -> Vec<RepoIconTarget> {
+        self.repositories
+            .iter()
+            .map(|r| self.target_for_repo(&path(&r.repo)))
+            .collect()
+    }
+    /// 등록된 저장소 키 하나의 아이콘 탐지 대상을 돌려준다(임의 경로 거부).
+    pub fn icon_target_for_key(&self, key: &str) -> Option<RepoIconTarget> {
+        let raw = self.repository(key)?;
+        Some(self.target_for_repo(&path(&raw)))
+    }
+    fn target_for_repo(&self, repo: &Path) -> RepoIconTarget {
+        let is_git = self.repo_is_git.get(repo).copied().unwrap_or(true);
+        let explicit = self
+            .repo_icons
+            .get(repo)
+            .map(|i| (i.kind.clone(), i.value.clone()));
+        RepoIconTarget {
+            repo: repo.to_path_buf(),
+            is_git,
+            explicit,
+        }
+    }
+    fn icon_json(&self, target: &Path, icons: &BTreeMap<PathBuf, MobileIconMeta>) -> Value {
+        if let Some(meta) = icons.get(target) {
+            return meta.to_json();
+        }
+        // SWR 캐시에 아직 없어도 이모지·Lucide는 디스크 I/O 없이 즉시 내려주고, 로컬 이미지 경로는 노출하지 않는다.
+        self.repo_icons.get(target).map_or(Value::Null, |i| {
+            let kind = i.kind.trim();
+            let value = i.value.trim();
+            if !value.is_empty() && matches!(kind, "emoji" | "lucide") {
+                json!({"kind": kind, "value": value})
+            } else {
+                Value::Null
+            }
+        })
+    }
+    #[cfg(test)]
     pub fn repositories_json(&self) -> Vec<Value> {
+        self.repositories_json_with_icons(&BTreeMap::new())
+    }
+    pub fn repositories_json_with_icons(
+        &self,
+        icons: &BTreeMap<PathBuf, MobileIconMeta>,
+    ) -> Vec<Value> {
         self.repositories
             .iter()
             .map(|r| {
@@ -577,7 +630,7 @@ impl Catalog {
                 json!({"key":hex(&r.repo),"path":repo.to_string_lossy(),
                 "remote":git_remote_slug(&repo),
                 "label":self.repo_labels.get(&repo).cloned().unwrap_or_else(|| label(&repo)),
-                "icon":self.repo_icons.get(&repo).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
+                "icon":self.icon_json(&repo, icons),
                 "badge_color":self.repo_badges.get(&repo).cloned().map_or(Value::Null, Value::String),
                 "removed":self.view.removed.contains(&repo),
                 "worktree_keys":r.worktrees.iter().map(|t| hex(t)).collect::<Vec<_>>()})
@@ -646,14 +699,24 @@ impl Catalog {
                 .unwrap_or_else(|| label(tree).replace('-', " "))
         }
     }
-    /// 데스크톱 사이드바와 같은 워크트리 순서·들여쓰기·아이콘을 낸다.
-    /// `ranks`는 워크트리 경로별 스마트 순위(0 승인대기 최우선, 4 유휴)다.
-    /// PC 사이드바에서 숨는 워크트리도 데이터는 남긴다(세션 열기·검색용).
+    #[cfg(test)]
     pub fn workspaces_json(
         &self,
         auto_titles: &BTreeMap<PathBuf, String>,
         ranks: &BTreeMap<PathBuf, u8>,
         awake: &BTreeSet<PathBuf>,
+    ) -> Vec<Value> {
+        self.workspaces_json_with_icons(auto_titles, ranks, awake, &BTreeMap::new())
+    }
+    /// 데스크톱 사이드바와 같은 워크트리 순서·들여쓰기·아이콘을 낸다.
+    /// `ranks`는 워크트리 경로별 스마트 순위(0 승인대기 최우선, 4 유휴)다.
+    /// PC 사이드바에서 숨는 워크트리도 데이터는 남긴다(세션 열기·검색용).
+    pub fn workspaces_json_with_icons(
+        &self,
+        auto_titles: &BTreeMap<PathBuf, String>,
+        ranks: &BTreeMap<PathBuf, u8>,
+        awake: &BTreeSet<PathBuf>,
+        icons: &BTreeMap<PathBuf, MobileIconMeta>,
     ) -> Vec<Value> {
         // 데스크톱 `sort_worktrees`와 같은 키: 핀 → 정렬 기준(스마트 순위·생성 시각) → 이름.
         // `sort_by`는 `SortBy` 변형 인덱스(0 스마트·1 최근·2 이름·3 생성순)다.
@@ -730,6 +793,10 @@ impl Catalog {
                         let branch = self.branches.get(&tree);
                         let title = self.worktree_label(&tree, &repo, auto_titles);
                         let raw = tree.as_os_str().as_bytes().to_vec();
+                        let icon = match self.icon_json(&tree, icons) {
+                            Value::Null => self.icon_json(&repo, icons),
+                            found => found,
+                        };
                         json!({"key":hex(&raw),"repo_key":hex(&r.repo),"path":tree.to_string_lossy(),
                     "label":title,
                     "pinned":pref.is_some_and(|p| p.pinned),"branch":branch,
@@ -738,7 +805,7 @@ impl Catalog {
                     "parent":parents.get(&tree),
                     "status":self.statuses.get(&tree).copied().unwrap_or("todo"),
                     "depth":depth,"primary":tree == repo,
-                    "icon":self.repo_icons.get(&tree).or_else(|| self.repo_icons.get(&repo)).map_or(Value::Null, |i| json!({"kind":i.kind,"value":i.value})),
+                    "icon":icon,
                     "badge_color":self.repo_badges.get(&tree).or_else(|| self.repo_badges.get(&repo)).cloned().map_or(Value::Null, Value::String)})
                     })
             })
@@ -1551,6 +1618,38 @@ value = "🚀"
             git_remote_slug(&without_origin).as_deref(),
             Some("up/stream")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repositories_json_never_leaks_raw_local_image_paths() {
+        let dir = std::env::temp_dir().join(format!("krill-ws-icon-path-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("projects.toml"),
+            r#"
+[[projects]]
+id = "img"
+path = "/secret-repo"
+[projects.repo_icon]
+kind = "image"
+value = "/Users/private/secret/favicon.ico"
+[[projects]]
+id = "luc"
+path = "/lucide-repo"
+[projects.repo_icon]
+kind = "lucide"
+value = "Rocket"
+"#,
+        )
+        .unwrap();
+        let catalog = Catalog::load(Some(&dir), &[]);
+        let repos = catalog.repositories_json();
+        let img = repos.iter().find(|r| r["path"] == "/secret-repo").unwrap();
+        assert!(img["icon"].is_null());
+        let luc = repos.iter().find(|r| r["path"] == "/lucide-repo").unwrap();
+        assert_eq!(luc["icon"]["kind"], "lucide");
+        assert_eq!(luc["icon"]["value"], "Rocket");
         fs::remove_dir_all(dir).unwrap();
     }
 }

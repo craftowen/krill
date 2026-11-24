@@ -1673,6 +1673,125 @@ async function mobileAuditWave2Regressions(){
  }
  console.log('PASS mobile audit wave 2 regressions: M-01..M-10, M-12..M-15');
 }
+async function projectIcons(){
+ const store=new Map(),ls={getItem:k=>store.get(k)??null,setItem:(k,v)=>store.set(k,String(v)),removeItem:k=>store.delete(k)};
+ const hashA='a'.repeat(16),hashB='b'.repeat(16),hashMiss='c'.repeat(16),pngB64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2d8AAAAASUVORK5CYII=',svgB64='PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiIvPg==';
+ const hostCalls=[];
+ const f=fixture('workspaces',{
+  globals:{localStorage:ls},
+  rpc:req=>{
+   hostCalls.push({host:null,req});
+   return {icons:{'k1':{hash:hashA,mime:'image/png',data_base64:pngB64},'k3':{hash:hashB,mime:'image/svg+xml',data_base64:svgB64}},truncated:false};
+  },
+ });
+ // Record requested icon glyph names to verify Lucide mapping and tinted fallback.
+ f.ctx.icon=name=>{const svg=f.ctx.el('svg');svg.dataset.iconName=name;return svg;};
+ const h1={
+  id:'mac-a',name:'Mac A',active:true,connection:{phase:'ready'},cached:false,
+  snapshot:{
+   capabilities:{repo_icons:true,worktree_create:true},
+   repositories:[
+    {key:'k1',label:'krill',path:'/krill',icon:{kind:'image',hash:hashA},badge_color:'#737373'},
+    {key:'k2',label:'kakaouto',path:'/kakaouto',icon:{kind:'image',hash:hashA}},
+    {key:'k3',label:'linear-lite',path:'/linear-lite',icon:{kind:'image',hash:hashB}},
+    {key:'k4',label:'drive',path:'/drive',badge_color:'#ef4444'},
+    {key:'k5',label:'rocket',path:'/rocket',icon:{kind:'lucide',value:'Rocket'},badge_color:'#22c55e'},
+    {key:'k6',label:'missing',path:'/missing',icon:{kind:'image',hash:hashMiss}},
+   ],
+   workspaces:[
+    {key:'w1',repo_key:'k1',label:'main',primary:true},
+    {key:'w2',repo_key:'k2',label:'main',primary:true},
+    {key:'w3',repo_key:'k3',label:'main',primary:true},
+    {key:'w4',repo_key:'k4',label:'main',primary:true},
+    {key:'w5',repo_key:'k5',label:'main',primary:true},
+    {key:'w6',repo_key:'k6',label:'main',primary:true},
+   ],
+   sessions:[],
+  },
+ };
+ const h2={
+  id:'mac-b',name:'Mac B',active:false,connection:{phase:'ready'},cached:false,
+  snapshot:{
+   capabilities:{repo_icons:true},
+   // Shares hashA with mac-a: deduplicated across hosts so mac-b needs zero RPC!
+   repositories:[{key:'kb1',label:'krill-b',path:'/krill-b',icon:{kind:'image',hash:hashA}}],
+   workspaces:[{key:'wb1',repo_key:'kb1',label:'main',primary:true}],
+   sessions:[],
+  },
+ };
+ f.ctx.connections=[h1,h2];
+ f.ctx.rpcForHost=(hostId,req)=>{
+  hostCalls.push({host:hostId,req});
+  return Promise.resolve({icons:{'k1':{hash:hashA,mime:'image/png',data_base64:pngB64},'k3':{hash:hashB,mime:'image/svg+xml',data_base64:svgB64}},truncated:false});
+ };
+ // Initial draw paints immediately with zero synchronous RPCs (deferred microtask).
+ f.view.update();
+ assert.equal(hostCalls.length,0,'icon fetch is deferred until after initial render');
+ const markOf=label=>f.all().find(n=>n.classList.contains('repo-toggle')&&n.querySelector('.repo-label').textContent===label).querySelector('.project-icon');
+ assert.equal(markOf('drive').querySelector('svg').style.color,'#ef4444','non-neutral badge_color tints folder icon');
+ assert.equal(markOf('krill').querySelector('svg').style.color,undefined,'neutral #737373 keeps default muted color');
+ assert.equal(markOf('rocket').querySelector('svg').dataset.iconName,'rocket','PC Lucide name maps to mobile SVG path');
+ assert.equal(markOf('rocket').querySelector('svg').style.color,'#22c55e','Lucide icon inherits non-neutral badge_color');
+
+ // Deferred batch fetch sends ONE deduplicated RPC for mac-a (k1, k3, k6) and ZERO for mac-b.
+ await f.flush();
+ assert.equal(hostCalls.length,1,'single deduplicated batch RPC across repos and hosts');
+ assert.equal(hostCalls[0].host,'mac-a');
+ assert.deepEqual(JSON.parse(JSON.stringify(hostCalls[0].req)),{action:'repo_icons.read',keys:['k1','k3','k6']});
+ assert.equal(markOf('krill').querySelector('img').src,`data:image/png;base64,${pngB64}`);
+ assert.equal(markOf('kakaouto').querySelector('img').src,`data:image/png;base64,${pngB64}`,'shared hash renders without duplicate fetch');
+ assert.equal(markOf('krill-b').querySelector('img').src,`data:image/png;base64,${pngB64}`,'cross-host shared hash renders from single cache');
+ assert.equal(markOf('linear-lite').querySelector('img').src,`data:image/svg+xml;base64,${svgB64}`);
+ assert.equal(markOf('krill').querySelector('img').decoding,'async');
+
+ // Missing hash is negative-cached: subsequent redraw sends zero retries.
+ f.view.update();
+ await f.flush();
+ assert.equal(hostCalls.length,1,'unreturned hash does not loop on redraw');
+
+ // Broken image decode falls back cleanly to folder glyph.
+ const krillImg=markOf('krill').querySelector('img');
+ krillImg.onerror();
+ assert.equal(markOf('krill').querySelector('img'),null,'onerror removes broken image');
+ assert.equal(markOf('krill').querySelector('svg').dataset.iconName,'folder');
+ f.abort.abort();
+
+ // Warm relaunch hydrates synchronously from localStorage with ZERO network RPCs.
+ const warmCalls=[];
+ const w=fixture('workspaces',{globals:{localStorage:ls},rpc:req=>{warmCalls.push(req);return {};}});
+ w.state.snapshot={
+  capabilities:{repo_icons:true,worktree_create:true},
+  repositories:[{key:'k1',label:'krill',path:'/krill',icon:{kind:'image',hash:hashA}}],
+  workspaces:[{key:'w1',repo_key:'k1',label:'main',primary:true}],
+  sessions:[],
+ };
+ w.state.groups=new Map([['w1',{key:'w1',repoKey:'k1',label:'main',path:'/krill',primary:true,sessions:[]}]]);
+ w.view.update();
+ assert.equal(w.all().find(n=>n.classList.contains('repo-toggle')).querySelector('.project-icon').querySelector('img').src,`data:image/png;base64,${pngB64}`,'persisted cache renders synchronously on cold launch');
+ await w.flush();
+ assert.equal(warmCalls.length,0,'persisted cache requires zero RPCs');
+ // Project composer also renders cached image icon in project-choice-dot.
+ await w.byText('New workspace').action();
+ const sheetBody=w.ctx.el('div');w.sheets.at(-1)[3](sheetBody);
+ assert.equal(sheetBody.querySelector('.worktree-project-button').querySelector('.project-choice-dot').querySelector('img').src,`data:image/png;base64,${pngB64}`);
+ w.abort.abort();
+
+ // Legacy daemon without capabilities.repo_icons receives zero repo_icons.read RPCs.
+ const legacyCalls=[];
+ const leg=fixture('workspaces',{rpc:req=>{legacyCalls.push(req);return {};}});
+ leg.state.snapshot={
+  capabilities:{},
+  repositories:[{key:'k1',label:'legacy',path:'/legacy',icon:{kind:'image',hash:'d'.repeat(16)}}],
+  workspaces:[{key:'w1',repo_key:'k1',label:'main',primary:true}],
+  sessions:[],
+ };
+ leg.state.groups=new Map([['w1',{key:'w1',repoKey:'k1',label:'main',path:'/legacy',primary:true,sessions:[]}]]);
+ leg.view.update();
+ await leg.flush();
+ assert.equal(legacyCalls.length,0,'legacy daemon is never sent repo_icons.read');
+ leg.abort.abort();
+ console.log('PASS project icons: deferred batched dedupe RPC, cross-host hash cache, localStorage 0ms warm launch, Lucide/badge tint, onerror fallback, legacy guard');
+}
 async function todoUxDacRegressions(){
  const botsSrc=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/bots.js'),'utf8');
  assert(!botsSrc.includes('innerHTML'),'bots.js must never use innerHTML');
@@ -1908,5 +2027,5 @@ async function voicePipitoRegressions(){
  assert.equal(K.t('Learned words ({0})',5),'자동 학습 단어장 (5)');
  console.log('PASS Voice / Pipito mobile regressions: WAV encoding, chunked upload, composer insert & feedback, settings UI, ko i18n');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};
