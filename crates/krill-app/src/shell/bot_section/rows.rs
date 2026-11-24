@@ -1176,7 +1176,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn rename_bot_on(
+    pub(super) fn rename_bot_on(
         &mut self,
         host: &krill_app::hosts::HostId,
         bot_id: BotId,
@@ -1241,6 +1241,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
                     this.notice = Some(err);
+                    cx.notify();
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
             })

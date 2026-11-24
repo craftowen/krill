@@ -373,18 +373,6 @@ pub(crate) enum BotChatCard {
 }
 
 impl BotChatCard {
-    pub(crate) fn card_id(&self) -> &str {
-        match self {
-            Self::ConnectorOffer { card_id, .. }
-            | Self::GoogleOffer { card_id, .. }
-            | Self::ToolAdded { card_id, .. }
-            | Self::WebhookSetup { card_id, .. }
-            | Self::ImportPlan { card_id, .. }
-            | Self::ImportDone { card_id, .. }
-            | Self::SignInOffer { card_id, .. } => card_id,
-        }
-    }
-
     pub(crate) fn search_text(&self) -> String {
         match self {
             Self::ConnectorOffer {

@@ -906,6 +906,7 @@ impl Shell {
             this.update(cx, |this, cx| {
                 if let Err(err) = res {
                     this.notice = Some(err);
+                    cx.notify();
                 }
                 this.refresh_bots_for_host(&host_owned, true, cx);
             })

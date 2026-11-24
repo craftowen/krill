@@ -1102,6 +1102,7 @@ impl Shell {
                                 move |this, _, _, cx| {
                                     this.chat.permission_picker.remove(&full_key);
                                     this.set_bot_permission(
+                                        full_key.0.clone(),
                                         full_bot.clone(),
                                         krill_proto::agent::Permission::Yolo,
                                         cx,
@@ -1154,6 +1155,7 @@ impl Shell {
                                 move |this, _, _, cx| {
                                     this.chat.permission_picker.remove(&ask_key);
                                     this.set_bot_permission(
+                                        ask_key.0.clone(),
                                         ask_bot.clone(),
                                         krill_proto::agent::Permission::Manual,
                                         cx,
