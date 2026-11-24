@@ -146,6 +146,58 @@ fn hook_plan_detects_changes_after_review() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn legacy_synchronous_agy_receipt_is_treated_as_needing_reinstall() {
+    let (root, env) = fixture("agy-legacy-upgrade");
+    let config = env.home.join(".gemini/config/hooks.json");
+    let receipt_path = env.state.join("hooks/agy.json");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+    let legacy_after = serde_json::json!({
+        "krill": {
+            "PreToolUse": [{
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": "/bin/sh -c 'export MK_HOOK_EVENT='\"'\"'PreToolUse'\"'\"'; if [ -n \"${MK_PANE_ID:-}\" ]; then exec '\"'\"'/Applications/Krill.app/Contents/MacOS/krill'\"'\"' hook agy '\"'\"'PreToolUse'\"'\"'; else printf '\"'\"'{\"decision\":\"ask\"}\\n'\"'\"'; fi'",
+                    "timeout": 10
+                }]
+            }]
+        }
+    })
+    .to_string();
+    std::fs::write(&config, &legacy_after).unwrap();
+    let legacy_receipt = krill_proto::hook_install::Receipt {
+        agent: "agy".to_owned(),
+        complete: true,
+        changes: vec![krill_proto::hook_install::Change {
+            path: config.clone(),
+            before: None,
+            after: legacy_after,
+        }],
+        codex: None,
+    };
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_string_pretty(&legacy_receipt).unwrap(),
+    )
+    .unwrap();
+    assert!(!hook_installed(&env.state, "agy"));
+
+    let Prepared::Review { review, .. } = SystemExecutor
+        .prepare(FixAction::Hook(TargetAgent::Other(Agent::Agy)), &env)
+        .unwrap()
+    else {
+        panic!("expected upgrade review for legacy agy hook");
+    };
+    SystemExecutor.apply(review).unwrap();
+    assert!(hook_installed(&env.state, "agy"));
+    let updated = std::fs::read_to_string(&config).unwrap();
+    assert!(updated.contains(krill_proto::agent::hooks::AGY_ASYNC_HOOK_MARKER));
+    assert!(!updated.contains("then exec "));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[derive(Clone, Default)]
 struct FakeExecutor {
     calls: Arc<std::sync::Mutex<Vec<FixAction>>>,

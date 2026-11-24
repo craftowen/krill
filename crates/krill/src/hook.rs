@@ -94,7 +94,7 @@ pub fn run(agent: Option<&str>, event_arg: Option<&str>) -> ExitCode {
                 .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
         },
         agent: agent.to_owned(),
-        ppid: std::os::unix::process::parent_id(),
+        ppid: hook_ppid(),
         input,
         payload,
     };
@@ -297,6 +297,19 @@ fn left(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::ErrorKind::TimedOut.into())
 }
 
+/// hook을 호출한 에이전트 프로세스 PID.
+///
+/// Antigravity(`agy`)처럼 비동기 백그라운드 디스패치로 실행된 hook은 셸이 먼저 종료되어
+/// `parent_id()`가 `1`(launchd)로 바뀌므로, 셸이 전달한 `MK_HOOK_PPID`가 유효하면 우선 사용한다.
+fn hook_ppid() -> u32 {
+    parse_hook_ppid(std::env::var("MK_HOOK_PPID").ok().as_deref())
+        .unwrap_or_else(std::os::unix::process::parent_id)
+}
+
+fn parse_hook_ppid(raw: Option<&str>) -> Option<u32> {
+    raw?.trim().parse::<u32>().ok().filter(|&pid| pid > 1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, Read as _, Write as _};
@@ -395,5 +408,17 @@ mod tests {
         let (mut client, _server) = UnixStream::pair().unwrap();
         let err = wait_ack(&mut client, Instant::now() + Duration::from_millis(5)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn parse_hook_ppid_accepts_live_agent_pids_and_rejects_invalid_values() {
+        assert_eq!(super::parse_hook_ppid(Some("4242")), Some(4242));
+        assert_eq!(super::parse_hook_ppid(Some(" 78515\n")), Some(78515));
+        assert_eq!(super::parse_hook_ppid(None), None);
+        assert_eq!(super::parse_hook_ppid(Some("")), None);
+        assert_eq!(super::parse_hook_ppid(Some("0")), None);
+        assert_eq!(super::parse_hook_ppid(Some("1")), None);
+        assert_eq!(super::parse_hook_ppid(Some("-5")), None);
+        assert_eq!(super::parse_hook_ppid(Some("abc")), None);
     }
 }

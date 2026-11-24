@@ -57,6 +57,32 @@ pub struct Receipt {
     pub codex: Option<CodexRecord>,
 }
 
+impl Receipt {
+    /// Whether this completed receipt records a superseded hook wrapper that should be
+    /// replaced in place when installing hooks again.
+    #[must_use]
+    pub fn needs_upgrade(&self) -> bool {
+        if !self.complete {
+            return false;
+        }
+        if self
+            .codex
+            .as_ref()
+            .is_some_and(|codex| codex.command.starts_with(hooks::POWERSHELL_CODEX_PREFIX))
+        {
+            return true;
+        }
+        self.agent == Agent::Agy.id() && self.is_legacy_agy()
+    }
+
+    fn is_legacy_agy(&self) -> bool {
+        self.changes.iter().any(|change| {
+            change.after.contains("hook agy")
+                && !change.after.contains(hooks::AGY_ASYNC_HOOK_MARKER)
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Change {
@@ -182,9 +208,11 @@ impl Plan {
                 hooks::command(exe, a).ok_or_else(|| error("krill executable path is not UTF-8"))?
             }
         };
-        // A complete receipt is kept, except an old Windows Codex PowerShell command that npm's
-        // codex.cmd cannot start; that one is replaced in place (its trust hashes are ours).
-        let mut superseded = None;
+        // A complete receipt is kept, except:
+        // - an old Windows Codex PowerShell command that npm's codex.cmd cannot start
+        // - a legacy synchronous Antigravity (`agy`) command that can block `PreToolUse` with SIGKILL
+        let mut superseded_codex = None;
+        let mut superseded_agy: Option<Change> = None;
         if action == Action::Install && previous.is_some() {
             let existing: Receipt = serde_json::from_str(previous.as_deref().unwrap_or(""))?;
             if !existing.complete {
@@ -192,16 +220,23 @@ impl Plan {
                     "interrupted hook installation; uninstall to recover first",
                 ));
             }
-            superseded = existing.codex.filter(|record| {
+            let legacy_agy = agent == TargetAgent::Other(Agent::Agy) && existing.is_legacy_agy();
+            superseded_codex = existing.codex.filter(|record| {
                 record.path == path
                     && record.command != command
                     && record.command.starts_with(hooks::POWERSHELL_CODEX_PREFIX)
             });
-            if superseded.is_none() {
+            if legacy_agy {
+                superseded_agy = existing.changes.into_iter().find(|change| {
+                    change.path == path
+                        || std::fs::canonicalize(&change.path).ok().as_deref() == Some(path)
+                });
+            }
+            if superseded_codex.is_none() && superseded_agy.is_none() {
                 return Ok(None);
             }
         }
-        let trust = if superseded.is_some() {
+        let trust = if superseded_codex.is_some() {
             CodexTrust::Refresh
         } else {
             trust
@@ -211,14 +246,26 @@ impl Plan {
             let changes = if agent == TargetAgent::Other(Agent::Codex) {
                 let codex_home = path.parent().ok_or_else(|| error("missing Codex home"))?;
                 let mut plan = codex::Plan::install(codex_home, &command, search, trust)?;
-                if let Some(old) = &superseded {
+                if let Some(old) = &superseded_codex {
                     plan.record.supersede(old);
                 }
                 codex_plan = Some(plan);
                 Vec::new()
             } else {
                 let path = path.to_path_buf();
-                let before = store::read(&path)?;
+                let before = if let Some(old) = &superseded_agy {
+                    match store::read(&path)? {
+                        Some(current) if current == old.after => old.before.clone(),
+                        Some(current) => Some(json::uninstall(
+                            &current,
+                            old.before.as_deref(),
+                            &old.after,
+                        )?),
+                        None => None,
+                    }
+                } else {
+                    store::read(&path)?
+                };
                 let after = match agent {
                     TargetAgent::Other(Agent::OpenCode | Agent::Pi) => {
                         if before.is_some() {
