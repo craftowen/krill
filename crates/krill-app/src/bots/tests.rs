@@ -1836,7 +1836,6 @@ fn saving_bot_settings_leaves_an_orca_background_alone(cx: &mut TestAppContext) 
 #[test]
 fn home_groups_items_as_orca_does() {
     use super::home::{Group, group_of, grouped, short_age, snooze_presets};
-    use crate::i18n::catalog::bots as text;
     let now = 1_795_341_600_000; // Sun 2026-11-22 10:00 UTC
     let at = |uid: &str, n: u64, status: BotItemStatus, ago_min: u64| {
         let mut item = sample_item("bot-1", uid, n, status);
@@ -1868,19 +1867,10 @@ fn home_groups_items_as_orca_does() {
     assert_eq!(uids(Group::Working), ["b"]);
     assert_eq!(uids(Group::Closed), ["f", "e"], "latest change first");
 
-    assert_eq!(short_age(now - 30_000, now), text::SHORT_AGE_NOW.get());
-    assert_eq!(
-        short_age(now - 6 * 60_000, now),
-        text::SHORT_AGE_MIN.format(&[("n", "6")])
-    );
-    assert_eq!(
-        short_age(now - 22 * 3_600_000, now),
-        text::SHORT_AGE_HOUR.format(&[("n", "22")])
-    );
-    assert_eq!(
-        short_age(now - 50 * 3_600_000, now),
-        text::SHORT_AGE_DAY.format(&[("n", "2")])
-    );
+    assert_eq!(short_age(now - 30_000, now), "now");
+    assert_eq!(short_age(now - 6 * 60_000, now), "6m");
+    assert_eq!(short_age(now - 22 * 3_600_000, now), "22h");
+    assert_eq!(short_age(now - 50 * 3_600_000, now), "2d");
 
     // Sunday 10:00: later is 6 PM, then Monday 9 AM twice.
     let at_ms = |p: &[(String, u64); 3]| p.iter().map(|(_, at)| *at).collect::<Vec<_>>();
@@ -3436,13 +3426,14 @@ fn bot_home_and_group_all_clear_show_avatar_above_folded_groups_and_hide_when_pa
     });
     vcx.run_until_parked();
 
-    // All clear avatar appears above the folded Planned group.
+    // Orca `#47436`: All clear renders as a left-aligned single plain line without an avatar.
     let all_clear = vcx
         .debug_bounds("bot-home-all-clear")
         .expect("BotItemsAllClear should render when only Planned items exist");
-    let avatar_bounds = vcx
-        .debug_bounds("bot-home-all-clear-avatar")
-        .expect("40px greyed bot avatar should render in AllClear");
+    assert!(
+        vcx.debug_bounds("bot-home-all-clear-avatar").is_none(),
+        "AllClear must not render an avatar after Orca #47436"
+    );
     let planned_header = vcx
         .debug_bounds("bot-home-group-planned")
         .expect("Planned group header");
@@ -3452,8 +3443,6 @@ fn bot_home_and_group_all_clear_show_avatar_above_folded_groups_and_hide_when_pa
         all_clear.top(),
         planned_header.top()
     );
-    assert_eq!(avatar_bounds.size.width, px(40.));
-    assert_eq!(avatar_bounds.size.height, px(40.));
 
     // Pausing the bot hides AllClear.
     vcx.update(|_, cx| {

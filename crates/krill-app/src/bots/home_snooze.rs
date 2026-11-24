@@ -216,7 +216,7 @@ impl View {
         self.update_items_batch(bot_id, params, cx);
     }
 
-    /// Marks these items with `status`.
+    /// Marks these items with `status` (clearing any `waiting:` note when moving off Waiting).
     pub(super) fn set_items_status(
         &mut self,
         bot_id: BotId,
@@ -226,7 +226,19 @@ impl View {
     ) {
         let params = uids
             .iter()
-            .map(|uid| item_params(uid, Some(status), FieldPatch::Unchanged))
+            .map(|uid| {
+                let was_waiting = self
+                    .items
+                    .items
+                    .iter()
+                    .find(|i| &i.uid == uid)
+                    .is_some_and(|i| super::home::waiting_note(i).is_some());
+                let mut p = item_params(uid, Some(status), FieldPatch::Unchanged);
+                if was_waiting {
+                    p.close_note = Some(String::new());
+                }
+                p
+            })
             .collect();
         self.update_items_batch(bot_id, params, cx);
     }

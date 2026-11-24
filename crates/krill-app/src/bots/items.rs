@@ -89,9 +89,24 @@ pub(super) enum LinkKindChoice {
     File,
 }
 
+/// A comment or answer whose RPC send failed, shown with Retry/Discard (Orca #47485).
+#[derive(Debug, Clone)]
+pub(super) struct FailedComment {
+    pub id: u64,
+    pub text: String,
+}
+
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent Home/Item UI panel toggle flags"
+)]
 pub(super) struct ItemsState {
     pub(super) items: Vec<BotItem>,
+    /// Per-bot cached items so switching/reopening Home paints immediately (Orca #47162).
+    pub(super) items_cache: BTreeMap<BotId, Vec<BotItem>>,
+    /// Live header facts supplied by the shell so `BotPanelHeader` scrolls inside Home.
+    pub(super) header_meta: Option<super::home::HomeHeaderMeta>,
     /// Monotonic revision bumped whenever `items` changes so Home's virtualized list cache
     /// skips O(N) re-grouping and cloning on hover, scroll, and selection updates.
     pub(super) items_rev: u64,
@@ -127,6 +142,16 @@ pub(super) struct ItemsState {
     pub(super) desc_open: bool,
     /// Home: comment event IDs the reader explicitly expanded past the 8-line clamp.
     pub(super) open_comments: std::collections::BTreeSet<u64>,
+    /// Home: asking comment IDs that waited while this item was open, kept un-clamped until
+    /// folded (`#47076`).
+    pub(super) asked_here: std::collections::BTreeSet<u64>,
+    /// Home: multi-question asks whose remaining lines were skipped via "send anyway" (`#47904`).
+    pub(super) skipped_asks: std::collections::BTreeSet<(String, u64)>,
+    /// Home: comments/answers whose send was refused by the host, with Retry/Discard (`#47485`).
+    pub(super) failed_comments: BTreeMap<String, Vec<FailedComment>>,
+    pub(super) next_failed_id: u64,
+    /// Home: whether the Suggestions section shows Look around live steps (`BotLookSteps`).
+    pub(super) look_steps_open: bool,
     /// Home: when the bot's automations ran and run next.
     pub(super) upcoming: Option<krill_proto::bots::BotUpcoming>,
     /// Home: why the last Look now failed.
@@ -141,8 +166,8 @@ pub(super) struct ItemsState {
     pub(super) select_anchor: Option<String>,
     /// Home: the open rows in the list's order, for ranges and stepping.
     pub(super) shown_order: Vec<String>,
-    /// Home: the Cancel dialog, while open.
-    pub(super) cancel_ask: Option<super::home_select::CancelAsk>,
+    /// Home: the Waiting note dialog, while open (`#47308`/`#47309`).
+    pub(super) cancel_ask: Option<super::home_select::WaitAsk>,
     /// Home: Stale's "Cancel all" asks to confirm.
     pub(super) stale_confirm: Option<()>,
     /// Home: each bot's item seen mark as its Home opened, so rows changed since keep their dot.
@@ -165,6 +190,8 @@ pub(super) struct ItemsState {
     pub(super) reply_hidden: BTreeMap<String, u64>,
     /// Home: each bot session's agent state, from the shell (its waiting chats are asks).
     pub(super) session_states: BTreeMap<SessionId, krill_proto::control::AgentState>,
+    /// Connectors: webhook rule ID whose URL was just copied (`#47479`).
+    pub(super) copied_webhook_id: Option<String>,
 }
 
 impl ItemsState {
@@ -173,8 +200,21 @@ impl ItemsState {
     }
 
     pub(super) fn set_items(&mut self, items: Vec<BotItem>) {
+        if let Some(bot_id) = items.first().map(|i| i.owner_bot_id.clone()) {
+            self.items_cache.insert(bot_id, items.clone());
+        }
         self.items = items;
         self.bump_items_rev();
+    }
+
+    pub(super) fn restore_cached(&mut self, bot_id: &BotId) -> bool {
+        if let Some(cached) = self.items_cache.get(bot_id).cloned() {
+            self.items = cached;
+            self.bump_items_rev();
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn clear_items(&mut self) {
@@ -183,7 +223,9 @@ impl ItemsState {
     }
 
     pub(super) fn push_front_item(&mut self, item: BotItem) {
+        let bot_id = item.owner_bot_id.clone();
         self.items.insert(0, item);
+        self.items_cache.insert(bot_id, self.items.clone());
         self.bump_items_rev();
     }
 
@@ -240,7 +282,7 @@ impl ItemsState {
         if let Some(i) = self.cancel_ask.as_ref().and_then(|a| a.input.as_ref()) {
             i.update(cx, |s, cx| {
                 s.set_placeholder(
-                    crate::i18n::catalog::bot_home::CANCEL_REASON.get(),
+                    crate::i18n::catalog::bot_home::WAIT_ON_PLACEHOLDER.get(),
                     window,
                     cx,
                 );
@@ -573,12 +615,21 @@ impl View {
         status: BotItemStatus,
         cx: &mut Context<Self>,
     ) {
+        let was_waiting = self
+            .items
+            .items
+            .iter()
+            .find(|i| i.uid == item_uid)
+            .is_some_and(|i| super::home::waiting_note(i).is_some());
         let close_note = if matches!(status, BotItemStatus::Done | BotItemStatus::Canceled) {
             self.items
                 .close_note_inputs
                 .get(&item_uid)
                 .map(|i| i.read(cx).value().trim().to_owned())
                 .filter(|s| !s.is_empty())
+                .or_else(|| was_waiting.then(String::new))
+        } else if was_waiting {
+            Some(String::new())
         } else {
             None
         };
@@ -757,6 +808,7 @@ impl View {
         }
         let rpc = self.rpc.clone();
         let uid_for_clear = item_uid.clone();
+        let body_for_retry = trimmed.clone();
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -793,9 +845,25 @@ impl View {
                         this.error = Some(SharedString::from(format!(
                             "unexpected AddItemComment response: {other:?}"
                         )));
+                        this.record_failed_comment(
+                            &uid_for_clear,
+                            body_for_retry,
+                            false,
+                            None,
+                            None,
+                            cx,
+                        );
                     }
                     Err(err) => {
                         this.error = Some(SharedString::from(err));
+                        this.record_failed_comment(
+                            &uid_for_clear,
+                            body_for_retry,
+                            false,
+                            None,
+                            None,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -924,6 +992,8 @@ impl View {
         let rpc = self.rpc.clone();
         let selected_bot_id = self.selected_bot_id.clone();
         let uid_for_clear = item_uid.clone();
+        let text_for_recover = cleaned_text.clone();
+        let ask_step_for_recover = clear_ask_step.clone();
         self.items.busy = true;
         self.error = None;
         self.notice = None;
@@ -978,6 +1048,19 @@ impl View {
                     }
                     Err(err) => {
                         this.error = Some(SharedString::from(err));
+                        // Orca #47485: restore a refused answer into the comment box and keep
+                        // Retry/Discard available so the owner never loses typed or picked answers.
+                        if let Some(words) = text_for_recover.filter(|w| !w.is_empty()) {
+                            this.restore_comment_draft(&uid_for_clear, &words, cx);
+                            this.record_failed_comment(
+                                &uid_for_clear,
+                                words,
+                                true,
+                                option_index,
+                                ask_step_for_recover,
+                                cx,
+                            );
+                        }
                     }
                 }
                 cx.notify();
@@ -1037,6 +1120,48 @@ impl View {
         cx.notify();
     }
 
+    /// Restores a refused answer or recovered draft into the item's comment box (`#47485`).
+    pub(super) fn restore_comment_draft(
+        &mut self,
+        item_uid: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.items.comment_inputs.get(item_uid).cloned() else {
+            return;
+        };
+        let Some(handle) = self.window_handle else {
+            return;
+        };
+        let text = text.to_owned();
+        drop(handle.update(cx, |_, window, cx| {
+            input.update(cx, |state, cx| {
+                if state.value().trim().is_empty() {
+                    state.set_value(text, window, cx);
+                }
+                state.focus(window, cx);
+            });
+        }));
+    }
+
+    pub(super) fn record_failed_comment(
+        &mut self,
+        item_uid: &str,
+        text: String,
+        _is_answer: bool,
+        _option_index: Option<u32>,
+        _ask_step_key: Option<(String, u64)>,
+        _cx: &mut Context<Self>,
+    ) {
+        self.items.next_failed_id = self.items.next_failed_id.wrapping_add(1);
+        let id = self.items.next_failed_id;
+        self.items
+            .failed_comments
+            .entry(item_uid.to_owned())
+            .or_default()
+            .push(FailedComment { id, text });
+    }
+
     pub(super) fn upsert_item(&mut self, updated: BotItem, _bot_id: &BotId) {
         let owner_id = updated.owner_bot_id.clone();
         if let Some(slot) = self
@@ -1053,6 +1178,11 @@ impl View {
             *slot = updated;
         } else {
             self.items.items.insert(0, updated);
+        }
+        if self.selected_bot_id.as_ref() == Some(&owner_id) {
+            self.items
+                .items_cache
+                .insert(owner_id.clone(), self.items.items.clone());
         }
         self.items.bump_items_rev();
         self.sync_open_items_for_bot(&owner_id);

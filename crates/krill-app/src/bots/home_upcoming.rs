@@ -1055,6 +1055,7 @@ impl View {
             hm::LOOK_NOW.get()
         };
         let look_tip = match (looking, last_looked) {
+            (true, _) => hm::LOOK_STEPS_TOGGLE.get().to_owned(),
             (false, Some(at)) => format!("{look_label}\n{}", looked_text(at, now_unix_ms())),
             _ => look_label.to_owned(),
         };
@@ -1085,7 +1086,15 @@ impl View {
                             .tooltip(look_tip)
                             .accessibility_label(look_label)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.soul_memory.look_around_running {
+                                if this.soul_memory.look_around_running {
+                                    let next = !this.items.look_steps_open;
+                                    this.items.look_steps_open = next;
+                                    if next {
+                                        this.items.folds.remove("suggestions");
+                                    }
+                                    cx.notify();
+                                } else {
+                                    this.items.look_steps_open = true;
                                     this.look_now(look_bot.clone(), cx);
                                 }
                             })),
@@ -1099,6 +1108,87 @@ impl View {
             .child(header);
         if !open {
             return Some(section);
+        }
+        // Orca `BotLookSteps`: while looking around, show compact progress steps under the header.
+        if looking && self.items.look_steps_open {
+            let sources = super::View::added_connectors(bot);
+            let mut steps = div()
+                .debug_selector(|| "bot-home-look-steps".into())
+                .mx_2()
+                .mb_1p5()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .border_l_1()
+                .border_color(p.border)
+                .py_0p5()
+                .pl(px(10.));
+            if sources.is_empty() {
+                steps = steps.child(
+                    div()
+                        .flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_1p5()
+                        .text_size(ui::TEXT_2XS)
+                        .text_color(p.foreground)
+                        .child(
+                            Icon::new(IconName::Eye)
+                                .size(px(12.))
+                                .text_color(p.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(hm::LOOK_STEPS_CHECKING.get()),
+                        )
+                        .child(
+                            Icon::new(IconName::LoaderCircle)
+                                .size(px(12.))
+                                .text_color(p.muted_foreground),
+                        ),
+                );
+            } else {
+                for src in sources.into_iter().take(4) {
+                    let label = format!(
+                        "{} · {}",
+                        Self::source_label(src),
+                        hm::LOOK_STEPS_CHECKING.get()
+                    );
+                    steps = steps.child(
+                        div()
+                            .flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.foreground)
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .children(source_logo(src).map(|svg| {
+                                        Icon::default()
+                                            .data(svg)
+                                            .size(px(12.))
+                                            .text_color(p.muted_foreground)
+                                    })),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            .child(
+                                Icon::new(IconName::LoaderCircle)
+                                    .size(px(12.))
+                                    .text_color(p.muted_foreground),
+                            ),
+                    );
+                }
+            }
+            section = section.child(steps);
         }
         for s in rows {
             let key = format!("suggestion:{}", s.id);

@@ -11,14 +11,17 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Disableable as _, Icon, Sizable as _};
+use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::bots::{
     BotConfig, BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind,
     BotItemStatus,
 };
 
-use super::home::{clock_label, is_snoozed, status_icon, status_name};
+use super::home::{
+    is_snoozed, item_status_icon, status_icon, status_name, waiting_icon, waiting_note,
+};
+use super::home_time::activity_timestamp;
 use super::{OpenSession, View, avatar, now_unix_ms};
 use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
@@ -30,6 +33,25 @@ const STATUSES: [BotItemStatus; 5] = [
     BotItemStatus::Done,
     BotItemStatus::Canceled,
 ];
+
+/// Latest non-owner ask event on `item`, used to mark older unanswered asks as superseded
+/// (Orca `#47869`).
+fn latest_ask_id(item: &BotItem) -> Option<u64> {
+    item.events
+        .iter()
+        .rev()
+        .find(|e| !matches!(e.actor, BotItemActor::Owner { .. }) && !e.decisions.is_empty())
+        .map(|e| e.id)
+}
+
+/// The waiting question excluding asks explicitly skipped via "send anyway" (Orca `#47904`).
+pub(super) fn waiting_question_with_skipped<'a>(
+    item: &'a BotItem,
+    skipped: &std::collections::BTreeSet<(String, u64)>,
+) -> Option<&'a BotItemEvent> {
+    let ask = waiting_question(item)?;
+    (!skipped.contains(&(item.uid.clone(), ask.id))).then_some(ask)
+}
 
 /// The event whose decisions the item waits on (Orca `botItemWaitingAsk`): the latest ask that
 /// still has an open line while the item is open and either `NeedsYou` or already partially
@@ -133,7 +155,7 @@ impl View {
         let item_snapshot = self.items.items.iter().find(|i| i.uid == uid).cloned();
         let ask = item_snapshot
             .as_ref()
-            .and_then(|i| waiting_question(i).cloned());
+            .and_then(|i| waiting_question_with_skipped(i, &self.items.skipped_asks).cloned());
         match (item_snapshot.as_ref(), ask) {
             // Several questions: words from the box post at once (Orca #46693), answering the
             // open line the box names with any held picks, or riding along as a plain comment
@@ -207,6 +229,12 @@ impl View {
     ) -> gpui::Stateful<gpui::Div> {
         self.ensure_per_item_inputs(&item.uid, window, cx);
         self.ensure_pr_reads(item, cx);
+        // Orca `#47076`: keep an asking comment expanded even after it is answered.
+        if let Some(ask) = waiting_question_with_skipped(item, &self.items.skipped_asks)
+            && self.items.asked_here.insert(ask.id)
+        {
+            self.items.open_comments.insert(ask.id);
+        }
         let now = now_unix_ms();
         let back = div()
             .flex_none()
@@ -229,12 +257,15 @@ impl View {
                     .text_color(p.muted_foreground)
                     .on_click(cx.listener(|this, _, _, cx| this.close_home_item(cx))),
             );
-        let mut content = div().flex().flex_col().gap_4().px(px(14.)).pt_2();
+        let mut content = div().flex().flex_col().gap_4().px(px(14.)).pt_3();
         if let Some(desc) = item.description.as_ref().filter(|d| !d.trim().is_empty()) {
             content = content.child(self.render_description(desc, p, cx));
         }
         if !item.status.is_open()
-            && let Some(note) = item.close_note.as_ref().filter(|n| !n.trim().is_empty())
+            && let Some(note) = item
+                .close_note
+                .as_ref()
+                .filter(|n| !n.trim().is_empty() && waiting_note(item).is_none())
         {
             content = content.child(
                 div()
@@ -262,11 +293,12 @@ impl View {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .child(self.render_item_header(bot, item, now, p, cx))
             .child(content);
+        let wait_modal = self.render_wait_ask(p, window, cx);
         div()
             .id("bot-item-pane")
             .debug_selector(|| "bot-item-pane".into())
+            .relative()
             .size_full()
             .min_h_0()
             .flex()
@@ -276,8 +308,10 @@ impl View {
                 this.item_key(ev, window, cx);
             }))
             .child(back)
+            .child(self.render_item_header(bot, item, now, p, cx))
             .child(scroller)
             .child(self.render_comment_box(bot, item, p, window, cx))
+            .children(wait_modal)
     }
 
     /// Orca's field grid: Chat (opens it), then Done means.
@@ -391,7 +425,14 @@ impl View {
         let this = cx.weak_entity();
         let (bot_id, uid, current) = (bot.id.clone(), item.uid.clone(), item.status);
         let snoozed = is_snoozed(item, now);
+        let is_waiting = item.status != BotItemStatus::NeedsYou && waiting_note(item).is_some();
+        let current_wait = waiting_note(item).unwrap_or_default().to_owned();
         let title_text = item.title.clone();
+        let status_label = if is_waiting {
+            hm::STATUS_WAITING.get()
+        } else {
+            status_name(item.status)
+        };
         let status_menu = Button::new("bot-item-status")
             .debug_selector(|| "bot-item-status".into())
             .ghost()
@@ -401,8 +442,13 @@ impl View {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(status_icon(item.status, self.item_live(item), false, p, cx))
-                    .child(status_name(item.status))
+                    .child(item_status_icon(item, self.item_live(item), false, p, cx))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .child(status_label),
+                    )
                     .child(
                         Icon::new(IconName::ChevronDown)
                             .size(px(12.))
@@ -410,40 +456,62 @@ impl View {
                     ),
             )
             .dropdown_menu(move |mut menu, _, _| {
-                for status in STATUSES {
+                let choices: [Option<BotItemStatus>; 6] = [
+                    Some(BotItemStatus::Planned),
+                    Some(BotItemStatus::Working),
+                    None, // Waiting (#47308/#47309)
+                    Some(BotItemStatus::NeedsYou),
+                    Some(BotItemStatus::Done),
+                    Some(BotItemStatus::Canceled),
+                ];
+                for choice in choices {
                     let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
-                    let name = if status == BotItemStatus::Canceled {
-                        text::HM_CANCELED_ITEM.get()
-                    } else {
-                        status_name(status)
-                    };
-                    menu = menu.item(
-                        PopupMenuItem::new(name)
-                            .checked(status == current)
-                            .disabled(status == current)
-                            .on_click({
-                                let title = title_text.clone();
-                                move |_, _, cx| {
-                                    this.update(cx, |v, cx| {
-                                        if status == BotItemStatus::Canceled {
-                                            v.ask_cancel(
+                    match choice {
+                        None => {
+                            let title = title_text.clone();
+                            let wait_init = current_wait.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(hm::STATUS_WAITING.get())
+                                    .checked(is_waiting)
+                                    .on_click(move |_, _, cx| {
+                                        this.update(cx, |v, cx| {
+                                            v.ask_waiting(
                                                 bot_id.clone(),
                                                 vec![(uid.clone(), title.clone())],
+                                                (!wait_init.is_empty()).then(|| wait_init.clone()),
                                                 cx,
                                             );
-                                        } else {
+                                        })
+                                        .ok();
+                                    }),
+                            );
+                        }
+                        Some(status) => {
+                            let active = status == current && !is_waiting;
+                            let name = if status == BotItemStatus::Canceled {
+                                text::HM_CANCELED_ITEM.get()
+                            } else {
+                                status_name(status)
+                            };
+                            // Orca `#47934`: Cancel applies immediately without a reason dialog.
+                            menu = menu.item(
+                                PopupMenuItem::new(name)
+                                    .checked(active)
+                                    .disabled(active)
+                                    .on_click(move |_, _, cx| {
+                                        this.update(cx, |v, cx| {
                                             v.update_item_status(
                                                 bot_id.clone(),
                                                 uid.clone(),
                                                 status,
                                                 cx,
                                             );
-                                        }
-                                    })
-                                    .ok();
-                                }
-                            }),
-                    );
+                                        })
+                                        .ok();
+                                    }),
+                            );
+                        }
+                    }
                 }
                 if current.is_open() {
                     menu = Self::snooze_menu_for(
@@ -467,7 +535,7 @@ impl View {
             .bg(p.sidebar)
             .px(px(14.))
             .pt_1()
-            .pb_2()
+            .pb_2p5()
             .child(
                 div()
                     .line_clamp(2)
@@ -486,18 +554,23 @@ impl View {
                     .child(div().flex_none().ml(px(-6.)).child(status_menu))
                     .child(
                         div()
+                            .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(ui::TEXT_SM)
+                            .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
-                            .child(format!(
-                                "{} · {}",
-                                hm::SUB_WHERE.format(&[
-                                    ("n", &item.number.to_string()),
-                                    ("chat", &self.item_chat(bot, item).title),
-                                ]),
-                                clock_label(item.created_at_ms, now)
-                            )),
+                            .child(hm::SUB_WHERE.format(&[
+                                ("n", &item.number.to_string()),
+                                ("chat", &self.item_chat(bot, item).title),
+                            ])),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(activity_timestamp(item.created_at_ms, now)),
                     ),
             );
         if let Some(until) = item.snoozed_until_ms.filter(|_| is_snoozed(item, now)) {
@@ -560,16 +633,27 @@ impl View {
                     div()
                         .id("bot-item-description-toggle")
                         .self_start()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .cursor_pointer()
-                        .text_size(ui::TEXT_SM)
+                        .text_size(ui::TEXT_XS)
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(p.foreground)
-                        .hover(gpui::Styled::underline)
+                        .text_color(p.muted_foreground)
+                        .hover(|d| d.text_color(p.foreground))
                         .child(if open {
                             text::HM_SHOW_LESS.get()
                         } else {
                             text::HM_SHOW_MORE_TEXT.get()
                         })
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(px(12.)),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.items.desc_open = !this.items.desc_open;
                             cx.notify();
@@ -579,7 +663,7 @@ impl View {
     }
 
     /// Orca's Activity: a rail of events, comments as cards, the waiting question with its
-    /// quick replies.
+    /// quick replies, plus wait card (`#47308`/`#47309`) and failed comment retry (`#47485`).
     fn render_activity(
         &self,
         bot: &BotConfig,
@@ -588,7 +672,8 @@ impl View {
         p: &ui::Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let waiting = waiting_question(item).map(|e| e.id);
+        let waiting = waiting_question_with_skipped(item, &self.items.skipped_asks).map(|e| e.id);
+        let latest_ask = latest_ask_id(item);
         let mut list = div()
             .debug_selector(|| "bot-item-activity".into())
             .relative()
@@ -619,11 +704,20 @@ impl View {
         for event in item.events.iter().skip(skip) {
             let card = event.kind == BotItemEventKind::Commented || !event.decisions.is_empty();
             if card {
+                let superseded = !event.decisions.is_empty()
+                    && waiting != Some(event.id)
+                    && latest_ask.is_some_and(|id| id != event.id);
+                let skipped = self
+                    .items
+                    .skipped_asks
+                    .contains(&(item.uid.clone(), event.id));
                 list = list.child(self.render_comment_card(
                     bot,
                     item,
                     event,
                     waiting == Some(event.id),
+                    superseded,
+                    skipped,
                     now,
                     p,
                     cx,
@@ -631,6 +725,172 @@ impl View {
             } else {
                 list = list.child(self.render_event_row(bot, item, event, now, p, cx));
             }
+        }
+        // Orca `#47308`/`#47309`: BotItemWaitCard at the bottom of Activity when Waiting.
+        if let Some(wait_text) = waiting_note(item) {
+            let (bot_id, uid, title, wait_owned) = (
+                bot.id.clone(),
+                item.uid.clone(),
+                item.title.clone(),
+                wait_text.to_owned(),
+            );
+            list = list.child(
+                div()
+                    .id("bot-item-wait-card")
+                    .debug_selector(|| "bot-item-wait-card".into())
+                    .relative()
+                    .mx(px(-8.))
+                    .my_1()
+                    .rounded(ui::RADIUS_LG)
+                    .bg(p.sidebar)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.ask_waiting(
+                            bot_id.clone(),
+                            vec![(uid.clone(), title.clone())],
+                            Some(wait_owned.clone()),
+                            cx,
+                        );
+                    }))
+                    .child(
+                        div()
+                            .rounded(ui::RADIUS_LG)
+                            .bg(p.muted.opacity(0.75))
+                            .border_1()
+                            .border_color(p.border.opacity(0.6))
+                            .px_3()
+                            .py_2()
+                            .hover(|d| d.bg(p.muted))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .mb_1()
+                                    .child(waiting_icon(p))
+                                    .child(
+                                        div()
+                                            .text_size(ui::TEXT_SM)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(p.foreground)
+                                            .child(hm::WAIT_ON_CARD_TITLE.get()),
+                                    )
+                                    .child(
+                                        div()
+                                            .ml_auto()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(activity_timestamp(item.updated_at_ms, now)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .pl_5()
+                                    .text_size(ui::TEXT_SM)
+                                    .line_height(px(18.))
+                                    .text_color(p.foreground.opacity(0.9))
+                                    .child(wait_text.to_owned()),
+                            ),
+                    ),
+            );
+        }
+        // Orca `#47485`: refused / failed comment cards with Retry & Discard.
+        for fc in self
+            .items
+            .failed_comments
+            .get(&item.uid)
+            .into_iter()
+            .flatten()
+        {
+            let (fid, uid, body) = (fc.id, item.uid.clone(), fc.text.clone());
+            let uid_discard = uid.clone();
+            let body_retry = body.clone();
+            list = list.child(
+                div()
+                    .id(("bot-item-failed-comment", usize::try_from(fid).unwrap_or(0)))
+                    .debug_selector(move || format!("bot-item-failed-comment-{fid}"))
+                    .relative()
+                    .mx(px(-8.))
+                    .my_1()
+                    .rounded(ui::RADIUS_LG)
+                    .bg(p.sidebar)
+                    .child(
+                        div()
+                            .rounded(ui::RADIUS_LG)
+                            .bg(p.muted.opacity(0.6))
+                            .border_1()
+                            .border_color(p.destructive.opacity(0.45))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_SM)
+                                    .line_height(px(18.))
+                                    .text_color(p.foreground.opacity(0.85))
+                                    .child(body),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(ui::TEXT_XS)
+                                    .child(
+                                        div()
+                                            .text_color(p.destructive)
+                                            .child(hm::COMMENT_NOT_SENT.get()),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .id((
+                                                "bot-item-failed-retry",
+                                                usize::try_from(fid).unwrap_or(0),
+                                            ))
+                                            .cursor_pointer()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(p.foreground)
+                                            .hover(gpui::Styled::underline)
+                                            .child(hm::COMMENT_RETRY.get())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(list) =
+                                                    this.items.failed_comments.get_mut(&uid)
+                                                {
+                                                    list.retain(|f| f.id != fid);
+                                                }
+                                                this.send_item_comment(
+                                                    uid.clone(),
+                                                    &body_retry,
+                                                    None,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id((
+                                                "bot-item-failed-discard",
+                                                usize::try_from(fid).unwrap_or(0),
+                                            ))
+                                            .cursor_pointer()
+                                            .text_color(p.muted_foreground)
+                                            .hover(|d| d.text_color(p.foreground))
+                                            .child(hm::COMMENT_DISCARD.get())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(list) =
+                                                    this.items.failed_comments.get_mut(&uid_discard)
+                                                {
+                                                    list.retain(|f| f.id != fid);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    ),
+            );
         }
         let mut section = div()
             .pb_2()
@@ -691,13 +951,15 @@ impl View {
                 .child(Self::actor_name(bot, &event.actor))
                 .into_any_element()
         };
-        let time = || {
+        let time_for = |at_ms: u64| {
             div()
                 .flex_none()
+                .whitespace_nowrap()
                 .text_size(ui::TEXT_XS)
                 .text_color(p.muted_foreground)
-                .child(clock_label(event.created_at_ms, now))
+                .child(activity_timestamp(at_ms, now))
         };
+        let time = || time_for(event.created_at_ms);
         let rail_icon = |icon: AnyElement| {
             div()
                 .h(px(18.))
@@ -736,32 +998,43 @@ impl View {
                 .child(changes)
                 .child(time());
         }
-        // A linked worker: started here, and finished once its session stops working.
+        // A linked worker: started here, and finished/stopped once its session stops working.
         if event.kind == BotItemEventKind::Linked
             && let Some((title, finished)) = self.worker_lines(event)
         {
-            let bold = |s: String| {
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(p.foreground)
-                    .child(s)
+            let inline_worker = |prefix: &str, title: &str, reason: Option<&str>| {
+                let mut full = format!("{prefix} {title}");
+                let title_start = prefix.len() + 1;
+                let title_end = title_start + title.len();
+                if let Some(r) = reason {
+                    full.push_str(" · ");
+                    full.push_str(r);
+                }
+                StyledText::new(full).with_highlights([(
+                    title_start..title_end,
+                    HighlightStyle {
+                        color: Some(p.foreground),
+                        font_weight: Some(FontWeight::MEDIUM),
+                        ..HighlightStyle::default()
+                    },
+                )])
             };
             let mut col = div().flex_1().min_w_0().flex().flex_col().child(
                 line()
                     .child(rail_icon(small(IconName::Play)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_wrap()
-                            .gap_x_1()
-                            .child(hm::WORKER_STARTED.get())
-                            .child(bold(title)),
-                    )
+                    .child(div().flex_1().min_w_0().child(inline_worker(
+                        hm::WORKER_STARTED.get(),
+                        &title,
+                        None,
+                    )))
                     .child(time()),
             );
-            if let Some((stopped, title)) = finished {
+            if let Some((stopped, title, finished_at, reason)) = finished {
+                let prefix = if stopped {
+                    hm::WORKER_STOPPED.get()
+                } else {
+                    hm::WORKER_FINISHED.get()
+                };
                 col = col.child(
                     line()
                         .child(rail_icon(if stopped {
@@ -773,16 +1046,9 @@ impl View {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .flex()
-                                .flex_wrap()
-                                .gap_x_1()
-                                .child(if stopped {
-                                    hm::WORKER_STOPPED.get()
-                                } else {
-                                    hm::WORKER_FINISHED.get()
-                                })
-                                .child(bold(title)),
-                        ),
+                                .child(inline_worker(prefix, &title, reason)),
+                        )
+                        .children(finished_at.map(time_for)),
                 );
             }
             return col;
@@ -808,13 +1074,13 @@ impl View {
             BotItemEventKind::Linked => (
                 Some(glyph(IconName::Link)),
                 text::HM_ACT_LINKED.get().to_owned(),
-                Some(
-                    event
-                        .text
-                        .split_once(':')
-                        .map_or(event.text.as_str(), |(_, t)| t)
-                        .to_owned(),
-                ),
+                Some({
+                    let raw = event.text.trim();
+                    raw.strip_prefix("url:")
+                        .or_else(|| raw.strip_prefix("file:"))
+                        .unwrap_or(raw)
+                        .to_owned()
+                }),
             ),
             BotItemEventKind::Snoozed => {
                 let until = event
@@ -826,7 +1092,7 @@ impl View {
                     Some(glyph(IconName::AlarmClock)),
                     until.map_or_else(
                         || text::HM_ACT_SNOOZED_BARE.get().to_owned(),
-                        |ms| text::HM_ACT_SNOOZED.format(&[("when", &clock_label(ms, now))]),
+                        |ms| text::HM_ACT_SNOOZED.format(&[("when", &activity_timestamp(ms, now))]),
                     ),
                     None,
                 )
@@ -888,13 +1154,7 @@ impl View {
                     .child(verb)
                     .children(object.map(bold)),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(clock_label(event.created_at_ms, now)),
-            )
+            .child(time())
     }
 
     /// Orca's `BotItemCommentCard`: face, name, time, the words, and its questions. The waiting
@@ -909,6 +1169,8 @@ impl View {
         item: &BotItem,
         event: &BotItemEvent,
         waiting: bool,
+        superseded: bool,
+        skipped: bool,
         now: u64,
         p: &ui::Palette,
         cx: &mut Context<Self>,
@@ -924,6 +1186,7 @@ impl View {
             .filter(|t| !t.is_empty());
         let event_id = event.id;
         let comment_open = self.items.open_comments.contains(&event_id);
+        let quote_source = words.clone();
         let mut body = div().pl_7().flex().flex_col().children(words.map(|w| {
             // Orca `d6cc2684` / `#47076`: while waiting on an open question, show the agent's
             // asking comment whole; once answered or for regular comments, clamp past 8 lines.
@@ -957,16 +1220,27 @@ impl View {
                             )))
                             .debug_selector(move || format!("bot-item-comment-toggle-{event_id}"))
                             .self_start()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .cursor_pointer()
-                            .text_size(ui::TEXT_SM)
+                            .text_size(ui::TEXT_XS)
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.foreground)
-                            .hover(gpui::Styled::underline)
+                            .text_color(p.muted_foreground)
+                            .hover(|d| d.text_color(p.foreground))
                             .child(if comment_open {
                                 text::HM_SHOW_LESS.get()
                             } else {
                                 text::HM_SHOW_MORE_TEXT.get()
                             })
+                            .child(
+                                Icon::new(if comment_open {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(px(12.)),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.items.open_comments.remove(&event_id) {
                                     this.items.open_comments.insert(event_id);
@@ -991,6 +1265,7 @@ impl View {
             // An ask of several questions waits one line at a time.
             questions = self.render_question_steps(item, event, p, cx);
         } else {
+            let mut has_unanswered = false;
             for (d, decision) in event.decisions.iter().enumerate() {
                 if let Some(words) = answered
                     .as_ref()
@@ -1002,27 +1277,57 @@ impl View {
                         div()
                             .flex()
                             .flex_wrap()
-                            .text_size(ui::TEXT_MD)
+                            .text_size(ui::TEXT_SM)
                             .line_height(px(19.))
                             .text_color(p.muted_foreground)
                             .child(format!("{q} → "))
                             .child(
                                 div()
-                                    .text_color(p.foreground.opacity(0.72))
+                                    .text_color(p.foreground.opacity(0.82))
                                     .child(words.to_owned()),
                             ),
                     );
+                } else if skipped {
+                    let q = super::home_item_parts::question_line(&decision.question);
+                    questions = questions.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .text_size(ui::TEXT_SM)
+                            .line_height(px(19.))
+                            .text_color(p.muted_foreground)
+                            .child(format!("{q} → "))
+                            .child(
+                                div()
+                                    .text_color(p.muted_foreground.opacity(0.7))
+                                    .child(hm::ASK_SKIPPED.get()),
+                            ),
+                    );
                 } else {
+                    has_unanswered = true;
                     questions = questions
                         .child(self.render_question(item, event, d, decision, waiting, p, cx));
                 }
+            }
+            // Orca `#47869`: mark an older unanswered ask superseded by a newer question set.
+            if superseded && has_unanswered {
+                questions = questions.child(
+                    div()
+                        .debug_selector(move || format!("bot-item-ask-replaced-{event_id}"))
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(hm::ASK_REPLACED.get()),
+                );
             }
         }
         if !event.decisions.is_empty() {
             body = body.child(
                 div()
                     .when(body_has_words(event), |d| {
-                        d.mt_3().pt_3().border_t_1().border_color(p.border)
+                        d.mt_2p5()
+                            .pt_2p5()
+                            .border_t_1()
+                            .border_color(p.border.opacity(0.6))
                     })
                     .child(questions),
             );
@@ -1044,23 +1349,59 @@ impl View {
                 .child(text::HM_STATUS_NEEDS_YOU.get())
         });
         let has_needs_you_tag = needs_you_tag.is_some();
+        let card_group: SharedString = format!("bot-comment-card-{event_id}").into();
+        let add_to_chat = quote_source.map(|src| {
+            let input = self.items.comment_inputs.get(&item.uid).cloned();
+            let snippet: String = src.lines().take(3).collect::<Vec<_>>().join("\n> ");
+            div()
+                .invisible()
+                .group_hover(card_group.clone(), gpui::Styled::visible)
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "bot-item-quote-comment-{event_id}"
+                    )))
+                    .debug_selector(move || format!("bot-item-quote-comment-{event_id}"))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Quote).size(px(12.)))
+                    .tooltip(hm::ADD_TO_CHAT.get())
+                    .accessibility_label(hm::ADD_TO_CHAT.get())
+                    .on_click(move |_, window, cx| {
+                        if let Some(input) = &input {
+                            input.update(cx, |s, cx| {
+                                let prev = s.value().to_string();
+                                let quoted = format!("> {snippet}\n\n");
+                                let next = if prev.trim().is_empty() {
+                                    quoted
+                                } else {
+                                    format!("{prev}\n{quoted}")
+                                };
+                                s.set_value(next, window, cx);
+                                s.focus(window, cx);
+                            });
+                        }
+                    }),
+                )
+        });
         div()
             .relative()
             .mx(px(-8.))
-            .my_1()
+            .my_1p5()
             .rounded(ui::RADIUS_LG)
             .bg(p.sidebar)
             .child(
                 div()
-                    .debug_selector(move || format!("bot-item-comment-{}", event.id))
+                    .id(SharedString::from(format!("bot-item-comment-{event_id}")))
+                    .debug_selector(move || format!("bot-item-comment-{event_id}"))
+                    .group(card_group)
                     .rounded(ui::RADIUS_LG)
                     .bg(p.muted)
                     .border_1()
-                    .border_color(p.border)
-                    .px_2()
-                    .pt(px(6.))
-                    .when(event.decisions.is_empty(), gpui::Styled::pb_2)
-                    .when(!event.decisions.is_empty(), gpui::Styled::pb_4)
+                    .border_color(p.border.opacity(0.45))
+                    .px_3()
+                    .pt(px(8.))
+                    .when(event.decisions.is_empty(), |d| d.pb(px(10.)))
+                    .when(!event.decisions.is_empty(), gpui::Styled::pb_3)
                     .child(
                         div()
                             .mb_1()
@@ -1070,14 +1411,7 @@ impl View {
                             .gap_2()
                             .text_size(ui::TEXT_SM)
                             .text_color(p.muted_foreground)
-                            .child(avatar::render(
-                                &face,
-                                upload,
-                                &name,
-                                px(20.),
-                                ui::RADIUS_XS,
-                                p,
-                            ))
+                            .child(avatar::render(&face, upload, &name, px(20.), px(10.), p))
                             .child(
                                 div()
                                     .min_w_0()
@@ -1092,9 +1426,17 @@ impl View {
                                 div()
                                     .when(!has_needs_you_tag, gpui::Styled::ml_auto)
                                     .flex_none()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(clock_label(event.created_at_ms, now)),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .children(add_to_chat)
+                                    .child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(activity_timestamp(event.created_at_ms, now)),
+                                    ),
                             ),
                     )
                     .child(body),
@@ -1221,7 +1563,7 @@ impl View {
     ) -> gpui::Div {
         let input = self.items.comment_inputs.get(&item.uid).cloned();
         let uid = item.uid.clone();
-        let waiting = waiting_question(item).cloned();
+        let waiting = waiting_question_with_skipped(item, &self.items.skipped_asks).cloned();
         let quote = waiting
             .as_ref()
             .filter(|w| self.items.reply_hidden.get(&uid) != Some(&w.id))
@@ -1273,6 +1615,11 @@ impl View {
             .unwrap_or_default();
         let empty = value.trim().is_empty() && files.is_empty();
         let replying = quote.is_some();
+        let pill = !replying
+            && files.is_empty()
+            && mentions.is_empty()
+            && !value.contains('\n')
+            && value.chars().count() < 48;
         let mut boxed = div()
             .debug_selector(|| "bot-item-comment-box".into())
             .flex_none()
@@ -1281,11 +1628,11 @@ impl View {
             .mt_2()
             .flex()
             .flex_col()
-            .rounded(ui::RADIUS_XL)
+            .when(pill, |d| d.rounded_full().px_2().py(px(5.)))
+            .when(!pill, |d| d.rounded(ui::RADIUS_XL).p(px(6.)))
             .border_1()
-            .border_color(p.border)
-            .bg(p.background)
-            .p(px(6.));
+            .border_color(p.chat_composer_border())
+            .bg(p.chat_composer_surface());
         if !mentions.is_empty() {
             let mut list = div()
                 .debug_selector(|| "bot-item-mentions".into())
@@ -1476,7 +1823,11 @@ impl View {
                 .child(Input::new(&i).appearance(false))
         });
         let send_input = self.items.comment_inputs.get(&uid).cloned();
-        let mut tools = div().flex().flex_wrap().items_end().gap_0p5();
+        let mut tools = div()
+            .flex()
+            .when(replying, |d| d.flex_wrap().items_end())
+            .when(!replying, gpui::Styled::items_center)
+            .gap_1();
         if replying {
             tools = tools.children(field).child(div().w_full());
         }
@@ -1485,8 +1836,12 @@ impl View {
                 Button::new("bot-item-attach")
                     .debug_selector(|| "bot-item-attach".into())
                     .ghost()
-                    .small()
-                    .icon(Icon::new(IconName::Paperclip).size(px(16.)))
+                    .xsmall()
+                    .icon(
+                        Icon::new(IconName::Plus)
+                            .size(px(16.))
+                            .text_color(p.muted_foreground),
+                    )
                     .tooltip(hm::ATTACH.get())
                     .accessibility_label(hm::ATTACH.get())
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -1503,24 +1858,57 @@ impl View {
                     .child(Input::new(&i).appearance(false))
             }));
         }
-        tools = tools.child(self.render_stepper(p, cx)).child(
-            Button::new("bot-item-comment-send")
-                .debug_selector(|| "bot-item-comment-send".into())
-                .primary()
-                .small()
-                .rounded(ui::RADIUS_LG)
-                .disabled(empty)
-                .icon(Icon::new(IconName::ArrowUp).size(px(16.)))
-                .tooltip(text::HM_COMMENT.get())
-                .accessibility_label(text::HM_COMMENT.get())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let Some(input) = send_input.clone() else {
-                        return;
-                    };
-                    let body = input.read(cx).value().to_string();
-                    this.send_item_comment(uid.clone(), &body, Some(input), cx);
-                })),
-        );
+        let mic_btn = Button::new("bot-item-comment-dictate")
+            .debug_selector(|| "bot-item-comment-dictate".into())
+            .ghost()
+            .xsmall()
+            .icon(
+                Icon::new(IconName::Mic)
+                    .size(px(15.))
+                    .text_color(p.muted_foreground),
+            )
+            .tooltip(hm::COMMENT_DICTATE.get())
+            .accessibility_label(hm::COMMENT_DICTATE.get());
+        let send_btn = div()
+            .id("bot-item-comment-send")
+            .debug_selector(|| "bot-item-comment-send".into())
+            .role(gpui::Role::Button)
+            .aria_label(text::HM_COMMENT.get())
+            .size(px(28.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(if empty {
+                p.foreground.opacity(0.35)
+            } else {
+                p.foreground
+            })
+            .when(!empty, |d| {
+                d.cursor_pointer()
+                    .hover(|d| d.bg(p.foreground.opacity(0.9)))
+            })
+            .child(
+                Icon::new(IconName::ArrowUp)
+                    .size(px(15.))
+                    .text_color(p.background),
+            )
+            .tooltip(|w, cx| ui::tooltip_view("bot-item-send-tip", text::HM_COMMENT.get(), w, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if empty {
+                    return;
+                }
+                let Some(input) = send_input.clone() else {
+                    return;
+                };
+                let body = input.read(cx).value().to_string();
+                this.send_item_comment(uid.clone(), &body, Some(input), cx);
+            }));
+        tools = tools
+            .child(self.render_stepper(replying, p, cx))
+            .child(mic_btn)
+            .child(send_btn);
         boxed.child(tools)
     }
 
