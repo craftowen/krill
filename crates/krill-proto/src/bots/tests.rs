@@ -2578,7 +2578,7 @@ fn group_room_v2_rpc_roundtrip() {
 }
 
 #[test]
-fn bot_session_refusal_formats_versions_and_host_names_in_en_and_ko() {
+fn bot_session_refusal_formats_versions_and_host_names() {
     let too_old = BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0");
     assert_eq!(
         too_old.message_en(Some("this computer")),
@@ -2593,9 +2593,6 @@ fn bot_session_refusal_formats_versions_and_host_names_in_en_and_ko() {
     assert!(phone_msg.contains("0.20.5"), "{phone_msg}");
     assert!(phone_msg.contains("0.23.0"), "{phone_msg}");
     assert!(!phone_msg.contains("this computer"), "{phone_msg}");
-
-    let ko_msg = too_old.message_ko(Some("이 컴퓨터"));
-    assert!(ko_msg.contains("Hermes") && ko_msg.contains("0.20.5") && ko_msg.contains("0.23.0"));
 
     let agy_missing = BotSessionRefusal::cli_not_installed("antigravity");
     assert_eq!(

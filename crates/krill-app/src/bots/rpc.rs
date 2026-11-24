@@ -477,7 +477,7 @@ pub fn bot_refusal_text(
     host_name: Option<&str>,
 ) -> String {
     match crate::i18n::language() {
-        crate::i18n::Language::Ko => refusal.message_ko(host_name),
+        crate::i18n::Language::Ko => crate::i18n::format_bot_refusal_ko(refusal, host_name),
         crate::i18n::Language::En => refusal.message_en(host_name),
     }
 }

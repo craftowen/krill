@@ -5008,6 +5008,90 @@ pub const SETTINGS_SEARCH_INDEX: &[(crate::admin_tab::AdminTab, Message, &[&str]
     ),
 ];
 
+/// Formats a structured [`krill_proto::bots::BotSessionRefusal`] in Korean from the reader's
+/// perspective, routing any embedded English `detail` through [`cached_notice_in`].
+#[must_use]
+pub fn format_bot_refusal_ko(
+    refusal: &krill_proto::bots::BotSessionRefusal,
+    host_name: Option<&str>,
+) -> String {
+    use krill_proto::bots::{BotRefusalCode, bot_agent_display_name};
+
+    let agent = refusal
+        .agent
+        .as_deref()
+        .map_or_else(|| "에이전트".to_owned(), bot_agent_display_name);
+    let on_host = host_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|h| format!("{h}의 "))
+        .unwrap_or_default();
+    let on_host_loc = host_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|h| format!("{h}에 "))
+        .unwrap_or_default();
+    let detail_ko = refusal
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|d| cached_notice_in(d, Language::Ko));
+    match refusal.code {
+        BotRefusalCode::CliTooOld => match (&refusal.installed_version, &refusal.minimum_version) {
+            (Some(installed), Some(min)) => {
+                format!(
+                    "{on_host}{agent} CLI 버전이 {installed}입니다. 채팅을 시작하려면 {min} 이상이 필요합니다."
+                )
+            }
+            (_, Some(min)) => {
+                format!(
+                    "{on_host}{agent} CLI가 너무 오래되었습니다. 채팅을 시작하려면 {min} 이상이 필요합니다."
+                )
+            }
+            _ => format!("{on_host}{agent} CLI 버전이 채팅 지원 기준보다 오래되었습니다."),
+        },
+        BotRefusalCode::CliNotInstalled => {
+            format!("{on_host_loc}{agent} CLI가 설치되어 있지 않습니다.")
+        }
+        BotRefusalCode::BotPaused => match refusal
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => {
+                format!("'{name}' 봇이 일시정지되었습니다. 재개한 뒤 채팅을 시작하세요.")
+            }
+            None => "봇이 일시정지되었습니다. 재개한 뒤 채팅을 시작하세요.".to_owned(),
+        },
+        BotRefusalCode::UnknownAgent => {
+            format!("{on_host_loc}'{agent}' 에이전트를 사용할 수 없습니다.")
+        }
+        BotRefusalCode::InvalidLaunchConfig => match detail_ko {
+            Some(detail) => format!("{agent} 채팅을 시작할 수 없습니다: {detail}"),
+            None => format!("{agent} 실행 설정이 올바르지 않습니다."),
+        },
+        BotRefusalCode::HostUnsupported => match detail_ko {
+            Some(detail) => detail,
+            None => format!("{on_host_loc}채팅을 지원하지 않습니다."),
+        },
+        BotRefusalCode::AuthRequired => {
+            format!("채팅을 시작하려면 {on_host_loc}{agent}에 로그인해야 합니다.")
+        }
+        BotRefusalCode::QuotaExceeded => match detail_ko {
+            Some(detail) => format!("{agent} 사용량 한도에 도달했습니다: {detail}"),
+            None => format!("{agent} 사용량 한도에 도달했습니다."),
+        },
+        BotRefusalCode::SpawnFailed => match detail_ko {
+            Some(detail) => {
+                format!("{on_host_loc}{agent} 채팅을 시작하지 못했습니다: {detail}")
+            }
+            None => format!("{on_host_loc}{agent} 채팅을 시작하지 못했습니다."),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::catalog;
@@ -5785,5 +5869,33 @@ mod platform_shortcut_tests {
                 "Ctrl+click to open"
             );
         }
+    }
+
+    #[test]
+    fn bot_refusal_ko_formats_versions_hosts_and_translates_detail() {
+        use krill_proto::bots::{BotRefusalCode, BotSessionRefusal};
+
+        let too_old = BotSessionRefusal::cli_too_old("hermes", "0.20.5", "0.23.0");
+        let ko_msg = super::format_bot_refusal_ko(&too_old, Some("이 컴퓨터"));
+        assert!(
+            ko_msg.contains("Hermes") && ko_msg.contains("0.20.5") && ko_msg.contains("0.23.0"),
+            "{ko_msg}"
+        );
+        let no_host = super::format_bot_refusal_ko(&too_old, None);
+        assert!(!no_host.contains("이 컴퓨터"), "{no_host}");
+
+        let spawn_err = BotSessionRefusal {
+            code: BotRefusalCode::SpawnFailed,
+            agent: Some("claude".to_owned()),
+            installed_version: None,
+            minimum_version: None,
+            detail: Some("remote host disconnected".to_owned()),
+        };
+        let ko_spawn = super::format_bot_refusal_ko(&spawn_err, None);
+        assert!(
+            ko_spawn
+                .contains(catalog::settings::REMOTE_HOST_DISCONNECTED.in_language(Language::Ko)),
+            "{ko_spawn}"
+        );
     }
 }

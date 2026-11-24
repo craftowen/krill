@@ -7822,12 +7822,14 @@ impl Shell {
                         origin: o.origin,
                         text: o.text.to_owned(),
                         columns: o.columns,
+                        selected: l.ime.selected_columns(),
                     });
                 // 확정 뒤 에코 대기 글자는 화면에 아직 없어도 그린다(OWE-615 원인 1).
                 el.pending = focused.then(|| l.ime.pending()).flatten().map(|p| Preedit {
                     origin: p.origin,
                     text: p.text.to_owned(),
                     columns: p.columns,
+                    selected: None,
                 });
                 if l.pane.is_cold() || l.pane.is_closed() {
                     div()

@@ -159,7 +159,7 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
       if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
       if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
       unset ANTIGRAVITY_CLI_HOME
-      # 호스트 기본 계정은 `host_default_dir`(`$HOME/.config/opencode`)이다. 옛 `.local/share` 경로도 호스트로 본다.
+      # Host default account uses `host_default_dir` (`$HOME/.config/opencode`); legacy `.local/share` counts as host too.
       if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
         __krill_opencode_xdg "$OPENCODE_CONFIG_DIR"
         export OPENCODE_DB=opencode.db
