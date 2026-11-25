@@ -372,11 +372,10 @@ fn sync_account_gated(
                     Some(host_token_path),
                     false,
                 )
+                && write_atomic_0600(host_token_path, &prof_raw).is_ok()
             {
-                if write_atomic_0600(host_token_path, &prof_raw).is_ok() {
-                    current_file = Some(prof_raw);
-                    evict_host_agy_caches(home);
-                }
+                current_file = Some(prof_raw);
+                evict_host_agy_caches(home);
             }
         }
     }
@@ -654,7 +653,6 @@ pub(crate) fn run_command_with_timeout(
     let stdout = stdout?;
     Some((status, stdout))
 }
-
 
 #[cfg(test)]
 mod tests;

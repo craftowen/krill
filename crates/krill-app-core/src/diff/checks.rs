@@ -431,11 +431,10 @@ impl Panel {
     }
 
     pub(super) fn open_external_url(url: &str, cx: &mut Context<Self>) {
-        let url = url.trim();
-        if url.is_empty() {
+        let Some(clean) = sanitized_external_url(url) else {
             return;
-        }
-        cx.open_url(url);
+        };
+        cx.open_url(&clean);
     }
 
     pub(super) fn open_review_comment_location(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -1533,7 +1532,6 @@ fn sanitized_external_url(url: &str) -> Option<String> {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
     is_http.then_some(clean)
 }
-
 
 #[cfg(test)]
 mod checks_tests {

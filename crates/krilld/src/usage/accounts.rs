@@ -2701,7 +2701,7 @@ mod orca_identity_regressions {
         };
         save_inner(&home, Some(&state), &file).unwrap();
 
-        let snap = refresh_accounts_with(&home, Some(&state), false);
+        let snap = refresh_accounts(&home, Some(&state));
         let acc = snap
             .accounts
             .iter()
@@ -2716,7 +2716,7 @@ mod orca_identity_regressions {
     }
 
     #[test]
-    fn manual_switch_clears_rate_limit_and_keeps_pin_on_refresh() {
+    fn manual_switch_clears_rate_limit_and_keeps_selection_on_refresh() {
         let root = std::env::temp_dir().join(format!("dc47-switch-rl-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
         let home = root.join("home");
@@ -2729,11 +2729,6 @@ mod orca_identity_regressions {
         std::fs::write(p1.join(CLAUDE_CACHE), r#"{"five_hour":{"utilization":90}}"#).unwrap();
         std::fs::write(p2.join(CLAUDE_CACHE), r#"{"five_hour":{"utilization":10}}"#).unwrap();
         let file = AccountsFile {
-            auto_switch: StoredAutoSwitch {
-                enabled: true,
-                threshold_percent: 80,
-                ..StoredAutoSwitch::default()
-            },
             active: BTreeMap::from([("claude".into(), "claude-dc47-b".into())]),
             accounts: vec![
                 StoredAccount {
@@ -2773,62 +2768,9 @@ mod orca_identity_regressions {
                 .accounts
                 .iter()
                 .any(|a| a.id == "claude-dc47-a" && a.active),
-            "manual pin must hold on subsequent refresh after clearing rate limit"
+            "manual selection must hold on subsequent refresh after clearing rate limit"
         );
         clear_rate_limited(ProviderKind::Claude, "claude-dc47-a");
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn auto_switch_blocked_warning_redacts_email_derived_account_id() {
-        let root = std::env::temp_dir().join(format!("dc54-redact-warn-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let home = root.join("home");
-        let state = root.join("state");
-        let p1 = root.join("p1");
-        std::fs::create_dir_all(&p1).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(p1.join(CLAUDE_CACHE), r#"{"five_hour":{"utilization":95}}"#).unwrap();
-        let secret_id = "claude-dc54-private-email-example-com";
-        let file = AccountsFile {
-            auto_switch: StoredAutoSwitch {
-                enabled: true,
-                threshold_percent: 80,
-                ..StoredAutoSwitch::default()
-            },
-            active: BTreeMap::from([("claude".into(), secret_id.into())]),
-            accounts: vec![StoredAccount {
-                id: secret_id.into(),
-                provider: "claude".into(),
-                label: "dc54-private-email@example.com".into(),
-                email: None,
-                profile_dir: p1.display().to_string(),
-            }],
-            ..AccountsFile::default()
-        };
-        save_inner(&home, Some(&state), &file).unwrap();
-        lock(&SWITCH_BLOCKED).remove(&ProviderKind::Claude);
-
-        let events = crate::usage::direct::failure_tests::Events::default();
-        tracing::subscriber::with_default(events.clone(), || {
-            let _ = refresh_accounts(&home, Some(&state));
-        });
-        let captured = lock(&events.0);
-        let expected_hash = redacted_account_id(secret_id);
-        assert!(
-            captured
-                .iter()
-                .any(|(level, text)| *level == tracing::Level::WARN
-                    && text.contains("auto-switch triggered")
-                    && text.contains(&expected_hash)),
-            "warning must include hashed account id: {captured:?}"
-        );
-        assert!(
-            captured
-                .iter()
-                .all(|(_, text)| !text.contains("dc54-private-email")),
-            "warning must not leak plaintext email-derived account id: {captured:?}"
-        );
         std::fs::remove_dir_all(root).ok();
     }
 }

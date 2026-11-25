@@ -591,14 +591,70 @@ impl Runner for Gh {
     }
 }
 
-pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
-    let exe = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|p| p.join(name))
-                .find(|p| executable(p))
+const WINDOWS_EXE_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+fn has_windows_executable_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            WINDOWS_EXE_EXTENSIONS
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
         })
-        .or_else(|| fallbacks.iter().map(PathBuf::from).find(|p| executable(p)))
+}
+
+fn executable_candidates_for(dir: &Path, name: &str, windows: bool) -> Vec<PathBuf> {
+    if windows {
+        if has_windows_executable_extension(Path::new(name)) {
+            return vec![dir.join(name)];
+        }
+        WINDOWS_EXE_EXTENSIONS
+            .iter()
+            .map(|ext| dir.join(format!("{name}.{ext}")))
+            .collect()
+    } else {
+        vec![dir.join(name)]
+    }
+}
+
+fn fallback_candidates_for(fallback: &str, windows: bool) -> Vec<PathBuf> {
+    let path = PathBuf::from(fallback);
+    if !windows || has_windows_executable_extension(&path) {
+        return vec![path];
+    }
+    WINDOWS_EXE_EXTENSIONS
+        .iter()
+        .map(|ext| PathBuf::from(format!("{fallback}.{ext}")))
+        .collect()
+}
+
+pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
+    find_executable_in_for(
+        name,
+        std::env::var_os("PATH").as_deref(),
+        fallbacks,
+        cfg!(windows),
+    )
+}
+
+fn find_executable_in_for(
+    name: &str,
+    path_env: Option<&std::ffi::OsStr>,
+    fallbacks: &[&str],
+    windows: bool,
+) -> PathBuf {
+    let exe = path_env
+        .and_then(|path| {
+            std::env::split_paths(path)
+                .flat_map(|dir| executable_candidates_for(&dir, name, windows))
+                .find(|candidate| executable_for(candidate, windows))
+        })
+        .or_else(|| {
+            fallbacks
+                .iter()
+                .flat_map(|fallback| fallback_candidates_for(fallback, windows))
+                .find(|candidate| executable_for(candidate, windows))
+        })
         .unwrap_or_else(|| name.into());
     std::fs::canonicalize(&exe).unwrap_or(exe)
 }
@@ -718,8 +774,16 @@ pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
 }
 
 fn executable(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
+    executable_for(path, cfg!(windows))
+}
+
+fn executable_for(path: &Path, windows: bool) -> bool {
+    if windows {
+        has_windows_executable_extension(path) && path.metadata().is_ok_and(|m| m.is_file())
+    } else {
+        path.metadata()
+            .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
+    }
 }
 
 struct Reap {
