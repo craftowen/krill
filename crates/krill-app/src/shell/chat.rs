@@ -674,6 +674,7 @@ pub(crate) struct ChatState {
     history_saved_draft: BTreeMap<ChatKey, String>,
     auto_continue: HashMap<ChatKey, rate_limit::AutoContinue>,
     auto_continue_declined: HashMap<ChatKey, rate_limit::Declined>,
+    rate_limit_ledger: rate_limit::RateLimitLedgerState,
     /// Last measured width per chat pane so `BotHomeBanner` hides at `<= 264px` (Orca CSS cutoff).
     pub(super) pane_widths: HashMap<PaneId, gpui::Pixels>,
     /// Open permission-mode dropdown above the composer shield button.
@@ -2440,6 +2441,9 @@ impl Shell {
         chat.question_other_inputs.retain(|(key, _), _| keep(key));
         chat.auto_continue.retain(|key, _| keep(key));
         chat.auto_continue_declined.retain(|key, _| keep(key));
+        chat.rate_limit_ledger
+            .last_cancel_at
+            .retain(|key, _| keep(key));
         let sending = &chat.prompt_tasks;
         let turn_tasks = &chat.turn_tasks;
         let keep_flight = |key: &ChatKey| {
@@ -3961,6 +3965,7 @@ impl Shell {
             };
             self.chat.editing_queued.remove(key);
             self.cancel_auto_continue(key, cx);
+            self.mark_auto_continue_resolved_by_user(key, cx);
             self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
             let queued_id = self.chat.next_pending_id;
             self.record_chat_prompt_history(key, &display_text);
@@ -4056,6 +4061,7 @@ impl Shell {
         let (origin_epoch, origin_item, opens_terminal, local_slash) =
             self.pending_prompt_meta(key, &submitted_payload, attachments.is_empty());
         self.cancel_auto_continue(key, cx);
+        self.mark_auto_continue_resolved_by_user(key, cx);
         self.chat.next_pending_id = self.chat.next_pending_id.wrapping_add(1);
         let pending_id = self.chat.next_pending_id;
         self.record_chat_prompt_history(key, &display_text);

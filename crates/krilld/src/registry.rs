@@ -531,11 +531,12 @@ impl Registry {
     }
 
     /// Binds a weak self-reference so lazy background subsystems (e.g., Bots connectors) can
-    /// upgrade back to this [`Registry`], and triggers automatic Bot startup recovery if bots
-    /// already exist on disk.
+    /// upgrade back to this [`Registry`], and triggers automatic startup recovery for bots and
+    /// lost orchestration terminal workers if state exists on disk.
     pub fn bind_self_arc(self: &Arc<Self>) {
         self.self_ref.set(Arc::downgrade(self)).ok();
         self.maybe_spawn_bot_boot();
+        crate::rejoin::recovery::recover_lost_terminal_workers_on_boot(self);
     }
 
     /// Spawns background Bot startup recovery once if `bots.json` already exists in `state_dir()`.
@@ -4170,6 +4171,166 @@ impl Registry {
                 .sessions
                 .get(&id)
                 .is_some_and(|entry| !entry.session.is_closed())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn insert_mock_live_session_for_test(
+        &self,
+        id: SessionId,
+        cwd: PathBuf,
+    ) -> io::Result<UnixStream> {
+        let (master, peer) = UnixStream::pair()?;
+        let session = Session::start(
+            id,
+            OwnedFd::from(master),
+            WinSize { cols: 80, rows: 24 },
+            Arc::clone(&self.look),
+            None,
+        )?;
+        let mut st = lock(&self.state);
+        st.exited.remove(&id);
+        st.sessions.insert(
+            id,
+            Entry {
+                session,
+                pid: std::process::id(),
+                cwd,
+                wrapped: false,
+            },
+        );
+        Ok(peer)
+    }
+
+    /// Returns the account ID recorded for `id`, if known from stored launch metadata.
+    pub(crate) fn session_account_id(&self, id: SessionId) -> Option<String> {
+        self.agents
+            .stored(id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.account)
+            .map(|a| a.id)
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    /// Returns `true` when `id` has saved, resumable agent conversation metadata on disk
+    /// (used by terminal-worker restart recovery under `resume_work_on_restart`, Orca #46643).
+    pub(crate) fn has_resumable_worker_conversation(&self, id: SessionId) -> bool {
+        let Ok(Some(stored)) = self.agents.stored(id) else {
+            return false;
+        };
+        let fallback_sid = self
+            .state_dir()
+            .as_deref()
+            .and_then(|d| crate::agent::claude::session_id(d, id));
+        let has_sid = stored
+            .session_id
+            .as_deref()
+            .or(fallback_sid.as_deref())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_sid {
+            return false;
+        }
+        self.agents
+            .agents()
+            .is_ok_and(|agents| agents.resolve(&stored.profile).is_some())
+    }
+
+    /// Attempts to resume a lost orchestration terminal worker's saved agent conversation into a
+    /// new live PTY session, preserving `KRILL_ORCH_DEPTH` / `KRILL_ORCH_MAX_DEPTH` and segment
+    /// history (Orca #46643).
+    pub(crate) fn resume_lost_worker_session(
+        &self,
+        old: SessionId,
+        dispatch: &krill_proto::orchestration::Dispatch,
+    ) -> io::Result<SessionId> {
+        let holder = self
+            .holder
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no holder"))?;
+        let stored = self
+            .agents
+            .stored(old)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing stored launch"))?;
+        let state = self.state_dir();
+        let fallback_sid = state
+            .as_deref()
+            .and_then(|d| crate::agent::claude::session_id(d, old));
+        let resume_id = stored
+            .session_id
+            .or(fallback_sid)
+            .filter(|s| !s.trim().is_empty());
+        if resume_id.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no resumable agent conversation id",
+            ));
+        }
+        let agents = self.agents.agents()?;
+        let (canonical, profile) = agents
+            .resolve(&stored.profile)
+            .ok_or_else(|| io::Error::other("unknown agent profile"))?;
+        let mut cwd = if stored.cwd.is_empty() {
+            dispatch.cwd.as_bytes().to_vec()
+        } else {
+            stored.cwd.clone()
+        };
+        sanitize_spawn_cwd(&mut cwd);
+        let session = self.reserve_session_id(Some(old))?;
+        let account = crate::agent::resume_target(
+            profile,
+            state.as_deref(),
+            None,
+            stored.account.as_ref(),
+            resume_id.as_deref(),
+        )?;
+        crate::agent::pre_trust_workspace(profile, &cwd, account.as_ref());
+        let (mut launch, session_id, account) = crate::agent::resume_in_with_bot_instructions(
+            profile,
+            stored.permission,
+            session,
+            state.as_deref(),
+            resume_id.as_deref(),
+            account.as_ref(),
+            stored.bot_instructions.as_deref(),
+        )
+        .inspect_err(|_| self.discard_settings(session))?;
+        for (key, value) in [
+            ("KRILL_ORCH_DEPTH", dispatch.depth.saturating_add(1)),
+            (
+                "KRILL_ORCH_MAX_DEPTH",
+                krill_proto::orchestration::MAX_WORKER_DEPTH,
+            ),
+        ] {
+            launch
+                .env
+                .push((key.as_bytes().to_vec(), value.to_string().into_bytes()));
+        }
+        let metadata = control::AgentLaunch {
+            profile: canonical.to_owned(),
+            permission: stored.permission,
+        };
+        self.agents
+            .remember_session(session, &metadata, session_id, cwd.clone(), account)
+            .inspect_err(|_| self.discard_settings(session))?;
+        if let Some(store) = &self.store {
+            store.inherit_history(session, old).inspect_err(|_| {
+                self.discard_settings(session);
+                self.agents.forget(session);
+            })?;
+        }
+        let (spawned_session, _) = self
+            .spawn_holder(holder, session, launch.argv, launch.env, cwd, 120, 36)
+            .map_err(|e| {
+                if let Some(store) = &self.store {
+                    store.discard_inherited_history(session);
+                }
+                io::Error::other(e.to_string())
+            })?;
+        lock(&self.state).resumed.insert(old);
+        self.discard_settings(old);
+        self.agents.forget(old);
+        self.clear_sleeping(old);
+        Ok(spawned_session)
     }
 
     /// Delivers input bytes to a live bot session PTY.

@@ -4526,6 +4526,8 @@ fn bot_session_account_switch_rebinds_bot_runtime_and_preserves_instructions() {
             created_at_ms: 1_795_400_000_000,
             owner_turn_pending: false,
             last_prompt: None,
+            status_message_id: None,
+            rate_limit_pause: None,
         },
     );
     reg.agents

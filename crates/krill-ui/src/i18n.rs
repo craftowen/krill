@@ -2623,6 +2623,8 @@ catalog! {
         DEFAULT_VIEW_MODE_CHAT => ("채팅", "Chat"),
         CHAT_AUTO_CONTINUE_TITLE => ("한도 리셋 후 채팅 자동 재개", "Auto-continue chat after rate-limit reset"),
         CHAT_AUTO_CONTINUE_DESC => ("채팅이 사용량 한도에 걸리고 24시간 안의 리셋 시각을 알면, 리셋 직후 이어서 진행하라는 메시지를 한 번 보냅니다.", "When a chat hits a usage limit with a reset within 24 hours, sends one message to continue right after the reset."),
+        RESUME_WORK_ON_RESTART_TITLE => ("재시작 후 중단된 작업 자동 재개", "Resume work on restart"),
+        RESUME_WORK_ON_RESTART_DESC => ("재부팅이나 데몬 크래시로 터미널 워커가 끊어지면 저장된 에이전트 대화를 한 번 자동으로 이어갑니다.", "Automatically resumes a terminal worker's saved agent conversation once if a reboot or daemon crash cuts its terminal."),
         YOLO_TITLE => ("에이전트 자동 승인 (YOLO 모드)", "Auto-approve (YOLO mode)"),
         YOLO_DESC => ("켜면 파일 수정, 명령 실행 전에 묻지 않습니다. 원치 않는 변경이 생길 수 있습니다.", "When on, agents edit files and run commands without asking. Unwanted changes can happen."),
         SECTION_AGENT_SAFETY => ("권한과 안전", "Permissions and safety"),
@@ -4807,6 +4809,18 @@ pub const SETTINGS_SEARCH_INDEX: &[(crate::admin_tab::AdminTab, Message, &[&str]
             "auto continue",
             "rate limit",
             "reset",
+        ],
+    ),
+    (
+        crate::admin_tab::AdminTab::Agents,
+        catalog::settings::RESUME_WORK_ON_RESTART_TITLE,
+        &[
+            "재시작",
+            "작업 재개",
+            "워커 복구",
+            "resume work",
+            "restart",
+            "worker recovery",
         ],
     ),
     (
