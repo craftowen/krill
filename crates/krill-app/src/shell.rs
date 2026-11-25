@@ -201,6 +201,8 @@ struct Live {
     echo: EchoDraw,
     /// 마지막으로 그린 자리와 칸 크기(IME 후보창).
     painted: Painted,
+    /// 마지막으로 그린 스크롤바 트랙 경계(클릭·드래그 스크롤용).
+    scrollbar_track: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Live와 함께 해제하는 행 계획(계정 입력 보존 중인 숨은 Live는 예외).
     row_cache: krill_app::terminal::RowPlanCache,
     /// 한 행이 안 되는 스크롤 양(px).
@@ -243,6 +245,7 @@ impl Live {
             ime_expiry: None,
             echo: EchoDraw::default(),
             painted: Rc::default(),
+            scrollbar_track: Rc::default(),
             row_cache: krill_app::terminal::RowPlanCache::default(),
             scroll_rem: 0.,
             error: None,
@@ -332,6 +335,11 @@ actions!(
         FocusPaneRight,
         FocusPaneUp,
         FocusPaneDown,
+        ResizePaneLeft,
+        ResizePaneRight,
+        ResizePaneUp,
+        ResizePaneDown,
+        RenamePane,
         ToggleZoomPane,
         ClearPane,
         SelectAll,
@@ -520,6 +528,7 @@ pub fn bind_keys(cx: &mut App) {
         krill_app::keys::bind("cmd-alt-shift-right", FocusPaneRight, ctx),
         krill_app::keys::bind("cmd-alt-shift-up", FocusPaneUp, ctx),
         krill_app::keys::bind("cmd-alt-shift-down", FocusPaneDown, ctx),
+        krill_app::keys::bind("cmd-shift-r", RenamePane, ctx),
         krill_app::keys::bind("cmd-shift-enter", ToggleZoomPane, ctx),
         krill_app::keys::bind("cmd-k", ClearPane, ctx),
         krill_app::keys::bind("cmd-up", ScrollTop, ctx),
@@ -579,6 +588,18 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-}", NextTab, ctx),
         KeyBinding::new("cmd-{", PrevTab, ctx),
+        KeyBinding::new("ctrl-alt-left", ResizePaneLeft, ctx),
+        KeyBinding::new("ctrl-alt-right", ResizePaneRight, ctx),
+        KeyBinding::new("ctrl-alt-up", ResizePaneUp, ctx),
+        KeyBinding::new("ctrl-alt-down", ResizePaneDown, ctx),
+    ]);
+    // Windows/Linux에서는 cmd-alt-화살표가 ctrl-alt-화살표로 매핑되므로 alt-shift-화살표를 쓴다.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("alt-shift-left", ResizePaneLeft, ctx),
+        KeyBinding::new("alt-shift-right", ResizePaneRight, ctx),
+        KeyBinding::new("alt-shift-up", ResizePaneUp, ctx),
+        KeyBinding::new("alt-shift-down", ResizePaneDown, ctx),
     ]);
     new_session::bind_keys(cx);
     files::bind_keys(cx);
@@ -622,6 +643,95 @@ struct HostSource {
         krill_hosts::HostConnectionInfo,
     )>,
     paths: Option<Paths>,
+}
+
+/// Minimum terminal columns needed before hiding the scrollbar on very narrow panes.
+const SCROLLBAR_MIN_COLS: u16 = 5;
+/// Minimum scrollbar thumb length in logical pixels so deep scrollback stays grabbable.
+const SCROLLBAR_MIN_THUMB_PX: f32 = 12.0;
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    pane: PaneId,
+    /// Pointer Y offset from the top of the thumb when the drag began.
+    grab_offset_px: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarGeometry {
+    thumb_ratio: f32,
+    top_ratio: f32,
+}
+
+const fn should_show_scrollbar(
+    alt_screen: bool,
+    cols: u16,
+    fetched: usize,
+    offset: usize,
+    dragging: bool,
+) -> bool {
+    !alt_screen && cols >= SCROLLBAR_MIN_COLS && fetched > 0 && (offset > 0 || dragging)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "행 수는 수만 이하라 f32로도 순서·비율이 유지된다"
+)]
+fn scrollbar_geometry(lines: usize, fetched: usize, offset: usize) -> Option<ScrollbarGeometry> {
+    if fetched == 0 {
+        return None;
+    }
+    let lines = lines.max(1) as f32;
+    let fetched_f = fetched as f32;
+    let shown = offset.min(fetched) as f32;
+    let thumb_ratio = (lines / (lines + fetched_f)).clamp(0.05, 1.0);
+    let top_ratio = ((1.0 - shown / fetched_f) * (1.0 - thumb_ratio)).clamp(0.0, 1.0 - thumb_ratio);
+    Some(ScrollbarGeometry {
+        thumb_ratio,
+        top_ratio,
+    })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "clamped finite offset in 0..=fetched"
+)]
+fn scrollbar_offset_for_y(
+    pointer_y: f32,
+    track_top: f32,
+    track_height: f32,
+    thumb_ratio: f32,
+    grab_offset_px: f32,
+    fetched: usize,
+) -> usize {
+    if fetched == 0 || !track_height.is_finite() || track_height <= 1.0 {
+        return 0;
+    }
+    let thumb_px = (track_height * thumb_ratio)
+        .max(SCROLLBAR_MIN_THUMB_PX)
+        .min(track_height);
+    let travel = (track_height - thumb_px).max(0.0);
+    if travel <= f32::EPSILON {
+        return 0;
+    }
+    let thumb_top = (pointer_y - track_top - grab_offset_px).clamp(0.0, travel);
+    let fraction_from_bottom = (1.0 - thumb_top / travel).clamp(0.0, 1.0);
+    (fraction_from_bottom * fetched as f32).round() as usize
+}
+
+fn wheel_scroll_delta(pixel_y: f32, alt_boost: bool, scroll_speed: f32) -> f32 {
+    let boost = if alt_boost { 5.0 } else { 1.0 };
+    let speed = if scroll_speed.is_finite() {
+        scroll_speed.clamp(
+            krill_app::settings::TERMINAL_SCROLL_SPEED_MIN,
+            krill_app::settings::TERMINAL_SCROLL_SPEED_MAX,
+        )
+    } else {
+        krill_app::settings::DEFAULT_TERMINAL_SCROLL_SPEED
+    };
+    pixel_y * 1.15 * boost * speed
 }
 
 #[expect(
@@ -863,6 +973,9 @@ pub struct Shell {
     session_switch: Option<session_switch_modal::SessionSwitchModal>,
     /// OWE-870: 탭 이름 인라인 편집.
     tab_rename: Option<tabs::TabRename>,
+    pane_rename: Option<tabs::TabRename>,
+    surface_bounds: Rc<std::cell::Cell<Bounds<Pixels>>>,
+    scrollbar_drag: Option<ScrollbarDrag>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
     pub(super) nav_history: NavHistory,
     /// OWE-946 / MK-243: 데스크톱 Hybrid Chat `[Chat | Term]` 오버레이 상태.
@@ -1532,6 +1645,9 @@ impl Shell {
             pending_running_close: None,
             session_switch: None,
             tab_rename: None,
+            pane_rename: None,
+            surface_bounds: Rc::default(),
+            scrollbar_drag: None,
             nav_history: NavHistory::default(),
             chat: chat::ChatState::default(),
             expanded_prompt_panes: HashSet::new(),
@@ -1615,6 +1731,9 @@ impl Shell {
                 if let Some(rename) = &this.tab_rename {
                     retained_panes.insert(rename.pane);
                 }
+                if let Some(rename) = &this.pane_rename {
+                    retained_panes.insert(rename.pane);
+                }
                 retained_panes.extend(this.confirm_close_tab);
                 retained_panes.extend(this.tab_context_menu.map(|(pane, _)| pane));
                 if let Some((PendingRunningClose::Tab(pane) | PendingRunningClose::Pane(pane), _)) =
@@ -1644,6 +1763,13 @@ impl Shell {
                             {
                                 this.tab_rename = None;
                             }
+                            if this
+                                .pane_rename
+                                .as_ref()
+                                .is_some_and(|r| !this.layout.pane_exists(r.pane))
+                            {
+                                this.pane_rename = None;
+                            }
                             this.shift_closed_tabs_after_restore(saved_tab_count, cx);
                         } else {
                             this.layout = layout;
@@ -1651,6 +1777,7 @@ impl Shell {
                             this.tab_context_menu = None;
                             this.pending_running_close = None;
                             this.tab_rename = None;
+                            this.pane_rename = None;
                         }
                         let layout_ref = &this.layout;
                         this.titles.retain(|p, _| layout_ref.pane_exists(*p));
@@ -6057,6 +6184,11 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        if self.pane_rename.is_some() && e.keystroke.key == "escape" {
+            self.cancel_pane_rename(cx);
+            cx.stop_propagation();
+            return;
+        }
         if e.keystroke.key == "escape" && self.close_link_menu(cx) {
             cx.stop_propagation();
             return;
@@ -6351,11 +6483,15 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let line = cell_size(window, cx).height;
+        let scroll_speed = krill_app::settings::terminal_scroll_speed(cx);
         let Some(l) = self.live.get_mut(&pane) else {
             return;
         };
-        let speed = if e.modifiers.alt { 5.0 } else { 1.0 };
-        let dy = f32::from(e.delta.pixel_delta(line).y) * 1.15 * speed + l.scroll_rem;
+        let dy = wheel_scroll_delta(
+            f32::from(e.delta.pixel_delta(line).y),
+            e.modifiers.alt,
+            scroll_speed,
+        ) + l.scroll_rem;
         let lines = (dy / f32::from(line)).trunc();
         l.scroll_rem = dy - lines * f32::from(line);
         #[expect(
@@ -7521,8 +7657,128 @@ impl Shell {
         )
     }
 
-    /// OWE-873: 스크롤 중(바닥 위)일 때 터미널 칸 우측에 스크롤 위치 막대와
-    /// '맨 아래로' 배지를 겹쳐 그린다. 바닥에 있으면 아무것도 그리지 않는다.
+    fn toggle_zoom_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        self.change(true, cx, |l| {
+            l.toggle_zoom_pane(id);
+        });
+        if self.layout.focused() == Some(id) {
+            self.files.refocus = true;
+            if !self.focus.is_focused(window) {
+                window.focus(&self.focus, cx);
+            }
+        }
+    }
+
+    fn resize_focused_pane(&mut self, dir: krill_app::layout::Direction, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay() || self.dashboard.is_some() {
+            return;
+        }
+        let bounds = self.surface_bounds.get();
+        let surface = (bounds.size.width > px(0.) && bounds.size.height > px(0.))
+            .then_some([f32::from(bounds.size.width), f32::from(bounds.size.height)]);
+        let step_px =
+            krill_app::layout::KEYBOARD_RESIZE_STEP_PX * krill_app::settings::current(cx).zoom();
+        let mut changed = false;
+        self.change(false, cx, |l| {
+            changed = l.resize_focused_pane(dir, step_px, surface);
+        });
+        if changed {
+            self.save();
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "행 수는 수만 이하라 f32로도 순서·비율이 유지된다"
+    )]
+    fn begin_scrollbar_drag(&mut self, id: PaneId, pointer_y: Pixels, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&id) else {
+            return;
+        };
+        let bounds = l.scrollbar_track.get();
+        let track_top = f32::from(bounds.origin.y);
+        let track_h = f32::from(bounds.size.height);
+        let fetched = l.pane.scrollback_len();
+        let offset = l.pane.scroll_offset();
+        let lines = usize::from(l.pane.screen().lines).max(1);
+        let Some(geom) = scrollbar_geometry(lines, fetched, offset) else {
+            return;
+        };
+        if !track_h.is_finite() || track_h <= 1.0 {
+            return;
+        }
+        let thumb_px = (track_h * geom.thumb_ratio)
+            .max(SCROLLBAR_MIN_THUMB_PX)
+            .min(track_h);
+        let travel = (track_h - thumb_px).max(0.0);
+        let thumb_top = (1.0 - (offset.min(fetched) as f32 / fetched as f32)) * travel;
+        let rel_y = f32::from(pointer_y) - track_top;
+        let on_thumb = rel_y >= thumb_top && rel_y <= thumb_top + thumb_px;
+        let grab_offset_px = if on_thumb {
+            (rel_y - thumb_top).clamp(0.0, thumb_px)
+        } else {
+            thumb_px * 0.5
+        };
+        self.scrollbar_drag = Some(ScrollbarDrag {
+            pane: id,
+            grab_offset_px,
+        });
+        if !on_thumb {
+            let target = scrollbar_offset_for_y(
+                f32::from(pointer_y),
+                track_top,
+                track_h,
+                geom.thumb_ratio,
+                grab_offset_px,
+                fetched,
+            );
+            l.pane.scroll_to_offset(target, true);
+        }
+        cx.notify();
+    }
+
+    fn update_scrollbar_drag(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        let Some(l) = self.live.get_mut(&drag.pane) else {
+            self.scrollbar_drag = None;
+            return;
+        };
+        let bounds = l.scrollbar_track.get();
+        let track_top = f32::from(bounds.origin.y);
+        let track_h = f32::from(bounds.size.height);
+        let fetched = l.pane.scrollback_len();
+        let offset = l.pane.scroll_offset();
+        let lines = usize::from(l.pane.screen().lines).max(1);
+        let Some(geom) = scrollbar_geometry(lines, fetched, offset) else {
+            return;
+        };
+        let target = scrollbar_offset_for_y(
+            f32::from(pointer_y),
+            track_top,
+            track_h,
+            geom.thumb_ratio,
+            drag.grab_offset_px,
+            fetched,
+        );
+        if l.pane.scroll_to_offset(target, true) {
+            cx.notify();
+        }
+    }
+
+    fn end_scrollbar_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag.take() else {
+            return;
+        };
+        if let Some(l) = self.live.get_mut(&drag.pane) {
+            l.pane.finish_scroll_drag();
+        }
+        cx.notify();
+    }
+
+    /// OWE-873: 스크롤 중(바닥 위)일 때 터미널 칸 우측에 드래그 가능한 스크롤바와
+    /// '맨 아래로' 배지를 겹쳐 그린다. 대체 화면·5열 미만·바닥(비드래그)에서는 숨긴다.
     fn scroll_chrome(&self, id: PaneId, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(l) = self.live.get(&id) else {
             return Vec::new();
@@ -7530,61 +7786,80 @@ impl Shell {
         if l.pane.session().is_none() {
             return Vec::new();
         }
+        let alt_screen = l
+            .pane
+            .modes()
+            .contains(krill_proto::term_modes::Modes::ALT_SCREEN);
+        let cols = l.pane.screen().cols;
         let fetched = l.pane.scrollback_len();
         let offset = l.pane.scroll_offset();
-        if offset == 0 || fetched == 0 {
+        let dragging = self.scrollbar_drag.is_some_and(|d| d.pane == id);
+        if !should_show_scrollbar(alt_screen, cols, fetched, offset, dragging) {
             return Vec::new();
         }
         let lines = usize::from(l.pane.screen().lines).max(1);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "행 수는 수만 이하라 f32로도 순서·비율이 유지된다"
-        )]
-        let (lines, fetched, shown) = (lines as f32, fetched as f32, offset.min(fetched) as f32);
-        // 전체(화면 + 받아 둔 행)에서 화면이 차지하는 비율이 막대 길이, 받아 둔 행 중
-        // 아직 위쪽에 남은 비율이 막대 머리 위치다(받는 중인 위쪽 행은 어림값).
-        let thumb = (lines / (lines + fetched)).clamp(0.05, 1.);
-        let top = ((fetched - shown) / (lines + fetched)).clamp(0., 1. - thumb);
+        let Some(geom) = scrollbar_geometry(lines, fetched, offset) else {
+            return Vec::new();
+        };
         let p = krill_app::ui::palette(cx);
+        let track_cell = Rc::clone(&l.scrollbar_track);
+        let track_probe = canvas(|_, _, _| {}, move |bounds, (), _, _| track_cell.set(bounds))
+            .absolute()
+            .size_full();
         let bar = div()
+            .id(("scrollbar", id.get()))
             .debug_selector(|| "scrollbar".into())
             .absolute()
             .top(px(4.))
             .bottom(px(4.))
-            .right(px(2.))
-            .w(px(6.))
+            .right(px(0.))
+            .w(px(10.))
+            .px(px(2.))
+            .cursor_pointer()
             .flex()
             .flex_col()
-            .child(div().w_full().h(gpui::relative(top)))
+            .child(track_probe)
+            .child(div().w_full().h(gpui::relative(geom.top_ratio)))
             .child(
                 div()
                     .debug_selector(|| "scrollbar-thumb".into())
                     .w_full()
-                    .h(gpui::relative(thumb))
-                    .min_h(px(12.))
+                    .h(gpui::relative(geom.thumb_ratio))
+                    .min_h(px(SCROLLBAR_MIN_THUMB_PX))
                     .rounded_full()
-                    .bg(p.ring),
+                    .bg(if dragging { p.primary } else { p.ring }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                    this.begin_scrollbar_drag(id, e.position.y, cx);
+                    cx.stop_propagation();
+                }),
             );
-        let bottom = div()
-            .id(("scroll-to-bottom", id.get()))
-            .debug_selector(|| "scroll-to-bottom".into())
-            .absolute()
-            .bottom(px(10.))
-            .right(px(14.))
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(l) = this.live.get_mut(&id) {
-                    l.pane.scroll(isize::MIN);
-                    cx.notify();
-                }
-            }))
-            .child(krill_app::ui::badge(
-                p,
-                krill_app::ui::BadgeTone::Neutral,
-                text::SCROLL_TO_BOTTOM.get(),
-            ));
-        vec![bar.into_any_element(), bottom.into_any_element()]
+        let mut out = vec![bar.into_any_element()];
+        if offset > 0 {
+            let bottom = div()
+                .id(("scroll-to-bottom", id.get()))
+                .debug_selector(|| "scroll-to-bottom".into())
+                .absolute()
+                .bottom(px(10.))
+                .right(px(14.))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(l) = this.live.get_mut(&id) {
+                        l.pane.scroll(isize::MIN);
+                        cx.notify();
+                    }
+                }))
+                .child(krill_app::ui::badge(
+                    p,
+                    krill_app::ui::BadgeTone::Neutral,
+                    text::SCROLL_TO_BOTTOM.get(),
+                ));
+            out.push(bottom.into_any_element());
+        }
+        out
     }
 
     fn render_pane(
@@ -7611,9 +7886,19 @@ impl Shell {
         let ended = self.live.get(&id).is_some_and(|live| {
             live.pane.session().is_some() && (live.pane.is_cold() || live.pane.is_closed())
         });
-        let show_ended_header = is_split || self.layout.host(id).is_remote();
+        let pane_title = self.layout.pane_title(id).map(str::to_owned);
+        let renaming_pane = self
+            .pane_rename
+            .as_ref()
+            .filter(|r| r.pane == id)
+            .map(|r| r.input.clone());
+        let has_pane_name_ui = pane_title.is_some() || renaming_pane.is_some();
+        let show_ended_header = is_split || self.layout.host(id).is_remote() || has_pane_name_ui;
         let show_floating_header = !ended
-            && (self.role == WindowRole::Main || is_split || self.layout.host(id).is_remote());
+            && (self.role == WindowRole::Main
+                || is_split
+                || self.layout.host(id).is_remote()
+                || has_pane_name_ui);
         let p = krill_app::ui::palette(cx);
         // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
@@ -7648,6 +7933,46 @@ impl Shell {
                     .group_hover(PANE_HEADER_GROUP, move |d| {
                         d.bg(hover_bg).border_color(hover_border)
                     })
+            })
+            .when_some(renaming_pane.clone(), |d, input| {
+                d.child(
+                    div()
+                        .id(("pane-rename-input", id.get()))
+                        .debug_selector(|| "pane-rename-input".into())
+                        .flex_none()
+                        .w(px(140.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(gpui_component::input::Input::new(&input).xsmall()),
+                )
+            })
+            .when(renaming_pane.is_none(), |d| {
+                d.when_some(pane_title, |d, title| {
+                    d.child(
+                        div()
+                            .id(("pane-title", id.get()))
+                            .debug_selector(move || format!("pane-title-{}", id.get()))
+                            .flex_none()
+                            .max_w(px(160.))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(krill_app::ui::RADIUS_XS)
+                            .bg(hover_bg)
+                            .border_1()
+                            .border_color(hover_border)
+                            .text_size(krill_app::ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(p.foreground)
+                            .truncate()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                                if e.click_count() >= 2 {
+                                    cx.stop_propagation();
+                                    this.begin_pane_rename(id, window, cx);
+                                }
+                            }))
+                            .child(title),
+                    )
+                })
             })
             .when_some(host_badge, |d, badge| {
                 d.child(
@@ -7693,15 +8018,36 @@ impl Shell {
                             .xsmall()
                             .debug_selector(move || format!("pane-unzoom-{}", id.get()))
                             .on_click(cx.listener(
-                                move |this, _, _, cx| {
+                                move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.layout.set_zoomed_pane(None);
-                                    this.save();
-                                    cx.notify();
+                                    this.toggle_zoom_pane(id, window, cx);
                                 },
                             )),
                             format!("pane-unzoom-{}", id.get()),
                             text::PANE_UNZOOM.get(),
+                        )),
+                )
+            })
+            .when(is_split && !zoomed, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .when(!ended, |d| {
+                            d.invisible()
+                                .group_hover(PANE_HEADER_GROUP, Styled::visible)
+                        })
+                        .child(krill_app::ui::button_with_tooltip(
+                            Button::new(("pane-zoom", id.get()))
+                                .debug_selector(move || format!("pane-zoom-{}", id.get()))
+                                .icon(IconName::Maximize)
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_zoom_pane(id, window, cx);
+                                })),
+                            format!("pane-zoom-{}", id.get()),
+                            text::PANE_ZOOM.get(),
                         )),
                 )
             })
@@ -7802,7 +8148,7 @@ impl Shell {
             Some(l) if l.pane.session().is_some() => {
                 let mut el = TerminalElement::new(l.pane.shown(), self.terminal_theme)
                     .with_row_cache(l.row_cache.clone());
-                el.opacity = krill_app::settings::terminal_opacity_alpha(cx);
+                el.opacity = krill_app::settings::effective_terminal_opacity_alpha(cx);
                 el.cursor = krill_app::terminal::effective_cursor(
                     el.screen.cursor_style,
                     el.screen.cursor_explicit,
@@ -7944,8 +8290,20 @@ impl Shell {
         };
         let term_bg = krill_app::ui::terminal_surface_alpha(
             self.terminal_theme,
-            krill_app::settings::terminal_opacity_pct(cx),
+            krill_app::settings::effective_terminal_opacity_pct(cx),
         );
+        let pane_veil = pane_frame::pane_veil_alpha(
+            is_split,
+            focused,
+            self.layout.zoomed_pane().is_some(),
+            krill_app::settings::unfocused_pane_veil(cx),
+        )
+        .map(|alpha| {
+            pane_frame::render_pane_veil(
+                id,
+                krill_app::ui::terminal_surface(self.terminal_theme).opacity(alpha),
+            )
+        });
         let (sticky_bar, sticky_popover) = match self.render_sticky_prompt_bar(id, in_card, cx) {
             Some((bar, pop)) => (Some(bar), pop),
             None => (None, None),
@@ -7977,6 +8335,7 @@ impl Shell {
                             .child(body)
                             .children(self.fit_probe(id, cx))
                             .children(self.scroll_chrome(id, cx))
+                            .children(pane_veil)
                             // 실행 중인 패인의 헤더만 터미널 위 오버레이로 남는다.
                             // 종료·콜드 패인의 헤더는 body가 이미 가져갔다.
                             .children(pane_header.filter(|_| show_floating_header)),
@@ -8201,6 +8560,9 @@ impl Shell {
                 }),
             )
             .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
+                if this.scrollbar_drag.is_some() {
+                    return;
+                }
                 this.update_path_hover(id, e.position, keys::link_modifier(e.modifiers), cx);
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
@@ -8826,7 +9188,9 @@ impl Render for Shell {
                 .map(|t| t.root.clone())
         };
         let stage = self.workspace_stage();
-        let opacity_pct = krill_app::settings::terminal_opacity_pct(cx);
+        let window_blur = krill_app::settings::window_blur(cx);
+        let opacity_pct = krill_app::settings::effective_terminal_opacity_pct(cx);
+        let translucent = window_blur || opacity_pct < 100;
         let (surface_bg, tree) = match (stage, root) {
             (pane_frame::WorkspaceStage::CardStage, Some(r)) => {
                 let stage_bg =
@@ -8879,6 +9243,18 @@ impl Render for Shell {
         };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
+        let shell_bg = if translucent {
+            krill_app::ui::transparent()
+        } else {
+            bg
+        };
+        let surface_bounds_cell = Rc::clone(&self.surface_bounds);
+        let surface_probe = canvas(
+            |_, _, _| {},
+            move |bounds, (), _, _| surface_bounds_cell.set(bounds),
+        )
+        .absolute()
+        .size_full();
 
         div()
             .relative()
@@ -9060,22 +9436,34 @@ impl Render for Shell {
                     l.focus_direction(krill_app::layout::Direction::Down);
                 });
             }))
-            .on_action(cx.listener(|this, _: &ToggleZoomPane, _, cx| {
+            .on_action(cx.listener(|this, _: &ResizePaneLeft, _, cx| {
+                this.resize_focused_pane(krill_app::layout::Direction::Left, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneRight, _, cx| {
+                this.resize_focused_pane(krill_app::layout::Direction::Right, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneUp, _, cx| {
+                this.resize_focused_pane(krill_app::layout::Direction::Up, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResizePaneDown, _, cx| {
+                this.resize_focused_pane(krill_app::layout::Direction::Down, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenamePane, window, cx| {
+                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                    return;
+                }
+                if let Some(pane) = this.layout.focused() {
+                    this.begin_pane_rename(pane, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleZoomPane, window, cx| {
                 if this.has_blocking_overlay() || this.dashboard.is_some() {
                     return;
                 }
                 let Some(focused) = this.layout.focused() else {
                     return;
                 };
-                if this.layout.zoomed_pane() == Some(focused) {
-                    this.layout.set_zoomed_pane(None);
-                } else if this.layout.visible().len() > 1 {
-                    this.layout.set_zoomed_pane(Some(focused));
-                } else {
-                    this.layout.set_zoomed_pane(None);
-                }
-                this.save();
-                cx.notify();
+                this.toggle_zoom_pane(focused, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ClearPane, _, cx| {
                 if this.has_blocking_overlay()
@@ -9527,10 +9915,31 @@ impl Render for Shell {
                 }
                 this.save();
             }))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                if this.scrollbar_drag.is_some() {
+                    if e.pressed_button == Some(MouseButton::Left) {
+                        this.update_scrollbar_drag(e.position.y, cx);
+                    } else {
+                        this.end_scrollbar_drag(cx);
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.end_scrollbar_drag(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.end_scrollbar_drag(cx);
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()
-            .bg(bg)
+            .bg(shell_bg)
             .text_color(fg)
             .font_family(krill_app::ui::FONT_UI)
             .text_size(krill_app::ui::TEXT_MD)
@@ -9583,7 +9992,7 @@ impl Render for Shell {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .bg(bg)
+                            .bg(shell_bg)
                             .child(self.render_tab_bar(window, cx))
                             .child(
                                 div()
@@ -9592,6 +10001,7 @@ impl Render for Shell {
                                     .relative()
                                     .debug_selector(|| "terminal-surface".into())
                                     .bg(surface_bg)
+                                    .child(surface_probe)
                                     .child(tree)
                                     .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).

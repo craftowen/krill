@@ -94,6 +94,23 @@ impl MenuState {
         uri: Option<&str>,
     ) -> PopupMenu {
         menu = menu.action_context(self.focus.clone());
+        let rename_shell = shell.clone();
+        let rename_pane = self.pane;
+        menu = menu
+            .item(
+                PopupMenuItem::element(|_, _| {
+                    div()
+                        .id("terminal-pane-rename")
+                        .debug_selector(|| "terminal-pane-rename".into())
+                        .child(text::RENAME_PANE.get())
+                })
+                .on_click(move |_, window, cx| {
+                    rename_shell
+                        .update(cx, |s, cx| s.begin_pane_rename(rename_pane, window, cx))
+                        .ok();
+                }),
+            )
+            .separator();
         if let Some(uri) = uri {
             for (id, label, open) in [
                 ("terminal-url-copy", stext::LINK_COPY.get(), false),
@@ -374,8 +391,23 @@ pub(super) fn build_chat_overlay(
         .ok();
     });
 
+    let rename_weak = shell.clone();
+    let rename_item = PopupMenuItem::element(|_, _| {
+        div()
+            .id("terminal-pane-rename")
+            .debug_selector(|| "terminal-pane-rename".into())
+            .child(text::RENAME_PANE.get())
+    })
+    .on_click(move |_, window, cx| {
+        rename_weak
+            .update(cx, |s, cx| s.begin_pane_rename(pane, window, cx))
+            .ok();
+    });
+
     menu = menu
         .action_context(focus)
+        .item(rename_item)
+        .separator()
         .item(switch_item)
         .separator()
         .menu(text::SPLIT_RIGHT.get(), Box::new(SplitRight))

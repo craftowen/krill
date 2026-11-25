@@ -14732,3 +14732,300 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
         "refresh_bots_badge must update bots_attention_count when background items arrive"
     );
 }
+
+#[gpui::test]
+fn unfocused_pane_veil_covers_only_unfocused_split_panes(cx: &mut TestAppContext) {
+    let dir = state_path("pane-veil");
+    let state_dir = dir.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("settings.toml"),
+        "unfocused_pane_veil = 0.35\n",
+    )
+    .unwrap();
+    let (view, cx) = open(cx, dir);
+    cx.update(|_, cx| krill_app::settings::init_at(Some(state_dir.clone()), cx));
+    cx.run_until_parked();
+
+    // Single pane never gets a veil.
+    assert!(cx.debug_bounds("pane-veil-0").is_none());
+
+    // Split into 2 panes: newly focused pane 1 has no veil; unfocused pane 0 has a veil.
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    assert_eq!(
+        layout_of(&view, cx).focused(),
+        Some(layout_of(&view, cx).visible()[1])
+    );
+    let p0 = layout_of(&view, cx).visible()[0];
+    let p1 = layout_of(&view, cx).visible()[1];
+    let veil0: &'static str = Box::leak(format!("pane-veil-{}", p0.get()).into_boxed_str());
+    let veil1: &'static str = Box::leak(format!("pane-veil-{}", p1.get()).into_boxed_str());
+    let veil0_bounds = cx
+        .debug_bounds(veil0)
+        .expect("unfocused split pane must show veil");
+    assert!(
+        cx.debug_bounds(veil1).is_none(),
+        "focused split pane must not show veil"
+    );
+
+    // Clicking through the veil focuses pane 0 and moves the veil onto pane 1.
+    cx.simulate_click(veil0_bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(p0));
+    assert!(cx.debug_bounds(veil0).is_none());
+    assert!(cx.debug_bounds(veil1).is_some());
+
+    // Zooming hides sibling panes and shows no veil on the zoomed pane.
+    cx.simulate_keystrokes("cmd-shift-enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(veil0).is_none());
+    assert!(cx.debug_bounds(veil1).is_none());
+    std::fs::remove_dir_all(&state_dir).ok();
+}
+
+#[gpui::test]
+fn zoom_button_focuses_unfocused_pane_and_navigation_moves_zoom(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("zoom-focus-ergonomics"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let visible = layout_of(&view, cx).visible();
+    let (left, right) = (visible[0], visible[1]);
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+
+    // Hover the UNFOCUSED left pane's header and click its zoom button.
+    let left_header: &'static str =
+        Box::leak(format!("pane-header-{}", left.get()).into_boxed_str());
+    let left_zoom: &'static str = Box::leak(format!("pane-zoom-{}", left.get()).into_boxed_str());
+    let header_at = cx.debug_bounds(left_header).expect("left header").center();
+    cx.simulate_mouse_move(header_at, None, Modifiers::default());
+    cx.run_until_parked();
+    let zoom_btn = cx
+        .debug_bounds(left_zoom)
+        .expect("zoom button revealed on hover")
+        .center();
+    cx.simulate_click(zoom_btn, Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(layout_of(&view, cx).zoomed_pane(), Some(left));
+    assert_eq!(
+        layout_of(&view, cx).focused(),
+        Some(left),
+        "zooming an unfocused pane must transfer focus to it"
+    );
+
+    // Navigating right while zoomed moves zoom to the right pane.
+    cx.simulate_keystrokes("cmd-alt-shift-right");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    assert_eq!(layout_of(&view, cx).zoomed_pane(), Some(right));
+
+    // Cmd+W closes the currently visible zoomed pane (right), leaving left alive.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).visible(), vec![left]);
+    assert_eq!(layout_of(&view, cx).focused(), Some(left));
+    assert_eq!(layout_of(&view, cx).zoomed_pane(), None);
+}
+
+#[gpui::test]
+fn keyboard_resize_actions_move_split_divider_in_shell(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("keyboard-pane-resize"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let ratio_of = |view: &Entity<Shell>, cx: &mut VisualTestContext| -> f32 {
+        let layout = layout_of(view, cx);
+        let PaneTree::Split { ratio, .. } = layout.active_tab().root else {
+            panic!("expected split");
+        };
+        ratio
+    };
+    let initial = ratio_of(&view, cx);
+    cx.dispatch_action(ResizePaneRight);
+    cx.run_until_parked();
+    let grew = ratio_of(&view, cx);
+    assert!(
+        grew > initial,
+        "ResizePaneRight must move divider right: {initial} -> {grew}"
+    );
+
+    cx.dispatch_action(ResizePaneLeft);
+    cx.dispatch_action(ResizePaneLeft);
+    cx.run_until_parked();
+    let shrank = ratio_of(&view, cx);
+    assert!(
+        shrank < initial,
+        "ResizePaneLeft must move divider left: {initial} -> {shrank}"
+    );
+}
+
+#[test]
+fn scrollbar_math_visibility_and_scroll_speed_multiplier() {
+    // Hidden on alt screen, narrow panes (< 5 cols), or empty scrollback.
+    assert!(!should_show_scrollbar(true, 80, 100, 10, false));
+    assert!(!should_show_scrollbar(false, 4, 100, 10, false));
+    assert!(should_show_scrollbar(false, 5, 100, 10, false));
+    assert!(!should_show_scrollbar(false, 80, 0, 0, false));
+    assert!(!should_show_scrollbar(false, 80, 100, 0, false));
+    assert!(should_show_scrollbar(false, 80, 100, 0, true));
+
+    // Geometry: 20 viewport lines + 80 scrollback = 100 total -> 0.2 thumb ratio.
+    let g_bottom = scrollbar_geometry(20, 80, 0).unwrap();
+    assert!((g_bottom.thumb_ratio - 0.2).abs() < 1e-5);
+    assert!((g_bottom.top_ratio - 0.8).abs() < 1e-5);
+    let g_top = scrollbar_geometry(20, 80, 80).unwrap();
+    assert!((g_top.top_ratio - 0.0).abs() < 1e-5);
+    let g_mid = scrollbar_geometry(20, 80, 40).unwrap();
+    assert!((g_mid.top_ratio - 0.4).abs() < 1e-5);
+
+    // Drag offset mapping: top clamps to fetched, bottom clamps to 0, middle maps cleanly.
+    assert_eq!(scrollbar_offset_for_y(0.0, 10.0, 200.0, 0.2, 0.0, 80), 80);
+    assert_eq!(scrollbar_offset_for_y(500.0, 10.0, 200.0, 0.2, 0.0, 80), 0);
+    // Track 10..210, thumb 40px, travel 160px -> thumb_top 80px (pointer_y = 90 with grab 0) -> offset 40.
+    assert_eq!(scrollbar_offset_for_y(90.0, 10.0, 200.0, 0.2, 0.0, 80), 40);
+
+    // Wheel scroll speed scales linearly and clamps to 0.25..=5.0.
+    let base = wheel_scroll_delta(10.0, false, 1.0);
+    let fast = wheel_scroll_delta(10.0, false, 2.0);
+    let clamped = wheel_scroll_delta(10.0, false, 99.0);
+    assert!((fast - base * 2.0).abs() < 1e-4);
+    assert!((clamped - base * 5.0).abs() < 1e-4);
+}
+
+#[gpui::test]
+fn draggable_scrollbar_drags_smoothly_and_hides_on_alt_screen_and_narrow_panes(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::control::Cold;
+    use krill_proto::screen::{Cell, Op};
+    use std::os::unix::net::UnixStream;
+
+    fn row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    let (view, cx) = open(cx, state_path("scrollbar-drag"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let history: Vec<_> = (0..100).map(|i| row(&format!("line-{i}"))).collect();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(9), ours, cx);
+            s.live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .show_cold(
+                    krill_proto::SessionId(9),
+                    Cold {
+                        screen: vec![Op::Reset {
+                            cols: 20,
+                            lines: 10,
+                        }],
+                        history,
+                    },
+                )
+                .unwrap();
+            assert!(s.live.get_mut(&pane).unwrap().pane.scroll(20));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    let track = cx.debug_bounds("scrollbar").expect("scrollbar track");
+    let thumb = cx.debug_bounds("scrollbar-thumb").expect("scrollbar thumb");
+    // Grab thumb and drag all the way to the top while moving pointer horizontally out of the track.
+    cx.simulate_mouse_down(thumb.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(
+        point(track.origin.x - px(80.), track.origin.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    let top_offset = cx.update(|_, cx| view.read(cx).live[&pane].pane.scroll_offset());
+    assert_eq!(
+        top_offset, 100,
+        "dragging to top must reach full scrollback"
+    );
+
+    // Continue dragging all the way to the bottom and release.
+    cx.simulate_mouse_move(
+        point(track.origin.x - px(80.), track.bottom() + px(20.)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).live[&pane].pane.scroll_offset()),
+        0
+    );
+    // Scrollbar remains visible while dragging through bottom so user can pull back up.
+    assert!(cx.debug_bounds("scrollbar").is_some());
+    cx.simulate_mouse_up(
+        point(track.origin.x - px(80.), track.bottom()),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("scrollbar").is_none(),
+        "releasing drag at bottom hides scrollbar"
+    );
+
+    // Re-scroll, then enter alt-screen -> scrollbar hides immediately.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            use krill_proto::screen::Msg as _;
+            use krill_proto::term_modes::Modes;
+            s.live.get_mut(&pane).unwrap().pane.scroll(30);
+            let modes = Modes {
+                kitty: 0,
+                flags: Modes::ALT_SCREEN,
+            };
+            let frame = modes.encode().unwrap();
+            let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+            s.on_frame(pane, kind, &body, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("scrollbar").is_none(),
+        "alt-screen must hide scrollbar"
+    );
+
+    // Leave alt-screen, shrink below 5 cols -> scrollbar stays hidden.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            use krill_proto::screen::Msg as _;
+            use krill_proto::term_modes::Modes;
+            let modes = Modes::default();
+            let frame = modes.encode().unwrap();
+            let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+            s.on_frame(pane, kind, &body, cx);
+            s.live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .show_cold(
+                    krill_proto::SessionId(9),
+                    Cold {
+                        screen: vec![Op::Reset { cols: 4, lines: 10 }],
+                        history: vec![row("a"), row("b"), row("c")],
+                    },
+                )
+                .unwrap();
+            s.live.get_mut(&pane).unwrap().pane.scroll(2);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("scrollbar").is_none(),
+        "narrow panes (< 5 cols) must hide scrollbar"
+    );
+}

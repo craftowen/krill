@@ -382,5 +382,144 @@ fn flush(plan: &mut RowPlan, seg: Option<Segment>) {
     }
 }
 
+/// Splits a single-width text [`Segment`] at the given terminal column boundaries so
+/// programming ligatures cannot bridge across cursor, selection, or background edges.
+/// Wide/overflow clusters (`seg.wide || seg.overflow`) are never split so CJK/ZWJ
+/// shaping stays intact.
+#[must_use]
+pub fn split_segment_at_columns(seg: &Segment, breaks: &[u16]) -> Vec<Segment> {
+    let cell_count = seg.colors.len();
+    if seg.wide || seg.overflow || cell_count <= 1 || breaks.is_empty() {
+        return vec![seg.clone()];
+    }
+    let seg_end = seg
+        .column
+        .saturating_add(u16::try_from(cell_count).unwrap_or(u16::MAX));
+    let mut split_cells: Vec<usize> = breaks
+        .iter()
+        .copied()
+        .filter(|&col| col > seg.column && col < seg_end)
+        .map(|col| usize::from(col - seg.column))
+        .filter(|&idx| idx > 0 && idx < cell_count)
+        .collect();
+    if split_cells.is_empty() {
+        return vec![seg.clone()];
+    }
+    split_cells.sort_unstable();
+    split_cells.dedup();
+
+    let mut out = Vec::with_capacity(split_cells.len() + 1);
+    let mut prev_cell = 0usize;
+    for cell_end in split_cells.into_iter().chain(std::iter::once(cell_count)) {
+        if cell_end <= prev_cell {
+            continue;
+        }
+        let Some(&(byte_start, _)) = seg.colors.get(prev_cell) else {
+            prev_cell = cell_end;
+            continue;
+        };
+        let byte_end = seg
+            .colors
+            .get(cell_end)
+            .map_or(seg.text.len(), |&(offset, _)| offset);
+        let Some(sub_text) = seg.text.get(byte_start..byte_end) else {
+            prev_cell = cell_end;
+            continue;
+        };
+        if sub_text.trim().is_empty() {
+            prev_cell = cell_end;
+            continue;
+        }
+        let colors = seg
+            .colors
+            .get(prev_cell..cell_end)
+            .unwrap_or_default()
+            .iter()
+            .map(|&(offset, fg)| (offset.saturating_sub(byte_start), fg))
+            .collect();
+        let mut runs: Vec<Run> = Vec::new();
+        let mut run_pos = 0usize;
+        for run in &seg.runs {
+            let run_end = run_pos.saturating_add(run.len);
+            let ov_start = run_pos.max(byte_start);
+            let ov_end = run_end.min(byte_end);
+            if ov_end > ov_start {
+                let len = ov_end - ov_start;
+                match runs.last_mut() {
+                    Some(last) if last.bold == run.bold && last.italic == run.italic => {
+                        last.len += len;
+                    }
+                    _ => runs.push(Run {
+                        len,
+                        bold: run.bold,
+                        italic: run.italic,
+                    }),
+                }
+            }
+            run_pos = run_end;
+        }
+        let col_offset = u16::try_from(prev_cell).unwrap_or(u16::MAX);
+        out.push(Segment {
+            column: seg.column.saturating_add(col_offset),
+            wide: false,
+            overflow: false,
+            text: sub_text.to_owned(),
+            runs,
+            colors,
+        });
+        prev_cell = cell_end;
+    }
+    out
+}
+
+/// Collects sorted, deduplicated column boundaries where programming ligatures must break:
+/// cursor cell edges, selection edges, and non-default background span edges.
+#[must_use]
+pub fn ligature_break_columns(
+    plan: &RowPlan,
+    cursor_span: Option<(u16, u16)>,
+    selection_span: Option<(u16, u16)>,
+) -> Vec<u16> {
+    let mut breaks = Vec::with_capacity(plan.bg.len() * 2 + 4);
+    for span in &plan.bg {
+        breaks.push(span.column);
+        breaks.push(span.column.saturating_add(span.cols));
+    }
+    if let Some((col, width)) = cursor_span
+        && width > 0
+    {
+        breaks.push(col);
+        breaks.push(col.saturating_add(width));
+    }
+    if let Some((col, cols)) = selection_span
+        && cols > 0
+    {
+        breaks.push(col);
+        breaks.push(col.saturating_add(cols));
+    }
+    breaks.sort_unstable();
+    breaks.dedup();
+    breaks
+}
+
+/// Splits a row's segments at cursor, selection, and background boundaries so opt-in
+/// programming ligatures stay cell-aligned and never bridge across boundaries.
+#[must_use]
+pub fn split_segments_for_ligatures(
+    plan: &RowPlan,
+    cursor_span: Option<(u16, u16)>,
+    selection_span: Option<(u16, u16)>,
+) -> Vec<Segment> {
+    let breaks = ligature_break_columns(plan, cursor_span, selection_span);
+    if breaks.is_empty() {
+        return plan.segments.clone();
+    }
+    let mut out = Vec::with_capacity(plan.segments.len() + 2);
+    for seg in &plan.segments {
+        out.extend(split_segment_at_columns(seg, &breaks));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

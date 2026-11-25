@@ -109,23 +109,52 @@ fn trim_url_end<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
     end
 }
 
-/// Scans a plain-text `http://` or `https://` URL at the start of `slice` and returns its
-/// element count after stripping trailing sentence punctuation and unmatched delimiters.
-/// Returns `0` if `slice` does not begin with a valid `http(s)://` URL prefix.
+/// Supported external URL schemes in terminal plain-text and OSC 8 links.
+pub const URL_SCHEMES: [&str; 4] = ["https://", "http://", "cursor://", "vscode://"];
+
+/// Returns the character length of a supported URL scheme prefix at the start of `slice`,
+/// or `0` if `slice` does not start with one.
+pub fn url_scheme_len<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
+    for scheme in URL_SCHEMES {
+        let len = scheme.len();
+        if slice
+            .get(..len)
+            .is_some_and(|s| s.iter().map(&mut ch).eq(scheme.chars()))
+        {
+            return len;
+        }
+    }
+    0
+}
+
+/// Strips a supported URL scheme prefix from `s`.
+#[must_use]
+pub fn strip_url_scheme(s: &str) -> Option<&str> {
+    URL_SCHEMES.iter().find_map(|scheme| s.strip_prefix(scheme))
+}
+
+/// Returns the byte length of a supported URL scheme prefix (ASCII case-insensitive),
+/// or `0` if `s` does not begin with one.
+#[must_use]
+pub fn url_scheme_prefix_len_ascii_ci(s: &str) -> usize {
+    URL_SCHEMES
+        .iter()
+        .find_map(|scheme| {
+            s.get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                .then_some(scheme.len())
+        })
+        .unwrap_or(0)
+}
+
+/// Scans a plain-text `http://`, `https://`, `cursor://`, or `vscode://` URL at the start of
+/// `slice` and returns its element count after stripping trailing sentence punctuation and
+/// unmatched delimiters. Returns `0` if `slice` does not begin with a supported URL prefix.
 pub fn scan_url_len<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
-    let scheme_len = if slice
-        .get(..8)
-        .is_some_and(|s| s.iter().map(&mut ch).eq("https://".chars()))
-    {
-        8
-    } else if slice
-        .get(..7)
-        .is_some_and(|s| s.iter().map(&mut ch).eq("http://".chars()))
-    {
-        7
-    } else {
+    let scheme_len = url_scheme_len(slice, &mut ch);
+    if scheme_len == 0 {
         return 0;
-    };
+    }
 
     let mut in_path = false;
     let mut seg_ascii = false;
@@ -228,10 +257,7 @@ pub fn scan_url_len<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
 }
 
 fn has_valid_authority(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Some(rest) = strip_url_scheme(url) else {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
@@ -628,10 +654,7 @@ fn normalize_osc8_links(rows: &mut [Vec<Cell>], links: &mut [Vec<Link>]) {
             let Some(first_link) = links.get(start_line).and_then(|r| r.get(start_idx)) else {
                 continue;
             };
-            if first_link.cols == 0
-                || (!first_link.uri.starts_with("http://")
-                    && !first_link.uri.starts_with("https://"))
-            {
+            if first_link.cols == 0 || strip_url_scheme(&first_link.uri).is_none() {
                 continue;
             }
             let uri = first_link.uri.clone();
@@ -1012,6 +1035,49 @@ mod tests {
             "http://localhost:3000/문서"
         );
         assert_eq!(scan_str("https://..."), "");
+        assert_eq!(
+            scan_str("cursor://vscode-remote/ssh-remote+box/home/user/repo)하면"),
+            "cursor://vscode-remote/ssh-remote+box/home/user/repo"
+        );
+        assert_eq!(
+            scan_str("vscode://vscode-remote/wsl+Ubuntu/workspace/main.rs:42:5."),
+            "vscode://vscode-remote/wsl+Ubuntu/workspace/main.rs:42:5"
+        );
+        assert_eq!(scan_str("cursor://..."), "");
+        assert_eq!(scan_str("vscode://"), "");
+    }
+
+    #[test]
+    fn normalize_trims_cursor_and_vscode_osc8_links() {
+        for uri_base in [
+            "cursor://vscode-remote/ssh-remote+dev/home/user/app",
+            "vscode://vscode-remote/wsl+Ubuntu/home/user/app",
+        ] {
+            let over = format!("{uri_base})하면");
+            let mut row = row_from_str("(", Flags::default(), Color::Default);
+            let start = u16::try_from(row.len()).unwrap();
+            let linked = row_from_str(&over, Flags::LINK, Color::Default);
+            let link_cols = u16::try_from(linked.len()).unwrap();
+            row.extend(linked);
+            let mut rows = vec![row];
+            let mut links = vec![vec![Link {
+                column: start,
+                cols: link_cols,
+                uri: over,
+            }]];
+            normalize_screen_links(&mut rows, &mut links);
+            assert_eq!(
+                links
+                    .first()
+                    .and_then(|r| r.first())
+                    .map(|l| l.uri.as_str()),
+                Some(uri_base)
+            );
+            assert_eq!(
+                links.first().and_then(|r| r.first()).map(|l| l.cols),
+                Some(u16::try_from(uri_base.len()).unwrap())
+            );
+        }
     }
 
     #[test]

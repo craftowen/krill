@@ -107,6 +107,11 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::FocusPaneRight", text::SC_PANE_RIGHT),
     ("shell::FocusPaneUp", text::SC_PANE_UP),
     ("shell::FocusPaneDown", text::SC_PANE_DOWN),
+    ("shell::ResizePaneLeft", text::SC_RESIZE_PANE_LEFT),
+    ("shell::ResizePaneRight", text::SC_RESIZE_PANE_RIGHT),
+    ("shell::ResizePaneUp", text::SC_RESIZE_PANE_UP),
+    ("shell::ResizePaneDown", text::SC_RESIZE_PANE_DOWN),
+    ("shell::RenamePane", text::SC_RENAME_PANE),
     ("shell::ToggleZoomPane", text::SC_ZOOM_PANE),
     ("shell::ClearPane", text::SC_CLEAR),
     ("shell::SelectAll", text::SC_SELECT_ALL),
@@ -175,6 +180,11 @@ pub(super) fn action_category(action: &str) -> Category {
         | "shell::FocusPaneRight"
         | "shell::FocusPaneUp"
         | "shell::FocusPaneDown"
+        | "shell::ResizePaneLeft"
+        | "shell::ResizePaneRight"
+        | "shell::ResizePaneUp"
+        | "shell::ResizePaneDown"
+        | "shell::RenamePane"
         | "shell::ToggleZoomPane"
         | "shell::ClearPane"
         | "shell::SelectAll"

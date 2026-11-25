@@ -314,8 +314,11 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
             || WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(760.)), cx)),
             |saved| on_screen(shell::gpui_window_bounds_from_saved(saved), cx),
         );
+    let window_background =
+        krill_app::settings::window_background_appearance(krill_app::settings::window_blur(cx));
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
+        window_background,
         window_min_size: Some(size(
             px(krill_app::layout::MIN_WINDOW_WIDTH),
             px(krill_app::layout::MIN_WINDOW_HEIGHT),

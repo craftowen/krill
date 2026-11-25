@@ -108,13 +108,7 @@ fn standalone(row: &[Cell]) -> Option<(usize, &[Cell])> {
 }
 
 fn starts_url(cells: &[Cell]) -> bool {
-    ["http://", "https://"].iter().any(|scheme| {
-        cells
-            .iter()
-            .take(scheme.len())
-            .map(|c| c.ch)
-            .eq(scheme.chars())
-    })
+    krill_proto::screen::url::url_scheme_len(cells, |c| c.ch) > 0
 }
 
 fn hard_parts(screen: &Screen, first: usize, hit: usize) -> Option<Vec<Part<'_>>> {

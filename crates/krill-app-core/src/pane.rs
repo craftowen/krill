@@ -1642,6 +1642,47 @@ impl<W: Write> Pane<W> {
         }
     }
 
+    /// 스크롤바 클릭·드래그로 `target_offset`(바닥 기준 위로 올린 행 수)으로 바로 이동한다.
+    /// `retain_at_bottom`이 참이면 드래그 중 0에 닿아도 받아 둔 스크롤백을 버리지 않아
+    /// 마우스를 다시 위로 끌어도 끊기지 않는다.
+    pub fn scroll_to_offset(&mut self, target_offset: usize, retain_at_bottom: bool) -> bool {
+        self.search.top_request = None;
+        self.search.pending = None;
+        self.search.track_screen_hit = false;
+        let had_mark = self.search.highlight.take().is_some();
+        let had_fetch =
+            self.search.hist_req.take().is_some() || self.search.hist_target.take().is_some();
+        let view_dropped = self.forget_search_view();
+        let before = self.history.visible();
+        let screen_lines = usize::from(self.view.screen.lines);
+        self.history
+            .scroll_to(target_offset, screen_lines, retain_at_bottom);
+        if self.history.offset > 0 {
+            self.fetch();
+        }
+        self.freeze_screen_if_scrolled();
+        let changed = self.history.visible() != before || had_mark || had_fetch || view_dropped;
+        if changed {
+            self.refresh();
+        }
+        changed
+    }
+
+    /// 스크롤바 드래그를 마쳤을 때 바닥(0)에 멈춰 있으면 보류했던 스크롤백을 정리한다.
+    pub fn finish_scroll_drag(&mut self) -> bool {
+        if self.history.offset == 0
+            && (!self.history.rows.is_empty()
+                || self.history.stable.is_some()
+                || self.history.frozen_screen.is_some())
+        {
+            self.history.reset();
+            self.refresh();
+            true
+        } else {
+            false
+        }
+    }
+
     /// 화면 바닥 위로 올린 행 수(0 = 라이브). 셸이 스크롤바·바닥 복귀 배지를 그릴 때 쓴다(OWE-873).
     pub fn scroll_offset(&self) -> usize {
         self.history.visible()
@@ -2380,6 +2421,25 @@ impl History {
         };
         self.offset = next.min(cap);
         if self.offset == 0 {
+            self.reset();
+        }
+    }
+
+    fn scroll_to(&mut self, target_offset: usize, screen_lines: usize, retain_at_bottom: bool) {
+        if let Some(cache) = &mut self.stable {
+            let total = cache.complete_total().unwrap_or_else(|| cache.total());
+            let clamped = target_offset.min(total);
+            self.offset = clamped;
+            if clamped == 0 && !retain_at_bottom {
+                self.reset();
+            } else {
+                cache.show(clamped, screen_lines);
+            }
+            return;
+        }
+        let clamped = target_offset.min(self.total_len());
+        self.offset = clamped;
+        if clamped == 0 && !retain_at_bottom {
             self.reset();
         }
     }

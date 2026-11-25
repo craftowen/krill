@@ -29,6 +29,12 @@ const FORMAT_VERSION: u8 = 7;
 const CHAT_VIEWS_TAG: &[u8] = b"KCV1";
 /// Optional group-pane bindings after `chat_views`; old readers ignore this suffix.
 const GROUP_PANES_TAG: &[u8] = b"KGP1";
+/// Optional per-pane custom titles after `group_panes`; old readers ignore this suffix.
+const PANE_TITLES_TAG: &[u8] = b"KPT1";
+/// Proportional split ratio step when pixel dimensions are unavailable.
+pub const DEFAULT_RESIZE_RATIO_STEP: f32 = 0.05;
+/// Default keyboard pane resize step in logical pixels (scaled by UI zoom in shell).
+pub const KEYBOARD_RESIZE_STEP_PX: f32 = 40.0;
 
 /// Group chat room/thread binding attached to a layout pane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +193,26 @@ impl PaneTree {
                 Branch::First => first.node_mut(rest),
                 Branch::Second => second.node_mut(rest),
             },
+        }
+    }
+
+    /// Finds the path of branches from this node down to `target`, if present.
+    fn path_to(&self, target: PaneId, out: &mut Vec<Branch>) -> bool {
+        match self {
+            Self::Leaf(id) => *id == target,
+            Self::Split { first, second, .. } => {
+                out.push(Branch::First);
+                if first.path_to(target, out) {
+                    return true;
+                }
+                out.pop();
+                out.push(Branch::Second);
+                if second.path_to(target, out) {
+                    return true;
+                }
+                out.pop();
+                false
+            }
         }
     }
 
@@ -410,6 +436,9 @@ pub struct Layout {
     /// Multi-bot group room/thread panes (Orca Group Page tabs).
     #[serde(skip)]
     group_panes: BTreeMap<PaneId, GroupPaneTarget>,
+    /// Per-pane custom names (distinct from `Tab.custom_title`), persisted via `PANE_TITLES_TAG`.
+    #[serde(skip)]
+    pane_titles: BTreeMap<PaneId, String>,
 }
 
 /// v5까지의 디스크 `Tab`(OWE-734 `pinned`·`color` 이전).
@@ -510,6 +539,7 @@ impl From<LegacyLayoutV6> for Layout {
             zoomed: Vec::new(),
             chat_views: BTreeMap::new(),
             group_panes: BTreeMap::new(),
+            pane_titles: BTreeMap::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -556,6 +586,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             zoomed: Vec::new(),
             chat_views: BTreeMap::new(),
             group_panes: BTreeMap::new(),
+            pane_titles: BTreeMap::new(),
         };
         layout.record_mru(layout.active);
         layout
@@ -590,6 +621,7 @@ impl Default for Layout {
             zoomed: Vec::new(),
             chat_views: BTreeMap::new(),
             group_panes: BTreeMap::new(),
+            pane_titles: BTreeMap::new(),
         }
     }
 }
@@ -665,6 +697,52 @@ impl Layout {
         self.zoomed.retain(|p| !visible.contains(p));
         if let Some(pane) = pane.filter(|p| visible.len() > 1 && visible.contains(p)) {
             self.zoomed.push(pane);
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.focused = pane;
+                self.record_pane_mru();
+            }
+        }
+    }
+
+    /// Toggles zoom for `pane`. Zooming also focuses `pane` so keyboard input and `Cmd+W`
+    /// always target the visible zoomed pane rather than a hidden sibling.
+    pub fn toggle_zoom_pane(&mut self, pane: PaneId) -> bool {
+        if self.zoomed_pane() == Some(pane) {
+            self.set_zoomed_pane(None);
+            false
+        } else {
+            self.set_zoomed_pane(Some(pane));
+            self.zoomed_pane() == Some(pane)
+        }
+    }
+
+    /// Custom title assigned to an individual pane (distinct from `Tab.custom_title`).
+    #[must_use]
+    pub fn pane_title(&self, pane: PaneId) -> Option<&str> {
+        self.pane_titles
+            .get(&pane)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Sets or clears an individual pane's custom title. Control characters are stripped
+    /// and the title is capped at 128 characters.
+    pub fn set_pane_title(&mut self, pane: PaneId, title: Option<&str>) {
+        if !self.pane_exists(pane) {
+            return;
+        }
+        let cleaned: String = title
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect();
+        if cleaned.is_empty() {
+            self.pane_titles.remove(&pane);
+        } else {
+            self.pane_titles.insert(pane, cleaned);
         }
     }
 
@@ -1096,6 +1174,8 @@ impl Layout {
         self.group_panes.retain(|p, _| {
             live.contains(p) && !self.files.contains_key(p) && !self.sessions.contains_key(p)
         });
+        self.pane_titles
+            .retain(|p, t| live.contains(p) && !t.trim().is_empty());
     }
 
     fn alloc_pane(&mut self) -> PaneId {
@@ -1123,6 +1203,7 @@ impl Layout {
                 && self.files.get(&pane) == baseline.files.get(&pane)
                 && self.file_states.get(&pane) == baseline.file_states.get(&pane)
                 && self.respawn_cwds.get(&pane) == baseline.respawn_cwds.get(&pane)
+                && self.pane_titles.get(&pane) == baseline.pane_titles.get(&pane)
                 && !self.zoomed.contains(&pane)
                 && self.preview.as_ref().is_none_or(|(p, _)| *p != pane)
         })
@@ -1165,6 +1246,7 @@ impl Layout {
             self.files = remap_pane_map(std::mem::take(&mut self.files), &saved_map);
             self.file_states = remap_pane_map(std::mem::take(&mut self.file_states), &saved_map);
             self.respawn_cwds = remap_pane_map(std::mem::take(&mut self.respawn_cwds), &saved_map);
+            self.pane_titles = remap_pane_map(std::mem::take(&mut self.pane_titles), &saved_map);
             self.preview = self
                 .preview
                 .take()
@@ -1206,6 +1288,9 @@ impl Layout {
                 }
                 if let Some(v) = edited.respawn_cwds.get(&pane) {
                     self.respawn_cwds.insert(pane, v.clone());
+                }
+                if let Some(v) = edited.pane_titles.get(&pane) {
+                    self.pane_titles.insert(pane, v.clone());
                 }
             }
             self.tabs.push(tab.clone());
@@ -1716,10 +1801,27 @@ impl Layout {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
+        if tab.root.contains(pane) {
+            tab.focused = pane;
+            self.record_pane_mru();
+        }
+    }
+
+    /// Focuses `pane` within the active tab and, when the tab is currently zoomed, transfers
+    /// zoom to `pane` so keyboard pane navigation stays zoomed on the newly focused pane.
+    fn focus_transferring_zoom(&mut self, pane: PaneId) {
+        let was_zoomed = self.zoomed_pane().is_some();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         let mut leaves = Vec::new();
         tab.root.leaves(&mut leaves);
         if leaves.contains(&pane) {
             tab.focused = pane;
+            if was_zoomed && leaves.len() > 1 {
+                self.zoomed.retain(|p| !leaves.contains(p));
+                self.zoomed.push(pane);
+            }
             self.record_pane_mru();
         }
     }
@@ -1736,7 +1838,7 @@ impl Layout {
             .unwrap_or(0);
         let len = leaves.len().cast_signed();
         let next = (cur.cast_signed() + step).rem_euclid(len).cast_unsigned();
-        self.focus(leaves[next]);
+        self.focus_transferring_zoom(leaves[next]);
     }
 
     /// OWE-871: 활성 탭 안에서 `dir` 쪽에 가장 가까운 칸으로 포커스를 옮긴다.
@@ -1776,7 +1878,7 @@ impl Layout {
             }
         }
         if let Some((pane, _)) = best {
-            self.focus(pane);
+            self.focus_transferring_zoom(pane);
         }
     }
 
@@ -1820,6 +1922,95 @@ impl Layout {
         {
             *ratio = value;
         }
+    }
+
+    /// Moves the nearest ancestor split divider of the focused pane along `dir`'s axis.
+    /// When `surface_size` (`[width, height]` in logical pixels) is provided, moves by
+    /// `step_px` respecting `MIN_PANE_PX` bounds; otherwise moves by `DEFAULT_RESIZE_RATIO_STEP`
+    /// clamped to `0.1..=0.9`. Returns `true` if a split ratio changed.
+    pub fn resize_focused_pane(
+        &mut self,
+        dir: Direction,
+        step_px: f32,
+        surface_size: Option<[f32; 2]>,
+    ) -> bool {
+        if self.zoomed_pane().is_some() {
+            return false;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let focused = tab.focused;
+        let target_axis = match dir {
+            Direction::Left | Direction::Right => Axis::Horizontal,
+            Direction::Up | Direction::Down => Axis::Vertical,
+        };
+        let sign: f32 = match dir {
+            Direction::Left | Direction::Up => -1.0,
+            Direction::Right | Direction::Down => 1.0,
+        };
+        let mut full_path = Vec::new();
+        if !tab.root.path_to(focused, &mut full_path) || full_path.is_empty() {
+            return false;
+        }
+
+        // Walk from root along `full_path`, tracking container width/height and recording
+        // the deepest (nearest) split matching `target_axis`.
+        let mut node = &tab.root;
+        let mut span = surface_size.map(|[w, h]| [w.max(0.0), h.max(0.0)]);
+        let mut matched: Option<(usize, f32, Option<f32>)> = None;
+        for (depth, &branch) in full_path.iter().enumerate() {
+            let PaneTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } = node
+            else {
+                break;
+            };
+            if *axis == target_axis {
+                let axis_span = span.map(|[w, h]| match target_axis {
+                    Axis::Horizontal => w,
+                    Axis::Vertical => h,
+                });
+                matched = Some((depth, *ratio, axis_span));
+            }
+            if let Some([w, h]) = span {
+                let factor = match branch {
+                    Branch::First => *ratio,
+                    Branch::Second => 1.0 - *ratio,
+                };
+                span = Some(match axis {
+                    Axis::Horizontal => [w * factor, h],
+                    Axis::Vertical => [w, h * factor],
+                });
+            }
+            node = match branch {
+                Branch::First => first,
+                Branch::Second => second,
+            };
+        }
+
+        let Some((depth, old_ratio, axis_span)) = matched else {
+            return false;
+        };
+        let next_ratio = match axis_span {
+            Some(total) if total.is_finite() && total > 2.0 * MIN_PANE_PX => {
+                let delta = if step_px.is_finite() && step_px > 0.0 {
+                    step_px
+                } else {
+                    KEYBOARD_RESIZE_STEP_PX
+                };
+                drag_ratio(old_ratio * total + sign * delta, 0.0, total)
+            }
+            _ => (old_ratio + sign * DEFAULT_RESIZE_RATIO_STEP).clamp(0.1, 0.9),
+        };
+        if (next_ratio - old_ratio).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.set_ratio(&full_path[..depth], next_ratio);
+        true
     }
 
     fn tail(&self) -> LayoutTail {
@@ -1880,6 +2071,7 @@ impl Layout {
             && self.group_panes.keys().all(|p| {
                 seen.contains(p) && !self.files.contains_key(p) && !self.sessions.contains_key(p)
             })
+            && self.pane_titles.keys().all(|p| seen.contains(p))
     }
 
     /// 손상 백업(`.corrupt`)을 만들지 않고 저장 파일에서 창 위치·크기만 미리 읽는다.
@@ -1963,7 +2155,7 @@ impl Layout {
                                 rest_prefs = next;
                             }
                             if let Some(bytes) = rest_prefs.strip_prefix(GROUP_PANES_TAG)
-                                && let Ok((groups, _)) = postcard::take_from_bytes::<
+                                && let Ok((groups, next)) = postcard::take_from_bytes::<
                                     BTreeMap<PaneId, GroupPaneTarget>,
                                 >(bytes)
                             {
@@ -1973,6 +2165,27 @@ impl Layout {
                                         l.pane_exists(*pane)
                                             && !l.files.contains_key(pane)
                                             && !l.sessions.contains_key(pane)
+                                    })
+                                    .collect();
+                                rest_prefs = next;
+                            }
+                            if let Some(bytes) = rest_prefs.strip_prefix(PANE_TITLES_TAG)
+                                && let Ok((titles, _)) =
+                                    postcard::take_from_bytes::<BTreeMap<PaneId, String>>(bytes)
+                            {
+                                l.pane_titles = titles
+                                    .into_iter()
+                                    .filter_map(|(pane, title)| {
+                                        if !l.pane_exists(pane) {
+                                            return None;
+                                        }
+                                        let cleaned: String = title
+                                            .trim()
+                                            .chars()
+                                            .filter(|c| !c.is_control())
+                                            .take(128)
+                                            .collect();
+                                        (!cleaned.is_empty()).then_some((pane, cleaned))
                                     })
                                     .collect();
                             }
@@ -2022,7 +2235,8 @@ impl Layout {
         let focus = (self.tabs.len() > 1
             || !self.zoomed.is_empty()
             || !self.chat_views.is_empty()
-            || !self.group_panes.is_empty())
+            || !self.group_panes.is_empty()
+            || !self.pane_titles.is_empty())
         .then(|| FocusTail {
             order: self.mru_order(),
             zoomed: self.zoomed.clone(),
@@ -2043,6 +2257,12 @@ impl Layout {
                         body.extend(GROUP_PANES_TAG);
                         body.extend(
                             postcard::to_stdvec(&self.group_panes).map_err(io::Error::other)?,
+                        );
+                    }
+                    if !self.pane_titles.is_empty() {
+                        body.extend(PANE_TITLES_TAG);
+                        body.extend(
+                            postcard::to_stdvec(&self.pane_titles).map_err(io::Error::other)?,
                         );
                     }
                 }
