@@ -133,6 +133,66 @@ pub(crate) fn poll_session_in(
     poll_session_in_bounded(roots, stored, fallback_cwd, offset, None, &empty_claimed).0
 }
 
+/// Resolves a session's transcript identity (`agent`, `session_id`, `transcript_path`, `bound`)
+/// without reading or parsing 512 KiB of transcript content from offset 0.
+pub(crate) fn resolve_session_bounded(
+    state_dir: Option<&Path>,
+    stored: Option<&StoredLaunch>,
+    fallback_cwd: &[u8],
+    min_birth_secs: Option<u64>,
+    claimed: &(BTreeSet<String>, BTreeSet<PathBuf>),
+) -> (ChatPollSnapshot, Option<(PathBuf, String)>) {
+    let Some(stored) = stored else {
+        return (ChatPollSnapshot::default(), None);
+    };
+    let Some(agent) = agent_for_session(stored) else {
+        return (
+            ChatPollSnapshot {
+                agent: bounded(&stored.profile, MAX_TEXT),
+                ..ChatPollSnapshot::default()
+            },
+            None,
+        );
+    };
+    let roots = collect_roots(state_dir);
+    let cwd_bytes = if stored.cwd.is_empty() {
+        fallback_cwd
+    } else {
+        stored.cwd.as_slice()
+    };
+    let cwd_str = String::from_utf8_lossy(cwd_bytes);
+    let filter = CwdFallbackFilter {
+        min_birth_secs,
+        claimed_ids: &claimed.0,
+        claimed_paths: &claimed.1,
+    };
+    let resolved = resolve_transcript(&roots, agent, stored, &cwd_str, &filter);
+    let Some((path, session_id)) = resolved else {
+        return (
+            ChatPollSnapshot {
+                agent: bounded(agent.profile(), MAX_TEXT),
+                session_id: bounded(stored.session_id.as_deref().unwrap_or(""), MAX_TEXT),
+                transcript_path: bounded(stored.transcript_path.as_deref().unwrap_or(""), MAX_TEXT),
+                next_offset: 0,
+                reset: false,
+                bound: false,
+                items: Vec::new(),
+            },
+            None,
+        );
+    };
+    let snapshot = ChatPollSnapshot {
+        agent: bounded(agent.profile(), MAX_TEXT),
+        session_id: bounded(&session_id, MAX_TEXT),
+        transcript_path: bounded(&path.to_string_lossy(), MAX_TEXT),
+        next_offset: 0,
+        reset: false,
+        bound: true,
+        items: Vec::new(),
+    };
+    (snapshot, Some((path, session_id)))
+}
+
 /// 세션의 `StoredLaunch`, 시작 시각 하한(`min_birth_secs`), 다른 세션이 이미 점유한 트랜스크립트(`claimed`)를
 /// 바탕으로 트랜스크립트를 증분 폴링하고, 해석된 `(path, session_id)`도 함께 반환한다.
 pub(crate) fn poll_session_bounded(
@@ -373,34 +433,114 @@ pub(crate) fn latest_page(
             start = floor;
         }
     }
+    if leading >= complete {
+        let page = poll_transcript_file_until(agent, &snapshot.session_id, path, start, Some(end));
+        return Ok((page, start));
+    }
     let mut count = 0usize;
     let mut page_bytes = 0usize;
+    let mut accepted: Vec<(u64, Option<bool>, Vec<ChatItem>)> = Vec::new();
     for line in bytes
         .get(leading..complete)
         .unwrap_or_default()
         .split_inclusive(|b| *b == b'\n')
         .rev()
     {
-        let mut items = Vec::new();
-        if let Ok(value) = serde_json::from_slice::<Value>(line) {
-            parse_line_into_items(agent, &value, &mut items);
+        let mut line_items = Vec::new();
+        let mut codex_record = None;
+        let trimmed = trim_ascii_whitespace(line);
+        if !trimmed.is_empty()
+            && let Ok(value) = serde_json::from_slice::<Value>(trimmed)
+        {
+            if agent == VaultAgent::Codex {
+                codex_record = match value.get("type").and_then(Value::as_str) {
+                    Some("response_item") => Some(false),
+                    Some("event_msg") => Some(true),
+                    _ => None,
+                };
+            }
+            parse_line_into_items(agent, &value, &mut line_items);
         }
-        let line_bytes: usize = items.iter().map(estimated_chat_item_wire_bytes).sum();
+        let line_bytes: usize = line_items.iter().map(estimated_chat_item_wire_bytes).sum();
         if count > 0
-            && !items.is_empty()
-            && (count.saturating_add(items.len()) > MAX_CHAT_ITEMS
+            && !line_items.is_empty()
+            && (count.saturating_add(line_items.len()) > MAX_CHAT_ITEMS
                 || page_bytes.saturating_add(line_bytes) > MAX_CHAT_RESPONSE_BYTES)
         {
             break;
         }
-        count = count.saturating_add(items.len());
+        let line_len = u64::try_from(line.len()).unwrap_or(0);
+        count = count.saturating_add(line_items.len());
         page_bytes = page_bytes.saturating_add(line_bytes);
-        start = start.saturating_sub(u64::try_from(line.len()).unwrap_or(0));
+        start = start.saturating_sub(line_len);
+        accepted.push((line_len, codex_record, line_items));
         if count >= MAX_CHAT_ITEMS || page_bytes >= MAX_CHAT_RESPONSE_BYTES {
             break;
         }
     }
-    let page = poll_transcript_file_until(agent, &snapshot.session_id, path, start, Some(end));
+    accepted.reverse();
+    let mut consumed = start;
+    let mut out_bytes = 0usize;
+    let mut items: Vec<ChatItem> = Vec::new();
+    let mut previous_codex_record = None;
+    for (n_u64, codex_record, mut line_items) in accepted {
+        // Claude names a prompt's pasted images in the next record: fold them into that prompt.
+        if let [only] = line_items.as_slice()
+            && only.kind == ChatItemKind::User
+            && only.text.is_empty()
+            && let Some(previous) = items.last_mut()
+            && previous.kind == ChatItemKind::User
+        {
+            let paths: Vec<String> = only.file_path.lines().map(str::to_owned).collect();
+            add_image_paths(previous, &paths);
+            line_items.clear();
+        }
+        if previous_codex_record
+            .zip(codex_record)
+            .is_some_and(|(a, b)| a != b)
+            && let Some(previous) = items.last_mut()
+            && let Some(current) = line_items.first()
+            && matches!(
+                current.kind,
+                ChatItemKind::User | ChatItemKind::Assistant | ChatItemKind::Reasoning
+            )
+            && previous.kind == current.kind
+            && previous.text == current.text
+        {
+            let paths: Vec<String> = current.file_path.lines().map(str::to_owned).collect();
+            add_image_paths(previous, &paths);
+            line_items.remove(0);
+            previous_codex_record = None;
+        } else {
+            previous_codex_record = codex_record;
+        }
+        let mut line_bytes: usize = line_items.iter().map(estimated_chat_item_wire_bytes).sum();
+        if !line_items.is_empty()
+            && !items.is_empty()
+            && (items.len().saturating_add(line_items.len()) > MAX_CHAT_ITEMS
+                || out_bytes.saturating_add(line_bytes) > MAX_CHAT_RESPONSE_BYTES)
+        {
+            break;
+        }
+        if items.is_empty() && line_bytes > MAX_CHAT_RESPONSE_BYTES {
+            line_bytes = cap_single_record_items(&mut line_items, MAX_CHAT_RESPONSE_BYTES);
+        }
+        consumed = consumed.saturating_add(n_u64);
+        out_bytes = out_bytes.saturating_add(line_bytes);
+        items.extend(line_items);
+        if items.len() > MAX_CHAT_ITEMS || out_bytes >= MAX_CHAT_RESPONSE_BYTES {
+            break;
+        }
+    }
+    let page = ChatPollSnapshot {
+        agent: bounded(agent.profile(), MAX_TEXT),
+        session_id: bounded(&snapshot.session_id, MAX_TEXT),
+        transcript_path: bounded(&path.to_string_lossy(), MAX_TEXT),
+        next_offset: consumed,
+        reset: false,
+        bound: true,
+        items,
+    };
     Ok((page, start))
 }
 
@@ -5228,5 +5368,68 @@ mod performance_tests {
         assert!(page2.items[0].text.starts_with("msg-000-"));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn latest_page_single_pass_tail_window_matches_multi_page_and_codex_dedup() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-latest-single-pass-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("large-claude.jsonl");
+        let mut raw = String::new();
+        // Exceed MAX_POLL_BYTES (512 KiB) so latest_page operates on a mid-file tail window.
+        for i in 0..700usize {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let pad = "x".repeat(900);
+            let line = serde_json::json!({
+                "type": role,
+                "message": { "role": role, "content": format!("turn-{i:04}-{pad}") }
+            })
+            .to_string();
+            raw.push_str(&line);
+            raw.push('\n');
+        }
+        assert!((raw.len() as u64) > MAX_POLL_BYTES);
+        fs::write(&path, &raw).unwrap();
+
+        let snap = ChatPollSnapshot {
+            agent: "claude".into(),
+            session_id: "large-sess".into(),
+            transcript_path: path.to_string_lossy().into_owned(),
+            next_offset: 0,
+            reset: false,
+            bound: true,
+            items: Vec::new(),
+        };
+        let (tail, start) = latest_page(snap, None).unwrap();
+        assert_eq!(tail.next_offset, raw.len() as u64);
+        assert_eq!(tail.items.len(), MAX_CHAT_ITEMS);
+        assert!(tail.items.last().unwrap().text.starts_with("turn-0699-"));
+        assert!(tail.items.first().unwrap().text.starts_with("turn-0572-"));
+        assert!(start > 0);
+        // Re-reading from `start` via forward poll reproduces the exact same tail items.
+        let forward = poll_transcript_file_until(
+            VaultAgent::Claude,
+            "large-sess",
+            &path,
+            start,
+            Some(tail.next_offset),
+        );
+        assert_eq!(forward.items.len(), tail.items.len());
+        assert_eq!(
+            forward.items.first().unwrap().text,
+            tail.items.first().unwrap().text
+        );
+        assert_eq!(
+            forward.items.last().unwrap().text,
+            tail.items.last().unwrap().text
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

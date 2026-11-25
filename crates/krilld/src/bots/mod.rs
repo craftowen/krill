@@ -265,6 +265,39 @@ impl BotsManager {
         &self.groups
     }
 
+    /// Access to the bot runtime session tracker.
+    #[must_use]
+    pub(crate) fn runtime(&self) -> &Arc<BotRuntime> {
+        &self.runtime
+    }
+
+    /// Computes upcoming schedule / Look Around metadata for `bot` without re-reading `bots.json`.
+    #[must_use]
+    pub(crate) fn bot_upcoming_for(
+        &self,
+        registry: &Registry,
+        bot: &BotConfig,
+        ts: u64,
+    ) -> krill_proto::bots::BotUpcoming {
+        let extras = self.store.settings_extras(&bot.id).unwrap_or_default();
+        krill_proto::bots::BotUpcoming {
+            items_seen_event_id: self.items.items_seen_event_id(&bot.id).unwrap_or(0),
+            ..look_around::bot_upcoming_with_extras(
+                bot,
+                extras,
+                &self.scheduler_state,
+                |id| self.schedule_running(registry, &bot.id, id),
+                ts,
+            )
+        }
+    }
+
+    /// Collects connector statuses across all active bots or one `bot_id`.
+    #[must_use]
+    pub(crate) fn connector_statuses(&self, bot_id: Option<&BotId>) -> Vec<BotConnectorStatus> {
+        self.collect_connector_statuses(bot_id)
+    }
+
     /// Lazily initializes and returns the Wave 2B [`ConnectorManager`].
     #[must_use]
     pub fn connector_manager(&self) -> &Arc<ConnectorManager> {

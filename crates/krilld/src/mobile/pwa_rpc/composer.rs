@@ -153,7 +153,7 @@ impl Backend {
     pub(super) fn composer_status(&self, session: u64) -> io::Result<Value> {
         let context = self.composer_context(session)?;
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
-        let snapshot = registry.chat_poll(SessionId(session), u64::MAX);
+        let snapshot = registry.resolve_chat_transcript(SessionId(session));
         let mut value = super::composer_status::read(&snapshot, &context)?;
         let catalog = self.composer_catalog(&context, session);
         set(

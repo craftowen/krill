@@ -100,10 +100,105 @@ impl From<io::Error> for MemoryUpdateError {
     }
 }
 
+const MAX_CACHED_AVATARS: usize = 32;
+const MAX_CACHED_AVATAR_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreFileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+fn file_stamp_from_meta(meta: &fs::Metadata) -> StoreFileStamp {
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+    };
+    StoreFileStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        identity,
+    }
+}
+
+/// Validates that `path` is not a symlink and returns its [`StoreFileStamp`], or `Ok(None)` if missing.
+fn stamp_regular_file(path: &Path) -> io::Result<Option<StoreFileStamp>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to follow symlink inside bot store",
+                ));
+            }
+            Ok(Some(file_stamp_from_meta(&meta)))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Default)]
+struct StoreCache {
+    bots: Option<(StoreFileStamp, Vec<BotConfig>)>,
+    groups: Option<(StoreFileStamp, Vec<BotGroupChat>)>,
+    access_requests: Option<(StoreFileStamp, Vec<BotAccessRequest>)>,
+    suggestions: Option<(StoreFileStamp, Vec<BotSuggestion>)>,
+    settings_extras: Option<(StoreFileStamp, BTreeMap<String, BotSettingsExtras>)>,
+    avatars: BTreeMap<PathBuf, (StoreFileStamp, Vec<u8>)>,
+    avatar_bytes: usize,
+}
+
+impl StoreCache {
+    fn invalidate_file(&mut self, filename: &str) {
+        match filename {
+            BOTS_INDEX_FILE => self.bots = None,
+            GROUPS_FILE => self.groups = None,
+            ACCESS_REQUESTS_FILE => self.access_requests = None,
+            SUGGESTIONS_FILE => self.suggestions = None,
+            SETTINGS_EXTRAS_FILE => self.settings_extras = None,
+            _ => {}
+        }
+    }
+
+    fn invalidate_avatar(&mut self, path: &Path) {
+        if let Some((_, bytes)) = self.avatars.remove(path) {
+            self.avatar_bytes = self.avatar_bytes.saturating_sub(bytes.len());
+        }
+    }
+
+    fn clear_avatars(&mut self) {
+        self.avatars.clear();
+        self.avatar_bytes = 0;
+    }
+
+    fn insert_avatar(&mut self, path: PathBuf, stamp: StoreFileStamp, bytes: Vec<u8>) {
+        if bytes.len() > MAX_CACHED_AVATAR_TOTAL_BYTES {
+            return;
+        }
+        self.invalidate_avatar(&path);
+        while self.avatars.len() >= MAX_CACHED_AVATARS
+            || self.avatar_bytes.saturating_add(bytes.len()) > MAX_CACHED_AVATAR_TOTAL_BYTES
+        {
+            let Some((_, (_, evicted))) = self.avatars.pop_first() else {
+                break;
+            };
+            self.avatar_bytes = self.avatar_bytes.saturating_sub(evicted.len());
+        }
+        self.avatar_bytes = self.avatar_bytes.saturating_add(bytes.len());
+        self.avatars.insert(path, (stamp, bytes));
+    }
+}
+
 /// Persistent store for Krill Bots under `<state_dir>/bots/`.
 pub struct BotStore {
     root: PathBuf,
     io_lock: Mutex<()>,
+    cache: Mutex<StoreCache>,
     pairing_failures: Mutex<Vec<u64>>,
 }
 
@@ -120,6 +215,7 @@ impl BotStore {
         Self {
             root: bots_root,
             io_lock: Mutex::new(()),
+            cache: Mutex::new(StoreCache::default()),
             pairing_failures: Mutex::new(Vec::new()),
         }
     }
@@ -438,6 +534,7 @@ impl BotStore {
         let updated = bot.clone();
         init_bot_home(&self.root, &updated, None)?;
         self.write_json(BOTS_INDEX_FILE, &bots)?;
+        lock(&self.cache).invalidate_avatar(&avatar_path);
 
         Ok(BotAvatarData {
             bot_id: bot_id.clone(),
@@ -454,13 +551,30 @@ impl BotStore {
         let avatar_path = home.join(AVATAR_FILE);
         ensure_no_symlink_path(&avatar_path)?;
         let meta = fs::symlink_metadata(&avatar_path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to follow symlink inside bot store",
+            ));
+        }
         if usize::try_from(meta.len()).unwrap_or(usize::MAX) > MAX_RPC_AVATAR_PNG_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "avatar PNG exceeds size limit",
             ));
         }
+        let stamp = file_stamp_from_meta(&meta);
+        if let Some((cached_stamp, cached_bytes)) = lock(&self.cache).avatars.get(&avatar_path)
+            && *cached_stamp == stamp
+        {
+            return Ok(BotAvatarData {
+                bot_id: bot_id.clone(),
+                mime: "image/png".to_owned(),
+                png_bytes: cached_bytes.clone(),
+            });
+        }
         let bytes = fs::read(&avatar_path)?;
+        lock(&self.cache).insert_avatar(avatar_path, stamp, bytes.clone());
         Ok(BotAvatarData {
             bot_id: bot_id.clone(),
             mime: "image/png".to_owned(),
@@ -637,6 +751,7 @@ impl BotStore {
             return Err(not_found_bot(bot_id));
         };
         let removed = bots.remove(pos);
+        lock(&self.cache).clear_avatars();
         self.write_json(BOTS_INDEX_FILE, &bots)?;
 
         let mut links: Vec<ExternalConversationLink> = self.read_json_or_default(LINKS_FILE)?;
@@ -1290,7 +1405,7 @@ impl BotStore {
         bot_id: Option<&BotId>,
     ) -> io::Result<Vec<BotAccessRequest>> {
         let _guard = lock(&self.io_lock);
-        let reqs: Vec<BotAccessRequest> = self.read_json_or_default(ACCESS_REQUESTS_FILE)?;
+        let reqs: Vec<BotAccessRequest> = self.read_access_requests_cached()?;
         Ok(reqs
             .into_iter()
             .filter(|r| bot_id.is_none_or(|id| &r.bot_id == id))
@@ -1525,7 +1640,7 @@ impl BotStore {
     /// Lists all multi-bot group chats.
     pub fn list_groups(&self) -> io::Result<Vec<BotGroupChat>> {
         let _guard = lock(&self.io_lock);
-        self.read_json_or_default(GROUPS_FILE)
+        self.read_groups_cached()
     }
 
     /// Creates a new multi-bot group chat after validating all member `bot_ids` exist.
@@ -1685,10 +1800,16 @@ impl BotStore {
 
     // ---------- Look-Around Suggestions ----------
 
+    /// Loads all persisted suggestions across all bots (cached by file stamp).
+    pub fn load_all_suggestions(&self) -> io::Result<Vec<BotSuggestion>> {
+        let _guard = lock(&self.io_lock);
+        self.read_suggestions_cached()
+    }
+
     /// Loads persisted suggestions for `bot_id`.
     pub fn load_suggestions(&self, bot_id: &BotId) -> io::Result<Vec<BotSuggestion>> {
         let _guard = lock(&self.io_lock);
-        let all: Vec<BotSuggestion> = self.read_json_or_default(SUGGESTIONS_FILE)?;
+        let all: Vec<BotSuggestion> = self.read_suggestions_cached()?;
         Ok(all.into_iter().filter(|s| &s.bot_id == bot_id).collect())
     }
 
@@ -2173,8 +2294,7 @@ impl BotStore {
     /// The bot's Items, Look around and Memory upkeep presets; defaults until changed.
     pub fn settings_extras(&self, bot_id: &BotId) -> io::Result<BotSettingsExtras> {
         let _guard = lock(&self.io_lock);
-        let all: BTreeMap<String, BotSettingsExtras> =
-            self.read_json_or_default(SETTINGS_EXTRAS_FILE)?;
+        let all = self.read_settings_extras_cached()?;
         Ok(all.get(bot_id.as_str()).copied().unwrap_or_default())
     }
 
@@ -2297,16 +2417,95 @@ impl BotStore {
     // ---------- Internal JSON Helpers ----------
 
     /// `bots.json`, with a mascot for a bot saved without any picture (Orca never shows one
-    /// bare); the next save keeps it.
+    /// bare); the next save keeps it. Validated against file metadata so unchanged reads avoid
+    /// re-reading and re-parsing JSON on every RPC.
     fn read_bots(&self) -> io::Result<Vec<BotConfig>> {
-        let mut bots: Vec<BotConfig> = self.read_json_or_default(BOTS_INDEX_FILE)?;
-        for bot in &mut bots {
-            let bare = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
-            if bare(&bot.avatar) && bare(&bot.emoji) {
-                bot.avatar = Some(default_mascot(bot.id.as_str()).to_owned());
-            }
+        self.read_cached_json(
+            BOTS_INDEX_FILE,
+            |c| &c.bots,
+            |c, v| c.bots = v,
+            |mut bots: Vec<BotConfig>| {
+                for bot in &mut bots {
+                    let bare =
+                        |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
+                    if bare(&bot.avatar) && bare(&bot.emoji) {
+                        bot.avatar = Some(default_mascot(bot.id.as_str()).to_owned());
+                    }
+                }
+                bots
+            },
+        )
+    }
+
+    fn read_groups_cached(&self) -> io::Result<Vec<BotGroupChat>> {
+        self.read_cached_json(GROUPS_FILE, |c| &c.groups, |c, v| c.groups = v, |v| v)
+    }
+
+    fn read_access_requests_cached(&self) -> io::Result<Vec<BotAccessRequest>> {
+        self.read_cached_json(
+            ACCESS_REQUESTS_FILE,
+            |c| &c.access_requests,
+            |c, v| c.access_requests = v,
+            |v| v,
+        )
+    }
+
+    fn read_suggestions_cached(&self) -> io::Result<Vec<BotSuggestion>> {
+        self.read_cached_json(
+            SUGGESTIONS_FILE,
+            |c| &c.suggestions,
+            |c, v| c.suggestions = v,
+            |v| v,
+        )
+    }
+
+    fn read_settings_extras_cached(&self) -> io::Result<BTreeMap<String, BotSettingsExtras>> {
+        self.read_cached_json(
+            SETTINGS_EXTRAS_FILE,
+            |c| &c.settings_extras,
+            |c, v| c.settings_extras = v,
+            |v| v,
+        )
+    }
+
+    fn read_cached_json<T: DeserializeOwned + Default + Clone>(
+        &self,
+        filename: &str,
+        get: impl Fn(&StoreCache) -> &Option<(StoreFileStamp, T)>,
+        set: impl Fn(&mut StoreCache, Option<(StoreFileStamp, T)>),
+        post: impl FnOnce(T) -> T,
+    ) -> io::Result<T> {
+        ensure_no_symlink_path(&self.root)?;
+        let path = self.root.join(filename);
+        let Some(stamp) = stamp_regular_file(&path)? else {
+            set(&mut lock(&self.cache), None);
+            return Ok(T::default());
+        };
+        if let Some((cached_stamp, cached_val)) = get(&lock(&self.cache))
+            && *cached_stamp == stamp
+        {
+            return Ok(cached_val.clone());
         }
-        Ok(bots)
+        ensure_no_symlink_path(&path)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                set(&mut lock(&self.cache), None);
+                return Ok(T::default());
+            }
+            Err(err) => return Err(err),
+        };
+        if bytes.len() > MAX_JSON_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bot metadata file exceeds size limit",
+            ));
+        }
+        let parsed: T = serde_json::from_slice(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let value = post(parsed);
+        set(&mut lock(&self.cache), Some((stamp, value.clone())));
+        Ok(value)
     }
 
     fn read_json_or_default<T: DeserializeOwned + Default>(&self, filename: &str) -> io::Result<T> {
@@ -2329,6 +2528,7 @@ impl BotStore {
     }
 
     fn write_json<T: Serialize>(&self, filename: &str, value: &T) -> io::Result<()> {
+        lock(&self.cache).invalidate_file(filename);
         ensure_no_symlink_path(&self.root)?;
         fs::DirBuilder::new()
             .recursive(true)
@@ -2339,7 +2539,9 @@ impl BotStore {
         let mut bytes = serde_json::to_vec_pretty(value)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         bytes.push(b'\n');
-        write_atomic_0600(&path, &bytes)
+        let res = write_atomic_0600(&path, &bytes);
+        lock(&self.cache).invalidate_file(filename);
+        res
     }
 }
 
@@ -3655,6 +3857,102 @@ mod tests {
         let after_full_delete = store.create_bot(mk("새 한글 봇"), 4_000).unwrap();
         assert_ne!(after_full_delete.id, recreated.id);
         assert_ne!(after_full_delete.id, old_research.id);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn store_stamp_cache_hits_and_invalidates_on_internal_and_external_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "krill-bot-store-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = BotStore::new(root.clone());
+        let bot = store
+            .create_bot(
+                CreateBotParams {
+                    name: "Cache Bot".to_owned(),
+                    agent_id: "agy".to_owned(),
+                    description: "v1".to_owned(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        // Repeated reads hit the stamp-validated cache and stay accurate.
+        assert_eq!(store.list_bots().unwrap().len(), 1);
+        assert_eq!(store.list_bots().unwrap()[0].description, "v1");
+
+        // Internal update invalidates cache immediately.
+        store
+            .update_bot(
+                UpdateBotParams {
+                    bot_id: bot.id.clone(),
+                    name: None,
+                    agent_id: None,
+                    description: Some("v2".to_owned()),
+                    emoji: FieldPatch::Unchanged,
+                    avatar: FieldPatch::Unchanged,
+                    model: FieldPatch::Unchanged,
+                    effort: FieldPatch::Unchanged,
+                    permission_mode: None,
+                    paused: None,
+                    workspace: FieldPatch::Unchanged,
+                    look_around: None,
+                    memory_tidy: None,
+                    first_run_completed: None,
+                    notifications: None,
+                    schedules: None,
+                    mcp_tools: None,
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(store.list_bots().unwrap()[0].description, "v2");
+
+        // External on-disk modification (different content/length/mtime) also invalidates cache.
+        let bots_path = root.join("bots.json");
+        let mut on_disk: Vec<BotConfig> =
+            serde_json::from_str(&fs::read_to_string(&bots_path).unwrap()).unwrap();
+        on_disk[0].description = "v3-external-edit-longer".to_owned();
+        fs::write(&bots_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+        assert_eq!(
+            store.list_bots().unwrap()[0].description,
+            "v3-external-edit-longer"
+        );
+
+        // Avatar upload/read/overwrite cache consistency.
+        let make_png = |rgba: [u8; 4]| {
+            let mut out = Vec::new();
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba(rgba));
+            img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        let png_a = make_png([255, 0, 0, 255]);
+        let png_b = make_png([0, 128, 255, 255]);
+        store.upload_avatar(&bot.id, &png_a, 2_100).unwrap();
+        let read_a1 = store.get_avatar(&bot.id).unwrap().png_bytes;
+        let read_a2 = store.get_avatar(&bot.id).unwrap().png_bytes;
+        assert_eq!(read_a1, read_a2);
+        assert!(!read_a1.is_empty());
+        store.upload_avatar(&bot.id, &png_b, 2_200).unwrap();
+        let read_b = store.get_avatar(&bot.id).unwrap().png_bytes;
+        assert_ne!(read_a1, read_b);
+
+        // load_all_suggestions returns the single-read map cleanly.
+        assert!(store.load_all_suggestions().unwrap().is_empty());
 
         fs::remove_dir_all(&root).ok();
     }

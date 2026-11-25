@@ -3662,11 +3662,29 @@ impl Registry {
             })
     }
 
+    /// Resolves a session's transcript identity (`bound`, `agent`, `session_id`, `transcript_path`)
+    /// without reading or parsing transcript content from byte offset 0.
+    pub(crate) fn resolve_chat_transcript(
+        &self,
+        id: SessionId,
+    ) -> krill_proto::agent_history::ChatPollSnapshot {
+        self.chat_poll_inner(id, 0, true)
+    }
+
     /// 세션의 에이전트 트랜스크립트를 `offset` 바이트부터 증분 정규화해 읽는다(OWE-945 / MK-242).
     pub(crate) fn chat_poll(
         &self,
         id: SessionId,
         offset: u64,
+    ) -> krill_proto::agent_history::ChatPollSnapshot {
+        self.chat_poll_inner(id, offset, false)
+    }
+
+    fn chat_poll_inner(
+        &self,
+        id: SessionId,
+        offset: u64,
+        resolve_only: bool,
     ) -> krill_proto::agent_history::ChatPollSnapshot {
         use krill_proto::os::ffi::OsStrExt as _;
         let (root_pid, raw_fg, exited) = {
@@ -3740,7 +3758,7 @@ impl Registry {
                         agent: stored
                             .as_ref()
                             .map_or_else(String::new, |s| s.profile.clone()),
-                        reset: offset > 0,
+                        reset: !resolve_only && offset > 0,
                         ..Default::default()
                     };
                 }
@@ -3777,7 +3795,7 @@ impl Registry {
                     session_id: String::new(),
                     transcript_path: String::new(),
                     next_offset: 0,
-                    reset: offset > 0,
+                    reset: !resolve_only && offset > 0,
                     bound: false,
                     items: Vec::new(),
                 };
@@ -3793,14 +3811,24 @@ impl Registry {
             (start / 1_000_000).checked_sub(11_644_473_600)
         });
         let claimed = self.agents.claimed_transcripts(id);
-        let (snapshot, resolved) = crate::agent_history::chat::poll_session_bounded(
-            self.state_dir().as_deref(),
-            stored.as_ref(),
-            &cwd,
-            offset,
-            launched_at,
-            &claimed,
-        );
+        let (snapshot, resolved) = if resolve_only {
+            crate::agent_history::chat::resolve_session_bounded(
+                self.state_dir().as_deref(),
+                stored.as_ref(),
+                &cwd,
+                launched_at,
+                &claimed,
+            )
+        } else {
+            crate::agent_history::chat::poll_session_bounded(
+                self.state_dir().as_deref(),
+                stored.as_ref(),
+                &cwd,
+                offset,
+                launched_at,
+                &claimed,
+            )
+        };
         if let Some((path, sid)) = resolved
             && stored.as_ref().is_some_and(|s| {
                 s.session_id.as_deref() == Some(&sid)
