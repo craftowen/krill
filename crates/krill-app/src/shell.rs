@@ -9457,7 +9457,13 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleZoomPane, window, cx| {
-                if this.has_blocking_overlay() || this.dashboard.is_some() {
+                if this.has_blocking_overlay()
+                    || this.dashboard.is_some()
+                    || this.bot_ui.renaming.is_some()
+                    || this.bot_ui.renaming_group.is_some()
+                    || this.tab_rename.is_some()
+                    || this.pane_rename.is_some()
+                {
                     return;
                 }
                 let Some(focused) = this.layout.focused() else {
