@@ -1940,10 +1940,22 @@ mod tests {
             .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        let assert_reaped = |pid: i32| {
+            // SIGKILL to a process group tears down reparented grandchildren asynchronously;
+            // allow a brief kernel reap window before asserting process_name fails.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while crate::sys::process_name(pid.unsigned_abs()).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "lingering descendant pid {pid} still alive after process-group kill"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
         if let Ok(pid_text) = fs::read_to_string(&pid_file_ls)
             && let Ok(pid) = pid_text.trim().parse::<i32>()
         {
-            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+            assert_reaped(pid);
         }
 
         let pid_file_ignored = dir.path().join("ignored.pid");
@@ -1969,7 +1981,7 @@ mod tests {
         if let Ok(pid_text) = fs::read_to_string(&pid_file_ignored)
             && let Ok(pid) = pid_text.trim().parse::<i32>()
         {
-            assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+            assert_reaped(pid);
         }
     }
 
