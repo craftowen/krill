@@ -44,6 +44,8 @@ use crate::registry::Registry;
 use crate::sys;
 use crate::sys::ExitWatch;
 
+pub mod recovery;
+
 /// 인계 소켓 이름 = 소켓 경로 + 이 접미사. `.tmp`와 길이가 같아 [`Listener::bind`]의 경로 길이 검사 안에 든다.
 const SUFFIX: &str = ".hnd";
 #[cfg(windows)]

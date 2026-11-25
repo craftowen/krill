@@ -81,7 +81,7 @@ fn stamp_from_opt_wire(w: Option<WireStamp>) -> Stamp {
 }
 
 struct RemoteSession {
-    stream: Option<krill_proto::os::net::UnixStream>,
+    stream: Option<(krill_proto::os::net::UnixStream, u64)>,
 }
 
 impl RemoteSession {
@@ -89,9 +89,11 @@ impl RemoteSession {
         Self { stream: None }
     }
 
-    fn connect_fresh(target: &HostTarget) -> io::Result<krill_proto::os::net::UnixStream> {
+    fn connect_fresh(target: &HostTarget) -> io::Result<(krill_proto::os::net::UnixStream, u64)> {
         let hello = daemon::client_hello(ClientRole::App, "krill-app-remote-fs");
-        let conn = target.connect(&hello).map_err(io::Error::other)?;
+        let (conn, epoch) = target
+            .connect_with_epoch(&hello)
+            .map_err(io::Error::other)?;
         let need = FEAT_CONTROL | FEAT_REMOTE_FS;
         if conn.negotiated.features & need != need {
             return Err(io::Error::new(
@@ -101,12 +103,20 @@ impl RemoteSession {
         }
         conn.stream.set_read_timeout(Some(RPC_TIMEOUT))?;
         conn.stream.set_write_timeout(Some(RPC_TIMEOUT))?;
-        Ok(conn.stream)
+        Ok((conn.stream, epoch))
     }
 
     /// 단일 제어 스트림 위에서 `RemoteFsRequest`를 연속 호출한다.
     /// 읽기 전용 요청에서 이전 응답 직후 피어가 유휴 스트림을 닫았으면 1회 새 연결로 이어간다.
     fn request(&mut self, target: &HostTarget, req: RemoteFsRequest) -> io::Result<RemoteFsReply> {
+        let current_epoch = target.transport_epoch();
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|(_, epoch)| *epoch != current_epoch)
+        {
+            self.stream = None;
+        }
         let can_retry = req.is_read_only() && self.stream.is_some();
         let encoded = Request::RemoteFs(req).encode()?;
         match self.send_encoded(target, &encoded, can_retry) {
@@ -128,15 +138,21 @@ impl RemoteSession {
         encoded: &[u8],
         allow_retry: bool,
     ) -> io::Result<RemoteFsReply> {
-        if self.stream.is_none() {
+        let current_epoch = target.transport_epoch();
+        if self
+            .stream
+            .as_ref()
+            .is_none_or(|(_, epoch)| *epoch != current_epoch)
+        {
             self.stream = Some(Self::connect_fresh(target)?);
         }
-        let Some(sock) = self.stream.as_mut() else {
+        let Some((sock, epoch)) = self.stream.as_mut() else {
             return Err(io::Error::other("missing remote_fs stream"));
         };
+        let epoch = *epoch;
         let record_err = |e: &io::Error| {
             if !(allow_retry && is_retryable_stream_close(e.kind())) {
-                target.record_outcome(false, Some(e));
+                target.record_outcome_for_epoch(epoch, false, Some(e));
             }
         };
         if let Err(e) = sock.write_all(encoded) {
@@ -155,7 +171,10 @@ impl RemoteSession {
                 return Err(e);
             }
         };
-        target.record_outcome(true, None);
+        if target.transport_epoch() != epoch {
+            self.stream = None;
+        }
+        target.record_outcome_for_epoch(epoch, true, None);
         let (kind, bytes) = frame;
         match Reply::decode(kind, &bytes)? {
             Reply::RemoteFs(reply) => Ok(reply),
@@ -1807,5 +1826,122 @@ mod tests {
         }
 
         fs::remove_dir_all(&base_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_session_discards_cached_stream_when_transport_epoch_advances() {
+        use krill_hosts::RemoteConnector;
+
+        let dir = std::env::temp_dir().join(format!("krill-rfs-epoch-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let sock1 = dir.join("t1.sock");
+        let sock2 = dir.join("t2.sock");
+        let l1 = UnixListener::bind(&sock1).unwrap();
+        let l2 = UnixListener::bind(&sock2).unwrap();
+
+        let keep_open = Arc::new(AtomicBool::new(true));
+        let serve_stat = |listener: UnixListener, stamp_ns: u64, hold: Arc<AtomicBool>| {
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                accept_test_handshake(&mut stream, &mut writer);
+                let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+                assert!(matches!(
+                    Request::decode(kind, &body).unwrap(),
+                    Request::RemoteFs(RemoteFsRequest::Stat { .. })
+                ));
+                let reply = Reply::RemoteFs(RemoteFsReply::Stat(Ok(WireStat {
+                    exists: true,
+                    is_file: true,
+                    is_dir: false,
+                    is_symlink: false,
+                    stamp: Some(WireStamp {
+                        modified_unix_ns: Some(stamp_ns),
+                        len: 1,
+                    }),
+                })));
+                writer.write_all(&reply.encode().unwrap()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while hold.load(Ordering::Acquire) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let t1 = serve_stat(l1, 100, Arc::clone(&keep_open));
+        let t2 = serve_stat(l2, 200, Arc::clone(&keep_open));
+
+        let epoch = Arc::new(AtomicU64::new(0));
+        let outcomes: Arc<Mutex<Vec<(u64, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ensure_epoch = Arc::clone(&epoch);
+        let p1 = sock1.clone();
+        let p2 = sock2.clone();
+        let read_epoch = Arc::clone(&epoch);
+        let rec_outcomes = Arc::clone(&outcomes);
+        let target = HostTarget::remote_with_connector(
+            "studio",
+            sock1,
+            RemoteConnector::new(
+                move || {
+                    Ok(if ensure_epoch.load(Ordering::Acquire) == 0 {
+                        p1.clone()
+                    } else {
+                        p2.clone()
+                    })
+                },
+                |_, _| {},
+            )
+            .with_transport_epoch(move || read_epoch.load(Ordering::Acquire))
+            .with_epoch_outcome(move |ep, ok, _| {
+                rec_outcomes.lock().unwrap().push((ep, ok));
+            }),
+        );
+
+        let mut session = RemoteSession::new();
+        let first = session
+            .request(
+                &target,
+                RemoteFsRequest::Stat {
+                    path: b"/remote/a".to_vec(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            RemoteFsReply::Stat(Ok(WireStat {
+                stamp: Some(WireStamp {
+                    modified_unix_ns: Some(100),
+                    ..
+                }),
+                ..
+            }))
+        ));
+
+        epoch.store(1, Ordering::Release);
+        let second = session
+            .request(
+                &target,
+                RemoteFsRequest::Stat {
+                    path: b"/remote/a".to_vec(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            second,
+            RemoteFsReply::Stat(Ok(WireStat {
+                stamp: Some(WireStamp {
+                    modified_unix_ns: Some(200),
+                    ..
+                }),
+                ..
+            }))
+        ));
+        assert_eq!(*outcomes.lock().unwrap(), vec![(0, true), (1, true)]);
+
+        keep_open.store(false, Ordering::Release);
+        t1.join().unwrap();
+        t2.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
     }
 }

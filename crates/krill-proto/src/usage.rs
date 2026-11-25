@@ -20,6 +20,11 @@ pub const FEAT_ACCOUNT_INPUT_RECOVERY: u64 = 1 << 39;
 pub const FEAT_SESSION_ACCOUNT_SWITCH: u64 = 1 << 28;
 /// Switch the default only, inspect running sessions, and hand off a chosen subset.
 pub const FEAT_ACCOUNT_SWITCH_CONTROL: u64 = 1 << 43;
+mod antigravity;
+pub use antigravity::{
+    AntigravityAccountOp, AntigravityAccountState, AntigravityAccountSummary,
+    AntigravityCurrentAccount, AntigravityStoredUsage,
+};
 mod switch_plan;
 pub use switch_plan::{
     CantMoveReason, SessionSwitchCandidate, SessionSwitchGroup, SessionSwitchPlan,
@@ -823,6 +828,9 @@ pub enum UsageRequest {
         sessions: Vec<crate::SessionId>,
         interrupt_busy: bool,
     },
+    /// Native Antigravity (`agy`) encrypted account vault operations (Orca `accounts.antigravity*`).
+    /// Never returns credentials over IPC.
+    AntigravityAccounts(AntigravityAccountOp),
 }
 
 impl UsageRequest {
@@ -860,6 +868,7 @@ impl UsageRequest {
                 | Self::ListOrphanProfiles
                 | Self::GetProvisioning
                 | Self::ImportOrcaAntigravity { dry_run: true, .. }
+                | Self::AntigravityAccounts(AntigravityAccountOp::List)
         )
     }
 
@@ -897,6 +906,10 @@ impl UsageRequest {
             }
             Self::ImportOrcaAntigravity { .. } => {
                 features |= FEAT_PROVIDER_DETAILS;
+                Some(ProviderKind::Antigravity)
+            }
+            Self::AntigravityAccounts(_) => {
+                features |= FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL;
                 Some(ProviderKind::Antigravity)
             }
             Self::SetDirectUsage(_) => {
@@ -1085,6 +1098,8 @@ pub enum UsageReply {
     },
     /// [`UsageRequest::InspectSessionSwitches`] 응답. [`FEAT_ACCOUNT_SWITCH_CONTROL`].
     SessionSwitchPlan(SessionSwitchPlan),
+    /// [`UsageRequest::AntigravityAccounts`] 응답. 오류 시 Orca와 동일한 실행 안내 문자열을 돌려준다.
+    AntigravityAccounts(Result<AntigravityAccountState, String>),
 }
 
 /// 등록되지 않은 Krill 관리 프로필 폴더(OWE-704). 이전 버전의 "제거"가 남긴 폴더 등.
@@ -1098,9 +1113,22 @@ impl UsageReply {
     /// Hide extensions that the peer cannot decode; retain the N-1 response prefix.
     #[must_use]
     pub fn for_features(mut self, features: u64) -> Self {
-        if features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 && matches!(self, Self::SessionSwitchPlan(_))
+        let allow_provider = |provider: ProviderKind| {
+            provider != ProviderKind::Gemini
+                && (features & FEAT_USAGE_AGY != 0 || provider != ProviderKind::Antigravity)
+        };
+        if matches!(self, Self::AntigravityAccounts(_))
+            && (features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 || features & FEAT_USAGE_AGY == 0)
         {
             return Self::Failed(crate::control::Failure::BadRequest);
+        }
+        if let Self::SessionSwitchPlan(plan) = &self
+            && (features & FEAT_ACCOUNT_SWITCH_CONTROL == 0 || !allow_provider(plan.provider))
+        {
+            return Self::Failed(crate::control::Failure::BadRequest);
+        }
+        if let Self::Orphans(orphans) = &mut self {
+            orphans.retain(|orphan| allow_provider(orphan.provider));
         }
         if features & FEAT_USAGE_RESET == 0
             && let Self::ResetConsumed { snapshot, .. } = self
@@ -1124,31 +1152,28 @@ impl UsageReply {
             }
             snapshot
                 .accounts
-                .retain(|account| account.provider != ProviderKind::Gemini);
+                .retain(|account| allow_provider(account.provider));
             snapshot
                 .switched
-                .retain(|event| event.provider != ProviderKind::Gemini);
+                .retain(|event| allow_provider(event.provider));
             snapshot
                 .auto_switch
                 .rules
-                .retain(|rule| rule.provider != ProviderKind::Gemini);
+                .retain(|rule| allow_provider(rule.provider));
             if features & FEAT_ACCOUNT_CONNECTION == 0 {
                 *snapshot.connections = ConnectionsSnapshot::default();
             }
             if features & FEAT_ACCOUNT_POLICY == 0 {
                 snapshot.advanced = AccountPolicyState::default();
-            }
-            if features & FEAT_USAGE_AGY == 0 {
+            } else {
                 snapshot
-                    .accounts
-                    .retain(|account| account.provider != ProviderKind::Antigravity);
+                    .advanced
+                    .cooldowns
+                    .retain(|cooldown| allow_provider(cooldown.provider));
                 snapshot
-                    .switched
-                    .retain(|event| event.provider != ProviderKind::Antigravity);
-                snapshot
-                    .auto_switch
-                    .rules
-                    .retain(|rule| rule.provider != ProviderKind::Antigravity);
+                    .advanced
+                    .history
+                    .retain(|record| allow_provider(record.event.provider));
             }
             if features & FEAT_USAGE_RULES == 0 {
                 snapshot.auto_switch.rules.clear();

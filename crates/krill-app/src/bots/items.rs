@@ -28,16 +28,18 @@ pub enum ItemFilter {
     All,
     NeedsYou,
     Working,
+    Waiting,
     Planned,
     Done,
     Canceled,
 }
 
 impl ItemFilter {
-    pub const ALL_FILTERS: [Self; 6] = [
+    pub const ALL_FILTERS: [Self; 7] = [
         Self::All,
         Self::NeedsYou,
         Self::Working,
+        Self::Waiting,
         Self::Planned,
         Self::Done,
         Self::Canceled,
@@ -49,6 +51,7 @@ impl ItemFilter {
             Self::All => "bots-items-filter-all",
             Self::NeedsYou => "bots-items-filter-needs-you",
             Self::Working => "bots-items-filter-working",
+            Self::Waiting => "bots-items-filter-waiting",
             Self::Planned => "bots-items-filter-planned",
             Self::Done => "bots-items-filter-done",
             Self::Canceled => "bots-items-filter-canceled",
@@ -61,6 +64,7 @@ impl ItemFilter {
             Self::All => text::FILTER_ALL.get(),
             Self::NeedsYou => text::FILTER_NEEDS_YOU.get(),
             Self::Working => text::FILTER_WORKING.get(),
+            Self::Waiting => text::FILTER_WAITING.get(),
             Self::Planned => text::FILTER_PLANNED.get(),
             Self::Done => text::FILTER_DONE.get(),
             Self::Canceled => text::FILTER_CANCELED.get(),
@@ -73,6 +77,7 @@ impl ItemFilter {
             Self::All => true,
             Self::NeedsYou => matches!(status, BotItemStatus::NeedsYou),
             Self::Working => matches!(status, BotItemStatus::Working),
+            Self::Waiting => matches!(status, BotItemStatus::Waiting),
             Self::Planned => matches!(status, BotItemStatus::Planned),
             Self::Done => matches!(status, BotItemStatus::Done),
             Self::Canceled => matches!(status, BotItemStatus::Canceled),
@@ -383,6 +388,7 @@ fn status_badge_spec(status: BotItemStatus) -> (ui::BadgeTone, &'static str) {
     match status {
         BotItemStatus::Planned => (ui::BadgeTone::Muted, text::STATUS_PLANNED.get()),
         BotItemStatus::Working => (ui::BadgeTone::Accent, text::STATUS_WORKING.get()),
+        BotItemStatus::Waiting => (ui::BadgeTone::Muted, text::STATUS_WAITING.get()),
         BotItemStatus::NeedsYou => (ui::BadgeTone::Warning, text::STATUS_NEEDS_YOU.get()),
         BotItemStatus::Done => (ui::BadgeTone::Success, text::STATUS_DONE.get()),
         BotItemStatus::Canceled => (ui::BadgeTone::Destructive, text::STATUS_CANCELED.get()),
@@ -677,6 +683,7 @@ impl View {
                             done_means: None,
                             status: Some(BotItemStatus::Planned),
                             links: Vec::new(),
+                            waiting_reason: None,
                         })),
                         |r| match r {
                             BotRpcResponse::Item(item) => Some(*item),
@@ -749,6 +756,7 @@ impl View {
                 decisions: Vec::new(),
                 close_note,
                 snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: None,
             },
             note_input,
             false,
@@ -790,6 +798,7 @@ impl View {
                 decisions: Vec::new(),
                 close_note: None,
                 snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: None,
             },
             None,
             true,
@@ -820,6 +829,7 @@ impl View {
                 decisions: Vec::new(),
                 close_note: None,
                 snoozed_until_ms: patch,
+                waiting_reason: None,
             },
             None,
             false,
@@ -2322,6 +2332,8 @@ mod swarm_regression_tests {
             last_activity_at_ms: 1_000,
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
+            waiting_reason: None,
+            waiting_since_ms: None,
         };
         state.set_items_for_bot(&bot_id, vec![sample]);
         assert_eq!(state.items_cache.get(&bot_id).map(Vec::len), Some(1));
@@ -2372,6 +2384,8 @@ mod tests {
             created_at_ms: now,
             updated_at_ms: now,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         }
     }
 

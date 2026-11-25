@@ -895,6 +895,8 @@ enum Action {
         limit: Option<u32>,
         #[serde(default)]
         cursor: Option<String>,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     #[serde(rename = "bots.item.create")]
     BotsItemCreate {
@@ -908,6 +910,8 @@ enum Action {
         status: Option<krill_proto::bots::BotItemStatus>,
         #[serde(default)]
         links: Vec<krill_proto::bots::BotItemLink>,
+        #[serde(default)]
+        waiting_reason: Option<String>,
     },
     #[serde(rename = "bots.item.update")]
     BotsItemUpdate {
@@ -928,6 +932,8 @@ enum Action {
         close_note: Option<String>,
         #[serde(default)]
         snoozed_until_ms: krill_proto::bots::FieldPatch<u64>,
+        #[serde(default)]
+        waiting_reason: Option<String>,
     },
     #[serde(rename = "bots.item.answer")]
     BotsItemAnswer {
@@ -2231,7 +2237,13 @@ impl Backend {
                 include_snoozed,
                 limit,
                 cursor,
+                capabilities,
             } => {
+                if capabilities.len() > 32 {
+                    return Err(invalid());
+                }
+                let supports_waiting =
+                    krill_proto::bots::client_supports_item_waiting(&capabilities);
                 let bot_id = parse_opt_bot_id(bot_id.as_deref())?;
                 let status_filter = match status.as_deref().map(str::trim).filter(|s| !s.is_empty())
                 {
@@ -2260,7 +2272,7 @@ impl Backend {
                     );
                 }
                 let req_limit = u32::try_from(bounded_limit).unwrap_or(100);
-                let page = if let Some(filter) = status_filter {
+                let mut page = if let Some(filter) = status_filter {
                     let registry = self.registry.upgrade().ok_or_else(invalid)?;
                     let mgr = registry.bots().map_err(io::Error::other)?;
                     mgr.items().list_items_page_filtered(
@@ -2284,6 +2296,9 @@ impl Backend {
                         _ => return Err(invalid()),
                     }
                 };
+                if !supports_waiting {
+                    krill_proto::bots::downgrade_items_for_legacy_client(&mut page.items);
+                }
                 let total = page.total_count;
                 let unseen = page.unseen_count;
                 let next = page.next_cursor;
@@ -2311,6 +2326,7 @@ impl Backend {
                 done_means,
                 status,
                 links,
+                waiting_reason,
             } => {
                 self.ensure_bots_active()?;
                 let bot_id = krill_proto::bots::BotId::new(&bot_id).map_err(|_| invalid())?;
@@ -2332,6 +2348,9 @@ impl Backend {
                     true,
                     true,
                 )?;
+                if waiting_reason.as_ref().is_some_and(|s| s.len() > 1024) {
+                    return Err(invalid());
+                }
                 if links.len() > 32 {
                     return Err(invalid());
                 }
@@ -2345,6 +2364,7 @@ impl Backend {
                     done_means,
                     status,
                     links,
+                    waiting_reason,
                 };
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::CreateItem(Box::new(
                     params,
@@ -2365,6 +2385,7 @@ impl Backend {
                 decisions,
                 close_note,
                 snoozed_until_ms,
+                waiting_reason,
             } => {
                 self.ensure_bots_active()?;
                 let trimmed_id = validate_bot_token(&item_id, 128)?;
@@ -2401,6 +2422,9 @@ impl Backend {
                     true,
                     true,
                 )?;
+                if waiting_reason.as_ref().is_some_and(|s| s.len() > 1024) {
+                    return Err(invalid());
+                }
                 validate_bot_decisions(&decisions)?;
                 let params = krill_proto::bots::UpdateBotItemParams {
                     item_id: trimmed_id,
@@ -2412,6 +2436,7 @@ impl Backend {
                     decisions,
                     close_note,
                     snoozed_until_ms,
+                    waiting_reason,
                 };
                 match self.bot_rpc(krill_proto::bots::BotRpcRequest::UpdateItem(Box::new(
                     params,
@@ -3809,7 +3834,7 @@ impl Backend {
         let mut data = json!({"sessions":cards,"orchestration":self.orchestration()?,
             "bots":self.snapshot_bots_summary()?,
             "repositories":catalog.repositories_json_with_icons(&repo_icons),"workspaces":catalog.workspaces_json_with_icons(&workspace_titles, &ranks, &awake, &repo_icons),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true,"repo_icons":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true,"chat_tail":true,"chat_push":true,"chat_interrupt":true,"live_prompt_reply":true,"prompt_steer":true,"quick_commands":true,"command_catalog":true,"mention_files":true,"composer_models":true,"chat_composer":true,"model_set":cfg!(unix),"change_feed":true,"drop":true,"bots":true,"bots_item_waiting":true,"repo_icons":true},
             "quick_commands":quick_commands_json(self.dir.as_deref()),
             "host":self.host,"agents":agents_value});
         bound_snapshot_payload(&mut data);
@@ -6659,6 +6684,7 @@ mod revision_tests {
                 done_means: None,
                 status: Some(BotItemStatus::NeedsYou),
                 links: Vec::new(),
+                waiting_reason: None,
             })),
         ) {
             BotRpcResponse::Item(i) => *i,
@@ -8071,5 +8097,121 @@ value = "{}"
             bounded["next_cursor"].is_null(),
             "next_cursor must not loop back to slice_start: {bounded}"
         );
+    }
+
+    #[test]
+    fn mobile_bots_item_waiting_capability_and_legacy_downgrade() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-pwa-bot-waiting-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(Registry::new(None, Some(&dir)));
+        registry.bind_self_arc();
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let mgr = registry.bots().unwrap();
+        let bot = match mgr.handle_rpc(
+            &registry,
+            krill_proto::bots::BotRpcRequest::CreateBot(Box::new(
+                krill_proto::bots::CreateBotParams {
+                    name: "Mobile Wait Bot".to_owned(),
+                    agent_id: "claude".to_owned(),
+                    description: String::new(),
+                    emoji: None,
+                    avatar: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    workspace: None,
+                    template_id: None,
+                    initial_soul: None,
+                },
+            )),
+        ) {
+            krill_proto::bots::BotRpcResponse::Bot(b) => *b,
+            other => panic!("expected Bot, got {other:?}"),
+        };
+
+        // Snapshot advertises bots_item_waiting capability.
+        let snap: Value =
+            serde_json::from_str(&backend.request(r#"{"action":"snapshot"}"#)).unwrap();
+        assert_eq!(snap["ok"], true, "{snap}");
+        assert_eq!(snap["data"]["capabilities"]["bots_item_waiting"], true);
+
+        // Create a waiting item via mobile RPC.
+        let created: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.item.create",
+                    "bot_id": bot.id.as_str(),
+                    "title": "Deploy staging",
+                    "status": "waiting",
+                    "waiting_reason": "CI on PR #42"
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(created["data"]["item"]["status"], "waiting");
+        assert_eq!(created["data"]["item"]["waiting_reason"], "CI on PR #42");
+
+        // Legacy mobile client (omitting capabilities) receives downgraded working item.
+        let legacy_list: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.items",
+                    "bot_id": bot.id.as_str(),
+                    "include_closed": false
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(legacy_list["ok"], true, "{legacy_list}");
+        assert_eq!(legacy_list["data"]["items"][0]["status"], "working");
+        assert!(
+            legacy_list["data"]["items"][0]
+                .get("waiting_reason")
+                .is_none()
+        );
+
+        // Updated mobile PWA advertising bots.item-waiting.v1 receives Waiting intact.
+        let modern_list: Value = serde_json::from_str(
+            &backend.request(
+                &json!({
+                    "action": "bots.items",
+                    "bot_id": bot.id.as_str(),
+                    "status": "waiting",
+                    "include_closed": false,
+                    "capabilities": [krill_proto::bots::BOTS_ITEM_WAITING_CAPABILITY]
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(modern_list["ok"], true, "{modern_list}");
+        assert_eq!(modern_list["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(modern_list["data"]["items"][0]["status"], "waiting");
+        assert_eq!(
+            modern_list["data"]["items"][0]["waiting_reason"],
+            "CI on PR #42"
+        );
+        assert!(modern_list["data"]["items"][0]["waiting_since_ms"].is_u64());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

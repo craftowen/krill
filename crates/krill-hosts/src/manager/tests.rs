@@ -524,3 +524,449 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '
     drop(manager);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn stale_host_target_record_outcome_cannot_drop_replacement_tunnel() {
+    let dir =
+        std::env::temp_dir().join(format!("krill-r3p05-stale-outcome-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; sleep 60' "${fwd%%:*}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    let mut host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec.clone()]);
+
+    let old_target = manager.target_for(&host, None).unwrap();
+    let _sock1 = manager.ensure_tunnel_socket("studio").unwrap();
+    old_target.record_outcome(true, None);
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // 1. Transport config change creates a new registration and replacement tunnel.
+    host_spec.port = Some(2223);
+    manager.sync_specs(&[host_spec.clone()]);
+    let new_target = manager.target_for(&host, None).unwrap();
+    let _sock2 = manager.ensure_tunnel_socket("studio").unwrap();
+    new_target.record_outcome(true, None);
+    let pid2 = manager.tunnel_pid("studio").unwrap();
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    let broken = io::Error::new(io::ErrorKind::BrokenPipe, "old tunnel closed");
+    old_target.record_outcome(false, Some(&broken));
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid2),
+        "stale HostTarget::record_outcome must not tear down replacement tunnel"
+    );
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // 2. Remove & re-add host creates a brand-new slot; old replacement target must not touch it.
+    manager.sync_specs(&[]);
+    manager.sync_specs(&[host_spec]);
+    let recreated_target = manager.target_for(&host, None).unwrap();
+    let _sock3 = manager.ensure_tunnel_socket("studio").unwrap();
+    recreated_target.record_outcome(true, None);
+    let pid3 = manager.tunnel_pid("studio").unwrap();
+
+    let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "removed slot EOF");
+    new_target.record_outcome(false, Some(&eof));
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid3),
+        "removed HostTarget::record_outcome must not tear down re-added host tunnel"
+    );
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sync_specs_transport_change_keeps_manually_disconnected_host_disconnected() {
+    let fake = FakeSsh::new("r3p08-suspended-edit", false);
+    let manager = fake.manager();
+    let mut host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec.clone()]);
+
+    manager.disconnect_now("studio");
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+
+    host_spec.port = Some(2299);
+    manager.sync_specs(&[host_spec]);
+    assert_eq!(
+        manager.status("studio"),
+        HostStatus::Disconnected,
+        "transport edit on a suspended host must not strand status in Connecting"
+    );
+    assert_eq!(
+        manager.statuses().first().map(|(_, status)| *status),
+        Some(HostStatus::Disconnected)
+    );
+    let target = manager.target_for(&host, None).unwrap();
+    assert!(!target.is_current());
+
+    manager.reconnect_now("studio");
+    assert_eq!(manager.status("studio"), HostStatus::Connecting);
+    assert!(target.is_current());
+}
+
+fn write_stalled_first_healthy_second_ssh(dir: &std::path::Path) -> PathBuf {
+    let hello_bytes = krill_proto::ipc::ServerHello {
+        proto_min: 1,
+        proto_max: 1,
+        features: 0,
+        build: "test".into(),
+        instance_id: 2,
+    }
+    .encode()
+    .unwrap();
+    fs::write(dir.join("hello.bin"), &hello_bytes).unwrap();
+
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+base=$(dirname "$0")
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+sock="${fwd%%:*}"
+if [ ! -f "$base/second" ]; then
+  : > "$base/second"
+  /usr/bin/perl -MIO::Socket::UNIX -e '
+    my ($sock, $base) = @ARGV;
+    my $s = IO::Socket::UNIX->new(Local => $sock, Listen => 5) or exit 3;
+    if (my $c = $s->accept) {
+      open my $fh, ">", "$base/accepted1" or die;
+      close $fh;
+      my $t0 = time;
+      while (!-f "$base/release1" && time - $t0 < 15) { select(undef, undef, undef, 0.01); }
+      close $c;
+    }
+  ' "$sock" "$base" </dev/null >/dev/null 2>&1 &
+  while [ ! -f "$base/kill_child1" ] && [ ! -f "$base/release1" ]; do sleep 0.02; done
+  exit 0
+fi
+exec /usr/bin/perl -MIO::Socket::UNIX -e '
+  my ($sock, $base) = @ARGV;
+  my $s = IO::Socket::UNIX->new(Local => $sock, Listen => 5) or exit 3;
+  while (my $c = $s->accept) {
+    open my $in, "<", "$base/hello.bin" or die;
+    binmode $in;
+    local $/;
+    my $hello = <$in>;
+    close $in;
+    print $c $hello;
+    $c->flush;
+    my $t0 = time;
+    while (-e $sock && time - $t0 < 15) { select(undef, undef, undef, 0.05); }
+    close $c;
+  }
+' "$sock" "$base"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+#[test]
+fn delayed_dial_tunnel_failure_after_ipc_drop_cannot_kill_replacement_tunnel() {
+    let dir = std::env::temp_dir().join(format!("krill-r4p01-ipc-drop-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let script = write_stalled_first_healthy_second_ssh(&dir);
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    let host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec]);
+
+    let target_a = manager.target_for(&host, None).unwrap();
+    let target_b = target_a.clone();
+    let target_c = target_a.clone();
+    let client_hello =
+        krill_proto::daemon::client_hello(krill_proto::ipc::ClientRole::App, "r4p01-ipc-drop");
+
+    let hello_a = client_hello.clone();
+    let thread_a = thread::spawn(move || target_a.connect(&hello_a));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dir.join("accepted1").exists() {
+        assert!(Instant::now() < deadline, "tunnel 1 did not accept");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let epoch1 = target_b.transport_epoch();
+    let pid1 = manager.tunnel_pid("studio").unwrap();
+
+    // Another caller observes an IPC timeout on Tunnel #1 and drops it without calling reconnect_now.
+    let timed_out = io::Error::new(io::ErrorKind::TimedOut, "tunnel 1 wedged");
+    target_b.record_outcome_for_epoch(epoch1, false, Some(&timed_out));
+    assert_eq!(manager.tunnel_pid("studio"), None);
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+    assert!(target_b.transport_epoch() > epoch1);
+
+    // Wait for backoff to expire, then establish healthy Tunnel #2.
+    thread::sleep(HostManager::backoff_delay(1) + Duration::from_millis(50));
+    let (_conn2, epoch2) = target_c.connect_with_epoch(&client_hello).unwrap();
+    let pid2 = manager.tunnel_pid("studio").unwrap();
+    assert_ne!(pid1, pid2);
+    assert!(epoch2 > epoch1);
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // Delayed dial_tunnel failure from Tunnel #1 must not tear down Tunnel #2.
+    fs::write(dir.join("release1"), "").unwrap();
+    assert!(thread_a.join().unwrap().is_err());
+
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid2),
+        "stale Tunnel #1 dial failure after IPC-drop must not kill Tunnel #2"
+    );
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn delayed_dial_tunnel_failure_after_dead_child_reap_cannot_kill_replacement_tunnel() {
+    enum ReapMode {
+        Status,
+        Statuses,
+        EnsureSocket,
+    }
+
+    for (tag, mode) in [
+        ("status", ReapMode::Status),
+        ("statuses", ReapMode::Statuses),
+        ("ensure", ReapMode::EnsureSocket),
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("krill-r4p01-reap-{tag}-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let script = write_stalled_first_healthy_second_ssh(&dir);
+
+        let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+        let host_spec = spec(Some("/tmp/remote.sock"));
+        let host = HostId::Remote(host_spec.id.clone());
+        manager.sync_specs(&[host_spec]);
+
+        let target_a = manager.target_for(&host, None).unwrap();
+        let target_b = target_a.clone();
+        let client_hello =
+            krill_proto::daemon::client_hello(krill_proto::ipc::ClientRole::App, "r4p01-reap");
+
+        let hello_a = client_hello.clone();
+        let thread_a = thread::spawn(move || target_a.connect(&hello_a));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("accepted1").exists() {
+            assert!(Instant::now() < deadline, "{tag}: tunnel 1 did not accept");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let epoch1 = target_b.transport_epoch();
+        let pid1 = manager.tunnel_pid("studio").unwrap();
+
+        // Let Tunnel #1's ssh child exit while Thread A is still blocked in dial_tunnel.
+        fs::write(dir.join("kill_child1"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match mode {
+            ReapMode::Status => {
+                while manager.status("studio") != HostStatus::Disconnected {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{tag}: status() did not reap dead child"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    target_b.transport_epoch() > epoch1,
+                    "status() dead-child reap must advance transport_epoch"
+                );
+            }
+            ReapMode::Statuses => {
+                while manager.statuses().first().map(|(_, s)| *s) != Some(HostStatus::Disconnected)
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{tag}: statuses() did not reap dead child"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    target_b.transport_epoch() > epoch1,
+                    "statuses() dead-child reap must advance transport_epoch"
+                );
+            }
+            ReapMode::EnsureSocket => {
+                // Wait until Tunnel #1's child has exited without calling status()/statuses().
+                while manager.tunnel_pid("studio").is_some() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{tag}: tunnel 1 child did not exit"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(
+                    target_b.transport_epoch(),
+                    epoch1,
+                    "tunnel_pid() alone does not reap; ensure_tunnel_socket_for_attempt will"
+                );
+            }
+        }
+
+        let (_conn2, epoch2) = target_b.connect_with_epoch(&client_hello).unwrap();
+        let pid2 = manager.tunnel_pid("studio").unwrap();
+        assert_ne!(pid1, pid2);
+        assert!(
+            epoch2 > epoch1,
+            "{tag}: replacement tunnel must have an advanced transport_epoch"
+        );
+        assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+        fs::write(dir.join("release1"), "").unwrap();
+        assert!(thread_a.join().unwrap().is_err());
+
+        assert_eq!(manager.status("studio"), HostStatus::Connected);
+        assert_eq!(
+            manager.tunnel_pid("studio"),
+            Some(pid2),
+            "{tag}: stale Tunnel #1 dial failure after dead-child reap must not kill Tunnel #2"
+        );
+
+        drop(manager);
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn stale_epoch_record_outcome_cannot_drop_tunnel_after_reconnect_or_kill() {
+    let dir = std::env::temp_dir().join(format!("krill-r4p02-epoch-fence-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let hello_bytes = krill_proto::ipc::ServerHello {
+        proto_min: 1,
+        proto_max: 1,
+        features: 0,
+        build: "test".into(),
+        instance_id: 2,
+    }
+    .encode()
+    .unwrap();
+    fs::write(dir.join("hello.bin"), &hello_bytes).unwrap();
+
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+base=$(dirname "$0")
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+sock="${fwd%%:*}"
+exec /usr/bin/perl -MIO::Socket::UNIX -e '
+  my ($sock, $base) = @ARGV;
+  my $s = IO::Socket::UNIX->new(Local => $sock, Listen => 5) or exit 3;
+  while (my $c = $s->accept) {
+    open my $in, "<", "$base/hello.bin" or die;
+    binmode $in;
+    local $/;
+    my $hello = <$in>;
+    close $in;
+    print $c $hello;
+    $c->flush;
+    my $t0 = time;
+    while (-e $sock && time - $t0 < 15) { select(undef, undef, undef, 0.05); }
+    close $c;
+  }
+' "$sock" "$base"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    let host_spec = spec(Some("/tmp/remote.sock"));
+    let host = HostId::Remote(host_spec.id.clone());
+    manager.sync_specs(&[host_spec]);
+
+    let target = manager.target_for(&host, None).unwrap();
+    let hello =
+        krill_proto::daemon::client_hello(krill_proto::ipc::ClientRole::App, "r4p02-epoch-fence");
+
+    // 1. Connect over Tunnel #1 (epoch1).
+    let (conn1, epoch1) = target.connect_with_epoch(&hello).unwrap();
+    let pid1 = manager.tunnel_pid("studio").unwrap();
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+    drop(conn1);
+
+    // 2. reconnect_now() tears down Tunnel #1 and keeps the same registration while advancing epoch.
+    manager.reconnect_now("studio");
+    let (conn2, epoch2) = target.connect_with_epoch(&hello).unwrap();
+    let pid2 = manager.tunnel_pid("studio").unwrap();
+    assert!(epoch2 > epoch1);
+    assert_ne!(pid1, pid2);
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+    drop(conn2);
+
+    // Stale Tunnel #1 outcome must not destroy Tunnel #2.
+    let broken = io::Error::new(io::ErrorKind::BrokenPipe, "tunnel 1 broken pipe");
+    target.record_outcome_for_epoch(epoch1, false, Some(&broken));
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid2),
+        "stale epoch outcome after reconnect_now() must not kill Tunnel #2"
+    );
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // 3. kill_tunnel() tears down Tunnel #2 and advances epoch; Tunnel #3 comes up after backoff.
+    manager.kill_tunnel("studio");
+    thread::sleep(HostManager::backoff_delay(1) + Duration::from_millis(50));
+    let (conn3, epoch3) = target.connect_with_epoch(&hello).unwrap();
+    let pid3 = manager.tunnel_pid("studio").unwrap();
+    assert!(epoch3 > epoch2);
+    assert_ne!(pid2, pid3);
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+    drop(conn3);
+
+    // Stale Tunnel #2 outcome must not destroy Tunnel #3.
+    let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "tunnel 2 eof");
+    target.record_outcome_for_epoch(epoch2, false, Some(&eof));
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        Some(pid3),
+        "stale epoch outcome after kill_tunnel() must not kill Tunnel #3"
+    );
+    assert_eq!(manager.status("studio"), HostStatus::Connected);
+
+    // A matching current-epoch failure still legitimately tears down Tunnel #3.
+    target.record_outcome_for_epoch(epoch3, false, Some(&eof));
+    assert_eq!(manager.tunnel_pid("studio"), None);
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}

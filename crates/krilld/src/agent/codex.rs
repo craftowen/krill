@@ -88,7 +88,7 @@ pub(super) fn launch_home(env: &[(Vec<u8>, Vec<u8>)]) -> Option<PathBuf> {
     let value = |key: &str| {
         env.iter()
             .rev()
-            .find(|(k, _)| k.as_slice() == key.as_bytes())
+            .find(|(k, _)| super::env_key_eq(k, key.as_bytes()))
             .map(|(_, v)| v.as_slice())
     };
     let dir = if value("KRILL_ACCOUNT_PROVIDER") == Some(ProviderKind::Codex.as_str().as_bytes()) {

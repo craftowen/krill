@@ -1270,72 +1270,132 @@ pub fn glob_matches_path(pattern: &str, relative_path: &str) -> bool {
     false
 }
 
-fn glob_chars_match(pat: &[char], text: &[char]) -> bool {
-    match pat.first() {
-        None => text.is_empty(),
-        Some('*') => {
-            if pat.get(1) == Some(&'*') {
-                if pat.get(2) == Some(&'/') {
-                    let rest_pat = pat.get(3..).unwrap_or(&[]);
-                    if glob_chars_match(rest_pat, text) {
-                        return true;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobToken {
+    /// `**/` — zero or more directory prefixes (empty or any span ending at `/`).
+    DoubleStarSlash,
+    /// `**` — zero or more arbitrary characters including `/`.
+    DoubleStar,
+    /// `*` — zero or more non-`/` characters.
+    Star,
+    /// `?` — one non-`/` character.
+    AnyNonSlash,
+    /// Exact literal character.
+    Literal(char),
+}
+
+fn compile_glob_tokens(pat: &[char]) -> Vec<GlobToken> {
+    let mut tokens = Vec::with_capacity(pat.len());
+    let mut i = 0usize;
+    while i < pat.len() {
+        match pat[i] {
+            '*' => {
+                let mut run = 1usize;
+                while pat.get(i + run) == Some(&'*') {
+                    run += 1;
+                }
+                if run == 1 {
+                    if tokens.last() != Some(&GlobToken::Star) {
+                        tokens.push(GlobToken::Star);
                     }
-                    for (i, ch) in text.iter().enumerate() {
-                        if *ch == '/' {
-                            let after_slash = text.get(i + 1..).unwrap_or(&[]);
-                            if glob_chars_match(rest_pat, after_slash) {
-                                return true;
-                            }
-                        }
+                    i += 1;
+                } else if run == 2 && pat.get(i + 2) == Some(&'/') {
+                    if tokens.last() != Some(&GlobToken::DoubleStarSlash) {
+                        tokens.push(GlobToken::DoubleStarSlash);
                     }
-                    false
+                    i += 3;
                 } else {
-                    let rest_pat = pat.get(2..).unwrap_or(&[]);
-                    if rest_pat.is_empty() {
-                        return true;
+                    if tokens.last() != Some(&GlobToken::DoubleStar) {
+                        tokens.push(GlobToken::DoubleStar);
                     }
-                    for i in 0..=text.len() {
-                        if glob_chars_match(rest_pat, text.get(i..).unwrap_or(&[])) {
-                            return true;
-                        }
-                    }
-                    false
+                    i += run;
                 }
-            } else {
-                let rest_pat = pat.get(1..).unwrap_or(&[]);
-                if glob_chars_match(rest_pat, text) {
-                    return true;
-                }
-                for (i, ch) in text.iter().enumerate() {
-                    if *ch == '/' {
-                        break;
-                    }
-                    if glob_chars_match(rest_pat, text.get(i + 1..).unwrap_or(&[])) {
-                        return true;
-                    }
-                }
-                false
             }
-        }
-        Some('?') => {
-            let Some(first_text) = text.first() else {
-                return false;
-            };
-            if *first_text == '/' {
-                return false;
+            '?' => {
+                tokens.push(GlobToken::AnyNonSlash);
+                i += 1;
             }
-            glob_chars_match(pat.get(1..).unwrap_or(&[]), text.get(1..).unwrap_or(&[]))
-        }
-        Some(c) => {
-            let Some(first_text) = text.first() else {
-                return false;
-            };
-            if c != first_text {
-                return false;
+            c => {
+                tokens.push(GlobToken::Literal(c));
+                i += 1;
             }
-            glob_chars_match(pat.get(1..).unwrap_or(&[]), text.get(1..).unwrap_or(&[]))
         }
     }
+    tokens
+}
+
+fn glob_chars_match(pat: &[char], text: &[char]) -> bool {
+    let tokens = compile_glob_tokens(pat);
+    let n = text.len();
+    let mut curr = vec![false; n + 1];
+    let mut next = vec![false; n + 1];
+    curr[0] = true;
+
+    for token in tokens {
+        next.fill(false);
+        match token {
+            GlobToken::Literal(c) => {
+                for ((&reachable, &ch), dst) in
+                    curr.iter().zip(text.iter()).zip(next[1..].iter_mut())
+                {
+                    if reachable && ch == c {
+                        *dst = true;
+                    }
+                }
+            }
+            GlobToken::AnyNonSlash => {
+                for ((&reachable, &ch), dst) in
+                    curr.iter().zip(text.iter()).zip(next[1..].iter_mut())
+                {
+                    if reachable && ch != '/' {
+                        *dst = true;
+                    }
+                }
+            }
+            GlobToken::Star => {
+                let mut active = false;
+                for (j, (&reachable, dst)) in curr.iter().zip(next.iter_mut()).enumerate() {
+                    if reachable {
+                        active = true;
+                    }
+                    if active {
+                        *dst = true;
+                    }
+                    if text.get(j) == Some(&'/') {
+                        active = false;
+                    }
+                }
+            }
+            GlobToken::DoubleStar => {
+                let mut active = false;
+                for (&reachable, dst) in curr.iter().zip(next.iter_mut()) {
+                    if reachable {
+                        active = true;
+                    }
+                    if active {
+                        *dst = true;
+                    }
+                }
+            }
+            GlobToken::DoubleStarSlash => {
+                let mut seen_start = false;
+                for (j, &reachable) in curr.iter().enumerate() {
+                    if reachable {
+                        next[j] = true;
+                        seen_start = true;
+                    }
+                    if seen_start && text.get(j) == Some(&'/') {
+                        next[j + 1] = true;
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut curr, &mut next);
+        if !curr.iter().any(|&reachable| reachable) {
+            return false;
+        }
+    }
+    curr[n]
 }
 
 /// 줄 미리보기 텍스트를 `(앞부분, 일치 부분, 뒷부분)`으로 문자(char) 인덱스 기준으로 분리한다.
@@ -2475,6 +2535,35 @@ mod performance_tests {
                 .is_empty()
         );
         assert!(budget.truncated);
+    }
+
+    #[test]
+    fn glob_matcher_preserves_semantics_and_avoids_exponential_backtracking() {
+        assert!(glob_matches_path("*.rs", "src/lib.rs"));
+        assert!(glob_matches_path("src/**/*.rs", "src/lib.rs"));
+        assert!(glob_matches_path("src/**/*.rs", "src/a/b/lib.rs"));
+        assert!(!glob_matches_path("src/*.rs", "src/a/lib.rs"));
+        assert!(!glob_matches_path("**/foo.rs", "xfoo.rs"));
+        assert!(glob_matches_path("**/foo.rs", "foo.rs"));
+        assert!(glob_matches_path("**/foo.rs", "a/b/foo.rs"));
+        assert!(glob_matches_path("a/?/c", "a/b/c"));
+        assert!(!glob_matches_path("a/?/c", "a///c"));
+        assert!(glob_matches_path("src/**", "src/a/b/c.rs"));
+
+        // Pathological patterns that would blow up unmemoized backtracking finish immediately.
+        let started = Instant::now();
+        let evil_star = "*a".repeat(30) + "*b";
+        let target_star = "a".repeat(60) + "c";
+        assert!(!glob_matches_path(&evil_star, &target_star));
+
+        let evil_double = "**/".repeat(30) + "target.rs";
+        let target_dirs = "a/".repeat(40) + "other.rs";
+        assert!(!glob_matches_path(&evil_double, &target_dirs));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "glob matching took {:?}",
+            started.elapsed()
+        );
     }
 }
 

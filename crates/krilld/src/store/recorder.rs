@@ -375,6 +375,7 @@ impl Recorder {
     /// Advances `seq` across `Store::clear` without touching disk.
     fn discard_for_clear(&mut self, generation: u64, len: u64, resized: Option<WinSize>) {
         self.open = None;
+        self.last_output = None;
         self.keyframe.clear();
         self.lost = 0;
         self.crashed = false;
@@ -541,17 +542,18 @@ impl Recorder {
         }
     }
 
-    /// 다음에 열 세그먼트 자리(`create`와 같은 이름)에 원본이 하나도 없는 세그먼트만
-    /// 치운다(K-02 복구). `Gap(0)` 크래시 표시·`Resize`·`Keyframe`만 든 세그먼트는 seq
-    /// 길이가 0이라 지워도 원본을 잃지 않고, 다음 세그먼트 헤더가 최신 크기를 담는다.
-    /// 데이터가 있거나 읽히지 않으면 `false`(그대로 오류)다.
+    /// 다음에 열 세그먼트 자리(`create`와 같은 이름)에 원본이 하나도 없는 세그먼트나
+    /// 크래시로 잘린 빈 헤더 파일만 치운다(K-02 복구). `Gap(0)` 크래시 표시·`Resize`·`Keyframe`만
+    /// 든 세그먼트는 seq 길이가 0이라 지워도 원본을 잃지 않고, 다음 세그먼트 헤더가 최신 크기를 담는다.
+    /// 데이터가 있거나 알 수 없는 미래 버전·복호화 실패면 `false`(그대로 오류)다.
     fn reclaim_empty_segment(&self) -> bool {
         let start = self.seq.saturating_sub(self.lost);
         let path = self.dir.join(format!("seg-{start:020}.krs"));
-        let empty = segment::read(&path, self.store.key.as_deref())
-            .ok()
-            .flatten()
-            .is_some_and(|seg| seg.end_seq() == seg.header.start_seq);
+        let empty = match segment::read(&path, self.store.key.as_deref()) {
+            Ok(Some(seg)) => seg.end_seq() == seg.header.start_seq,
+            Ok(None) => segment::is_reclaimable_unreadable(&path),
+            Err(_) => false,
+        };
         empty && fs::remove_file(&path).is_ok()
     }
 
@@ -698,9 +700,17 @@ impl AsyncHandle {
             }
         }
         state.queued_bytes = 0;
-        if had_ops {
+        if (had_ops || state.worker_open || state.in_flight)
+            && state.lifecycle != WorkerLifecycle::Dead
+        {
+            let ticket = if had_ops {
+                max_ticket
+            } else {
+                state.enqueued_gen = state.enqueued_gen.saturating_add(1);
+                state.enqueued_gen
+            };
             state.queue.push_back(AsyncOp::DropSpan {
-                ticket: max_ticket,
+                ticket,
                 len: dropped_len,
                 resized: dropped_resized,
                 generation,
@@ -709,7 +719,7 @@ impl AsyncHandle {
             self.cv.notify_all();
         }
         let target = state.enqueued_gen;
-        while (state.completed_gen < target || state.in_flight)
+        while (state.completed_gen < target || state.in_flight || state.worker_open)
             && state.lifecycle != WorkerLifecycle::Dead
         {
             state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
@@ -1100,15 +1110,15 @@ fn recorder_worker(
     reg_id: u64,
     on_panic_gap: &dyn Fn(Gap),
 ) {
-    let mut rec = Some(recorder);
-    let mut last_size = rec
-        .as_ref()
-        .map_or(WinSize { cols: 80, rows: 24 }, |r| r.size);
     let _exit_guard = WorkerExitGuard {
         store,
         handle,
         reg_id,
     };
+    let mut rec = Some(recorder);
+    let mut last_size = rec
+        .as_ref()
+        .map_or(WinSize { cols: 80, rows: 24 }, |r| r.size);
 
     loop {
         enum NextWork {
@@ -1160,13 +1170,14 @@ fn recorder_worker(
         match work {
             NextWork::Exit => break,
             NextWork::IdleSeal => {
-                if !store.is_clearing()
-                    && let Some(r) = &mut rec
-                    && panic::catch_unwind(AssertUnwindSafe(|| r.seal())).is_err()
-                {
-                    tracing::warn!("pty seal panicked; continuing");
-                    let seq = r.seq();
-                    rec = recover_worker_recorder(rec.take(), seq, last_size);
+                if let Some(r) = &mut rec {
+                    if store.is_clearing() {
+                        r.discard_for_clear(store.generation.load(Ordering::Acquire), 0, None);
+                    } else if panic::catch_unwind(AssertUnwindSafe(|| r.seal())).is_err() {
+                        tracing::warn!("pty seal panicked; continuing");
+                        let seq = r.seq();
+                        rec = recover_worker_recorder(rec.take(), seq, last_size);
+                    }
                 }
             }
             NextWork::Op(AsyncOp::Batch { ticket, batch }) => {
@@ -1652,6 +1663,124 @@ mod async_tests {
                 .unwrap()
                 .sealed
         );
+        async_rec.finish(None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn clear_closes_open_segment_when_queue_is_empty_or_in_flight() {
+        let root = tmp("clear-open-empty-queue");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let size = WinSize { cols: 80, rows: 24 };
+
+        // 1. Empty queue with an open segment still waiting for IDLE_SEAL: clear must drop rec.open.
+        let id1 = SessionId(9506);
+        let rec1 = store.recorder(id1, size).unwrap();
+        let mut async1 = AsyncRecorder::start(rec1, |_| {}).ok().unwrap();
+        async1.record(0, b"open-before-clear", None, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = lock(&async1.handle.mu);
+            if state.completed_gen >= 1 && !state.in_flight {
+                assert!(state.queue.is_empty());
+                assert!(state.worker_open);
+                break;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for open batch"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        store.clear().unwrap();
+        assert!(!lock(&async1.handle.mu).worker_open);
+        async1.record(17, b"after-clear", None, None);
+        async1.finish(None);
+        let mut pieces = Vec::new();
+        store
+            .raw(id1, 0, 28, |piece| {
+                pieces.push(piece);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                Piece::Gap { seq: 0, len: 17 },
+                Piece::Data {
+                    seq: 17,
+                    bytes: b"after-clear".to_vec(),
+                },
+            ]
+        );
+
+        // 2. In-flight batch with an empty queue: clear must wait and close the segment opened by it.
+        let id2 = SessionId(9507);
+        let rec2 = store.recorder(id2, size).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = write_hook::install(id2, move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                entered_tx.send(()).ok();
+                lock(&release_rx).recv().ok();
+            }
+        });
+        let mut async2 = AsyncRecorder::start(rec2, |_| {}).ok().unwrap();
+        async2.record(0, b"in-flight-only", None, None);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(lock(&async2.handle.mu).queue.is_empty());
+        assert!(lock(&async2.handle.mu).in_flight);
+
+        let clear_store = Arc::clone(&store);
+        let (done_tx, done_rx) = mpsc::channel();
+        let clearer = thread::spawn(move || {
+            clear_store.clear().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(80)).is_err());
+        release_tx.send(()).unwrap();
+        drop(hook);
+        done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        clearer.join().unwrap();
+        assert!(!lock(&async2.handle.mu).worker_open);
+        async2.finish(None);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn idle_seal_during_clear_discards_open_segment_without_spinning() {
+        let root = tmp("idle-seal-clear");
+        let store = Store::open(&root, Limits::default()).unwrap();
+        let id = SessionId(9508);
+        let size = WinSize { cols: 80, rows: 24 };
+        let mut rec = store.recorder(id, size).unwrap();
+        rec.append_at(
+            b"stale-before-clear",
+            Instant::now()
+                .checked_sub(IDLE_SEAL + Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(rec.idle_deadline().is_some_and(|at| at <= Instant::now()));
+
+        let clear_guard = store.begin_clear();
+        let async_rec = AsyncRecorder::start(rec, |_| {}).ok().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = lock(&async_rec.handle.mu);
+            if !state.worker_open && !state.in_flight && !state.idle_sealing {
+                break;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "idle seal while clearing must discard open segment instead of spinning"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(clear_guard);
         async_rec.finish(None);
         fs::remove_dir_all(&root).ok();
     }

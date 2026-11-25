@@ -523,7 +523,7 @@ impl View {
             self.group_panel.list_cache.rebuild_count += 1;
         }
 
-        let mut grouped_indices: [Vec<usize>; 6] = Default::default();
+        let mut grouped_indices: [Vec<usize>; 7] = Default::default();
         let mut max_number = 0u64;
         let mut shown_count = 0usize;
         for (idx, item) in self.items.items.iter().enumerate() {
@@ -601,7 +601,8 @@ impl View {
             && !all_members_paused
             && group_needs.is_empty()
             && grouped_indices[Group::NeedsYou as usize].is_empty()
-            && grouped_indices[Group::Working as usize].is_empty();
+            && grouped_indices[Group::Working as usize].is_empty()
+            && grouped_indices[Group::Waiting as usize].is_empty();
         if all_clear {
             rows.push(GroupListRow::AllClear);
             row_keys.push(RowAnchor::AllClear);
@@ -745,6 +746,7 @@ impl View {
                     match bucket {
                         Group::NeedsYou => text::HM_STATUS_NEEDS_YOU.get(),
                         Group::Working => text::HM_STATUS_WORKING.get(),
+                        Group::Waiting => text::HM_STATUS_WAITING.get(),
                         Group::Planned => text::HM_STATUS_PLANNED.get(),
                         Group::Snoozed => text::HM_GROUP_SNOOZED.get(),
                         Group::Stale => text::HM_GROUP_STALE.get(),
@@ -1138,6 +1140,8 @@ mod tests {
             created_at_ms: 100,
             updated_at_ms: 100,
             closed_at_ms: None,
+            waiting_reason: None,
+            waiting_since_ms: None,
         }
     }
 

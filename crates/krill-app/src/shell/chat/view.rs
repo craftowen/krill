@@ -2508,6 +2508,7 @@ impl Shell {
         let status_name = |s: BotItemStatus| match s {
             BotItemStatus::Planned => krill_app::i18n::catalog::bots::STATUS_PLANNED.get(),
             BotItemStatus::Working => krill_app::i18n::catalog::bots::STATUS_WORKING.get(),
+            BotItemStatus::Waiting => krill_app::i18n::catalog::bots::STATUS_WAITING.get(),
             BotItemStatus::NeedsYou => krill_app::i18n::catalog::bots::STATUS_NEEDS_YOU.get(),
             BotItemStatus::Done => krill_app::i18n::catalog::bots::STATUS_DONE.get(),
             BotItemStatus::Canceled => krill_app::i18n::catalog::bots::STATUS_CANCELED.get(),
@@ -2551,6 +2552,7 @@ impl Shell {
         let (glyph, glyph_color): (&'static [u8], gpui::Hsla) = match note.status {
             BotItemStatus::Planned => (ui::icons::CIRCLE_SVG, palette.muted_foreground),
             BotItemStatus::Working => (ui::icons::CIRCLE_SVG, palette.warning),
+            BotItemStatus::Waiting => (ui::status::BOT_ITEM_WAITING_SVG, palette.muted_foreground),
             BotItemStatus::NeedsYou => (ui::icons::TRIANGLE_ALERT_SVG, palette.warning),
             BotItemStatus::Done => (ui::icons::CIRCLE_CHECK_SVG, palette.success),
             BotItemStatus::Canceled => (ui::icons::CIRCLE_X_SVG, palette.muted_foreground),

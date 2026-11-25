@@ -27,6 +27,12 @@ const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
 
 type AttemptToken = (Arc<()>, u64);
 
+enum OutcomeFence {
+    None,
+    Attempt(AttemptToken),
+    Epoch(u64),
+}
+
 /// 같은 접속 대상을 가리키는 관리자끼리 나누는 '꺼진 기기' 판정의 키.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct OfflineKey {
@@ -165,6 +171,18 @@ impl RemoteSlot {
             suspended: false,
         }
     }
+
+    fn reap_dead_tunnel(&mut self) -> bool {
+        if let Some(t) = &mut self.tunnel
+            && !t.is_alive()
+        {
+            self.tunnel = None;
+            self.generation = self.generation.wrapping_add(1);
+            self.transport_epoch.fetch_add(1, Ordering::Release);
+            return true;
+        }
+        false
+    }
 }
 
 /// 다중 원격 호스트 연결 관리자.
@@ -247,10 +265,16 @@ impl HostManager {
                     if transport_changed {
                         slot.registration = Arc::new(());
                         slot.generation = slot.generation.wrapping_add(1);
+                        slot.transport_epoch.fetch_add(1, Ordering::Release);
                         slot.tunnel = None;
                         slot.failures = 0;
                         slot.next_retry_at = None;
-                        slot.status = HostStatus::Connecting;
+                        slot.last_error = None;
+                        slot.status = if slot.suspended {
+                            HostStatus::Disconnected
+                        } else {
+                            HostStatus::Connecting
+                        };
                     }
                 }
                 keep.insert(spec.id.clone(), existing);
@@ -295,10 +319,7 @@ impl HostManager {
             .filter_map(|id| map.get(id))
             .filter_map(|slot| {
                 let mut s = slot.lock().ok()?;
-                if let Some(t) = &mut s.tunnel
-                    && !t.is_alive()
-                {
-                    s.tunnel = None;
+                if s.reap_dead_tunnel() {
                     s.status = HostStatus::Disconnected;
                 }
                 Some((s.spec.clone(), s.status))
@@ -320,10 +341,7 @@ impl HostManager {
         let Ok(mut s) = slot.lock() else {
             return HostStatus::Disconnected;
         };
-        if let Some(t) = &mut s.tunnel
-            && !t.is_alive()
-        {
-            s.tunnel = None;
+        if s.reap_dead_tunnel() {
             s.status = HostStatus::Disconnected;
         }
         s.status
@@ -441,52 +459,80 @@ impl HostManager {
                     Mutex<std::collections::HashMap<std::thread::ThreadId, AttemptToken>>,
                 > = Arc::new(Mutex::new(std::collections::HashMap::new()));
                 let ensure_attempts = Arc::clone(&attempts);
-                let outcome_attempts = Arc::clone(&attempts);
-                let connector = RemoteConnector::new(
-                    move || {
+                let ensure_with_epoch: Arc<dyn Fn() -> io::Result<(PathBuf, u64)> + Send + Sync> =
+                    Arc::new(move || {
                         let tid = std::thread::current().id();
                         if let Ok(mut guard) = ensure_attempts.lock() {
                             guard.remove(&tid);
                         }
-                        let (sock, reg, gen_) =
+                        let (sock, reg, gen_, epoch) =
                             manager.ensure_tunnel_socket_for_attempt(&host_id)?;
                         if let Ok(mut guard) = ensure_attempts.lock() {
                             guard.insert(tid, (reg, gen_));
                         }
-                        Ok(sock)
-                    },
-                    {
+                        Ok((sock, epoch))
+                    });
+                let ensure_sock = Arc::clone(&ensure_with_epoch);
+                let outcome_attempts = Arc::clone(&attempts);
+                let connector =
+                    RemoteConnector::new(move || ensure_sock().map(|(sock, _)| sock), {
                         let manager = self.clone();
                         let host_id = id.clone();
+                        let expected_slot = Arc::downgrade(&slot);
+                        let expected_reg = Arc::clone(&registration);
                         move |ok, err| {
                             let tid = std::thread::current().id();
-                            let token = outcome_attempts
+                            let fence = outcome_attempts
                                 .lock()
                                 .ok()
-                                .and_then(|mut g| g.remove(&tid));
-                            manager.record_ipc_outcome_for_attempt(&host_id, token, ok, err);
+                                .and_then(|mut g| g.remove(&tid))
+                                .map_or(OutcomeFence::None, OutcomeFence::Attempt);
+                            manager.record_ipc_outcome_for_target(
+                                &host_id,
+                                &expected_slot,
+                                &expected_reg,
+                                fence,
+                                ok,
+                                err,
+                            );
                         }
-                    },
-                )
-                .with_lifetime(registration.clone(), {
-                    let manager = self.clone();
-                    let host_id = id.clone();
-                    let expected = Arc::downgrade(&slot);
-                    move || {
-                        let (Some(current), Some(expected)) =
-                            (manager.slot(&host_id), expected.upgrade())
-                        else {
-                            return false;
-                        };
-                        if !Arc::ptr_eq(&current, &expected) {
-                            return false;
+                    })
+                    .with_ensure_socket_epoch(move || ensure_with_epoch())
+                    .with_epoch_outcome({
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        let expected_slot = Arc::downgrade(&slot);
+                        let expected_reg = Arc::clone(&registration);
+                        move |expected_epoch, ok, err| {
+                            manager.record_ipc_outcome_for_target(
+                                &host_id,
+                                &expected_slot,
+                                &expected_reg,
+                                OutcomeFence::Epoch(expected_epoch),
+                                ok,
+                                err,
+                            );
                         }
-                        current.lock().is_ok_and(|slot| {
-                            !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
-                        })
-                    }
-                })
-                .with_transport_epoch(move || transport_epoch.load(Ordering::Acquire));
+                    })
+                    .with_lifetime(registration.clone(), {
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        let expected = Arc::downgrade(&slot);
+                        move || {
+                            let (Some(current), Some(expected)) =
+                                (manager.slot(&host_id), expected.upgrade())
+                            else {
+                                return false;
+                            };
+                            if !Arc::ptr_eq(&current, &expected) {
+                                return false;
+                            }
+                            current.lock().is_ok_and(|slot| {
+                                !slot.suspended && Arc::ptr_eq(&slot.registration, &registration)
+                            })
+                        }
+                    })
+                    .with_transport_epoch(move || transport_epoch.load(Ordering::Acquire));
                 Some(HostTarget::remote_with_connector(
                     id.clone(),
                     initial_socket,
@@ -527,10 +573,13 @@ impl HostManager {
     #[cfg(all(test, unix))]
     fn ensure_tunnel_socket(&self, id: &str) -> io::Result<PathBuf> {
         self.ensure_tunnel_socket_for_attempt(id)
-            .map(|(sock, _, _)| sock)
+            .map(|(sock, _, _, _)| sock)
     }
 
-    fn ensure_tunnel_socket_for_attempt(&self, id: &str) -> io::Result<(PathBuf, Arc<()>, u64)> {
+    fn ensure_tunnel_socket_for_attempt(
+        &self,
+        id: &str,
+    ) -> io::Result<(PathBuf, Arc<()>, u64, u64)> {
         let slot = self.slot(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::ConnectionRefused, "unknown remote host")
         })?;
@@ -554,11 +603,7 @@ impl HostManager {
             ));
         }
 
-        if let Some(t) = &mut s.tunnel
-            && !t.is_alive()
-        {
-            s.tunnel = None;
-        }
+        s.reap_dead_tunnel();
 
         if let Some(until) = s.next_retry_at {
             if Instant::now() < until {
@@ -578,6 +623,7 @@ impl HostManager {
                 t.socket().to_path_buf(),
                 Arc::clone(&s.registration),
                 s.generation,
+                s.transport_epoch.load(Ordering::Acquire),
             ));
         }
 
@@ -629,7 +675,12 @@ impl HostManager {
                 let sock = tunnel.socket().to_path_buf();
                 s.tunnel = Some(tunnel);
                 s.tunnel_starts = s.tunnel_starts.saturating_add(1);
-                Ok((sock, Arc::clone(&s.registration), s.generation))
+                Ok((
+                    sock,
+                    Arc::clone(&s.registration),
+                    s.generation,
+                    s.transport_epoch.load(Ordering::Acquire),
+                ))
             }
             Err(err) => {
                 s.failures = s.failures.saturating_add(1);
@@ -677,6 +728,25 @@ impl HostManager {
         self.record_ipc_outcome_for_attempt(id, None, ok, err);
     }
 
+    fn record_ipc_outcome_for_target(
+        &self,
+        id: &str,
+        expected_slot: &std::sync::Weak<Mutex<RemoteSlot>>,
+        expected_reg: &Arc<()>,
+        fence: OutcomeFence,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
+        let (Some(slot), Some(expected)) = (self.slot(id), expected_slot.upgrade()) else {
+            return;
+        };
+        if !Arc::ptr_eq(&slot, &expected) {
+            return;
+        }
+        Self::record_ipc_outcome_in_slot(&slot, Some(expected_reg), fence, ok, err);
+    }
+
+    #[cfg(all(test, unix))]
     fn record_ipc_outcome_for_attempt(
         &self,
         id: &str,
@@ -687,13 +757,37 @@ impl HostManager {
         let Some(slot) = self.slot(id) else {
             return;
         };
+        let fence = attempt.map_or(OutcomeFence::None, OutcomeFence::Attempt);
+        Self::record_ipc_outcome_in_slot(&slot, None, fence, ok, err);
+    }
+
+    fn record_ipc_outcome_in_slot(
+        slot: &Mutex<RemoteSlot>,
+        expected_reg: Option<&Arc<()>>,
+        fence: OutcomeFence,
+        ok: bool,
+        err: Option<&io::Error>,
+    ) {
         let Ok(mut s) = slot.lock() else {
             return;
         };
-        if let Some((expected_reg, expected_gen)) = attempt
-            && (!Arc::ptr_eq(&s.registration, &expected_reg) || s.generation != expected_gen)
+        if let Some(reg) = expected_reg
+            && !Arc::ptr_eq(&s.registration, reg)
         {
             return;
+        }
+        match fence {
+            OutcomeFence::None => {}
+            OutcomeFence::Attempt((attempt_reg, attempt_gen)) => {
+                if !Arc::ptr_eq(&s.registration, &attempt_reg) || s.generation != attempt_gen {
+                    return;
+                }
+            }
+            OutcomeFence::Epoch(expected_epoch) => {
+                if s.transport_epoch.load(Ordering::Acquire) != expected_epoch {
+                    return;
+                }
+            }
         }
         if s.suspended {
             s.status = HostStatus::Disconnected;
@@ -712,10 +806,11 @@ impl HostManager {
             return;
         }
         s.transport_epoch.fetch_add(1, Ordering::Release);
+        let mut dropped_tunnel = false;
         if let Some(t) = &mut s.tunnel
             && !t.is_alive()
         {
-            s.tunnel = None;
+            dropped_tunnel |= s.tunnel.take().is_some();
         }
         s.failures = s.failures.saturating_add(1);
         // 터널은 살았는데 원격 krilld에 닿지 못했다(원격 소켓 없음·데몬 죽음·채널 시간 초과). 터널을 내려야
@@ -730,7 +825,10 @@ impl HostManager {
             )
         }) || s.failures >= OFFLINE_AFTER_FAILURES
         {
-            s.tunnel = None;
+            dropped_tunnel |= s.tunnel.take().is_some();
+        }
+        if dropped_tunnel {
+            s.generation = s.generation.wrapping_add(1);
         }
         let delay = Self::backoff_delay(s.failures);
         s.next_retry_at = Some(Instant::now() + delay);
@@ -858,9 +956,9 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $A
             identity_file: None,
             remote_socket: Some("/tmp/remote.sock".into()),
         }]);
-        let (_, reg1, gen1) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
+        let (_, reg1, gen1, _) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
         manager2.reconnect_now("studio");
-        let (_, reg2, gen2) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
+        let (_, reg2, gen2, _) = manager2.ensure_tunnel_socket_for_attempt("studio").unwrap();
         manager2.record_ipc_outcome_for_attempt("studio", Some((reg2, gen2)), true, None);
         let pid2 = manager2.tunnel_pid("studio").unwrap();
 

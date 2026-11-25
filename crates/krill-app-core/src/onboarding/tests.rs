@@ -1571,3 +1571,31 @@ fn quick_checks_find_helpers_in_app_bundle() {
     assert_eq!(status("bin.version"), Some(Status::Ok));
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn quick_version_matches_prefixed_krill_and_bare_krilld_outputs() {
+    let root = std::env::temp_dir().join(format!("mk-quick-version-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    script(&bin.join("krill"), "echo 'krill 0.2.6+dev.aaa'\n");
+    script(&bin.join("krilld"), "echo '0.2.6+dev.bbb'\n");
+    script(&bin.join("krill-holder"), "exit 0\n");
+
+    let env = Env {
+        shell: "/bin/sh".into(),
+        krill: bin.join("krill"),
+        state: root.join("state"),
+        default_state: Some(krill_proto::daemon::state_dir_in(&root.join("home"))),
+        home: root.join("home"),
+        state_overridden: true,
+    };
+    let ok = super::quick_version(&env);
+    assert_eq!(ok.status, Status::Ok);
+    assert_eq!(ok.detail, "0.2.6");
+
+    script(&bin.join("krilld"), "echo '0.2.7+dev.ccc'\n");
+    let fail = super::quick_version(&env);
+    assert_eq!(fail.status, Status::Fail);
+    fs::remove_dir_all(&root).ok();
+}

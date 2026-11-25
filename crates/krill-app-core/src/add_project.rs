@@ -141,21 +141,33 @@ impl Dialog {
             .new(|cx| InputState::new(window, cx).placeholder(text::REMOTE_PATH_PLACEHOLDER.get()));
         let remote_path = cx
             .new(|cx| InputState::new(window, cx).placeholder(text::REMOTE_PATH_PLACEHOLDER.get()));
-        let enter_url = cx.subscribe(&url, |d, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                d.submit_clone(cx);
-            }
-        });
-        let enter_dest = cx.subscribe(&dest, |d, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                d.submit_clone(cx);
-            }
-        });
-        let enter_path = cx.subscribe(&remote_path, |d, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                d.submit_remote_path(cx);
-            }
-        });
+        let enter_url =
+            cx.subscribe_in(&url, window, |d, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    d.submit_clone(cx);
+                }
+            });
+        let enter_dest =
+            cx.subscribe_in(&dest, window, |d, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    d.submit_clone(cx);
+                }
+            });
+        let enter_path = cx.subscribe_in(
+            &remote_path,
+            window,
+            |d, input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && !crate::jump::entity_input_is_composing(input, window, cx)
+                {
+                    d.submit_remote_path(cx);
+                }
+            },
+        );
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         Self {
@@ -676,6 +688,13 @@ impl Render for Dialog {
                     }
                 }),
             )
+            .capture_action(
+                cx.listener(|d, _: &gpui_component::input::Enter, window, cx| {
+                    if d.input_is_composing(window, cx) {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|d, e: &KeyDownEvent, window, cx| {
                 d.on_key(e, window, cx);
             }))
@@ -713,3 +732,118 @@ impl Render for Dialog {
 #[cfg(test)]
 #[path = "add_project/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod ime_enter_tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::{EntityInputHandler as _, TestAppContext};
+
+    use super::*;
+
+    #[gpui::test]
+    fn press_enter_is_ignored_during_ime_preedit_in_all_inputs(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let remote = HostId::Remote("mini".to_owned());
+        let (dialog, cx) = cx.add_window_view(|window, cx| {
+            Dialog::new_with_hosts(
+                window,
+                cx,
+                vec![
+                    (HostId::Local, "local".to_owned()),
+                    (remote.clone(), "mini".to_owned()),
+                ],
+                remote.clone(),
+            )
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&dialog, move |_, e: &Event, _| {
+                sink.lock().unwrap().push(e.clone());
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        // Clone URL input with active IME preedit must not submit on Enter.
+        cx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                d.show_clone(window, cx);
+                d.url.update(cx, |input, cx| {
+                    input.set_value("git@github.com:o/repo.git", window, cx);
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                d.dest.update(cx, |input, cx| {
+                    input.set_value("/srv", window, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "Enter during url IME preedit must not submit clone"
+        );
+
+        // Clone dest input with active IME preedit must not submit on Enter.
+        cx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                d.url.update(cx, |input, cx| {
+                    input.unmark_text(window, cx);
+                    input.set_value("git@github.com:o/repo.git", window, cx);
+                });
+                d.dest.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "한", None, window, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "Enter during dest IME preedit must not submit clone"
+        );
+
+        // RemotePath input with active IME preedit must not submit on Enter, then submits after unmark.
+        cx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                d.dest.update(cx, |input, cx| input.unmark_text(window, cx));
+                d.show_start(window, cx);
+                d.browse_activated(window, cx);
+                d.remote_path.update(cx, |input, cx| {
+                    input.set_value("/srv/repo", window, cx);
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "경", None, window, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "Enter during remote_path IME preedit must not submit remote path"
+        );
+
+        cx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                d.remote_path.update(cx, |input, cx| {
+                    input.unmark_text(window, cx);
+                    input.set_value("/srv/repo", window, cx);
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [Event::OpenPath(remote, PathBuf::from("/srv/repo"))]
+        );
+    }
+}

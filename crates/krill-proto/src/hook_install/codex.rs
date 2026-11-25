@@ -244,8 +244,7 @@ struct Rpc {
 
 impl Drop for Rpc {
     fn drop(&mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
+        crate::os::kill_tree(&mut self.child);
     }
 }
 
@@ -399,8 +398,9 @@ impl Rpc {
 
 /// Codex reports ordinary Windows paths while selected account homes are canonical
 /// (`\\?\C:\...`). Compare existing parents too, including for a not-yet-created config.
-fn same_config_path(left: &Path, right: &Path) -> bool {
+pub(super) fn same_config_path(left: &Path, right: &Path) -> bool {
     left == right
+        || crate::path::equivalent(left, right)
         || (left.file_name().is_some()
             && left.file_name() == right.file_name()
             && left
@@ -535,6 +535,51 @@ mod windows_tests {
         std::fs::create_dir(root.join("another")).unwrap();
         assert!(rpc.version(&root.join("another/config.toml")).is_err());
         drop(rpc);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rpc_drop_ends_batch_shim_grandchild() {
+        use base64::Engine as _;
+
+        let root = std::env::temp_dir().join(format!("krill-codex-drop-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let bin = root.join("npm bin");
+        let home = root.join("profile");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let pid_file = root.join("grandchild.pid");
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             Set-Content -LiteralPath '{}' $PID; \
+             $null=[Console]::ReadLine(); \
+             [Console]::WriteLine('{{\"id\":0,\"result\":{{}}}}'); \
+             Start-Sleep 60",
+            pid_file.display().to_string().replace('\'', "''"),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        std::fs::write(
+            bin.join("codex.cmd"),
+            format!(
+                "@echo off\r\n\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -EncodedCommand {encoded}\r\n"
+            ),
+        )
+        .unwrap();
+        let rpc = Rpc::start(&home, Some("fixture command"), Some(bin.as_os_str())).unwrap();
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim().to_owned();
+        drop(rpc);
+        let list = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8_lossy(&list.stdout);
+        assert!(!list.contains(&format!("\"{pid}\"")), "{list}");
         std::fs::remove_dir_all(root).ok();
     }
 }

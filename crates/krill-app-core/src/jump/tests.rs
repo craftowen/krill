@@ -215,14 +215,14 @@ fn jump_palette_filters_vault_hits_and_emits_resume_vault(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 1);
 
-    // One-click Resume on OpenCode vault hit (index 1)
+    // One-click Resume on OpenCode vault hit (index 1) must emit exactly one event.
     let btn = cx
         .debug_bounds("jump-vault-resume-1")
         .expect("jump vault resume button");
     cx.simulate_click(btn.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     let expected = cx.update(|_, cx| view.read(cx).vault_event(1).unwrap());
-    assert_eq!(events.borrow().last(), Some(&expected));
+    assert_eq!(events.borrow().as_slice(), &[expected]);
 }
 
 /// OWE-768: 열린 세션이 있을 때와 0개일 때 모두 방향키(↑/↓)·Enter로

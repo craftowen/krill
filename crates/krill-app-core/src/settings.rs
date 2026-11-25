@@ -22,6 +22,7 @@ use crate::ui::{DarkUiTheme, LightUiTheme};
 
 pub use crate::i18n::Language;
 
+mod antigravity;
 mod locale;
 mod location;
 mod machines;
@@ -312,9 +313,12 @@ pub struct Settings {
     /// 기본 계정 전환 시 실행 중 세션 처리(기본 `ask`).
     #[serde(default)]
     pub running_session_switch_policy: RunningSessionSwitchPolicy,
-    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 끔).
-    #[serde(default)]
+    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 켬, Orca #47221).
+    #[serde(default = "default_true")]
     pub chat_auto_continue_after_rate_limit: bool,
+    /// 재부팅이나 데몬 크래시로 터미널 워커가 끊어졌을 때 저장된 대화를 자동 재개할지(기본 끔, Orca #46643).
+    #[serde(default)]
+    pub resume_work_on_restart: bool,
     /// 사이드바 봇 섹션 "봇 옵션"의 정렬(Orca `botSidebarView.sortBy`).
     pub bot_sidebar_sort: krill_ui::bot_types::BotSidebarSort,
     /// 일시정지한 봇 숨기기(Orca `hidePausedBots`).
@@ -522,7 +526,8 @@ impl Default for Settings {
             show_automations_button: true,
             show_mobile_button: true,
             running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
-            chat_auto_continue_after_rate_limit: false,
+            chat_auto_continue_after_rate_limit: true,
+            resume_work_on_restart: false,
             bot_sidebar_sort: krill_ui::bot_types::BotSidebarSort::Manual,
             bot_sidebar_hide_paused: false,
             bot_sidebar_hide_sleeping_workers: false,
@@ -1967,10 +1972,16 @@ pub fn copy_on_select(cx: &App) -> bool {
         .is_some_and(|c| c.settings.copy_on_select)
 }
 
-/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 false.
+/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 기본값 true.
 pub fn chat_auto_continue_after_rate_limit(cx: &App) -> bool {
     cx.try_global::<Config>()
-        .is_some_and(|c| c.settings.chat_auto_continue_after_rate_limit)
+        .is_none_or(|c| c.settings.chat_auto_continue_after_rate_limit)
+}
+
+/// 재부팅·데몬 크래시 뒤 중단된 터미널 워커 대화를 자동 재개할지. `init` 전이면 기본값 false.
+pub fn resume_work_on_restart(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_some_and(|c| c.settings.resume_work_on_restart)
 }
 
 /// 사이드바 봇 섹션의 "봇 옵션". `init` 전이면 기본값.
@@ -3429,6 +3440,8 @@ pub struct SettingsView {
     opencode_key_open: bool,
     opencode_api_key_pending: bool,
     opencode_api_key_error: Option<SharedString>,
+    /// Native Antigravity (`agy`) account section state (1:1 Orca `AntigravityAccountsSection`).
+    antigravity: antigravity::AntigravityPanelState,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     /// 같은 기기 중복 등록 `(중복 id, 남길 id)`와 그것을 구한 호스트 목록(`ssh -G`, 백그라운드).
     ssh_duplicates: Vec<(String, String)>,
@@ -3933,6 +3946,7 @@ impl SettingsView {
             opencode_key_open: false,
             opencode_api_key_pending: false,
             opencode_api_key_error: None,
+            antigravity: antigravity::AntigravityPanelState::default(),
             ssh_hosts: Vec::new(),
             ssh_duplicates: Vec::new(),
             ssh_duplicates_for: None,
@@ -4573,6 +4587,7 @@ impl SettingsView {
             self.opencode_api_key_input.as_ref(),
             self.rename.as_ref().map(|(_, input)| input),
             self.search.as_ref().map(|(input, _)| input),
+            self.shortcuts.search.as_ref().map(|(input, _)| input),
         ]
         .into_iter()
         .flatten()
@@ -4581,11 +4596,24 @@ impl SettingsView {
                 return true;
             }
         }
+        if self
+            .feedback_input
+            .as_ref()
+            .is_some_and(|input| textarea_is_composing(input, window, app))
+        {
+            return true;
+        }
+        if self.install.any_alias_input_is_composing(window, app) {
+            return true;
+        }
         for edit in self.agent_edits.values() {
             for input in [&edit.cmd, &edit.args] {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&edit.env, window, app) {
+                return true;
             }
         }
         if let Some((search, _)) = &self.agent_preset_search
@@ -4598,6 +4626,9 @@ impl SettingsView {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&form.env, window, app) {
+                return true;
             }
         }
         if let Some(form) = &self.ssh_form {
@@ -4642,6 +4673,9 @@ impl SettingsView {
                 if crate::jump::entity_input_is_composing(input, window, app) {
                     return true;
                 }
+            }
+            if textarea_is_composing(&modal.prompt, window, app) {
+                return true;
             }
         }
         false
@@ -4716,6 +4750,7 @@ impl SettingsView {
             self.accounts_offline = false;
             self.terminal_login_provider = None;
             self.terminal_login_account = None;
+            self.antigravity.reset_for_host_switch();
             self.removing = None;
             self.rename = None;
             self.disarm(cx);
@@ -4953,6 +4988,9 @@ impl SettingsView {
     }
 
     fn refresh_accounts_async(&mut self, cx: &mut Context<Self>) {
+        if self.antigravity.state.is_none() && !self.antigravity.busy {
+            self.run_antigravity_action(antigravity::AntigravityAction::List, cx);
+        }
         if self.accounts_refresh_pending {
             return;
         }
@@ -9140,6 +9178,17 @@ impl SettingsView {
                     continue;
                 }
             }
+            // Antigravity (`agy`) uses Orca's native single-login account section 1:1
+            // (Save current / Select / Remove / Refresh usage — no isolated profile guide).
+            if provider == ProviderKind::Antigravity {
+                let section = self.render_antigravity_section(provider_installed, cx);
+                if provider_installed {
+                    root = root.child(section);
+                } else {
+                    not_installed.push(section);
+                }
+                continue;
+            }
             // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
             accounts.sort_by_key(|a| !a.host_default);
             let add_id = format!("admin-add-account-{}", provider.as_str());
@@ -9636,6 +9685,27 @@ impl SettingsView {
                 ),
             );
 
+        let resume_work_on_restart_row = crate::ui::group_row()
+            .child(self.search_focus.label(
+                p,
+                text::RESUME_WORK_ON_RESTART_TITLE.get(),
+                Some(text::RESUME_WORK_ON_RESTART_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "admin-resume-work-on-restart",
+                        s.resume_work_on_restart,
+                        false,
+                        |next, _, cx| {
+                            edit(cx, move |s| s.resume_work_on_restart = next);
+                        },
+                    )
+                    .aria_label(text::RESUME_WORK_ON_RESTART_TITLE.get()),
+                ),
+            );
+
         // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
         let yolo_seg = layout::segment(
             p,
@@ -9843,6 +9913,7 @@ impl SettingsView {
                     open_toml_row,
                     default_view_mode_row,
                     chat_auto_continue_row,
+                    resume_work_on_restart_row,
                     hooks_row,
                     auto_setup_row,
                     quick_commands_row,
@@ -13726,6 +13797,161 @@ mod host_fence_tests {
         });
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[gpui::test]
+    fn settings_ime_preedit_covers_shortcuts_search_and_all_textareas(cx: &mut TestAppContext) {
+        let dir =
+            std::env::temp_dir().join(format!("krill-settings-ime-all-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+
+        // 1. Shortcuts search input: composing must be detected and Escape must not clear search.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_tab(AdminTab::Shortcuts, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let search_input = v.shortcuts.search.as_ref().unwrap().0.clone();
+                search_input.update(cx, |input, cx| {
+                    input.set_value("zoom", window, cx);
+                    input.focus(window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "shortcuts.search preedit must be detected"
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, cx| {
+            assert!(
+                !v.shortcuts.search_query(cx).is_empty(),
+                "IME preedit Escape in shortcuts search must not clear query"
+            );
+        });
+
+        // 2-5. All four TextareaState fields must be checked by input_is_composing.
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                if let Some((search_input, _)) = &v.shortcuts.search {
+                    search_input.update(cx, |input, cx| input.unmark_text(window, cx));
+                }
+                let mk_input = |window: &mut Window, cx: &mut Context<SettingsView>| {
+                    cx.new(|cx| gpui_component::input::InputState::new(window, cx))
+                };
+                let mk_textarea = |window: &mut Window, cx: &mut Context<SettingsView>| {
+                    cx.new(|cx| gpui_component::input::TextareaState::new(window, cx))
+                };
+
+                // feedback_input
+                let fb = mk_textarea(window, cx);
+                v.feedback_input = Some(fb.clone());
+                fb.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "feedback_input preedit must be detected"
+                );
+                fb.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // agent_edits[*].env
+                let agent_env = mk_textarea(window, cx);
+                v.agent_edits.insert(
+                    "claude".into(),
+                    AgentEdit {
+                        cmd: mk_input(window, cx),
+                        args: mk_input(window, cx),
+                        env: agent_env.clone(),
+                        status: None,
+                    },
+                );
+                agent_env.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "agent_edits.env preedit must be detected"
+                );
+                agent_env.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // custom_agent_form.env
+                let custom_env = mk_textarea(window, cx);
+                v.custom_agent_form = Some(CustomAgentForm {
+                    id: mk_input(window, cx),
+                    name: mk_input(window, cx),
+                    command: mk_input(window, cx),
+                    env: custom_env.clone(),
+                    status: None,
+                });
+                custom_env.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "custom_agent_form.env preedit must be detected"
+                );
+                custom_env.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+
+                // schedule_modal.prompt
+                let prompt = mk_textarea(window, cx);
+                v.schedule_modal = Some(schedules::ScheduleModal {
+                    editing_id: None,
+                    id: mk_input(window, cx),
+                    cron: mk_input(window, cx),
+                    cwd: mk_input(window, cx),
+                    command: mk_input(window, cx),
+                    prompt: prompt.clone(),
+                    name: mk_input(window, cx),
+                    extra_args: mk_input(window, cx),
+                    precheck_timeout: mk_input(window, cx),
+                    base_branch: mk_input(window, cx),
+                    grace: mk_input(window, cx),
+                    agent: None,
+                    reuse_session: false,
+                    preset: krill_proto::schedule::classify_schedule("0 9 * * *").preset,
+                    subscriptions: Vec::new(),
+                    precheck: mk_input(window, cx),
+                    workspace_mode: krill_proto::schedule::WorkspaceMode::Reuse,
+                    enabled: true,
+                    error: None,
+                });
+                prompt.update(cx, |ta, cx| {
+                    ta.focus(window, cx);
+                    ta.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(
+                    v.input_is_composing(window, cx),
+                    "schedule_modal.prompt preedit must be detected"
+                );
+                prompt.update(cx, |ta, cx| ta.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+            });
+        });
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
 mod updates;
 
@@ -13754,6 +13980,18 @@ pub fn usage_tone(pct: u8) -> UsageTone {
     } else {
         UsageTone::Normal
     }
+}
+
+fn textarea_is_composing(
+    input: &gpui::Entity<gpui_component::input::TextareaState>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> bool {
+    use gpui::Focusable as _;
+    input.update(cx, |input, cx| {
+        input.focus_handle(cx).is_focused(window)
+            && gpui::EntityInputHandler::marked_text_range(input, window, cx).is_some()
+    })
 }
 
 fn accept_account_mutation_reply(

@@ -121,11 +121,20 @@ impl Header {
     }
 }
 
+fn read_hello_error(error: iroh::endpoint::ReadExactError) -> Error {
+    match error {
+        iroh::endpoint::ReadExactError::ReadError(e) => Error::Transport(e.to_string()),
+        iroh::endpoint::ReadExactError::FinishedEarly(_) => {
+            Error::Protocol("truncated resume preamble")
+        }
+    }
+}
+
 pub async fn read_hello(recv: &mut RecvStream) -> Result<Hello, Error> {
     let mut bytes = [0; HELLO_LEN];
     recv.read_exact(&mut bytes)
         .await
-        .map_err(|_| Error::Protocol("truncated resume preamble"))?;
+        .map_err(read_hello_error)?;
     Hello::decode(&bytes)
 }
 
@@ -182,6 +191,32 @@ mod tests {
         };
         assert!(Header::decode(&header.encode()).is_err());
     }
+    #[test]
+    fn read_hello_error_distinguishes_transport_loss_from_truncated_preamble() {
+        use iroh::endpoint::{ConnectionError, ReadError, ReadExactError, VarInt};
+
+        assert!(matches!(
+            read_hello_error(ReadExactError::ReadError(ReadError::ConnectionLost(
+                ConnectionError::TimedOut
+            ))),
+            Error::Transport(_)
+        ));
+        assert!(matches!(
+            read_hello_error(ReadExactError::ReadError(ReadError::ClosedStream)),
+            Error::Transport(_)
+        ));
+        assert!(matches!(
+            read_hello_error(ReadExactError::ReadError(ReadError::Reset(
+                VarInt::from_u32(0)
+            ))),
+            Error::Transport(_)
+        ));
+        assert!(matches!(
+            read_hello_error(ReadExactError::FinishedEarly(10)),
+            Error::Protocol("truncated resume preamble")
+        ));
+    }
+
     proptest! {
         #[test]
         fn arbitrary_hello_roundtrip(id in any::<[u8;16]>(),generation in any::<u64>(),received in any::<u64>(),sent in any::<u64>(),received_fin in any::<bool>(),resume in any::<bool>(),grace_ms in any::<u64>()) {

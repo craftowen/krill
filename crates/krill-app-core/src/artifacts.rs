@@ -190,6 +190,22 @@ fn cli_delete_call(state: Option<PathBuf>) -> DeleteCall {
     })
 }
 
+fn command_error(prefix: &str, output: &std::process::Output) -> String {
+    if let Ok(parsed) =
+        serde_json::from_slice::<krill_proto::artifacts::ErrorOutput>(&output.stdout)
+    {
+        let message = parsed.error.message.trim();
+        if !message.is_empty() {
+            return message.to_owned();
+        }
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    format!("{prefix}: {}", output.status)
+}
+
 fn list_command(
     command: &mut Command,
     state: Option<&Path>,
@@ -207,12 +223,7 @@ fn list_command(
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if error.is_empty() {
-            format!("krill artifacts: {}", output.status)
-        } else {
-            error
-        });
+        return Err(command_error("krill artifacts", &output));
     }
     serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())
 }
@@ -227,12 +238,7 @@ fn delete_command(command: &mut Command, state: Option<&Path>, slug: &str) -> Re
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if error.is_empty() {
-            format!("krill artifacts delete: {}", output.status)
-        } else {
-            error
-        });
+        return Err(command_error("krill artifacts delete", &output));
     }
     Ok(())
 }
@@ -257,7 +263,14 @@ struct PresentedRow {
     search_haystack: String,
 }
 
+const ARTIFACTS_API_URL_ENV: &str = "KRILL_ARTIFACTS_API_URL";
+
 fn load_cached_page(dir: &Path) -> Option<Page> {
+    let origin = std::env::var(ARTIFACTS_API_URL_ENV).ok();
+    load_cached_page_with_origin(dir, origin.as_deref())
+}
+
+fn load_cached_page_with_origin(dir: &Path, api_url_override: Option<&str>) -> Option<Page> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct CachedList {
@@ -271,8 +284,7 @@ fn load_cached_page(dir: &Path) -> Option<Page> {
 
     let raw = std::fs::read(dir.join("artifact-list-cache.json")).ok()?;
     let cached: CachedList = serde_json::from_slice(&raw).ok()?;
-    let expected_origin = std::env::var("KRILL_ARTIFACTS_URL")
-        .ok()
+    let expected_origin = api_url_override
         .map(|s| s.trim().trim_end_matches('/').to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://share.krill.page".to_owned());
@@ -310,6 +322,7 @@ pub struct View {
     error: Option<String>,
     loading: bool,
     slow_load: bool,
+    list_generation: u64,
     call: Call,
     delete_call: DeleteCall,
     task: Option<Task<()>>,
@@ -384,6 +397,7 @@ impl View {
             error: None,
             loading: false,
             slow_load: false,
+            list_generation: 0,
             call,
             delete_call,
             task: None,
@@ -454,7 +468,7 @@ impl View {
             }
         }
         self.sync_from_disk_cache(cx);
-        if self.loading {
+        if self.loading || self.deleting_slug.is_some() {
             cx.notify();
         } else {
             self.load(false, cx);
@@ -462,6 +476,9 @@ impl View {
     }
 
     pub fn sync_from_disk_cache(&mut self, cx: &mut Context<Self>) {
+        if self.deleting_slug.is_some() {
+            return;
+        }
         let Some(dir) = &self.state_dir else {
             return;
         };
@@ -471,6 +488,13 @@ impl View {
         if !cached.artifacts.is_empty() || self.items.is_empty() {
             self.items = cached.artifacts;
             self.next = cached.next_cursor;
+            if let Some(sel) = &self.selected_slug
+                && !self.items.iter().any(|i| &i.artifact.slug == sel)
+            {
+                self.selected_slug = None;
+                self.detail = None;
+                self.detail_task = None;
+            }
             self.rebuild_rows();
             cx.notify();
         }
@@ -639,11 +663,24 @@ impl View {
         }
     }
 
+    pub(crate) fn input_is_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app: &mut gpui::App = cx;
+        self.input
+            .as_ref()
+            .is_some_and(|input| crate::jump::entity_input_is_composing(input, window, app))
+    }
+
     pub fn delete_artifact(&mut self, slug: String, cx: &mut Context<Self>) {
         self.armed_delete = None;
         if self.deleting_slug.is_some() || self.retention_slug.is_some() {
             return;
         }
+        self.list_generation = self.list_generation.wrapping_add(1);
+        let generation = self.list_generation;
+        self.task = None;
+        self.loading = false;
+        self.slow_load = false;
+        self.loading_feedback = None;
         let call = self.delete_call.clone();
         self.deleting_slug = Some(slug.clone());
         self.error = None;
@@ -654,6 +691,9 @@ impl View {
                 .spawn(async move { call(slug_for_call) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.list_generation != generation {
+                    return;
+                }
                 this.deleting_slug = None;
                 match result {
                     Ok(()) => {
@@ -678,12 +718,18 @@ impl View {
 
     fn load(&mut self, more: bool, cx: &mut Context<Self>) {
         self.armed_delete = None;
-        if self.loading || self.retention_slug.is_some() || (more && self.next.is_none()) {
+        if self.loading
+            || self.deleting_slug.is_some()
+            || self.retention_slug.is_some()
+            || (more && self.next.is_none())
+        {
             return;
         }
         if let Some(dir) = &self.state_dir {
             self.sharing_enabled = krill_proto::artifacts::sharing_enabled(dir);
         }
+        self.list_generation = self.list_generation.wrapping_add(1);
+        let generation = self.list_generation;
         let cursor = more.then(|| self.next.clone()).flatten();
         let requested_cursor = cursor.clone();
         let call = self.call.clone();
@@ -695,8 +741,10 @@ impl View {
                 .timer(std::time::Duration::from_secs(1))
                 .await;
             this.update(cx, |this, cx| {
-                this.slow_load = this.loading;
-                cx.notify();
+                if this.list_generation == generation {
+                    this.slow_load = this.loading;
+                    cx.notify();
+                }
             })
             .ok();
         }));
@@ -706,6 +754,9 @@ impl View {
                 .spawn(async move { call(cursor) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.list_generation != generation {
+                    return;
+                }
                 this.loading = false;
                 this.slow_load = false;
                 this.loading_feedback = None;
@@ -774,7 +825,11 @@ impl View {
                     .child(
                         ui::secondary("artifacts-retry", text::RETRY.get())
                             .debug_selector(|| "artifacts-retry".into())
-                            .disabled(self.loading || self.retention_slug.is_some())
+                            .disabled(
+                                self.loading
+                                    || self.deleting_slug.is_some()
+                                    || self.retention_slug.is_some(),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| this.load(false, cx))),
                     ),
             ),
@@ -932,7 +987,11 @@ impl View {
             container = container.child(
                 ui::secondary("artifacts-more", text::MORE.get())
                     .debug_selector(|| "artifacts-more".into())
-                    .disabled(self.loading)
+                    .disabled(
+                        self.loading
+                            || self.deleting_slug.is_some()
+                            || self.retention_slug.is_some(),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| this.load(true, cx))),
             );
         }
@@ -1062,7 +1121,11 @@ impl Render for View {
                     .child(
                         ui::secondary("artifacts-refresh", text::REFRESH.get())
                             .debug_selector(|| "artifacts-refresh".into())
-                            .disabled(self.loading)
+                            .disabled(
+                                self.loading
+                                    || self.deleting_slug.is_some()
+                                    || self.retention_slug.is_some(),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| this.load(false, cx))),
                     ),
             )
@@ -1366,7 +1429,11 @@ impl Render for View {
                         div().flex().justify_center().child(
                             ui::secondary("artifacts-more", text::MORE.get())
                                 .debug_selector(|| "artifacts-more".into())
-                                .disabled(self.loading)
+                                .disabled(
+                                    self.loading
+                                        || self.deleting_slug.is_some()
+                                        || self.retention_slug.is_some(),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| this.load(true, cx))),
                         ),
                     )
@@ -1379,8 +1446,18 @@ impl Render for View {
                 .id("artifacts-page")
                 .relative()
                 .debug_selector(|| "artifacts-page".into())
+                .capture_action(cx.listener(
+                    |this, _: &gpui_component::input::Escape, window, cx| {
+                        if this.input_is_composing(window, cx) {
+                            window.prevent_default();
+                        }
+                    },
+                ))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" && !event.keystroke.modifiers.modified() {
+                        if window.default_prevented() || this.input_is_composing(window, cx) {
+                            return;
+                        }
                         this.handle_escape(Some(window), cx);
                         cx.stop_propagation();
                     }
@@ -1476,6 +1553,308 @@ impl Render for View {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn sample_page(slugs: &[&str]) -> Page {
+        let artifacts: Vec<_> = slugs
+            .iter()
+            .map(|slug| {
+                serde_json::json!({
+                    "artifact": {
+                        "slug": slug,
+                        "originalFileName": format!("{slug}.html"),
+                    },
+                    "shareUrl": format!("https://share.krill.page/a/{slug}"),
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "artifacts": artifacts,
+            "nextCursor": null,
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_and_delete_commands_parse_json_error_from_stdout_and_fallback_to_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("krill-artifact-cmd-err-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write_script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+
+        let json_err = write_script(
+            "json-err",
+            r#"printf '%s\n' '{"error":{"code":"unauthorized","message":"token expired"}}'; exit 1"#,
+        );
+        assert_eq!(
+            list_command(&mut Command::new(&json_err), Some(&dir), None).unwrap_err(),
+            "token expired"
+        );
+        assert_eq!(
+            delete_command(&mut Command::new(&json_err), Some(&dir), "s1").unwrap_err(),
+            "token expired"
+        );
+
+        let stderr_err = write_script("stderr-err", "echo 'network unreachable' >&2; exit 1\n");
+        assert_eq!(
+            list_command(&mut Command::new(&stderr_err), Some(&dir), None).unwrap_err(),
+            "network unreachable"
+        );
+        assert_eq!(
+            delete_command(&mut Command::new(&stderr_err), Some(&dir), "s1").unwrap_err(),
+            "network unreachable"
+        );
+
+        let silent_err = write_script("silent-err", "exit 7\n");
+        assert!(
+            list_command(&mut Command::new(&silent_err), Some(&dir), None)
+                .unwrap_err()
+                .starts_with("krill artifacts:")
+        );
+        assert!(
+            delete_command(&mut Command::new(&silent_err), Some(&dir), "s1")
+                .unwrap_err()
+                .starts_with("krill artifacts delete:")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cached_page_uses_krill_artifacts_api_url_env_and_filters_origin() {
+        assert_eq!(ARTIFACTS_API_URL_ENV, "KRILL_ARTIFACTS_API_URL");
+        let dir = std::env::temp_dir().join(format!(
+            "krill-artifact-cache-origin-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("artifact-list-cache.json"),
+            serde_json::json!({
+                "apiOrigin": "https://custom.example.com/",
+                "artifacts": [{
+                    "artifact": { "slug": "custom-1", "title": "Custom" },
+                    "shareUrl": "https://custom.example.com/a/custom-1"
+                }],
+                "nextCursor": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let matched = load_cached_page_with_origin(&dir, Some("https://custom.example.com"))
+            .expect("matching custom api origin should load cache");
+        assert_eq!(matched.artifacts.len(), 1);
+        assert_eq!(matched.artifacts[0].artifact.slug, "custom-1");
+        assert!(load_cached_page_with_origin(&dir, Some("https://other.example.com")).is_none());
+        assert!(load_cached_page_with_origin(&dir, None).is_none());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn ime_preedit_escape_does_not_clear_search_or_close_artifacts_page(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::EntityInputHandler as _;
+
+        cx.update(gpui_component::init);
+        let closed = Arc::new(Mutex::new(0usize));
+        let closed_seen = Arc::clone(&closed);
+        let (view, visual) = cx.add_window_view(|_, cx| {
+            let v = View::with_call(Arc::new(|_| Ok(sample_page(&["one"]))), cx);
+            cx.subscribe(&cx.entity(), move |_, _, _: &Close, _| {
+                *closed_seen.lock().unwrap() += 1;
+            })
+            .detach();
+            v
+        });
+        visual.simulate_resize(gpui::size(px(960.), px(640.)));
+        visual.run_until_parked();
+
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let input = v.input.as_ref().expect("search input").clone();
+                input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.replace_text_in_range(None, "계획", window, cx);
+                    input.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(v.input_is_composing(window, cx));
+            });
+        });
+        visual.run_until_parked();
+        let query_before = view.read_with(visual, |v, _| v.query.clone());
+        assert!(!query_before.is_empty());
+
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert_eq!(
+                v.query, query_before,
+                "IME preedit Escape must not clear the search query"
+            );
+        });
+        assert_eq!(
+            *closed.lock().unwrap(),
+            0,
+            "IME preedit Escape must not close the Artifacts modal"
+        );
+
+        // Once composition ends, Escape clears the query normally.
+        visual.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let input = v.input.as_ref().expect("search input").clone();
+                input.update(cx, |input, cx| {
+                    input.unmark_text(window, cx);
+                });
+                assert!(!v.input_is_composing(window, cx));
+            });
+        });
+        visual.run_until_parked();
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        view.read_with(visual, |v, _| {
+            assert!(v.query.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn load_and_delete_mutually_fence_without_resurrecting_deleted_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let load_calls = Arc::new(Mutex::new(0usize));
+        let load_seen = Arc::clone(&load_calls);
+        let call: Call = Arc::new(move |_| {
+            *load_seen.lock().unwrap() += 1;
+            Ok(sample_page(&["one", "two"]))
+        });
+        let view = cx.new(|cx| View::with_calls(call, Arc::new(|_| Ok(())), None, cx));
+        cx.run_until_parked();
+        assert_eq!(*load_calls.lock().unwrap(), 1);
+        view.read_with(cx, |v, _| assert_eq!(v.items.len(), 2));
+
+        // In-flight load followed immediately by delete_artifact must not resurrect "one".
+        view.update(cx, |v, cx| {
+            v.load(false, cx);
+            assert!(v.loading);
+            v.delete_artifact("one".into(), cx);
+            assert!(!v.loading);
+            assert_eq!(v.deleting_slug.as_deref(), Some("one"));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
+            let slugs: Vec<_> = v.items.iter().map(|i| i.artifact.slug.as_str()).collect();
+            assert_eq!(slugs, vec!["two"]);
+            assert!(!v.loading);
+            assert!(v.deleting_slug.is_none());
+        });
+
+        // A load triggered while delete_artifact is in flight is fenced out.
+        let calls_before_delete = *load_calls.lock().unwrap();
+        view.update(cx, |v, cx| {
+            v.delete_artifact("two".into(), cx);
+            assert_eq!(v.deleting_slug.as_deref(), Some("two"));
+            v.load(false, cx);
+            assert!(!v.loading);
+        });
+        cx.run_until_parked();
+        assert_eq!(*load_calls.lock().unwrap(), calls_before_delete);
+        view.read_with(cx, |v, _| {
+            assert!(v.items.is_empty());
+            assert!(v.deleting_slug.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn sync_from_disk_cache_clears_selection_when_selected_slug_disappears(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-artifact-sync-clear-sel-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        krill_proto::artifacts::enable_sharing(&dir).unwrap();
+        let cache = dir.join("artifact-list-cache.json");
+        std::fs::write(
+            &cache,
+            serde_json::json!({
+                "apiOrigin": "https://share.krill.page",
+                "artifacts": [
+                    {
+                        "artifact": { "slug": "one", "title": "One" },
+                        "shareUrl": "https://share.krill.page/a/one"
+                    },
+                    {
+                        "artifact": { "slug": "two", "title": "Two" },
+                        "shareUrl": "https://share.krill.page/a/two"
+                    }
+                ],
+                "nextCursor": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let view = cx.new(|cx| {
+            View::with_calls(
+                Arc::new(|_| Ok(sample_page(&["one", "two"]))),
+                Arc::new(|_| Ok(())),
+                Some(dir.clone()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.update(cx, |v, cx| v.select_slug(Some("one".into()), cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.selected_slug(), Some("one"));
+            assert!(v.detail.is_some());
+        });
+
+        // Cache now only has "two"; syncing from disk cache must clear stale selection/detail.
+        std::fs::write(
+            &cache,
+            serde_json::json!({
+                "apiOrigin": "https://share.krill.page",
+                "artifacts": [
+                    {
+                        "artifact": { "slug": "two", "title": "Two" },
+                        "shareUrl": "https://share.krill.page/a/two"
+                    }
+                ],
+                "nextCursor": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+        view.update(cx, super::View::sync_from_disk_cache);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.selected_slug(), None);
+            assert!(v.detail.is_none());
+            assert!(v.detail_task.is_none());
+            assert_eq!(v.items.len(), 1);
+            assert_eq!(v.items[0].artifact.slug, "two");
+        });
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 mod detail;
 mod retention;

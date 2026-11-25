@@ -3027,6 +3027,20 @@ fn rate_limited_fixture<'a>(
     with_alternative: bool,
     auto_continue_setting: bool,
 ) -> (Entity<Shell>, &'a mut VisualTestContext, SentBytes) {
+    rate_limited_fixture_at(
+        cx,
+        state_path(name),
+        with_alternative,
+        auto_continue_setting,
+    )
+}
+
+fn rate_limited_fixture_at(
+    cx: &mut TestAppContext,
+    layout_path: std::path::PathBuf,
+    with_alternative: bool,
+    auto_continue_setting: bool,
+) -> (Entity<Shell>, &mut VisualTestContext, SentBytes) {
     use krill_proto::usage::{
         AccountInfo, AccountsSnapshot, FEAT_PROVIDER_DETAILS, FEAT_SESSION_ACCOUNT_SWITCH,
         FEAT_USAGE, ProviderKind, Snapshot, Window,
@@ -3037,14 +3051,14 @@ fn rate_limited_fixture<'a>(
             Ok(self.0.clone())
         }
     }
-    let (shell, cx) = open(cx, state_path(name));
-    if auto_continue_setting {
-        // Settings edits reload accounts; settle that before injecting the snapshot below.
-        cx.update(|_, cx| {
-            krill_app::settings::edit(cx, |s| s.chat_auto_continue_after_rate_limit = true);
+    let (shell, cx) = open(cx, layout_path);
+    // Settings default is now `true`; explicitly apply `auto_continue_setting` so fixtures test both.
+    cx.update(|_, cx| {
+        krill_app::settings::edit(cx, move |s| {
+            s.chat_auto_continue_after_rate_limit = auto_continue_setting;
         });
-        cx.run_until_parked();
-    }
+    });
+    cx.run_until_parked();
     let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
     let recorded = sent.clone();
     let account = |id: &str, seven_day: Option<Window>| AccountInfo {
@@ -3249,6 +3263,158 @@ fn auto_continue_arms_from_setting_cancels_and_sends_once_after_reset(cx: &mut T
     cx.run_until_parked();
     shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
     assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+}
+
+#[gpui::test]
+fn auto_continue_continues_early_on_account_switch_with_fresh_headroom(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountInfo, AccountsSnapshot, ProviderKind, Snapshot, Window};
+    struct StateSource(krill_app::sidebar::Snapshot);
+    impl krill_app::sidebar::Source for StateSource {
+        fn fetch(&self) -> std::io::Result<krill_app::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let (shell, cx, sent) = rate_limited_fixture(cx, "chat-auto-continue-switch", true, true);
+    let key = local_key(SESSION);
+    // Initial rate limit on account `main` arms the timer for RL_RESET (60s away).
+    shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
+    cx.run_until_parked();
+    assert!(shell.read_with(cx, |s, _| s.chat.auto_continue.contains_key(&key)));
+    assert!(sent_text(&sent).is_empty());
+
+    // Simulate switching the session to `other` (which has fresh headroom) BEFORE RL_RESET!
+    let switched_sessions = krill_app::sidebar::Snapshot {
+        sessions: vec![krill_app::sidebar::Session {
+            id: SESSION,
+            status: krill_proto::control::AgentStatus {
+                state: krill_proto::control::AgentState::Done,
+                agent: "claude".into(),
+                since_unix_ns: 2,
+                ..krill_proto::control::AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: Some(krill_proto::control::SessionAccount {
+                session: SESSION,
+                account_id: "other".into(),
+                label: "other".into(),
+            }),
+        }],
+        trees: std::collections::BTreeMap::new(),
+    };
+    let fresh_snap = AccountsSnapshot {
+        accounts: vec![
+            AccountInfo {
+                id: "main".into(),
+                provider: ProviderKind::Claude,
+                label: "main".into(),
+                email: None,
+                profile_dir: "/synthetic/main".into(),
+                active: false,
+                host_default: false,
+                stale: false,
+                usage: Snapshot {
+                    five_hour: None,
+                    seven_day: Some(Window {
+                        percent: 100,
+                        resets_at: Some(RL_RESET.to_string()),
+                    }),
+                },
+            },
+            AccountInfo {
+                id: "other".into(),
+                provider: ProviderKind::Claude,
+                label: "other".into(),
+                email: None,
+                profile_dir: "/synthetic/other".into(),
+                active: true,
+                host_default: false,
+                stale: false,
+                usage: Snapshot {
+                    five_hour: Some(Window {
+                        percent: 15,
+                        resets_at: Some((RL_RESET + 3_600).to_string()),
+                    }),
+                    seven_day: None,
+                },
+            },
+        ],
+        ..AccountsSnapshot::default()
+    };
+    shell.update(cx, |s, cx| {
+        s.on_chat_account_switch_requested(&key, "other", cx);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(std::sync::Arc::new(StateSource(switched_sessions)), cx);
+        });
+    });
+    cx.run_until_parked();
+    shell.update(cx, |s, cx| {
+        s.apply_accounts_snapshot_for_host(krill_app::hosts::HostId::Local, fresh_snap, cx);
+    });
+    cx.run_until_parked();
+
+    // Immediately continued early without waiting for RL_RESET, and only once.
+    let prompt = ctext::AUTO_CONTINUE_PROMPT.get();
+    assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+    assert!(shell.read_with(cx, |s, _| !s.chat.auto_continue.contains_key(&key)));
+
+    // Re-syncing does not double-send.
+    shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
+    cx.run_until_parked();
+    assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+}
+
+#[gpui::test]
+fn auto_continue_survives_restart_once_and_respects_explicit_false(cx: &mut TestAppContext) {
+    let layout_path = state_path("chat-auto-continue-restart");
+    let state_dir = layout_path.parent().expect("state dir").to_path_buf();
+    // First run: record a pending cut on `main` resetting at RL_RESET.
+    {
+        let (shell, cx, sent) = rate_limited_fixture_at(cx, layout_path.clone(), false, true);
+        let key = local_key(SESSION);
+        shell.update(cx, |s, cx| s.sync_auto_continue(&key, cx));
+        cx.run_until_parked();
+        assert!(sent_text(&sent).is_empty());
+        assert!(state_dir.join("chat-rate-limit-recovery.json").is_file());
+    }
+
+    // Second run with setting explicitly OFF (`false`): even after reset elapsed, must NOT send.
+    {
+        let (shell, cx, sent) = rate_limited_fixture_at(cx, layout_path.clone(), false, false);
+        let key = local_key(SESSION);
+        shell.update(cx, |s, cx| {
+            s.chat.now_override = Some(RL_RESET + 10);
+            s.sync_auto_continue(&key, cx);
+        });
+        cx.run_until_parked();
+        assert!(sent_text(&sent).is_empty());
+    }
+
+    // Third run with setting ON (`true`) after reset elapsed: continues ONCE and persists `Continued`.
+    {
+        let (shell, cx, sent) = rate_limited_fixture_at(cx, layout_path.clone(), false, true);
+        let key = local_key(SESSION);
+        shell.update(cx, |s, cx| {
+            s.chat.now_override = Some(RL_RESET + 10);
+            s.sync_auto_continue(&key, cx);
+        });
+        cx.run_until_parked();
+        let prompt = ctext::AUTO_CONTINUE_PROMPT.get();
+        assert_eq!(sent_text(&sent).matches(prompt).count(), 1);
+    }
+
+    // Fourth run (another restart): already persisted as `Continued`, must NEVER double-send!
+    {
+        let (shell, cx, sent) = rate_limited_fixture_at(cx, layout_path, false, true);
+        let key = local_key(SESSION);
+        shell.update(cx, |s, cx| {
+            s.chat.now_override = Some(RL_RESET + 30);
+            s.sync_auto_continue(&key, cx);
+        });
+        cx.run_until_parked();
+        assert!(sent_text(&sent).is_empty());
+    }
 }
 
 fn bot_for(session: SessionId, paused: bool) -> krill_app::bots::SidebarBot {
@@ -6126,6 +6292,8 @@ fn cross_host_paused_resume_and_split_item_note_focus_behave_cleanly(cx: &mut Te
         created_at_ms: 1_700_000_000_500,
         updated_at_ms: 1_700_000_000_500,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let items_for_rpc = vec![item];
 

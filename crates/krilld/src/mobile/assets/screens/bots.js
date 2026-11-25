@@ -156,8 +156,19 @@ const isSafeAvatarSrc = (mime, b64) =>
 typeof b64 === "string" &&
 b64.length > 0 &&
 /^[A-Za-z0-9+/=]+$/.test(b64);
+const BOTS_ITEM_WAITING_CAPABILITY = "bots.item-waiting.v1";
+const hostSupportsItemWaiting = (ctx, hostId) => {
+const conns = Array.isArray(ctx.connections) ? ctx.connections : [];
+const conn = hostId ? conns.find((c) => c.id === hostId) : conns.find((c) => c.active) || conns[0];
+return Boolean(conn?.snapshot?.capabilities?.bots_item_waiting || (!hostId && ctx.state?.snapshot?.capabilities?.bots_item_waiting));
+};
+const withWaitingCap = (ctx, hostId, req) =>
+hostSupportsItemWaiting(ctx, hostId)
+? { ...req, capabilities: [BOTS_ITEM_WAITING_CAPABILITY] }
+: req;
 const statusTone = (status) => {
 if (status === "needs_you") return "waiting";
+if (status === "waiting") return "item-waiting";
 if (status === "working" || status === "running") return "working";
 if (status === "done" || status === "connected" || status === "active") return "connected";
 if (status === "error" || status === "blocked") return "blocked";
@@ -166,6 +177,7 @@ return "unknown";
 const statusLabel = (status, t) => {
 if (status === "needs_you") return t("Needs You");
 if (status === "working") return t("Working");
+if (status === "waiting") return t("Waiting");
 if (status === "running") return t("Running");
 if (status === "planned") return t("Planned");
 if (status === "done") return t("Done");
@@ -231,7 +243,16 @@ return t("Auto");
 const eventStatusTarget = (ev) => {
 const raw = String(ev?.text || "");
 const parts = raw.split("-> ");
-return parts.length > 1 ? parts[parts.length - 1].trim() : null;
+return parts.length > 1 ? parts[parts.length - 1].split(":")[0].trim() : null;
+};
+const activeWaitEventId = (item) => {
+if (!item || item.status !== "waiting" || !String(item.waiting_reason || "").trim()) return null;
+const events = Array.isArray(item.events) ? item.events : [];
+for (let i = events.length - 1; i >= 0; i--) {
+const ev = events[i];
+if (ev?.kind === "status" && eventStatusTarget(ev) === "waiting") return ev.id;
+}
+return null;
 };
 const answeredDecisionLines = (item, askEv) => {
 const decs = Array.isArray(askEv?.decisions) ? askEv.decisions : [];
@@ -442,7 +463,7 @@ return Promise.reject(e);
 const isActivelySnoozed = (item, now = Date.now()) => Number(item?.snoozed_until_ms || 0) > now;
 async function fetchBotItemsWithStatus(ctx, hostId, req, noStatusHosts) {
 const hKey = hostId ?? "local";
-const nextReq = { ...req };
+const nextReq = withWaitingCap(ctx, hostId, req);
 if (nextReq.status && noStatusHosts?.has(hKey)) delete nextReq.status;
 try {
 return await rpcHost(ctx, hostId, nextReq);
@@ -1171,6 +1192,45 @@ if (!linkForm.hidden) linkInput.focus();
 },
 "secondary small",
 );
+const waitForm = el("form", undefined, "bot-item-form");
+waitForm.hidden = true;
+const waitInput = el("input");
+waitInput.type = "text";
+waitInput.maxLength = 200;
+waitInput.value = String(curItem.waiting_reason || "");
+waitInput.placeholder = t("What is it waiting on?");
+waitInput.setAttribute("aria-label", t("Waiting on"));
+const saveWait = () => {
+const reason = waitInput.value.trim();
+if (!reason || /[\r\n]/.test(reason) || [...reason].length > 200) {
+throw Error(t("Waiting reason must be a single line (max 200 chars)"));
+}
+return runMutation(
+() =>
+rpcHost(ctx, curItem._hostId, {
+action: "bots.item.update",
+item_id: curItem.uid,
+status: "waiting",
+waiting_reason: reason,
+}),
+t("Marked waiting"),
+true,
+);
+};
+waitForm.addEventListener("submit", (ev) => {
+ev.preventDefault();
+ctx.act(saveWait);
+});
+const saveWaitBtn = button(t("Mark waiting"), saveWait, "primary small");
+waitForm.append(waitInput, saveWaitBtn);
+const waitBtn = button(
+t("Waiting"),
+() => {
+waitForm.hidden = !waitForm.hidden;
+if (!waitForm.hidden) waitInput.focus();
+},
+"secondary small",
+);
 const cancelBtn = button(
 t("Cancel item"),
 () =>
@@ -1181,15 +1241,18 @@ true,
 ),
 "secondary small danger",
 );
-actionsGrid.append(chatBtn, doneBtn, snoozeBtn, linkBtn, cancelBtn);
+actionsGrid.append(chatBtn, doneBtn, waitBtn, snoozeBtn, linkBtn, cancelBtn);
 const timeline = el("div", undefined, "bot-timeline");
 function drawTimeline() {
 const events = Array.isArray(curItem.events) ? curItem.events : [];
-if (!events.length) {
+const hiddenWaitId = activeWaitEventId(curItem);
+const waitReason = curItem.status === "waiting" ? String(curItem.waiting_reason || "").trim() : "";
+const shownEvents = events.filter((ev) => !(hiddenWaitId !== null && ev?.id === hiddenWaitId));
+if (!shownEvents.length && !waitReason) {
 timeline.replaceChildren(el("p", t("No activity yet."), "muted"));
 return;
 }
-const rows = events.map((ev) => {
+const rows = shownEvents.map((ev) => {
 const mine = isOwnerActor(ev.actor);
 const row = el("div", undefined, `bot-timeline-item${mine ? " mine" : ""}`);
 const head = el("div", undefined, "bot-timeline-head");
@@ -1199,6 +1262,17 @@ const bodyText = formatEventText(ev, t);
 if (bodyText) row.append(el("p", bodyText, "bot-timeline-body"));
 return row;
 });
+if (waitReason) {
+const waitCard = el("div", undefined, "bot-wait-card");
+const waitHead = el("div", undefined, "bot-wait-card-head");
+const waitSince =
+curItem.waiting_since_ms ||
+events.find((ev) => ev?.id === hiddenWaitId)?.created_at_ms ||
+curItem.updated_at_ms;
+waitHead.append(el("strong", t("Waiting on")), el("span", formatTimestamp(waitSince, t)));
+waitCard.append(waitHead, el("p", waitReason, "bot-wait-card-body"));
+rows.push(waitCard);
+}
 timeline.replaceChildren(...rows);
 }
 function drawSheet() {
@@ -1261,6 +1335,7 @@ snoozeBtn.textContent = curSnoozeLbl;
 snoozeBtn.setAttribute("aria-label", curSnoozeLbl);
 input.disabled = submitBtn.disabled = off;
 doneBtn.disabled = snoozeBtn.disabled = cancelBtn.disabled = off || isClosed();
+waitBtn.disabled = waitInput.disabled = saveWaitBtn.disabled = off || isClosed() || curItem.status === "needs_you";
 linkBtn.disabled = linkInput.disabled = saveLinkBtn.disabled = off;
 }
 const nodes = [metaRow];
@@ -1272,7 +1347,7 @@ const lw = el("div", undefined, "bot-item-links");
 lw.append(...linkChips);
 nodes.push(lw);
 }
-nodes.push(decisionsBox, form, actionsGrid, linkForm);
+nodes.push(decisionsBox, form, actionsGrid, linkForm, waitForm);
 nodes.push(el("p", t("Activity"), "sheet-field-label"));
 nodes.push(timeline);
 body.append(...nodes);
@@ -1315,6 +1390,8 @@ headRight.append(botBtn);
 if (collapsible) headRight.append(toggleBtn);
 header.append(headLeft, headRight);
 const title = el("strong", undefined, "bot-item-title");
+const waitLine = el("p", undefined, "bot-item-wait-line");
+waitLine.hidden = true;
 const contextBox = el("div", undefined, "bot-item-context");
 const contextHead = el("div", undefined, "bot-item-context-head");
 const contextWho = el("strong");
@@ -1359,7 +1436,7 @@ const sheetDetailBtn = button(t("Details"), () => entry.onOpenSheet?.(), "second
 const chatJumpBtn = button(t("Open chat"), () => openBotDetail(ctx, entry.current.owner_bot_id, entry.current._hostId, "chat"), "ghost small");
 foot.append(sheetDetailBtn, chatJumpBtn);
 detailsWrap.append(desc, doneMeans, form);
-card.append(header, title, contextBox, links, decisionsBox, detailsWrap);
+card.append(header, title, waitLine, contextBox, links, decisionsBox, detailsWrap);
 if (sheetDetail) card.append(foot);
 entry = {
 card,
@@ -1368,6 +1445,7 @@ hostBadge,
 botBtn,
 toggleBtn,
 title,
+waitLine,
 contextBox,
 contextWho,
 contextTime,
@@ -1508,7 +1586,7 @@ const waiting = waitingQuestion(cur);
 const hasDecisions = Boolean(waiting && waiting.openIndices.length);
 const isNeedsTextOnly = cur.status === "needs_you" && !hasDecisions;
 const isExpanded = sheetDetail ? isNeedsTextOnly : (!collapsible || !!expandedIds?.has(cardKey));
-entry.card.className = `bot-item-card${collapsible ? " is-collapsible" : ""}${cur.status === "needs_you" ? " waiting" : ""}`;
+entry.card.className = `bot-item-card${collapsible ? " is-collapsible" : ""}${cur.status === "needs_you" ? " waiting" : cur.status === "waiting" ? " item-waiting" : ""}`;
 entry.badge.textContent = statusLabel(cur.status, t);
 entry.badge.className = `bot-status-pill ${statusTone(cur.status)}`;
 entry.hostBadge.hidden = !multiHost || !cur._hostName;
@@ -1523,6 +1601,10 @@ entry.toggleBtn.setAttribute("aria-label", lbl);
 entry.toggleBtn.setAttribute("aria-expanded", String(isExpanded));
 }
 entry.title.textContent = cur.title || "";
+const waitSnoozed = Number(cur.snoozed_until_ms || 0) > Date.now();
+const waitReason = cur.status === "waiting" && !waitSnoozed ? String(cur.waiting_reason || "").trim() : "";
+entry.waitLine.hidden = !waitReason;
+entry.waitLine.textContent = waitReason ? `${t("Waiting on")}: ${waitReason}` : "";
 const latestCtx = latestBotContext(cur);
 const fallbackCtx = sheetDetail ? (cur.description || cur.done_means || "") : "";
 if (latestCtx) {
@@ -2993,13 +3075,13 @@ draw();
 try {
 const [botsRes, itemsRes, allItemsRes, statusRes, sugRes, accRes, upRes, sessRes, grpRes] = await Promise.all([
 ctx.rpc({ action: "bots.list", limit: 100 }),
-ctx.rpc({
+ctx.rpc(withWaitingCap(ctx, null, {
 action: "bots.items",
 bot_id: botId,
 include_closed: includeClosed,
 include_snoozed: includeSnoozed,
 limit: 25,
-}),
+})),
 fetchBotItemsWithStatus(
 ctx,
 null,
@@ -3059,14 +3141,14 @@ draw();
 }
 async function loadMoreItems() {
 if (!itemsCursor || !ready()) return;
-const res = await ctx.rpc({
+const res = await ctx.rpc(withWaitingCap(ctx, null, {
 action: "bots.items",
 bot_id: botId,
 include_closed: includeClosed,
 include_snoozed: includeSnoozed,
 limit: 25,
 cursor: itemsCursor,
-});
+}));
 if (ctx.signal.aborted) return;
 const seen = new Set(items.map((x) => x.uid));
 for (const item of res?.items || []) if (!seen.has(item.uid)) items.push(item);
@@ -3811,6 +3893,7 @@ return head;
 const filterBar = el("div", undefined, "todo-filter-bar");
 const filterButtons = [
 ["needs_you", t("Needs You")],
+["waiting", t("Waiting")],
 ["open", t("All Open")],
 ["snoozed", t("Snoozed")],
 ["closed", t("Closed")],
@@ -3846,12 +3929,8 @@ const itemRequestParams = (reqFilter, cursor) => ({
 action: "bots.items",
 include_closed: reqFilter === "closed",
 include_snoozed: reqFilter === "snoozed",
-...(reqFilter === "needs_you"
-? { status: "needs_you" }
-: reqFilter === "closed"
-? { status: "closed" }
-: reqFilter === "snoozed"
-? { status: "snoozed" }
+...(reqFilter === "needs_you" || reqFilter === "waiting" || reqFilter === "closed" || reqFilter === "snoozed"
+? { status: reqFilter }
 : {}),
 limit: 25,
 ...(cursor ? { cursor } : {}),
@@ -4245,6 +4324,8 @@ filter === "needs_you"
 ? items.filter((i) => i.status === "needs_you")
 : filter === "open"
 ? items.filter((i) => i.status !== "done" && i.status !== "canceled" && !isActivelySnoozed(i, now))
+: filter === "waiting"
+? items.filter((i) => i.status === "waiting")
 : filter === "closed"
 ? items.filter((i) => i.status === "done" || i.status === "canceled")
 : filter === "snoozed"

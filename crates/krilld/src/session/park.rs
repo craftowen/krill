@@ -62,7 +62,7 @@ pub(super) fn schedule(session: &Arc<Shared>, epoch: u64) {
     };
     let mut pending = lock(&timer.pending);
     {
-        let live = lock(&session.live);
+        let live = session.live();
         // A delayed schedule call from an older viewer drop must not replace the
         // newer epoch's deadline after a quick tab round trip.
         if live.epoch != epoch || live.viewers > 0 {

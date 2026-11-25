@@ -278,10 +278,15 @@ fn hook_prepare_error(agent: TargetAgent, error: &io::Error) -> FixError {
 
 fn stage_helpers(env: &Env) -> Result<PathBuf, String> {
     use super::{Access, access};
-    let parent = env
-        .krill
-        .parent()
-        .ok_or_else(|| atext::HELPERS_MISSING.get().to_owned())?;
+    let parent = env.krill.parent().ok_or_else(|| {
+        let missing = env.krill.display().to_string();
+        let path = if missing.is_empty() {
+            "krill"
+        } else {
+            &missing
+        };
+        atext::HELPERS_MISSING.format(&[("path", path)])
+    })?;
     // 번들 설치본은 krill만 Contents/MacOS에 있고 holder·krilld는 Contents/Helpers에 있다(OWE-714).
     for name in ["krill", "krill-holder", "krilld"] {
         let path = krill_proto::daemon::exe_near(parent, name);
@@ -324,7 +329,7 @@ fn install_managed_cli_at(env: &Env, path: &std::ffi::OsStr) -> FixOutcome {
         .iter()
         .find(|dir| managed.contains(dir) && safe_cli_dir(&env.home, dir).is_ok())
         .unwrap_or(&managed[0]);
-    safe_cli_dir(&env.home, directory)?;
+    let dir_safe = safe_cli_dir(&env.home, directory);
     let target = super::stable_mk_path(&env.krill, &env.home);
     for dir in &dirs {
         let candidate = dir.join("krill");
@@ -333,14 +338,19 @@ fn install_managed_cli_at(env: &Env, path: &std::ffi::OsStr) -> FixOutcome {
                 std::fs::canonicalize(&target).ok().as_ref() == Some(&found)
                     || std::fs::canonicalize(&env.krill).ok().as_ref() == Some(&found)
             });
-            let managed_broken = candidate == directory.join("krill")
+            if ours {
+                return Ok(());
+            }
+            let managed_broken = dir_safe.is_ok()
+                && candidate == directory.join("krill")
                 && std::fs::read_link(&candidate).is_ok_and(|raw| raw == target);
-            if !ours && !managed_broken {
+            if !managed_broken {
                 return Err(atext::CLI_CONFLICT.get().to_owned());
             }
             break;
         }
     }
+    dir_safe?;
     let link = directory.join("krill");
     match std::fs::symlink_metadata(&link) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -567,6 +577,13 @@ pub fn dismiss_need(id: &str, cx: &mut App) {
 
 /// 파일 접근이 실제로 거부됐을 때만 호출한다. 권한을 미리 요청하지 않는다.
 pub fn note_access_denied(path: &Path, error: &io::Error, cx: &mut App) {
+    note_access_denied_for(cfg!(target_os = "macos"), path, error, cx);
+}
+
+fn note_access_denied_for(is_macos: bool, path: &Path, error: &io::Error, cx: &mut App) {
+    if !is_macos {
+        return;
+    }
     if error.kind() != io::ErrorKind::PermissionDenied && error.raw_os_error() != Some(1) {
         return;
     }
@@ -743,12 +760,13 @@ pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
 }
 
 /// 상태 감지 훅을 두는 에이전트와 로그인 셸 PATH에서 찾을 실행 파일 이름.
-const HOOK_AGENTS: [(TargetAgent, &str); 5] = [
+const HOOK_AGENTS: [(TargetAgent, &str); 6] = [
     (TargetAgent::Claude, "claude"),
     (TargetAgent::Other(Agent::Codex), "codex"),
     (TargetAgent::Other(Agent::OpenCode), "opencode"),
     (TargetAgent::Other(Agent::Cursor), "cursor-agent"),
     (TargetAgent::Other(Agent::Agy), "agy"),
+    (TargetAgent::Other(Agent::Pi), "pi"),
 ];
 
 /// 설정의 상태 감지 훅 스위치를 바꾼 직후 백그라운드에서 반영한다. 켜면 설치된 에이전트에 훅을

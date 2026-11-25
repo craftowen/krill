@@ -2265,10 +2265,14 @@ fn bot_instructions_reach_each_agent_system_prompt_not_first_input() {
     );
 
     let (_, oc_env) = launch(&["opencode"], 916, &[("XDG_CONFIG_HOME", &xdg)]);
+    assert!(
+        !oc_env.iter().any(|(k, _)| k == b"OPENCODE_CONFIG_DIR"),
+        "launch.env should pass bot instructions via KRILL_OPENCODE_INSTRUCTIONS_DIR, not OPENCODE_CONFIG_DIR"
+    );
     let oc_dir = oc_env
         .iter()
         .rev()
-        .find(|(k, _)| k == b"OPENCODE_CONFIG_DIR")
+        .find(|(k, _)| k == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         .map(|(_, v)| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
         .unwrap();
     assert_ne!(oc_dir, oc_config);
@@ -2396,13 +2400,20 @@ fn resume_opencode_bot_instructions_reads_custom_config_dir_from_login_env() {
     )
     .unwrap();
 
+    assert!(
+        !launch
+            .env
+            .iter()
+            .any(|(k, _)| k.as_slice() == b"OPENCODE_CONFIG_DIR"),
+        "resume launch.env should pass bot instructions via KRILL_OPENCODE_INSTRUCTIONS_DIR"
+    );
     let resumed_cfg = launch
         .env
         .iter()
         .rev()
-        .find(|(k, _)| k.as_slice() == b"OPENCODE_CONFIG_DIR")
+        .find(|(k, _)| k.as_slice() == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         .map(|(_, v)| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
-        .expect("OPENCODE_CONFIG_DIR set on resume");
+        .expect("KRILL_OPENCODE_INSTRUCTIONS_DIR set on resume");
     assert_ne!(resumed_cfg, custom_cfg);
     let agents_md = std::fs::read_to_string(resumed_cfg.join("AGENTS.md")).unwrap();
     assert!(agents_md.contains("User base rules"), "{agents_md}");
@@ -2619,9 +2630,9 @@ fn resume_in_with_bot_mcp_preserves_bot_context_for_all_four_providers() {
     .unwrap();
     let oc_instr_dir = env_val(&oc_launch, b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
         .expect("KRILL_OPENCODE_INSTRUCTIONS_DIR marker set");
-    assert_eq!(
-        env_val(&oc_launch, b"OPENCODE_CONFIG_DIR").as_deref(),
-        Some(oc_instr_dir.as_str())
+    assert!(
+        env_val(&oc_launch, b"OPENCODE_CONFIG_DIR").is_none(),
+        "outer launch.env must not leak OPENCODE_CONFIG_DIR to fallback shell"
     );
     assert_eq!(
         env_val(&oc_launch, b"KRILL_MCP_HELPER_TOKEN").as_deref(),
@@ -2675,6 +2686,272 @@ fn resume_in_with_bot_mcp_preserves_bot_context_for_all_four_providers() {
         claude::discard(&state, krill_proto::SessionId(sid));
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn opencode_bot_instructions_survive_preflight_launch_and_resume_without_leaking() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-dc24-opencode-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let bot_home = dir.join("bot-home");
+    let zdot = dir.join("zdot");
+    let bin = dir.join("bin");
+    let iso = dir.join("iso-account");
+    for d in [&state, &bot_home, &zdot, &bin, &iso] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let opencode_exe = bin.join("opencode");
+    std::fs::write(
+        &opencode_exe,
+        "#!/bin/sh\nprintf 'AGENT_CFG=%s\\nAGENT_MARKER=%s\\nAGENT_KEY=%s\\nAGENT_XDG=%s\\n' \"${OPENCODE_CONFIG_DIR-unset}\" \"${KRILL_OPENCODE_INSTRUCTIONS_DIR-unset}\" \"${OPENAI_API_KEY-unset}\" \"${XDG_DATA_HOME-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&opencode_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let fallback_shell = bin.join("fallback-shell");
+    std::fs::write(
+        &fallback_shell,
+        "#!/bin/sh\nprintf 'SHELL_CFG=%s\\nSHELL_MARKER=%s\\n' \"${OPENCODE_CONFIG_DIR-unset}\" \"${KRILL_OPENCODE_INSTRUCTIONS_DIR-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fallback_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let exec_launch = |mut launch: Launch| -> String {
+        launch.env.retain(|(k, _)| {
+            !matches!(
+                k.as_slice(),
+                b"HOME" | b"ZDOTDIR" | b"SHELL" | b"OPENAI_API_KEY"
+            )
+        });
+        launch.env.extend([
+            kv("HOME", zdot.to_str().unwrap()),
+            kv("ZDOTDIR", zdot.to_str().unwrap()),
+            kv("SHELL", fallback_shell.to_str().unwrap()),
+            kv("OPENAI_API_KEY", "should-be-cleared"),
+        ]);
+        let (prog, args) = launch.argv.split_first().unwrap();
+        let out = Command::new(OsStr::from_bytes(prog))
+            .args(args.iter().map(|a| OsStr::from_bytes(a)))
+            .env_clear()
+            .envs(
+                launch
+                    .env
+                    .iter()
+                    .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // 1. Fresh bot launch with OpenCode host account.
+    let oc = profile(&[opencode_exe.to_str().unwrap()]);
+    let mcp = BotMcpLaunchConfig {
+        bot_home: Some(bot_home.clone()),
+        instructions: Some("Bot launch instructions".into()),
+        ..BotMcpLaunchConfig::default()
+    };
+    let (launch, _, _) = launch_selected_in_with_bot_mcp(
+        &oc,
+        Permission::Manual,
+        krill_proto::SessionId(951),
+        Some(&state),
+        None,
+        Some(&bot_home),
+        Some(&mcp),
+    )
+    .unwrap();
+    let expected_dir = launch
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        .expect("instructions marker on launch");
+    let stdout = exec_launch(launch);
+    assert!(
+        stdout.contains(&format!("AGENT_CFG={expected_dir}\n")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("AGENT_MARKER=unset\n"), "{stdout}");
+    assert!(stdout.contains("AGENT_KEY=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_CFG=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_MARKER=unset\n"), "{stdout}");
+
+    // 2. Cold resume with isolated OpenCode account preserves both XDG isolation and instructions dir.
+    let isolated = LaunchAccount {
+        id: "oc-iso".into(),
+        env_key: "OPENCODE_CONFIG_DIR".into(),
+        dir: iso.to_str().unwrap().to_owned(),
+    };
+    let (resumed, _, _) = resume_in_with_bot_instructions(
+        &oc,
+        Permission::Manual,
+        krill_proto::SessionId(952),
+        Some(&state),
+        Some("ses_bot_952"),
+        Some(&isolated),
+        Some("Bot resume instructions"),
+    )
+    .unwrap();
+    let expected_resumed_dir = resumed
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.as_slice() == b"KRILL_OPENCODE_INSTRUCTIONS_DIR")
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        .expect("instructions marker on resume");
+    let stdout = exec_launch(resumed);
+    assert!(
+        stdout.contains(&format!("AGENT_CFG={expected_resumed_dir}\n")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("AGENT_XDG={}\n", iso.join("data").display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("AGENT_MARKER=unset\n"), "{stdout}");
+    assert!(stdout.contains("AGENT_KEY=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_CFG=unset\n"), "{stdout}");
+    assert!(stdout.contains("SHELL_MARKER=unset\n"), "{stdout}");
+
+    // 3. Profile env cannot forge KRILL_OPENCODE_INSTRUCTIONS_DIR to bypass credential clearing.
+    let mut forged = profile(&["opencode"]);
+    forged
+        .env
+        .insert("KRILL_OPENCODE_INSTRUCTIONS_DIR".into(), "/forged".into());
+    let mut login = Launch {
+        argv: Vec::new(),
+        env: vec![kv("KRILL_OPENCODE_INSTRUCTIONS_DIR", "/inherited")],
+    };
+    apply_account_env(&mut login, &forged, None, Some(&isolated));
+    assert!(
+        !login
+            .env
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(b"KRILL_OPENCODE_INSTRUCTIONS_DIR"))
+    );
+
+    claude::discard(&state, krill_proto::SessionId(951));
+    claude::discard(&state, krill_proto::SessionId(952));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn preflight_sets_ssh_connection_for_antigravity_alias_and_spliced_args() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-dc35-preflight-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let zdot = dir.join("zdot");
+    std::fs::create_dir_all(&zdot).unwrap();
+    let exe = dir.join("antigravity");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\nprintf 'SSH=%s\\n' \"${SSH_CONNECTION-unset}\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let done_shell = dir.join("done-shell");
+    std::fs::write(&done_shell, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&done_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let run_with = |args: &[&str]| -> String {
+        let mut launch = wrap(
+            &profile(args),
+            Permission::Manual,
+            Shell::Login.launch_with(Some(&user()), vec![kv("PATH", "/usr/bin:/bin")]),
+        );
+        launch
+            .env
+            .retain(|(k, _)| !matches!(k.as_slice(), b"HOME" | b"ZDOTDIR" | b"SSH_CONNECTION"));
+        launch.env.extend([
+            kv("HOME", zdot.to_str().unwrap()),
+            kv("ZDOTDIR", zdot.to_str().unwrap()),
+            kv("SHELL", done_shell.to_str().unwrap()),
+        ]);
+        let (prog, argv) = launch.argv.split_first().unwrap();
+        let out = Command::new(OsStr::from_bytes(prog))
+            .args(argv.iter().map(|a| OsStr::from_bytes(a)))
+            .env_clear()
+            .envs(
+                launch
+                    .env
+                    .iter()
+                    .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let exe_str = exe.to_str().unwrap();
+    let with_spliced = run_with(&[
+        exe_str,
+        "--add-dir",
+        "/tmp/bot-home",
+        "--gemini_dir=/tmp/profile/.gemini",
+    ]);
+    assert!(with_spliced.contains("SSH=krill\n"), "{with_spliced}");
+
+    let without_gemini = run_with(&[exe_str, "--add-dir", "/tmp/bot-home"]);
+    assert!(without_gemini.contains("SSH=unset\n"), "{without_gemini}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn upsert_codex_project_trust_handles_commented_headers_and_guards_other_tables() {
+    // Commented following header `[features] # enabled` must end the project section
+    // so `trust_level = "trusted"` is placed in `[projects."/ws"]`, never `[features]`.
+    let with_commented_next = "\
+[projects.\"/ws\"]
+sandbox_mode = \"workspace-write\"
+
+[features] # enabled
+multi_agent = true
+";
+    let (next, changed) =
+        upsert_codex_project_trust_checked(with_commented_next, "/ws").expect("valid update");
+    assert!(changed);
+    let parsed: toml::Value = toml::from_str(&next).unwrap();
+    assert_eq!(
+        parsed["projects"]["/ws"]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert_eq!(
+        parsed["projects"]["/ws"]["sandbox_mode"].as_str(),
+        Some("workspace-write")
+    );
+    assert!(parsed["features"].get("trust_level").is_none());
+    assert_eq!(parsed["features"]["multi_agent"].as_bool(), Some(true));
+
+    // Commented target header and `#` inside a quoted path must match cleanly without duplicating.
+    let with_hash_path = "\
+[projects.\"/tmp/a#b\"] # my project
+foo = 1
+[other] # trailing comment
+bar = 2
+";
+    let (next_hash, changed_hash) =
+        upsert_codex_project_trust_checked(with_hash_path, "/tmp/a#b").expect("hash path update");
+    assert!(changed_hash);
+    let parsed_hash: toml::Value = toml::from_str(&next_hash).unwrap();
+    assert_eq!(
+        parsed_hash["projects"]["/tmp/a#b"]["trust_level"].as_str(),
+        Some("trusted")
+    );
+    assert!(parsed_hash["other"].get("trust_level").is_none());
+
+    // Existing dotted-key untrusted choice must not be overwritten or duplicated.
+    let dotted_untrusted = "projects.\"/ws\".trust_level = \"untrusted\"\n";
+    assert!(upsert_codex_project_trust_checked(dotted_untrusted, "/ws").is_none());
 }
 
 #[test]

@@ -3,7 +3,7 @@
 fn windows_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     path.starts_with("\\\\")
-        || path.starts_with("//")
+        || (path.starts_with("//") && !path.starts_with("///"))
         || (bytes.first().is_some_and(u8::is_ascii_alphabetic)
             && bytes.get(1) == Some(&b':')
             && bytes.get(2).is_some_and(|b| matches!(b, b'/' | b'\\')))
@@ -60,6 +60,13 @@ pub fn normalize_path_for_comparison(path: &str) -> String {
                 .strip_prefix("//?/")
                 .unwrap_or(&normalized)
                 .to_owned()
+        }
+    } else if path.starts_with("///") {
+        let rest = path.trim_start_matches('/');
+        if rest.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{rest}")
         }
     } else {
         path.to_owned()
@@ -334,5 +341,23 @@ mod tests {
             &scope.display().to_string(),
         ));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn triple_slash_posix_paths_are_not_treated_as_windows_unc() {
+        assert!(!windows_path("///Users/Alice/Repo"));
+        assert!(!windows_path("////"));
+        assert!(windows_path("//server/share/Repo"));
+        assert_eq!(
+            normalize_path_for_comparison("///Users/Alice/Repo"),
+            "/Users/Alice/Repo"
+        );
+        assert_eq!(
+            normalize_path_for_comparison("///Users/Alice/Repo/"),
+            "/Users/Alice/Repo"
+        );
+        assert_eq!(normalize_path_for_comparison("////"), "/");
+        assert!(path_inside_or_equal("///Users/Alice/Repo", "/Users/Alice"));
+        assert!(!path_inside_or_equal("///work/App", "/work/app"));
     }
 }

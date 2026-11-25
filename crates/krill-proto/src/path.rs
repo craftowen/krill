@@ -28,8 +28,10 @@ fn windows_text(path: &Path) -> Option<String> {
         text
     };
     let is_unc = text.strip_prefix("//").is_some_and(|rest| {
-        let mut parts = rest.split('/').filter(|s| !s.is_empty());
-        parts.next().is_some() && parts.next().is_some()
+        !rest.starts_with('/') && {
+            let mut parts = rest.split('/').filter(|s| !s.is_empty());
+            parts.next().is_some() && parts.next().is_some()
+        }
     });
     if !drive_absolute(&text) && !is_unc {
         return None;
@@ -107,6 +109,10 @@ pub fn within(path: &Path, root: &Path) -> bool {
                 .split('/')
                 .chain(root_str.split('/'))
                 .any(|p| p == "..")
+                || path.components().chain(root.components()).any(|c| {
+                    matches!(c, std::path::Component::ParentDir)
+                        || matches!(c, std::path::Component::Normal(s) if s == "..")
+                })
             {
                 return false;
             }
@@ -156,12 +162,30 @@ mod tests {
     fn unix_and_device_namespaces_do_not_gain_windows_semantics() {
         for path in [
             "/Repo/한글",
+            "///Users/alice/repo",
+            "////a/b",
             r"relative\file",
             "C:relative",
             r"\\?\Volume{abc}\file",
             r"\\.\pipe\foo",
         ] {
+            assert_eq!(normalize(Path::new(path)), Path::new(path));
             assert_eq!(identity(Path::new(path)), Path::new(path));
+        }
+        assert_ne!(
+            normalize(Path::new("///Users/alice/repo")),
+            Path::new(r"\\Users\alice\repo")
+        );
+        #[cfg(unix)]
+        {
+            assert!(equivalent(
+                Path::new("///Users/alice/repo"),
+                Path::new("/Users/alice/repo")
+            ));
+            assert!(within(
+                Path::new("///Users/alice/repo"),
+                Path::new("/Users/alice")
+            ));
         }
         assert!(!equivalent(Path::new("/Repo"), Path::new("/repo")));
         assert!(!equivalent(Path::new("C:/Ä"), Path::new("C:/ä")));
@@ -170,5 +194,26 @@ mod tests {
         assert!(!within(Path::new("/repository"), Path::new("/repo")));
         assert!(!within(Path::new("/repo/../outside"), Path::new("/repo")));
         assert!(!within(Path::new("/repo/sub"), Path::new("/repo/../repo")));
+        #[cfg(windows)]
+        {
+            assert!(!within(
+                Path::new(r"\\?\Volume{abc}\repo\..\outside"),
+                Path::new(r"\\?\Volume{abc}\repo")
+            ));
+            assert!(!within(Path::new(r"\repo\..\outside"), Path::new(r"\repo")));
+            assert!(!within(
+                Path::new(r"C:repo\..\outside"),
+                Path::new(r"C:repo")
+            ));
+            assert!(!within(Path::new(r"repo\..\outside"), Path::new("repo")));
+        }
+        #[cfg(unix)]
+        {
+            // Literal backslashes in Unix filenames keep native Path semantics.
+            assert!(within(
+                Path::new(r"dir/a\..\b/child"),
+                Path::new(r"dir/a\..\b")
+            ));
+        }
     }
 }

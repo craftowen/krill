@@ -13,7 +13,7 @@
 //!   text into PTYs).
 //! - Mapping internal failures into user-safe messages using [`BotErrorCategory`].
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,14 +21,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::SessionId;
 use krill_proto::bots::{
-    BOT_QUIET_MARKER, BotAccessRequest, BotErrorCategory, BotId, ExternalConversationLink,
-    ExternalSource,
+    BOT_QUIET_MARKER, BotAccessRequest, BotConfig, BotErrorCategory, BotId,
+    ExternalConversationLink, ExternalSource,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::bots::connectors::{
-    AccessDecision, ConnectorBridge, DispatchOutcome, InboundExternalMessage, OutboundBotReply,
+    AccessDecision, ConnectorBridge, DispatchOutcome, ExternalResumeResult, InboundExternalMessage,
+    OutboundBotReply,
 };
 use crate::session::lock;
+
+/// Slack Block Kit `action_id` used for interactive `Resume` buttons on failed/interrupted turns.
+pub const SLACK_RESUME_ACTION_ID: &str = "krill_resume_turn";
+
+/// Classifies why a bot turn ended unsuccessfully for external status notices & Resume prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureKind {
+    Error,
+    UsageLimit,
+    Interrupted,
+}
 
 /// Minimum interval (ms) between consecutive in-place turn-activity status updates.
 pub const TURN_ACTIVITY_MIN_GAP_MS: u64 = 3_000;
@@ -94,6 +108,31 @@ pub trait PlatformSender: Send + Sync {
     ) -> io::Result<()> {
         Ok(())
     }
+
+    /// Sends a failed/interrupted status notice, optionally attaching a platform-native
+    /// interactive `Resume` action button (implemented by Slack Block Kit, Orca #47233).
+    fn send_failure_message(
+        &self,
+        target: &DeliveryTarget,
+        text: &str,
+        resume_action_value: Option<&str>,
+    ) -> io::Result<String> {
+        let _ = resume_action_value;
+        self.send_message(target, text)
+    }
+
+    /// Updates an existing status message into a failed/interrupted state, optionally attaching
+    /// a platform-native interactive `Resume` action button (Orca #47233).
+    fn edit_failure_message(
+        &self,
+        target: &DeliveryTarget,
+        message_id: &str,
+        text: &str,
+        resume_action_value: Option<&str>,
+    ) -> io::Result<()> {
+        let _ = resume_action_value;
+        self.edit_message(target, message_id, text)
+    }
 }
 
 /// Outcome of routing an inbound external message through access control and bot dispatch.
@@ -137,16 +176,81 @@ impl GateCallbackOutcome {
     }
 }
 
+/// Outcome of handling an interactive `Resume` button callback on a failed or interrupted turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeCallbackOutcome {
+    Resumed {
+        link_id: String,
+        session_id: SessionId,
+        queued_count: usize,
+    },
+    NotFailed,
+    PendingAccess(BotAccessRequest),
+    Denied,
+    Paused,
+    InvalidPayload,
+    Failed(String),
+}
+
+impl ResumeCallbackOutcome {
+    /// Returns a concise, user-safe acknowledgment notice for the interactive thread.
+    #[must_use]
+    pub fn user_notice(&self) -> String {
+        match self {
+            Self::Resumed { queued_count, .. } if *queued_count > 0 => {
+                format!("Resuming turn ({queued_count} queued message(s) will follow)...")
+            }
+            Self::Resumed { .. } => "Resuming turn...".to_owned(),
+            Self::NotFailed => {
+                "This turn is already running or has already been resumed.".to_owned()
+            }
+            Self::PendingAccess(req) => format!(
+                "Access approval required before resuming. Ask the owner to approve token: {}",
+                req.token
+            ),
+            Self::Denied => "You do not have permission to resume this bot turn.".to_owned(),
+            Self::Paused => "This bot is currently paused.".to_owned(),
+            Self::InvalidPayload => "Unsupported or expired resume action.".to_owned(),
+            Self::Failed(_) => {
+                "Could not resume that turn. Send a new message to retry.".to_owned()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveTurnState {
     turn_id: u64,
     turn_seq: Option<u64>,
+    link_id: Option<String>,
     source: ExternalSource,
     target: DeliveryTarget,
-    last_inbound_message_id: Option<String>,
     status_message_id: Option<String>,
     last_activity_at_ms: Option<u64>,
     last_activity_text: Option<String>,
+    /// Turn sequences whose written answers have already been delivered (prevents duplicate
+    /// sends and prevents later quiet worker-wake turns from dropping earlier replies, Orca #47532).
+    delivered_turn_seqs: BTreeSet<u64>,
+    workers_running: bool,
+}
+
+fn find_matching_turn_index(
+    queue: &VecDeque<ActiveTurnState>,
+    turn_seq: Option<u64>,
+) -> Option<usize> {
+    if let Some(seq) = turn_seq
+        && let Some(idx) = queue.iter().position(|s| s.turn_seq == Some(seq))
+    {
+        return Some(idx);
+    }
+    queue.iter().position(|s| {
+        if turn_seq_matches(s.turn_seq, turn_seq) {
+            return true;
+        }
+        // When a turn delivered an early answer while helper workers kept running (Orca #47532),
+        // subsequent worker-wake turns carry higher `turn_seq` values for the same external link.
+        s.workers_running && turn_seq.is_some_and(|act| s.turn_seq.is_none_or(|orig| act >= orig))
+    })
 }
 
 fn turn_seq_matches(expected: Option<u64>, actual: Option<u64>) -> bool {
@@ -508,7 +612,7 @@ impl ConversationRouter {
         notify_could_not_finish: bool,
     ) -> InboundRouteOutcome {
         // Ensure conversation link exists before dispatch.
-        if let Err(err) = self.bridge.lookup_or_create_link(
+        let pre_link = match self.bridge.lookup_or_create_link(
             &msg.bot_id,
             msg.source,
             msg.workspace_id.as_deref(),
@@ -516,16 +620,20 @@ impl ConversationRouter {
             msg.thread_id.as_deref(),
             msg.acts_for.clone(),
         ) {
-            let category = classify_error(&err.to_string());
-            if notify_could_not_finish && let Some(s) = sender {
-                let safe = user_safe_error_message(category, bot_name);
-                send_chunked(s, target, &safe).ok();
+            Ok(link) => link,
+            Err(err) => {
+                let category = classify_error(&err.to_string());
+                if notify_could_not_finish && let Some(s) = sender {
+                    let safe = user_safe_error_message(category, bot_name);
+                    send_chunked(s, target, &safe).ok();
+                }
+                return InboundRouteOutcome::Error(category);
             }
-            return InboundRouteOutcome::Error(category);
-        }
+        };
 
         let bot_id = msg.bot_id.clone();
         let source = msg.source;
+        let pre_link_id = pre_link.id;
         let inbound_msg_id = msg.external_message_id.clone();
         let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
         let registered_sid = std::cell::Cell::new(None::<SessionId>);
@@ -541,12 +649,14 @@ impl ConversationRouter {
             queue.push_back(ActiveTurnState {
                 turn_id,
                 turn_seq,
+                link_id: Some(pre_link_id.clone()),
                 source,
                 target: target.clone(),
-                last_inbound_message_id: inbound_msg_id.clone(),
                 status_message_id: None,
                 last_activity_at_ms: None,
                 last_activity_text: None,
+                delivered_turn_seqs: BTreeSet::new(),
+                workers_running: false,
             });
             registered_sid.set(Some(sid));
         };
@@ -580,6 +690,11 @@ impl ConversationRouter {
                 }
                 if registered_sid.get().is_none() {
                     on_bound(outcome.session_id, None);
+                }
+                if let Some(queue) = lock(&self.active_turns).get_mut(&(bot_id, outcome.session_id))
+                    && let Some(state) = queue.iter_mut().find(|t| t.turn_id == turn_id)
+                {
+                    state.link_id = Some(outcome.link.id.clone());
                 }
                 InboundRouteOutcome::Dispatched(outcome)
             }
@@ -792,6 +907,206 @@ impl ConversationRouter {
         lock(&self.active_turns).retain(|(_, sid), _| *sid != session_id);
     }
 
+    /// Registers or refreshes active external delivery tracking for `(bot_id, session_id)`
+    /// (used when resuming failed turns, draining queued external turns, or rehydrating links).
+    pub fn register_active_turn(
+        &self,
+        bot_id: BotId,
+        session_id: SessionId,
+        link: &ExternalConversationLink,
+        status_message_id: Option<String>,
+    ) {
+        self.register_active_turn_seq(bot_id, session_id, None, link, status_message_id);
+    }
+
+    /// Sequence-tagged variant of [`Self::register_active_turn`].
+    pub fn register_active_turn_seq(
+        &self,
+        bot_id: BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        link: &ExternalConversationLink,
+        status_message_id: Option<String>,
+    ) {
+        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+        let mut turns = lock(&self.active_turns);
+        let queue = turns.entry((bot_id, session_id)).or_default();
+        if queue.len() >= 64 {
+            queue.pop_front();
+        }
+        queue.push_back(ActiveTurnState {
+            turn_id,
+            turn_seq,
+            link_id: Some(link.id.clone()),
+            source: link.source,
+            target: DeliveryTarget::from_link(link),
+            status_message_id,
+            last_activity_at_ms: None,
+            last_activity_text: None,
+            delivered_turn_seqs: BTreeSet::new(),
+            workers_running: false,
+        });
+    }
+
+    /// Registers an active turn for `turn_seq` only if no matching sequence is already tracked
+    /// (used when draining persisted/resumed queued turns without duplicating `on_bound`).
+    pub fn ensure_active_turn_seq(
+        &self,
+        bot_id: BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        link: &ExternalConversationLink,
+    ) {
+        let mut turns = lock(&self.active_turns);
+        let queue = turns.entry((bot_id, session_id)).or_default();
+        if let Some(seq) = turn_seq
+            && queue.iter().any(|s| s.turn_seq == Some(seq))
+        {
+            return;
+        }
+        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
+        if queue.len() >= 64 {
+            queue.pop_front();
+        }
+        queue.push_back(ActiveTurnState {
+            turn_id,
+            turn_seq,
+            link_id: Some(link.id.clone()),
+            source: link.source,
+            target: DeliveryTarget::from_link(link),
+            status_message_id: None,
+            last_activity_at_ms: None,
+            last_activity_text: None,
+            delivered_turn_seqs: BTreeSet::new(),
+            workers_running: false,
+        });
+    }
+
+    /// Returns the in-place status message ID currently tracked for `(bot_id, session_id)`, if any.
+    #[must_use]
+    pub fn status_message_id_for(&self, bot_id: &BotId, session_id: SessionId) -> Option<String> {
+        lock(&self.active_turns)
+            .get(&(bot_id.clone(), session_id))
+            .and_then(|q| q.front())
+            .and_then(|s| s.status_message_id.clone())
+    }
+
+    /// Validates and handles an interactive `Resume` button callback (`resume:<bot_id>:<link_id>:<turn_seq>`)
+    /// enforcing bot ownership, pause state, channel/guild/workspace gates, user authorization,
+    /// thread ownership, and single-use failed-turn fencing (Orca #47233, #47898).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "external resume callback context"
+    )]
+    pub fn handle_resume_callback_with_context(
+        &self,
+        bot_id: &BotId,
+        source: ExternalSource,
+        workspace_id: Option<&str>,
+        sender_id: &str,
+        sender_name: &str,
+        channel_id: &str,
+        thread_id: Option<&str>,
+        payload: &str,
+    ) -> ResumeCallbackOutcome {
+        let Some((cb_bot_id, link_id, turn_seq)) = parse_resume_callback(payload) else {
+            return ResumeCallbackOutcome::InvalidPayload;
+        };
+        if cb_bot_id != bot_id.as_str() {
+            return ResumeCallbackOutcome::Denied;
+        }
+        let Some(bot) = self.bridge.get_bot_config(bot_id) else {
+            return ResumeCallbackOutcome::Failed("bot is not set up".to_owned());
+        };
+        if bot.paused {
+            return ResumeCallbackOutcome::Paused;
+        }
+        if !passes_independent_channel_gate(&bot, source, workspace_id, channel_id, thread_id) {
+            return ResumeCallbackOutcome::Denied;
+        }
+
+        let user_gate_denied = !passes_independent_user_gate(&bot, source, workspace_id, sender_id);
+        let bypass_possible = has_channel_or_bypass_overlap(&bot, source);
+        match self.bridge.check_or_request_access_with_workspace(
+            bot_id,
+            source,
+            workspace_id,
+            sender_id,
+            sender_name,
+            channel_id,
+        ) {
+            Ok(AccessDecision::Allowed) => {
+                if user_gate_denied && bypass_possible {
+                    return ResumeCallbackOutcome::Denied;
+                }
+            }
+            Ok(AccessDecision::Pending(req)) => return ResumeCallbackOutcome::PendingAccess(req),
+            Ok(AccessDecision::Denied(_)) => return ResumeCallbackOutcome::Denied,
+            Err(err) => {
+                return ResumeCallbackOutcome::Failed(sanitize_error_for_status(&err.to_string()));
+            }
+        }
+
+        // Verify the link belongs to this bot, platform, channel, and thread (Orca #47898).
+        match self.bridge.get_link(link_id) {
+            Ok(Some(link)) => {
+                let workspace_ok = match (link.workspace_id.as_deref(), workspace_id) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    _ => true,
+                };
+                let thread_ok = match (link.thread_id.as_deref(), thread_id) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                if &link.bot_id != bot_id
+                    || link.source != source
+                    || link.channel_id != channel_id
+                    || !workspace_ok
+                    || !thread_ok
+                {
+                    return ResumeCallbackOutcome::Denied;
+                }
+            }
+            Ok(None) => return ResumeCallbackOutcome::NotFailed,
+            Err(err) => {
+                return ResumeCallbackOutcome::Failed(sanitize_error_for_status(&err.to_string()));
+            }
+        }
+
+        match self.bridge.resume_failed_external_turn(
+            bot_id,
+            link_id,
+            turn_seq,
+            sender_id,
+            sender_name,
+        ) {
+            Ok(ExternalResumeResult::Resumed {
+                link,
+                session_id,
+                turn_seq: resumed_seq,
+                queued_count,
+            }) => {
+                let lid = link.id.clone();
+                self.register_active_turn_seq(
+                    bot_id.clone(),
+                    session_id,
+                    (resumed_seq > 0).then_some(resumed_seq),
+                    &link,
+                    None,
+                );
+                ResumeCallbackOutcome::Resumed {
+                    link_id: lid,
+                    session_id,
+                    queued_count,
+                }
+            }
+            Ok(ExternalResumeResult::NotFailed) => ResumeCallbackOutcome::NotFailed,
+            Ok(ExternalResumeResult::BotPaused) => ResumeCallbackOutcome::Paused,
+            Err(err) => ResumeCallbackOutcome::Failed(sanitize_error_for_status(&err.to_string())),
+        }
+    }
+
     /// Posts the final chunked reply for `(bot_id, session_id)` on turn completion.
     /// Honors `[[KRILL_QUIET]]`, `BotNotifications::task_complete`, and Slack `mirror_desktop`.
     pub fn on_turn_complete(
@@ -800,7 +1115,7 @@ impl ConversationRouter {
         session_id: SessionId,
         final_reply: Option<&str>,
     ) {
-        self.on_turn_complete_seq(bot_id, session_id, None, final_reply);
+        self.on_turn_complete_with_context(bot_id, session_id, None, final_reply, false);
     }
 
     /// Sequence-correlated variant of [`Self::on_turn_complete`] so a non-connector turn never
@@ -812,44 +1127,101 @@ impl ConversationRouter {
         turn_seq: Option<u64>,
         final_reply: Option<&str>,
     ) {
+        self.on_turn_complete_with_context(bot_id, session_id, turn_seq, final_reply, false);
+    }
+
+    /// Posts a turn's written reply immediately when the turn finishes — even while helper
+    /// workers spawned by that turn are still running — and prevents subsequent silent/quiet
+    /// worker-wake turns or hold releases from overwriting or duplicating it (Orca #47532).
+    pub fn on_turn_complete_with_context(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        final_reply: Option<&str>,
+        workers_running: bool,
+    ) {
         let key = (bot_id.clone(), session_id);
-        let active = {
+        let raw_text = final_reply
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.trim_end().ends_with(BOT_QUIET_MARKER));
+
+        let active_plan = {
             let mut turns = lock(&self.active_turns);
-            let popped = turns.get_mut(&key).and_then(|q| {
-                let idx = q
-                    .iter()
-                    .position(|s| turn_seq_matches(s.turn_seq, turn_seq))?;
-                q.remove(idx)
+            let matched = turns.get_mut(&key).and_then(|q| {
+                let idx = find_matching_turn_index(q, turn_seq)?;
+                Some((q, idx))
             });
-            if turns.get(&key).is_some_and(VecDeque::is_empty) {
-                turns.remove(&key);
+            if let Some((queue, idx)) = matched {
+                let already_delivered =
+                    turn_seq.is_some_and(|seq| queue[idx].delivered_turn_seqs.contains(&seq));
+                if already_delivered {
+                    if workers_running {
+                        queue[idx].workers_running = true;
+                    } else {
+                        queue.remove(idx);
+                        if queue.is_empty() {
+                            turns.remove(&key);
+                        }
+                    }
+                    return;
+                }
+                if raw_text.is_some() {
+                    if let Some(seq) = turn_seq {
+                        queue[idx].delivered_turn_seqs.insert(seq);
+                    }
+                    let target = queue[idx].target.clone();
+                    let source = queue[idx].source;
+                    if workers_running {
+                        // Keep the link context alive for any substantive worker follow-up turn,
+                        // but detach `status_message_id` so subsequent activity never overwrites
+                        // the early-delivered reply.
+                        queue[idx].workers_running = true;
+                        queue[idx].status_message_id = None;
+                    } else {
+                        queue.remove(idx);
+                        if queue.is_empty() {
+                            turns.remove(&key);
+                        }
+                    }
+                    Some((source, target))
+                } else {
+                    // Silent/quiet turn (e.g., worker-wake turn with no new words): never touch
+                    // or drop an earlier reply! Keep tracking only while workers still run.
+                    if workers_running {
+                        queue[idx].workers_running = true;
+                    } else {
+                        queue.remove(idx);
+                        if queue.is_empty() {
+                            turns.remove(&key);
+                        }
+                    }
+                    return;
+                }
+            } else {
+                None
             }
-            popped
         };
 
-        let Some(raw_text) = final_reply.map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(raw_text) = raw_text else {
             return;
         };
-        if raw_text.trim_end().ends_with(BOT_QUIET_MARKER) {
-            return;
-        }
 
         let bot = self.bridge.get_bot_config(bot_id);
         if bot.as_ref().is_some_and(|b| !b.notifications.task_complete) {
             return;
         }
 
-        if let Some(turn) = active {
-            if let Some(sender) = self.sender_for(bot_id, turn.source)
-                && send_chunked(sender.as_ref(), &turn.target, raw_text).is_err()
+        if let Some((source, target)) = active_plan {
+            if let Some(sender) = self.sender_for(bot_id, source)
+                && send_chunked(sender.as_ref(), &target, raw_text).is_err()
             {
                 tracing::warn!(
                     bot_id = bot_id.as_str(),
-                    source = turn.source.as_str(),
+                    source = source.as_str(),
                     "failed posting final turn reply"
                 );
             }
-            let _ = &turn.last_inbound_message_id;
             return;
         }
 
@@ -870,6 +1242,155 @@ impl ConversationRouter {
             };
             send_chunked(sender.as_ref(), &target, raw_text).ok();
         }
+    }
+
+    /// Reports a failed, rate-limited, or interrupted bot turn to its linked external channel.
+    /// On Slack, attaches an interactive `Resume` button (`krill_resume_turn`, Orca #47233).
+    pub fn on_turn_failed(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        link_id_hint: Option<&str>,
+        turn_seq: u64,
+        kind: TurnFailureKind,
+        raw_error: &str,
+    ) {
+        let key = (bot_id.clone(), session_id);
+        let active = {
+            let mut turns = lock(&self.active_turns);
+            let popped = turns.get_mut(&key).and_then(|q| {
+                let seq_opt = (turn_seq > 0).then_some(turn_seq);
+                let idx = seq_opt
+                    .and_then(|seq| q.iter().position(|s| s.turn_seq == Some(seq)))
+                    .or_else(|| {
+                        link_id_hint.and_then(|lid| {
+                            q.iter().position(|s| s.link_id.as_deref() == Some(lid))
+                        })
+                    })
+                    .or_else(|| find_matching_turn_index(q, seq_opt))?;
+                q.remove(idx)
+            });
+            if turns.get(&key).is_some_and(VecDeque::is_empty) {
+                turns.remove(&key);
+            }
+            popped
+        };
+        let Some(bot) = self.bridge.get_bot_config(bot_id) else {
+            return;
+        };
+        if bot.paused || !bot.notifications.could_not_finish {
+            return;
+        }
+
+        let (source, target, resolved_link_id, status_msg_id) = if let Some(turn) = active {
+            (
+                turn.source,
+                turn.target,
+                turn.link_id.or_else(|| link_id_hint.map(ToOwned::to_owned)),
+                turn.status_message_id,
+            )
+        } else if let Some(lid) = link_id_hint
+            && let Ok(Some(link)) = self.bridge.get_link(lid)
+            && &link.bot_id == bot_id
+        {
+            (
+                link.source,
+                DeliveryTarget::from_link(&link),
+                Some(link.id),
+                None,
+            )
+        } else {
+            return;
+        };
+
+        let Some(sender) = self.sender_for(bot_id, source) else {
+            return;
+        };
+
+        let base_msg = match kind {
+            TurnFailureKind::UsageLimit => {
+                user_safe_error_message(BotErrorCategory::UsageLimit, &bot.name)
+            }
+            TurnFailureKind::Interrupted => {
+                format!("{} was interrupted before finishing this turn.", bot.name)
+            }
+            TurnFailureKind::Error => user_safe_error_message(classify_error(raw_error), &bot.name),
+        };
+
+        let resume_value = (source == ExternalSource::Slack)
+            .then(|| {
+                resolved_link_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|lid| format_resume_action_value(bot_id, lid, turn_seq.max(1)))
+            })
+            .flatten();
+
+        let text = if resume_value.is_some() {
+            format!("{base_msg} Click Resume to try again.")
+        } else {
+            base_msg
+        };
+
+        if let Some(ref mid) = status_msg_id
+            && sender
+                .edit_failure_message(&target, mid, &text, resume_value.as_deref())
+                .is_ok()
+        {
+            return;
+        }
+        if sender
+            .send_failure_message(&target, &text, resume_value.as_deref())
+            .is_err()
+        {
+            tracing::warn!(
+                bot_id = bot_id.as_str(),
+                source = source.as_str(),
+                "failed posting external turn failure notice"
+            );
+        }
+    }
+
+    /// Posts a clean restart-interruption notice to a linked external conversation whose turn was
+    /// cut off by a daemon restart, offering an interactive `Resume` button on Slack (Orca #47898).
+    /// Returns `true` when delivered to the external platform.
+    pub fn report_restart_cut_turn(
+        &self,
+        bot: &BotConfig,
+        link: &ExternalConversationLink,
+        turn_seq: u64,
+        status_message_id: Option<&str>,
+    ) -> bool {
+        if bot.paused || !bot.notifications.could_not_finish {
+            return false;
+        }
+        let Some(sender) = self.sender_for(&bot.id, link.source) else {
+            return false;
+        };
+        let target = DeliveryTarget::from_link(link);
+        let resume_value = (link.source == ExternalSource::Slack)
+            .then(|| format_resume_action_value(&bot.id, &link.id, turn_seq.max(1)));
+        let text = if resume_value.is_some() {
+            format!(
+                "{} was interrupted by a Krill restart before finishing this turn. Click Resume to continue.",
+                bot.name
+            )
+        } else {
+            format!(
+                "{} was interrupted by a Krill restart before finishing this turn.",
+                bot.name
+            )
+        };
+        if let Some(mid) = status_message_id
+            && sender
+                .edit_failure_message(&target, mid, &text, resume_value.as_deref())
+                .is_ok()
+        {
+            return true;
+        }
+        sender
+            .send_failure_message(&target, &text, resume_value.as_deref())
+            .is_ok()
     }
 
     /// Posts an explicit reply (`krill bot reply` / `BotRpcRequest::PostBotReply`).
@@ -1080,6 +1601,36 @@ fn has_channel_or_bypass_overlap(
         ExternalSource::Discord => !bot.connectors.discord.allowed_channel_ids.is_empty(),
         _ => false,
     }
+}
+
+/// Encodes a validated Slack `Resume` button value: `resume:<bot_id>:<link_id>:<turn_seq>`.
+#[must_use]
+pub fn format_resume_action_value(bot_id: &BotId, link_id: &str, turn_seq: u64) -> String {
+    format!("resume:{}:{link_id}:{}", bot_id.as_str(), turn_seq.max(1))
+}
+
+/// Parses and strictly validates a resume callback payload (`resume:<bot_id>:<link_id>:<turn_seq>`).
+#[must_use]
+pub fn parse_resume_callback(raw: &str) -> Option<(&str, &str, u64)> {
+    let rest = raw.trim().strip_prefix("resume:")?;
+    let mut parts = rest.split(':');
+    let bot_id = parts.next()?.trim();
+    let link_id = parts.next()?.trim();
+    let turn_seq_str = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    let valid_id = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !valid_id(bot_id) || !valid_id(link_id) {
+        return None;
+    }
+    let turn_seq = turn_seq_str.parse::<u64>().ok().filter(|&n| n > 0)?;
+    Some((bot_id, link_id, turn_seq))
 }
 
 /// Parses and strictly validates a gate callback payload of the form `gate:<gate_id>:<decision>`.
@@ -2565,5 +3116,557 @@ mod tests {
             lock(&router.active_turns).is_empty(),
             "Alice's Turn 3 entry must be popped after matching completion"
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingSender {
+        src: Option<ExternalSource>,
+        sent: Mutex<Vec<(String, String)>>,
+        edits: Mutex<Vec<(String, String)>>,
+        failures: Mutex<Vec<(String, String, Option<String>)>>,
+        failure_edits: Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    impl RecordingSender {
+        fn for_source(source: ExternalSource) -> Self {
+            Self {
+                src: Some(source),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl PlatformSender for RecordingSender {
+        fn source(&self) -> ExternalSource {
+            self.src.unwrap_or(ExternalSource::Slack)
+        }
+        fn max_chunk_chars(&self) -> usize {
+            2_000
+        }
+        fn send_message(&self, target: &DeliveryTarget, text: &str) -> io::Result<String> {
+            let mut s = lock(&self.sent);
+            let id = format!("msg-{}", s.len() + 1);
+            s.push((target.channel_id.clone(), text.to_owned()));
+            Ok(id)
+        }
+        fn edit_message(
+            &self,
+            _target: &DeliveryTarget,
+            message_id: &str,
+            text: &str,
+        ) -> io::Result<()> {
+            lock(&self.edits).push((message_id.to_owned(), text.to_owned()));
+            Ok(())
+        }
+        fn send_failure_message(
+            &self,
+            target: &DeliveryTarget,
+            text: &str,
+            resume_action_value: Option<&str>,
+        ) -> io::Result<String> {
+            let mut f = lock(&self.failures);
+            let id = format!("fail-{}", f.len() + 1);
+            f.push((
+                target.channel_id.clone(),
+                text.to_owned(),
+                resume_action_value.map(ToOwned::to_owned),
+            ));
+            Ok(id)
+        }
+        fn edit_failure_message(
+            &self,
+            _target: &DeliveryTarget,
+            message_id: &str,
+            text: &str,
+            resume_action_value: Option<&str>,
+        ) -> io::Result<()> {
+            lock(&self.failure_edits).push((
+                message_id.to_owned(),
+                text.to_owned(),
+                resume_action_value.map(ToOwned::to_owned),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn early_reply_delivers_immediately_on_discord_github_linear_while_workers_run_and_silent_wake_does_not_overwrite_or_duplicate()
+     {
+        for (idx, (source, channel_id, thread_id)) in [
+            (ExternalSource::Discord, "CH-DISCORD", Some("TH-1")),
+            (ExternalSource::GitHub, "acme/krill#42", None),
+            (ExternalSource::Linear, "LIN-ISSUE-99", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bot_id = BotId::new(format!("bot-early-{idx}")).unwrap();
+            let bot = BotConfig::new(bot_id.clone(), "EarlyBot", "claude", 1_000).unwrap();
+            let bridge = Arc::new(MockBridge {
+                bot: Mutex::new(bot),
+                decision: Mutex::new(AccessDecision::Allowed),
+                dispatched: Mutex::new(Vec::new()),
+                gates: Mutex::new(Vec::new()),
+            });
+            let router = ConversationRouter::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+            let sender = Arc::new(RecordingSender::for_source(source));
+            router.register_sender(
+                bot_id.clone(),
+                source,
+                Arc::clone(&sender) as Arc<dyn PlatformSender>,
+            );
+
+            let target = DeliveryTarget {
+                source,
+                workspace_id: None,
+                channel_id: channel_id.to_owned(),
+                thread_id: thread_id.map(ToOwned::to_owned),
+                reply_to_message_id: None,
+            };
+            let inbound = InboundExternalMessage {
+                bot_id: bot_id.clone(),
+                source,
+                workspace_id: None,
+                channel_id: channel_id.to_owned(),
+                thread_id: thread_id.map(ToOwned::to_owned),
+                sender_id: "u-owner".to_owned(),
+                sender_name: "Owner".to_owned(),
+                text: "Kick off the build check".to_owned(),
+                attachments: Vec::new(),
+                external_message_id: Some("ext-1".to_owned()),
+                acts_for: ActsFor::Owner,
+            };
+            let dispatched = router.handle_inbound_message(inbound, target, sender.as_ref());
+            let InboundRouteOutcome::Dispatched(out) = dispatched else {
+                panic!("expected Dispatched for {source:?}");
+            };
+
+            // Turn 1 finishes with an answer while helper workers are still running: deliver NOW!
+            router.on_turn_complete_with_context(
+                &bot_id,
+                out.session_id,
+                Some(1),
+                Some("Started checks; helper worker is running."),
+                true,
+            );
+            assert_eq!(lock(&sender.sent).len(), 1);
+            assert_eq!(
+                lock(&sender.sent)[0].1,
+                "Started checks; helper worker is running."
+            );
+
+            // Re-emitting completion for the same turn_seq must NOT duplicate.
+            router.on_turn_complete_with_context(
+                &bot_id,
+                out.session_id,
+                Some(1),
+                Some("Started checks; helper worker is running."),
+                true,
+            );
+            assert_eq!(lock(&sender.sent).len(), 1);
+
+            // Later silent & quiet worker-wake turns must NOT overwrite, drop, or duplicate.
+            router.on_turn_complete_with_context(&bot_id, out.session_id, Some(2), None, true);
+            router.on_turn_complete_with_context(
+                &bot_id,
+                out.session_id,
+                Some(3),
+                Some("[[KRILL_QUIET]]"),
+                true,
+            );
+            assert_eq!(lock(&sender.sent).len(), 1);
+            assert!(lock(&sender.edits).is_empty());
+
+            // Final substantive worker report delivers cleanly and retires the active turn.
+            router.on_turn_complete_with_context(
+                &bot_id,
+                out.session_id,
+                Some(4),
+                Some("Helper worker finished: all green."),
+                false,
+            );
+            assert_eq!(lock(&sender.sent).len(), 2);
+            assert_eq!(
+                lock(&sender.sent)[1].1,
+                "Helper worker finished: all green."
+            );
+        }
+    }
+
+    #[test]
+    fn failed_turn_attaches_slack_resume_button_and_validates_auth_ownership_and_single_use() {
+        struct ResumeBridge {
+            bot: Mutex<BotConfig>,
+            link: ExternalConversationLink,
+            resume_pending: Mutex<bool>,
+            resumed_calls: Mutex<Vec<(String, u64, String)>>,
+        }
+        impl ConnectorBridge for ResumeBridge {
+            fn dispatch_external_message(
+                &self,
+                _msg: InboundExternalMessage,
+            ) -> io::Result<DispatchOutcome> {
+                Err(io::Error::other("unused"))
+            }
+            fn check_or_request_access(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                sender_id: &str,
+                _sender_name: &str,
+                _channel_id: &str,
+            ) -> io::Result<AccessDecision> {
+                if sender_id == "U_OWNER" {
+                    Ok(AccessDecision::Allowed)
+                } else {
+                    Ok(AccessDecision::Denied("not allowed".to_owned()))
+                }
+            }
+            fn resolve_secret(
+                &self,
+                _bot_id: &BotId,
+                _explicit_ref: Option<&str>,
+                _fallback_key: &str,
+            ) -> io::Result<Option<zeroize::Zeroizing<String>>> {
+                Ok(None)
+            }
+            fn lookup_or_create_link(
+                &self,
+                _bot_id: &BotId,
+                _source: ExternalSource,
+                _workspace_id: Option<&str>,
+                _channel_id: &str,
+                _thread_id: Option<&str>,
+                _acts_for: ActsFor,
+            ) -> io::Result<ExternalConversationLink> {
+                Ok(self.link.clone())
+            }
+            fn reply_orchestration_gate(
+                &self,
+                _gate_id: &str,
+                _decision: &str,
+                _rationale: Option<String>,
+                _resolved_by: &str,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn update_connector_status(&self, _status: krill_proto::bots::BotConnectorStatus) {}
+            fn get_bot_config(&self, bot_id: &BotId) -> Option<BotConfig> {
+                let b = lock(&self.bot);
+                (&b.id == bot_id).then(|| b.clone())
+            }
+            fn list_bots(&self) -> Vec<BotConfig> {
+                vec![lock(&self.bot).clone()]
+            }
+            fn get_link(&self, link_id: &str) -> io::Result<Option<ExternalConversationLink>> {
+                Ok((self.link.id == link_id).then(|| self.link.clone()))
+            }
+            fn resume_failed_external_turn(
+                &self,
+                bot_id: &BotId,
+                link_id: &str,
+                turn_seq: u64,
+                sender_id: &str,
+                _sender_name: &str,
+            ) -> io::Result<ExternalResumeResult> {
+                if lock(&self.bot).paused {
+                    return Ok(ExternalResumeResult::BotPaused);
+                }
+                let mut pending = lock(&self.resume_pending);
+                if !*pending || &self.link.bot_id != bot_id || self.link.id != link_id {
+                    return Ok(ExternalResumeResult::NotFailed);
+                }
+                *pending = false;
+                lock(&self.resumed_calls).push((
+                    link_id.to_owned(),
+                    turn_seq,
+                    sender_id.to_owned(),
+                ));
+                Ok(ExternalResumeResult::Resumed {
+                    link: Box::new(self.link.clone()),
+                    session_id: SessionId(55),
+                    turn_seq: turn_seq + 1,
+                    queued_count: 2,
+                })
+            }
+        }
+
+        let bot_id = BotId::new("bot-res").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "SlackBot", "claude", 1_000).unwrap();
+        bot.connectors.slack.allowed_channel_ids = vec!["C_OPS".to_owned()];
+        bot.connectors.slack.allowed_user_ids = vec!["U_OWNER".to_owned()];
+        let link = ExternalConversationLink {
+            id: "link-slack-1".to_owned(),
+            bot_id: bot_id.clone(),
+            source: ExternalSource::Slack,
+            workspace_id: Some("T1".to_owned()),
+            channel_id: "C_OPS".to_owned(),
+            thread_id: Some("100.1".to_owned()),
+            session_id: Some(SessionId(55)),
+            acts_for: ActsFor::Owner,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let bridge = Arc::new(ResumeBridge {
+            bot: Mutex::new(bot),
+            link: link.clone(),
+            resume_pending: Mutex::new(true),
+            resumed_calls: Mutex::new(Vec::new()),
+        });
+        let router = ConversationRouter::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+        let sender = Arc::new(RecordingSender::for_source(ExternalSource::Slack));
+        router.register_sender(
+            bot_id.clone(),
+            ExternalSource::Slack,
+            Arc::clone(&sender) as Arc<dyn PlatformSender>,
+        );
+
+        // 1. Failure without existing activity status posts a new failure message with Resume payload.
+        router.on_turn_failed(
+            &bot_id,
+            SessionId(55),
+            Some(&link.id),
+            7,
+            TurnFailureKind::UsageLimit,
+            "429 rate limit exceeded",
+        );
+        let failures = lock(&sender.failures);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "C_OPS");
+        assert!(failures[0].1.contains("Resume"));
+        assert_eq!(
+            failures[0].2.as_deref(),
+            Some("resume:bot-res:link-slack-1:7")
+        );
+        drop(failures);
+
+        // 2. Failure WITH existing activity status edits it in-place with Resume payload.
+        router.register_active_turn(
+            bot_id.clone(),
+            SessionId(55),
+            &link,
+            Some("status-ts-1".to_owned()),
+        );
+        router.on_turn_failed(
+            &bot_id,
+            SessionId(55),
+            Some(&link.id),
+            8,
+            TurnFailureKind::Error,
+            "provider crash",
+        );
+        assert_eq!(lock(&sender.failure_edits).len(), 1);
+        assert_eq!(lock(&sender.failure_edits)[0].0, "status-ts-1");
+        assert_eq!(
+            lock(&sender.failure_edits)[0].2.as_deref(),
+            Some("resume:bot-res:link-slack-1:8")
+        );
+
+        let payload = "resume:bot-res:link-slack-1:8";
+        // Invalid payload, wrong bot_id, paused bot, wrong channel, intruder, wrong thread all blocked.
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OPS",
+                Some("100.1"),
+                "resume:bad",
+            ),
+            ResumeCallbackOutcome::InvalidPayload
+        );
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OPS",
+                Some("100.1"),
+                "resume:other-bot:link-slack-1:8",
+            ),
+            ResumeCallbackOutcome::Denied
+        );
+        lock(&bridge.bot).paused = true;
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OPS",
+                Some("100.1"),
+                payload,
+            ),
+            ResumeCallbackOutcome::Paused
+        );
+        lock(&bridge.bot).paused = false;
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OTHER",
+                Some("100.1"),
+                payload,
+            ),
+            ResumeCallbackOutcome::Denied
+        );
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_INTRUDER",
+                "Intruder",
+                "C_OPS",
+                Some("100.1"),
+                payload,
+            ),
+            ResumeCallbackOutcome::Denied
+        );
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OPS",
+                Some("999.9"),
+                payload,
+            ),
+            ResumeCallbackOutcome::Denied
+        );
+        assert!(lock(&bridge.resumed_calls).is_empty());
+
+        // Authorized click in matching thread succeeds once and re-registers active turn.
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OPS",
+                Some("100.1"),
+                payload,
+            ),
+            ResumeCallbackOutcome::Resumed {
+                link_id: "link-slack-1".to_owned(),
+                session_id: SessionId(55),
+                queued_count: 2,
+            }
+        );
+        assert_eq!(lock(&bridge.resumed_calls).len(), 1);
+
+        // Second press is rejected cleanly as NotFailed (single-use fencing).
+        assert_eq!(
+            router.handle_resume_callback_with_context(
+                &bot_id,
+                ExternalSource::Slack,
+                Some("T1"),
+                "U_OWNER",
+                "Owner",
+                "C_OPS",
+                Some("100.1"),
+                payload,
+            ),
+            ResumeCallbackOutcome::NotFailed
+        );
+    }
+
+    #[test]
+    fn restart_cut_turn_notifies_slack_with_resume_and_discord_github_linear_without() {
+        let bot_id = BotId::new("bot-cut").unwrap();
+        let mut bot = BotConfig::new(bot_id.clone(), "CutBot", "claude", 1_000).unwrap();
+        let bridge = Arc::new(MockBridge {
+            bot: Mutex::new(bot.clone()),
+            decision: Mutex::new(AccessDecision::Allowed),
+            dispatched: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+        });
+        let router = ConversationRouter::new(Arc::clone(&bridge) as Arc<dyn ConnectorBridge>);
+
+        let slack_sender = Arc::new(RecordingSender::for_source(ExternalSource::Slack));
+        let discord_sender = Arc::new(RecordingSender::for_source(ExternalSource::Discord));
+        let github_sender = Arc::new(RecordingSender::for_source(ExternalSource::GitHub));
+        let linear_sender = Arc::new(RecordingSender::for_source(ExternalSource::Linear));
+
+        for (src, s) in [
+            (ExternalSource::Slack, Arc::clone(&slack_sender)),
+            (ExternalSource::Discord, Arc::clone(&discord_sender)),
+            (ExternalSource::GitHub, Arc::clone(&github_sender)),
+            (ExternalSource::Linear, Arc::clone(&linear_sender)),
+        ] {
+            router.register_sender(bot_id.clone(), src, s as Arc<dyn PlatformSender>);
+        }
+
+        let mk_link = |id: &str, source: ExternalSource, ch: &str| ExternalConversationLink {
+            id: id.to_owned(),
+            bot_id: bot_id.clone(),
+            source,
+            workspace_id: None,
+            channel_id: ch.to_owned(),
+            thread_id: (source == ExternalSource::Slack).then(|| "100.1".to_owned()),
+            session_id: None,
+            acts_for: ActsFor::Owner,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+
+        // Slack receives Resume button; in-place edit used when status_message_id exists.
+        assert!(router.report_restart_cut_turn(
+            &bot,
+            &mk_link("lnk-sl", ExternalSource::Slack, "C1"),
+            5,
+            Some("ts-old"),
+        ));
+        assert_eq!(lock(&slack_sender.failure_edits).len(), 1);
+        assert_eq!(
+            lock(&slack_sender.failure_edits)[0].2.as_deref(),
+            Some("resume:bot-cut:lnk-sl:5")
+        );
+
+        // Discord, GitHub, and Linear receive clean restart notices without Slack Resume payload.
+        for (id, src, ch, sender) in [
+            ("lnk-dc", ExternalSource::Discord, "D1", &discord_sender),
+            (
+                "lnk-gh",
+                ExternalSource::GitHub,
+                "acme/repo#7",
+                &github_sender,
+            ),
+            ("lnk-ln", ExternalSource::Linear, "LIN-7", &linear_sender),
+        ] {
+            assert!(router.report_restart_cut_turn(&bot, &mk_link(id, src, ch), 2, None));
+            let failures = lock(&sender.failures);
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0].1.contains("interrupted by a Krill restart"));
+            assert_eq!(failures[0].2, None);
+        }
+
+        // Paused bot or disabled `could_not_finish` suppresses notice.
+        bot.paused = true;
+        assert!(!router.report_restart_cut_turn(
+            &bot,
+            &mk_link("lnk-sl", ExternalSource::Slack, "C1"),
+            6,
+            None,
+        ));
+        bot.paused = false;
+        bot.notifications.could_not_finish = false;
+        assert!(!router.report_restart_cut_turn(
+            &bot,
+            &mk_link("lnk-sl", ExternalSource::Slack, "C1"),
+            6,
+            None,
+        ));
     }
 }

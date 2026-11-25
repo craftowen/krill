@@ -2443,6 +2443,7 @@ impl Render for Palette {
                             .cursor_pointer()
                             .child(vault_text::RESUME.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.selection_epoch = this.selection_epoch.wrapping_add(1);
                                 this.selected = abs_row;
                                 this.resume_vault_at(hit_idx, cx);
@@ -2491,6 +2492,7 @@ impl Render for Palette {
                             )
                             .child(right_meta)
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.selection_epoch = this.selection_epoch.wrapping_add(1);
                                 this.selected = abs_row;
                                 this.resume_vault_at(hit_idx, cx);

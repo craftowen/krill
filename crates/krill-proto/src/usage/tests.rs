@@ -1603,3 +1603,256 @@ fn session_switch_plan_roundtrips_and_downgrades_for_old_peers() {
         reply
     );
 }
+
+#[test]
+fn antigravity_native_accounts_rpc_roundtrips_and_gates_features() {
+    let req = UsageRequest::AntigravityAccounts(AntigravityAccountOp::Select {
+        account_id: "acct-1".into(),
+    });
+    let frame = req.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body[0], 25, "appended after SwitchSelectedSessions");
+    assert_eq!(UsageRequest::decode(kind, &body).unwrap(), req);
+    assert!(!req.is_read());
+    assert!(UsageRequest::AntigravityAccounts(AntigravityAccountOp::List).is_read());
+    assert_eq!(
+        req.required_features(),
+        FEAT_USAGE | FEAT_USAGE_AGY | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL
+    );
+
+    let state = AntigravityAccountState {
+        accounts: vec![AntigravityAccountSummary {
+            id: "acct-1".into(),
+            email: Some("owner@example.test".into()),
+            subject: Some("sub-1".into()),
+            auth_method: "consumer".into(),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_100_000,
+            usage: Some(AntigravityStoredUsage {
+                usage: Snapshot {
+                    five_hour: Some(Window {
+                        percent: 25,
+                        resets_at: Some("2026-11-25T00:00:00Z".into()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 10,
+                        resets_at: None,
+                    }),
+                },
+                meters: vec![],
+                updated_at: 1_700_000_100,
+            }),
+        }],
+        active_account_id: Some("acct-1".into()),
+        current_account: Some(AntigravityCurrentAccount {
+            email: Some("owner@example.test".into()),
+            subject: Some("sub-1".into()),
+            auth_method: "consumer".into(),
+            identity_known: true,
+        }),
+        selected_account_id: Some("acct-1".into()),
+    };
+    assert!(!state.native_account_changed());
+    let mut changed = state.clone();
+    changed.active_account_id = None;
+    assert!(changed.native_account_changed());
+
+    let reply = UsageReply::AntigravityAccounts(Ok(state));
+    let frame = reply.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body[0], 7, "appended after SessionSwitchPlan");
+    assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
+    assert_eq!(
+        reply
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reply
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        reply.clone().for_features(
+            FEAT_USAGE | FEAT_USAGE_AGY | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL
+        ),
+        reply
+    );
+}
+
+#[test]
+fn for_features_filters_retired_and_unnegotiated_providers_in_advanced_orphans_and_plan() {
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    enum PreAgyProvider {
+        Claude,
+        Codex,
+        Gemini,
+        OpenCode,
+    }
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    struct PreAgyOrphan {
+        provider: PreAgyProvider,
+        dir: String,
+    }
+
+    let make_event = |provider| AutoSwitchEvent {
+        provider,
+        from_id: "a".into(),
+        from_label: "A".into(),
+        to_id: "b".into(),
+        to_label: "B".into(),
+        reason_percent: 90,
+    };
+    let mut snapshot = AccountsSnapshot::default();
+    snapshot.advanced.supported = true;
+    snapshot.advanced.cooldowns = vec![
+        ProviderCooldown {
+            provider: ProviderKind::Claude,
+            cooldown_until: 100,
+        },
+        ProviderCooldown {
+            provider: ProviderKind::Gemini,
+            cooldown_until: 200,
+        },
+        ProviderCooldown {
+            provider: ProviderKind::Antigravity,
+            cooldown_until: 300,
+        },
+    ];
+    snapshot.advanced.history = vec![
+        SwitchRecord {
+            sequence: 1,
+            at: 10,
+            event: make_event(ProviderKind::Claude),
+            predicted: false,
+        },
+        SwitchRecord {
+            sequence: 2,
+            at: 20,
+            event: make_event(ProviderKind::Gemini),
+            predicted: false,
+        },
+        SwitchRecord {
+            sequence: 3,
+            at: 30,
+            event: make_event(ProviderKind::Antigravity),
+            predicted: true,
+        },
+    ];
+
+    let reply = UsageReply::Accounts(snapshot);
+    let UsageReply::Accounts(without_agy) =
+        reply.clone().for_features(FEAT_USAGE | FEAT_ACCOUNT_POLICY)
+    else {
+        panic!("expected Accounts");
+    };
+    assert_eq!(
+        without_agy
+            .advanced
+            .cooldowns
+            .iter()
+            .map(|c| c.provider)
+            .collect::<Vec<_>>(),
+        [ProviderKind::Claude]
+    );
+    assert_eq!(
+        without_agy
+            .advanced
+            .history
+            .iter()
+            .map(|r| r.event.provider)
+            .collect::<Vec<_>>(),
+        [ProviderKind::Claude]
+    );
+
+    let UsageReply::Accounts(with_agy) =
+        reply.for_features(FEAT_USAGE | FEAT_ACCOUNT_POLICY | FEAT_USAGE_AGY)
+    else {
+        panic!("expected Accounts");
+    };
+    assert_eq!(
+        with_agy
+            .advanced
+            .cooldowns
+            .iter()
+            .map(|c| c.provider)
+            .collect::<Vec<_>>(),
+        [ProviderKind::Claude, ProviderKind::Antigravity]
+    );
+    assert_eq!(
+        with_agy
+            .advanced
+            .history
+            .iter()
+            .map(|r| r.event.provider)
+            .collect::<Vec<_>>(),
+        [ProviderKind::Claude, ProviderKind::Antigravity]
+    );
+
+    let orphans = UsageReply::Orphans(vec![
+        OrphanProfile {
+            provider: ProviderKind::Claude,
+            dir: "/p/claude".into(),
+        },
+        OrphanProfile {
+            provider: ProviderKind::Gemini,
+            dir: "/p/gemini".into(),
+        },
+        OrphanProfile {
+            provider: ProviderKind::Antigravity,
+            dir: "/p/agy".into(),
+        },
+    ]);
+    let legacy_orphans = orphans.clone().for_features(FEAT_USAGE | FEAT_USAGE_MANAGE);
+    let UsageReply::Orphans(filtered) = &legacy_orphans else {
+        panic!("expected Orphans");
+    };
+    assert_eq!(
+        filtered.iter().map(|o| o.provider).collect::<Vec<_>>(),
+        [ProviderKind::Claude]
+    );
+    // Legacy peer without Antigravity enum variant must still decode filtered Orphans.
+    let decoded: Vec<PreAgyOrphan> =
+        postcard::from_bytes(&postcard::to_stdvec(filtered).unwrap()).unwrap();
+    assert_eq!(
+        decoded,
+        [PreAgyOrphan {
+            provider: PreAgyProvider::Claude,
+            dir: "/p/claude".into(),
+        }]
+    );
+
+    let UsageReply::Orphans(modern_orphans) =
+        orphans.for_features(FEAT_USAGE | FEAT_USAGE_MANAGE | FEAT_USAGE_AGY)
+    else {
+        panic!("expected Orphans");
+    };
+    assert_eq!(
+        modern_orphans
+            .iter()
+            .map(|o| o.provider)
+            .collect::<Vec<_>>(),
+        [ProviderKind::Claude, ProviderKind::Antigravity]
+    );
+
+    let agy_plan = UsageReply::SessionSwitchPlan(SessionSwitchPlan {
+        provider: ProviderKind::Antigravity,
+        previous_account_id: None,
+        target_account_id: "agy-1".into(),
+        candidates: Vec::new(),
+    });
+    assert_eq!(
+        agy_plan
+            .clone()
+            .for_features(FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL),
+        UsageReply::Failed(Failure::BadRequest)
+    );
+    assert_eq!(
+        agy_plan.clone().for_features(
+            FEAT_USAGE | FEAT_PROVIDER_DETAILS | FEAT_ACCOUNT_SWITCH_CONTROL | FEAT_USAGE_AGY
+        ),
+        agy_plan
+    );
+}

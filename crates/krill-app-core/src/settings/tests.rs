@@ -4742,7 +4742,7 @@ fn accounts_tab_folds_not_installed_providers(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-add-account-claude").is_some());
     assert!(vcx.debug_bounds("admin-add-account-opencode").is_some());
-    for hidden in ["admin-add-account-codex", "admin-add-account-agy"] {
+    for hidden in ["admin-add-account-codex", "admin-agy-refresh-accounts"] {
         assert!(
             vcx.debug_bounds(hidden).is_none(),
             "{hidden} must be folded"
@@ -4752,6 +4752,7 @@ fn accounts_tab_folds_not_installed_providers(cx: &mut TestAppContext) {
     vcx.simulate_click(fold.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-add-account-codex").is_some());
+    assert!(vcx.debug_bounds("admin-agy-refresh-accounts").is_some());
     fs::remove_dir_all(d).unwrap();
 }
 
@@ -9389,9 +9390,13 @@ fn mobile_pairing_path_selection_does_not_block_settings(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn agy_account_add_and_relogin_use_the_profile_terminal(cx: &mut TestAppContext) {
-    use krill_proto::usage::ProviderKind;
-    let d = dir("agy-terminal-login");
+fn agy_terminal_section_mirrors_orca_native_accounts_ui(cx: &mut TestAppContext) {
+    use krill_proto::usage::{
+        AntigravityAccountState, AntigravityAccountSummary, AntigravityCurrentAccount,
+        AntigravityStoredUsage, ProviderKind, Snapshot, Window,
+    };
+
+    let d = dir("agy-orca-native-ui");
     init(cx, &d);
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(6000.)));
@@ -9399,82 +9404,153 @@ fn agy_account_add_and_relogin_use_the_profile_terminal(cx: &mut TestAppContext)
         cx.set_global(crate::accounts::installed::Installed(Some(vec![
             ProviderKind::Antigravity,
         ])));
-        view.update(cx, |v, cx| v.set_tab(AdminTab::Accounts, cx));
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Accounts, cx);
+            v.antigravity.busy = false;
+            v.antigravity.error = None;
+            v.antigravity.state = Some(AntigravityAccountState::default());
+            cx.notify();
+        });
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
-        let bounds = vcx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("missing {selector}"));
-        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
-        vcx.run_until_parked();
-    };
-    click(vcx, "admin-add-account-agy");
-    assert!(vcx.debug_bounds("admin-agy-login-guide").is_some());
-    vcx.update(|_, cx| {
-        assert_eq!(
-            view.read(cx).terminal_login_provider,
-            Some(ProviderKind::Antigravity)
-        );
-        assert!(view.read(cx).login_pending.is_none());
-        assert_eq!(take_pending_terminal_command(cx), None);
-    });
-    click(vcx, "admin-agy-login-dismiss");
-    vcx.update(|_, cx| {
-        assert!(view.read(cx).terminal_login_provider.is_none());
-        assert!(
-            !view
-                .read(cx)
-                .accounts_snapshot
-                .accounts
-                .iter()
-                .any(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
-        );
-        assert_eq!(take_pending_terminal_command(cx), None);
-    });
-    click(vcx, "admin-add-account-agy");
-    click(vcx, "admin-agy-login-run");
-    let account = vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert!(v.terminal_login_provider.is_none());
-        assert!(v.login_pending.is_none());
-        let account = v
-            .accounts_snapshot
-            .accounts
-            .iter()
-            .find(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
-            .unwrap()
-            .clone();
-        assert!(Path::new(&account.profile_dir).is_dir());
-        assert_eq!(
-            take_pending_terminal_command(cx),
-            Some(crate::accounts::terminal_login_command(&account))
-        );
-        account
-    });
-    vcx.update(|_, cx| {
+
+    // Orca parity: no `+ Add account` button or intermediate terminal login guide modal.
+    assert!(vcx.debug_bounds("admin-add-account-agy").is_none());
+    assert!(vcx.debug_bounds("admin-agy-login-guide").is_none());
+    assert!(vcx.debug_bounds("admin-agy-refresh-accounts").is_some());
+    assert!(vcx.debug_bounds("admin-agy-row-signed-out").is_some());
+    assert!(vcx.debug_bounds("admin-agy-sign-in-help").is_some());
+    assert!(vcx.debug_bounds("admin-agy-add-account-help").is_none());
+
+    // Current unsaved login shows active badge + Refresh usage + Save button.
+    vcx.update(|window, cx| {
         view.update(cx, |v, cx| {
-            v.login_account(ProviderKind::Antigravity, Some(account.clone()), cx);
+            v.antigravity.state = Some(AntigravityAccountState {
+                accounts: Vec::new(),
+                selected_account_id: None,
+                active_account_id: None,
+                current_account: Some(AntigravityCurrentAccount {
+                    email: Some("unsaved@example.com".into()),
+                    subject: Some("sub-unsaved".into()),
+                    auth_method: "consumer".into(),
+                    identity_known: true,
+                }),
+            });
+            cx.notify();
         });
+        window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    click(vcx, "admin-agy-login-run");
-    vcx.update(|_, cx| {
-        assert_eq!(
-            take_pending_terminal_command(cx),
-            Some(crate::accounts::terminal_login_command(&account))
-        );
-        assert_eq!(
-            view.read(cx)
-                .accounts_snapshot
-                .accounts
-                .iter()
-                .filter(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
-                .count(),
-            1
-        );
+    assert!(vcx.debug_bounds("admin-agy-row-current").is_some());
+    assert!(vcx.debug_bounds("admin-agy-save-current").is_some());
+    assert!(vcx.debug_bounds("admin-agy-current-usage").is_some());
+    assert!(vcx.debug_bounds("admin-agy-row-signed-out").is_none());
+    assert!(vcx.debug_bounds("admin-agy-changed-warning").is_none());
+
+    // Saved accounts show Select rows, Active badge + usage refresh on active, Remove on inactive, and footer help.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.antigravity.state = Some(AntigravityAccountState {
+                accounts: vec![
+                    AntigravityAccountSummary {
+                        id: "acc-1".into(),
+                        email: Some("first@example.com".into()),
+                        subject: Some("sub-1".into()),
+                        auth_method: "consumer".into(),
+                        created_at: 1_700_000_000_000,
+                        updated_at: 1_700_000_000_000,
+                        usage: Some(AntigravityStoredUsage {
+                            updated_at: 1_700_000_000,
+                            usage: Snapshot {
+                                five_hour: Some(Window {
+                                    percent: 30,
+                                    resets_at: None,
+                                }),
+                                seven_day: None,
+                            },
+                            meters: Vec::new(),
+                        }),
+                    },
+                    AntigravityAccountSummary {
+                        id: "acc-2".into(),
+                        email: Some("second@example.com".into()),
+                        subject: Some("sub-2".into()),
+                        auth_method: "consumer".into(),
+                        created_at: 1_700_000_001_000,
+                        updated_at: 1_700_000_001_000,
+                        usage: None,
+                    },
+                ],
+                selected_account_id: Some("acc-1".into()),
+                active_account_id: Some("acc-1".into()),
+                current_account: Some(AntigravityCurrentAccount {
+                    email: Some("first@example.com".into()),
+                    subject: Some("sub-1".into()),
+                    auth_method: "consumer".into(),
+                    identity_known: true,
+                }),
+            });
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
     });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-row-current").is_none());
+    assert!(vcx.debug_bounds("admin-agy-account-acc-1").is_some());
+    assert!(vcx.debug_bounds("admin-agy-account-acc-2").is_some());
+    assert!(vcx.debug_bounds("admin-agy-active-acc-1").is_some());
+    assert!(vcx.debug_bounds("admin-agy-active-acc-2").is_none());
+    assert!(vcx.debug_bounds("admin-agy-usage-acc-1").is_some());
+    assert!(vcx.debug_bounds("admin-agy-remove-acc-1").is_none());
+    assert!(vcx.debug_bounds("admin-agy-remove-acc-2").is_some());
+    assert!(vcx.debug_bounds("admin-agy-add-account-help").is_some());
+    assert!(vcx.debug_bounds("admin-agy-changed-warning").is_none());
+
+    // Changed externally (selected != active) renders warning + unsaved current row.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.antigravity.state = Some(AntigravityAccountState {
+                accounts: vec![AntigravityAccountSummary {
+                    id: "acc-1".into(),
+                    email: Some("first@example.com".into()),
+                    subject: Some("sub-1".into()),
+                    auth_method: "consumer".into(),
+                    created_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_000_000,
+                    usage: None,
+                }],
+                selected_account_id: Some("acc-1".into()),
+                active_account_id: None,
+                current_account: Some(AntigravityCurrentAccount {
+                    email: Some("external@example.com".into()),
+                    subject: Some("sub-ext".into()),
+                    auth_method: "consumer".into(),
+                    identity_known: true,
+                }),
+            });
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-changed-warning").is_some());
+    assert!(vcx.debug_bounds("admin-agy-row-current").is_some());
+    assert!(vcx.debug_bounds("admin-agy-save-current").is_some());
+
+    // Error state with no loaded state renders error banner + retry button.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.antigravity.state = None;
+            v.antigravity.error = Some("Keychain unavailable".into());
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-agy-row-error").is_some());
+    assert!(vcx.debug_bounds("admin-agy-retry").is_some());
+
     fs::remove_dir_all(d).ok();
 }
 
@@ -12228,17 +12304,29 @@ fn multi_provider_add_search_edit_remove_and_custom_agent(cx: &mut TestAppContex
 }
 
 #[test]
-fn chat_auto_continue_after_rate_limit_defaults_off_and_toml_roundtrips() {
+fn chat_auto_continue_after_rate_limit_defaults_on_and_roundtrips_toml_and_json() {
     let mut settings = Settings::default();
-    assert!(!settings.chat_auto_continue_after_rate_limit);
+    assert!(settings.chat_auto_continue_after_rate_limit);
     assert!(
-        !Settings::parse_with_language("theme = 'dark'", Language::En)
+        Settings::parse_with_language("theme = 'dark'", Language::En)
             .unwrap()
             .chat_auto_continue_after_rate_limit
     );
-    settings.chat_auto_continue_after_rate_limit = true;
+    // Explicit false in TOML and JSON must be respected instead of overridden by default_true.
+    assert!(
+        !Settings::parse_with_language("chat_auto_continue_after_rate_limit = false", Language::En)
+            .unwrap()
+            .chat_auto_continue_after_rate_limit
+    );
+    let from_json_omitted: Settings = serde_json::from_str("{}").unwrap();
+    assert!(from_json_omitted.chat_auto_continue_after_rate_limit);
+    let from_json_false: Settings =
+        serde_json::from_str(r#"{"chat_auto_continue_after_rate_limit":false}"#).unwrap();
+    assert!(!from_json_false.chat_auto_continue_after_rate_limit);
+
+    settings.chat_auto_continue_after_rate_limit = false;
     let encoded = settings.to_toml();
-    assert!(encoded.contains("chat_auto_continue_after_rate_limit = true"));
+    assert!(encoded.contains("chat_auto_continue_after_rate_limit = false"));
     assert_eq!(
         Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
         settings
@@ -12317,4 +12405,24 @@ fn ssh_and_quick_command_forms_ignore_enter_during_ime_composition(cx: &mut Test
         after_qc, before_qc,
         "Quick command form must not submit while IME is composing (R2A-16)"
     );
+}
+
+#[test]
+fn resume_work_on_restart_defaults_off_and_roundtrips() {
+    let mut settings = Settings::default();
+    assert!(!settings.resume_work_on_restart);
+    assert!(
+        !Settings::parse_with_language("theme = 'dark'", Language::En)
+            .unwrap()
+            .resume_work_on_restart
+    );
+    settings.resume_work_on_restart = true;
+    let encoded = settings.to_toml();
+    assert!(encoded.contains("resume_work_on_restart = true"));
+    assert_eq!(
+        Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
+        settings
+    );
+    let from_json: Settings = serde_json::from_str(r#"{"resume_work_on_restart":true}"#).unwrap();
+    assert!(from_json.resume_work_on_restart);
 }

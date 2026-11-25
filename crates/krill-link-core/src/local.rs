@@ -293,8 +293,12 @@ mod windows {
                             }
                             Err(e) => Err(e),
                         };
+                        let failed = accepted.is_err();
                         if tx.blocking_send(accepted).is_err() {
                             break;
+                        }
+                        if failed {
+                            std::thread::sleep(ACCEPT_POLL);
                         }
                     }
                 })?;
@@ -305,7 +309,10 @@ mod windows {
         pub async fn accept(&self) -> io::Result<(Stream, net::SocketAddr)> {
             match self.rx.lock().await.recv().await {
                 Some(accepted) => accepted,
-                None => Err(io::Error::other("local listener stopped")),
+                None => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "local listener stopped",
+                )),
             }
         }
     }

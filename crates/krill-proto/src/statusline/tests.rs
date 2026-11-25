@@ -137,6 +137,62 @@ fn own_command_format_round_trips() {
 }
 
 #[test]
+fn windows_chain_command_uses_shell_agnostic_b64_and_preserves_legacy_chain() {
+    let win_exe = r"C:\Users\Alice\AppData\Local\Programs\Krill\krill.exe";
+    for user_cmd in [
+        r#"powershell -Command "Write-Host 'hi'""#,
+        r"C:\Users\O'Brien\status.ps1 --flag 'a b'",
+        "한글 status 'quote' $env:PATH",
+    ] {
+        let chained = chain_command_for(win_exe, user_cmd, true);
+        assert!(
+            chained.contains(" statusline --chain-b64 "),
+            "Windows chain must use --chain-b64: {chained}"
+        );
+        let (_, encoded) = chained.split_once(" --chain-b64 ").unwrap();
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+            "b64 argument must be shell-agnostic ASCII: {encoded}"
+        );
+        assert_eq!(
+            classify_command_for(&chained, win_exe, true),
+            OwnCommand::Chained(user_cmd.to_owned())
+        );
+        // Also recognized on Unix readers.
+        assert_eq!(
+            classify_command_for(&chained, win_exe, false),
+            OwnCommand::Foreign // exe word on Windows uses plain_word `C:/...`
+        );
+        let unix_b64 = format!("{} statusline --chain-b64 {encoded}", shell_quote(EXE));
+        assert_eq!(
+            classify_command(&unix_b64, EXE),
+            OwnCommand::Chained(user_cmd.to_owned())
+        );
+    }
+
+    // Legacy Windows `--chain <shell_quote>` remains recognized for N-1 compatibility.
+    let legacy = format!(
+        "{} statusline --chain {}",
+        exe_word_for(win_exe, true),
+        shell_quote("user-cmd --flag")
+    );
+    assert_eq!(
+        classify_command_for(&legacy, win_exe, true),
+        OwnCommand::Chained("user-cmd --flag".to_owned())
+    );
+
+    // Malformed / padded / non-canonical base64 tokens are rejected.
+    assert_eq!(decode_chain_b64(""), None);
+    assert_eq!(decode_chain_b64("a"), None);
+    assert_eq!(decode_chain_b64("YQ=="), None);
+    assert_eq!(decode_chain_b64("YR"), None); // non-zero trailing bits
+    assert_eq!(decode_chain_b64("////"), None); // invalid UTF-8 + non-url alphabet
+    assert_eq!(decode_chain_b64("____"), None); // invalid UTF-8
+}
+
+#[test]
 fn slot_state_distinguishes_empty_managed_user() {
     assert_eq!(slot_state(None, EXE), SlotState::Empty);
     assert_eq!(
@@ -272,6 +328,11 @@ proptest::proptest! {
         text in proptest::string::string_regex("[ -~]{0,128}").unwrap(),
         exe in proptest::string::string_regex("[ -~]{0,64}").unwrap(),
     ) {
+        if !text.is_empty() {
+            let encoded = encode_chain_b64(&text);
+            assert_eq!(decode_chain_b64(&encoded).as_deref(), Some(text.as_str()));
+        }
+        core::hint::black_box(decode_chain_b64(&text));
         core::hint::black_box(parse_version(&text));
         core::hint::black_box(supports_status_line(Some(&text)));
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {

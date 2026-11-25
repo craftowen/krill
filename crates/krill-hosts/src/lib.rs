@@ -77,7 +77,9 @@ pub enum HostStatus {
 }
 
 type EnsureSocketFn = dyn Fn() -> io::Result<PathBuf> + Send + Sync;
+type EnsureSocketEpochFn = dyn Fn() -> io::Result<(PathBuf, u64)> + Send + Sync;
 type OutcomeFn = dyn Fn(bool, Option<&io::Error>) + Send + Sync;
+type EpochOutcomeFn = dyn Fn(u64, bool, Option<&io::Error>) + Send + Sync;
 
 #[derive(Clone)]
 struct ConnectorLifetime {
@@ -89,7 +91,9 @@ struct ConnectorLifetime {
 #[derive(Clone)]
 pub struct RemoteConnector {
     ensure_socket: Arc<EnsureSocketFn>,
+    ensure_socket_epoch: Option<Arc<EnsureSocketEpochFn>>,
     on_outcome: Arc<OutcomeFn>,
+    on_epoch_outcome: Option<Arc<EpochOutcomeFn>>,
     map_error: Option<Arc<dyn Fn(io::Error) -> io::Error + Send + Sync>>,
     lifetime: Option<ConnectorLifetime>,
     transport_epoch: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
@@ -108,7 +112,9 @@ impl RemoteConnector {
     ) -> Self {
         Self {
             ensure_socket: Arc::new(ensure_socket),
+            ensure_socket_epoch: None,
             on_outcome: Arc::new(on_outcome),
+            on_epoch_outcome: None,
             map_error: None,
             lifetime: None,
             transport_epoch: None,
@@ -142,6 +148,25 @@ impl RemoteConnector {
     #[must_use]
     pub fn with_transport_epoch(mut self, epoch: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.transport_epoch = Some(Arc::new(epoch));
+        self
+    }
+
+    /// 전송 세대(`transport_epoch`) 일치 시에만 요청 결과를 기록하는 훅.
+    #[must_use]
+    pub fn with_epoch_outcome(
+        mut self,
+        on_epoch_outcome: impl Fn(u64, bool, Option<&io::Error>) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_epoch_outcome = Some(Arc::new(on_epoch_outcome));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_ensure_socket_epoch(
+        mut self,
+        ensure_socket_epoch: impl Fn() -> io::Result<(PathBuf, u64)> + Send + Sync + 'static,
+    ) -> Self {
+        self.ensure_socket_epoch = Some(Arc::new(ensure_socket_epoch));
         self
     }
 }
@@ -259,8 +284,30 @@ impl HostTarget {
 
     /// 재사용 중인 소켓의 요청 성공/실패를 연결 관리자에 알린다.
     pub fn record_outcome(&self, ok: bool, err: Option<&io::Error>) {
+        if !self.is_current() {
+            return;
+        }
         if let Some(c) = &self.connector {
             (c.on_outcome)(ok, err);
+        }
+    }
+
+    /// 재사용 중인 소켓의 요청 성공/실패를 연결 시점의 전송 세대(`expected_epoch`)와 함께 기록한다.
+    /// 그사이 터널이 교체·종료되어 세대가 진행됐으면 결과를 무시해 새 터널을 끊지 않는다.
+    pub fn record_outcome_for_epoch(&self, expected_epoch: u64, ok: bool, err: Option<&io::Error>) {
+        if !self.is_current() {
+            return;
+        }
+        if let Some(c) = &self.connector {
+            if let Some(on_epoch_outcome) = &c.on_epoch_outcome {
+                on_epoch_outcome(expected_epoch, ok, err);
+            } else if c
+                .transport_epoch
+                .as_ref()
+                .is_none_or(|epoch| epoch() == expected_epoch)
+            {
+                (c.on_outcome)(ok, err);
+            }
         }
     }
 
@@ -305,26 +352,40 @@ impl HostTarget {
     /// - `allow_local_launch == false` (`Remote`): 절대 로컬 `krill-holder`/`krilld`를 띄우지 않고
     ///   포워딩된 소켓에만 Hello 협상을 수행한다.
     pub fn connect(&self, hello: &ClientHello) -> Result<Connection, daemon::Error> {
+        self.connect_with_epoch(hello).map(|(conn, _)| conn)
+    }
+
+    /// 호스트 데몬에 연결하고, 해당 연결이 속한 전송 세대(`transport_epoch`)를 함께 돌려준다.
+    pub fn connect_with_epoch(
+        &self,
+        hello: &ClientHello,
+    ) -> Result<(Connection, u64), daemon::Error> {
         if !self.is_current() {
             return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
         }
         if self.allow_local_launch
             && let Some(paths) = &self.local_paths
         {
-            return daemon::connect(paths, hello);
+            return daemon::connect(paths, hello).map(|conn| (conn, 0));
         }
-        let socket = match &self.connector {
-            Some(c) => match (c.ensure_socket)() {
-                Ok(sock) => sock,
-                Err(err) => {
-                    let err = match &c.map_error {
-                        Some(mapper) => mapper(err),
-                        None => normalize_remote_io_error(err),
-                    };
-                    return Err(daemon::Error::Io(err));
+        let (socket, epoch) = match &self.connector {
+            Some(c) => {
+                let ensured = match &c.ensure_socket_epoch {
+                    Some(ensure) => ensure(),
+                    None => (c.ensure_socket)().map(|sock| (sock, self.transport_epoch())),
+                };
+                match ensured {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        let err = match &c.map_error {
+                            Some(mapper) => mapper(err),
+                            None => normalize_remote_io_error(err),
+                        };
+                        return Err(daemon::Error::Io(err));
+                    }
                 }
-            },
-            None => self.socket.clone(),
+            }
+            None => (self.socket.clone(), 0),
         };
         if !self.is_current() {
             return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
@@ -339,7 +400,7 @@ impl HostTarget {
                 if let Some(c) = &self.connector {
                     (c.on_outcome)(true, None);
                 }
-                Ok(conn)
+                Ok((conn, epoch))
             }
             Err(err) => {
                 let norm = match self.connector.as_ref().and_then(|c| c.map_error.as_ref()) {

@@ -169,6 +169,28 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io:
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn is_windows_verbatim_only_name(text: &str) -> bool {
+    let stem = text
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    text.ends_with(['.', ' '])
+        || text.contains(['/', '<', '>', ':', '"', '|', '?', '*'])
+        || text.chars().any(char::is_control)
+        || matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            upper.strip_prefix(prefix).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+}
+
 /// Use ordinary DOS/UNC paths for shell working directories and arguments. A Windows
 /// verbatim prefix from canonicalization makes `cmd.exe` treat a local drive as UNC
 /// and silently change to the Windows directory. Other device namespaces are preserved.
@@ -187,31 +209,7 @@ pub fn shell_path(path: &std::path::Path) -> std::path::PathBuf {
                     std::path::Component::CurDir | std::path::Component::ParentDir => return true,
                     _ => return false,
                 };
-                let text = name.to_string_lossy();
-                let stem = text.split('.').next().unwrap_or_default();
-                let upper = stem.to_ascii_uppercase();
-                text.ends_with(['.', ' '])
-                    || text.contains(['/', '<', '>', ':', '"', '|', '?', '*'])
-                    || text.chars().any(char::is_control)
-                    || matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                    || ["COM", "LPT"].iter().any(|prefix| {
-                        upper.strip_prefix(prefix).is_some_and(|n| {
-                            matches!(
-                                n,
-                                "1" | "2"
-                                    | "3"
-                                    | "4"
-                                    | "5"
-                                    | "6"
-                                    | "7"
-                                    | "8"
-                                    | "9"
-                                    | "¹"
-                                    | "²"
-                                    | "³"
-                            )
-                        })
-                    })
+                is_windows_verbatim_only_name(&name.to_string_lossy())
             })
         {
             return path.to_owned();
@@ -456,5 +454,32 @@ mod tests {
         assert!(split.contains(&agy_bin));
         assert!(split.contains(&npm_bin));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn verbatim_only_name_trims_trailing_spaces_before_dos_device_check() {
+        for reserved in [
+            "CON",
+            "con.txt",
+            "CON .txt",
+            "CON   .txt",
+            "NUL .log",
+            "PRN .md",
+            "AUX .rs",
+            "COM1 .dir",
+            "lpt9  .bin",
+            "com¹ .txt",
+        ] {
+            assert!(
+                is_windows_verbatim_only_name(reserved),
+                "expected DOS device name to keep verbatim prefix: {reserved:?}"
+            );
+        }
+        for ordinary in ["console.txt", "normal .txt", "com10.txt", "my-repo"] {
+            assert!(
+                !is_windows_verbatim_only_name(ordinary),
+                "ordinary name must not force verbatim prefix: {ordinary:?}"
+            );
+        }
     }
 }

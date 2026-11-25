@@ -88,3 +88,18 @@ fn known_agent_process_recognition_covers_orca_presets() {
         );
     }
 }
+
+#[test]
+fn windows_error_invalid_parameter_marks_process_ended() {
+    let win_invalid_param = io::Error::from_raw_os_error(87);
+    assert!(is_missing_process(&win_invalid_param, true));
+    assert!(!is_missing_process(&win_invalid_param, false));
+    #[cfg(windows)]
+    {
+        let mut agent = tracked(42, 100);
+        assert!(agent.ended(&[], Instant::now(), |_| {
+            Err(io::Error::from_raw_os_error(87))
+        }));
+        assert!(agent.process.is_none());
+    }
+}

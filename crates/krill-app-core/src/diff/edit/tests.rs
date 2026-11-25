@@ -1367,3 +1367,330 @@ fn partial_stage_on_deleted_file_applies_cleanly() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn line_patch_never_cross_matches_old_and_new_line_numbers_and_supports_cross_side_ranges() {
+    use gpui_component::diff::DiffSide;
+
+    // Pure deletion at old line 2 (no Modified line) + pure insertion at new line 2 (no Original line).
+    let raw = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1,4 +1,3 @@
+ a
+-deleted_at_old_2
+ b
+ c
+@@ -10,2 +9,3 @@
+ x
++added_at_new_10
+ y
+";
+    // Selecting Modified line 2 must NOT pick up the pure deletion at Original line 2.
+    assert!(build_line_patch(raw, false, 2, 2, true).is_none());
+    // Selecting Original line 10 must NOT pick up the pure insertion at Modified line 10.
+    assert!(build_line_patch(raw, false, 10, 10, false).is_none());
+    // Selecting Original line 2 picks only the deletion.
+    let del_only = build_line_patch(raw, false, 2, 2, false).unwrap();
+    assert!(del_only.contains("-deleted_at_old_2"));
+    assert!(!del_only.contains("+added_at_new_10"));
+    // Selecting Modified line 10 picks only the addition.
+    let add_only = build_line_patch(raw, false, 10, 10, true).unwrap();
+    assert!(add_only.contains("+added_at_new_10"));
+    assert!(!add_only.contains("-deleted_at_old_2"));
+
+    // Real git repo test for cross-side Unified diff selection (Original -> Modified and reversed).
+    let dir = std::env::temp_dir().join(format!(
+        "krill-cross-side-patch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "core.autocrlf", "false"],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(dir.join("u.txt"), "keep1\nold1\nold2\nkeep2\n").unwrap();
+    for args in [&["add", "u.txt"][..], &["commit", "-q", "-m", "init"]] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(dir.join("u.txt"), "keep1\nnew1\nnew2\nkeep2\n").unwrap();
+    let file = ChangedFile {
+        path: b"u.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+
+    // Select Unified span from `-old2` (Original line 3) to `+new1` (Modified line 2).
+    // Forward order and reversed drag order must produce the exact same patch.
+    let forward = build_line_patch_for_sides(
+        &wt_patch,
+        false,
+        DiffSide::Original,
+        3,
+        DiffSide::Modified,
+        2,
+    )
+    .unwrap();
+    let reversed = build_line_patch_for_sides(
+        &wt_patch,
+        false,
+        DiffSide::Modified,
+        2,
+        DiffSide::Original,
+        3,
+    )
+    .unwrap();
+    assert_eq!(forward, reversed);
+    apply_git_patch(&dir, &forward, true, false).unwrap();
+    let staged = Command::new("git")
+        .args(["show", ":u.txt"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(staged.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout),
+        "keep1\nold1\nnew1\nkeep2\n"
+    );
+
+    // Reverse discard of the same cross-side span on worktree restores old2 and drops new1 while keeping new2.
+    let discard = build_line_patch_for_sides(
+        &wt_patch,
+        true,
+        DiffSide::Original,
+        3,
+        DiffSide::Modified,
+        2,
+    )
+    .unwrap();
+    apply_git_patch(&dir, &discard, false, true).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("u.txt")).unwrap(),
+        "keep1\nold2\nnew2\nkeep2\n"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+gpui::actions!(commit_shortcut_regression_test, [ParentZoom]);
+
+struct CommitShortcutHost {
+    panel: Entity<Panel>,
+    zoomed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl gpui::Render for CommitShortcutHost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let zoomed = Arc::clone(&self.zoomed);
+        div()
+            .size_full()
+            .key_context("Shell")
+            .on_action(cx.listener(move |_, _: &ParentZoom, _, _| {
+                zoomed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+            .child(self.panel.clone())
+    }
+}
+
+#[gpui::test]
+fn commit_textarea_secondary_shift_enter_commits_and_pushes_without_newline_or_parent_zoom(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let commit_push_keys = if cfg!(target_os = "macos") {
+        "cmd-shift-enter"
+    } else {
+        "ctrl-shift-enter"
+    };
+    cx.update(|cx| {
+        cx.bind_keys([gpui::KeyBinding::new(
+            commit_push_keys,
+            ParentZoom,
+            Some("Shell"),
+        )]);
+    });
+    let fake = Arc::new(Fake::default());
+    let parent_zoomed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let zoomed_flag = Arc::clone(&parent_zoomed);
+
+    let panel_slot: Arc<Mutex<Option<Entity<Panel>>>> = Arc::new(Mutex::new(None));
+    let panel_slot_init = Arc::clone(&panel_slot);
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let panel = cx.new(|cx| {
+            let mut p = Panel::unconnected("/repo".into(), cx);
+            p.visible = false;
+            p.editing.source = fake.clone();
+            p.changes = Changes {
+                files: vec![ChangedFile {
+                    path: b"file.rs".into(),
+                    old_path: None,
+                    status: *b"M.",
+                    staged: None,
+                    unstaged: None,
+                }],
+                limited: false,
+            };
+            p.refresh_branch_sync(cx);
+            drop(p.render_editor(window, cx));
+            p
+        });
+        *panel_slot_init.lock().unwrap() = Some(panel.clone());
+        CommitShortcutHost {
+            panel,
+            zoomed: zoomed_flag,
+        }
+    });
+    let panel = panel_slot.lock().unwrap().clone().unwrap();
+    cx.run_until_parked();
+
+    // Commit textarea must NOT have submit_on_enter enabled; plain Enter inserts newline natively.
+    panel.update_in(cx, |p, window, cx| {
+        let input = p.editing.input.as_ref().unwrap().clone();
+        input.update(cx, |state, cx| {
+            state.set_value("subject", window, cx);
+            state.focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // Even when commit fails, Cmd+Enter must not leave a stray newline in the textarea.
+    *fake.fail.lock().unwrap() = true;
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |p, cx| {
+        assert_eq!(
+            p.editing.input.as_ref().unwrap().read(cx).value(),
+            "subject"
+        );
+    });
+
+    // Cmd+Shift+Enter submits CommitAndPush directly and stops propagation before ParentZoom.
+    *fake.fail.lock().unwrap() = false;
+    cx.simulate_keystrokes(commit_push_keys);
+    cx.run_until_parked();
+    assert!(
+        !parent_zoomed.load(std::sync::atomic::Ordering::SeqCst),
+        "secondary-shift-enter inside commit input must not trigger ancestor ToggleZoomPane"
+    );
+    assert_eq!(
+        fake.edits.lock().unwrap().last(),
+        Some(&Edit::CommitAndPush {
+            message: "subject".into(),
+        })
+    );
+}
+
+#[test]
+fn apply_git_patch_handles_large_valid_and_rejected_patches_without_pipe_deadlock() {
+    use std::fmt::Write as _;
+
+    let dir = std::env::temp_dir().join(format!(
+        "krill-large-patch-io-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "core.autocrlf", "false"],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let line_count = 4_000usize;
+    let mut initial = String::new();
+    let mut updated = String::new();
+    for i in 0..line_count {
+        writeln!(initial, "old_line_{i:05}_0123456789abcdef0123456789abcdef").unwrap();
+        writeln!(updated, "new_line_{i:05}_fedcba9876543210fedcba9876543210").unwrap();
+    }
+    std::fs::write(dir.join("big.txt"), &initial).unwrap();
+    for args in [&["add", "big.txt"][..], &["commit", "-q", "-m", "init"]] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(dir.join("big.txt"), &updated).unwrap();
+    let file = ChangedFile {
+        path: b"big.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let big_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    assert!(
+        big_patch.len() > 256 * 1024,
+        "patch should exceed OS pipe buffer: {} bytes",
+        big_patch.len()
+    );
+
+    // 1. Valid large patch streams stdin and applies cleanly.
+    apply_git_patch(&dir, &big_patch, true, false).unwrap();
+
+    // 2. Large invalid patch where git exits early must ignore BrokenPipe and surface git's stderr.
+    let mut bogus = String::from("not a valid patch header\n");
+    for _ in 0..8_000 {
+        bogus.push_str("+0123456789abcdef0123456789abcdef0123456789abcdef\n");
+    }
+    let err = apply_git_patch(&dir, &bogus, true, false).unwrap_err();
+    assert_ne!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe,
+        "must report git apply error rather than BrokenPipe: {err}"
+    );
+    assert!(
+        err.to_string().contains("unrecognized input")
+            || err.to_string().contains("error:")
+            || err.to_string().contains("git apply failed"),
+        "unexpected error: {err}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

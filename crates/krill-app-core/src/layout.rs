@@ -657,6 +657,8 @@ impl Layout {
             Some(target) => {
                 self.sessions.remove(&pane);
                 self.files.remove(&pane);
+                self.file_states.remove(&pane);
+                self.clear_stale_preview();
                 self.chat_views.remove(&pane);
                 self.group_panes.insert(pane, target);
             }
@@ -1041,8 +1043,12 @@ impl Layout {
         self.sessions.remove(&pane);
         self.chat_views.remove(&pane);
         self.group_panes.remove(&pane);
+        if self.files.get(&pane) != Some(&path) || self.host(pane) != &host {
+            self.file_states.remove(&pane);
+        }
         self.set_host(pane, host);
         self.files.insert(pane, path);
+        self.clear_stale_preview();
         Some(pane)
     }
 
@@ -1076,6 +1082,7 @@ impl Layout {
             && tabs.contains(&tab)
         {
             self.files.insert(pane, path.clone());
+            self.file_states.remove(&pane);
             self.preview = Some((pane, path));
             self.active = tab;
             self.tabs[tab].focused = pane;
@@ -1204,6 +1211,8 @@ impl Layout {
                 && self.file_states.get(&pane) == baseline.file_states.get(&pane)
                 && self.respawn_cwds.get(&pane) == baseline.respawn_cwds.get(&pane)
                 && self.pane_titles.get(&pane) == baseline.pane_titles.get(&pane)
+                && self.chat_views.get(&pane) == baseline.chat_views.get(&pane)
+                && self.group_panes.get(&pane) == baseline.group_panes.get(&pane)
                 && !self.zoomed.contains(&pane)
                 && self.preview.as_ref().is_none_or(|(p, _)| *p != pane)
         })
@@ -1247,6 +1256,8 @@ impl Layout {
             self.file_states = remap_pane_map(std::mem::take(&mut self.file_states), &saved_map);
             self.respawn_cwds = remap_pane_map(std::mem::take(&mut self.respawn_cwds), &saved_map);
             self.pane_titles = remap_pane_map(std::mem::take(&mut self.pane_titles), &saved_map);
+            self.chat_views = remap_pane_map(std::mem::take(&mut self.chat_views), &saved_map);
+            self.group_panes = remap_pane_map(std::mem::take(&mut self.group_panes), &saved_map);
             self.preview = self
                 .preview
                 .take()
@@ -1291,6 +1302,12 @@ impl Layout {
                 }
                 if let Some(v) = edited.pane_titles.get(&pane) {
                     self.pane_titles.insert(pane, v.clone());
+                }
+                if let Some(&v) = edited.chat_views.get(&pane) {
+                    self.chat_views.insert(pane, v);
+                }
+                if let Some(v) = edited.group_panes.get(&pane) {
+                    self.group_panes.insert(pane, v.clone());
                 }
             }
             self.tabs.push(tab.clone());
@@ -2468,6 +2485,96 @@ mod leaf_mru_tests {
             })
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn startup_merge_preserves_and_remaps_chat_views_and_group_panes() {
+        let mut saved = Layout::default();
+        saved.set_session(PaneId(0), SessionId(11));
+        saved.set_chat_view(PaneId(0), true);
+        saved.new_tab();
+        let saved_group_pane = saved.focused().unwrap();
+        saved.set_group_pane(
+            saved_group_pane,
+            Some(GroupPaneTarget {
+                group_id: "grp-saved".to_owned(),
+                thread_id: Some("thr-saved".to_owned()),
+            }),
+        );
+
+        let baseline = Layout::default();
+        let mut edited = baseline.clone();
+        edited.set_chat_view(PaneId(0), false);
+        edited.new_tab();
+        let startup_group_pane = edited.focused().unwrap();
+        edited.set_group_pane(
+            startup_group_pane,
+            Some(GroupPaneTarget {
+                group_id: "grp-startup".to_owned(),
+                thread_id: None,
+            }),
+        );
+
+        let mut merged = saved;
+        let map = merged.absorb_startup_edits(&baseline, &edited, &BTreeSet::new());
+        assert!(merged.is_valid());
+        assert_eq!(map.get(&0).copied(), Some(2));
+        assert_eq!(map.get(&1).copied(), Some(3));
+        assert_eq!(merged.chat_view(PaneId(0)), Some(false));
+        assert_eq!(
+            merged.group_pane(startup_group_pane),
+            Some(&GroupPaneTarget {
+                group_id: "grp-startup".to_owned(),
+                thread_id: None,
+            })
+        );
+        let remapped_saved_chat = merged.tab_panes(0)[0];
+        let remapped_saved_group = merged.tab_panes(1)[0];
+        assert_eq!(merged.chat_view(remapped_saved_chat), Some(true));
+        assert_eq!(
+            merged.group_pane(remapped_saved_group),
+            Some(&GroupPaneTarget {
+                group_id: "grp-saved".to_owned(),
+                thread_id: Some("thr-saved".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn replacing_file_preview_or_pane_clears_stale_file_state() {
+        let mut layout = Layout::default();
+        let p_a = layout.open_file_preview(PathBuf::from("a.md"));
+        let state = SavedFileState {
+            line: 12,
+            column: 4,
+            preview: true,
+        };
+        assert!(layout.set_file_state(p_a, state));
+        assert_eq!(layout.file_state(p_a), Some(state));
+
+        let p_b = layout.open_file_preview(PathBuf::from("b.md"));
+        assert_eq!(p_b, p_a);
+        assert_eq!(layout.file_state(p_b), None);
+        assert!(layout.is_valid());
+
+        assert!(layout.set_file_state(p_b, state));
+        assert_eq!(
+            layout.open_file_in_pane(p_b, HostId::Local, PathBuf::from("c.md")),
+            Some(p_b)
+        );
+        assert_eq!(layout.file_state(p_b), None);
+        assert!(layout.is_valid());
+
+        assert!(layout.set_file_state(p_b, state));
+        layout.set_group_pane(
+            p_b,
+            Some(GroupPaneTarget {
+                group_id: "grp-1".to_owned(),
+                thread_id: None,
+            }),
+        );
+        assert_eq!(layout.file_state(p_b), None);
+        assert!(layout.is_valid());
     }
 }
 

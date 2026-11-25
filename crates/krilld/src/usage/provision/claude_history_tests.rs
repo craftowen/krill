@@ -206,6 +206,54 @@ fn prompt_history_keeps_lines_from_both_accounts() {
 }
 
 #[test]
+fn prompt_history_with_larger_duplicate_profile_file_never_overwrites_host_lines() {
+    let (home, host, profile) = fixture("prompts-dup-larger");
+    write(&host.join("history.jsonl"), b"host only\nshared\n", 10);
+    write(
+        &profile.join("history.jsonl"),
+        b"shared\nshared\nshared\nshared\nshared\nprofile unique\n",
+        20,
+    );
+    share(&host, &profile, &mut Report::default()).unwrap();
+    assert_eq!(
+        fs::read(host.join("history.jsonl")).unwrap(),
+        b"host only\nshared\nprofile unique\n"
+    );
+    assert_eq!(
+        fs::read_link(profile.join("history.jsonl")).unwrap(),
+        host.join("history.jsonl")
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn replace_with_link_rolls_back_source_and_cleans_staged_when_parking_fails() {
+    let (home, host, profile) = fixture("replace-rollback");
+    let source = profile.join("projects");
+    let target = host.join("projects");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    write(&source.join("keep.jsonl"), b"original data", 10);
+    let missing_parent_parked = host.join("no-such-dir/original");
+    let err =
+        super::super::history_store::replace_with_link(&target, &source, &missing_parent_parked)
+            .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(!source.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(
+        fs::read(source.join("keep.jsonl")).unwrap(),
+        b"original data"
+    );
+    let leftovers: Vec<_> = fs::read_dir(&profile)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".krill-link-"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover staged links: {leftovers:?}");
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn process_probe_only_defers_the_selected_profile_and_treats_errors_as_unknown() {
     let profile = Path::new("/tmp/profile with spaces");
     assert!(has_writer(

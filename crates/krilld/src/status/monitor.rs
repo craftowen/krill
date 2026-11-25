@@ -32,6 +32,12 @@ struct Tracked {
     launched: Option<bool>,
 }
 
+fn is_missing_process(error: &io::Error, is_windows: bool) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(libc::ESRCH)
+        || (is_windows && error.raw_os_error() == Some(87))
+}
+
 impl Tracked {
     /// Kernel notifications are an optimization. Keep checking the original identity,
     /// including when the agent moved to the background or the watch could not be installed.
@@ -55,11 +61,7 @@ impl Tracked {
         self.process_checked = Some(now);
         let ended = match start_us(pid) {
             Ok(current) => current != start || notified,
-            Err(e) => {
-                notified
-                    || e.kind() == io::ErrorKind::NotFound
-                    || e.raw_os_error() == Some(libc::ESRCH)
-            }
+            Err(e) => notified || is_missing_process(&e, cfg!(windows)),
         };
         if ended {
             self.process = None;

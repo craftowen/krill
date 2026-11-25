@@ -333,6 +333,18 @@ pub struct Panel {
     pub alias_configured_path: Option<PathBuf>,
 }
 
+impl Panel {
+    pub(super) fn any_alias_input_is_composing(
+        &self,
+        window: &mut Window,
+        app: &mut gpui::App,
+    ) -> bool {
+        self.alias_rows
+            .values()
+            .any(|row| crate::jump::entity_input_is_composing(&row.alias_input, window, app))
+    }
+}
+
 impl std::fmt::Debug for Panel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstallPanel")
@@ -964,8 +976,10 @@ impl SettingsView {
             let sub = cx.subscribe_in(
                 &input,
                 window,
-                |this, _, ev: &gpui_component::input::InputEvent, _, cx| match ev {
-                    gpui_component::input::InputEvent::PressEnter { .. } => {
+                |this, input, ev: &gpui_component::input::InputEvent, window, cx| match ev {
+                    gpui_component::input::InputEvent::PressEnter { .. }
+                        if !crate::jump::entity_input_is_composing(input, window, cx) =>
+                    {
                         this.save_shell_aliases(cx);
                     }
                     // 미리보기와 YOLO 경고가 입력을 따라간다.
@@ -1945,6 +1959,13 @@ impl SettingsView {
                     .debug_selector(move || input_id.clone())
                     .w(px(110.))
                     .flex_none()
+                    .capture_action(cx.listener(
+                        |this, _: &gpui_component::input::Enter, window, cx| {
+                            if this.install.any_alias_input_is_composing(window, cx) {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
                     .child(Input::new(&row_state.alias_input).small()),
             )
             .child(layout::segmented_control(p, [seg_yolo, seg_normal])),
@@ -2257,5 +2278,82 @@ mod tests {
         assert_eq!(status.version.as_deref(), Some("0.167.2"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[gpui::test]
+    fn alias_input_ignores_enter_during_ime_preedit(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler as _;
+
+        let dir = std::env::temp_dir().join(format!("krill-alias-ime-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.clone();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::super::init_at(Some(d), cx);
+        });
+        cx.run_until_parked();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| super::super::SettingsView::new(cx));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_tab(super::super::AdminTab::Install, cx);
+                v.install.alias_saved = Some(BTreeMap::new());
+                v.ensure_alias_form(window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let input = v
+                    .install
+                    .alias_rows
+                    .get("claude")
+                    .unwrap()
+                    .alias_input
+                    .clone();
+                input.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                    state.replace_and_mark_text_in_range(None, "ㅎ", None, window, cx);
+                });
+                assert!(v.input_is_composing(window, cx));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, _| {
+            assert!(
+                v.install.alias_status.is_none(),
+                "PressEnter during IME preedit must not submit aliases"
+            );
+            assert!(!v.file_jobs.contains_key("shell-alias"));
+        });
+
+        // After unmarking, Enter submits normally (and rejects the non-ASCII alias synchronously).
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let input = v
+                    .install
+                    .alias_rows
+                    .get("claude")
+                    .unwrap()
+                    .alias_input
+                    .clone();
+                input.update(cx, |state, cx| state.unmark_text(window, cx));
+                assert!(!v.input_is_composing(window, cx));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        vcx.read_entity(&view, |v, _| {
+            assert!(
+                v.install.alias_status.as_ref().is_some_and(|(_, err)| *err),
+                "PressEnter after unmarking should submit aliases"
+            );
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

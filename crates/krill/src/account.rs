@@ -12,7 +12,7 @@ use krill_proto::usage::{
     AccountsSnapshot, FEAT_USAGE, ProviderKind, ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
-const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
+const USAGE: &str = "usage: krill account [list [--json] | provisioning <on|off|status> [--json] | switch <provider> <id> | save agy [--json] | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json]]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
@@ -36,6 +36,13 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     if strs.first() == Some(&"provisioning") {
         return run_provisioning(&strs);
+    }
+    if matches!(
+        strs.as_slice(),
+        ["save", "agy" | "antigravity"] | ["save", "agy" | "antigravity", "--json"]
+    ) {
+        let json = strs.len() == 3;
+        return run_save_antigravity(json);
     }
     if let ["login", provider, id] = strs.as_slice() {
         return match login(provider, id) {
@@ -300,14 +307,60 @@ fn run_provisioning(args: &[&str]) -> ExitCode {
     }
 }
 
+fn run_save_antigravity(json: bool) -> ExitCode {
+    let req =
+        UsageRequest::AntigravityAccounts(krill_proto::usage::AntigravityAccountOp::AddCurrent);
+    match exchange(&req) {
+        Ok(UsageReply::AntigravityAccounts(Ok(state))) => {
+            if json {
+                match serde_json::to_string_pretty(&state) {
+                    Ok(rendered) => println!("{rendered}"),
+                    Err(e) => {
+                        eprintln!("account: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                println!("Managed Antigravity accounts ({}):", state.accounts.len());
+                for acc in &state.accounts {
+                    let active = if state.active_account_id.as_deref() == Some(acc.id.as_str()) {
+                        " (active)"
+                    } else {
+                        ""
+                    };
+                    let name = acc
+                        .email
+                        .as_deref()
+                        .or(acc.subject.as_deref())
+                        .unwrap_or(&acc.id);
+                    println!("  {}  {}{active}", acc.id, name);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(UsageReply::AntigravityAccounts(Err(e))) | Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(UsageReply::Failed(e)) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(_) => {
+            eprintln!("account: unexpected Antigravity account reply");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn request(req: &UsageRequest) -> Result<AccountsSnapshot, String> {
     match exchange(req)? {
         UsageReply::Accounts(snap) => Ok(snap),
         UsageReply::Current(_) | UsageReply::Orphans(_) => Ok(AccountsSnapshot::default()),
         UsageReply::ResetConsumed { snapshot, .. } => Ok(snapshot),
-        UsageReply::Provisioning(_) | UsageReply::SessionSwitchPlan(_) => {
-            Err("unexpected account reply".to_owned())
-        }
+        UsageReply::Provisioning(_)
+        | UsageReply::SessionSwitchPlan(_)
+        | UsageReply::AntigravityAccounts(_) => Err("unexpected account reply".to_owned()),
         UsageReply::Failed(e) => Err(e.to_string()),
     }
 }
@@ -382,6 +435,7 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_USAGE_MANAGE
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
         | krill_proto::usage::FEAT_ACCOUNT_POLICY
+        | krill_proto::usage::FEAT_ACCOUNT_SWITCH_CONTROL
         | krill_proto::usage::FEAT_USAGE_RESET;
     let mut conn = if matches!(
         req,

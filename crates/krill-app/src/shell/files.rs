@@ -980,7 +980,10 @@ impl Shell {
                     .and_then(|handle| {
                         handle
                             .update(cx, |_, window, _| {
-                                (window.mouse_position(), window.modifiers().platform)
+                                (
+                                    window.mouse_position(),
+                                    krill_app::keys::link_modifier(window.modifiers()),
+                                )
                             })
                             .ok()
                     });
@@ -2154,7 +2157,7 @@ impl Shell {
     }
 
     /// `krill file open|diff` CLI가 상태 디렉터리(`file-requests.json`)에 넣은 요청을 소비한다.
-    fn apply_file_requests(
+    pub(super) fn apply_file_requests(
         &mut self,
         requests: Vec<CliFileRequest>,
         window: &mut Window,
@@ -2172,7 +2175,7 @@ impl Shell {
                     self.files.goto = req
                         .line
                         .map(|line| (req.path.clone(), line, req.column.unwrap_or(1)));
-                    self.open_file(req.path, cx);
+                    self.open_file_on(krill_app::hosts::HostId::Local, req.path, cx);
                 }
                 CliFileActionKind::Diff => {
                     self.close_settings(Some(window), cx);
@@ -2184,7 +2187,11 @@ impl Shell {
                     let worktree = req.worktree;
                     let rel = req.relative_path;
                     let staged = req.staged;
+                    let local_target = self.local_target();
                     self.diff.update(cx, |d, cx| {
+                        if let Some(target) = local_target {
+                            d.connect(target, cx);
+                        }
                         d.set_visible(true, cx);
                         d.open_diff_file(worktree, &rel, staged, cx);
                     });
@@ -2898,14 +2905,7 @@ impl Shell {
         }
         let ws = self.active_workspace(cx);
         let ws_host = ws.host.clone();
-        let root = {
-            let focused_folder = self.folder();
-            if focused_folder.as_os_str().is_empty() {
-                ws.folder
-            } else {
-                focused_folder
-            }
-        };
+        let root = self.quick_open_root(cx);
         let remote_target = ws_host
             .is_remote()
             .then(|| self.target_for_host(&ws_host))
@@ -2957,14 +2957,7 @@ impl Shell {
             let (ordered, items) = loop {
                 if !this
                     .read_with(cx, |this, cx| {
-                        let current_root = {
-                            let f = this.folder();
-                            if f.as_os_str().is_empty() {
-                                this.active_workspace(cx).folder
-                            } else {
-                                f
-                            }
-                        };
+                        let current_root = this.quick_open_root(cx);
                         this.files.quick_generation == generation
                             && this.files.quick_loading
                             && this.files.quick_open.is_some()
@@ -3027,14 +3020,7 @@ impl Shell {
                     .await;
             };
             this.update(cx, |this, cx| {
-                let current_root = {
-                    let f = this.folder();
-                    if f.as_os_str().is_empty() {
-                        this.active_workspace(cx).folder
-                    } else {
-                        f
-                    }
-                };
+                let current_root = this.quick_open_root(cx);
                 if this.files.quick_generation != generation
                     || !this.files.quick_loading
                     || this.files.quick_open.is_none()
@@ -3050,6 +3036,16 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    pub(super) fn quick_open_root(&self, cx: &App) -> PathBuf {
+        if self.layout.focused().is_some() {
+            let focused_folder = self.folder();
+            if !focused_folder.as_os_str().is_empty() {
+                return focused_folder;
+            }
+        }
+        self.active_workspace(cx).folder
     }
 
     pub(super) fn quick_open_palette(&self) -> Option<gpui::Entity<jump::Palette>> {
@@ -3122,9 +3118,9 @@ fn quit_now(cx: &mut App) {
             }
             snapshots.push((window, layout));
         }
-        cx.update(|cx| {
+        let link_services = cx.update(|cx| {
             if !restart_quit_is_current(restart.as_ref(), cx) {
-                return;
+                return None;
             }
             if snapshots
                 .iter()
@@ -3135,14 +3131,28 @@ fn quit_now(cx: &mut App) {
                         shell.quit_layout_ready.set(true);
                     }
                 }
-                #[cfg(test)]
-                if let Some(observed) = cx.try_global::<QuitObserved>() {
-                    observed.0.set(true);
-                }
-                cx.quit();
+                Some(krill_app::hosts::link::begin_shutdown())
             } else {
                 quit_app(cx);
+                None
             }
+        });
+        let Some(link_services) = link_services else {
+            return;
+        };
+        if !link_services.is_empty() {
+            cx.background_executor()
+                .spawn(async move {
+                    krill_app::hosts::link::shutdown_services(&link_services);
+                })
+                .await;
+        }
+        cx.update(|cx| {
+            #[cfg(test)]
+            if let Some(observed) = cx.try_global::<QuitObserved>() {
+                observed.0.set(true);
+            }
+            cx.quit();
         });
     })
     .detach();

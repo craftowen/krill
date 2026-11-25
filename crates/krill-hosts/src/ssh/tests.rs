@@ -559,5 +559,156 @@ fn valid_local_socket_and_start_at_reject_colon_and_control_chars() {
         )
         .unwrap_err();
         assert_eq!(err2.kind(), io::ErrorKind::InvalidInput);
+
+        for bad_remote in [
+            "/remote/krilld.sock\n",
+            "\n/remote/krilld.sock",
+            "\t/remote/krilld.sock",
+            " /remote/krilld.sock",
+            "/remote/krilld.sock ",
+        ] {
+            assert!(!valid_remote_socket(bad_remote), "remote={bad_remote:?}");
+            let err = Tunnel::start_at_with_program(
+                &opts,
+                PathBuf::from("/tmp/good-local.sock"),
+                Path::new(bad_remote),
+                std::ffi::OsStr::new("ssh"),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad_remote:?}");
+        }
     }
+}
+
+#[test]
+fn resolve_host_options_and_extract_host_reject_empty_host_with_unlabeled_entry() {
+    let dir = std::env::temp_dir().join(format!("krill-r3p06-empty-host-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("hosts.toml"),
+        "[[hosts]]\ndestination = \"prod@server\"\n",
+    )
+    .unwrap();
+
+    for blank in ["", "   ", "\t"] {
+        let err = resolve_host_options(blank, Some(&dir)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "blank={blank:?}");
+    }
+    let matched = resolve_host_options("prod@server", Some(&dir)).unwrap();
+    assert_eq!(matched.destination, "prod@server");
+
+    let empty_args: Vec<OsString> = ["--host", "", "ls"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    assert!(extract_host(&empty_args).is_err());
+    let ws_args: Vec<OsString> = ["--host", "   ", "ls"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    assert!(extract_host(&ws_args).is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn effective_config_fails_closed_does_not_cache_none_and_bypasses_remote_jobs_limit() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-r3p04-ssh-g-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Fail-closed when ssh -G fails (cannot resolve effective config): must NOT inject accept-new.
+    let accept_new = "StrictHostKeyChecking=accept-new".to_owned();
+    let opts = SshOptions::new("fail-closed.invalid");
+    assert!(
+        !opts.common_args_with_config(10, None).contains(&accept_new),
+        "common_args must fail closed when effective ssh config is unavailable"
+    );
+    assert!(
+        opts.common_args_with_config(10, Some("stricthostkeychecking ask\n"))
+            .contains(&accept_new)
+    );
+    assert!(
+        !opts
+            .common_args_with_config(10, Some("stricthostkeychecking true\n"))
+            .contains(&accept_new)
+    );
+
+    let fail_dest = format!("fail-closed-{}.invalid", std::process::id());
+    let fail_ssh = dir.join("fail-ssh");
+    std::fs::write(&fail_ssh, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fail_ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(effective_config_with_program(&fail_dest, None, fail_ssh.as_os_str()).is_none());
+    // effective_config returning None must never populate SSH_CONFIGS.
+    let probe_dest = format!("no-cache-none-{}.invalid", std::process::id());
+    let key = (ssh_program(), probe_dest.clone(), None);
+    SSH_CONFIGS.lock().unwrap().remove(&key);
+    assert!(effective_config_with_program(&probe_dest, None, fail_ssh.as_os_str()).is_none());
+    assert!(!SSH_CONFIGS.lock().unwrap().contains_key(&key));
+
+    // 2. While 4 remote SSH workers saturate managed::JOBS, local `ssh -G` must still succeed.
+    let sleeper = dir.join("sleep-ssh");
+    let release = dir.join("release");
+    std::fs::write(
+        &sleeper,
+        format!(
+            "#!/bin/sh\ntouch \"$1\"\nwhile [ ! -f '{}' ]; do sleep 0.02; done\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sleeper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let fast_ssh = dir.join("fast-ssh-g");
+    std::fs::write(
+        &fast_ssh,
+        "#!/bin/sh\nif [ \"$1\" = -G ]; then printf 'user u\\nhostname h\\nstricthostkeychecking true\\n'; exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fast_ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let marker = dir.join(format!("slot-{i}"));
+        let prog = sleeper.clone().into_os_string();
+        handles.push(std::thread::spawn(move || {
+            crate::managed::run_piped_ssh_with_timeout(
+                &prog,
+                &[marker.to_string_lossy().into_owned()],
+                None,
+                Duration::from_secs(10),
+            )
+        }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (0..4).any(|i| !dir.join(format!("slot-{i}")).exists()) {
+        assert!(
+            Instant::now() < deadline,
+            "4 remote SSH workers did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Confirm a 5th remote job is rejected by JOBS, while local `ssh -G` succeeds immediately.
+    let fifth = crate::managed::run_piped_ssh_with_timeout(
+        fast_ssh.as_os_str(),
+        &["-G".to_owned(), "host".to_owned()],
+        None,
+        Duration::from_secs(2),
+    );
+    assert_eq!(fifth.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+    let cfg = effective_config_with_program("host", None, fast_ssh.as_os_str())
+        .expect("local ssh -G must bypass remote JOBS semaphore");
+    assert!(user_sets_host_key_checking(&cfg));
+
+    std::fs::write(&release, "").unwrap();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }

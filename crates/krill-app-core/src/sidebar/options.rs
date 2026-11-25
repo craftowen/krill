@@ -584,6 +584,24 @@ pub(super) fn is_worktree_awake(
         })
 }
 
+pub(super) fn is_automation_worktree_path(path: &Path) -> bool {
+    let mut parts = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .flat_map(|s| s.split(['/', '\\']))
+        .filter(|s| !s.is_empty())
+        .peekable();
+    while let Some(part) = parts.next() {
+        if part.eq_ignore_ascii_case("automations") && parts.peek().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 pub(super) fn is_worktree_visible(
     repo: &Path,
     path: &Path,
@@ -593,12 +611,10 @@ pub(super) fn is_worktree_visible(
     options: &WorkspaceOptions,
     ctx: &WorktreeContext<'_>,
 ) -> bool {
-    if options.filters.hide_automation && {
-        let lossy = path.to_string_lossy();
-        ctx.automation_worktrees.is_some_and(|s| s.contains(path))
-            || lossy.contains("/.orca/automations/")
-            || lossy.contains("/automations/")
-    } {
+    if options.filters.hide_automation
+        && (ctx.automation_worktrees.is_some_and(|s| s.contains(path))
+            || is_automation_worktree_path(path))
+    {
         return false;
     }
     if options.filters.hide_cli
@@ -1343,7 +1359,9 @@ impl Sidebar {
             created_at: Some(&self.disk.worktree_created_at),
             unread: Some(&self.unread),
             unread_worktrees: Some(&derived.unread_worktrees),
-            focused: self.focused,
+            focused: self
+                .focused
+                .filter(|_| self.same_machine_host(&HostId::Local, &self.focused_host)),
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
@@ -1420,7 +1438,9 @@ impl Sidebar {
             prs: Some(&self.prs),
             statuses: Some(&self.worktree_statuses),
             updated_at: Some(&self.worktree_updated_at),
-            focused: self.focused,
+            focused: self
+                .focused
+                .filter(|_| self.same_machine_host(&host_id, &self.focused_host)),
             awake_worktrees: None,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
@@ -2830,5 +2850,25 @@ mod projection_tests {
                 "sort_by={sort_by:?} must compare updated_at secs with created_ms / 1000 + 300"
             );
         }
+    }
+
+    #[test]
+    fn is_automation_worktree_path_handles_posix_and_windows_separators() {
+        assert!(is_automation_worktree_path(Path::new(
+            "/Users/me/.orca/automations/job-1"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            "/work/automations/nightly"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            r"C:\Users\me\.orca\automations\job-1"
+        )));
+        assert!(is_automation_worktree_path(Path::new(
+            r"D:\work\automations\nightly"
+        )));
+        assert!(!is_automation_worktree_path(Path::new(
+            "/work/my-automations/job-1"
+        )));
+        assert!(!is_automation_worktree_path(Path::new("/work/automations")));
     }
 }

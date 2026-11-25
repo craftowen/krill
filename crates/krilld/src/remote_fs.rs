@@ -420,6 +420,15 @@ fn is_forbidden_git_or_win32_segment(part: &OsStr) -> bool {
         || (cfg!(windows) && (lossy.contains(':') || lossy.ends_with(['.', ' '])))
 }
 
+fn is_allowed_canonical_target(canon_repo: &Path, canon_target: &Path) -> bool {
+    let Ok(rel) = canon_target.strip_prefix(canon_repo) else {
+        return false;
+    };
+    rel.components().all(
+        |comp| matches!(comp, Component::Normal(part) if !is_forbidden_git_or_win32_segment(part)),
+    )
+}
+
 fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>> {
     let denied = || {
         io::Error::new(
@@ -445,7 +454,7 @@ fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>
     }
     let canon_repo = fs::canonicalize(repo)?;
     let canon_dir = fs::canonicalize(dir)?;
-    if !canon_dir.starts_with(&canon_repo) {
+    if !is_allowed_canonical_target(&canon_repo, &canon_dir) {
         return Err(denied());
     }
     let rd = fs::read_dir(dir)?;
@@ -470,7 +479,7 @@ fn read_raw_dir_entries(repo: &Path, dir: &Path) -> io::Result<Vec<WireDirEntry>
             let is_dir = ft.is_dir()
                 || (is_symlink
                     && fs::canonicalize(&path)
-                        .is_ok_and(|t| t.starts_with(&canon_repo) && t.is_dir()));
+                        .is_ok_and(|t| is_allowed_canonical_target(&canon_repo, &t) && t.is_dir()));
             (is_dir, is_symlink)
         });
         let relative_path = path
@@ -600,6 +609,26 @@ fn drain_pipe_capped(
     }
 }
 
+const CLEARED_GIT_ENV: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+];
+
+fn git_command(program: &Path, repo: &Path) -> std::process::Command {
+    let mut cmd = krill_proto::os::background_command(program);
+    own_group(&mut cmd)
+        .current_dir(krill_proto::os::shell_path(repo))
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for var in CLEARED_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
     query_git_ignored_with(Path::new("git"), repo, relative_paths, GIT_TIMEOUT)
 }
@@ -613,21 +642,17 @@ fn query_git_ignored_with(
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return Vec::new();
     }
-    let mut cmd = krill_proto::os::background_command(program);
-    own_group(&mut cmd)
-        .current_dir(krill_proto::os::shell_path(repo))
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "core.quotePath=false",
-            "check-ignore",
-            "--stdin",
-            "-z",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    let mut cmd = git_command(program, repo);
+    cmd.args([
+        "-c",
+        "core.quotePath=false",
+        "check-ignore",
+        "--stdin",
+        "-z",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     let Ok(mut child) = spawn(&mut cmd) else {
         return Vec::new();
     };
@@ -794,7 +819,7 @@ fn ensure_worktree_create_path(
         match fs::symlink_metadata(&cur) {
             Ok(_) => {
                 let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                if !canon_cur.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_cur) {
                     return Err(denied());
                 }
             }
@@ -825,7 +850,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                         "target directory is outside worktree",
                     )
                 })?;
-                if !canon_parent.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_parent) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target directory is outside worktree",
@@ -856,7 +881,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                         "target directory is outside worktree",
                     )
                 })?;
-                if !canon_parent.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_parent) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "target directory is outside worktree",
@@ -913,12 +938,12 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                 }
                 cur.push(part);
                 let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                if !canon_cur.starts_with(&canon_repo) {
+                if !is_allowed_canonical_target(&canon_repo, &canon_cur) {
                     return Err(denied());
                 }
             }
             let canon_parent = parent.canonicalize().map_err(|_| denied())?;
-            if !canon_parent.starts_with(&canon_repo) {
+            if !is_allowed_canonical_target(&canon_repo, &canon_parent) {
                 return Err(denied());
             }
             target.symlink_metadata()?;
@@ -968,7 +993,7 @@ fn execute_explorer_op(repo: &Path, op: WireExplorerOp) -> io::Result<PathBuf> {
                 cur.push(part);
                 if comps.peek().is_some() {
                     let canon_cur = cur.canonicalize().map_err(|_| denied())?;
-                    if !canon_cur.starts_with(&canon_repo) {
+                    if !is_allowed_canonical_target(&canon_repo, &canon_cur) {
                         return Err(denied());
                     }
                 }
@@ -1021,23 +1046,19 @@ fn git_ls_files_with(program: &Path, root: &Path, deadline: Instant) -> Option<V
     if !root.join(".git").exists() {
         return None;
     }
-    let mut cmd = krill_proto::os::background_command(program);
-    own_group(&mut cmd)
-        .current_dir(krill_proto::os::shell_path(root))
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "core.quotePath=false",
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    let mut cmd = git_command(program, root);
+    cmd.args([
+        "-c",
+        "core.quotePath=false",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     let mut child = spawn(&mut cmd).ok()?;
     let stdout_raw = child.stdout.take()?;
     let mut stdout = PipeReader::new(stdout_raw).ok()?;
@@ -1534,6 +1555,76 @@ mod tests {
             && let Ok(pid) = pid_text.trim().parse::<i32>()
         {
             assert!(crate::sys::process_name(pid.unsigned_abs()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_repo_symlink_to_git_cannot_bypass_git_protection() {
+        let outer = TestDir::new("git-symlink");
+        let repo = outer.path().join("repo");
+        fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        fs::write(repo.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let repo = repo.canonicalize().unwrap();
+
+        let link = repo.join("git-link");
+        std::os::unix::fs::symlink(repo.join(".git"), &link).unwrap();
+
+        assert!(read_dir_listing(&repo, &link).is_err());
+        let listing = read_dir_listing(&repo, &repo).unwrap();
+        let entry = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "git-link")
+            .unwrap();
+        assert!(entry.is_symlink);
+        assert!(!entry.is_dir);
+
+        let link_wire = link.as_os_str().as_bytes().to_vec();
+        let repo_wire = repo.as_os_str().as_bytes().to_vec();
+        for op in [
+            WireExplorerOp::CreateFile {
+                parent: link_wire.clone(),
+                name: "injected".to_owned(),
+            },
+            WireExplorerOp::CreateFile {
+                parent: repo_wire.clone(),
+                name: "git-link/injected".to_owned(),
+            },
+            WireExplorerOp::CreateFolder {
+                parent: link_wire,
+                name: "injected-dir".to_owned(),
+            },
+            WireExplorerOp::CreateFolder {
+                parent: repo_wire,
+                name: "git-link/injected-dir".to_owned(),
+            },
+            WireExplorerOp::Rename {
+                path: link.join("HEAD").as_os_str().as_bytes().to_vec(),
+                new_name: "HEAD2".to_owned(),
+            },
+            WireExplorerOp::Delete {
+                path: link.join("HEAD").as_os_str().as_bytes().to_vec(),
+            },
+        ] {
+            let err = execute_explorer_op(&repo, op).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert!(repo.join(".git/HEAD").is_file());
+        assert!(!repo.join(".git/injected").exists());
+        assert!(!repo.join(".git/injected-dir").exists());
+    }
+
+    #[test]
+    fn git_command_clears_inherited_git_repository_env_vars() {
+        let cmd = git_command(Path::new("git"), Path::new("."));
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for var in CLEARED_GIT_ENV {
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == OsStr::new(var) && v.is_none()),
+                "missing env_remove for {var}"
+            );
         }
     }
 }

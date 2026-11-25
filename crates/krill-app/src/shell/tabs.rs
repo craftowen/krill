@@ -1985,8 +1985,14 @@ impl Shell {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.tab_context_menu = None;
+                        let Some(tab) = this.layout.tab_of_pane(pane) else {
+                            return;
+                        };
                         if this.layout.focused() != Some(pane) {
-                            this.change(false, cx, |l| l.focus(pane));
+                            this.change(false, cx, |l| {
+                                l.activate(tab);
+                                l.focus(pane);
+                            });
                         }
                         this.toggle_chat_view_with_focus(window, cx);
                     })),

@@ -3,6 +3,8 @@
 #[cfg(unix)]
 mod detach;
 #[cfg(unix)]
+mod early_exit;
+#[cfg(unix)]
 mod handoff_env;
 #[cfg(unix)]
 mod link;

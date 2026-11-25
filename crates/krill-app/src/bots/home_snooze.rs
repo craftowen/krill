@@ -699,6 +699,7 @@ fn item_params(
         decisions: Vec::new(),
         close_note: None,
         snoozed_until_ms: snooze,
+        waiting_reason: None,
     }
 }
 

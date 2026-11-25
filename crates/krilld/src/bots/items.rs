@@ -17,13 +17,14 @@ use krill_proto::bots::{
     BOT_ITEM_COMMENT_MAX_BYTES, BOT_ITEM_DESCRIPTION_MAX_BYTES, BOT_ITEM_TITLE_MAX_BYTES, BotId,
     BotItem, BotItemActor, BotItemDecision, BotItemEvent, BotItemEventKind, BotItemLink,
     BotItemStatus, BotItemsPage, CreateBotItemParams, FieldPatch, UpdateBotItemParams,
+    validate_waiting_reason,
 };
 use krill_proto::os::fs::DirBuilderExt as _;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::session::lock;
 
-const CURRENT_DB_VERSION: i64 = 1;
+const CURRENT_DB_VERSION: i64 = 2;
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 200;
 static ITEM_UID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -37,13 +38,14 @@ pub enum BotItemsStatusFilter {
 }
 
 impl BotItemsStatusFilter {
-    /// Parses a mobile/CLI status filter token (`needs_you`/`needs-you`, `working`, `planned`,
+    /// Parses a mobile/CLI status filter token (`needs_you`/`needs-you`, `working`, `waiting`, `planned`,
     /// `done`, `canceled`/`cancelled`, `closed`, `snoozed`).
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "planned" => Some(Self::Status(BotItemStatus::Planned)),
             "working" => Some(Self::Status(BotItemStatus::Working)),
+            "waiting" => Some(Self::Status(BotItemStatus::Waiting)),
             "needs_you" | "needs-you" => Some(Self::Status(BotItemStatus::NeedsYou)),
             "done" => Some(Self::Status(BotItemStatus::Done)),
             "canceled" | "cancelled" => Some(Self::Status(BotItemStatus::Canceled)),
@@ -109,7 +111,7 @@ impl BotItemsStore {
             let mut sql = String::from(
                 "SELECT uid, number, owner_bot_id, title, description, done_means, status, \
                  close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, \
-                 updated_at_ms, closed_at_ms \
+                 updated_at_ms, closed_at_ms, waiting_reason, waiting_since_ms \
                  FROM items WHERE 1=1",
             );
             let mut bind: Vec<rusqlite::types::Value> = Vec::new();
@@ -256,7 +258,7 @@ impl BotItemsStore {
             let mut page_sql = format!(
                 "SELECT uid, number, owner_bot_id, title, description, done_means, status, \
                  close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, \
-                 updated_at_ms, closed_at_ms \
+                 updated_at_ms, closed_at_ms, waiting_reason, waiting_since_ms \
                  FROM items{where_clause}"
             );
             let mut page_bind = base_bind;
@@ -355,6 +357,19 @@ impl BotItemsStore {
         let description = validate_optional_description(params_in.description.as_deref())?;
         let done_means = validate_optional_description(params_in.done_means.as_deref())?;
         let status = params_in.status.unwrap_or(BotItemStatus::Planned);
+        let (waiting_reason, waiting_since_ms) = if status == BotItemStatus::Waiting {
+            let raw = params_in.waiting_reason.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "waiting status requires a non-empty waiting_reason note",
+                )
+            })?;
+            let reason = validate_waiting_reason(raw)
+                .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+            (Some(reason), Some(now_ms))
+        } else {
+            (None, None)
+        };
         let closed_at_ms = (!status.is_open()).then_some(now_ms);
         let seq = ITEM_UID_SEQ.fetch_add(1, Ordering::Relaxed);
         let uid = format!("item-{now_ms}-{}-{seq}", std::process::id());
@@ -379,8 +394,8 @@ impl BotItemsStore {
                 "INSERT INTO items \
                  (uid, number, owner_bot_id, title, description, done_means, status, close_note, \
                   snoozed_until_ms, version, last_activity_at_ms, created_at_ms, updated_at_ms, closed_at_ms, \
-                  mail_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 1, ?8, ?8, ?8, ?9, ?10)",
+                  mail_state, waiting_reason, waiting_since_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 1, ?8, ?8, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     uid,
                     next_number,
@@ -392,6 +407,8 @@ impl BotItemsStore {
                     u64_to_i64(now_ms),
                     closed_at_ms.map(u64_to_i64),
                     initial_mail_state,
+                    waiting_reason,
+                    waiting_since_ms.map(u64_to_i64),
                 ],
             )
             .map_err(sql_err)?;
@@ -502,8 +519,9 @@ impl BotItemsStore {
                 edited = true;
             }
 
-            let status_changed = params_in.status.filter(|&s| s != item.status);
-            let effective_status = status_changed.unwrap_or(item.status);
+            let prev_status = item.status;
+            let status_changed = params_in.status.filter(|&s| s != prev_status);
+            let effective_status = status_changed.unwrap_or(prev_status);
             if !effective_status.is_open()
                 && matches!(params_in.snoozed_until_ms, FieldPatch::Set(_))
             {
@@ -512,8 +530,43 @@ impl BotItemsStore {
                     "cannot snooze a closed (Done or Canceled) item",
                 ));
             }
-            if let Some(new_status) = status_changed {
+
+            let wants_waiting = params_in.status == Some(BotItemStatus::Waiting)
+                || (params_in.status.is_none()
+                    && prev_status == BotItemStatus::Waiting
+                    && params_in.waiting_reason.is_some());
+            let mut waiting_status_event: Option<String> = None;
+
+            if wants_waiting {
+                if prev_status == BotItemStatus::NeedsYou {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "item #{} waits on your owner's answer; it stays needs_you (put the wait in a comment)",
+                            item.number
+                        ),
+                    ));
+                }
+                let raw_reason = params_in.waiting_reason.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "waiting status requires a non-empty waiting_reason note",
+                    )
+                })?;
+                let validated_reason = validate_waiting_reason(raw_reason)
+                    .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+                let reason_changed = item.waiting_reason.as_deref() != Some(validated_reason.as_str());
+                item.status = BotItemStatus::Waiting;
+                item.closed_at_ms = None;
+                if prev_status != BotItemStatus::Waiting || reason_changed {
+                    item.waiting_reason = Some(validated_reason.clone());
+                    item.waiting_since_ms = Some(now_ms);
+                    waiting_status_event = Some(format!("status -> waiting: {validated_reason}"));
+                }
+            } else if let Some(new_status) = status_changed {
                 item.status = new_status;
+                item.waiting_reason = None;
+                item.waiting_since_ms = None;
                 if new_status.is_open() {
                     item.closed_at_ms = None;
                 } else {
@@ -576,8 +629,9 @@ impl BotItemsStore {
                 "UPDATE items SET title = ?1, description = ?2, done_means = ?3, status = ?4, \
                  close_note = ?5, snoozed_until_ms = ?6, version = ?7, last_activity_at_ms = ?8, \
                  updated_at_ms = ?8, closed_at_ms = ?9, \
-                 mail_state = COALESCE(?10, mail_state) \
-                 WHERE uid = ?11",
+                 mail_state = COALESCE(?10, mail_state), \
+                 waiting_reason = ?11, waiting_since_ms = ?12 \
+                 WHERE uid = ?13",
                 params![
                     item.title,
                     item.description,
@@ -589,6 +643,8 @@ impl BotItemsStore {
                     u64_to_i64(now_ms),
                     item.closed_at_ms.map(u64_to_i64),
                     next_mail_state,
+                    item.waiting_reason,
+                    item.waiting_since_ms.map(u64_to_i64),
                     uid,
                 ],
             )
@@ -610,7 +666,17 @@ impl BotItemsStore {
                     now_ms,
                 )?;
             }
-            if let Some(new_status) = status_changed {
+            if let Some(wait_text) = waiting_status_event {
+                insert_event(
+                    &tx,
+                    &uid,
+                    BotItemEventKind::Status,
+                    actor,
+                    &wait_text,
+                    &[],
+                    now_ms,
+                )?;
+            } else if let Some(new_status) = status_changed {
                 let status_decisions: &[BotItemDecision] = if trimmed_comment.is_some() {
                     &[]
                 } else {
@@ -1118,6 +1184,15 @@ impl BotItemsStore {
                 )
             })?;
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let cur_status_raw: String = tx
+                .query_row(
+                    "SELECT status FROM items WHERE uid = ?1",
+                    params![uid],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            let wake_from_waiting = matches!(link, BotItemLink::Dispatch(_))
+                && parse_status(&cur_status_raw) == BotItemStatus::Waiting;
             let inserted = tx
                 .execute(
                     "INSERT OR IGNORE INTO item_links (item_uid, kind, target) VALUES (?1, ?2, ?3)",
@@ -1134,6 +1209,25 @@ impl BotItemsStore {
                     &[],
                     now_ms,
                 )?;
+            }
+            if wake_from_waiting {
+                insert_event(
+                    &tx,
+                    &uid,
+                    BotItemEventKind::Status,
+                    actor,
+                    "status -> working",
+                    &[],
+                    now_ms,
+                )?;
+                tx.execute(
+                    "UPDATE items SET status = 'working', waiting_reason = NULL, \
+                     waiting_since_ms = NULL, version = version + 1, \
+                     last_activity_at_ms = ?1, updated_at_ms = ?1 WHERE uid = ?2",
+                    params![u64_to_i64(now_ms), uid],
+                )
+                .map_err(sql_err)?;
+            } else if inserted > 0 {
                 tx.execute(
                     "UPDATE items SET version = version + 1, last_activity_at_ms = ?1, updated_at_ms = ?1 WHERE uid = ?2",
                     params![u64_to_i64(now_ms), uid],
@@ -1216,6 +1310,8 @@ fn open_and_migrate(path: &PathBuf) -> io::Result<Connection> {
              mail_state TEXT,\n\
              request_id TEXT,\n\
              answer_id TEXT,\n\
+             waiting_reason TEXT,\n\
+             waiting_since_ms INTEGER,\n\
              UNIQUE(owner_bot_id, number)\n\
          );\n\
          CREATE INDEX IF NOT EXISTS idx_items_bot_status ON items(owner_bot_id, status);\n\
@@ -1250,10 +1346,11 @@ fn open_and_migrate(path: &PathBuf) -> io::Result<Connection> {
         .map_err(sql_err)?;
     if user_version < CURRENT_DB_VERSION {
         ensure_items_v1_columns(&conn)?;
+        ensure_items_v2_columns(&conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_items_mail_state ON items(owner_bot_id, mail_state);\n\
              CREATE INDEX IF NOT EXISTS idx_items_request_id ON items(request_id);\n\
-             PRAGMA user_version = 1;",
+             PRAGMA user_version = 2;",
         )
         .map_err(sql_err)?;
     }
@@ -1286,6 +1383,26 @@ fn ensure_items_v1_columns(conn: &Connection) -> io::Result<()> {
         ("request_id", "TEXT"),
         ("answer_id", "TEXT"),
     ] {
+        if !existing.contains(col) {
+            conn.execute(&format!("ALTER TABLE items ADD COLUMN {col} {ty}"), [])
+                .map_err(sql_err)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_items_v2_columns(conn: &Connection) -> io::Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(items)").map_err(sql_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_err)?;
+    for row in rows {
+        existing.insert(row.map_err(sql_err)?);
+    }
+    drop(stmt);
+
+    for (col, ty) in [("waiting_reason", "TEXT"), ("waiting_since_ms", "INTEGER")] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE items ADD COLUMN {col} {ty}"), [])
                 .map_err(sql_err)?;
@@ -1686,7 +1803,7 @@ fn load_item_by_uid(conn: &Connection, uid: &str) -> io::Result<Option<BotItem>>
         .query_row(
             "SELECT uid, number, owner_bot_id, title, description, done_means, status, \
              close_note, snoozed_until_ms, version, last_activity_at_ms, created_at_ms, \
-             updated_at_ms, closed_at_ms \
+             updated_at_ms, closed_at_ms, waiting_reason, waiting_since_ms \
              FROM items WHERE uid = ?1",
             params![uid],
             row_to_item_header,
@@ -1716,6 +1833,8 @@ fn row_to_item_header(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotItem> {
     let created: i64 = row.get(11)?;
     let updated: i64 = row.get(12)?;
     let closed: Option<i64> = row.get(13)?;
+    let waiting_reason: Option<String> = row.get(14)?;
+    let waiting_since: Option<i64> = row.get(15)?;
 
     let owner_bot_id = BotId::new(&owner_raw).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
@@ -1738,6 +1857,8 @@ fn row_to_item_header(row: &rusqlite::Row<'_>) -> rusqlite::Result<BotItem> {
         created_at_ms: i64_to_u64(created),
         updated_at_ms: i64_to_u64(updated),
         closed_at_ms: closed.map(i64_to_u64),
+        waiting_reason,
+        waiting_since_ms: waiting_since.map(i64_to_u64),
     })
 }
 
@@ -1846,6 +1967,7 @@ fn decode_link(kind: &str, target: String) -> BotItemLink {
 fn parse_status(raw: &str) -> BotItemStatus {
     match raw {
         "working" => BotItemStatus::Working,
+        "waiting" => BotItemStatus::Waiting,
         "needs_you" | "needs-you" => BotItemStatus::NeedsYou,
         "done" => BotItemStatus::Done,
         "canceled" => BotItemStatus::Canceled,
@@ -2036,6 +2158,7 @@ mod tests {
                     links: vec![BotItemLink::Pr(
                         "https://github.com/craftowen/krill/pull/42".to_owned(),
                     )],
+                    waiting_reason: None,
                 },
                 &actor,
                 1_000,
@@ -2088,6 +2211,7 @@ mod tests {
                     decisions: Vec::new(),
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Set(10_000),
+                    waiting_reason: None,
                 },
                 &actor,
                 3_000,
@@ -2121,6 +2245,7 @@ mod tests {
                     decisions: Vec::new(),
                     close_note: Some("Done".to_owned()),
                     snoozed_until_ms: FieldPatch::Clear,
+                    waiting_reason: None,
                 },
                 &actor,
                 6_000,
@@ -2167,6 +2292,7 @@ mod tests {
                     done_means: None,
                     status: None,
                     links: vec![],
+                    waiting_reason: None,
                 },
                 &owner,
                 1_000,
@@ -2184,6 +2310,7 @@ mod tests {
                     decisions: vec![],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 },
                 &owner,
                 2_000,
@@ -2222,6 +2349,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: vec![],
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 1_000,
@@ -2236,6 +2364,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::Planned),
                     links: vec![],
+                    waiting_reason: None,
                 },
                 &owner,
                 1_100,
@@ -2264,6 +2393,7 @@ mod tests {
                     }],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 },
                 &owner,
                 1_500,
@@ -2294,6 +2424,7 @@ mod tests {
                     }],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Set(99_000),
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 2_000,
@@ -2326,6 +2457,7 @@ mod tests {
                         decisions: Vec::new(),
                         close_note: None,
                         snoozed_until_ms: FieldPatch::Set(120_000),
+                        waiting_reason: None,
                     },
                     &owner,
                     2_100,
@@ -2390,6 +2522,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::Working),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &owner,
                 5_000,
@@ -2407,6 +2540,7 @@ mod tests {
                     decisions: Vec::new(),
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Set(999_999),
+                    waiting_reason: None,
                 },
                 &owner,
                 5_100,
@@ -2441,6 +2575,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &owner,
                 5_300,
@@ -2505,6 +2640,7 @@ mod tests {
                     done_means: Some("Rollout plan confirmed".to_owned()),
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 1_000,
@@ -2540,6 +2676,7 @@ mod tests {
                     ],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 1_500,
@@ -2672,6 +2809,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 3_000,
@@ -2714,6 +2852,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 4_000,
@@ -2744,6 +2883,7 @@ mod tests {
                     ],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 4_100,
@@ -2803,6 +2943,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 1_000,
@@ -2833,6 +2974,7 @@ mod tests {
                     ],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 1_100,
@@ -2933,6 +3075,7 @@ mod tests {
                     done_means: None,
                     status: Some(BotItemStatus::NeedsYou),
                     links: Vec::new(),
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 2_000,
@@ -2963,6 +3106,7 @@ mod tests {
                     ],
                     close_note: None,
                     snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
                 },
                 &bot_actor,
                 2_100,
@@ -2996,6 +3140,301 @@ mod tests {
         assert!(norm_ans.should_wake_bot);
         assert_eq!(norm_ans.item.status, BotItemStatus::Working);
         assert_eq!(norm_ans.answer_summary, "Env? → Prod\nMode? → Safe");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waiting_status_validation_guardrails_dispatch_wakeup_and_v1_migration() {
+        let (dir, db) = temp_db("waiting-v2-mig");
+        // Seed a legacy v1 SQLite database (no waiting_reason / waiting_since_ms columns).
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (\n\
+                     uid TEXT PRIMARY KEY,\n\
+                     number INTEGER NOT NULL,\n\
+                     owner_bot_id TEXT NOT NULL,\n\
+                     title TEXT NOT NULL,\n\
+                     description TEXT,\n\
+                     done_means TEXT,\n\
+                     status TEXT NOT NULL,\n\
+                     close_note TEXT,\n\
+                     snoozed_until_ms INTEGER,\n\
+                     version INTEGER NOT NULL,\n\
+                     last_activity_at_ms INTEGER NOT NULL,\n\
+                     created_at_ms INTEGER NOT NULL,\n\
+                     updated_at_ms INTEGER NOT NULL,\n\
+                     closed_at_ms INTEGER,\n\
+                     chat_id TEXT,\n\
+                     question_event TEXT,\n\
+                     others_last_event_id INTEGER,\n\
+                     mail_state TEXT,\n\
+                     request_id TEXT,\n\
+                     answer_id TEXT,\n\
+                     UNIQUE(owner_bot_id, number)\n\
+                 );\n\
+                 CREATE TABLE item_links (\n\
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                     item_uid TEXT NOT NULL REFERENCES items(uid) ON DELETE CASCADE,\n\
+                     kind TEXT NOT NULL,\n\
+                     target TEXT NOT NULL,\n\
+                     UNIQUE(item_uid, kind, target)\n\
+                 );\n\
+                 CREATE TABLE item_events (\n\
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                     item_uid TEXT NOT NULL REFERENCES items(uid) ON DELETE CASCADE,\n\
+                     kind TEXT NOT NULL,\n\
+                     actor_json TEXT NOT NULL,\n\
+                     text TEXT NOT NULL,\n\
+                     decisions_json TEXT NOT NULL,\n\
+                     created_at_ms INTEGER NOT NULL\n\
+                 );\n\
+                 CREATE TABLE items_seen (\n\
+                     bot_id TEXT PRIMARY KEY,\n\
+                     last_seen_event_id INTEGER NOT NULL DEFAULT 0,\n\
+                     opened_at_ms INTEGER NOT NULL DEFAULT 0\n\
+                 );\n\
+                 INSERT INTO items (uid, number, owner_bot_id, title, status, version, last_activity_at_ms, created_at_ms, updated_at_ms)\n\
+                 VALUES ('legacy-1', 1, 'bot-w', 'Pre-existing item', 'working', 1, 1000, 1000, 1000);\n\
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        let store = BotItemsStore::new(db);
+        let bot = BotId::new("bot-w").unwrap();
+        let bot_actor = BotItemActor::Bot {
+            bot_id: bot.clone(),
+            session_id: None,
+        };
+        let owner = BotItemActor::Owner { device: None };
+
+        // Existing row survives v1 -> v2 migration intact with waiting fields = None.
+        let migrated = store.get_item("legacy-1").unwrap().unwrap();
+        assert_eq!(migrated.title, "Pre-existing item");
+        assert_eq!(migrated.status, BotItemStatus::Working);
+        assert_eq!(migrated.waiting_reason, None);
+        assert_eq!(migrated.waiting_since_ms, None);
+
+        // Moving to Waiting rejects missing, empty, multiline, and >200-char reasons.
+        for bad in [
+            None,
+            Some("   ".to_owned()),
+            Some("line1\nline2".to_owned()),
+            Some("x".repeat(201)),
+        ] {
+            let res = store.update_item(
+                &UpdateBotItemParams {
+                    item_id: migrated.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Waiting),
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: bad,
+                },
+                &bot_actor,
+                2_000,
+            );
+            assert!(res.is_err());
+        }
+
+        // Valid single-line reason (exact 200 chars or trimmed) succeeds and records Status event.
+        let waiting = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: migrated.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Waiting),
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: Some("  CI on PR #42  ".to_owned()),
+                },
+                &bot_actor,
+                2_500,
+            )
+            .unwrap();
+        assert_eq!(waiting.status, BotItemStatus::Waiting);
+        assert_eq!(waiting.waiting_reason.as_deref(), Some("CI on PR #42"));
+        assert_eq!(waiting.waiting_since_ms, Some(2_500));
+        assert!(
+            waiting
+                .events
+                .iter()
+                .any(|e| e.kind == BotItemEventKind::Status
+                    && e.text == "status -> waiting: CI on PR #42")
+        );
+
+        // Re-setting Waiting with a new reason replaces reason + timestamp and records a new event.
+        let replaced = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: migrated.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Waiting),
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: Some("Review from Alice".to_owned()),
+                },
+                &bot_actor,
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(replaced.status, BotItemStatus::Waiting);
+        assert_eq!(
+            replaced.waiting_reason.as_deref(),
+            Some("Review from Alice")
+        );
+        assert_eq!(replaced.waiting_since_ms, Some(3_000));
+        assert_eq!(
+            replaced
+                .events
+                .iter()
+                .filter(|e| e.kind == BotItemEventKind::Status)
+                .count(),
+            2
+        );
+
+        // Filtered query for "waiting" returns the item.
+        let wait_page = store
+            .list_items_page_filtered(
+                Some(&bot),
+                BotItemsStatusFilter::parse("waiting"),
+                false,
+                false,
+                Some(10),
+                None,
+                3_100,
+            )
+            .unwrap();
+        assert_eq!(wait_page.items.len(), 1);
+        assert_eq!(wait_page.items[0].uid, migrated.uid);
+
+        // Comments and non-dispatch links keep the item Waiting with its reason intact.
+        let commented = store
+            .add_comment(&migrated.uid, &owner, "Pinged Alice", &[], 3_200)
+            .unwrap();
+        assert_eq!(commented.status, BotItemStatus::Waiting);
+        assert_eq!(
+            commented.waiting_reason.as_deref(),
+            Some("Review from Alice")
+        );
+        let pr_linked = store
+            .add_link(
+                &migrated.uid,
+                &BotItemLink::Pr("org/repo#42".to_owned()),
+                &bot_actor,
+                3_300,
+            )
+            .unwrap();
+        assert_eq!(pr_linked.status, BotItemStatus::Waiting);
+
+        // Linking a worker Dispatch moves Waiting -> Working and clears waiting metadata.
+        let dispatched = store
+            .add_link(
+                &migrated.uid,
+                &BotItemLink::Dispatch("disp-42".to_owned()),
+                &bot_actor,
+                3_500,
+            )
+            .unwrap();
+        assert_eq!(dispatched.status, BotItemStatus::Working);
+        assert_eq!(dispatched.waiting_reason, None);
+        assert_eq!(dispatched.waiting_since_ms, None);
+        assert!(
+            dispatched.events.last().is_some_and(
+                |e| e.kind == BotItemEventKind::Status && e.text == "status -> working"
+            )
+        );
+
+        // Guardrail: NeedsYou item refuses moving directly to Waiting.
+        let needs_you = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: bot,
+                    title: "Approve rollout".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                    waiting_reason: None,
+                },
+                &bot_actor,
+                4_000,
+            )
+            .unwrap();
+        let blocked = store.update_item(
+            &UpdateBotItemParams {
+                item_id: needs_you.uid,
+                title: None,
+                description: None,
+                done_means: None,
+                status: Some(BotItemStatus::Waiting),
+                comment: None,
+                decisions: Vec::new(),
+                close_note: None,
+                snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: Some("CI run".to_owned()),
+            },
+            &bot_actor,
+            4_100,
+        );
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().to_string().contains("stays needs_you"));
+
+        // Leaving Waiting via explicit status transition clears waiting_reason & waiting_since_ms.
+        let back_waiting = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: migrated.uid.clone(),
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Waiting),
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: Some("Deploy window".to_owned()),
+                },
+                &bot_actor,
+                4_200,
+            )
+            .unwrap();
+        assert_eq!(back_waiting.status, BotItemStatus::Waiting);
+        let done = store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: migrated.uid,
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Done),
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: Some("Shipped".to_owned()),
+                    snoozed_until_ms: FieldPatch::Unchanged,
+                    waiting_reason: None,
+                },
+                &bot_actor,
+                4_500,
+            )
+            .unwrap();
+        assert_eq!(done.status, BotItemStatus::Done);
+        assert_eq!(done.waiting_reason, None);
+        assert_eq!(done.waiting_since_ms, None);
 
         fs::remove_dir_all(&dir).ok();
     }

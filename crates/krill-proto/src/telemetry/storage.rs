@@ -21,7 +21,6 @@ const MAX_STATE_BYTES: u64 = 128 * 1024;
 const DAY: u64 = 86_400;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Queue {
     install_id: String,
     generation: String,
@@ -171,19 +170,27 @@ fn lock(dir: &Path, name: &str, wait: Duration) -> io::Result<File> {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-fn read(dir: &Path) -> io::Result<Option<Queue>> {
+enum ReadState {
+    Missing,
+    Valid(Queue),
+    Corrupt,
+}
+
+fn read(dir: &Path) -> io::Result<ReadState> {
     let file = match open(&dir.join(FILE), false) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ReadState::Missing),
         Err(e) => return Err(e),
     };
     let mut bytes = Vec::new();
     file.take(MAX_STATE_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATE_BYTES {
-        return Err(io::Error::other("telemetry state exceeds limit"));
+        return Ok(ReadState::Corrupt);
     }
-    let mut queue: Queue = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let Ok(mut queue) = serde_json::from_slice::<Queue>(&bytes) else {
+        return Ok(ReadState::Corrupt);
+    };
     queue
         .events
         .retain(|event| event.install_id == queue.install_id);
@@ -191,9 +198,17 @@ fn read(dir: &Path) -> io::Result<Option<Queue>> {
         .next_attempt_unix
         .map(|at| at.min(super::now_unix().saturating_add(DAY)));
     if !queue.valid() {
-        return Err(io::Error::other("invalid telemetry state"));
+        return Ok(ReadState::Corrupt);
     }
-    Ok(Some(queue))
+    Ok(ReadState::Valid(queue))
+}
+
+fn remove_corrupt_state(dir: &Path) -> io::Result<()> {
+    match fs::remove_file(dir.join(FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 fn write(dir: &Path, queue: &Queue) -> io::Result<()> {
     let bytes = serde_json::to_vec(queue).map_err(io::Error::other)?;
@@ -240,9 +255,13 @@ pub(super) fn set_enabled(state: &Path, enabled: bool) -> io::Result<()> {
         file.sync_all()?;
     }
     let mut queue = match read(&dir)? {
-        Some(queue) => queue,
-        None if enabled => Queue::new()?,
-        None => return Ok(()),
+        ReadState::Valid(queue) => queue,
+        ReadState::Missing | ReadState::Corrupt if enabled => Queue::new()?,
+        ReadState::Missing => return Ok(()),
+        ReadState::Corrupt => {
+            remove_corrupt_state(&dir)?;
+            return Ok(());
+        }
     };
     queue.events.clear();
     queue.generation = random_uuid()?;
@@ -278,12 +297,13 @@ pub fn activity_generation(state: &Path, env: &Env) -> io::Result<Option<Activit
     if !consent(Some(state), env).enabled() {
         return Ok(None);
     }
-    let queue = if let Some(queue) = read(&dir)? {
-        queue
-    } else {
-        let queue = Queue::new()?;
-        write(&dir, &queue)?;
-        queue
+    let queue = match read(&dir)? {
+        ReadState::Valid(queue) => queue,
+        ReadState::Missing | ReadState::Corrupt => {
+            let queue = Queue::new()?;
+            write(&dir, &queue)?;
+            queue
+        }
     };
     Ok(Some(ActivityGeneration(queue.generation)))
 }
@@ -301,7 +321,10 @@ pub fn record_activity_for_generation(
 }
 
 pub fn status_with(state: &Path, env: &Env) -> io::Result<Status> {
-    let queue = read(&state.join(DIR))?;
+    let queue = match read(&state.join(DIR))? {
+        ReadState::Valid(queue) => Some(queue),
+        ReadState::Missing | ReadState::Corrupt => None,
+    };
     let permission = consent(Some(state), env);
     Ok(Status {
         enabled: permission.enabled(),
@@ -337,8 +360,8 @@ pub fn record_agent_active(state: &Path, env: &Env, now: u64) -> io::Result<bool
         return Ok(false);
     }
     let mut queue = match read(&dir)? {
-        Some(queue) => queue,
-        None => Queue::new()?,
+        ReadState::Valid(queue) => queue,
+        ReadState::Missing | ReadState::Corrupt => Queue::new()?,
     };
     prune(&mut queue, now);
     let day = now.checked_div(DAY).unwrap_or(0);
@@ -372,8 +395,8 @@ pub fn record_event(state: &Path, env: &Env, name: UsageName, now: u64) -> io::R
         return Ok(false);
     }
     let mut queue = match read(&dir)? {
-        Some(queue) => queue,
-        None => Queue::new()?,
+        ReadState::Valid(queue) => queue,
+        ReadState::Missing | ReadState::Corrupt => Queue::new()?,
     };
     prune(&mut queue, now);
     push_event(&mut queue, name, now)?;
@@ -411,9 +434,9 @@ fn record(
         return Ok(false);
     }
     let mut queue = match (read(&dir)?, expected) {
-        (Some(queue), Some(token)) if queue.generation == token.0 => queue,
-        (Some(queue), None) => queue,
-        (None, None) => Queue::new()?,
+        (ReadState::Valid(queue), Some(token)) if queue.generation == token.0 => queue,
+        (ReadState::Valid(queue), None) => queue,
+        (ReadState::Missing | ReadState::Corrupt, None) => Queue::new()?,
         _ => return Ok(false),
     };
     prune(&mut queue, now);
@@ -468,8 +491,13 @@ pub fn flush_with(
         if !consent(Some(state), env).enabled() {
             return Ok(report(Outcome::Disabled, 0, None));
         }
-        let Some(mut queue) = read(&dir)? else {
-            return Ok(report(Outcome::Empty, 0, None));
+        let mut queue = match read(&dir)? {
+            ReadState::Valid(queue) => queue,
+            ReadState::Missing => return Ok(report(Outcome::Empty, 0, None)),
+            ReadState::Corrupt => {
+                remove_corrupt_state(&dir)?;
+                return Ok(report(Outcome::Empty, 0, None));
+            }
         };
         prune(&mut queue, now);
         write(&dir, &queue)?;
@@ -507,7 +535,10 @@ pub fn flush_with(
     {
         let _lock = lock(&dir, "queue.lock", Duration::from_secs(1))?;
         if !consent(Some(state), env).enabled()
-            || read(&dir)?.is_none_or(|current| current.generation != queue.generation)
+            || !matches!(
+                read(&dir)?,
+                ReadState::Valid(current) if current.generation == queue.generation
+            )
         {
             return Ok(report(Outcome::Withdrawn, 0, None));
         }
@@ -519,7 +550,7 @@ pub fn flush_with(
                 .is_ok_and(|ack| ack.accepted == batch.events.len())
     });
     let _lock = lock(&dir, "queue.lock", Duration::from_secs(1))?;
-    let Some(mut current) = read(&dir)? else {
+    let ReadState::Valid(mut current) = read(&dir)? else {
         return Ok(report(Outcome::Withdrawn, 0, None));
     };
     if !consent(Some(state), env).enabled() || current.generation != queue.generation {

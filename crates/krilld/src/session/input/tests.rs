@@ -209,3 +209,59 @@ fn guarded_enter_respects_screen_predicate_and_writes_single_cr() {
     drop(user);
     session.wait().expect("PTY fixture operation");
 }
+
+#[cfg(unix)]
+#[test]
+fn lone_esc_expires_after_grace_and_does_not_block_interrupt_or_guarded_commands() {
+    let (session, mut user) = fixture();
+    let tap = session.tap();
+
+    // Standalone Esc written with peer: None leaves matched == 1 briefly.
+    write_input(&tap, b"\x1b", None).expect("write lone Esc");
+    assert_eq!(read_until(&mut user, 1), b"\x1b");
+    assert_eq!(lock(&tap.0.input).matched, 1);
+    assert!(!lock(&tap.0.input).paste);
+
+    // Wait past PARTIAL_START_GRACE (50ms) and guarded_command's 250ms idle input window.
+    thread::sleep(Duration::from_millis(270));
+
+    // Mobile Stop (write_interrupt) must succeed after lone Esc instead of staying wedged.
+    assert!(write_interrupt(&tap, || true).expect("write_interrupt after lone Esc"));
+    assert_eq!(read_until(&mut user, 1), b"\x03");
+
+    // Another lone Esc followed by grace expiry must not block guarded_enter.
+    write_input(&tap, b"\x1b", None).expect("write second lone Esc");
+    assert_eq!(read_until(&mut user, 1), b"\x1b");
+    thread::sleep(Duration::from_millis(70));
+    assert!(guarded_enter(&tap, |s| text(s).contains("EMPTY")).expect("guarded_enter after Esc"));
+    assert_eq!(read_until(&mut user, 1), b"\r");
+
+    // Another lone Esc followed by 270ms must not block streaming_command.
+    write_input(&tap, b"\x1b", None).expect("write third lone Esc");
+    assert_eq!(read_until(&mut user, 1), b"\x1b");
+    thread::sleep(Duration::from_millis(270));
+    let writer = tap.clone();
+    let worker = thread::spawn(move || {
+        streaming_command(&writer, b"/model next", |s, pasted| {
+            text(s).contains(if pasted { "/model next" } else { "EMPTY" })
+        })
+    });
+    assert_eq!(read_until(&mut user, 11), b"/model next");
+    user.write_all(b"\x1b[2J\x1b[H/model next")
+        .expect("PTY echo");
+    assert_eq!(read_until(&mut user, 1), b"\r");
+    worker
+        .join()
+        .expect("worker join")
+        .expect("streaming_command after lone Esc");
+
+    // A genuine split START marker arriving immediately (< grace) still enters paste mode.
+    write_input(&tap, b"\x1b[20", None).expect("write split paste start 1");
+    write_input(&tap, b"0~hi", None).expect("write split paste start 2");
+    assert!(lock(&tap.0.input).paste);
+    write_input(&tap, b"\x1b[201~", None).expect("close paste");
+    assert!(!lock(&tap.0.input).paste);
+
+    drop(user);
+    session.wait().expect("PTY fixture operation");
+}

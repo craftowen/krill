@@ -7798,6 +7798,8 @@ fn needs_you_item(bot_id: &krill_proto::bots::BotId) -> krill_proto::bots::BotIt
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     }
 }
 
@@ -14544,6 +14546,8 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
                         closed_at_ms: None,
+                        waiting_reason: None,
+                        waiting_since_ms: None,
                     },
                     BotItem {
                         uid: "i-2".to_owned(),
@@ -14562,6 +14566,8 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
                         closed_at_ms: None,
+                        waiting_reason: None,
+                        waiting_since_ms: None,
                     },
                 ];
                 if extra_cap.load(std::sync::atomic::Ordering::SeqCst) {
@@ -14582,6 +14588,8 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
                         closed_at_ms: None,
+                        waiting_reason: None,
+                        waiting_since_ms: None,
                     });
                 }
                 Ok(BotRpcResponse::Items(items))
@@ -15028,6 +15036,263 @@ fn round2_shell_bot_dialogs_and_group_composer_shortcuts(cx: &mut TestAppContext
         assert!(
             !room.sending,
             "Shift+Enter in group composer must not send the message (R2A-10)"
+        );
+    });
+}
+
+#[gpui::test]
+fn quick_open_root_uses_workspace_folder_when_no_pane_focused(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("quick-open-empty-ws"));
+    let ws_dir = PathBuf::from("/remote/project-root");
+    view.update(cx, |s, cx| {
+        s.layout.deactivate();
+        s.sidebar.update(cx, |sb, cx| {
+            sb.set_remote_snapshot_for_test(
+                "studio",
+                krill_app::hosts::HostStatus::Connected,
+                sidebar::Snapshot {
+                    sessions: Vec::new(),
+                    trees: BTreeMap::from([(ws_dir.clone(), vec![ws_dir.clone()])]),
+                },
+                cx,
+            );
+            sb.select_worktree(Some(ws_dir.clone()), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, cx| {
+        assert!(s.layout.focused().is_none());
+        assert_eq!(s.quick_open_root(cx), ws_dir);
+    });
+}
+
+#[gpui::test]
+fn command_palette_open_settings_keeps_modal_focus(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("palette-modal-focus"));
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.toggle_command_palette(window, cx));
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let palette = view.read(cx).jump.as_ref().unwrap().0.clone();
+        view.update(cx, |s, cx| {
+            s.on_palette_event(
+                &palette,
+                &jump::Event::Action(jump::ActionKind::OpenSettings),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let shell = view.read(cx);
+        assert!(shell.settings().is_some(), "settings modal must open");
+        assert!(
+            !shell.focus.is_focused(window),
+            "palette must not steal focus back to terminal after opening Settings modal"
+        );
+    });
+}
+
+#[gpui::test]
+fn tab_menu_toggle_chat_activates_and_toggles_inactive_tab(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-menu-toggle-chat"));
+    let (pane_a, pane_b) = view.update(cx, |s, cx| {
+        let pane_a = s.layout.active_tab().focused;
+        s.layout.set_session(pane_a, SessionId(11));
+        s.layout.new_tab();
+        let pane_b = s.layout.active_tab().focused;
+        s.layout.set_session(pane_b, SessionId(22));
+        s.layout.activate(0);
+        s.tab_context_menu = Some((pane_b, gpui::point(px(40.), px(40.))));
+        cx.notify();
+        (pane_a, pane_b)
+    });
+    cx.run_until_parked();
+    let item = cx
+        .debug_bounds("tab-menu-toggle-chat")
+        .expect("tab-menu-toggle-chat must render for inactive session tab");
+    cx.simulate_click(item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert_eq!(
+            s.layout.focused(),
+            Some(pane_b),
+            "clicking Toggle Chat View on inactive Tab B must activate Tab B"
+        );
+        assert!(
+            s.layout.chat_view(pane_a).is_none(),
+            "Tab A chat_view must remain untouched"
+        );
+        assert!(
+            s.layout.chat_view(pane_b).is_some(),
+            "Tab B chat_view must be toggled"
+        );
+    });
+}
+
+#[gpui::test]
+fn plain_text_paste_survives_drop_policy_change(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("plain-text-paste-policy"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let paste_id = cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(pane, SessionId(1));
+            s.sync(cx);
+            // Simulate foreground drop_policy changing between clipboard read start and completion.
+            s.begin_plain_paste_with_policy_for_test(
+                krill_term::paste::DropPolicy {
+                    shell: krill_term::paste::ShellFamily::Posix,
+                    image_attachments: true,
+                    windows_images: false,
+                },
+                window,
+                cx,
+            )
+            .expect("queued paste")
+        })
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.complete_attachment_paste_for_test(
+                paste_id,
+                Some(b"hello world".to_vec()),
+                false,
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.live
+                .get(&pane)
+                .is_some_and(|l| l.pane.has_pending_input()),
+            "plain text clipboard paste must not be dropped when drop_policy changes"
+        );
+    });
+}
+
+#[gpui::test]
+fn cli_file_open_uses_local_host_when_remote_tab_focused(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("cli-file-open-local"));
+    let remote = krill_app::hosts::HostId::Remote("studio".into());
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_host(pane, remote.clone());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let local_file = PathBuf::from("/tmp/local-from-cli.rs");
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.apply_file_requests(
+                vec![super::files::CliFileRequest {
+                    id: 1,
+                    kind: super::files::CliFileActionKind::Open,
+                    path: local_file.clone(),
+                    worktree: PathBuf::new(),
+                    relative_path: String::new(),
+                    line: None,
+                    column: None,
+                    staged: false,
+                    focus: false,
+                }],
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        let focused = s.layout.focused().expect("opened file pane");
+        assert_eq!(s.layout.file(focused), Some(local_file.as_path()));
+        assert!(
+            s.layout.host(focused).is_local(),
+            "local CLI file open must open on HostId::Local even when a remote tab was focused"
+        );
+    });
+}
+
+#[gpui::test]
+fn tab_close_and_session_switch_modals_block_background_shortcuts_and_close_on_cmd_w(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("modal-overlay-blocking"));
+    let pane = layout_of(&view, cx).tabs()[0].focused;
+    view.update(cx, |s, cx| {
+        s.confirm_close_tab = Some(pane);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, cx| {
+        assert!(s.has_dialog_or_viewer_overlay());
+        assert!(s.has_workspace_focus_blocker(cx));
+    });
+    // Cmd+D while confirm_close_tab is open must not split the underlying pane.
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).visible().len(), 1);
+    // Cmd+W closes the blocking dialog rather than the underlying pane.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.confirm_close_tab.is_none());
+        assert_eq!(s.layout.tabs().len(), 1);
+    });
+
+    // Repeat for pending_running_close.
+    view.update(cx, |s, cx| {
+        s.pending_running_close = Some((PendingRunningClose::Tab(pane), false));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| assert!(s.has_dialog_or_viewer_overlay()));
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(s.pending_running_close.is_none());
+        assert_eq!(s.layout.tabs().len(), 1);
+    });
+}
+
+#[gpui::test]
+fn close_daemon_session_clears_workspace_closing_on_error(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("close-daemon-clears-closing"));
+    // Disconnected target keeps workspace_closing so stale snapshots cannot resurrect
+    // the closed tab until explicitly reopened, while surfacing an error notice.
+    let remote = krill_app::hosts::HostId::Remote("offline".into());
+    view.update(cx, |s, cx| {
+        s.close_daemon_session(&remote, SessionId(42), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            s.workspace_closing
+                .contains(&(remote.clone(), SessionId(42))),
+            "missing host target must retain workspace_closing against stale snapshots"
+        );
+        assert!(s.notice.is_some());
+    });
+
+    // Failing daemon call must clear workspace_closing so the live session is not hidden.
+    view.update(cx, |s, cx| {
+        s.close_call = Some(Arc::new(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated timeout",
+            ))
+        }));
+        s.close_daemon_session(&krill_app::hosts::HostId::Local, SessionId(43), cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, _| {
+        assert!(
+            !s.workspace_closing
+                .contains(&(krill_app::hosts::HostId::Local, SessionId(43))),
+            "failed daemon close must remove session from workspace_closing"
         );
     });
 }

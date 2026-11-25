@@ -690,3 +690,106 @@ fn antigravity_listed_family_selection_folds_only_grouped_family_level_ids() {
         None
     );
 }
+
+#[test]
+fn canonical_id_normalizes_mixed_case_builtins_and_presets() {
+    let agents = Agents::load(None).unwrap();
+    for (input, expected) in [
+        ("Claude", "claude"),
+        ("CODEX", "codex"),
+        ("Agy", "agy"),
+        ("CURSOR", "cursor"),
+        ("OpenCode", "opencode"),
+        ("Grok", "grok"),
+        ("MUSE", "muse"),
+        ("Mistral-Vibe", "mistral-vibe"),
+        ("OpenCode2", "opencode2"),
+        ("Pi", "pi"),
+        ("OMP", "omp"),
+    ] {
+        assert_eq!(canonical_id(input), expected, "{input}");
+        let (resolved, _) = agents.resolve(input).unwrap();
+        assert_eq!(resolved, expected, "{input}");
+    }
+    assert_eq!(canonical_id("  CustomAgent  "), "CustomAgent");
+
+    let mut claude = agents.profiles["claude"].clone();
+    apply_launch_overrides(
+        "Claude",
+        &mut claude,
+        &LaunchOverrides {
+            model: Some("opus".to_owned()),
+            effort: Some("high".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        claude.argv(Permission::Manual),
+        ["claude", "--model", "opus", "--effort", "high"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_rejects_nonzero_exit_bounds_stdout_and_times_out_cleanly() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!("krill-agent-capture-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+
+    // Broken CLI prints error prose to stdout and exits non-zero -> must return None.
+    let err_prose = script(
+        "err-prose",
+        "echo 'error: unknown option --version'; exit 1",
+    );
+    assert_eq!(version(&err_prose), None);
+    assert_eq!(
+        capture(Command::new(&err_prose), Duration::from_secs(2)),
+        None
+    );
+
+    // Large stdout exceeding 64 KiB with multibyte char split across the 64 KiB boundary still succeeds boundedly.
+    let filler = "a".repeat(65_529);
+    let large = script(
+        "large",
+        &format!(
+            "printf '1.2.3\\n%s가%s' '{filler}' '{}'",
+            "b".repeat(8 * 1024)
+        ),
+    );
+    let out = capture(Command::new(&large), Duration::from_secs(5)).unwrap();
+    assert!(out.starts_with("1.2.3\n"));
+    assert!(
+        out.len() <= 64 * 1024 + 4,
+        "bounded capture was {}B",
+        out.len()
+    );
+    assert_eq!(version(&large).as_deref(), Some("1.2.3"));
+
+    // Unbounded stdout flood must time out cleanly without OOM.
+    let flood = script("flood", "while :; do printf '0123456789abcdef\\n'; done");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        capture(Command::new(&flood), Duration::from_millis(150)),
+        None
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // Closing stdout early while child hangs must still time out and return None.
+    let close_hang = script("close-hang", "exec >&-; exec sleep 30");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        capture(Command::new(&close_hang), Duration::from_millis(150)),
+        None
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -20,19 +20,21 @@ pub struct Pty {
 }
 impl Pty {
     pub fn from_handles(handles: Vec<OwnedHandle>) -> io::Result<Self> {
-        let mut it = handles.into_iter();
-        let pty = Self {
-            input: it.next().ok_or(io::ErrorKind::InvalidData)?,
-            output: it.next().ok_or(io::ErrorKind::InvalidData)?,
-            signal: it.next().ok_or(io::ErrorKind::InvalidData)?,
-            reference: it.next(),
-            process: it.next(),
-            recovery: it.collect(),
+        let bundled = match handles.len() {
+            3 | 6 => false,
+            5 | 8 => true,
+            _ => return Err(io::ErrorKind::InvalidData.into()),
         };
-        if !matches!(pty.recovery.len(), 0 | 3) {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        Ok(pty)
+        let mut it = handles.into_iter();
+        let mut next = || it.next().ok_or(io::ErrorKind::InvalidData);
+        Ok(Self {
+            input: next()?,
+            output: next()?,
+            signal: next()?,
+            reference: bundled.then(&mut next).transpose()?,
+            process: bundled.then(&mut next).transpose()?,
+            recovery: it.collect(),
+        })
     }
     pub fn handles(&self) -> Vec<BorrowedHandle<'_>> {
         let mut v = vec![
@@ -289,6 +291,37 @@ mod tests {
             b.recv().err().map(|e| e.kind()),
             Some(io::ErrorKind::UnexpectedEof)
         );
+        Ok(())
+    }
+    #[test]
+    fn inbox_pty_handles_preserve_recovery_and_reject_invalid_counts() -> io::Result<()> {
+        let (read, _write) = std::io::pipe()?;
+        let clone_n = |n: usize| {
+            (0..n)
+                .map(|_| read.as_handle().try_clone_to_owned())
+                .collect::<io::Result<Vec<_>>>()
+        };
+        let inbox = Pty::from_handles(clone_n(3)?)?;
+        assert!(inbox.reference.is_none() && inbox.process.is_none() && inbox.recovery.is_empty());
+        assert_eq!(inbox.handles().len(), 3);
+
+        let inbox_rec = Pty::from_handles(clone_n(6)?)?.try_clone()?;
+        assert!(inbox_rec.reference.is_none() && inbox_rec.process.is_none());
+        assert_eq!(inbox_rec.recovery.len(), 3);
+        assert_eq!(inbox_rec.handles().len(), 6);
+
+        let bundled = Pty::from_handles(clone_n(5)?)?;
+        assert!(
+            bundled.reference.is_some() && bundled.process.is_some() && bundled.recovery.is_empty()
+        );
+
+        for bad in [0, 1, 2, 4, 7, 9] {
+            assert_eq!(
+                Pty::from_handles(clone_n(bad)?).err().map(|e| e.kind()),
+                Some(io::ErrorKind::InvalidData),
+                "handle count {bad} must fail"
+            );
+        }
         Ok(())
     }
 }

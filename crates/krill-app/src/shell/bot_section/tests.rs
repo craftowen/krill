@@ -563,6 +563,8 @@ fn group_page_turns_peer_handoff_reply_picker_and_panel_filters(cx: &mut TestApp
         created_at_ms: 1_700_000_000_025,
         updated_at_ms: 1_700_000_000_025,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let external_item = BotItem {
         uid: "item-other-2".to_owned(),
@@ -581,6 +583,8 @@ fn group_page_turns_peer_handoff_reply_picker_and_panel_filters(cx: &mut TestApp
         created_at_ms: 1_700_000_000_020,
         updated_at_ms: 1_700_000_000_020,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
 
     let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1248,6 +1252,8 @@ fn bot_panel_chats_tab_shows_orch_and_linked_dispatch_workers_open_by_default(
         created_at_ms: 1_700_000_050_000,
         updated_at_ms: 1_700_000_050_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let chats = vec![chat("krill", 21, "")];
     let listed = chats.clone();

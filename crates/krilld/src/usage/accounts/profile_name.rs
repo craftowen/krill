@@ -12,6 +12,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use krill_proto::usage::ProviderKind;
+#[cfg(any(target_os = "macos", test))]
+use zeroize::Zeroizing;
 
 use super::{SAVE_LOCK, StoredAccount, load_writable, lock, profile_in_use, save_inner, slugify};
 
@@ -46,27 +48,68 @@ pub fn adopt_email_dirs(
     in_use: &[PathBuf],
     vault: &dyn Vault,
 ) -> io::Result<bool> {
-    let _guard = lock(&SAVE_LOCK);
-    let mut file = load_writable(home, state_dir)?;
     let root = krill_proto::usage::profiles::managed_root(home).join(ProviderKind::Claude.as_str());
-    let todo: Vec<(String, String)> = file
-        .accounts
-        .iter()
-        .filter_map(|a| Some((a.id.clone(), candidate(home, &root, a, in_use)?)))
-        .collect();
+    let plan: Vec<(String, PathBuf, PathBuf)> = {
+        let _guard = lock(&SAVE_LOCK);
+        if crate::usage::provision::try_lock_provision().is_none() {
+            return Ok(false);
+        }
+        let file = load_writable(home, state_dir)?;
+        let mut taken: Vec<PathBuf> = file
+            .accounts
+            .iter()
+            .map(|a| PathBuf::from(&a.profile_dir))
+            .collect();
+        let mut planned = Vec::new();
+        for account in &file.accounts {
+            let Some(email) = candidate(home, &root, account, in_use) else {
+                continue;
+            };
+            let from = PathBuf::from(&account.profile_dir);
+            if crate::usage::provision::is_busy(&from) {
+                continue;
+            }
+            let to = free_dir(&root, &slugify(&email), &taken);
+            taken.push(to.clone());
+            planned.push((account.id.clone(), from, to));
+        }
+        planned
+    };
+    if plan.is_empty() {
+        return Ok(false);
+    }
     let mut moved = false;
-    for (id, email) in todo {
+    for (id, from, to) in plan {
+        // 키체인 조회·복사 서브프로세스(`/usr/bin/security`)는 `SAVE_LOCK` 밖에서 실행한다.
+        if let Err(error) = copy_credentials(&from, &to, vault) {
+            tracing::warn!(kind = ?error.kind(), "profile rename skipped");
+            continue;
+        }
+        let _guard = lock(&SAVE_LOCK);
+        let mut file = load_writable(home, state_dir)?;
         let taken: Vec<PathBuf> = file
             .accounts
             .iter()
             .map(|a| PathBuf::from(&a.profile_dir))
             .collect();
-        let to = free_dir(&root, &slugify(&email), &taken);
+        if to.symlink_metadata().is_ok() || taken.contains(&to) {
+            continue;
+        }
         let Some(account) = file.accounts.iter_mut().find(|a| a.id == id) else {
             continue;
         };
-        let from = PathBuf::from(&account.profile_dir);
-        if let Err(error) = move_profile(&from, &to, vault) {
+        if Path::new(&account.profile_dir) != from
+            || candidate(home, &root, account, in_use).is_none()
+        {
+            continue;
+        }
+        let Some(_provision_guard) = crate::usage::provision::try_lock_provision() else {
+            continue;
+        };
+        if crate::usage::provision::is_busy(&from) {
+            continue;
+        }
+        if let Err(error) = std::fs::rename(&from, &to) {
             tracing::warn!(kind = ?error.kind(), "profile rename skipped");
             continue;
         }
@@ -127,78 +170,153 @@ fn free_dir(root: &Path, slug: &str, taken: &[PathBuf]) -> PathBuf {
     }
 }
 
-fn move_profile(from: &Path, to: &Path, vault: &dyn Vault) -> io::Result<()> {
+fn copy_credentials(from: &Path, to: &Path, vault: &dyn Vault) -> io::Result<()> {
     let service = |dir: &Path| {
         crate::usage::direct::claude_service(Some(dir))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "profile path not utf-8"))
     };
     vault.copy(&service(from)?, &service(to)?)?;
-    std::fs::rename(from, to)
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn copy_accounts(
+    from: &str,
+    to: &str,
+    accounts: &[&str],
+    mut read: impl FnMut(&str, &str) -> io::Result<Option<Zeroizing<Vec<u8>>>>,
+    mut write: impl FnMut(&str, &str, &[u8]) -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut copied_any = false;
+    for &account in accounts {
+        let Some(secret) = read(from, account)? else {
+            continue;
+        };
+        write(to, account, &secret)?;
+        match read(to, account)? {
+            Some(copied) if *copied == *secret => copied_any = true,
+            _ => return Err(io::Error::other("keychain copy mismatch")),
+        }
+    }
+    Ok(copied_any)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn build_security_interactive_write_line(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Option<Zeroizing<String>> {
+    use std::fmt::Write as _;
+    let safe_arg = |s: &str| {
+        !s.is_empty()
+            && !s
+                .bytes()
+                .any(|b| matches!(b, b'"' | b'\\' | b'\r' | b'\n' | b'\0'))
+    };
+    if !safe_arg(service) || !safe_arg(account) {
+        return None;
+    }
+    let prefix = format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X ");
+    let line_len = prefix
+        .len()
+        .checked_add(secret.len().checked_mul(2)?)?
+        .checked_add(1)?;
+    if line_len > crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE {
+        return None;
+    }
+    let mut script = Zeroizing::new(String::with_capacity(line_len));
+    script.push_str(&prefix);
+    for b in secret {
+        write!(script, "{b:02x}").ok();
+    }
+    script.push('\n');
+    Some(script)
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::fmt::Write as _;
-    use std::io::{self, Write as _};
-    use std::process::{Command, Stdio};
+    use std::io;
+    use std::process::Command;
 
     use zeroize::Zeroizing;
 
     const SECURITY: &str = "/usr/bin/security";
     /// `errSecItemNotFound`의 `security` 종료 코드.
     const NOT_FOUND: i32 = 44;
+    const MAX_KEYCHAIN_BYTES: u64 = 64 * 1024;
 
     // Claude Code는 `/usr/bin/security`로 항목을 만들어 ACL이 그 도구만 믿는다(direct.rs와 같은 이유).
     // 비밀은 인자가 아니라 `security -i`의 표준 입력으로 넘겨 프로세스 목록에 드러나지 않게 한다.
+    // 4095바이트 `fgets` 한도를 넘는 큰 항목은 Security.framework(`SecItemAdd`/`SecItemUpdate`)로 쓴다.
     pub(super) fn copy(from: &str, to: &str) -> io::Result<bool> {
         let user = crate::usage::direct::claude_keychain_user();
-        let Some(secret) = read(from, &user)? else {
-            return Ok(false);
+        let accounts: &[&str] = if user == "claude-code-user" {
+            &["claude-code-user"]
+        } else {
+            &[user.as_str(), "claude-code-user"]
         };
-        let mut script =
-            Zeroizing::new(format!("add-generic-password -U -a {user} -s \"{to}\" -X "));
-        for b in secret.iter() {
-            write!(script, "{b:02x}").ok();
+        super::copy_accounts(from, to, accounts, read, write)
+    }
+
+    fn write(service: &str, account: &str, secret: &[u8]) -> io::Result<()> {
+        if !u64::try_from(secret.len()).is_ok_and(|len| len <= MAX_KEYCHAIN_BYTES)
+            || !crate::usage::direct::is_json_object_credential(secret)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid keychain credential payload",
+            ));
         }
-        script.push('\n');
-        let mut child = Command::new(SECURITY)
-            .arg("-i")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let written = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("security stdin unavailable"))
-            .and_then(|mut stdin| stdin.write_all(script.as_bytes()));
-        if let Err(error) = written {
-            child.kill().ok();
-            child.wait().ok();
-            return Err(error);
-        }
-        if !child.wait()?.success() {
+        let Some(script) = super::build_security_interactive_write_line(service, account, secret)
+        else {
+            return security_framework::passwords::set_generic_password(service, account, secret)
+                .map_err(|_| io::Error::other("keychain write failed"));
+        };
+        let mut cmd = Command::new(SECURITY);
+        cmd.arg("-i");
+        let (status, _) = crate::usage::accounts::agy_native::run_command_with_timeout(
+            &mut cmd,
+            Some(script.as_bytes()),
+            false,
+            0,
+            crate::usage::accounts::agy_native::KEYCHAIN_TIMEOUT,
+        )
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "keychain write failed or timed out",
+            )
+        })?;
+        if !status.success() {
             return Err(io::Error::other("keychain write failed"));
         }
-        match read(to, &user)? {
-            Some(copied) if *copied == *secret => Ok(true),
-            _ => Err(io::Error::other("keychain copy mismatch")),
-        }
+        Ok(())
     }
 
     fn read(service: &str, user: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
-        let output = Command::new(SECURITY)
-            .args(["find-generic-password", "-s", service, "-a", user, "-w"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()?;
-        let mut secret = Zeroizing::new(output.stdout);
-        match output.status.code() {
+        let mut cmd = Command::new(SECURITY);
+        cmd.args(["find-generic-password", "-s", service, "-a", user, "-w"]);
+        let (status, secret) = crate::usage::accounts::agy_native::run_command_with_timeout(
+            &mut cmd,
+            None,
+            true,
+            MAX_KEYCHAIN_BYTES.saturating_mul(2).saturating_add(1),
+            crate::usage::accounts::agy_native::KEYCHAIN_TIMEOUT,
+        )
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "keychain read failed or timed out")
+        })?;
+        match status.code() {
             Some(0) => {
-                if secret.last() == Some(&b'\n') {
-                    secret.pop();
+                let decoded = crate::usage::direct::decode_macos_security_password(&secret);
+                if !crate::usage::direct::is_json_object_credential(&decoded) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "keychain credential is not valid JSON",
+                    ));
                 }
-                Ok(Some(secret))
+                Ok(Some(decoded))
             }
             Some(NOT_FOUND) => Ok(None),
             _ => Err(io::Error::other("keychain read failed")),
@@ -391,5 +509,121 @@ mod tests {
         );
         assert!(existing.is_dir());
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn adopt_email_dirs_does_not_hold_save_lock_during_vault_copy() {
+        struct LockCheckingVault;
+        impl Vault for LockCheckingVault {
+            fn copy(&self, _from: &str, _to: &str) -> io::Result<bool> {
+                assert!(
+                    SAVE_LOCK.try_lock().is_ok(),
+                    "SAVE_LOCK must not be held across blocking keychain copy"
+                );
+                Ok(true)
+            }
+        }
+        let (home, state) = sandbox("no-save-lock");
+        let old = register(
+            &home,
+            &state,
+            "claude-code-profile-1",
+            Some("unlocked@example.com"),
+        );
+        assert!(adopt_email_dirs(&home, Some(&state), &[], &LockCheckingVault).unwrap());
+        assert!(!old.exists());
+        assert!(old.with_file_name("unlocked-example-com").is_dir());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn copy_accounts_probes_fallback_claude_code_user_and_preserves_account_name() {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        let store = RefCell::new(BTreeMap::from([(
+            ("from-svc".to_owned(), "claude-code-user".to_owned()),
+            b"secret-payload".to_vec(),
+        )]));
+        let copied = copy_accounts(
+            "from-svc",
+            "to-svc",
+            &["alice", "claude-code-user"],
+            |svc, acc| {
+                Ok(store
+                    .borrow()
+                    .get(&(svc.to_owned(), acc.to_owned()))
+                    .cloned()
+                    .map(Zeroizing::new))
+            },
+            |svc, acc, bytes| {
+                store
+                    .borrow_mut()
+                    .insert((svc.to_owned(), acc.to_owned()), bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(copied);
+        let store = store.into_inner();
+        assert_eq!(
+            store.get(&("to-svc".to_owned(), "claude-code-user".to_owned())),
+            Some(&b"secret-payload".to_vec())
+        );
+        assert!(!store.contains_key(&("to-svc".to_owned(), "alice".to_owned())));
+    }
+
+    #[test]
+    fn adopt_email_dirs_skips_when_provision_lock_or_history_job_is_busy() {
+        let (home, state) = sandbox("provision-busy");
+        let old = register(
+            &home,
+            &state,
+            "claude-code-profile-1",
+            Some("busy@example.com"),
+        );
+        let vault = Fake::default();
+        {
+            let _prov_lock = crate::usage::provision::lock_provision_for_tests();
+            assert!(!adopt_email_dirs(&home, Some(&state), &[], &vault).unwrap());
+            assert!(vault.calls.borrow().is_empty());
+            assert!(old.is_dir());
+        }
+        #[cfg(unix)]
+        {
+            let _running = crate::usage::provision::mark_busy_for_tests(&old);
+            assert!(!adopt_email_dirs(&home, Some(&state), &[], &vault).unwrap());
+            assert!(vault.calls.borrow().is_empty());
+            assert!(old.is_dir());
+        }
+        assert!(adopt_email_dirs(&home, Some(&state), &[], &vault).unwrap());
+        assert!(old.with_file_name("busy-example-com").is_dir());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn security_interactive_write_line_enforces_4095_byte_limit_and_safe_quoting() {
+        let small = r#"{"claudeAiOauth":{"accessToken":"small","name":"한글"}}"#.as_bytes();
+        let line = build_security_interactive_write_line("Claude Code-credentials", "owen", small)
+            .expect("small JSON fits security -i");
+        assert!(line.len() <= crate::usage::accounts::agy_native::MAX_SECURITY_INTERACTIVE_LINE);
+
+        // 2100 raw bytes -> 4200 hex chars + command prefix > 4095 fgets buffer limit
+        let large = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{}"}}}}"#,
+            "x".repeat(2100)
+        );
+        assert!(
+            build_security_interactive_write_line(
+                "Claude Code-credentials",
+                "owen",
+                large.as_bytes()
+            )
+            .is_none(),
+            "lines exceeding 4095 bytes must bypass security -i fgets limit"
+        );
+        assert!(
+            build_security_interactive_write_line("svc\"bad", "owen", small).is_none(),
+            "quotes in service name must bypass security -i"
+        );
     }
 }

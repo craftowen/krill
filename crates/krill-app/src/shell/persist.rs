@@ -288,6 +288,9 @@ fn run(path: &Path, mailbox: &Mailbox) {
             }
         });
         if pending.closed && (pending.layout.is_none() || !saved) {
+            for (_, done) in pending.barriers.drain(..) {
+                done.send(false).ok();
+            }
             return;
         }
     }
@@ -384,4 +387,27 @@ fn burst_replaces_one_pending_snapshot_and_barrier_waits_for_latest() {
     assert!(wait.recv_timeout(Duration::from_secs(1)).unwrap());
     assert_eq!(Layout::load(&path).unwrap(), layout);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn closed_failed_save_drains_remaining_barriers() {
+    let dir = std::env::temp_dir().join(format!("mk-layout-fail-barrier-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    // Create a directory at the target file path so Layout::save fails deterministically.
+    std::fs::create_dir_all(&dir).unwrap();
+    let mailbox = Arc::new(Mailbox::default());
+    let (done1, wait1) = mpsc::channel();
+    let (done2, wait2) = mpsc::channel();
+    {
+        let mut pending = mailbox.pending.lock().unwrap();
+        pending.generation = 1;
+        pending.layout = Some(Box::new(Layout::default()));
+        pending.barriers.push((1, done1));
+        pending.barriers.push((2, done2));
+        pending.closed = true;
+    }
+    run(&dir, &mailbox);
+    assert_eq!(wait1.recv_timeout(Duration::from_secs(1)), Ok(false));
+    assert_eq!(wait2.recv_timeout(Duration::from_secs(1)), Ok(false));
+    std::fs::remove_dir_all(&dir).ok();
 }

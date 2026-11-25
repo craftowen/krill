@@ -81,6 +81,8 @@ fn sample_item() -> BotItem {
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     }
 }
 
@@ -2630,4 +2632,405 @@ fn groups_send_defaults_sender_to_env_bot_id_and_avatar_rpc_fits_frame() {
         encoded.len(),
         krill_proto::ipc::MAX_FRAME + 4
     );
+}
+
+#[test]
+fn parses_and_executes_waiting_status_with_note_and_help_guidance() {
+    assert_eq!(
+        super::parse::parse_item_status("waiting").unwrap(),
+        BotItemStatus::Waiting
+    );
+    assert_eq!(
+        super::parse::parse_item_status("needs-you").unwrap(),
+        BotItemStatus::NeedsYou
+    );
+    assert!(
+        parse_command(
+            &s(&["items", "mybot", "update", "42", "--status", "waiting"]),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        parse_command(
+            &s(&[
+                "items", "mybot", "update", "42", "--status", "waiting", "--note", "   "
+            ]),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        parse_command(
+            &s(&[
+                "items",
+                "mybot",
+                "update",
+                "42",
+                "--status",
+                "waiting",
+                "--note",
+                "line1\nline2"
+            ]),
+            None
+        )
+        .is_err()
+    );
+
+    let cmd = parse_command(
+        &s(&[
+            "items",
+            "mybot",
+            "update",
+            "42",
+            "--status",
+            "waiting",
+            "--note",
+            "CI on PR #42",
+        ]),
+        None,
+    )
+    .unwrap();
+    let BotCommand::ItemsUpdate(upd) = cmd.clone() else {
+        panic!("expected ItemsUpdate");
+    };
+    assert_eq!(upd.status, Some(BotItemStatus::Waiting));
+    assert_eq!(upd.waiting_reason.as_deref(), Some("CI on PR #42"));
+
+    let list_cmd =
+        parse_command(&s(&["items", "mybot", "ls", "--status", "waiting"]), None).unwrap();
+    assert!(matches!(
+        list_cmd,
+        BotCommand::ItemsList {
+            status: Some(BotItemStatus::Waiting),
+            ..
+        }
+    ));
+
+    let help = super::parse::help_text(Some("items"));
+    assert!(help.contains("waiting"));
+    assert!(help.contains("running worker counts as working"));
+
+    let mut waiting_item = sample_item();
+    waiting_item.status = BotItemStatus::Waiting;
+    waiting_item.waiting_reason = Some("CI on PR #42".to_owned());
+    waiting_item.waiting_since_ms = Some(1_700_000_000_000);
+    let mut client = MockClient::new([
+        BotRpcResponse::Bot(Box::new(sample_bot())),
+        BotRpcResponse::Item(Box::new(waiting_item)),
+    ]);
+    let mut empty = std::io::empty();
+    let rendered = execute_online(
+        parse_command(
+            &s(&[
+                "items",
+                "pr-reviewer",
+                "update",
+                "1",
+                "--status",
+                "waiting",
+                "--note",
+                "CI on PR #42",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        1_000,
+        |_| None,
+    )
+    .unwrap();
+    assert!(rendered.contains("[waiting]"));
+    assert!(rendered.contains("waiting_on:  CI on PR #42"));
+    assert!(matches!(
+        client.recorded.last(),
+        Some(BotRpcRequest::UpdateItem(p))
+            if p.status == Some(BotItemStatus::Waiting)
+                && p.waiting_reason.as_deref() == Some("CI on PR #42")
+    ));
+}
+
+#[test]
+fn avatar_set_accepts_bot_avatar_reply_and_enforces_ipc_size_limit() {
+    let bot = sample_bot();
+    let dir = temp_dir("pc09-avatar-reply");
+    let png_in = dir.join("avatar.png");
+    let png_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+    fs::write(&png_in, &png_bytes).unwrap();
+
+    let avatar_data = krill_proto::bots::BotAvatarData {
+        bot_id: bot.id.clone(),
+        mime: "image/png".to_owned(),
+        png_bytes: png_bytes.clone(),
+    };
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let mut client = MockClient::new([
+        BotRpcResponse::Bot(Box::new(bot.clone())),
+        BotRpcResponse::BotAvatar(avatar_data.clone()),
+        BotRpcResponse::Bot(Box::new(bot)),
+        BotRpcResponse::BotAvatar(avatar_data),
+    ]);
+    let text_out = execute_online(
+        parse_command(
+            &s(&["avatar", "set", "bot-pr-1", png_in.to_str().unwrap()]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(
+        text_out.contains("updated avatar for bot-pr-1"),
+        "{text_out}"
+    );
+    assert!(text_out.contains("12 bytes"), "{text_out}");
+
+    let json_out = execute_online(
+        parse_command(
+            &s(&[
+                "avatar",
+                "set",
+                "bot-pr-1",
+                png_in.to_str().unwrap(),
+                "--json",
+            ]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["bot_id"], "bot-pr-1");
+    assert_eq!(parsed["bytes"], 12);
+
+    // Oversized PNG above MAX_AVATAR_PNG_BYTES (which fits inside ipc::MAX_FRAME) is rejected before RPC.
+    let big_png = dir.join("too-big.png");
+    fs::write(
+        &big_png,
+        vec![0u8; krill_proto::bots::MAX_AVATAR_PNG_BYTES + 1],
+    )
+    .unwrap();
+    let err = execute_online(
+        parse_command(
+            &s(&["avatar", "set", "bot-pr-1", big_png.to_str().unwrap()]),
+            None,
+        )
+        .unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(
+        err.message.contains("avatar PNG must be 1..="),
+        "{}",
+        err.message
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn default_items_ls_hides_actively_snoozed_items() {
+    let mut visible = sample_item();
+    visible.uid = "item-1".to_owned();
+    visible.number = 1;
+    visible.snoozed_until_ms = None;
+
+    let mut expired_snooze = sample_item();
+    expired_snooze.uid = "item-2".to_owned();
+    expired_snooze.number = 2;
+    expired_snooze.snoozed_until_ms = Some(1_000);
+
+    let mut active_snooze = sample_item();
+    active_snooze.uid = "item-3".to_owned();
+    active_snooze.number = 3;
+    active_snooze.snoozed_until_ms = Some(9_000);
+
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let mut client = MockClient::new([BotRpcResponse::Items(vec![
+        visible,
+        expired_snooze,
+        active_snooze,
+    ])]);
+    let raw = execute_online(
+        parse_command(&s(&["items", "ls", "--json"]), None).unwrap(),
+        &mut client,
+        &mut empty,
+        5_000,
+        |_| None,
+    )
+    .unwrap();
+    let listed: Vec<BotItem> = serde_json::from_str(&raw).unwrap();
+    let nums: Vec<u64> = listed.into_iter().map(|i| i.number).collect();
+    assert_eq!(nums, vec![1, 2]);
+}
+
+#[test]
+fn reply_supports_reaction_only_and_file_only_forms() {
+    assert_eq!(
+        parse_command(
+            &s(&["reply", "--bot", "mybot", "--react", ":thumbsup:"]),
+            None
+        )
+        .unwrap(),
+        BotCommand::Reply {
+            bot: "mybot".to_owned(),
+            text: String::new(),
+            link_id: None,
+            files: Vec::new(),
+            reaction: Some(":thumbsup:".to_owned()),
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_command(&s(&["reply", "--file", "a.pdf"]), Some("mybot")).unwrap(),
+        BotCommand::Reply {
+            bot: "mybot".to_owned(),
+            text: String::new(),
+            link_id: None,
+            files: vec!["a.pdf".to_owned()],
+            reaction: None,
+            json: false,
+        }
+    );
+    assert_eq!(
+        parse_command(&s(&["reply", "mybot", "--react", ":thumbsup:"]), None).unwrap(),
+        BotCommand::Reply {
+            bot: "mybot".to_owned(),
+            text: String::new(),
+            link_id: None,
+            files: Vec::new(),
+            reaction: Some(":thumbsup:".to_owned()),
+            json: false,
+        }
+    );
+    assert!(parse_command(&s(&["reply", "--bot", "mybot"]), None).is_err());
+}
+
+#[test]
+fn items_update_and_answer_flag_aliases_do_not_eagerly_consume_values() {
+    let cmd = parse_command(
+        &s(&[
+            "items",
+            "update",
+            "1",
+            "--ask",
+            "--question",
+            "--option",
+            "yes",
+            "--status",
+            "needs-you",
+        ]),
+        Some("mybot"),
+    )
+    .unwrap();
+    let BotCommand::ItemsUpdate(upd) = cmd else {
+        panic!("expected ItemsUpdate");
+    };
+    assert_eq!(upd.status, Some(BotItemStatus::NeedsYou));
+    assert_eq!(upd.decisions.len(), 1);
+    assert_eq!(upd.decisions[0].question, "--question");
+
+    // `--option` value `"--option-index"` must not be eagerly matched by the second `take_opt`
+    // and swallow a following flag; it must fail parsing `"--option-index"` as integer instead.
+    let err = parse_command(
+        &s(&[
+            "items",
+            "answer",
+            "1",
+            "--option",
+            "--option-index",
+            "--json",
+        ]),
+        Some("mybot"),
+    )
+    .unwrap_err();
+    assert!(
+        err.message.contains("non-negative integer"),
+        "unexpected error: {}",
+        err.message
+    );
+}
+
+#[test]
+fn export_zip_rejects_traversal_and_absolute_daemon_filenames() {
+    let dir = std::env::temp_dir().join(format!("krill-bot-export-sec-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let out_dir_slash = format!("{}/", out_dir.display());
+
+    for bad_name in [
+        "../../escape.zip",
+        "../escape.zip",
+        "..",
+        ".",
+        "",
+        "/tmp/escape.zip",
+        r"C:\Windows\escape.zip",
+        "C:escape.zip",
+        "nested/escape.zip",
+        r"nested\escape.zip",
+        "bad\0name.zip",
+    ] {
+        let mut client = MockClient::new([
+            BotRpcResponse::Bot(Box::new(sample_bot())),
+            BotRpcResponse::ExportedZip {
+                filename: bad_name.to_owned(),
+                zip_bytes: b"evil".to_vec(),
+            },
+        ]);
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        let err = execute_online(
+            parse_command(&s(&["export", "bot-pr-1", &out_dir_slash]), None).unwrap(),
+            &mut client,
+            &mut empty,
+            0,
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("unsafe filename"),
+            "expected unsafe filename rejection for {bad_name:?}, got: {}",
+            err.message
+        );
+        assert!(!dir.join("escape.zip").exists());
+        assert!(!out_dir.join("nested").exists());
+    }
+
+    // Legitimate single-component filename succeeds inside out_dir.
+    let mut client = MockClient::new([
+        BotRpcResponse::Bot(Box::new(sample_bot())),
+        BotRpcResponse::ExportedZip {
+            filename: "pr-reviewer.zip".to_owned(),
+            zip_bytes: b"PK-valid".to_vec(),
+        },
+    ]);
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    let ok = execute_online(
+        parse_command(&s(&["export", "bot-pr-1", &out_dir_slash]), None).unwrap(),
+        &mut client,
+        &mut empty,
+        0,
+        |_| None,
+    )
+    .unwrap();
+    assert!(ok.contains("pr-reviewer.zip"), "{ok}");
+    assert_eq!(
+        fs::read(out_dir.join("pr-reviewer.zip")).unwrap(),
+        b"PK-valid"
+    );
+
+    fs::remove_dir_all(&dir).ok();
 }

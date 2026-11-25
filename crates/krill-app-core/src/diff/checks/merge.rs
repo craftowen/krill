@@ -112,7 +112,11 @@ impl Panel {
                 match result {
                     Ok(()) => {
                         this.checks.fix_status = Some(text::ACTION_SUCCESS);
-                        this.refresh_checks(cx);
+                        if this.visible && this.tab == super::PanelTab::Checks {
+                            this.refresh_checks(cx);
+                        } else {
+                            this.checks.inspection = None;
+                        }
                     }
                     Err(reason) => {
                         this.checks.action_error =

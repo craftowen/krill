@@ -59,14 +59,46 @@ pub fn is_id(id: &str) -> bool {
     crate::error_reporting::is_hex32(id)
 }
 
-/// A file name safe to create inside one directory: the last path component, without control
-/// characters or leading dots (no hidden files), at most 255 bytes with the extension kept.
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            upper.strip_prefix(prefix).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+}
+
+/// A file name safe to create inside one directory across Unix and Windows: the last path
+/// component, without control or Windows-illegal characters, leading/trailing dots or whitespace,
+/// or Win32 reserved device stems, at most 255 bytes with the extension kept.
 #[must_use]
 pub fn sanitize_name(raw: &str) -> Option<String> {
     let last = raw.rsplit(['/', '\\']).next().unwrap_or_default();
-    let clean: String = last.chars().filter(|c| !c.is_control()).collect();
-    let clean = clean.trim_start_matches('.');
-    (!clean.is_empty()).then(|| numbered_name(clean, 0))
+    let clean: String = last
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let clean = clean.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if clean.is_empty() {
+        return None;
+    }
+    let mut out = numbered_name(clean, 0);
+    if is_windows_reserved_name(&out) {
+        out = numbered_name(&format!("_{out}"), 0);
+    }
+    Some(out)
 }
 
 /// `name` for `n == 0`, else `stem (n).ext`, trimmed to 255 bytes on a char boundary.
@@ -91,7 +123,14 @@ pub fn numbered_name(name: &str, n: u32) -> String {
     while !stem.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
-    format!("{}{suffix}{ext}", stem.get(..end).unwrap_or_default())
+    let head = stem.get(..end).unwrap_or_default();
+    let head = if suffix.is_empty() && ext.is_empty() {
+        let trimmed = head.trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+        if trimmed.is_empty() { head } else { trimmed }
+    } else {
+        head
+    };
+    format!("{head}{suffix}{ext}")
 }
 
 pub fn new_id() -> io::Result<String> {
@@ -261,7 +300,49 @@ mod tests {
         );
         assert_eq!(sanitize_name("a\u{0}b\nc.txt").as_deref(), Some("abc.txt"));
         assert_eq!(sanitize_name("..env").as_deref(), Some("env"));
-        for rejected in ["", ".", "..", "dir/", "a/..", "\u{7}", "..."] {
+        assert_eq!(
+            sanitize_name("meeting 10:30.txt").as_deref(),
+            Some("meeting 10_30.txt")
+        );
+        assert_eq!(sanitize_name("notes?.md").as_deref(), Some("notes_.md"));
+        assert_eq!(
+            sanitize_name("a<b>c\"d|e*f.txt").as_deref(),
+            Some("a_b_c_d_e_f.txt")
+        );
+        assert_eq!(
+            sanitize_name("report.pdf...").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            sanitize_name("  report.pdf   ").as_deref(),
+            Some("report.pdf")
+        );
+        for reserved in [
+            "CON",
+            "con.txt",
+            "PRN.md",
+            "aux",
+            "NUL.tar.gz",
+            "COM1",
+            "com9.log",
+            "LPT1.txt",
+            "lpt9",
+            "con .txt",
+        ] {
+            let clean = sanitize_name(reserved).unwrap();
+            assert!(
+                clean.starts_with('_') && !is_windows_reserved_name(&clean),
+                "{reserved:?} -> {clean:?}"
+            );
+        }
+        // Truncation landing on trailing spaces/dots must not expose a reserved stem or trailing dot.
+        let tricky = format!("CON{}a", " ".repeat(260));
+        let clean_tricky = sanitize_name(&tricky).unwrap();
+        assert_eq!(clean_tricky, "_CON");
+        let trailing_dot_trunc = format!("{}.{}", "a".repeat(254), "x".repeat(300));
+        let clean_dot = sanitize_name(&trailing_dot_trunc).unwrap();
+        assert!(!clean_dot.ends_with('.'), "{clean_dot:?}");
+        for rejected in ["", ".", "..", "dir/", "a/..", "\u{7}", "...", "   ", ". ."] {
             assert_eq!(sanitize_name(rejected), None, "{rejected:?}");
         }
     }
@@ -293,12 +374,19 @@ mod tests {
         fn sanitize_never_yields_a_path_or_hidden_name(raw in ".{0,400}") {
             if let Some(name) = sanitize_name(&raw) {
                 prop_assert!(!name.is_empty() && name.len() <= 255);
-                prop_assert!(!name.contains(['/', '\\']));
+                prop_assert!(!name.contains(['/', '\\', '<', '>', ':', '"', '|', '?', '*']));
                 prop_assert!(!name.starts_with('.'));
+                prop_assert!(!name.ends_with('.'));
+                prop_assert!(!name.chars().next().unwrap().is_whitespace());
+                prop_assert!(!name.chars().last().unwrap().is_whitespace());
                 prop_assert!(!name.chars().any(char::is_control));
+                prop_assert!(!is_windows_reserved_name(&name));
                 for n in [1, 999, u32::MAX] {
                     let numbered = numbered_name(&name, n);
                     prop_assert!(numbered.len() <= 255 && !numbered.starts_with('.'));
+                    prop_assert!(!numbered.ends_with('.'));
+                    prop_assert!(!numbered.chars().last().unwrap().is_whitespace());
+                    prop_assert!(!is_windows_reserved_name(&numbered));
                 }
             }
         }

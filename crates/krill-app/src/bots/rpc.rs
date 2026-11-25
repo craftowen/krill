@@ -310,12 +310,70 @@ fn exchange_batch_on_stream(
     Ok(replies)
 }
 
+/// Capabilities advertised by the Krill Desktop client on bot item reads so `Waiting` items
+/// are never downgraded to `Working` (Orca `#47429`).
+pub const DESKTOP_BOT_CAPABILITIES: &[&str] = krill_proto::bots::DESKTOP_BOT_CAPABILITIES;
+
+fn needs_desktop_capabilities(req: &BotRpcRequest) -> bool {
+    matches!(
+        req,
+        BotRpcRequest::ListItems { .. }
+            | BotRpcRequest::ListItemsPage { .. }
+            | BotRpcRequest::GetBotItem { .. }
+    )
+}
+
+fn wrap_with_desktop_capabilities(req: &BotRpcRequest) -> BotRpcRequest {
+    if needs_desktop_capabilities(req) {
+        BotRpcRequest::WithCapabilities {
+            capabilities: DESKTOP_BOT_CAPABILITIES
+                .iter()
+                .map(|cap| (*cap).to_owned())
+                .collect(),
+            request: Box::new(req.clone()),
+        }
+    } else {
+        req.clone()
+    }
+}
+
 /// Executes a batch of `BotRpcRequest`s against `target` using a pooled persistent control
 /// connection and pipelining when possible.
+///
+/// Advertises [`DESKTOP_BOT_CAPABILITIES`] on item-read requests so `Waiting` items are never
+/// downgraded on modern daemons, transparently falling back to raw requests if an older daemon
+/// does not understand `WithCapabilities`.
 ///
 /// If a reused pooled connection fails with a transient stream error and all requests are
 /// read-only, transparently reconnects once on a fresh stream.
 pub fn call_daemon_bot_batch(
+    target: &HostTarget,
+    reqs: &[BotRpcRequest],
+) -> io::Result<Vec<Result<BotRpcResponse, String>>> {
+    if reqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let any_wrapped = reqs.iter().any(needs_desktop_capabilities);
+    if any_wrapped {
+        let wrapped: Vec<BotRpcRequest> = reqs.iter().map(wrap_with_desktop_capabilities).collect();
+        match call_daemon_bot_batch_raw(target, &wrapped) {
+            Ok(replies)
+                if !reqs
+                    .iter()
+                    .zip(replies.iter())
+                    .any(|(req, slot)| needs_desktop_capabilities(req) && slot.is_err()) =>
+            {
+                return Ok(replies);
+            }
+            Ok(replies) if !target.is_current() => return Ok(replies),
+            Err(err) if !target.is_current() => return Err(err),
+            Ok(_) | Err(_) => {}
+        }
+    }
+    call_daemon_bot_batch_raw(target, reqs)
+}
+
+fn call_daemon_bot_batch_raw(
     target: &HostTarget,
     reqs: &[BotRpcRequest],
 ) -> io::Result<Vec<Result<BotRpcResponse, String>>> {

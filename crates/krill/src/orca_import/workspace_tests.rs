@@ -100,7 +100,7 @@ fn manual_reimport_repairs_old_paths_and_current_lineage_without_duplicates() {
     fs::remove_dir_all(&root).ok();
     fs::create_dir_all(root.join("repo/child")).unwrap();
     fs::create_dir_all(root.join("repo/legacy")).unwrap();
-    let repo = fs::canonicalize(root.join("repo"))
+    let repo = krill_proto::os::canonicalize(&root.join("repo"))
         .unwrap()
         .to_string_lossy()
         .into_owned();
@@ -208,8 +208,10 @@ fn manual_reimport_repairs_old_paths_and_current_lineage_without_duplicates() {
         );
         let checkpoints = WorktreeStore::load(&opts.state_dir).unwrap();
         assert_eq!(
-            checkpoints.parent_of(&child).as_deref(),
-            Some(repo.as_str())
+            checkpoints
+                .parent_of(&worktree_key(Path::new(&child)))
+                .as_deref(),
+            Some(worktree_key(Path::new(&repo)).as_str())
         );
         assert_eq!(
             checkpoints.checkpoint(&child).comment.as_deref(),

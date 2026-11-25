@@ -339,3 +339,90 @@ fn external_skill_ownership_skip_is_not_reported_as_failure() {
     assert!(install_skill("orchestration", &claude_skills).is_err());
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn foreign_orca_skill_and_user_references_stay_already_current_without_locking() {
+    let home = home("foreign-orca-current");
+    let root = home.join("skills");
+    let first = sync_builtin_skills(std::slice::from_ref(&root));
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
+    assert_eq!(first.updated, builtin_skills().len());
+
+    // Simulate Orca's own unprefixed `orchestration` and `computer-use` skills alongside
+    // Krill's `krill-orchestration` / `krill-computer-use`, plus a user-authored file in
+    // `krill-computer-use/references/`.
+    for foreign in ["orchestration", "computer-use"] {
+        let dir = root.join(foreign);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {foreign}\n---\nForeign Orca skill\n"),
+        )
+        .unwrap();
+    }
+    let user_ref_dir = root.join("krill-computer-use/references");
+    fs::create_dir_all(&user_ref_dir).unwrap();
+    let user_note = user_ref_dir.join("notes.md");
+    fs::write(&user_note, "user-authored notes").unwrap();
+
+    // Holding `.krill-skills.lock` proves `already_current` succeeds without touching the lock.
+    let guard = LockGuard::acquire(&root.join(".krill-skills.lock")).unwrap();
+    let second = sync_builtin_skills(std::slice::from_ref(&root));
+    drop(guard);
+    assert!(second.failures.is_empty(), "{:?}", second.failures);
+    assert!(second.busy.is_empty(), "{:?}", second.busy);
+    assert_eq!(second.updated, 0);
+    assert_eq!(second.unchanged, builtin_skills().len());
+    assert_eq!(
+        fs::read_to_string(&user_note).unwrap(),
+        "user-authored notes"
+    );
+
+    // Stale Krill-marked references and stale Krill-owned unprefixed copies still get cleaned.
+    let stale_ref = user_ref_dir.join("old.md");
+    fs::write(&stale_ref, format!("old\n{MARKER}\n")).unwrap();
+    fs::write(
+        root.join("orchestration/SKILL.md"),
+        format!("old krill copy\n{MARKER}\n"),
+    )
+    .unwrap();
+    let cleanup = sync_builtin_skills(std::slice::from_ref(&root));
+    assert!(cleanup.failures.is_empty(), "{:?}", cleanup.failures);
+    assert!(!stale_ref.exists());
+    assert!(user_note.is_file());
+    assert!(!root.join("orchestration/SKILL.md").exists());
+
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn readonly_root_with_foreign_orca_skill_checks_every_remaining_skill() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = home("readonly-orca-current");
+    let root = home.join("skills");
+    let initial = sync_builtin_skills(std::slice::from_ref(&root));
+    assert!(initial.failures.is_empty(), "{:?}", initial.failures);
+
+    let orca_dir = root.join("orchestration");
+    fs::create_dir_all(&orca_dir).unwrap();
+    fs::write(
+        orca_dir.join("SKILL.md"),
+        "---\nname: orchestration\n---\nForeign Orca skill\n",
+    )
+    .unwrap();
+    let user_refs = root.join("krill-computer-use/references");
+    fs::create_dir_all(&user_refs).unwrap();
+    fs::write(user_refs.join("custom.md"), "user notes").unwrap();
+
+    fs::remove_file(root.join(".krill-skills.lock")).ok();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let report = sync_builtin_skills(std::slice::from_ref(&root));
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ok();
+    fs::remove_dir_all(home).ok();
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.unchanged, builtin_skills().len());
+}
