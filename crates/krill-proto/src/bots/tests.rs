@@ -213,9 +213,13 @@ fn bot_config_json_roundtrip_and_validation() {
 
     assert!(BotItemStatus::Planned.is_open());
     assert!(BotItemStatus::Working.is_open());
+    assert!(BotItemStatus::Waiting.is_open());
     assert!(BotItemStatus::NeedsYou.is_open());
     assert!(!BotItemStatus::Done.is_open());
     assert!(!BotItemStatus::Canceled.is_open());
+    assert_eq!(BotItemStatus::Waiting.as_str(), "waiting");
+    assert!(BotItemStatus::Working < BotItemStatus::Waiting);
+    assert!(BotItemStatus::Waiting < BotItemStatus::NeedsYou);
 }
 
 // ---------- Bot Home, Memory Guard & Preamble ----------
@@ -831,6 +835,7 @@ fn bot_rpc_feature_bit_kinds_control_wiring_and_secret_redaction() {
             done_means: Some("Merged".to_owned()),
             status: Some(BotItemStatus::Working),
             links: vec![BotItemLink::Pr("craftowen/krill#1".to_owned())],
+            waiting_reason: None,
         })),
         BotRpcRequest::UpdateItem(Box::new(UpdateBotItemParams {
             item_id: "item-1".to_owned(),
@@ -847,6 +852,7 @@ fn bot_rpc_feature_bit_kinds_control_wiring_and_secret_redaction() {
             }],
             close_note: None,
             snoozed_until_ms: FieldPatch::Unchanged,
+            waiting_reason: None,
         })),
         BotRpcRequest::AddItemComment {
             item_id: "item-1".to_owned(),
@@ -999,6 +1005,8 @@ fn bot_rpc_feature_bit_kinds_control_wiring_and_secret_redaction() {
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let sample_access = BotAccessRequest {
         token: "tok-123".to_owned(),
@@ -1220,6 +1228,8 @@ fn v0317_wire_golden_bytes_unchanged() {
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let req_create = BotRpcRequest::CreateBot(Box::new(CreateBotParams {
         name: "Helper".to_owned(),
@@ -1343,6 +1353,8 @@ fn v2_rpc_roundtrip_read_only_and_debug_redaction() {
         created_at_ms: 100,
         updated_at_ms: 100,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
 
     let v2_requests = vec![
@@ -2803,4 +2815,127 @@ fn extract_group_mention_ids_enforces_word_boundaries() {
         extract_group_mention_ids("Ping @Ops. Also @Ops-Lead?", &members),
         vec![ops, ops_lead]
     );
+}
+
+#[test]
+fn bot_item_waiting_serde_wire_and_legacy_downgrade() {
+    assert_eq!(
+        serde_json::to_string(&BotItemStatus::Waiting).unwrap(),
+        "\"waiting\""
+    );
+    assert_eq!(
+        serde_json::from_str::<BotItemStatus>("\"waiting\"").unwrap(),
+        BotItemStatus::Waiting
+    );
+    assert_eq!(
+        BotItemStatus::ALL,
+        [
+            BotItemStatus::Planned,
+            BotItemStatus::Working,
+            BotItemStatus::Waiting,
+            BotItemStatus::NeedsYou,
+            BotItemStatus::Done,
+            BotItemStatus::Canceled,
+        ]
+    );
+    assert!(BotItemStatus::Working < BotItemStatus::Waiting);
+    assert!(BotItemStatus::Waiting < BotItemStatus::NeedsYou);
+
+    // Wait reason validation rules (trimmed, non-empty, single line, max 200 chars).
+    assert_eq!(
+        validate_waiting_reason("  CI on PR #42  ").unwrap(),
+        "CI on PR #42"
+    );
+    assert!(validate_waiting_reason("   ").is_err());
+    assert!(validate_waiting_reason("line one\nline two").is_err());
+    assert!(validate_waiting_reason("line one\rline two").is_err());
+    assert!(validate_waiting_reason(&"a".repeat(BOT_ITEM_WAITING_REASON_MAX_CHARS)).is_ok());
+    assert!(validate_waiting_reason(&"a".repeat(BOT_ITEM_WAITING_REASON_MAX_CHARS + 1)).is_err());
+
+    let bot_id = BotId::new("bot-wait").unwrap();
+    let item = BotItem {
+        uid: "item-wait-1".to_owned(),
+        number: 7,
+        owner_bot_id: bot_id.clone(),
+        title: "Merge release".to_owned(),
+        description: None,
+        done_means: None,
+        status: BotItemStatus::Waiting,
+        close_note: None,
+        links: Vec::new(),
+        events: Vec::new(),
+        snoozed_until_ms: None,
+        version: 3,
+        last_activity_at_ms: 1_700_000_000_500,
+        created_at_ms: 1_700_000_000_000,
+        updated_at_ms: 1_700_000_000_500,
+        closed_at_ms: None,
+        waiting_reason: Some("CI on PR #42".to_owned()),
+        waiting_since_ms: Some(1_700_000_000_500),
+    };
+
+    // JSON round-trip preserves waiting_reason & waiting_since_ms; old JSON without them loads cleanly.
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(json.contains("\"status\":\"waiting\""));
+    assert!(json.contains("\"waiting_reason\":\"CI on PR #42\""));
+    assert!(json.contains("\"waiting_since_ms\":1700000000500"));
+    assert_eq!(serde_json::from_str::<BotItem>(&json).unwrap(), item);
+
+    let legacy_json = r#"{
+        "uid":"item-old","number":1,"owner_bot_id":"bot-wait","title":"Old",
+        "status":"working","version":1,"last_activity_at_ms":1,"created_at_ms":1,"updated_at_ms":1
+    }"#;
+    let parsed_legacy: BotItem = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(parsed_legacy.waiting_reason, None);
+    assert_eq!(parsed_legacy.waiting_since_ms, None);
+
+    // Postcard BotRpcResponse::Item / Items / ItemsPage round-trip preserves waiting fields.
+    for resp in [
+        BotRpcResponse::Item(Box::new(item.clone())),
+        BotRpcResponse::Items(vec![item.clone(), parsed_legacy.clone()]),
+        BotRpcResponse::ItemsPage(BotItemsPage {
+            items: vec![item.clone()],
+            next_cursor: None,
+            total_count: 1,
+            unseen_count: 0,
+        }),
+    ] {
+        let frame = resp.encode().unwrap();
+        let (kind, body) = crate::ipc::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        let decoded = BotRpcResponse::decode(kind, &body).unwrap();
+        assert_eq!(decoded, resp);
+
+        let reply = crate::control::Reply::Bot(resp.clone());
+        let rframe = reply.encode().unwrap();
+        let (rkind, rbody) = crate::ipc::read_frame(&mut rframe.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::control::Reply::decode(rkind, &rbody).unwrap(), reply);
+    }
+
+    // Legacy client capability check + downgrade (Orca #47429).
+    let desktop_caps: Vec<String> = DESKTOP_BOT_CAPABILITIES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert!(client_supports_item_waiting(&desktop_caps));
+    assert!(!client_supports_item_waiting(&[]));
+
+    let mut downgraded = BotRpcResponse::Item(Box::new(item));
+    downgrade_response_for_legacy_client(&mut downgraded);
+    let BotRpcResponse::Item(down_item) = downgraded else {
+        panic!("expected Item");
+    };
+    assert_eq!(down_item.status, BotItemStatus::Working);
+    assert_eq!(down_item.waiting_reason, None);
+    assert_eq!(down_item.waiting_since_ms, None);
+
+    // Preamble instructs bots on waiting vs working (#47818) and preserves strip_launch_preamble.
+    let cfg = sample_bot_config();
+    let preamble = build_launch_preamble(&cfg, Some("# Soul"), Some("- fact"));
+    assert!(preamble.contains("waiting"));
+    assert!(preamble.contains("running worker counts as `working`"));
+    assert_eq!(strip_launch_preamble(&preamble), Some(""));
 }

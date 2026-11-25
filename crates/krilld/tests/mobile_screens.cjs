@@ -2918,5 +2918,77 @@ async function mobileI18nAuditRegressions(){
  }
  console.log('PASS mobile i18n audit regressions: 0 duplicate keys, placeholder parity, literal coverage, ko_KR/languages, Object.hasOwn, autonyms, banner switch, privacy link, bots timeline, details/workspaces/client ko');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function botItemWaitingRegressions(){
+ const now=Date.now();
+ const calls=[];
+ const waitItem={
+  uid:'it-wait-1',owner_bot_id:'b1',title:'Merge release PR',status:'waiting',
+  waiting_reason:'CI on PR #42',waiting_since_ms:now-60000,snoozed_until_ms:null,
+  links:[],events:[
+   {id:1,kind:'made',actor:{bot:{bot_id:'b1'}},text:'Merge release PR',decisions:[],created_at_ms:now-120000},
+   {id:2,kind:'status',actor:{bot:{bot_id:'b1'}},text:'status -> waiting: CI on PR #42',decisions:[],created_at_ms:now-60000},
+  ],
+ };
+ const uf=fixture('up-next',{
+  rpc:async req=>{
+   calls.push(req);
+   if(req.action==='bots.list')return {bots:[{id:'b1',name:'Release Bot',agent_id:'agy'}]};
+   if(req.action==='bots.items')return {items:req.status==='needs_you'?[]:[waitItem]};
+   if(req.action==='bots.access.list')return {requests:[]};
+   if(req.action==='bots.suggestions.list')return {suggestions:[]};
+   if(req.action==='bots.upcoming')return {schedules:[]};
+   if(req.action==='bots.item.update')return {item:{...waitItem,waiting_reason:req.waiting_reason}};
+   return {};
+  },
+ });
+ uf.ctx.connections=[{id:'h1',active:true,name:'Desktop',connection:{phase:'ready'},snapshot:{capabilities:{bots:true,bots_item_waiting:true},bots:{count:1,needs_you:0,pending_access:0},sessions:[],orchestration:{gates:[],questions:[],runs:[],tasks:[]}}}];
+ uf.view.update();
+ await uf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ // Clicking Waiting filter sends capabilities:["bots.item-waiting.v1"] and status:"waiting".
+ const waitChip=uf.all().find(n=>n.dataset?.filter==='waiting');
+ assert(waitChip,'Waiting filter chip rendered on up-next');
+ await waitChip.action();
+ await uf.flush();
+ await new Promise(r=>setTimeout(r,20));
+ assert(calls.some(c=>c.action==='bots.items'&&c.status==='waiting'&&Array.isArray(c.capabilities)&&c.capabilities.includes('bots.item-waiting.v1')),'modern host sends bots.item-waiting.v1 capability and waiting filter');
+ const card=uf.all().find(n=>n.dataset?.item==='it-wait-1');
+ assert(card,'waiting item card rendered');
+ assert(card.className.includes('item-waiting')&&!card.className.includes(' waiting'),'waiting card uses distinct item-waiting class');
+ const pill=card.querySelector('.bot-status-pill');
+ assert(pill&&pill.textContent==='Waiting'&&pill.className.includes('item-waiting'),'distinct Waiting pill rendered');
+ const waitLine=card.querySelector('.bot-item-wait-line');
+ assert(waitLine&&!waitLine.hidden&&waitLine.textContent.includes('CI on PR #42'),'waiting_reason rendered directly under item title');
+ // Opening detail sheet renders "Waiting on" card at end of Activity and hides duplicate latest status->waiting line.
+ const detailBtn=card.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Details');
+ await detailBtn.action();
+ const sheetSpec=uf.sheets.at(-1);
+ const sheetBody=uf.ctx.el('div');
+ sheetSpec[3](sheetBody);
+ const waitCard=sheetBody.querySelector('.bot-wait-card');
+ assert(waitCard&&waitCard.textContent.includes('Waiting on')&&waitCard.textContent.includes('CI on PR #42'),'Waiting on card rendered in item detail Activity');
+ assert(!sheetBody.textContent.includes('status -> waiting: CI on PR #42'),'duplicate latest status -> waiting event hidden while Waiting');
+ // Updating wait reason from detail sheet sends bots.item.update with status:"waiting" and waiting_reason.
+ const waitToggle=sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Waiting');
+ await waitToggle.action();
+ const waitInp=sheetBody.querySelectorAll('input').find(i=>i.getAttribute('aria-label')==='Waiting on');
+ assert(waitInp,'waiting reason input rendered');
+ waitInp.value='Review from Alice';
+ const saveWaitBtn=sheetBody.querySelectorAll('button').find(b=>b.getAttribute('aria-label')==='Mark waiting');
+ await saveWaitBtn.action();
+ assert(calls.some(c=>c.action==='bots.item.update'&&c.item_id==='it-wait-1'&&c.status==='waiting'&&c.waiting_reason==='Review from Alice'),'detail sheet updates waiting_reason via bots.item.update');
+ uf.abort.abort();
+
+ // Korean i18n translations for Waiting item UI.
+ const koBox=vm.createContext({navigator:{language:'ko'}});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/i18n.js'),'utf8'),koBox);
+ const K=koBox.KrillMobile.i18n;
+ assert.equal(K.t('Waiting'),'대기 중');
+ assert.equal(K.t('Waiting on'),'대기 사유');
+ for(const key of ['What is it waiting on?','Mark waiting','Marked waiting']){
+  assert.notEqual(K.t(key),key,`missing ko translation for "${key}"`);
+ }
+ console.log('PASS bot item Waiting regressions: capability, filter, badge, waiting_reason under title, detail Waiting on card, ko i18n');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();await botItemWaitingRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

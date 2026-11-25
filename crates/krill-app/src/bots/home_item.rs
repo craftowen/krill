@@ -26,13 +26,7 @@ use super::{OpenSession, View, avatar, now_unix_ms};
 use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
-const STATUSES: [BotItemStatus; 5] = [
-    BotItemStatus::Planned,
-    BotItemStatus::Working,
-    BotItemStatus::NeedsYou,
-    BotItemStatus::Done,
-    BotItemStatus::Canceled,
-];
+const STATUSES: [BotItemStatus; 6] = BotItemStatus::ALL;
 
 /// Latest non-owner ask event on `item`, used to mark older unanswered asks as superseded
 /// (Orca `#47869`).
@@ -99,10 +93,35 @@ pub(super) fn waiting_question(item: &BotItem) -> Option<&BotItemEvent> {
     (has_open && (item.status == BotItemStatus::NeedsYou || has_answered)).then_some(ask)
 }
 
-/// The status a `status -> x` event moved to (krilld's event text).
+/// The status a `status -> x` (or `status -> waiting: <reason>`) event moved to.
 fn event_status(event: &BotItemEvent) -> Option<BotItemStatus> {
-    let to = event.text.rsplit("-> ").next()?.trim();
-    STATUSES.into_iter().find(|s| s.as_str() == to)
+    let after = event.text.rsplit("-> ").next()?.trim();
+    let token = after.split(':').next()?.trim();
+    STATUSES.into_iter().find(|s| s.as_str() == token)
+}
+
+/// Optional waiting reason recorded inside a `status -> waiting: <reason>` event.
+fn event_waiting_reason(event: &BotItemEvent) -> Option<&str> {
+    let after = event.text.rsplit("-> ").next()?.trim();
+    after
+        .split_once(':')
+        .map(|(_, reason)| reason.trim())
+        .filter(|reason| !reason.is_empty())
+}
+
+/// The latest `status -> waiting` event while the item is still `Waiting` with a reason;
+/// suppressed from the plain event rail because it renders as the "Waiting on" card instead.
+pub(super) fn active_wait_event_id(item: &BotItem) -> Option<u64> {
+    if item.status != BotItemStatus::Waiting || item.waiting_reason.is_none() {
+        return None;
+    }
+    item.events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.kind == BotItemEventKind::Status && event_status(e) == Some(BotItemStatus::Waiting)
+        })
+        .map(|e| e.id)
 }
 
 /// Orca's `BotItemClampedText` clamps by measuring; Krill guesses from the text instead.
@@ -427,7 +446,8 @@ impl View {
         let this = cx.weak_entity();
         let (bot_id, uid, current) = (bot.id.clone(), item.uid.clone(), item.status);
         let snoozed = is_snoozed(item, now);
-        let is_waiting = item.status != BotItemStatus::NeedsYou && waiting_note(item).is_some();
+        let is_waiting = item.status == BotItemStatus::Waiting
+            || (item.status != BotItemStatus::NeedsYou && waiting_note(item).is_some());
         let current_wait = waiting_note(item).unwrap_or_default().to_owned();
         let title_text = item.title.clone();
         let status_label = if is_waiting {
@@ -458,61 +478,52 @@ impl View {
                     ),
             )
             .dropdown_menu(move |mut menu, _, _| {
-                let choices: [Option<BotItemStatus>; 6] = [
-                    Some(BotItemStatus::Planned),
-                    Some(BotItemStatus::Working),
-                    None, // Waiting (#47308/#47309)
-                    Some(BotItemStatus::NeedsYou),
-                    Some(BotItemStatus::Done),
-                    Some(BotItemStatus::Canceled),
-                ];
-                for choice in choices {
+                for status in STATUSES {
                     let (this, bot_id, uid) = (this.clone(), bot_id.clone(), uid.clone());
-                    match choice {
-                        None => {
-                            let title = title_text.clone();
-                            let wait_init = current_wait.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(hm::STATUS_WAITING.get())
-                                    .checked(is_waiting)
-                                    .on_click(move |_, _, cx| {
-                                        this.update(cx, |v, cx| {
-                                            v.ask_waiting(
-                                                bot_id.clone(),
-                                                vec![(uid.clone(), title.clone())],
-                                                (!wait_init.is_empty()).then(|| wait_init.clone()),
-                                                cx,
-                                            );
-                                        })
-                                        .ok();
-                                    }),
-                            );
-                        }
-                        Some(status) => {
-                            let active = status == current && !is_waiting;
-                            let name = if status == BotItemStatus::Canceled {
-                                text::HM_CANCELED_ITEM.get()
-                            } else {
-                                status_name(status)
-                            };
-                            // Orca `#47934`: Cancel applies immediately without a reason dialog.
-                            menu = menu.item(
-                                PopupMenuItem::new(name)
-                                    .checked(active)
-                                    .disabled(active)
-                                    .on_click(move |_, _, cx| {
-                                        this.update(cx, |v, cx| {
-                                            v.update_item_status(
-                                                bot_id.clone(),
-                                                uid.clone(),
-                                                status,
-                                                cx,
-                                            );
-                                        })
-                                        .ok();
-                                    }),
-                            );
-                        }
+                    if status == BotItemStatus::Waiting {
+                        let title = title_text.clone();
+                        let wait_init = current_wait.clone();
+                        let disabled = current == BotItemStatus::NeedsYou;
+                        menu = menu.item(
+                            PopupMenuItem::new(text::HM_WAITING_ITEM.get())
+                                .checked(is_waiting)
+                                .disabled(disabled)
+                                .on_click(move |_, _, cx| {
+                                    this.update(cx, |v, cx| {
+                                        v.ask_waiting(
+                                            bot_id.clone(),
+                                            vec![(uid.clone(), title.clone())],
+                                            (!wait_init.is_empty()).then(|| wait_init.clone()),
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                                }),
+                        );
+                    } else {
+                        let active = status == current && !is_waiting;
+                        let name = if status == BotItemStatus::Canceled {
+                            text::HM_CANCELED_ITEM.get()
+                        } else {
+                            status_name(status)
+                        };
+                        // Orca `#47934`: Cancel applies immediately without a reason dialog.
+                        menu = menu.item(
+                            PopupMenuItem::new(name)
+                                .checked(active)
+                                .disabled(active)
+                                .on_click(move |_, _, cx| {
+                                    this.update(cx, |v, cx| {
+                                        v.update_item_status(
+                                            bot_id.clone(),
+                                            uid.clone(),
+                                            status,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                                }),
+                        );
                     }
                 }
                 if current.is_open() {
@@ -676,6 +687,7 @@ impl View {
     ) -> gpui::Div {
         let waiting = waiting_question_with_skipped(item, &self.items.skipped_asks).map(|e| e.id);
         let latest_ask = latest_ask_id(item);
+        let hidden_wait_event = active_wait_event_id(item);
         let mut list = div()
             .debug_selector(|| "bot-item-activity".into())
             .relative()
@@ -704,6 +716,9 @@ impl View {
                 .saturating_sub(super::home_item_parts::ACTIVITY_PAGE)
         };
         for event in item.events.iter().skip(skip) {
+            if hidden_wait_event == Some(event.id) {
+                continue;
+            }
             let card = event.kind == BotItemEventKind::Commented || !event.decisions.is_empty();
             if card {
                 let superseded = !event.decisions.is_empty()
@@ -736,6 +751,14 @@ impl View {
                 item.title.clone(),
                 wait_text.to_owned(),
             );
+            let since = item
+                .waiting_since_ms
+                .or_else(|| {
+                    hidden_wait_event
+                        .and_then(|id| item.events.iter().find(|e| e.id == id))
+                        .map(|e| e.created_at_ms)
+                })
+                .unwrap_or(item.updated_at_ms);
             list = list.child(
                 div()
                     .id("bot-item-wait-card")
@@ -782,7 +805,7 @@ impl View {
                                             .ml_auto()
                                             .text_size(ui::TEXT_XS)
                                             .text_color(p.muted_foreground)
-                                            .child(activity_timestamp(item.updated_at_ms, now)),
+                                            .child(activity_timestamp(since, now)),
                                     ),
                             )
                             .child(
@@ -1133,6 +1156,12 @@ impl View {
                 },
                 match status {
                     Some(BotItemStatus::Done | BotItemStatus::Canceled) | None => None,
+                    Some(BotItemStatus::Waiting) => Some(match event_waiting_reason(event) {
+                        Some(reason) => {
+                            format!("{} ({reason})", status_name(BotItemStatus::Waiting))
+                        }
+                        None => status_name(BotItemStatus::Waiting).to_owned(),
+                    }),
                     Some(s) => Some(status_name(s).to_owned()),
                 },
             ),

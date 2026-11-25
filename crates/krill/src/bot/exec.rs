@@ -570,6 +570,7 @@ where
                 decisions: Vec::new(),
                 close_note: None,
                 snoozed_until_ms: patch,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for UpdateItem"));
@@ -588,6 +589,7 @@ where
                 decisions: Vec::new(),
                 close_note: None,
                 snoozed_until_ms: FieldPatch::Clear,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for UpdateItem"));
@@ -628,6 +630,7 @@ where
                 decisions: Vec::new(),
                 close_note: note,
                 snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for UpdateItem"));
@@ -932,6 +935,7 @@ where
                 done_means: None,
                 status: Some(BotItemStatus::Planned),
                 links,
+                waiting_reason: None,
             })))?;
             let BotRpcResponse::Item(item) = resp else {
                 return Err(CliError::fail("unexpected reply for CreateItem"));
@@ -1934,6 +1938,7 @@ fn exec_items_add(args: ItemsAddArgs, client: &mut dyn BotClient) -> Result<Stri
         done_means: args.done_means,
         status: args.status,
         links: args.links,
+        waiting_reason: args.waiting_reason,
     })))?;
     let BotRpcResponse::Item(item) = resp else {
         return Err(CliError::fail("unexpected reply for CreateItem"));
@@ -1964,6 +1969,7 @@ fn exec_items_update(
         decisions: args.decisions,
         close_note: args.close_note,
         snoozed_until_ms,
+        waiting_reason: args.waiting_reason,
     })))?;
     let BotRpcResponse::Item(item) = resp else {
         return Err(CliError::fail("unexpected reply for UpdateItem"));

@@ -47,6 +47,65 @@ pub const BOT_ITEM_TITLE_MAX_BYTES: usize = 200;
 pub const BOT_ITEM_DESCRIPTION_MAX_BYTES: usize = 20_000;
 /// Maximum bot item comment length.
 pub const BOT_ITEM_COMMENT_MAX_BYTES: usize = 8_000;
+/// Maximum character length for a single-line `Waiting` reason.
+pub const BOT_ITEM_WAITING_REASON_MAX_CHARS: usize = 200;
+/// Client capability advertising support for [`BotItemStatus::Waiting`] and `waiting_reason`.
+pub const BOTS_ITEM_WAITING_CAPABILITY: &str = "bots.item-waiting.v1";
+/// Default bot capabilities advertised by Krill Desktop and CLI clients.
+pub const DESKTOP_BOT_CAPABILITIES: &[&str] = &[BOTS_ITEM_WAITING_CAPABILITY];
+
+/// Validates and trims a single-line wait reason (non-empty, no line breaks, at most
+/// [`BOT_ITEM_WAITING_REASON_MAX_CHARS`] characters).
+pub fn validate_waiting_reason(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("waiting reason must not be empty");
+    }
+    if trimmed.contains(['\n', '\r']) {
+        return Err("waiting reason must be a single line");
+    }
+    if trimmed.chars().count() > BOT_ITEM_WAITING_REASON_MAX_CHARS {
+        return Err("waiting reason exceeds 200 characters");
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Returns `true` when `capabilities` advertises [`BOTS_ITEM_WAITING_CAPABILITY`].
+#[must_use]
+pub fn client_supports_item_waiting(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|cap| cap == BOTS_ITEM_WAITING_CAPABILITY)
+}
+
+/// Downgrades a `Waiting` item to `Working` and strips waiting metadata so older clients
+/// that do not advertise [`BOTS_ITEM_WAITING_CAPABILITY`] decode and display it cleanly.
+pub fn downgrade_item_for_legacy_client(item: &mut BotItem) {
+    if item.status == BotItemStatus::Waiting {
+        item.status = BotItemStatus::Working;
+    }
+    item.waiting_reason = None;
+    item.waiting_since_ms = None;
+}
+
+/// Downgrades a slice of items for legacy clients without [`BOTS_ITEM_WAITING_CAPABILITY`].
+pub fn downgrade_items_for_legacy_client(items: &mut [BotItem]) {
+    for item in items {
+        downgrade_item_for_legacy_client(item);
+    }
+}
+
+/// Downgrades item payloads inside a [`super::BotRpcResponse`] for legacy clients.
+pub fn downgrade_response_for_legacy_client(resp: &mut super::BotRpcResponse) {
+    match resp {
+        super::BotRpcResponse::Item(item) => downgrade_item_for_legacy_client(item),
+        super::BotRpcResponse::Items(items) => downgrade_items_for_legacy_client(items),
+        super::BotRpcResponse::ItemsPage(page) => {
+            downgrade_items_for_legacy_client(&mut page.items);
+        }
+        _ => {}
+    }
+}
 
 /// Validation error for bot identifiers, slugs, names, and configs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1012,6 +1071,10 @@ pub struct BotErrorDetail {
 }
 
 /// Lifecycle state of a tracked bot deliverable or decision item.
+///
+/// `Waiting` is appended at the end of the enum so postcard discriminants for
+/// `Planned..=Canceled` (`0..=4`) stay frozen for N-1 wire compatibility. Logical ordering
+/// ([`Self::ALL`], [`Self::order_rank`], `Ord`) places `Waiting` between `Working` and `NeedsYou`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BotItemStatus {
@@ -1021,12 +1084,39 @@ pub enum BotItemStatus {
     NeedsYou,
     Done,
     Canceled,
+    Waiting,
 }
 
 impl BotItemStatus {
+    /// Canonical logical display order with `Waiting` between `Working` and `NeedsYou`.
+    pub const ALL: [Self; 6] = [
+        Self::Planned,
+        Self::Working,
+        Self::Waiting,
+        Self::NeedsYou,
+        Self::Done,
+        Self::Canceled,
+    ];
+
+    /// Logical ordering rank (`Planned=0 < Working=1 < Waiting=2 < NeedsYou=3 < Done=4 < Canceled=5`).
+    #[must_use]
+    pub const fn order_rank(self) -> u8 {
+        match self {
+            Self::Planned => 0,
+            Self::Working => 1,
+            Self::Waiting => 2,
+            Self::NeedsYou => 3,
+            Self::Done => 4,
+            Self::Canceled => 5,
+        }
+    }
+
     #[must_use]
     pub const fn is_open(self) -> bool {
-        matches!(self, Self::Planned | Self::Working | Self::NeedsYou)
+        matches!(
+            self,
+            Self::Planned | Self::Working | Self::Waiting | Self::NeedsYou
+        )
     }
 
     #[must_use]
@@ -1034,10 +1124,23 @@ impl BotItemStatus {
         match self {
             Self::Planned => "planned",
             Self::Working => "working",
+            Self::Waiting => "waiting",
             Self::NeedsYou => "needs_you",
             Self::Done => "done",
             Self::Canceled => "canceled",
         }
+    }
+}
+
+impl PartialOrd for BotItemStatus {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BotItemStatus {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order_rank().cmp(&other.order_rank())
     }
 }
 
@@ -1183,31 +1286,226 @@ pub struct BotItemEvent {
 }
 
 /// A deliverable or decision tracked by a bot for its owner.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotItem {
     pub uid: String,
     pub number: u64,
     pub owner_bot_id: BotId,
     pub title: String,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
     pub done_means: Option<String>,
     pub status: BotItemStatus,
-    #[serde(default)]
     pub close_note: Option<String>,
-    #[serde(default)]
     pub links: Vec<BotItemLink>,
-    #[serde(default)]
     pub events: Vec<BotItemEvent>,
-    #[serde(default)]
     pub snoozed_until_ms: Option<u64>,
     pub version: u64,
     pub last_activity_at_ms: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    #[serde(default)]
     pub closed_at_ms: Option<u64>,
+    /// Single-line description of the external wait while `status == BotItemStatus::Waiting`.
+    /// Serialized on JSON/human-readable formats and via [`super::BotRpcResponse`] trailing wire
+    /// extensions so the frozen v0.3.17 16-field postcard layout stays bit-for-bit identical.
+    pub waiting_reason: Option<String>,
+    /// Unix timestamp (ms) when the item entered its current wait, for the "Waiting on" card.
+    pub waiting_since_ms: Option<u64>,
+}
+
+impl Serialize for BotItem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct WireV0317<'a> {
+            uid: &'a str,
+            number: u64,
+            owner_bot_id: &'a BotId,
+            title: &'a str,
+            description: &'a Option<String>,
+            done_means: &'a Option<String>,
+            status: BotItemStatus,
+            close_note: &'a Option<String>,
+            links: &'a [BotItemLink],
+            events: &'a [BotItemEvent],
+            snoozed_until_ms: Option<u64>,
+            version: u64,
+            last_activity_at_ms: u64,
+            created_at_ms: u64,
+            updated_at_ms: u64,
+            closed_at_ms: Option<u64>,
+        }
+        #[derive(Serialize)]
+        struct Human<'a> {
+            uid: &'a str,
+            number: u64,
+            owner_bot_id: &'a BotId,
+            title: &'a str,
+            description: &'a Option<String>,
+            done_means: &'a Option<String>,
+            status: BotItemStatus,
+            close_note: &'a Option<String>,
+            links: &'a [BotItemLink],
+            events: &'a [BotItemEvent],
+            snoozed_until_ms: Option<u64>,
+            version: u64,
+            last_activity_at_ms: u64,
+            created_at_ms: u64,
+            updated_at_ms: u64,
+            closed_at_ms: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            waiting_reason: &'a Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            waiting_since_ms: Option<u64>,
+        }
+        if serializer.is_human_readable() {
+            Human {
+                uid: &self.uid,
+                number: self.number,
+                owner_bot_id: &self.owner_bot_id,
+                title: &self.title,
+                description: &self.description,
+                done_means: &self.done_means,
+                status: self.status,
+                close_note: &self.close_note,
+                links: &self.links,
+                events: &self.events,
+                snoozed_until_ms: self.snoozed_until_ms,
+                version: self.version,
+                last_activity_at_ms: self.last_activity_at_ms,
+                created_at_ms: self.created_at_ms,
+                updated_at_ms: self.updated_at_ms,
+                closed_at_ms: self.closed_at_ms,
+                waiting_reason: &self.waiting_reason,
+                waiting_since_ms: self.waiting_since_ms,
+            }
+            .serialize(serializer)
+        } else {
+            WireV0317 {
+                uid: &self.uid,
+                number: self.number,
+                owner_bot_id: &self.owner_bot_id,
+                title: &self.title,
+                description: &self.description,
+                done_means: &self.done_means,
+                status: self.status,
+                close_note: &self.close_note,
+                links: &self.links,
+                events: &self.events,
+                snoozed_until_ms: self.snoozed_until_ms,
+                version: self.version,
+                last_activity_at_ms: self.last_activity_at_ms,
+                created_at_ms: self.created_at_ms,
+                updated_at_ms: self.updated_at_ms,
+                closed_at_ms: self.closed_at_ms,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BotItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireV0317 {
+            uid: String,
+            number: u64,
+            owner_bot_id: BotId,
+            title: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            done_means: Option<String>,
+            status: BotItemStatus,
+            #[serde(default)]
+            close_note: Option<String>,
+            #[serde(default)]
+            links: Vec<BotItemLink>,
+            #[serde(default)]
+            events: Vec<BotItemEvent>,
+            #[serde(default)]
+            snoozed_until_ms: Option<u64>,
+            version: u64,
+            last_activity_at_ms: u64,
+            created_at_ms: u64,
+            updated_at_ms: u64,
+            #[serde(default)]
+            closed_at_ms: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        struct Human {
+            uid: String,
+            number: u64,
+            owner_bot_id: BotId,
+            title: String,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            done_means: Option<String>,
+            status: BotItemStatus,
+            #[serde(default)]
+            close_note: Option<String>,
+            #[serde(default)]
+            links: Vec<BotItemLink>,
+            #[serde(default)]
+            events: Vec<BotItemEvent>,
+            #[serde(default)]
+            snoozed_until_ms: Option<u64>,
+            version: u64,
+            last_activity_at_ms: u64,
+            created_at_ms: u64,
+            updated_at_ms: u64,
+            #[serde(default)]
+            closed_at_ms: Option<u64>,
+            #[serde(default)]
+            waiting_reason: Option<String>,
+            #[serde(default)]
+            waiting_since_ms: Option<u64>,
+        }
+        if deserializer.is_human_readable() {
+            let h = Human::deserialize(deserializer)?;
+            Ok(Self {
+                uid: h.uid,
+                number: h.number,
+                owner_bot_id: h.owner_bot_id,
+                title: h.title,
+                description: h.description,
+                done_means: h.done_means,
+                status: h.status,
+                close_note: h.close_note,
+                links: h.links,
+                events: h.events,
+                snoozed_until_ms: h.snoozed_until_ms,
+                version: h.version,
+                last_activity_at_ms: h.last_activity_at_ms,
+                created_at_ms: h.created_at_ms,
+                updated_at_ms: h.updated_at_ms,
+                closed_at_ms: h.closed_at_ms,
+                waiting_reason: h.waiting_reason,
+                waiting_since_ms: h.waiting_since_ms,
+            })
+        } else {
+            let w = WireV0317::deserialize(deserializer)?;
+            Ok(Self {
+                uid: w.uid,
+                number: w.number,
+                owner_bot_id: w.owner_bot_id,
+                title: w.title,
+                description: w.description,
+                done_means: w.done_means,
+                status: w.status,
+                close_note: w.close_note,
+                links: w.links,
+                events: w.events,
+                snoozed_until_ms: w.snoozed_until_ms,
+                version: w.version,
+                last_activity_at_ms: w.last_activity_at_ms,
+                created_at_ms: w.created_at_ms,
+                updated_at_ms: w.updated_at_ms,
+                closed_at_ms: w.closed_at_ms,
+                waiting_reason: None,
+                waiting_since_ms: None,
+            })
+        }
+    }
 }
 
 /// A named multi-bot group chat room.

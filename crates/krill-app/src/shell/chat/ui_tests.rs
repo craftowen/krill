@@ -6292,6 +6292,8 @@ fn cross_host_paused_resume_and_split_item_note_focus_behave_cleanly(cx: &mut Te
         created_at_ms: 1_700_000_000_500,
         updated_at_ms: 1_700_000_000_500,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let items_for_rpc = vec![item];
 

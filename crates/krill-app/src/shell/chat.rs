@@ -6837,16 +6837,17 @@ fn bot_notes(items: &[krill_proto::bots::BotItem]) -> Vec<BotNote> {
                         .to_owned(),
                 ),
                 BotItemEventKind::Status => {
-                    let to = event.text.rsplit("-> ").next().unwrap_or_default().trim();
-                    let Some(status) = [
-                        BotItemStatus::Planned,
-                        BotItemStatus::Working,
-                        BotItemStatus::NeedsYou,
-                        BotItemStatus::Done,
-                        BotItemStatus::Canceled,
-                    ]
-                    .into_iter()
-                    .find(|s| s.as_str() == to) else {
+                    let to = event
+                        .text
+                        .rsplit("-> ")
+                        .next()
+                        .unwrap_or_default()
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .trim();
+                    let Some(status) = BotItemStatus::ALL.into_iter().find(|s| s.as_str() == to)
+                    else {
                         continue;
                     };
                     NoteAction::Status(status)

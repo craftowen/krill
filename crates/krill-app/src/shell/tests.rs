@@ -7798,6 +7798,8 @@ fn needs_you_item(bot_id: &krill_proto::bots::BotId) -> krill_proto::bots::BotIt
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     }
 }
 
@@ -14544,6 +14546,8 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
                         closed_at_ms: None,
+                        waiting_reason: None,
+                        waiting_since_ms: None,
                     },
                     BotItem {
                         uid: "i-2".to_owned(),
@@ -14562,6 +14566,8 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
                         closed_at_ms: None,
+                        waiting_reason: None,
+                        waiting_since_ms: None,
                     },
                 ];
                 if extra_cap.load(std::sync::atomic::Ordering::SeqCst) {
@@ -14582,6 +14588,8 @@ fn bots_link_up_refreshes_attention_badge_and_sidebar_sessions(cx: &mut TestAppC
                         created_at_ms: 1_700_000_000_000,
                         updated_at_ms: 1_700_000_000_000,
                         closed_at_ms: None,
+                        waiting_reason: None,
+                        waiting_since_ms: None,
                     });
                 }
                 Ok(BotRpcResponse::Items(items))

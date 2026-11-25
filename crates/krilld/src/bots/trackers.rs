@@ -671,6 +671,7 @@ fn create_dedup_item(
                 done_means: None,
                 status: Some(status),
                 links: vec![link],
+                waiting_reason: None,
             },
             actor,
             now_ms,

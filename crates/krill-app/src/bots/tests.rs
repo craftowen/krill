@@ -99,6 +99,8 @@ fn sample_item(bot_id: &str, uid: &str, number: u64, status: BotItemStatus) -> B
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_000,
         closed_at_ms: None,
+        waiting_reason: None,
+        waiting_since_ms: None,
     }
 }
 
@@ -463,6 +465,8 @@ fn make_mock_rpc(state: Arc<Mutex<MockState>>) -> BotRpcCall {
                     created_at_ms: 1_700_000_000_000,
                     updated_at_ms: 1_700_000_000_000,
                     closed_at_ms: None,
+                    waiting_reason: params.waiting_reason.clone(),
+                    waiting_since_ms: params.waiting_reason.as_ref().map(|_| 1_700_000_000_000),
                 };
                 st.items.push(item.clone());
                 Ok(BotRpcResponse::Item(Box::new(item)))
@@ -3412,6 +3416,8 @@ fn bot_home_and_group_all_clear_show_avatar_above_folded_groups_and_hide_when_pa
         created_at_ms: now,
         updated_at_ms: now,
         last_activity_at_ms: now,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let state = Arc::new(Mutex::new(MockState {
         bots: vec![bot.clone()],
@@ -3548,6 +3554,8 @@ fn waiting_question_comment_is_shown_whole_and_settled_comment_clamps(
         created_at_ms: 1_000,
         updated_at_ms: 2_000,
         last_activity_at_ms: 2_000,
+        waiting_reason: None,
+        waiting_since_ms: None,
     };
     let state = Arc::new(Mutex::new(MockState {
         bots: vec![bot.clone()],

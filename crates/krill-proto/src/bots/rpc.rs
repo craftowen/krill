@@ -177,6 +177,8 @@ pub struct CreateBotItemParams {
     pub status: Option<BotItemStatus>,
     #[serde(default)]
     pub links: Vec<BotItemLink>,
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
 }
 
 /// Parameters for updating a tracked bot item.
@@ -199,6 +201,8 @@ pub struct UpdateBotItemParams {
     pub close_note: Option<String>,
     #[serde(default)]
     pub snoozed_until_ms: FieldPatch<u64>,
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
 }
 
 /// Versioned extensible RPC request enum covering all Phase 1-3 Krill Bot operations.
@@ -638,44 +642,52 @@ pub enum BotRpcRequest {
         #[serde(default)]
         bot_id: Option<BotId>,
     },
+    /// Wraps a bot RPC request with client capability strings (e.g. `bots.item-waiting.v1`)
+    /// so the daemon can preserve or downgrade newer item states cleanly.
+    WithCapabilities {
+        #[serde(default)]
+        capabilities: Vec<String>,
+        request: Box<BotRpcRequest>,
+    },
 }
 
 impl BotRpcRequest {
     /// Returns `true` for read-only requests safe for `Role::Observer` clients.
     #[must_use]
-    pub const fn is_read_only(&self) -> bool {
-        matches!(
-            self,
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::WithCapabilities { request, .. } => request.is_read_only(),
             Self::ListBots
-                | Self::GetBot { .. }
-                | Self::GetSoul { .. }
-                | Self::GetMemory { .. }
-                | Self::ListItems { .. }
-                | Self::ListGroups
-                | Self::ConnectorStatus { .. }
-                | Self::ToolRelayStatus
-                | Self::ImportExternalBots { dry_run: true, .. }
-                | Self::GetBotAvatar { .. }
-                | Self::ListItemsPage { .. }
-                | Self::GetBotItem { .. }
-                | Self::GetMemoryHistory { .. }
-                | Self::GetMemoryTidyStatus { .. }
-                | Self::ListMemoryTopics { .. }
-                | Self::GetMemoryTopic { .. }
-                | Self::ListSuggestions { .. }
-                | Self::ListBotSessions { .. }
-                | Self::ReadGroup { .. }
-                | Self::McpOAuthStatus { .. }
-                | Self::ListComposioConnections { .. }
-                | Self::GetDefaultTrackerBots
-                | Self::ListAgentModels { .. }
-                | Self::GetBotUpcoming { .. }
-                | Self::GetBotSettingsExtras { .. }
-                | Self::ListBotOffers { .. }
-                | Self::ListImportedSources
-                | Self::ListGroupSummaries
-                | Self::ReadGroupRoom { .. }
-        )
+            | Self::GetBot { .. }
+            | Self::GetSoul { .. }
+            | Self::GetMemory { .. }
+            | Self::ListItems { .. }
+            | Self::ListGroups
+            | Self::ConnectorStatus { .. }
+            | Self::ToolRelayStatus
+            | Self::ImportExternalBots { dry_run: true, .. }
+            | Self::GetBotAvatar { .. }
+            | Self::ListItemsPage { .. }
+            | Self::GetBotItem { .. }
+            | Self::GetMemoryHistory { .. }
+            | Self::GetMemoryTidyStatus { .. }
+            | Self::ListMemoryTopics { .. }
+            | Self::GetMemoryTopic { .. }
+            | Self::ListSuggestions { .. }
+            | Self::ListBotSessions { .. }
+            | Self::ReadGroup { .. }
+            | Self::McpOAuthStatus { .. }
+            | Self::ListComposioConnections { .. }
+            | Self::GetDefaultTrackerBots
+            | Self::ListAgentModels { .. }
+            | Self::GetBotUpcoming { .. }
+            | Self::GetBotSettingsExtras { .. }
+            | Self::ListBotOffers { .. }
+            | Self::ListImportedSources
+            | Self::ListGroupSummaries
+            | Self::ReadGroupRoom { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -1220,6 +1232,14 @@ impl fmt::Debug for BotRpcRequest {
                 .field("thread_id", thread_id)
                 .field("bot_id", bot_id)
                 .finish(),
+            Self::WithCapabilities {
+                capabilities,
+                request,
+            } => f
+                .debug_struct("WithCapabilities")
+                .field("capabilities", capabilities)
+                .field("request", request)
+                .finish(),
         }
     }
 }
@@ -1602,13 +1622,42 @@ struct BotUpcomingV1 {
     items_seen_event_id: u64,
 }
 
+/// Postcard variant discriminant for [`BotRpcResponse::Items`] (0-indexed variant 10).
+pub(crate) const ITEMS_RESPONSE_TAG: u8 = 10;
+/// Postcard variant discriminant for [`BotRpcResponse::Item`] (0-indexed variant 11).
+pub(crate) const ITEM_RESPONSE_TAG: u8 = 11;
+/// Postcard variant discriminant for [`BotRpcResponse::ItemsPage`] (0-indexed variant 25).
+pub(crate) const ITEMS_PAGE_RESPONSE_TAG: u8 = 25;
 /// Postcard variant discriminant for [`BotRpcResponse::Upcoming`] (0-indexed variant 39).
 pub(crate) const UPCOMING_RESPONSE_TAG: u8 = 39;
 
+fn item_has_waiting_meta(item: &BotItem) -> bool {
+    item.waiting_reason.is_some() || item.waiting_since_ms.is_some()
+}
+
+fn append_waiting_meta(body: &mut Vec<u8>, item: &BotItem) -> Result<(), crate::ipc::Error> {
+    body.extend(
+        postcard::to_stdvec(&(&item.waiting_reason, item.waiting_since_ms))
+            .map_err(crate::ipc::Error::Codec)?,
+    );
+    Ok(())
+}
+
+fn decode_waiting_meta<'a>(
+    tail: &'a [u8],
+    item: &mut BotItem,
+) -> Result<&'a [u8], crate::ipc::Error> {
+    let ((reason, since), next) = postcard::take_from_bytes::<(Option<String>, Option<u64>)>(tail)
+        .map_err(crate::ipc::Error::Codec)?;
+    item.waiting_reason = reason;
+    item.waiting_since_ms = since;
+    Ok(next)
+}
+
 impl BotRpcResponse {
-    /// Encodes this response into postcard body bytes, preserving the frozen v0.3.22
-    /// 4-field layout for [`BotRpcResponse::Upcoming`] and appending `last_error` /
-    /// `last_refusal` as trailing postcard extensions.
+    /// Encodes this response into postcard body bytes, preserving frozen v0.3.17/v0.3.22
+    /// layouts while appending trailing extensions (`last_error`/`last_refusal` on `Upcoming`,
+    /// and `waiting_reason`/`waiting_since_ms` on `Item`/`Items`/`ItemsPage`) only when set.
     pub(crate) fn encode_wire_body(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::Upcoming(up) = self {
             let v1 = BotUpcomingV1 {
@@ -1651,10 +1700,27 @@ impl BotRpcResponse {
             }
             return Ok(body);
         }
-        postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)
+        let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
+        match self {
+            Self::Item(item) if item_has_waiting_meta(item) => {
+                append_waiting_meta(&mut body, item)?;
+            }
+            Self::Items(items) if items.iter().any(item_has_waiting_meta) => {
+                for item in items {
+                    append_waiting_meta(&mut body, item)?;
+                }
+            }
+            Self::ItemsPage(page) if page.items.iter().any(item_has_waiting_meta) => {
+                for item in &page.items {
+                    append_waiting_meta(&mut body, item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(body)
     }
 
-    /// Decodes postcard body bytes produced by either this build or v0.3.22.
+    /// Decodes postcard body bytes produced by either this build or N-1 releases.
     pub(crate) fn decode_wire_body(body: &[u8]) -> Result<Self, crate::ipc::Error> {
         if body.first() == Some(&UPCOMING_RESPONSE_TAG) {
             let (_, rest) =
@@ -1699,6 +1765,32 @@ impl BotRpcResponse {
                 up_next_seen_ms: v1.up_next_seen_ms,
                 items_seen_event_id: v1.items_seen_event_id,
             }));
+        }
+        if matches!(
+            body.first().copied(),
+            Some(ITEMS_RESPONSE_TAG | ITEM_RESPONSE_TAG | ITEMS_PAGE_RESPONSE_TAG)
+        ) {
+            let (mut resp, mut tail) =
+                postcard::take_from_bytes::<Self>(body).map_err(crate::ipc::Error::Codec)?;
+            if !tail.is_empty() {
+                match &mut resp {
+                    Self::Item(item) => {
+                        let _ = decode_waiting_meta(tail, item)?;
+                    }
+                    Self::Items(items) => {
+                        for item in items {
+                            tail = decode_waiting_meta(tail, item)?;
+                        }
+                    }
+                    Self::ItemsPage(page) => {
+                        for item in &mut page.items {
+                            tail = decode_waiting_meta(tail, item)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(resp);
         }
         postcard::from_bytes(body).map_err(crate::ipc::Error::Codec)
     }

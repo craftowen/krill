@@ -17,13 +17,7 @@ use crate::i18n::catalog::{bot_home as hm, bots as text};
 use crate::ui;
 
 /// Orca's `BOT_ITEM_STATUSES`, in the Move to menu's order.
-const STATUSES: [BotItemStatus; 5] = [
-    BotItemStatus::Planned,
-    BotItemStatus::Working,
-    BotItemStatus::NeedsYou,
-    BotItemStatus::Done,
-    BotItemStatus::Canceled,
-];
+const STATUSES: [BotItemStatus; 6] = BotItemStatus::ALL;
 
 /// Checks (`on`) or unchecks a row; with `range`, every row from the last one clicked to it, in
 /// the list's order.
@@ -181,47 +175,18 @@ impl View {
                 } else {
                     None
                 };
+                let any_needs_you = items.iter().any(|i| i.status == BotItemStatus::NeedsYou);
                 for status in STATUSES {
-                    if status == BotItemStatus::Planned {
-                        let (this_w, bot_w, all_w, existing_w) = (
-                            this.clone(),
-                            bot.clone(),
-                            all.clone(),
-                            existing_wait.clone(),
-                        );
-                        let wait_glyph = PopupMenuItem::element(move |_, cx| {
-                            let p = ui::palette(cx);
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(px(16.))
-                                        .flex()
-                                        .justify_center()
-                                        .child(super::home::waiting_icon(p)),
-                                )
-                                .child(hm::STATUS_WAITING.get())
-                        });
-                        menu = menu.item(wait_glyph.on_click(move |_, _, cx| {
-                            this_w
-                                .update(cx, |v, cx| {
-                                    v.ask_waiting(
-                                        bot_w.clone(),
-                                        all_w.clone(),
-                                        existing_w.clone(),
-                                        cx,
-                                    );
-                                })
-                                .ok();
-                        }));
-                    }
-                    let (this, bot, all) = (this.clone(), bot.clone(), all.clone());
-                    let name = if status == BotItemStatus::Canceled {
-                        text::HM_CANCELED_ITEM.get()
-                    } else {
-                        status_name(status)
+                    let (this, bot, all, existing_w) = (
+                        this.clone(),
+                        bot.clone(),
+                        all.clone(),
+                        existing_wait.clone(),
+                    );
+                    let name = match status {
+                        BotItemStatus::Canceled => text::HM_CANCELED_ITEM.get(),
+                        BotItemStatus::Waiting => text::HM_WAITING_ITEM.get(),
+                        _ => status_name(status),
                     };
                     let glyph = PopupMenuItem::element(move |_, cx| {
                         let p = ui::palette(cx);
@@ -237,12 +202,18 @@ impl View {
                                     .child(status_icon(status, false, false, p, cx)),
                             )
                             .child(name)
-                    });
+                    })
+                    .disabled(status == BotItemStatus::Waiting && any_needs_you);
                     menu = menu.item(glyph.on_click(move |_, _, cx| {
                         this.update(cx, |v, cx| {
-                            let uids: Vec<String> = all.iter().map(|(u, _)| u.clone()).collect();
-                            // Orca #47934: Cancel (and every non-Waiting move) happens at once.
-                            v.set_items_status(bot.clone(), &uids, status, cx);
+                            if status == BotItemStatus::Waiting {
+                                v.ask_waiting(bot.clone(), all.clone(), existing_w.clone(), cx);
+                            } else {
+                                let uids: Vec<String> =
+                                    all.iter().map(|(u, _)| u.clone()).collect();
+                                // Orca #47934: Cancel (and every non-Waiting move) happens at once.
+                                v.set_items_status(bot.clone(), &uids, status, cx);
+                            }
                         })
                         .ok();
                     }));
@@ -372,21 +343,21 @@ impl View {
         let Some(ask) = self.items.cancel_ask.as_ref() else {
             return;
         };
-        let note = ask
+        let raw = ask
             .input
             .as_ref()
-            .map(|i| i.read(cx).value().trim().to_owned())
+            .map(|i| i.read(cx).value().to_string())
             .unwrap_or_default();
-        if note.is_empty() {
+        let Ok(reason) = krill_proto::bots::validate_waiting_reason(&raw) else {
             return;
-        }
+        };
         let Some(ask) = self.items.cancel_ask.take() else {
             return;
         };
-        self.set_items_waiting(ask.bot_id, &ask.uids, &note, cx);
+        self.set_items_waiting(ask.bot_id, &ask.uids, &reason, cx);
     }
 
-    /// Marks these items as Waiting with what they wait on (`waiting:<note>`).
+    /// Marks these items as `Waiting` with a validated single-line `reason`.
     pub(super) fn set_items_waiting(
         &mut self,
         bot_id: BotId,
@@ -394,7 +365,6 @@ impl View {
         note: &str,
         cx: &mut Context<Self>,
     ) {
-        let encoded = super::home::encode_waiting_note(note);
         let params = uids
             .iter()
             .map(|uid| UpdateBotItemParams {
@@ -402,11 +372,12 @@ impl View {
                 title: None,
                 description: None,
                 done_means: None,
-                status: Some(BotItemStatus::Planned),
+                status: Some(BotItemStatus::Waiting),
                 comment: None,
                 decisions: Vec::new(),
-                close_note: Some(encoded.clone()),
+                close_note: None,
                 snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: Some(note.to_owned()),
             })
             .collect();
         self.update_items_batch(bot_id, params, cx);
@@ -432,6 +403,7 @@ impl View {
                 decisions: Vec::new(),
                 close_note: Some(reason.to_owned()),
                 snoozed_until_ms: FieldPatch::Unchanged,
+                waiting_reason: None,
             })
             .collect();
         self.update_items_batch(bot_id, params, cx);
@@ -472,7 +444,7 @@ impl View {
                 input
             })
             .clone();
-        crate::i18n::sync_input_placeholder(&input, hm::CANCEL_REASON.get(), window, cx);
+        crate::i18n::sync_input_placeholder(&input, hm::WAIT_ON_PLACEHOLDER.get(), window, cx);
         let count = ask.uids.len();
         let title = if count == 1 {
             hm::WAIT_ON_TITLE_ONE
@@ -480,7 +452,8 @@ impl View {
         } else {
             hm::WAIT_ON_TITLE_MANY.format(&[("n", &count.to_string())])
         };
-        let ready = !input.read(cx).value().trim().is_empty();
+        let current_val = input.read(cx).value().to_string();
+        let ready = krill_proto::bots::validate_waiting_reason(&current_val).is_ok();
         let close = cx.listener(|this, _, _, cx| {
             this.items.cancel_ask = None;
             cx.notify();
@@ -793,7 +766,7 @@ mod tests {
         view.read_with(vcx, |v, _| assert!(v.items.cancel_ask.is_none()));
         let recorded = updates.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].status, Some(BotItemStatus::Planned));
-        assert_eq!(recorded[0].close_note.as_deref(), Some("waiting:reason 한"));
+        assert_eq!(recorded[0].status, Some(BotItemStatus::Waiting));
+        assert_eq!(recorded[0].waiting_reason.as_deref(), Some("reason 한"));
     }
 }
