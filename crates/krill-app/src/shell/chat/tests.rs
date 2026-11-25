@@ -714,12 +714,58 @@ fn work_run_timing_tracks_live_working_run_without_fake_historical_timestamps() 
         Some(65)
     );
 
-    assert_eq!(work_run::format_elapsed_secs(0), "0s");
-    assert_eq!(work_run::format_elapsed_secs(59), "59s");
-    assert_eq!(work_run::format_elapsed_secs(60), "1m");
-    assert_eq!(work_run::format_elapsed_secs(65), "1m 5s");
-    assert_eq!(work_run::format_elapsed_secs(3600), "1h");
-    assert_eq!(work_run::format_elapsed_secs(3660), "1h 1m");
+    assert_eq!(
+        work_run::format_elapsed_secs_in(0, krill_app::i18n::Language::En),
+        "0s"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(59, krill_app::i18n::Language::En),
+        "59s"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(60, krill_app::i18n::Language::En),
+        "1m"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(65, krill_app::i18n::Language::En),
+        "1m 5s"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(3600, krill_app::i18n::Language::En),
+        "1h"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(3660, krill_app::i18n::Language::En),
+        "1h 1m"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(0, krill_app::i18n::Language::Ko),
+        "0초"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(59, krill_app::i18n::Language::Ko),
+        "59초"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(60, krill_app::i18n::Language::Ko),
+        "1분"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(65, krill_app::i18n::Language::Ko),
+        "1분 5초"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(3600, krill_app::i18n::Language::Ko),
+        "1시간"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs_in(3660, krill_app::i18n::Language::Ko),
+        "1시간 1분"
+    );
+    assert_eq!(
+        work_run::format_elapsed_secs(65),
+        work_run::format_elapsed_secs_in(65, krill_app::i18n::language())
+    );
 }
 
 #[test]

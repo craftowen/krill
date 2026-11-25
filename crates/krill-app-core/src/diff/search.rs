@@ -1664,7 +1664,9 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         if let Some(input) = &self.search.query_input {
-            return input.clone();
+            let input = input.clone();
+            crate::i18n::sync_input_placeholder(&input, text::SEARCH_PLACEHOLDER.get(), window, cx);
+            return input;
         }
         let initial = self.search.options.query.clone();
         let input = cx.new(|cx| {
@@ -1699,7 +1701,14 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         if let Some(input) = &self.search.include_input {
-            return input.clone();
+            let input = input.clone();
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::SEARCH_INCLUDE_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            return input;
         }
         let initial = self.search.options.include_pattern.clone();
         let input = cx.new(|cx| {
@@ -1734,7 +1743,14 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         if let Some(input) = &self.search.exclude_input {
-            return input.clone();
+            let input = input.clone();
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::SEARCH_EXCLUDE_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            return input;
         }
         let initial = self.search.options.exclude_pattern.clone();
         let input = cx.new(|cx| {
@@ -1804,7 +1820,7 @@ impl Panel {
             .child(
                 Button::new("search-toggle-case")
                     .debug_selector(|| "search-toggle-case".into())
-                    .label("Aa")
+                    .label(text::SEARCH_CASE_LABEL.get())
                     .ghost()
                     .xsmall()
                     .selected(case_sensitive)
@@ -1817,7 +1833,7 @@ impl Panel {
             .child(
                 Button::new("search-toggle-word")
                     .debug_selector(|| "search-toggle-word".into())
-                    .label("ab")
+                    .label(text::SEARCH_WORD_LABEL.get())
                     .ghost()
                     .xsmall()
                     .selected(whole_word)
@@ -1871,7 +1887,7 @@ impl Panel {
                     .gap_1p5()
                     .child(
                         div()
-                            .w(px(68.))
+                            .w(gpui::rems(4.5))
                             .flex_none()
                             .truncate()
                             .text_size(ui::TEXT_2XS)
@@ -1892,7 +1908,7 @@ impl Panel {
                     .gap_1p5()
                     .child(
                         div()
-                            .w(px(68.))
+                            .w(gpui::rems(4.5))
                             .flex_none()
                             .truncate()
                             .text_size(ui::TEXT_2XS)
@@ -1940,7 +1956,7 @@ impl Panel {
             div()
                 .flex_none()
                 .p_2()
-                .child(ui::error_banner(p, msg.clone()))
+                .child(ui::error_banner(p, crate::i18n::cached_notice(msg)))
         });
 
         let body = if self.search.remote {

@@ -826,7 +826,7 @@ impl SettingsView {
                     {
                         err.to_owned()
                     } else if let Some(st) = run.status {
-                        format!("exit status {st}")
+                        text::SCHEDULE_RUN_EXIT.format(&[("code", &st.to_string())])
                     } else {
                         text::SCHEDULE_LOG_EMPTY.get().to_owned()
                     }
@@ -986,7 +986,9 @@ impl SettingsView {
                     });
                 let mut meta_line = format!("{} · {} · {}", sched.cron, cmd_str, sched.cwd);
                 if let Some(pre) = &sched.precheck {
-                    meta_line.push_str(" · precheck: ");
+                    meta_line.push_str(" · ");
+                    meta_line.push_str(text::SCHEDULE_PRECHECK_PREFIX.get());
+                    meta_line.push_str(": ");
                     meta_line.push_str(pre);
                 }
 

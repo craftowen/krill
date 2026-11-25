@@ -337,7 +337,12 @@ pub mod menu_bar {
             });
         }
         pub fn set_title(&self, title: &str) {
-            TRAY.with_borrow_mut(|s| s.title = format!("Krill · {title}"));
+            let full = if title.starts_with("Krill · ") || title == "Krill" {
+                title.to_owned()
+            } else {
+                format!("Krill · {title}")
+            };
+            TRAY.with_borrow_mut(|s| s.title = full);
             TRAY.with_borrow(|s| {
                 notify(self.0, &s.title, NIM_MODIFY);
             });

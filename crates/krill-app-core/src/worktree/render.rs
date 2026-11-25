@@ -109,6 +109,7 @@ impl Render for Dialog {
                                     .id("worktree-host-picker")
                                     .w_full()
                                     .menu_width(px(420.))
+                                    .placeholder(text::HOST_LABEL.get())
                                     .search_placeholder(text::HOST_SEARCH.get())
                                     .accessibility_label(text::HOST_LABEL.get()),
                             ),

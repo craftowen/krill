@@ -1,34 +1,34 @@
-# Backprop Playbook (강제력 피라미드 교정 및 v0 정본 역전파)
+# Backprop Playbook (Enforcement Pyramid & Single-Source v0 Backprop)
 
 ## Trigger
 
-세션 중 에이전트 실수, 사용자 교정, 게이트 우회, 또는 반복되는 마찰이 발견되었을 때 재발 방지 가드레일을 남기기 위해 `afk` 기어로 실행한다.
+Run in `afk` gear whenever an agent mistake, user correction, gate bypass, or recurring friction is discovered during a session, to leave a permanent structural guardrail.
 
 ## Steps
 
-1. **강제력 피라미드 최상단 계층 선택.** 문서에 주의사항을 적기 전에 아래 순서대로 더 위쪽 계층에서 원천 차단할 수 있는지 먼저 판정한다.
-   - **1순위 (`architecture`)**: 잘못된 호출이나 공유 상태 자체가 불가능하도록 모듈/경로 구조를 제거하거나 합친다.
-   - **2순위 (`type`)**: 불법 상태를 표현할 수 없도록 스키마나 데이터 타입으로 강제한다.
-   - **3순위 (`gate`)**: 에러 메시지에 즉시 실행 가능한 해결책(`fix`)을 담은 정적 게이트나 린트 규칙으로 차단한다.
-   - **4순위 (`test`)**: 과거 실제 실수 입력을 실패 픽스처 코퍼스로 박아 회귀 행동 테스트로 잠근다.
-   - **5순위 (`doc`)**: 위 1순위부터 4순위까지로 기계적 부호화가 불가능한 판단 기준만 단일 정본 문서에 남긴다.
-2. **과거 실수 재현 입증.** 1순위부터 4순위까지의 구조적 교정을 작성했으면 실제로 방금 겪었던 잘못된 입력이나 상태에서 게이트/테스트가 실패(적색)하고 교정 후 통과(녹색)하는지 확인한다.
-3. **탈도구화 및 단일 정본 검증.** 5순위 문서 역전파가 필요할 때는 [unwrap.mjs](../scripts/unwrap.mjs)로 특정 도구명, 인물명, 티켓 번호, 패치 날짜 꼬리표가 섞이지 않았는지, 그리고 대상 파일이 심볼릭 링크 사본이 아닌 단일 정본인지 검사한다(호스트 어댑터 전용 섹션이면 `--allow-host-specific`을 추가한다).
+1. **Choose the highest layer of the enforcement pyramid.** Before writing a note in docs, determine whether the failure can be eliminated at a stronger layer in this order:
+   - **Level 1 (`architecture`)**: Remove or merge module/path structure so the invalid call or shared state cannot exist.
+   - **Level 2 (`type`)**: Encode invariants in schemas or types so illegal states are unrepresentable.
+   - **Level 3 (`gate`)**: Block regressions with a static gate or lint rule whose error message includes an immediately runnable `fix`.
+   - **Level 4 (`test`)**: Pin the real failure input in a fixture corpus with a behavioral regression test.
+   - **Level 5 (`doc`)**: Record in a single canonical document only judgment criteria that cannot be mechanically enforced by Levels 1 through 4.
+2. **Prove failure reproduction.** For Level 1 through 4 fixes, verify the new gate or test fails (red) against the buggy input/state and passes (green) after the fix.
+3. **De-tool and verify single canonical source.** When Level 5 documentation backprop is required, run [unwrap.mjs](../scripts/unwrap.mjs) to ensure no tool names, people, ticket IDs, or patch-date tags leaked in, and that the target is a real single source rather than a symlinked copy (add `--allow-host-specific` only for host-adapter sections).
 
 ```bash
 node "<SKILL_DIR>/scripts/unwrap.mjs" check-rule \
   --level doc \
-  --target "<정본_파일_경로>" \
-  --text "<반영할_일반화_규칙_문장>"
+  --target "<canonical_file_path>" \
+  --text "<generalized_rule_sentence>"
 ```
 
-4. **패치 흔적 없는 `v0` 재작성.** 기존 문단 끝에 예외나 추기 문장을 덧붙이지 않고, 처음부터 그 규칙을 알고 설계한 첫 버전처럼 해당 섹션 전체를 응집력 있게 다시 쓴다. 줄바꿈 정리가 필요하면 `unwrap.mjs reflow <파일> --write`로 무손실 정리한다.
+4. **Patch-free `v0` rewrite.** Do not append caveats or addenda onto the end of an existing paragraph; rewrite the affected section cohesively as if the rule had been known from version 0. Use `unwrap.mjs reflow <file> --write` if lossless line-wrapping cleanup is needed.
 
 ## Rules
 
-- 구조적 체크(1순위부터 4순위)로 이미 완벽히 차단된 규칙은 문서에 중복 서술하지 않는다.
-- 같은 규칙을 여러 파일에 복사하지 않고 그 작업을 수행하는 주체가 실제로 여는 단일 정본 1곳에만 두며 나머지는 포인터나 심볼릭 링크로 연결한다.
+- Do not duplicate in documentation any rule already enforced completely by a structural check (Levels 1 through 4).
+- Never copy the same rule across multiple files; keep it in the single canonical file read by the actor performing that work and link to it elsewhere.
 
 ## Verification
 
-- `unwrap.mjs check-rule` 통과 여부를 확인하고, 작업 중인 대상 저장소의 정적 검사와 테스트 스위트(하네스 자체 정본을 수정한 경우에는 하네스 루트의 `npm run check`와 `npm test`)가 종료 코드 `0`으로 통과하는지 확인한다.
+- Verify `unwrap.mjs check-rule` exits `0`, and confirm the target repository's static checks and test suite (or `npm run check` and `npm test` at the harness root when editing canonical harness docs) exit `0`.

@@ -580,9 +580,10 @@ impl Wizard {
                             (None, TargetAgent::Other(a)) => mk_hook(&staged, &path, a, "--yes")
                                 .map(|_| ())
                                 .map_err(|e| text::HOOK_FAILED.format(&[("error", &e)])),
-                            (None, TargetAgent::Claude) => {
-                                Err(text::HOOK_FAILED.format(&[("error", "missing hook plan")]))
-                            }
+                            (None, TargetAgent::Claude) => Err(text::HOOK_FAILED.format(&[(
+                                "error",
+                                crate::i18n::catalog::checks::D_MISSING_HOOK_PLAN.get(),
+                            )])),
                         }
                     })
                     .await;

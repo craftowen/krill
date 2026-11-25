@@ -797,10 +797,8 @@ impl View {
         let mut color_swatches = div().flex().flex_wrap().items_center().gap_1();
         for rgb in swatches {
             let active = rgb == current;
-            let name = ui::BOT_AVATAR_BACKGROUNDS
-                .iter()
-                .find(|(c, _)| *c == rgb)
-                .map_or_else(|| avatar::format_color(rgb), |(_, n)| (*n).to_owned());
+            let name = avatar::background_label(rgb)
+                .map_or_else(|| avatar::format_color(rgb), str::to_owned);
             color_swatches = color_swatches.child(
                 div()
                     .id(SharedString::from(format!("bots-settings-color-{rgb:06x}")))

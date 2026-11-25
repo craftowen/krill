@@ -129,6 +129,7 @@ pub fn scan_url_len<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
 
     let mut in_path = false;
     let mut seg_ascii = false;
+    let mut host_label_ascii = false;
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
     let mut prev_at = false;
@@ -146,9 +147,19 @@ pub fn scan_url_len<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
             continue;
         }
         if !in_path {
-            if !c.is_ascii() || matches!(c, '(' | ')' | ',' | ';' | '!') {
+            if matches!(c, '(' | ')' | ',' | ';' | '!') {
                 raw_end = idx;
                 break;
+            }
+            if !c.is_ascii() {
+                // Allow Unicode IDN host labels while still breaking when an East Asian particle
+                // immediately follows an ASCII host label or port (e.g. `https://example.com에서`).
+                if !c.is_alphanumeric() || (host_label_ascii && is_cjk_or_hangul(c)) {
+                    raw_end = idx;
+                    break;
+                }
+                prev_at = false;
+                continue;
             }
             if c == '[' {
                 if idx == scheme_len || prev_at {
@@ -164,6 +175,11 @@ pub fn scan_url_len<T>(slice: &[T], mut ch: impl FnMut(&T) -> char) -> usize {
                     raw_end = idx;
                     break;
                 }
+            }
+            if matches!(c, '.' | '@') {
+                host_label_ascii = false;
+            } else if c.is_ascii_alphanumeric() {
+                host_label_ascii = true;
             }
             prev_at = c == '@';
             continue;
@@ -996,6 +1012,28 @@ mod tests {
             "http://localhost:3000/문서"
         );
         assert_eq!(scan_str("https://..."), "");
+    }
+
+    #[test]
+    fn scan_url_len_supports_idn_unicode_hosts_without_swallowing_particles() {
+        assert_eq!(scan_str("https://münchen.de"), "https://münchen.de");
+        assert_eq!(
+            scan_str("https://münchen.de/über/straße."),
+            "https://münchen.de/über/straße"
+        );
+        assert_eq!(scan_str("https://예시.한국"), "https://예시.한국");
+        assert_eq!(
+            scan_str("https://sub.예시.한국/문서（참고）"),
+            "https://sub.예시.한국/문서"
+        );
+        assert_eq!(scan_str("https://пример.рф/тест"), "https://пример.рф/тест");
+        assert_eq!(scan_str("https://例え.jp/path"), "https://例え.jp/path");
+        assert_eq!(scan_str("https://example.com에서"), "https://example.com");
+        assert_eq!(
+            scan_str("http://127.0.0.1:8787에서"),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(scan_str("https://예시.한국（링크）"), "https://예시.한국");
     }
 
     #[test]

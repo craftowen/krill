@@ -135,19 +135,19 @@
 <td width="50%" valign="top">
 
 ### 5. 종단간 암호화 모바일 웹 앱 (PWA)
-Mac 앱의 **설정 → 모바일**에서 QR 코드를 스캔하면, 폰 브라우저나 홈 화면 앱(PWA)에서 에이전트 상태를 확인하고 터미널에 접속합니다. Relay·Tailscale 경로와 **ChaCha20-Poly1305**(`HKDF-SHA256`) 종단간 암호화로 보호됩니다.
+Mac·Windows 앱의 **설정 → 모바일**에서 QR 코드를 스캔하면, 폰 브라우저나 홈 화면 앱(PWA)에서 에이전트 상태를 확인하고 터미널에 접속합니다. Relay·Tailscale 경로와 **ChaCha20-Poly1305**(`HKDF-SHA256`) 종단간 암호화로 보호됩니다.
 
 PC에서 릴레이 연결을 선택하면 Google 로그인으로 이어집니다. 모바일 PWA는 로그인 없이 열리고 QR 페어링 또는 저장된 기기 키로 인증합니다.
 
-[모바일 연결 안내 →](https://krill.page/docs)
+[모바일 연결 안내 →](https://krill.page/docs#mobile)
 
 </td>
 <td width="50%" valign="top">
 
 ### 6. 아티팩트 1클릭 링크 공유 (`share.krill.page`)
-에이전트가 작성한 HTML 보고서, 차트, Markdown 문서를 `krill artifacts share` 명령 한 줄로 샌드박스 공개 링크(90일 보관, 2 MB 상한)로 발행하고, 같은 링크를 업데이트하거나 회수합니다.
+에이전트가 작성한 HTML 보고서, 차트, Markdown 문서를 `krill artifacts share` 명령 한 줄로 샌드박스 공개 링크(보관 기한 설정 가능·무기한 포함, 최대 10 MiB)로 발행하고, 같은 링크를 업데이트하거나 회수합니다.
 
-[아티팩트 가이드 →](docs/ARTIFACTS.md)
+[아티팩트 가이드 →](docs/ARTIFACTS.md#korean)
 
 </td>
 </tr>
@@ -157,7 +157,7 @@ PC에서 릴레이 연결을 선택하면 Google 로그인으로 이어집니다
 
 - **GUI 없이 동작하는 `krill` CLI &amp; SSH 원격 호스트** — 단일 바이너리가 데몬에 직접 붙어 세션 생성·입출력·`attach`·맥락 인계(`krill handoff`)를 수행하며, 지원되는 원격 Mac 호스트(`krill --host user@host`)도 제어합니다.
 - **계정 전환 및 자동 로테이션 (`krill account`)** — 에이전트 계정을 전환하고 사용량 한도 도달 시 자동으로 다음 계정으로 전환(`auto-switch`)합니다.
-- **UTC Cron 예약 실행 (`krill schedule`)** — 반복 에이전트 작업을 스케줄에 맞춰 자동 실행합니다([스케줄링 문서](docs/SCHEDULING.md)).
+- **UTC Cron 예약 실행 (`krill schedule`)** — 반복 에이전트 작업을 스케줄에 맞춰 자동 실행합니다([스케줄링 문서](docs/SCHEDULING.md#korean)).
 - **45종 터미널 테마 &amp; 퍼스트클래스 한글 IME** — **Krill Deep**을 포함한 Krill 테마 15종과 Orca 호환 기본 테마 30종(Ghostty·Warp 테마 가져오기 지원)와 전용 한글 조합 상태기계(`krill-term`)를 내장합니다.
 - **빠른 열기 &amp; 워크스페이스 컨텍스트** — 워크트리, 세션, 파일, 로컬 서버 포트(`krill ports`), 참고 URL(`krill reference`)을 빠르게 탐색합니다.
 
@@ -218,7 +218,7 @@ ZIP SHA-256 검사 뒤 `%LOCALAPPDATA%\Programs\Krill`에 설치하고 시작 �
 |---|---|---|
 | **macOS Apple Silicon (`arm64`)** | 주 데스크톱 플랫폼 | 릴리스 앱·CLI 또는 소스 빌드 |
 | **Windows `x64`** | 네이티브 데스크톱 프리뷰. Windows Server VM 기록 외에 데스크톱 GUI·대화형 로그온·절전·재부팅 검증이 더 필요 | 릴리스 ZIP·PowerShell 설치기 |
-| **모바일 (iOS / Android)** | QR 코드로 페어링하는 모바일 웹 앱(PWA, Relay·Tailscale + ChaCha20-Poly1305 종단간 암호화) | Mac 앱 **설정 → 모바일**에서 QR 스캔(앱 스토어 앱 아님) |
+| **모바일 (iOS / Android)** | QR 코드로 페어링하는 모바일 웹 앱(PWA, Relay·Tailscale + ChaCha20-Poly1305 종단간 암호화) | Mac·Windows 앱 **설정 → 모바일**에서 QR 스캔(앱 스토어 앱 아님) |
 | **Intel Mac (`x86_64`)** | 이번 공개 프리뷰에서 미지원 | 지원 번들·소스 설치를 약속하지 않음 |
 | **Linux** | 이번 공개 프리뷰에서 미지원 | 데스크톱·원격 호스트 다운로드를 약속하지 않음 |
 | **Windows 11 ARM64** | Windows 11 x64 에뮬레이션으로 `x64` 패키지 실행. 네이티브 ARM64 빌드 없음 | 같은 Windows 릴리스 ZIP·PowerShell 설치기 |
@@ -230,7 +230,7 @@ ZIP SHA-256 검사 뒤 `%LOCALAPPDATA%\Programs\Krill`에 설치하고 시작 �
 
 ## 첫 성공
 
-1. 앱의 **폴더 열기…**로 로컬 Git 저장소를 엽니다. 언어는 **설정 → 모양 → 언어**에서 바꿉니다.
+1. 앱의 **폴더 열기…**로 로컬 Git 저장소를 엽니다. 첫 실행 시 OS 언어를 자동으로 따르며(비한국어 시스템은 영어), 언제든 **설정 → 모양 → 언어**에서 바꿀 수 있습니다.
 2. **새 세션**(`+`) 메뉴에서 **터미널** 또는 설치·인증한 Claude Code·Codex 등의 에이전트를 선택합니다.
 3. 사이드바의 **새 워크트리**에서 고유한 이름으로 **만들기**를 누릅니다. setup은 내용을 확인해 승인하거나 **setup 건너뛰기**를 선택합니다. 두 번째 에이전트를 실행합니다.
 4. `krill ls`로 세션 ID를 기록합니다. 탭을 남겨 둔 채 앱을 종료·재실행하고 같은 세션에 다시 연결되는지 확인합니다. 탭·칸을 명시적으로 닫으면 해당 세션이 종료됩니다.
@@ -260,5 +260,3 @@ ZIP SHA-256 검사 뒤 `%LOCALAPPDATA%\Programs\Krill`에 설치하고 시작 �
 [아키텍처](docs/ARCHITECTURE.md) · [로드맵](docs/ROADMAP.md) · [코드 규칙](docs/CONVENTIONS.md) · [디자인 시스템](docs/STYLEGUIDE.md).
 
 Apache-2.0 ([LICENSE](LICENSE), Copyright 2026 Krill contributors). [서드파티 고지](THIRD_PARTY_NOTICES.md)·[라이선스 기록](docs/licensing/README.md)을 참고합니다. 기여 시 Zed `terminal`·`terminal_view`(GPL-3.0) 코드는 읽거나 복사하지 않으며, 허용된 Orca 소스 차용에는 출처·저작권을 표기합니다.
-
-사용 통계는 별도 동의창 없이 기본 활성화됩니다. 무작위 설치 ID·최초 실행·앱 실행·일별 입력 활동·버전·OS·아키텍처를 집계하며, 프롬프트·터미널 출력·명령·프로젝트 경로·계정 정보는 제외합니다. `krill telemetry disable` 또는 `DO_NOT_TRACK=1`로 수집을 끌 수 있습니다. 전송 상태와 운영자 설정은 [사용 통계 안내](services/telemetry/CLIENT.md)를 참고합니다. 오류 보고는 별도 설정이며 기본 꺼짐입니다.

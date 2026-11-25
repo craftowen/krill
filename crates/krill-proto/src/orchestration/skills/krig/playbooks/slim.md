@@ -1,33 +1,33 @@
-# Slim Playbook (저장소 전수 군살 감사 및 기술 부채 원장)
+# Slim Playbook (Repository-Wide Bloat Audit & Technical Debt Ledger)
 
 ## Trigger
 
-저장소 전체의 과잉 추상화, 미사용 의존성, 단일 재수출 배럴, 죽은 내부 모듈을 감사(`audit` 세부 모드)하거나, 주석에 흩어진 기술 부채와 임시 우회로의 부패 위험을 원장으로 수거(`debt` 세부 모드)할 때 `afk` 기어로 실행한다. 감사 보고서 단독 요청이면 파일 수정 없이 종료하고, 실제 감량 적용이 함께 요청된 경우에는 확정된 삭제 목록을 [drive.md](drive.md)로 넘긴다.
+Run in `afk` gear to audit the repository for over-abstraction, unused dependencies, single-re-export barrels, and dead internal modules (`audit` submode), or to collect scattered tech-debt comments and temporary workarounds with rot-risk scoring (`debt` submode). Audit-only requests end without editing files; when actual reduction is also requested, pass the confirmed deletion list to [drive.md](drive.md).
 
 ## Steps
 
-1. **결정론적 군살 및 부채 스캔 실행.** [slim.mjs](../scripts/slim.mjs)를 실행해 주석 토큰 전용 부채 원장(`debtLedger`), `package.json` 미사용 의존성(`unusedDependencies`), 순수 재수출 배럴(`passThroughModules`), 미참조 내부 모듈(`unreferencedModules`), 고복잡도 파일(`hotspots`)을 추출한다.
+1. **Run deterministic slim and debt scanner.** Execute [slim.mjs](../scripts/slim.mjs) to extract the comment-token debt ledger (`debtLedger`), unused `package.json` dependencies (`unusedDependencies`), pure re-export barrels (`passThroughModules`), unreferenced internal modules (`unreferencedModules`), and high-complexity files (`hotspots`):
 
 ```bash
 node "<SKILL_DIR>/scripts/slim.mjs" --json --repo "$PWD"
 ```
 
-2. **5단계 감량 우선순위 분류 (`route.mjs`의 `slimMode`가 `audit`이거나 전체 감량 시).** 스캐너가 잡은 후보와 핫스팟 파일을 실제 코드 문맥으로 교차 확인해 오탐(예: 동적 플러그인 로더나 외부 리플렉션 진입점)을 걸러내고, 아래 우선순위로 감량 후보를 정렬한다.
-   - **1순위 (`delete`)**: 프로덕션 호출부가 0건인 고아 모듈, 죽은 기능 분기, 쓰이지 않는 패키지 의존성 통째 삭제.
-   - **2순위 (`stdlib`)**: 언어 표준 라이브러리(`node:crypto`, `structuredClone`, `node:test`, `URL`, `Intl` 등) 몇 줄로 즉시 대체되는 커스텀 유틸리티나 외부 의존성 교체.
-   - **3순위 (`native`)**: 플랫폼이나 런타임 기본 기능(SQL 제약, CSS 기본 속성, OS 원자적 파일 이동 등)을 애플리케이션 코드로 재발명한 계층 제거.
-   - **4순위 (`yagni`)**: 구현체가 1개뿐인 미래 대비 인터페이스, 한 번도 바뀐 적 없는 설정 옵션, 내부 패스스루 배럴 파일 병합.
-   - **5순위 (`shrink`)**: 수백 줄로 비대해진 핫스팟 모듈의 중복 분기를 데이터 테이블로 압축.
-3. **부채 원장 부패 위험(`rotRisk`) 판정 (`slimMode`가 `debt`이거나 주석 정비 시).**
-   - 의도적으로 택한 단순화나 임시 우회는 반드시 한계치와 재검토 조건(`// krig-debt: <현재 한계> -> <전환 조건 및 방법>`)을 갖춰야 한다.
-   - 전환 조건 없이 막연한 미루기만 적힌 항목(`rotRisk: true`)은 즉시 고치거나 구체적 전환 임계치를 명시하도록 분리 보고한다.
+2. **Rank candidates by the 5-tier slimming priority (`audit` submode or full reduction).** Cross-check scanner hits and hotspots against real code context to filter false positives (such as dynamic plugin loaders or external reflection entrypoints), then order remaining items:
+   - **Priority 1 (`delete`)**: Orphan modules with zero production callers, dead feature branches, and unused package dependencies.
+   - **Priority 2 (`stdlib`)**: Custom utilities or third-party dependencies replaceable by a few lines of standard library (`node:crypto`, `structuredClone`, `node:test`, `URL`, `Intl`, etc.).
+   - **Priority 3 (`native`)**: Application layers reinventing platform or runtime primitives (SQL constraints, native CSS, atomic OS file renames).
+   - **Priority 4 (`yagni`)**: Speculative interfaces with one implementation, never-changed config toggles, and internal pass-through barrel files.
+   - **Priority 5 (`shrink`)**: Bloated hotspot modules whose repetitive branches collapse into data tables.
+3. **Evaluate debt-ledger rot risk (`debt` submode or comment cleanup).**
+   - Intentional simplifications or temporary workarounds must specify both a current limit and a trigger condition (`// krig-debt: <current limit> -> <trigger condition and replacement>`).
+   - Flag vague deferrals lacking a trigger condition (`rotRisk: true`) so they are either fixed immediately or annotated with a concrete threshold.
 
 ## Rules
 
-- 사용자가 감사, 스캔, 원장 정리를 요청했을 때는 소스 파일을 건드리지 않고 `파일:줄`, 제거 대상, 대체 수단만 한 줄씩 명확히 보고한다.
-- 정적 import 그래프에 안 잡히더라도 외부 공개 패키지 `exports`이거나 `package.json` 스크립트에서 실행되는 CLI 도구인지 확인하기 전에는 삭제하지 않는다.
+- For audit, scan, or debt-ledger requests, do not modify source files; report `file:line`, removal target, and replacement concisely in one line per item.
+- Never delete an item absent from the static import graph before confirming it is not exposed via package `exports` or invoked as a CLI script from `package.json`.
 
 ## Verification
 
-- `slim.mjs --repo "$PWD"` 종료 코드 `0`과 보고된 각 후보의 실제 호출 유무를 [recon.mjs](../scripts/recon.mjs) 또는 저장소 검색으로 교차 확인한다.
-- 실제 코드 감량까지 이어서 수행한 경우에는 `slim.mjs --strict --repo "$PWD"` 결과와 후속 `drive`, `demock`, `verify` 파이프라인의 테스트 통과를 확인한다.
+- Verify `slim.mjs --repo "$PWD"` exits `0` and cross-check each reported candidate's call sites via [recon.mjs](../scripts/recon.mjs) or repository search.
+- When applying code reductions, verify `slim.mjs --strict --repo "$PWD"` and the downstream `drive`, `demock`, and `verify` test passes.

@@ -954,7 +954,7 @@ impl View {
                 div()
                     .flex_1()
                     .min_w(px(120.))
-                    .min_w_0()
+                    .truncate()
                     .child(text::COL_NAME.get()),
             )
             .child(div().w(px(84.)).flex_none().child(text::COL_TYPE.get()))
@@ -963,7 +963,7 @@ impl View {
             .child(div().w(px(116.)).flex_none().child(text::COL_EXPIRES.get()))
             .child(
                 div()
-                    .w(px(184.))
+                    .w(gpui::rems(13.))
                     .flex_none()
                     .flex()
                     .justify_end()
@@ -1138,7 +1138,6 @@ impl Render for View {
                             div()
                                 .flex_1()
                                 .min_w(px(120.))
-                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
@@ -1196,7 +1195,7 @@ impl Render for View {
                         )
                         .child(
                             div()
-                                .w(px(184.))
+                                .w(gpui::rems(13.))
                                 .flex_none()
                                 .flex()
                                 .items_center()

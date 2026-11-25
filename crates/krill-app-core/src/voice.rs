@@ -322,7 +322,24 @@ pub fn display_shortcut(shortcut: &str) -> String {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        effective.to_owned()
+        let platform_label = if cfg!(windows) { "Win" } else { "Super" };
+        effective
+            .split('+')
+            .filter_map(|token| {
+                let norm = token.trim().to_ascii_lowercase();
+                if norm.is_empty() {
+                    return None;
+                }
+                Some(match norm.as_str() {
+                    "ctrl" | "control" => "Ctrl".to_owned(),
+                    "alt" | "opt" | "option" => "Alt".to_owned(),
+                    "shift" => "Shift".to_owned(),
+                    "cmd" | "command" | "meta" | "super" | "platform" => platform_label.to_owned(),
+                    other => canonical_key_label(other),
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 

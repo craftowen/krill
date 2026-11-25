@@ -23,6 +23,9 @@ const ENCLOSING: char = '\u{20E3}';
 /// 피부색 꾸밈(`👩` + `🏽`). 앞 글자에 붙어 함께 셰이핑해야 한다.
 const MODIFIER_START: char = '\u{1F3FB}';
 const MODIFIER_END: char = '\u{1F3FF}';
+/// Regional Indicator symbols (`🇦`..=`🇿`) pair two-by-two into country flag emoji clusters.
+const REGIONAL_INDICATOR_START: char = '\u{1F1E6}';
+const REGIONAL_INDICATOR_END: char = '\u{1F1FF}';
 
 /// 셰이핑 한 번으로 묶을 엔진 칸 범위. `end`는 포함하지 않는 끝 열이다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,10 @@ impl Cluster {
 
 fn is_modifier(ch: char) -> bool {
     (MODIFIER_START..=MODIFIER_END).contains(&ch)
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    (REGIONAL_INDICATOR_START..=REGIONAL_INDICATOR_END).contains(&ch)
 }
 
 /// 뒤 칸이 앞 칸과 같은 문자소에 속해 함께 셰이핑해야 하면 참. 칸은 행 안에서 바로 이웃해야 한다.
@@ -94,11 +101,14 @@ pub fn clusters(row: &[Cell]) -> Vec<Cluster> {
         let start = cells[i].0;
         let mut end = start.saturating_add(cell_cols(cells[i].1));
         let mut j = i;
-        // 바로 이웃한 칸이 `joins`면 묶음을 늘린다.
+        let mut ri_pair_open =
+            is_regional_indicator(cells[i].1.ch) && !cells[i].1.zerowidth.contains(&ZWJ);
+        // 바로 이웃한 칸이 `joins`거나 짝이 열린 Regional Indicator면 묶음을 늘린다.
         while let Some(next) = cells.get(j + 1)
             && next.0 == end
-            && joins(cells[j].1, next.1)
+            && (joins(cells[j].1, next.1) || (ri_pair_open && is_regional_indicator(next.1.ch)))
         {
+            ri_pair_open = false;
             end = end.saturating_add(cell_cols(next.1));
             j += 1;
         }

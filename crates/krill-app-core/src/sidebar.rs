@@ -4638,7 +4638,9 @@ impl Sidebar {
     fn jump_snapshots(&self) -> impl Iterator<Item = (HostId, &str, &Snapshot)> {
         std::iter::once((
             HostId::Local,
-            crate::i18n::catalog::jump::LOCAL_MAC.get(),
+            text::HOST_LOCAL
+                .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                .get(),
             &self.snapshot,
         ))
         .chain(

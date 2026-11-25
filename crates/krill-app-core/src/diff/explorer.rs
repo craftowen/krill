@@ -1706,7 +1706,9 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         if let Some(input) = &self.explorer.filter_input {
-            return input.clone();
+            let input = input.clone();
+            crate::i18n::sync_input_placeholder(&input, text::EXPLORER_FILTER.get(), window, cx);
+            return input;
         }
         let initial = self.explorer.filter_query.clone();
         let input = cx.new(|cx| {
@@ -1795,6 +1797,14 @@ impl Panel {
     ) -> impl IntoElement {
         self.ensure_explorer_loaded_async(cx);
         let filter_input = self.ensure_explorer_filter_input(window, cx);
+        if let Some((kind, input, _)) = self.explorer.editing.as_ref() {
+            let placeholder = match kind {
+                EditKind::NewFile { .. } => text::EXPLORER_NEW_FILE.get(),
+                EditKind::NewFolder { .. } => text::EXPLORER_NEW_FOLDER.get(),
+                EditKind::Rename { .. } => text::EXPLORER_RENAME.get(),
+            };
+            crate::i18n::sync_input_placeholder(input, placeholder, window, cx);
+        }
         let p = ui::palette(cx);
         let show_dotfiles = self.explorer.show_dotfiles;
         let show_ignored = self.explorer.show_ignored;
@@ -1865,7 +1875,7 @@ impl Panel {
             .child(
                 Button::new("explorer-toggle-ignored")
                     .debug_selector(|| "explorer-toggle-ignored".into())
-                    .label("git")
+                    .label(text::EXPLORER_IGNORED_LABEL.get())
                     .ghost()
                     .xsmall()
                     .selected(show_ignored)
@@ -1893,7 +1903,7 @@ impl Panel {
             div()
                 .flex_none()
                 .p_2()
-                .child(ui::error_banner(p, msg.clone()))
+                .child(ui::error_banner(p, crate::i18n::cached_notice(msg)))
         });
 
         // 인라인 편집 행: 이름 변경이면 해당 행을 대체하고, 새 파일/폴더면 부모 다음에 삽입한다.

@@ -740,7 +740,14 @@ impl PictureState {
         cx: &mut Context<E>,
     ) -> Entity<InputState> {
         if let Some(existing) = &self.hex_input {
-            return existing.clone();
+            let input = existing.clone();
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::COLOR_HEX_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            return input;
         }
         let initial = avatar::format_color(self.background);
         let input = cx.new(|cx| {
@@ -770,7 +777,14 @@ impl PictureState {
         cx: &mut Context<E>,
     ) -> Entity<TextareaState> {
         if let Some(existing) = &self.gen_input {
-            return existing.clone();
+            let input = existing.clone();
+            crate::i18n::sync_textarea_placeholder(
+                &input,
+                text::AVATAR_GEN_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            return input;
         }
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -1336,12 +1350,13 @@ impl PictureState {
         for (rgb, name) in ui::BOT_AVATAR_BACKGROUNDS {
             let selected = current == rgb;
             let id = SharedString::from(format!("{prefix}-swatch-{rgb:06x}"));
+            let aria = avatar::background_label(rgb).unwrap_or(name);
             row = row.child(
                 div()
                     .id(id.clone())
                     .debug_selector(move || id.to_string())
                     .role(gpui::Role::Button)
-                    .aria_label(name)
+                    .aria_label(aria)
                     .tab_index(0)
                     .focus_visible(|d| d.border_color(p.ring))
                     .flex_none()

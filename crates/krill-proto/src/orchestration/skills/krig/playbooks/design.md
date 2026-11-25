@@ -1,25 +1,25 @@
-# Design Playbook (깊은 모듈 설계 및 병렬 후보 접목)
+# Design Playbook (Deep Module Design & Parallel Candidate Grafting)
 
 ## Trigger
 
-함수나 모듈 경계를 새로 그어야 하는 설계, 외부 연동 어댑터 이음매 정의, 도메인 데이터 모델링, 또는 복수 아키텍처 대안 비교가 필요할 때 `afk` 기어로 실행한다. 설계 단독 요청이면 [verify.md](verify.md)로 이어지고, 구현 결합 파이프라인이면 확정된 계약을 [drive.md](drive.md)로 넘긴다.
+Run in `afk` gear when drawing new module or function boundaries, defining external adapter seams, modeling domain data, or comparing architecture alternatives. Standalone design requests chain into [verify.md](verify.md); implementation pipelines hand the finalized contract to [drive.md](drive.md).
 
 ## Steps
 
-1. **깊은 모듈 기준 로드.** [deepening.md](../references/deepening.md)를 읽고 설계 대상의 공개 인터페이스 크기(노출 함수 수, 인자 수, 호출자가 알아야 할 순서 제약)와 내부 은닉 복잡도를 대조한다.
-2. **도메인 데이터 형태 및 의존성 4분류 선언.** 코드를 쓰기 전에 핵심 데이터 구조(상태 머신, 레지스트리 맵, 판별 유니온)를 먼저 적고, 모든 외부 접점을 `In-process`, `Local-substitutable`, `Remote-owned`, `True-external` 4종으로 분류해 경계 교체 테스트 방식을 확정한다. 재시도, 복구, 비동기 인터리빙이 얽힌 유한 상태 프로토콜이라면 [statecheck.mjs](../scripts/statecheck.mjs)로 상태 전이 불변식과 데드락 부재를 함께 검증한다.
-3. **단순 경계 대 비자명 경계 분기.**
-   - **단순 경계**: 이미 데이터 형태와 이음매가 자명하면 과잉 추상화 없이 단일 설계안을 확정한다.
-   - **비자명/논쟁적 경계(병렬 후보 설계 접목)**: 서로 다른 제약 조건(후보 A는 공개 시그니처 최소 크기 우선, 후보 B는 상태 불변성 및 무분기 테이블 구조 우선)을 부여한 읽기 전용 독립 서브에이전트 2개를 병렬 실행한다.
-4. **베이스 선정 및 장점 접목.** 두 후보를 합산 평균하지 않고 공개 인터페이스 단순성, 삭제 테스트 통과 여부, 경계 테스트 용이성 기준으로 더 깊은 베이스 1개를 고른 뒤, 탈락한 후보에서 검증된 장점 1개만 수동으로 접목한다.
-5. **설계 계약 인계.** 되돌리기 어려운 아키텍처 경계 결정은 짧은 `ADR` 또는 모듈 상단 설계 계약으로 고정하고, 임시 설계 초안은 `.krig/design-spec.md`에 적어 후속 `drive` 또는 `verify` 단계의 기준서로 넘긴다.
+1. **Load deep-module criteria.** Read [deepening.md](../references/deepening.md) and weigh the public interface surface (exported functions, argument count, caller ordering constraints) against the complexity hidden inside.
+2. **Declare domain data shapes and 4-way dependency taxonomy.** Define core data structures (state machines, registry maps, discriminated unions) before writing code, and classify every external touchpoint into `In-process`, `Local-substitutable`, `Remote-owned`, or `True-external` to fix its boundary-replacement test strategy. For finite-state protocols involving retries, recovery, or async interleaving, also verify invariants and deadlock freedom with [statecheck.mjs](../scripts/statecheck.mjs).
+3. **Branch on trivial vs non-trivial boundaries.**
+   - **Trivial boundary**: When data shapes and seams are already obvious, finalize a single design without speculative abstraction.
+   - **Non-trivial / contested boundary (parallel candidate grafting)**: Launch two independent read-only subagents in parallel under distinct constraints (Candidate A optimizes for minimal public signature surface; Candidate B optimizes for state invariants and branch-free table structure).
+4. **Pick a base and graft strengths.** Never blend candidates into a muddled average. Choose the single deeper base by public simplicity, deletion-test survival, and boundary testability, then manually graft at most one proven strength from the rejected candidate.
+5. **Hand off the design contract.** Record irreversible architectural boundary decisions as a short `ADR` or module-header contract, and write working design drafts to `.krig/design-spec.md` for downstream `drive` or `verify`.
 
 ## Rules
 
-- 호출자가 1곳뿐인 패스스루 래퍼나 단일 구현체 위의 미래 대비용 인터페이스를 만들지 않는다(2-어댑터 이음매 규칙).
-- `agy`에서 병렬 설계 서브에이전트를 띄울 때는 `TypeName: "research"`와 `Model: "inherit"`를 지정하고 후보 간 컨텍스트를 격리한다.
+- Do not introduce single-caller pass-through wrappers or speculative interfaces over a single implementation (Two-Adapter Seam Rule).
+- On `agy`, run parallel design subagents with `TypeName: "research"` and `Model: "inherit"` in isolated contexts.
 
 ## Verification
 
-- 확정된 설계가 (a) 핵심 데이터 형태, (b) 공개 시그니처, (c) 의존성 4분류별 테스트 전략, (d) 기각된 대안과 기각 사유 4가지를 빠짐없이 포함하는지 확인한다.
-- 파이프라인의 최종 [verify.md](verify.md) 콜드 리드에서 배경 설명 없이 설계 계약만 읽고도 호출 규약과 실패 경계가 추측 없이 이해되는지 확인한다.
+- Verify the finalized design covers all four elements: (a) core data shapes, (b) public signatures, (c) test strategy per dependency category, and (d) rejected alternatives with rejection reasons.
+- Confirm in the final [verify.md](verify.md) cold read that calling contracts and failure boundaries are unambiguous without extra verbal context.

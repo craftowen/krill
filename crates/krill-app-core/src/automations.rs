@@ -236,29 +236,24 @@ impl ScheduleCadence {
 pub struct AutomationTemplate {
     pub id: &'static str,
     pub cron: &'static str,
-    pub prompt: &'static str,
 }
 
 pub const TEMPLATES: [AutomationTemplate; 4] = [
     AutomationTemplate {
         id: "weekday-repo-audit",
         cron: "0 9 * * 1-5",
-        prompt: "Review the current repository status, recent commits, failing checks, and stale branches. Summarize top maintenance risks and concrete next actions.",
     },
     AutomationTemplate {
         id: "release-readiness",
         cron: "0 14 * * 4",
-        prompt: "Inspect commits since the last tag, verify test/build health, and summarize release readiness, breaking changes, and remaining blockers.",
     },
     AutomationTemplate {
         id: "daily-change-review",
         cron: "30 16 * * *",
-        prompt: "Scan today's commits and open diffs for regressions, missing tests, or security concerns. Report only actionable findings.",
     },
     AutomationTemplate {
         id: "hourly-queue-check",
         cron: "15 * * * *",
-        prompt: "Check the workflow queue and recent run statuses. Report only if a job is stuck or failing repeatedly.",
     },
 ];
 
@@ -290,6 +285,16 @@ impl AutomationTemplate {
             "release-readiness" => text::TPL_RELEASE_SUMMARY.get(),
             "daily-change-review" => text::TPL_REVIEW_SUMMARY.get(),
             _ => text::TPL_QUEUE_SUMMARY.get(),
+        }
+    }
+
+    #[must_use]
+    pub fn prompt(self) -> &'static str {
+        match self.id {
+            "weekday-repo-audit" => stext::AUTOMATIONS_AUDIT_PROMPT.get(),
+            "release-readiness" => stext::AUTOMATIONS_RELEASE_PROMPT.get(),
+            "daily-change-review" => stext::AUTOMATIONS_DAILY_PROMPT.get(),
+            _ => stext::AUTOMATIONS_HOURLY_PROMPT.get(),
         }
     }
 }
@@ -337,16 +342,17 @@ pub fn format_cron_summary(cron: &str) -> String {
             return format!("{} :{m:02}", text::CADENCE_HOURLY.get());
         }
         if let Ok(h) = hour.parse::<u32>() {
+            use crate::i18n::catalog::bot_home as bh;
             match *dow {
                 "*" => return format!("{} {h:02}:{m:02} UTC", text::CADENCE_DAILY.get()),
                 "1-5" => return format!("{} {h:02}:{m:02} UTC", text::CADENCE_WEEKDAYS.get()),
-                "0" | "7" => return format!("Sun {h:02}:{m:02} UTC"),
-                "1" => return format!("Mon {h:02}:{m:02} UTC"),
-                "2" => return format!("Tue {h:02}:{m:02} UTC"),
-                "3" => return format!("Wed {h:02}:{m:02} UTC"),
-                "4" => return format!("Thu {h:02}:{m:02} UTC"),
-                "5" => return format!("Fri {h:02}:{m:02} UTC"),
-                "6" => return format!("Sat {h:02}:{m:02} UTC"),
+                "0" | "7" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_SUN.get()),
+                "1" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_MON.get()),
+                "2" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_TUE.get()),
+                "3" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_WED.get()),
+                "4" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_THU.get()),
+                "5" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_FRI.get()),
+                "6" => return format!("{} {h:02}:{m:02} UTC", bh::WEEKDAY_SAT.get()),
                 _ => {}
             }
         }
@@ -623,7 +629,7 @@ impl View {
                     {
                         err.to_owned()
                     } else if let Some(st) = run_for_bg.status {
-                        format!("exit status {st}")
+                        stext::SCHEDULE_RUN_EXIT.format(&[("code", &st.to_string())])
                     } else {
                         stext::SCHEDULE_LOG_EMPTY.get().to_owned()
                     }
@@ -820,7 +826,7 @@ impl View {
             s.set_value(template.cron.to_owned(), window, cx);
         });
         modal.prompt.update(cx, |s, cx| {
-            s.set_value(template.prompt.to_owned(), window, cx);
+            s.set_value(template.prompt().to_owned(), window, cx);
         });
         modal.cadence = ScheduleCadence::from_cron(template.cron);
         modal.error = None;
@@ -1772,7 +1778,7 @@ impl View {
             .child(div().w(px(88.)).flex_none().child(text::COL_AGENT.get()))
             .child(
                 div()
-                    .w(px(196.))
+                    .w(gpui::rems(14.))
                     .flex_none()
                     .flex()
                     .justify_end()
@@ -1977,7 +1983,7 @@ impl View {
                         )
                         .child(
                             div()
-                                .w(px(196.))
+                                .w(gpui::rems(14.))
                                 .flex_none()
                                 .flex()
                                 .items_center()
@@ -3345,7 +3351,7 @@ impl View {
                                 div()
                                     .id("automations-modal-error")
                                     .debug_selector(|| "automations-modal-error".into())
-                                    .child(ui::error_banner(p, err))
+                                    .child(ui::error_banner(p, crate::i18n::cached_notice(&err)))
                             })),
                     )
                     .child(
@@ -3701,11 +3707,12 @@ impl Render for View {
             .text_size(ui::TEXT_MD)
             .text_color(p.foreground)
             .child(top_bar)
-            .children(
-                self.error
-                    .clone()
-                    .map(|err| div().px_5().pb_2().child(ui::error_banner(p, err))),
-            )
+            .children(self.error.clone().map(|err| {
+                div()
+                    .px_5()
+                    .pb_2()
+                    .child(ui::error_banner(p, crate::i18n::cached_notice(&err)))
+            }))
             .child(main_content)
             .children(modal)
     }

@@ -464,10 +464,7 @@ pub fn join_errors(errors: &[String]) -> String {
 /// Localized name for the local computer when wording host-side bot refusals.
 #[must_use]
 pub fn local_host_label() -> &'static str {
-    match crate::i18n::language() {
-        crate::i18n::Language::Ko => "이 컴퓨터",
-        crate::i18n::Language::En => "this computer",
-    }
+    crate::i18n::catalog::bots::LOCAL_HOST_NAME.get()
 }
 
 /// Formats a structured [`krill_proto::bots::BotSessionRefusal`] from the reader's perspective,
@@ -480,7 +477,7 @@ pub fn bot_refusal_text(
     host_name: Option<&str>,
 ) -> String {
     match crate::i18n::language() {
-        crate::i18n::Language::Ko => refusal.message_ko(host_name),
+        crate::i18n::Language::Ko => crate::i18n::format_bot_refusal_ko(refusal, host_name),
         crate::i18n::Language::En => refusal.message_en(host_name),
     }
 }

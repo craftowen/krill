@@ -1,14 +1,39 @@
-# 예약 자동화 (MK-101)
+# Scheduled Automation (`krill schedule`)
+
+[한국어](#korean)
+
+`krill schedule` edits `schedules.toml` in Krill's state directory, and `krilld` launches a new `krill-holder` session on each matching cron minute even while the GUI app is closed. Registering a schedule starts the daemon automatically if it is not running.
+
+```sh
+krill schedule add greeting --cron '*/15 9-17 * * 1-5' \
+  --cwd "$PWD" --prompt 'Hello $(this string is passed literally)' \
+  -- /bin/echo
+krill schedule list
+krill schedule runs
+krill schedule rm greeting
+```
+
+- **Command and arguments:** Everything after `--` is the executable and fixed arguments. `--prompt` is appended as a **single final argument** without shell evaluation. To run a coding agent unattended, pass that agent CLI's non-interactive flags explicitly; scheduled runs do not add permission-bypass flags automatically. Omitting `--cwd` saves the current working directory at registration time. Schedule IDs use ASCII alphanumerics, `_`, and `-`; duplicates are rejected.
+- **Cron syntax (UTC):** Standard **5-field UTC** `minute hour day-of-month month day-of-week` supporting numbers, `*`, comma lists, ranges, and `*/n` / `a-b/n` steps. Sunday is `0` or `7`. When both day-of-month and day-of-week are restricted, a run triggers when either matches. Month/day names, `@daily`-style aliases, seconds fields, and RRULE are not supported.
+- **Evaluation and catch-up:** `krilld` evaluates the current minute at startup and once per minute thereafter. Config edits take effect on the next minute. Minutes missed during sleep or daemon downtime are not replayed; restarting within the same minute runs only schedules not yet recorded for that minute. Clock rollbacks do not re-run a minute the daemon has already evaluated. Long-running jobs can overlap the next trigger and remain subject to the normal session limit.
+- **Run log (`krill schedule runs`):** Prints JSONL from `schedule-runs.jsonl` and its previous rotated file, recording the schedule ID, UTC minute since the Unix epoch, stage (`started`, `spawned`, `failed`, `finished`), and session ID. `started` is persisted before spawning; `finished` records the holder's raw wait `status` once exit status and PTY EOF are both observed, and cleans up the scheduled session on the next minute tick. While running, inspect sessions with `krill ls`, `krill read`, or `krill attach`.
+- **Durability and limits:** Prompts and commands are not duplicated into the run log. If `krilld` crashes between writing `started` and spawning the process, that ambiguous attempt is not auto-retried. Config files are `0600` (state dir `0700`) and atomically replaced under a lock, capped at 64 schedules / 256 KiB, with run logs rotating every 1 MiB (keeping one prior file). Exactly-once execution across extended downtime, clock jumps, or reboots is not guaranteed.
+
+---
+
+<a id="korean"></a>
+
+## 예약 자동화 (MK-101)
 
 `krill schedule`은 상태 디렉터리의 `schedules.toml`을 편집하고, krilld는 앱이 닫힌 상태에서도 cron에 맞는 새 holder 세션을 만든다. 등록 시 데몬도 자동으로 기동한다.
 
 ```sh
-mk schedule add greeting --cron '*/15 9-17 * * 1-5' \
+krill schedule add greeting --cron '*/15 9-17 * * 1-5' \
   --cwd "$PWD" --prompt '안녕하세요 $(이 문자열은 그대로 전달됩니다)' \
   -- /bin/echo
-mk schedule list
-mk schedule runs
-mk schedule rm greeting
+krill schedule list
+krill schedule runs
+krill schedule rm greeting
 ```
 
 `--` 뒤는 실행 파일과 고정 인자다. 프롬프트는 **마지막 인자 하나**로 전달하며 셸 코드로 평가하지 않는다. 에이전트를 실행하려면 해당 CLI의 비대화형 실행 인자를 명령에 명시한다. 예약 실행이 권한 우회 인자를 자동으로 추가하지는 않는다. `--cwd`를 생략하면 등록 당시의 현재 디렉터리를 저장한다. ID는 ASCII 영숫자, `_`, `-`로 구성하며 중복 등록은 거부한다.

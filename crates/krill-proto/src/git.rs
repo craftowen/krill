@@ -699,7 +699,10 @@ pub fn is_ack_or_trivial_prompt(text: &str) -> bool {
         .filter(|c| !c.is_ascii_punctuation() && !matches!(c, '!' | '?' | '.' | ',' | '~' | '…'))
         .collect();
     let norm = trimmed.trim().to_lowercase();
-    if norm.is_empty() || norm.chars().count() <= 4 {
+    if norm.is_empty()
+        || (norm.is_ascii() && norm.len() <= 4)
+        || (!norm.is_ascii() && norm.chars().count() <= 1)
+    {
         return true;
     }
     let words: Vec<&str> = norm.split_whitespace().collect();
@@ -1440,5 +1443,34 @@ mod slug_tests {
         assert_eq!(hist.turns.last().map(|t| t.turn), Some(3));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn short_non_ascii_prompts_are_not_misclassified_as_trivial_acks() {
+        for ack in [
+            "",
+            "...",
+            "ok",
+            "yes",
+            "네",
+            "ㅇㅇ",
+            "진행해",
+            "ㅇㅇ 진행해",
+        ] {
+            assert!(is_ack_or_trivial_prompt(ack), "expected trivial ack: {ack}");
+        }
+        for substantive in [
+            "버그수정",
+            "리팩토링",
+            "リファクタ",
+            "ログイン",
+            "修复登录",
+            "テスト",
+        ] {
+            assert!(
+                !is_ack_or_trivial_prompt(substantive),
+                "expected substantive prompt: {substantive}"
+            );
+        }
     }
 }

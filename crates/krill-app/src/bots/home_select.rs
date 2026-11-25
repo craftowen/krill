@@ -470,6 +470,7 @@ impl View {
                 input
             })
             .clone();
+        crate::i18n::sync_input_placeholder(&input, hm::CANCEL_REASON.get(), window, cx);
         let count = ask.uids.len();
         let title = if count == 1 {
             hm::WAIT_ON_TITLE_ONE

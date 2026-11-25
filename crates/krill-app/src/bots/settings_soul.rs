@@ -350,7 +350,13 @@ impl View {
     }
 
     fn ensure_memory_add_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.memory_add_input.is_some() {
+        if let Some(input) = self.settings.memory_add_input.clone() {
+            crate::i18n::sync_input_placeholder(
+                &input,
+                text::SV_MEMORY_ADD_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             return;
         }
         let input = cx.new(|cx| {

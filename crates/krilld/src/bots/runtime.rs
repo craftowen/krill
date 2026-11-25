@@ -197,7 +197,7 @@ impl BotStartError {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Self::Refused(r) => r.message_en(Some("this computer")),
+            Self::Refused(r) => r.message_en(None),
             Self::Other(msg) => msg.clone(),
         }
     }

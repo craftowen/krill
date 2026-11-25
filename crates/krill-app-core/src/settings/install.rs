@@ -1141,8 +1141,10 @@ impl SettingsView {
         let any_installing = !self.install.installing.is_empty();
         let os_badge = if cfg!(windows) {
             "Windows (PowerShell / winget)"
-        } else {
+        } else if cfg!(target_os = "macos") {
             "macOS (zsh / bash / Homebrew)"
+        } else {
+            "Linux (bash / zsh)"
         };
         let count = if scanned {
             div()

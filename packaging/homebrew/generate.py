@@ -91,7 +91,7 @@ class Krill < Formula
   depends_on "rust" => :build
   depends_on :macos
   depends_on arch: :arm64
-  conflicts_with "krill", because: "both install an krill executable"
+  conflicts_with "krill", because: "both install a krill executable"
 
   def install
     system "perl", "-e", "alarm shift; exec @ARGV", "300",

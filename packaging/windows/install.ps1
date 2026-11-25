@@ -23,34 +23,59 @@ param(
     [switch]$NoOpen
 )
 $ErrorActionPreference = 'Stop'
-if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows x64 or Windows 11 on ARM64.' }
+
+# 7-bit safe \uXXXX unescaping so Windows PowerShell 5.1 without UTF-8 BOM
+# never corrupts box-drawing, arc spinner, or Korean status strings.
+function Convert-KrillUnicode([string]$Text) {
+    return [regex]::Unescape($Text)
+}
+
+$krillLang = if ($null -ne $env:KRILL_LANG) { $env:KRILL_LANG.Trim() } else { '' }
+if ($krillLang -ne '') {
+    $uiKo = ($krillLang -like 'ko*')
+} else {
+    $uiKo = $false
+    try {
+        $uiKo = ([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'ko')
+    } catch {
+        $uiKo = $false
+    }
+}
+
+function Get-KrillMsg([string]$Ko, [string]$En) {
+    if ($uiKo) { return (Convert-KrillUnicode $Ko) }
+    return $En
+}
+
+$krillSiteUrl = if ($uiKo) { 'https://krill.page' } else { 'https://krill.page/en' }
+
+if ($env:OS -ne 'Windows_NT') {
+    throw (Get-KrillMsg '\uC774 \uC124\uCE58\uAE30\uB294 Windows x64 \uB610\uB294 Windows 11 ARM64\uAC00 \uD544\uC694\uD569\uB2C8\uB2E4.' 'This installer requires Windows x64 or Windows 11 on ARM64.')
+}
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
 # ARM64 PCs run the x64 package through Windows 11's built-in x64 emulation (build 22000+).
 # Windows 10 on ARM only emulates 32-bit x86, so the x64 binaries cannot start there.
 if ($arch -eq 'ARM64') {
-    if ([Environment]::OSVersion.Version.Build -lt 22000) { throw 'Krill on ARM64 PCs requires Windows 11 (x64 emulation). Windows 10 on ARM is not supported.' }
+    if ([Environment]::OSVersion.Version.Build -lt 22000) {
+        throw (Get-KrillMsg 'ARM64 PC\uC5D0\uC11C Krill\uC744 \uC2E4\uD589\uD558\uB824\uBA74 Windows 11(x64 \uC5D0\uBBAC\uB808\uC774\uC158)\uC774 \uD544\uC694\uD569\uB2C8\uB2E4. Windows 10 on ARM\uC740 \uC9C0\uC6D0\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.' 'Krill on ARM64 PCs requires Windows 11 (x64 emulation). Windows 10 on ARM is not supported.')
+    }
 } elseif ($arch -ne 'AMD64') {
-    throw 'Windows release packages require an x64 PC or Windows 11 on ARM64.'
+    throw (Get-KrillMsg 'Windows \uB9B4\uB9AC\uC2A4 \uD328\uD0A4\uC9C0\uB294 x64 PC \uB610\uB294 Windows 11 ARM64\uAC00 \uD544\uC694\uD569\uB2C8\uB2E4.' 'Windows release packages require an x64 PC or Windows 11 on ARM64.')
 }
 $required = @('Krill.json', 'krill-app.exe', 'krill.exe', 'krilld.exe', 'krill-holder.exe', 'conpty.dll', 'x64\OpenConsole.exe')
 $alreadyInstalled = Test-Path -LiteralPath $Dest
 if ($alreadyInstalled) {
     foreach ($file in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $Dest $file) -PathType Leaf)) {
-            throw "$Dest already exists but is not a complete Krill installation (missing $file). Its files were preserved; choose another destination or move it aside before retrying."
+            throw ((Get-KrillMsg '{0} \uACBD\uB85C\uAC00 \uC774\uBBF8 \uC788\uC9C0\uB9CC \uC644\uC804\uD55C Krill \uC124\uCE58\uAC00 \uC544\uB2D9\uB2C8\uB2E4({1} \uB204\uB77D). \uAE30\uC874 \uD30C\uC77C\uC740 \uBCF4\uC874\uD588\uC2B5\uB2C8\uB2E4. \uB2E4\uB978 \uC124\uCE58 \uACBD\uB85C\uB97C \uC120\uD0DD\uD558\uAC70\uB098 \uAE30\uC874 \uD3F4\uB354\uB97C \uC62E\uAE34 \uB4A4 \uB2E4\uC2DC \uC2DC\uB3C4\uD558\uC138\uC694.' '{0} already exists but is not a complete Krill installation (missing {1}). Its files were preserved; choose another destination or move it aside before retrying.') -f $Dest, $file)
         }
     }
 }
 
 # -----------------------------------------------------------------------------
 # Trench Clack Pipeline UI (docs/STYLEGUIDE.md tokens, PS 5.1 & PS 7 compatible)
-# Uses 7-bit safe \uXXXX unescaping so Windows PowerShell 5.1 without UTF-8 BOM
-# never corrupts box-drawing, arc spinner, or Korean status strings.
 # -----------------------------------------------------------------------------
-function Convert-KrillUnicode([string]$Text) {
-    return [regex]::Unescape($Text)
-}
 
 # IShellLinkW avoids WScript.Shell's ANSI path conversion on non-UTF-8 systems.
 function New-KrillShortcut([string]$Link, [string]$Target, [string]$WorkingDirectory) {
@@ -147,11 +172,11 @@ $gArcs  = @(
     (Convert-KrillUnicode '\u25DE')
 )
 
-$kWork  = Convert-KrillUnicode '\uC791\uC5C5'
-$kFail  = Convert-KrillUnicode '\uC2E4\uD328'
-$kAbort = Convert-KrillUnicode '\uC124\uCE58\uB97C \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4'
-$kDone  = Convert-KrillUnicode '\uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4'
-$kStart = Convert-KrillUnicode '\uC2DC\uC791'
+$kWork  = Get-KrillMsg '\uC791\uC5C5' 'working'
+$kFail  = Get-KrillMsg '\uC2E4\uD328' 'failed'
+$kAbort = Get-KrillMsg '\uC124\uCE58\uB97C \uC911\uB2E8\uD588\uC2B5\uB2C8\uB2E4' 'Installation stopped'
+$kDone  = Get-KrillMsg '\uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4' 'Installed'
+$kStartLabel = Get-KrillMsg '\uC2DC\uC791           ' 'Start          '
 
 $installTimer = [Diagnostics.Stopwatch]::StartNew()
 $stepTimer = [Diagnostics.Stopwatch]::New()
@@ -211,8 +236,12 @@ function Fail-KrillStep([string]$Reason) {
 
 $download = -not $Zip
 if ($download -and -not $PSBoundParameters.ContainsKey('AddToPath')) { $AddToPath = $true }
-$archText = if ($arch -eq 'ARM64') { 'ARM64 (x64 emulation)' } else { 'x64' }
-$modeText = if ($download) { "Windows $gDot $archText $gDot release: $Release" } else { "Windows $gDot $archText $gDot local package" }
+$archText = if ($arch -eq 'ARM64') { Get-KrillMsg 'ARM64 (x64 \uC5D0\uBBAC\uB808\uC774\uC158)' 'ARM64 (x64 emulation)' } else { 'x64' }
+$modeText = if ($download) {
+    (Get-KrillMsg 'Windows {0} {1} {0} \uB9B4\uB9AC\uC2A4: {2}' 'Windows {0} {1} {0} release: {2}') -f $gDot, $archText, $Release
+} else {
+    (Get-KrillMsg 'Windows {0} {1} {0} \uB85C\uCEEC \uD328\uD0A4\uC9C0' 'Windows {0} {1} {0} local package') -f $gDot, $archText
+}
 Show-KrillIntro $modeText
 
 if (-not $alreadyInstalled) {
@@ -221,7 +250,7 @@ if (-not $alreadyInstalled) {
     try {
         if ($download) {
 
-            Start-KrillStep '01' (Convert-KrillUnicode '\uB9B4\uB9AC\uC2A4 \uD655\uC778 \uC911') 0
+            Start-KrillStep '01' (Get-KrillMsg '\uB9B4\uB9AC\uC2A4 \uD655\uC778 \uC911' 'Checking the release') 0
             # Windows PowerShell 5.1 may otherwise negotiate an obsolete TLS version.
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
             $api = 'https://api.github.com/repos/craftowen/krill/releases/'
@@ -229,14 +258,18 @@ if (-not $alreadyInstalled) {
             else { $api += 'tags/' + [uri]::EscapeDataString($Release) }
             $releaseInfo = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'Krill-Installer' }
             $packages = @($releaseInfo.assets | Where-Object { $_.name -cmatch '^Krill-[0-9][0-9A-Za-z.+-]*-windows-x64\.zip$' })
-            if ($packages.Count -ne 1) { throw 'This release has no Windows x64 package yet. Please check https://krill.page for availability.' }
+            if ($packages.Count -ne 1) {
+                throw ((Get-KrillMsg '\uC774 \uB9B4\uB9AC\uC2A4\uC5D0\uB294 \uC544\uC9C1 Windows x64 \uD328\uD0A4\uC9C0\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. {0}\uC5D0\uC11C \uC9C0\uC6D0 \uC5EC\uBD80\uB97C \uD655\uC778\uD558\uC138\uC694.' 'This release has no Windows x64 package yet. Please check {0} for availability.') -f $krillSiteUrl)
+            }
             $asset = $packages[0]
             $checksums = @($releaseInfo.assets | Where-Object { $_.name -ceq ($asset.name + '.sha256') })
-            if ($checksums.Count -ne 1) { throw 'The Windows package SHA-256 file is missing.' }
-            Complete-KrillStep '01' (Convert-KrillUnicode '\uD655\uC778') ((Convert-KrillUnicode '\uB9B4\uB9AC\uC2A4 \uB2E4\uC6B4\uB85C\uB4DC \uACBD\uB85C \uD655\uC778 (') + $asset.name + ')')
+            if ($checksums.Count -ne 1) {
+                throw (Get-KrillMsg 'Windows \uD328\uD0A4\uC9C0 SHA-256 \uD30C\uC77C\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.' 'The Windows package SHA-256 file is missing.')
+            }
+            Complete-KrillStep '01' (Get-KrillMsg '\uD655\uC778' 'Checked') ((Get-KrillMsg '\uB9B4\uB9AC\uC2A4 \uB2E4\uC6B4\uB85C\uB4DC \uACBD\uB85C \uD655\uC778 ({0})' 'Release download path found ({0})') -f $asset.name)
 
 
-            Start-KrillStep '02' ((Convert-KrillUnicode '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC911 (') + $asset.name + ')') 1
+            Start-KrillStep '02' ((Get-KrillMsg '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC911 ({0})' 'Downloading the bundle ({0})') -f $asset.name) 1
             $Zip = Join-Path $tmp $asset.name
             $checksumFile = Join-Path $tmp 'package.sha256'
             $savedProgress = $ProgressPreference
@@ -246,7 +279,7 @@ if (-not $alreadyInstalled) {
                     $url = [uri]$item.Asset.browser_download_url
                     if ($url.Scheme -ne 'https' -or $url.Host -ne 'github.com' -or
                         -not $url.AbsolutePath.StartsWith('/craftowen/krill/releases/download/')) {
-                        throw 'Unexpected release asset URL.'
+                        throw (Get-KrillMsg '\uC608\uC0C1\uCE58 \uBABB\uD55C \uB9B4\uB9AC\uC2A4 \uC790\uC0B0 URL\uC785\uB2C8\uB2E4.' 'Unexpected release asset URL.')
                     }
                     Invoke-WebRequest -UseBasicParsing -Uri $url.AbsoluteUri -OutFile $item.File
                 }
@@ -255,29 +288,35 @@ if (-not $alreadyInstalled) {
             }
             $zipBytes = if (Test-Path -LiteralPath $Zip) { (Get-Item -LiteralPath $Zip).Length } else { 0 }
             $zipMib = ('{0:0.0} MiB' -f ($zipBytes / 1048576.0))
-            Complete-KrillStep '02' (Convert-KrillUnicode '\uC218\uC2E0') ((Convert-KrillUnicode '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC644\uB8CC (') + $zipMib + ')')
+            Complete-KrillStep '02' (Get-KrillMsg '\uC218\uC2E0' 'Received') ((Get-KrillMsg '\uBC88\uB4E4 \uB2E4\uC6B4\uB85C\uB4DC \uC644\uB8CC ({0})' 'Bundle downloaded ({0})') -f $zipMib)
 
 
-            Start-KrillStep '03' (Convert-KrillUnicode 'SHA-256 \uBE44\uAD50 \uC911') 2
+            Start-KrillStep '03' (Get-KrillMsg 'SHA-256 \uBE44\uAD50 \uC911' 'Comparing SHA-256') 2
             $checksum = (Get-Content -LiteralPath $checksumFile -Raw).Trim()
-            if ($checksum -notmatch '^([0-9a-fA-F]{64})(?:\s+\*?([^\r\n]+))?$') { throw 'Invalid SHA-256 file.' }
+            if ($checksum -notmatch '^([0-9a-fA-F]{64})(?:\s+\*?([^\r\n]+))?$') {
+                throw (Get-KrillMsg '\uC62C\uBC14\uB978 SHA-256 \uD30C\uC77C\uC774 \uC544\uB2D9\uB2C8\uB2E4.' 'Invalid SHA-256 file.')
+            }
             $expected = $Matches[1]
-            if ($Matches[2] -and $Matches[2] -cne $asset.name) { throw 'SHA-256 filename does not match the package.' }
-            if ((Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash -ne $expected) { throw 'Windows package SHA-256 mismatch; nothing was installed.' }
+            if ($Matches[2] -and $Matches[2] -cne $asset.name) {
+                throw (Get-KrillMsg 'SHA-256 \uD30C\uC77C \uC774\uB984\uC774 \uD328\uD0A4\uC9C0\uC640 \uC77C\uCE58\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.' 'SHA-256 filename does not match the package.')
+            }
+            if ((Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash -ne $expected) {
+                throw (Get-KrillMsg 'Windows \uD328\uD0A4\uC9C0 SHA-256\uC774 \uC77C\uCE58\uD558\uC9C0 \uC54A\uC544 \uC124\uCE58\uD558\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4.' 'Windows package SHA-256 mismatch; nothing was installed.')
+            }
             if (-not $PSBoundParameters.ContainsKey('AddToPath')) { $AddToPath = $true }
-            Complete-KrillStep '03' (Convert-KrillUnicode '\uC77C\uCE58') (Convert-KrillUnicode 'SHA-256 \uCCB4\uD06C\uC12C \uC77C\uCE58')
+            Complete-KrillStep '03' (Get-KrillMsg '\uC77C\uCE58' 'Matched') (Get-KrillMsg 'SHA-256 \uCCB4\uD06C\uC12C \uC77C\uCE58' 'SHA-256 checksum matched')
         } else {
             $leafName = Split-Path -Leaf $Zip
-            Start-KrillStep '01' (Convert-KrillUnicode '\uB85C\uCEEC \uD328\uD0A4\uC9C0 \uD655\uC778 \uC911') 0
-            Complete-KrillStep '01' (Convert-KrillUnicode '\uD655\uC778') ((Convert-KrillUnicode '\uB85C\uCEEC \uD328\uD0A4\uC9C0 \uC9C0\uC815 (') + $leafName + ')')
-            Start-KrillStep '02' (Convert-KrillUnicode '\uB85C\uCEEC \uBC88\uB4E4 \uC900\uBE44 \uC911') 1
-            Complete-KrillStep '02' (Convert-KrillUnicode '\uC218\uC2E0') (Convert-KrillUnicode '\uB85C\uCEEC \uBC88\uB4E4 \uC0AC\uC6A9 (\uB2E4\uC6B4\uB85C\uB4DC \uC0DD\uB7B5)')
-            Start-KrillStep '03' (Convert-KrillUnicode '\uC624\uD504\uB77C\uC778 \uBAA8\uB4DC \uD655\uC778 \uC911') 2
-            Complete-KrillStep '03' (Convert-KrillUnicode '\uC0DD\uB7B5') (Convert-KrillUnicode '\uC624\uD504\uB77C\uC778 \uD328\uD0A4\uC9C0 (\uC678\uBD80 \uCCB4\uD06C\uC12C \uC0DD\uB7B5)')
+            Start-KrillStep '01' (Get-KrillMsg '\uB85C\uCEEC \uD328\uD0A4\uC9C0 \uD655\uC778 \uC911' 'Checking the local package') 0
+            Complete-KrillStep '01' (Get-KrillMsg '\uD655\uC778' 'Checked') ((Get-KrillMsg '\uB85C\uCEEC \uD328\uD0A4\uC9C0 \uC9C0\uC815 ({0})' 'Local package selected ({0})') -f $leafName)
+            Start-KrillStep '02' (Get-KrillMsg '\uB85C\uCEEC \uBC88\uB4E4 \uC900\uBE44 \uC911' 'Preparing the local bundle') 1
+            Complete-KrillStep '02' (Get-KrillMsg '\uC218\uC2E0' 'Received') (Get-KrillMsg '\uB85C\uCEEC \uBC88\uB4E4 \uC0AC\uC6A9 (\uB2E4\uC6B4\uB85C\uB4DC \uC0DD\uB7B5)' 'Using local bundle (download skipped)')
+            Start-KrillStep '03' (Get-KrillMsg '\uC624\uD504\uB77C\uC778 \uBAA8\uB4DC \uD655\uC778 \uC911' 'Checking offline mode') 2
+            Complete-KrillStep '03' (Get-KrillMsg '\uC0DD\uB7B5' 'Skipped') (Get-KrillMsg '\uC624\uD504\uB77C\uC778 \uD328\uD0A4\uC9C0 (\uC678\uBD80 \uCCB4\uD06C\uC12C \uC0DD\uB7B5)' 'Offline package (external checksum skipped)')
         }
 
 
-        Start-KrillStep '04' (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C\u00B7\uAD6C\uC131 \uD30C\uC77C \uAC80\uC0AC \uC911') 3
+        Start-KrillStep '04' (Get-KrillMsg '\uBC88\uB4E4 \uD574\uC81C\u00B7\uAD6C\uC131 \uD30C\uC77C \uAC80\uC0AC \uC911' 'Unpacking the bundle and verifying files') 3
         $unpacked = Join-Path $tmp 'unpacked'
         $savedProgress2 = $ProgressPreference
         try {
@@ -288,21 +327,21 @@ if (-not $alreadyInstalled) {
         }
         foreach ($file in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path $unpacked "Krill\$file") -PathType Leaf)) {
-                throw "Not a Krill package (missing $file)."
+                throw ((Get-KrillMsg 'Krill \uD328\uD0A4\uC9C0\uAC00 \uC544\uB2D9\uB2C8\uB2E4({0} \uB204\uB77D).' 'Not a Krill package (missing {0}).') -f $file)
             }
         }
         # conpty.dll starts <dll folder>\<native OS architecture>\OpenConsole.exe, so an ARM64 PC needs
         # arm64\OpenConsole.exe even though Krill itself runs as x64; without it sessions fail.
         if ($arch -eq 'ARM64' -and -not (Test-Path -LiteralPath (Join-Path $unpacked 'Krill\arm64\OpenConsole.exe') -PathType Leaf)) {
-            throw 'This Krill release has no ARM64 console host (arm64\OpenConsole.exe); ARM64 PCs need a newer release.'
+            throw ((Get-KrillMsg '\uC774 Krill \uB9B4\uB9AC\uC2A4\uC5D0\uB294 ARM64 \uCF58\uC194 \uD638\uC2A4\uD2B8({0})\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4. ARM64 PC\uC5D0\uB294 \uCD5C\uC2E0 \uB9B4\uB9AC\uC2A4\uAC00 \uD544\uC694\uD569\uB2C8\uB2E4.' 'This Krill release has no ARM64 console host ({0}); ARM64 PCs need a newer release.') -f 'arm64\OpenConsole.exe')
         }
-        Complete-KrillStep '04' (Convert-KrillUnicode '\uAC80\uC99D') (Convert-KrillUnicode '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C 5\uC885 \uD655\uC778')
+        Complete-KrillStep '04' (Get-KrillMsg '\uAC80\uC99D' 'Verified') ((Get-KrillMsg '\uBC88\uB4E4 \uD574\uC81C \u00B7 \uD544\uC218 \uAD6C\uC131 \uD30C\uC77C {0}\uC885 \uD655\uC778' 'Bundle unpacked, verified {0} required files') -f $required.Count)
 
 
-        Start-KrillStep '05' ((Convert-KrillUnicode '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 (') + $Dest + ')') 4
+        Start-KrillStep '05' ((Get-KrillMsg '\uC571 \uD30C\uC77C \uC124\uCE58 \uC911 ({0})' 'Installing app files ({0})') -f $Dest) 4
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dest) | Out-Null
         Move-Item -LiteralPath (Join-Path $unpacked 'Krill') -Destination $Dest
-        Complete-KrillStep '05' (Convert-KrillUnicode '\uC124\uCE58') ($Dest + (Convert-KrillUnicode ' \uC124\uCE58 \uC644\uB8CC'))
+        Complete-KrillStep '05' (Get-KrillMsg '\uC124\uCE58' 'Installed') ((Get-KrillMsg '{0} \uC124\uCE58 \uC644\uB8CC' 'Installed to {0}') -f $Dest)
     } catch {
         Fail-KrillStep $_.Exception.Message
         throw
@@ -312,14 +351,14 @@ if (-not $alreadyInstalled) {
 }
 
 
-Start-KrillStep '06' (Convert-KrillUnicode 'CLI PATH \u00B7 \uBC14\uB85C\uAC00\uAE30 \u00B7 \uC571 \uC5F4\uAE30 \uAD6C\uC131 \uC911') 5
+Start-KrillStep '06' (Get-KrillMsg 'CLI PATH \u00B7 \uBC14\uB85C\uAC00\uAE30 \u00B7 \uC571 \uC5F4\uAE30 \uAD6C\uC131 \uC911' 'Configuring CLI PATH, shortcut, and app launch') 5
 try {
     if (-not $NoShortcut) {
         try {
             $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Krill.lnk'
             New-KrillShortcut $lnk (Join-Path $Dest 'krill-app.exe') $env:USERPROFILE
         } catch {
-            Write-Warning "Could not create the Start Menu shortcut: $($_.Exception.Message)"
+            Write-Warning ((Get-KrillMsg '\uC2DC\uC791 \uBA54\uB274 \uBC14\uB85C\uAC00\uAE30\uB97C \uB9CC\uB4E4\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4: {0}' 'Could not create the Start Menu shortcut: {0}') -f $_.Exception.Message)
         }
     }
     if ($AddToPath) {
@@ -336,11 +375,11 @@ try {
         if (($env:Path -split ';') -notcontains $Dest) { $env:Path += ";$Dest" }
     }
     $openNote = if ($download -and -not $NoOpen) {
-        Convert-KrillUnicode '\uC571 \uC5F4\uAE30 \uC694\uCCAD \uC804\uB2EC'
+        Get-KrillMsg '\uC571 \uC5F4\uAE30 \uC694\uCCAD \uC804\uB2EC' 'app launch requested'
     } else {
-        Convert-KrillUnicode '\uC571 \uC5F4\uAE30 \uC0DD\uB7B5'
+        Get-KrillMsg '\uC571 \uC5F4\uAE30 \uC0DD\uB7B5' 'app launch skipped'
     }
-    Complete-KrillStep '06' (Convert-KrillUnicode '\uC644\uB8CC') ((Convert-KrillUnicode 'CLI \uAD6C\uC131 \u00B7 ') + $openNote)
+    Complete-KrillStep '06' (Get-KrillMsg '\uC644\uB8CC' 'Done') ((Get-KrillMsg 'CLI \uAD6C\uC131 \u00B7 {0}' 'CLI configured, {0}') -f $openNote)
 } catch {
     Fail-KrillStep $_.Exception.Message
     throw
@@ -355,7 +394,7 @@ if ($krillUi) {
     Write-KrillErrLine (" {0}{1}  {2}{3}  {4}/  {5}{3}" -f $cSuccess, $gBot, $kDone, $cReset, $cMuted, $totalElapsed)
     Write-KrillErrLine ("    {0}Krill          {1} {2}{3}" -f $cFg, $gArrow, $Dest, $cReset)
     Write-KrillErrLine ("    {0}CLI            {1} {2}{3}" -f $cMuted, $gArrow, $cliPath, $cReset)
-    Write-KrillErrLine ("    {0}{1}           {2} {3}{4}" -f $cMuted, $kStart, $gArrow, $appPath, $cReset)
+    Write-KrillErrLine ("    {0}{1}{2} {3}{4}" -f $cMuted, $kStartLabel, $gArrow, $appPath, $cReset)
 }
 
 if ($alreadyInstalled) { "already installed: $Dest (files preserved; use the app to check for updates)" }

@@ -86,7 +86,9 @@ pub fn fix_label(check: &Check) -> Option<&'static str> {
         FixAction::Notifications if check.fix.value.is_empty() => {
             text::FIX_ALLOW_NOTIFICATIONS.get()
         }
-        FixAction::Applications => text::FIX_REVEAL.get(),
+        FixAction::Applications => text::FIX_REVEAL
+            .mac_or(crate::i18n::catalog::other_os::REVEAL)
+            .get(),
         FixAction::Notifications | FixAction::Settings(_) => text::FIX_OPEN_SETTINGS.get(),
     })
 }
@@ -133,7 +135,12 @@ fn run_with<E: Executor>(id: &str, env: &Env, executor: E, cx: &mut App) -> Task
                         PromptLevel::Info,
                         atext::MOVE_TITLE.get(),
                         Some(atext::MOVE_DETAIL.get()),
-                        &[text::FIX_REVEAL.get(), atext::CANCEL.get()],
+                        &[
+                            text::FIX_REVEAL
+                                .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                                .get(),
+                            atext::CANCEL.get(),
+                        ],
                         cx,
                     )
                 })

@@ -108,7 +108,7 @@ impl Snapshot {
     }
 
     /// 5h·7d 중 더 높은 사용률(모르면 0). 모름을 0%로 보여주면 안 되는 곳(표시·판정)은
-    /// [`AutoSwitchMetric::effective_percent`]·[`format_window_percent_ko`]를 쓴다.
+    /// [`AutoSwitchMetric::effective_percent`]를 쓴다.
     pub fn max_percent(&self) -> u8 {
         [self.five_hour.as_ref(), self.seven_day.as_ref()]
             .into_iter()
@@ -381,32 +381,6 @@ pub enum AccountStatus {
     RateLimited,
 }
 
-impl AccountStatus {
-    /// 상태 배지 짧은 한글 라벨(2단계 UI용 공개 API).
-    pub const fn label_ko(self) -> &'static str {
-        match self {
-            Self::Unknown => "모름",
-            Self::Stale => "오래됨",
-            Self::NeedsLogin => "로그인 필요",
-            Self::Error => "오류",
-            Self::Ok => "정상",
-            Self::RateLimited => "한도 도달",
-        }
-    }
-
-    /// 접근성·툴팁용 한 줄 설명(2단계 UI용 공개 API).
-    pub const fn describe_ko(self) -> &'static str {
-        match self {
-            Self::Unknown => "사용량을 알 수 없음",
-            Self::Stale => "오래된 사용량 값",
-            Self::NeedsLogin => "다시 로그인 필요",
-            Self::Error => "사용량 조회 오류",
-            Self::Ok => "정상",
-            Self::RateLimited => "사용량 한도에 도달함",
-        }
-    }
-}
-
 /// 계정별 상태 꼬리 한 행. 와이어에서는 rules 꼬리 뒤에 붙고,
 /// [`FEAT_USAGE_STATUS`] 없는 피어에게는 비워 보낸다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,24 +404,6 @@ pub fn is_updated_stale(updated_at_secs: Option<u64>, now_secs: u64) -> bool {
     match updated_at_secs {
         None => true,
         Some(updated) => now_secs.saturating_sub(updated) > STATUS_UPDATED_STALE_SECS,
-    }
-}
-
-/// 창 사용률 한글 표기(2단계 UI용 공개 API): 모름 "—", 리셋 지남 "리셋됨", 그 밖 "N%".
-#[must_use]
-pub fn format_window_percent_ko(window: Option<&Window>, now_secs: i64) -> String {
-    let Some(w) = window else {
-        return "—".to_owned();
-    };
-    let expired = w
-        .resets_at
-        .as_deref()
-        .and_then(crate::time::parse_reset_epoch)
-        .is_some_and(|epoch| now_secs >= epoch);
-    if expired {
-        "리셋됨".to_owned()
-    } else {
-        format!("{}%", w.percent.min(100))
     }
 }
 

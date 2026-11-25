@@ -134,14 +134,14 @@ function queryGitCommits(repoDir, extraArgs) {
 export function analyzeRecon(options = {}) {
   const repoDir = path.resolve(options.repoDir ?? process.cwd());
   if (!fs.existsSync(repoDir) || !fs.statSync(repoDir).isDirectory()) {
-    throw new Error(`대상 저장소 디렉터리가 존재하지 않습니다: ${repoDir}`);
+    throw new Error(`Target repository directory does not exist: ${repoDir}`);
   }
 
   const symbol = options.symbol ? String(options.symbol).trim() : null;
   const rawTargetPath = options.targetPath ? String(options.targetPath).trim() : null;
   const parsedLimit = Number.parseInt(String(options.limit ?? '8'), 10);
   if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
-    throw new Error(`유효하지 않은 --limit 값입니다(1 이상의 정수 필요): ${options.limit}`);
+    throw new Error(`Invalid --limit value (integer >= 1 required): ${options.limit}`);
   }
   const limit = parsedLimit;
 
@@ -149,7 +149,7 @@ export function analyzeRecon(options = {}) {
   if (rawTargetPath) {
     resolvedTarget = path.resolve(repoDir, rawTargetPath);
     if (!fs.existsSync(resolvedTarget)) {
-      throw new Error(`분석 대상 경로가 존재하지 않습니다: ${rawTargetPath}`);
+      throw new Error(`Analysis target path does not exist: ${rawTargetPath}`);
     }
   }
   const hasSpecificTargetPath = Boolean(resolvedTarget && resolvedTarget !== repoDir);
@@ -313,11 +313,11 @@ export function analyzeRecon(options = {}) {
   }
 
   const proofLadder = [
-    `L1 어휘/심볼 확인: 정의 ${definitions.length}건, 프로덕션 호출 ${productionCallers.length}건, 테스트 호출 ${testCallers.length}건`,
-    `L2 모듈 의존 그래프: 프로덕션 임포터 ${productionImporters.length}개, 테스트 임포터 ${testImporters.length}개`,
-    `L3 외부 경계 표면: ${boundaryKinds.length > 0 ? boundaryKinds.join(', ') : '순수 인메모리'}`,
-    'L4 런타임 프로브: 변경 전후 핵심 진입점에 실제 입력을 넣어 반환 형태와 부수효과 불변 여부 확인',
-    'L5 핵심 안전 명제 실행 증명: 가장 위험한 실패 경로 1건을 행동 테스트 또는 CLI 실행으로 직접 입증'
+    `L1 lexical/symbol check: ${definitions.length} definition(s), ${productionCallers.length} production caller(s), ${testCallers.length} test caller(s)`,
+    `L2 module dependency graph: ${productionImporters.length} production importer(s), ${testImporters.length} test importer(s)`,
+    `L3 external boundary surface: ${boundaryKinds.length > 0 ? boundaryKinds.join(', ') : 'pure in-memory'}`,
+    'L4 runtime probe: run concrete inputs before/after change at key entrypoints to verify return shape and side-effect invariants',
+    'L5 execution proof of load-bearing safety fact: prove the highest-risk failure path directly with a behavioral test or CLI run'
   ];
 
   return {
@@ -354,7 +354,7 @@ export function analyzeRecon(options = {}) {
 }
 
 function printHelp() {
-  console.log('사용법: node recon.mjs [--json] [--repo <저장소>] [--symbol <심볼명>] [--path <대상경로>] [--limit <커밋수>] [<대상경로>]');
+  console.log('Usage: node recon.mjs [--json] [--repo <repo>] [--symbol <name>] [--path <target_path>] [--limit <commits>] [<target_path>]');
 }
 
 function main() {
@@ -375,7 +375,7 @@ function main() {
   }
 
   if (parsed.positional.length > 1) {
-    console.error(`위치 인자는 최대 1개 경로만 허용됩니다: ${parsed.positional.join(' ')}`);
+    console.error(`At most one positional path is allowed: ${parsed.positional.join(' ')}`);
     process.exit(2);
   }
 
@@ -394,29 +394,29 @@ function main() {
       return;
     }
 
-    console.log(`Recon 분석 대상 파일: ${report.targetFiles.length}개 (위험 등급: ${report.blastSummary.riskTier})`);
+    console.log(`Recon target files: ${report.targetFiles.length} (risk tier: ${report.blastSummary.riskTier})`);
     if (report.symbol) {
-      console.log(`심볼 [${report.symbol}] 정의 ${report.definitions.length}건, 프로덕션 호출 ${report.productionCallers.length}건, 테스트 호출 ${report.testCallers.length}건`);
+      console.log(`Symbol [${report.symbol}]: ${report.definitions.length} definition(s), ${report.productionCallers.length} production caller(s), ${report.testCallers.length} test caller(s)`);
       for (const d of report.definitions) {
-        console.log(`  정의: ${d.file}:${d.line} (${d.kind}, exported=${d.exported})`);
+        console.log(`  Def: ${d.file}:${d.line} (${d.kind}, exported=${d.exported})`);
       }
       for (const c of report.productionCallers.slice(0, 15)) {
-        console.log(`  호출: ${c.file}:${c.line} ${c.snippet}`);
+        console.log(`  Call: ${c.file}:${c.line} ${c.snippet}`);
       }
     }
     if (report.importers.production.length > 0) {
-      console.log(`프로덕션 임포터: ${report.importers.production.join(', ')}`);
+      console.log(`Production importers: ${report.importers.production.join(', ')}`);
     }
     if (report.blastSummary.boundaryKinds.length > 0) {
-      console.log(`외부 경계 표면: ${report.blastSummary.boundaryKinds.join(', ')} (${report.boundarySurfaces.length}지점)`);
+      console.log(`External boundary surfaces: ${report.blastSummary.boundaryKinds.join(', ')} (${report.boundarySurfaces.length} site(s))`);
     }
     if (report.lineage.pickaxeCommits.length > 0) {
-      console.log('심볼 변경 계보(git log -S):');
+      console.log('Symbol change lineage (git log -S):');
       for (const c of report.lineage.pickaxeCommits) {
         console.log(`  ${c.sha} ${c.date} ${c.subject}`);
       }
     } else if (report.lineage.recentCommits.length > 0) {
-      console.log('최근 커밋 계보:');
+      console.log('Recent commit lineage:');
       for (const c of report.lineage.recentCommits) {
         console.log(`  ${c.sha} ${c.date} ${c.subject}`);
       }

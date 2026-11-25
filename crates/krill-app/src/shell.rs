@@ -6145,7 +6145,19 @@ impl Shell {
         }
         self.character_input_keys.remove(&e.keystroke.key);
         // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·←·→만 Ctrl+U·A·E로 보낸다.
-        let ks = &e.keystroke;
+        // Non-Latin layouts (Cyrillic, Greek, Hebrew, Arabic) send localized `key` characters;
+        // map to their ASCII equivalent when Control or Alt is pressed so Ctrl+C/D/Z and Meta work.
+        let mapped_ks;
+        let ks = if (e.keystroke.modifiers.control || e.keystroke.modifiers.alt)
+            && !e.keystroke.key.is_ascii()
+        {
+            mapped_ks = cx
+                .keyboard_mapper()
+                .map_key_equivalent(e.keystroke.clone(), true);
+            mapped_ks.inner()
+        } else {
+            &e.keystroke
+        };
         let Some(pane) = self
             .layout
             .focused()
@@ -6239,7 +6251,18 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
-        if let Some(pty) = keys::tui::key(&e.keystroke, l.pane.modes(), keys::tui::Event::Release) {
+        let mapped_ks;
+        let ks = if (e.keystroke.modifiers.control || e.keystroke.modifiers.alt)
+            && !e.keystroke.key.is_ascii()
+        {
+            mapped_ks = cx
+                .keyboard_mapper()
+                .map_key_equivalent(e.keystroke.clone(), true);
+            mapped_ks.inner()
+        } else {
+            &e.keystroke
+        };
+        if let Some(pty) = keys::tui::key(ks, l.pane.modes(), keys::tui::Event::Release) {
             self.send_in_key(
                 &Output {
                     pty,
@@ -7799,12 +7822,14 @@ impl Shell {
                         origin: o.origin,
                         text: o.text.to_owned(),
                         columns: o.columns,
+                        selected: l.ime.selected_columns(),
                     });
                 // 확정 뒤 에코 대기 글자는 화면에 아직 없어도 그린다(OWE-615 원인 1).
                 el.pending = focused.then(|| l.ime.pending()).flatten().map(|p| Preedit {
                     origin: p.origin,
                     text: p.text.to_owned(),
                     columns: p.columns,
+                    selected: None,
                 });
                 if l.pane.is_cold() || l.pane.is_closed() {
                     div()
@@ -8674,6 +8699,22 @@ impl Render for Shell {
         if self.language != krill_app::i18n::language() {
             self.language = krill_app::i18n::language();
             self.refresh_jump(cx);
+            for find in self.chat.finds.values() {
+                krill_app::i18n::sync_input_placeholder(
+                    &find.input,
+                    krill_app::i18n::catalog::chat::FIND_PLACEHOLDER.get(),
+                    window,
+                    cx,
+                );
+            }
+            if let Some((input, _)) = self.bot_ui.search.as_ref() {
+                krill_app::i18n::sync_input_placeholder(
+                    input,
+                    krill_app::i18n::catalog::bots::SB_SEARCH.get(),
+                    window,
+                    cx,
+                );
+            }
         }
         if self.system_appearance.is_none() {
             self.system_appearance = Some(cx.observe_window_appearance(window, |_, window, cx| {

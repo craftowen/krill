@@ -121,7 +121,7 @@ fn render_head(collected: &Collected) {
         );
     } else {
         println!(
-            "launch     dev build (posix_spawn + setsid; TCC attribution follows the launcher)"
+            "launch     dev build (detached process; macOS permissions follow the launching app)"
         );
     }
     #[cfg(windows)]

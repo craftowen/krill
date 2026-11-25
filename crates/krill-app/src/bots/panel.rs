@@ -91,7 +91,7 @@ impl View {
             .children(self.render_pending_switch(p, cx))
             .children(
                 self.error
-                    .clone()
+                    .as_deref()
                     .map(|err| self.render_error_with_retry(err, p, cx)),
             )
             .children(self.render_notice(p));

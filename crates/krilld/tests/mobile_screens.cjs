@@ -383,7 +383,7 @@ async function accounts(){const data={accounts:[{id:'work',provider:'Claude',lab
  chooser.action();let choices=picker.sheets.at(-1)[1];assert.deepEqual(Array.from(choices,h=>h.label),['Online desktop'],'offline, reconnecting and cached hosts are omitted');
  live.connection.phase='disconnected';await choices[0].action();assert.equal(picker.ctx.selected,undefined,'an already-open picker cannot select a host that disconnected');assert(chooser.hidden);live.connection.phase='ready';picker.view.update();assert(!chooser.hidden);chooser.action();await picker.sheets.at(-1)[1][0].action();assert.equal(picker.ctx.selected,'live');assert.equal(picker.routes.at(-1),'/accounts');
  picker.state.connection.phase='ready';active.connection.phase='ready';picker.view.update();chooser.action();assert.equal(picker.sheets.at(-1)[1].length,2);live.connection.phase='connecting';picker.view.update();assert(chooser.hidden,'other-host changes update the picker while the active connection stays ready');live.connection.phase='ready';picker.view.update();assert(!chooser.hidden);chooser.action();choices=picker.sheets.at(-1)[1];picker.abort.abort();await choices[1].action();assert.equal(picker.routes.length,1,'aborted screens cannot switch hosts');
- const A=f.M.accounts,now=1000000;assert.equal(A.usageWindow(null,now).percent,null);assert.equal(A.usageWindow({percent:88,resets_at:String(now-1)},now).text,'—');assert.equal(A.usageWindow({percent:40,resets_at:new Date((now+90)*1000).toISOString()},now).reset,'1m');assert.equal(A.countdown(2*86400+3600),'2d');assert.equal(A.countdown(5*3600,()=>{throw Error('duration must not translate');}),'5h');assert.equal(A.countdown(7*86400),'7d');assert.equal(A.usageWindow({percent:NaN},now).text,'—');
+ const A=f.M.accounts,now=1000000;assert.equal(A.usageWindow(null,now).percent,null);assert.equal(A.usageWindow({percent:88,resets_at:String(now-1)},now).text,'—');assert.equal(A.usageWindow({percent:40,resets_at:new Date((now+90)*1000).toISOString()},now).reset,'1m');assert.equal(A.countdown(2*86400+3600),'2d');assert.equal(A.countdown(5*3600),'5h');assert.equal(A.countdown(7*86400),'7d');assert.equal(A.usageWindow({percent:NaN},now).text,'—');
  let refreshes=0,handoffState={accounts:[{id:'agy-2',provider:'Antigravity',label:'Agy 2',email:'agy2@example.test',profile_dir:'/agy2',active:false,stale:false,usage:{five_hour:null,seven_day:null}}],statuses:[],connections:{supported:true,accounts:[{account_id:'agy-2',status:'connected'}]},details:{handoffs:[]}};
  const h=fixture('accounts',{refresh:()=>{refreshes++;},rpc:req=>{if(req.action==='switch_account'){handoffState={...handoffState,accounts:[{...handoffState.accounts[0],active:true}],details:{handoffs:[{from:7,to:null,account_id:'agy-2',error:null}]}};return handoffState;}return handoffState;}});await h.flush();
  await h.find('.account-row').action();await h.flush();assert.equal(refreshes,1);assert(h.find('.account-trailing').querySelector('.spinner'),'pending session handoff shows spinner');
@@ -2690,5 +2690,233 @@ async function sweepR3MobileRegressions(){
  }
  console.log('PASS sweep R3 mobile screen regressions: R3M-04');
 }
-async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
+async function mobileI18nAuditRegressions(){
+ const assetsDir=path.join(__dirname,'../src/mobile/assets');
+ const i18nPath=path.join(assetsDir,'i18n.js');
+ const i18nSrc=fs.readFileSync(i18nPath,'utf8');
+
+ // 1. Zero duplicate keys in i18n.js ko dictionary (token-level check, not Object.keys which hides overwrites).
+ const koStart=i18nSrc.indexOf('const ko = {');
+ const koEnd=i18nSrc.indexOf('\n  };\n',koStart);
+ assert(koStart>=0&&koEnd>koStart,'i18n.js const ko = { ... } block present');
+ const seenKeys=new Map(),dupKeys=[];
+ {
+  let i=koStart+'const ko = {'.length;
+  const skipWs=()=>{while(i<koEnd){if(/\s/.test(i18nSrc[i])){i++;continue;}if(i18nSrc.slice(i,i+2)==='//'){while(i<koEnd&&i18nSrc[i]!=='\n')i++;continue;}if(i18nSrc.slice(i,i+2)==='/*'){i=i18nSrc.indexOf('*/',i+2)+2;continue;}break;}};
+  const readStr=()=>{const q=i18nSrc[i++];let s='';while(i<koEnd&&i18nSrc[i]!==q){if(i18nSrc[i]==='\\'){const n=i18nSrc[++i];if(n==='n')s+='\n';else if(n==='t')s+='\t';else if(n==='u'){s+=String.fromCharCode(parseInt(i18nSrc.slice(i+1,i+5),16));i+=4;}else s+=n;i++;}else s+=i18nSrc[i++];}i++;return s;};
+  while(i<koEnd){
+   skipWs();if(i>=koEnd)break;
+   let key;
+   if(i18nSrc[i]==='"'||i18nSrc[i]==="'")key=readStr();
+   else{const m=i18nSrc.slice(i,koEnd).match(/^[A-Za-z_$][A-Za-z0-9_$]*/);if(!m){i++;continue;}key=m[0];i+=key.length;}
+   skipWs();if(i18nSrc[i]!==':')continue;i++;skipWs();
+   let val='';if(i18nSrc[i]==='"'||i18nSrc[i]==="'")val=readStr();
+   skipWs();if(i18nSrc[i]===',')i++;
+   if(seenKeys.has(key))dupKeys.push(key);
+   else seenKeys.set(key,val);
+  }
+ }
+ assert.deepEqual(dupKeys,[],'i18n.js must have zero duplicate keys');
+ assert(!seenKeys.has('English'),'autonym English must not be in ko dictionary');
+
+ // 2. {N} placeholder parity for every key -> ko value.
+ const placeholders=s=>[...String(s).matchAll(/\{(\d+)\}/g)].map(m=>m[1]).sort().join(',');
+ for(const [k,v] of seenKeys)assert.equal(placeholders(v),placeholders(k),`placeholder mismatch for ${JSON.stringify(k)}`);
+
+ // 3. Every literal t(...)/tr(...)/translate(...)/toast(...)/Error(...) key across assets/**/*.js exists in i18n.js.
+ const jsFiles=[];
+ const walk=dir=>{for(const ent of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,ent.name);if(ent.isDirectory())walk(p);else if(ent.name.endsWith('.js')&&ent.name!=='i18n.js'&&ent.name!=='qr.js')jsFiles.push(p);}};
+ walk(assetsDir);
+ const missingLiterals=[];
+ const reCall=/\b(?:(?:ctx\.)?(?:t|tr|translate|toast)|Error)\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g;
+ for(const file of jsFiles){
+  const src=fs.readFileSync(file,'utf8');
+  let hit;
+  while((hit=reCall.exec(src))){
+   let str;try{str=vm.runInNewContext(hit[1]);}catch{continue;}
+   if(!str||!/[A-Za-z]/.test(str))continue;
+   if(!seenKeys.has(str)&&!seenKeys.has(str.replaceAll('\u2019',"'")))missingLiterals.push(`${path.relative(assetsDir,file)}: ${str}`);
+  }
+ }
+ assert.deepEqual(missingLiterals,[],'every literal t/toast/Error copy key in assets/**/*.js must exist in i18n.js');
+
+ // 4. configure() locale detection (ko_KR, ko-KR, en-US, navigator.languages), Object.hasOwn guard, autonyms & helpers.
+ const loadI18n=nav=>{const doc={documentElement:{lang:''}};const box=vm.createContext({navigator:nav,document:doc});vm.runInContext(i18nSrc,box);return {I:box.KrillMobile.i18n,doc};};
+ assert.equal(loadI18n({language:'ko_KR'}).I.language,'ko','ko_KR underscore tag must resolve to ko');
+ assert.equal(loadI18n({language:'ko-KR'}).I.language,'ko');
+ assert.equal(loadI18n({language:'en-US'}).I.language,'en');
+ assert.equal(loadI18n({languages:['ja-JP','ko_KR'],language:'en-US'}).I.language,'ko','navigator.languages secondary ko_KR');
+ assert.equal(loadI18n({languages:['en-US','ko-KR'],language:'ko-KR'}).I.language,'en','navigator.languages primary en-US wins over ko-KR');
+ assert.equal(loadI18n({languages:['fr-FR'],language:'fr-FR'}).I.language,'en','unsupported locale falls back to en');
+ const {I:K,doc:koDoc}=loadI18n({language:'ko-KR'});
+ assert.equal(koDoc.documentElement.lang,'ko');
+ assert.equal(K.t('English'),'English','autonym English stays English in ko mode');
+ assert.equal(K.t('toString'),'toString','Object.hasOwn guards prototype property toString');
+ assert.equal(K.t('constructor'),'constructor','Object.hasOwn guards prototype property constructor');
+ assert.equal(K.t('valueOf'),'valueOf','Object.hasOwn guards prototype property valueOf');
+ assert.equal(typeof K.formatDate,'function');
+ assert.equal(typeof K.formatNumber,'function');
+ assert(K.formatNumber(12345).includes('12,345'));
+ for(const key of ['Invalid bot link','Reconnecting…','Session ended','Pipito is not running','Pipito is not installed','Pipito bridge token rejected','Plain text','Orchestrate','Shell','This computer','Local computer','Read 1 file','Changed 1 file','Create an AGENTS.md file with instructions for Codex','Relay']){
+  assert.notEqual(K.t(key),key,`missing ko translation for ${key}`);
+ }
+
+ // 5. Settings screen: autonyms English & 한국어 stay untranslated in ko mode, and privacy link matches active language.
+ for(const lang of ['en','ko']){
+  const {I}=loadI18n({language:lang});
+  const sf=fixture('settings',{t:I.t,globals:{KrillMobile:{i18n:I,diagnostics:{enabled:()=>true,privacySignal:false,setEnabled:v=>v},terminal:{fontScales:[1],keys:[]},install:{offer:null}}}});
+  const langGroup=sf.all().find(n=>n.getAttribute('role')==='group'&&n.getAttribute('aria-label')===I.t('Language'));
+  assert(langGroup,'language segmented group present');
+  const labels=langGroup.children.map(b=>b.textContent);
+  assert(labels.includes('English'),'English autonym preserved in '+lang);
+  assert(labels.includes('한국어'),'한국어 autonym preserved in '+lang);
+  assert(!labels.includes('영어'),'must never render 영어 in language picker');
+  const expectedHref=lang==='ko'?'https://krill.page/privacy#mobile-errors':'https://krill.page/en/privacy#mobile-errors';
+  assert(sf.all().some(n=>n.tagName==='A'&&n.href===expectedHref),`privacy link matches ${lang} (${expectedHref})`);
+  sf.abort.abort();
+ }
+
+ // 6. #connection-banner updates on language switch without duplicating logs; dot() localizes aria-label; header({raw:true}) skips t().
+ {
+  const appSrc=fs.readFileSync(path.join(assetsDir,'app.js'),'utf8');
+  const {I}=loadI18n({language:'en'});
+  const makeNode=(tag,txt='',cls='')=>({tagName:tag.toUpperCase(),textContent:txt??'',className:cls,children:[],attrs:{},hidden:false,append(...a){this.children.push(...a);},replaceChildren(...a){this.children=a;this.textContent=a.map(x=>x.textContent||'').join('');},setAttribute(k,v){this.attrs[k]=String(v);},getAttribute(k){return this.attrs[k]??null;},addEventListener(){}});
+  const banner=makeNode('div','','connection-banner');
+  const logs=[];
+  const dotLine=appSrc.split('\n').find(l=>l.includes('const dot=status=>'));
+  const hdrLine=appSrc.split('\n').find(l=>l.includes('function header('));
+  const showLine=appSrc.split('\n').find(l=>l.includes('function showConnection('));
+  const saveLine=appSrc.split('\n').find(l=>l.includes('function savePreferences('));
+  assert(dotLine&&hdrLine&&showLine&&saveLine,'app.js helpers present');
+  let renders=0;
+  const box=vm.createContext({
+   Date,Math,String,Object,JSON,Error,
+   el:makeNode,
+   button:(label,action,cls='')=>{const b=makeNode('button',label,cls);b.action=action;return b;},
+   t:(...a)=>I.t(...a),
+   banner,
+   notice:makeNode('div'),
+   hideNotice(){},
+   update(){},
+   render(){renders++;},
+   applyPreferences(){I.configure(box.state.preferences.language);},
+   localStorage:{getItem:()=>'{}',setItem(){}},
+   error(e){throw e;},
+   back(){},
+   scanQr(){},
+   transport:{reconnect(){}},
+   endpoint:{profiles:()=>[{name:'Desk',active:true}]},
+   state:{connection:{phase:'idle',message:'Not connected'},preferences:{language:'en'},logs,cached:false},
+   activeRouteScreen:'session',
+   pendingHostAction:null,
+  });
+  vm.runInContext(`${dotLine}\n${hdrLine}\n${showLine}\n${saveLine}\nglobalThis.api={dot,header,showConnection,savePreferences};`,box);
+  box.api.showConnection({phase:'disconnected',message:'Reconnecting…',retryAt:Date.now()+5000});
+  assert.equal(logs.length,1);
+  assert(banner.children[0].textContent==='Reconnecting…');
+  assert(banner.children[1].textContent.includes('Next retry in'));
+  assert(banner.children[2].children[0].textContent==='Reconnect');
+  box.api.savePreferences({language:'ko'});
+  assert.equal(renders,1,'savePreferences triggers render on language change');
+  assert.equal(logs.length,1,'re-rendering banner on language switch must not append duplicate logs');
+  assert.equal(banner.children[0].textContent,'다시 연결하는 중…');
+  assert(banner.children[1].textContent.includes('초 뒤 다시 시도'));
+  assert.equal(banner.children[2].children[0].textContent,'다시 연결');
+  assert.equal(banner.children[2].children[1].textContent,'QR 스캔');
+  assert.equal(box.api.dot('waiting').getAttribute('aria-label'),'확인 대기');
+  assert.equal(box.api.dot('connected').getAttribute('aria-label'),'연결됨');
+  assert.equal(box.api.header('active','/bots',undefined,{raw:true}).children[1].children[0].textContent,'active','raw header never translates botId');
+ }
+
+ // 7. Details countdown & visible 5h/7d labels in Korean; Workspaces multi-warning translation; Bots structured timeline & effort in Korean.
+ {
+  const {I}=loadI18n({language:'ko'});
+  const df=fixture('accounts',{t:I.t,globals:{KrillMobile:{i18n:I,terminal:{fontScales:[1],keys:[]},install:{offer:null}}},rpc:()=>({accounts:[{id:'a1',provider:'Claude',label:'C',email:'c@test',profile_dir:'/c',active:true,stale:false,usage:{five_hour:{percent:50,resets_at:String(Math.floor(Date.now()/1000)+3600*2)},seven_day:{percent:10,resets_at:String(Math.floor(Date.now()/1000)+86400*3)}}}],statuses:[],connections:{supported:false}})});
+  await df.flush();
+  assert.equal(df.M.accounts.countdown(10,I.t),'지금');
+  assert.equal(df.M.accounts.countdown(120,I.t),'2분');
+  assert.equal(df.M.accounts.countdown(5*3600,I.t),'5시간');
+  assert.equal(df.M.accounts.countdown(7*86400,I.t),'7일');
+  const barText=df.root.textContent;
+  assert(barText.includes('5시간')&&barText.includes('7일'),'details usage labels translated in ko');
+  df.abort.abort();
+
+  // Workspaces warnings translated individually before joining
+  const toasts=[];
+  const wf=fixture('workspaces',{t:I.t,rpc:()=>({workspace:'w-new',session:7,warnings:['setup did not start','Workspace created; terminal unavailable']})});
+  wf.ctx.toast=msg=>toasts.push(msg);
+  wf.state.snapshot={capabilities:{worktree_create:true},repositories:[{key:'r1',label:'repo',path:'/repo'}],workspaces:[],sessions:[]};
+  wf.M.workspaceComposer(wf.ctx,'r1');
+  const formHost=wf.ctx.el('div');wf.sheets.at(-1)[3](formHost);
+  emit(formHost.querySelector('form'),'submit');
+  await wf.flush();
+  assert.equal(toasts.at(-1),'설정 스크립트를 시작하지 못했습니다 · 작업 공간을 만들었지만 터미널을 사용할 수 없습니다.');
+  wf.abort.abort();
+
+  // Bots Activity timeline formatting + localized effort + last_error translation in ko
+  const bf=fixture('bots',{route:{botId:'active'},t:I.t,globals:{KrillMobile:{i18n:I,terminal:{fontScales:[1],keys:[]},install:{offer:null}}},rpc:req=>{
+   if(req.action==='bots.list')return {bots:[{id:'active',name:'Active Bot',agent_id:'claude',model:'opus',effort:'xhigh',schedules:[{id:'s1',name:'Nightly',cron:'0 9 * * *',enabled:true}]}]};
+   if(req.action==='bots.items')return {items:[{uid:'it1',owner_bot_id:'active',title:'Check',status:'needs_you',events:[
+    {id:1,kind:'status',actor:{bot:{bot_id:'active'}},text:'status -> needs_you',created_at_ms:Date.now()-60000},
+    {id:2,kind:'snoozed',actor:{owner:{device:'mac'}},text:'snoozed until 1764000000000',created_at_ms:Date.now()-50000},
+    {id:3,kind:'unsnoozed',actor:{owner:{device:'mac'}},text:'unsnoozed',created_at_ms:Date.now()-40000},
+    {id:4,kind:'edited',actor:{owner:{device:'mac'}},text:'{"fields":["title","done_means"]}',created_at_ms:Date.now()-30000},
+    {id:5,kind:'linked',actor:{owner:{device:'mac'}},text:'dispatch:disp-123',created_at_ms:Date.now()-20000},
+   ]}]};
+   if(req.action==='bots.upcoming')return {schedules:[{id:'s1',running:false,last_error:'connector worker panicked'}]};
+   return {sessions:[],statuses:[],requests:[],suggestions:[],groups:[]};
+  }});
+  await bf.flush();
+  // Switch to Settings tab and verify effort is localized (매우 높음, not raw xhigh)
+  const settingsTab=bf.all().find(n=>n.tagName==='BUTTON'&&n.textContent===I.t('Settings'));
+  await settingsTab.action();
+  assert(bf.root.textContent.includes('매우 높음')&&!bf.root.textContent.includes('xhigh'),'bot.effort localized in Settings');
+  // Switch to Automations tab and verify last_error passes through safeMsg/t
+  const autoTab=bf.all().find(n=>n.tagName==='BUTTON'&&n.textContent.includes(I.t('Automations')));
+  await autoTab.action();
+  assert(bf.root.textContent.includes('커넥터 워커에서 오류가 발생했습니다'),'run.last_error localized via safeMsg');
+  bf.abort.abort();
+
+  // Up-next detail sheet verifies structured Activity timeline events are localized in ko
+  const uf2=fixture('up-next',{state:{snapshot:{capabilities:{bots:true}}},t:I.t,globals:{KrillMobile:{i18n:I,terminal:{fontScales:[1],keys:[]},install:{offer:null}}},rpc:req=>{
+   if(req.action==='bots.list')return {bots:[{id:'active',name:'Active Bot',agent_id:'claude',schedules:[]}]};
+   if(req.action==='bots.items')return {items:[{uid:'it1',owner_bot_id:'active',title:'Check',status:'needs_you',events:[
+    {id:1,kind:'status',actor:{bot:{bot_id:'active'}},text:'status -> needs_you',created_at_ms:Date.now()-60000},
+    {id:2,kind:'snoozed',actor:{owner:{device:'mac'}},text:'snoozed until 1764000000000',created_at_ms:Date.now()-50000},
+    {id:3,kind:'unsnoozed',actor:{owner:{device:'mac'}},text:'unsnoozed',created_at_ms:Date.now()-40000},
+    {id:4,kind:'edited',actor:{owner:{device:'mac'}},text:'{"fields":["title","done_means"]}',created_at_ms:Date.now()-30000},
+    {id:5,kind:'linked',actor:{owner:{device:'mac'}},text:'dispatch:disp-123',created_at_ms:Date.now()-20000},
+   ]}]};
+   return {sessions:[],statuses:[],requests:[],suggestions:[],schedules:[]};
+  }});
+  await uf2.flush();
+  const detailBtn=uf2.all().find(n=>n.tagName==='BUTTON'&&n.getAttribute('aria-label')===I.t('Details'));
+  assert(detailBtn,'Details button present on up-next card');
+  await detailBtn.action();
+  const body=uf2.ctx.el('div');uf2.sheets.at(-1)[3](body);
+  const tl=body.textContent;
+  assert(tl.includes('상태가 확인 필요(으)로 변경됨'),'status event localized');
+  assert(tl.includes('까지 보류됨')&&!tl.includes('1764000000000'),'snoozed event formats epoch timestamp');
+  assert(tl.includes('보류 해제됨'),'unsnoozed event localized');
+  assert(tl.includes('제목, 완료 기준 수정됨')&&!tl.includes('{"fields"'),'edited JSON fields localized');
+  assert(tl.includes('연결된 작업 연결됨')&&!tl.includes('disp-123'),'linked dispatch event localized');
+  uf2.abort.abort();
+
+  // Client profiles() localizes default Desktop & Relay prefix in ko mode
+  const mockCrypto={hex:()=>'',unhex:()=>new Uint8Array(),sha256:()=>new Uint8Array(32),enc:new TextEncoder(),concat:()=>new Uint8Array()};
+  const clientBox=vm.createContext({
+   location:{origin:'https://krill-mobile.pages.dev',pathname:'/m/0123456789abcdef/',search:'',hash:'',protocol:'https:',hostname:'krill-mobile.pages.dev',host:'krill-mobile.pages.dev'},
+   localStorage:{getItem:k=>k==='krill-mobile-hosts-v1'?JSON.stringify({active:'h1',hosts:[{id:'h1',name:'Desktop',fixed:true,rid:'a'.repeat(32),device_id:'d1',credential:'c'.repeat(64)}]}):null,setItem(){},removeItem(){}},
+   URL,URLSearchParams,TextEncoder,TextDecoder,crypto,console,navigator:{},history:{replaceState(){}},
+   MkCrypto:mockCrypto,
+   KrillMobile:{i18n:I,crypto:mockCrypto},
+  });
+  vm.runInContext(fs.readFileSync(path.join(assetsDir,'client.js'),'utf8'),clientBox);
+  const prof=clientBox.KrillMobile.transport.bootstrap().profiles()[0];
+  assert.equal(prof.name,'컴퓨터','unnamed Desktop profile localized in ko');
+  assert.equal(prof.endpoint,'릴레이 · aaaaaaaa','Relay prefix localized in ko');
+ }
+ console.log('PASS mobile i18n audit regressions: 0 duplicate keys, placeholder parity, literal coverage, ko_KR/languages, Object.hasOwn, autonyms, banner switch, privacy link, bots timeline, details/workspaces/client ko');
+}
+async function main(){pathLabelSnapshots();await sessionDetailsAudit();exitedSessionProjection();await layoutAnchors();await tabletRoutePreservation();await tabBarAndLayoutContracts();await mobileAuditPairingAndShell();await installHandoffFragments();await mobileAuditIdentity();await mobileAuditScanner();await renderPerformance();await orchestration();await confirmationInbox();await workspace();await workspaceTree();await emptyWorkspace();await desktopWorkspaceOrder();await desktopVisibility();await projectFilters();await createWorktreeSheet();await projectIcons();await home();await homeResumeAndLogins();await git();await accounts();await settings();await quickCommandSettings();await installedQuickCommandSettings();await dropScreen();await botsScreens();await mobileAuditWave2Regressions();await todoUxDacRegressions();await voicePipitoRegressions();await sweepW2MobileRegressions();await sweepR2MobileRegressions();await sweepR3MobileRegressions();await mobileI18nAuditRegressions();console.log('PASS mobile_screens: isolated screen regressions (no real browser/device layout assertion)');if(process.env.KRILL_SCREEN_I18N_KEYS)fs.writeFileSync(process.env.KRILL_SCREEN_I18N_KEYS,JSON.stringify([...copyKeys].filter(Boolean).sort(),null,2)+'\n');}
 if(require.main===module)main().catch(error=>{console.error(error);process.exitCode=1;});module.exports={fixture,main};

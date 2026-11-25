@@ -139,13 +139,13 @@ function collectPkgEntrypoints(rootDir, pkgJson) {
 export function analyzeSlim(targetDir = process.cwd(), options = {}) {
   const rootDir = path.resolve(targetDir);
   if (!fs.existsSync(rootDir) || !fs.statSync(rootDir).isDirectory()) {
-    throw new Error(`감사 대상 디렉터리가 존재하지 않습니다: ${targetDir}`);
+    throw new Error(`Audit target directory does not exist: ${targetDir}`);
   }
 
   const rawHotspot = options.hotspotLines ?? '350';
   const parsedHotspot = Number.parseInt(String(rawHotspot), 10);
   if (!Number.isInteger(parsedHotspot) || parsedHotspot < 1) {
-    throw new Error(`유효하지 않은 --hotspot-lines 값입니다(양의 정수 필요): ${rawHotspot}`);
+    throw new Error(`Invalid --hotspot-lines value (positive integer required): ${rawHotspot}`);
   }
   const hotspotLines = Math.max(50, parsedHotspot);
   const allCodeFiles = collectCodeFiles(rootDir, { includeTests: true });
@@ -157,7 +157,7 @@ export function analyzeSlim(targetDir = process.cwd(), options = {}) {
     try {
       pkgJson = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
     } catch (err) {
-      throw new Error(`package.json 파싱 실패 (${pkgPath}): ${err.message}`);
+      throw new Error(`Failed to parse package.json (${pkgPath}): ${err.message}`);
     }
   }
 
@@ -298,7 +298,7 @@ export function analyzeSlim(targetDir = process.cwd(), options = {}) {
         kind: 'pure-reexport-barrel',
         prodImporterCount: prodImporters.length,
         targets: mod.localTargets,
-        recommendation: '호출자가 실제 정의 모듈을 직접 import 하도록 바꾸고 배럴 파일을 삭제하세요.'
+        recommendation: 'Import the defining module directly from callers and remove the pass-through barrel file.'
       });
     }
 
@@ -307,8 +307,8 @@ export function analyzeSlim(targetDir = process.cwd(), options = {}) {
         file: mod.rel,
         testImporterCount: testImporters.length,
         recommendation: testImporters.length > 0
-          ? '프로덕션 호출부가 0건이며 테스트에서만 참조됩니다. 사양 폐기 여부를 확인해 모듈과 테스트를 함께 정리하세요.'
-          : '어느 프로덕션/진입점에서도 참조되지 않는 고아 모듈 후보입니다. 삭제를 검토하세요.'
+          ? 'Zero production callers; referenced only by tests. Confirm whether the feature is retired and remove module + tests together.'
+          : 'Unreferenced by any production module or entrypoint; candidate orphan module for deletion.'
       });
     }
   }
@@ -339,7 +339,7 @@ export function analyzeSlim(targetDir = process.cwd(), options = {}) {
 }
 
 function printHelp() {
-  console.log('사용법: node slim.mjs [--json] [--strict] [--repo <대상디렉터리>] [--hotspot-lines <줄수>] [<대상디렉터리>]');
+  console.log('Usage: node slim.mjs [--json] [--strict] [--repo <target_dir>] [--hotspot-lines <lines>] [<target_dir>]');
 }
 
 function main() {
@@ -360,7 +360,7 @@ function main() {
   }
 
   if (parsed.positional.length > 1) {
-    console.error(`대상 디렉터리는 1개만 지정할 수 있습니다: ${parsed.positional.join(' ')}`);
+    console.error(`Only one target directory may be specified: ${parsed.positional.join(' ')}`);
     process.exit(2);
   }
 
@@ -376,7 +376,7 @@ function main() {
     } else {
       const s = report.summary;
       console.log(
-        `Slim 감사 완료 (프로덕션 파일 ${report.scannedFiles}개): 부채 마커 ${s.debtCount}건(부패위험 ${s.rotRiskDebtCount}건), 미사용 의존성 ${s.unusedDependencyCount}건, 패스스루 ${s.passThroughCount}건, 미참조 모듈 ${s.unreferencedModuleCount}건, 핫스팟 ${s.hotspotCount}건`
+        `Slim audit complete (${report.scannedFiles} production files): debt=${s.debtCount} (rotRisk=${s.rotRiskDebtCount}), unusedDeps=${s.unusedDependencyCount}, passThrough=${s.passThroughCount}, unreferenced=${s.unreferencedModuleCount}, hotspots=${s.hotspotCount}`
       );
       for (const dep of report.unusedDependencies) {
         console.log(`  [delete:dep] package.json (${dep.scope}): ${dep.name}`);

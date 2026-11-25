@@ -730,7 +730,7 @@ fn quick_helpers(env: &Env) -> Check {
             id: "bin.helpers".to_owned(),
             level: Level::Required,
             status: Status::Ok,
-            summary: "helpers are present".to_owned(),
+            summary: ctext::D_HELPERS_OK_SHORT.get().to_owned(),
             detail: String::new(),
             fix: Fix {
                 kind: FixKind::None,
@@ -743,7 +743,7 @@ fn quick_helpers(env: &Env) -> Check {
             level: Level::Required,
             status: Status::Fail,
             summary: ctext::D_HELPERS_MISSING.format(&[("what", &missing.join(", "))]),
-            detail: format!("{} (reinstall Krill)", missing.join(", ")),
+            detail: ctext::D_HELPERS_MISSING.format(&[("what", &missing.join(", "))]),
             fix: Fix {
                 kind: FixKind::Reinstall,
                 value: String::new(),
@@ -793,7 +793,7 @@ fn quick_version(env: &Env) -> Check {
             level: Level::Required,
             status: Status::Fail,
             summary: ctext::D_VERSION_DIFF.get().to_owned(),
-            detail: "reinstall Krill".to_owned(),
+            detail: ctext::D_REINSTALL.get().to_owned(),
             fix: Fix {
                 kind: FixKind::Reinstall,
                 value: String::new(),
@@ -803,8 +803,8 @@ fn quick_version(env: &Env) -> Check {
             id: "bin.version".to_owned(),
             level: Level::Required,
             status: Status::Skip,
-            summary: "versions not compared".to_owned(),
-            detail: "a --version call failed".to_owned(),
+            summary: ctext::D_VERSION_NOT_COMPARED.get().to_owned(),
+            detail: ctext::D_VERSION_CALL_FAILED.get().to_owned(),
             fix: Fix {
                 kind: FixKind::None,
                 value: String::new(),
@@ -836,7 +836,8 @@ fn quick_state(env: &Env) -> Check {
             level: Level::Required,
             status: Status::Fail,
             summary: ctext::D_STATE_FAIL.get().to_owned(),
-            detail: format!("{} (check owner: ls -ld)", env.state.display()),
+            detail: ctext::D_STATE_FAIL_DETAIL
+                .format(&[("path", &env.state.display().to_string())]),
             fix: Fix {
                 kind: FixKind::Command,
                 value: format!("ls -ld {}", env.state.display()),
@@ -927,7 +928,12 @@ const DOCTOR_TEXT: &[crate::i18n::Message] = &[
     ctext::D_CLI_OK,
     ctext::D_CLI_CONFLICT,
     ctext::D_CLI_MISSING,
+    ctext::D_HELPERS_OK_SHORT,
     ctext::D_HELPERS_MISSING,
+    ctext::D_REINSTALL,
+    ctext::D_VERSION_NOT_COMPARED,
+    ctext::D_VERSION_CALL_FAILED,
+    ctext::D_MISSING_HOOK_PLAN,
     ctext::D_VERSION_DIFF_DETAIL,
     ctext::D_STATE_FAIL_DETAIL,
     ctext::D_AGENTS_FOUND,

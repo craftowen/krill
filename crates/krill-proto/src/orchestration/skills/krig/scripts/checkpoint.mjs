@@ -63,12 +63,12 @@ function readDecisionSummary(tsvFile, repoDir, gitAvailable) {
 export function saveCheckpoint(options = {}) {
   const repoDir = path.resolve(options.repoDir ?? process.cwd());
   if (!fs.existsSync(repoDir) || !fs.statSync(repoDir).isDirectory()) {
-    throw new Error(`대상 디렉터리가 존재하지 않습니다: ${repoDir}`);
+    throw new Error(`Target directory does not exist: ${repoDir}`);
   }
 
   const summary = String(options.summary ?? '').trim();
   if (!summary) {
-    throw new Error('체크포인트 저장에는 현재 상태 한 줄 요약(--summary)이 필수입니다.');
+    throw new Error('Saving a checkpoint requires a one-line status summary (--summary).');
   }
 
   const krigDir = path.join(repoDir, '.krig');
@@ -146,7 +146,7 @@ export function saveCheckpoint(options = {}) {
 export function inspectSessionState(options = {}) {
   const repoDir = path.resolve(options.repoDir ?? process.cwd());
   if (!fs.existsSync(repoDir) || !fs.statSync(repoDir).isDirectory()) {
-    throw new Error(`대상 디렉터리가 존재하지 않습니다: ${repoDir}`);
+    throw new Error(`Target directory does not exist: ${repoDir}`);
   }
 
   const krigDir = path.join(repoDir, '.krig');
@@ -200,7 +200,7 @@ export function inspectSessionState(options = {}) {
     if (worktree.stagedKrigFiles.length > 0) {
       driftFlags.push({
         code: 'STAGED_KRIG_ARTIFACT',
-        detail: `.krig 런타임 파일이 스테이징되어 있습니다(${worktree.stagedKrigFiles.join(', ')})`
+        detail: `.krig runtime files are staged in git (${worktree.stagedKrigFiles.join(', ')})`
       });
     }
 
@@ -225,7 +225,7 @@ export function inspectSessionState(options = {}) {
         if (!verificationFresh) {
           driftFlags.push({
             code: 'STALE_VERIFICATION',
-            detail: '마지막 verify 스탬프 이후 코드가 수정되어 재검증이 필요합니다.'
+            detail: 'Code changed after the last verify stamp; re-verification is required.'
           });
         }
       }
@@ -236,8 +236,8 @@ export function inspectSessionState(options = {}) {
           driftFlags.push({
             code: fastForward ? 'HEAD_ADVANCED' : 'HEAD_REWRITTEN',
             detail: fastForward
-              ? `체크포인트 이후 새 커밋이 추가되었습니다(${handoff.git.headSha.slice(0, 8)}..${headSha.slice(0, 8)})`
-              : `체크포인트 커밋(${handoff.git.headSha.slice(0, 8)})이 현재 HEAD의 조상이 아닙니다(리베이스 또는 리셋 발생)`
+              ? `New commits were added after the checkpoint (${handoff.git.headSha.slice(0, 8)}..${headSha.slice(0, 8)})`
+              : `Checkpoint commit (${handoff.git.headSha.slice(0, 8)}) is not an ancestor of current HEAD (rebased or reset)`
           });
         }
         if (handoff.git.patchId) {
@@ -251,7 +251,7 @@ export function inspectSessionState(options = {}) {
           if (!handoffEval.fresh) {
             driftFlags.push({
               code: 'PATCH_DRIFT_FROM_HANDOFF',
-              detail: '체크포인트 저장 시점 이후 작업 트리 또는 커밋 diff가 변경되었습니다.'
+              detail: 'Working tree or commit diff changed since the checkpoint was saved.'
             });
           } else if (handoffEval.matchedBaseSha && handoffEval.matchedBaseSha !== effectiveBaseSha) {
             effectiveBaseSha = handoffEval.matchedBaseSha;
@@ -273,7 +273,7 @@ export function inspectSessionState(options = {}) {
       if (decisions.orphanCommits.length > 0) {
         driftFlags.push({
           code: 'ORPHAN_DECISION_COMMITS',
-          detail: `decisions.tsv에 기록된 커밋 중 현재 브랜치에 없는 항목이 있습니다: ${decisions.orphanCommits.join(', ')}`
+          detail: `Commits recorded in decisions.tsv are missing from the current branch: ${decisions.orphanCommits.join(', ')}`
         });
       }
     } else {
@@ -319,9 +319,9 @@ export function inspectSessionState(options = {}) {
 
 function printHelp() {
   console.log([
-    '사용법:',
-    '  node checkpoint.mjs status [--repo <dir>] [--base <rev>] [--file <경로>] [--json]',
-    '  node checkpoint.mjs save [--repo <dir>] [--base <rev>] [--file <경로>] --summary "<요약>" [--route <라우트>] [--done "항목1|항목2"] [--next "항목1|항목2"] [--blockers "사유"] [--json]'
+    'Usage:',
+    '  node checkpoint.mjs status [--repo <dir>] [--base <rev>] [--file <path>] [--json]',
+    '  node checkpoint.mjs save [--repo <dir>] [--base <rev>] [--file <path>] --summary "<summary>" [--route <route>] [--done "item1|item2"] [--next "item1|item2"] [--blockers "reason"] [--json]'
   ].join('\n'));
 }
 
@@ -363,7 +363,7 @@ function main() {
       if (parsed.flags.json) {
         console.log(JSON.stringify(res, null, 2));
       } else {
-        console.log(`체크포인트 저장 완료: ${res.handoffFile}`);
+        console.log(`Checkpoint saved: ${res.handoffFile}`);
       }
       process.exit(0);
     }
@@ -376,15 +376,15 @@ function main() {
     if (parsed.flags.json) {
       console.log(JSON.stringify(state, null, 2));
     } else {
-      console.log(`세션 복구 진단: 권고=${state.recommendedAction}, 핸드오프=${state.hasHandoff}, 검증신선도=${state.verificationFresh}`);
+      console.log(`Session recovery status: action=${state.recommendedAction}, handoff=${state.hasHandoff}, verificationFresh=${state.verificationFresh}`);
       if (state.handoff && !state.handoff.parseError) {
-        console.log(`  요약: ${state.handoff.summary}`);
-        if (state.handoff.next?.length > 0) console.log(`  남은 작업: ${state.handoff.next.join(', ')}`);
-        if (state.handoff.blockers?.length > 0) console.log(`  차단 요인: ${state.handoff.blockers.join(', ')}`);
+        console.log(`  Summary: ${state.handoff.summary}`);
+        if (state.handoff.next?.length > 0) console.log(`  Next: ${state.handoff.next.join(', ')}`);
+        if (state.handoff.blockers?.length > 0) console.log(`  Blockers: ${state.handoff.blockers.join(', ')}`);
       }
       if (state.driftFlags.length > 0) {
         for (const d of state.driftFlags) {
-          console.log(`  드리프트 [${d.code}]: ${d.detail}`);
+          console.log(`  Drift [${d.code}]: ${d.detail}`);
         }
       }
     }

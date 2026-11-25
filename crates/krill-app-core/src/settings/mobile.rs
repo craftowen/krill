@@ -1148,14 +1148,14 @@ impl SettingsView {
             let seconds = expires.saturating_sub(krill_proto::mobile::client::now_ms()) / 1000;
             actions = actions
                 .child(
-                    layout::secondary(
+                    crate::ui::button_with_reserved_label(
                         "mobile-page-copy",
-                        if copied {
-                            text::COPIED.get()
-                        } else {
-                            text::COPY.get()
-                        },
+                        text::COPY.get(),
+                        text::COPIED.get(),
+                        copied,
                     )
+                    .small()
+                    .outline()
                     .icon(if copied {
                         IconName::Check
                     } else {
@@ -1572,19 +1572,36 @@ fn device_line(device: &PairedMobileDevice, connected: bool, now: u64) -> String
 }
 
 fn ago(now: u64, then: u64) -> String {
+    ago_in(now, then, crate::i18n::language())
+}
+
+fn ago_in(now: u64, then: u64, language: crate::i18n::Language) -> String {
     let elapsed = now.saturating_sub(then);
     if elapsed < 60_000 {
-        return text::JUST_NOW.get().to_owned();
+        return text::JUST_NOW.in_language(language).to_owned();
     }
     let mins = elapsed / 60_000;
     if mins < 60 {
-        return format!("{} {}", mins, text::MINUTES_AGO.get());
+        return if mins == 1 {
+            text::MINUTES_AGO_ONE.in_language(language).to_owned()
+        } else {
+            text::MINUTES_AGO_MANY.format_in(language, &[("n", &mins.to_string())])
+        };
     }
     let hours = mins / 60;
     if hours < 24 {
-        return format!("{} {}", hours, text::HOURS_AGO.get());
+        return if hours == 1 {
+            text::HOURS_AGO_ONE.in_language(language).to_owned()
+        } else {
+            text::HOURS_AGO_MANY.format_in(language, &[("n", &hours.to_string())])
+        };
     }
-    format!("{} {}", hours / 24, text::DAYS_AGO.get())
+    let days = hours / 24;
+    if days == 1 {
+        text::DAYS_AGO_ONE.in_language(language).to_owned()
+    } else {
+        text::DAYS_AGO_MANY.format_in(language, &[("n", &days.to_string())])
+    }
 }
 
 #[cfg(test)]

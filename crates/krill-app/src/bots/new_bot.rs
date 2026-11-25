@@ -1347,6 +1347,13 @@ fn clip_chars(s: &str, max: usize) -> &str {
 
 impl Render for NewBot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::i18n::sync_input_placeholder(&self.name, text::NB_NAME_LABEL.get(), window, cx);
+        crate::i18n::sync_textarea_placeholder(
+            &self.purpose,
+            text::NB_IDENTITY_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
         let p = ui::palette(cx);
         let dark = cx.theme().mode.is_dark();
         let viewport = window.viewport_size();
@@ -1520,7 +1527,11 @@ impl Render for NewBot {
                     .child(self.render_template_parts(tpl, p, cx))
             })
             .children(self.render_proposal_fields(p))
-            .children(self.error.clone().map(|e| ui::error_banner(p, e)));
+            .children(
+                self.error
+                    .clone()
+                    .map(|e| ui::error_banner(p, crate::i18n::cached_notice(&e))),
+            );
 
         let band = self.picture.band_color();
         let card = div()

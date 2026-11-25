@@ -75,7 +75,7 @@ export function collectCodeFiles(targetPath, options = {}) {
   const exts = options.exts ?? CODE_EXTS;
   const abs = path.resolve(targetPath);
   if (!fs.existsSync(abs)) {
-    throw new Error(`스캔 대상 경로가 존재하지 않습니다: ${targetPath}`);
+    throw new Error(`Scan target path does not exist: ${targetPath}`);
   }
 
   const stat = fs.statSync(abs);

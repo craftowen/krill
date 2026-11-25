@@ -307,7 +307,7 @@ fn park_later(shared: &Arc<Shared>, epoch: u64) {
 }
 
 /// 화면 구독자 하나(MK-035, [`Tap::watch`]). 들고 있는 동안 세션은 핫 스크롤백을 쌓는다.
-#[must_use = "화면을 구독하는 동안 보관해야 한다"]
+#[must_use = "must be held while subscribed to screen updates"]
 pub(crate) struct Viewer(Arc<Shared>);
 
 impl Drop for Viewer {

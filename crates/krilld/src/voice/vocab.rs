@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use krill_proto::os::fs::OpenOptionsExt as _;
 use krill_proto::voice::{DEFAULT_DESKTOP_SHORTCUT, VocabEntry, VoiceConfig, VoiceConfigPatch};
+use serde::{Deserialize, Serialize};
 
 const VOICE_CONFIG_FILE: &str = "voice.json";
 /// 디스크에 영구 저장하는 자동 학습 단어 상한.
@@ -24,10 +25,19 @@ pub fn now_unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoredVoiceConfig {
+    #[serde(flatten)]
+    config: VoiceConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_lang: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct VocabStore {
     path: Option<PathBuf>,
     config: VoiceConfig,
+    target_lang: Option<String>,
     dirty: bool,
     last_flush_ms: u64,
 }
@@ -36,15 +46,20 @@ impl VocabStore {
     #[must_use]
     pub fn load(state_dir: Option<&Path>) -> Self {
         let path = state_dir.map(|dir| dir.join(VOICE_CONFIG_FILE));
-        let config = path
+        let stored = path
             .as_deref()
             .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|raw| serde_json::from_str::<VoiceConfig>(&raw).ok())
-            .map(sanitize_config)
+            .and_then(|raw| serde_json::from_str::<StoredVoiceConfig>(&raw).ok())
             .unwrap_or_default();
+        let config = sanitize_config(stored.config);
+        let target_lang = stored
+            .target_lang
+            .as_deref()
+            .and_then(normalize_target_lang);
         Self {
             path,
             config,
+            target_lang,
             dirty: false,
             last_flush_ms: 0,
         }
@@ -53,6 +68,21 @@ impl VocabStore {
     #[must_use]
     pub fn config(&self) -> VoiceConfig {
         self.config.clone()
+    }
+
+    #[must_use]
+    pub fn target_lang(&self) -> Option<&str> {
+        self.target_lang.as_deref()
+    }
+
+    pub fn set_target_lang(&mut self, raw: Option<&str>) -> io::Result<Option<String>> {
+        let normalized = raw.and_then(normalize_target_lang);
+        if self.target_lang != normalized {
+            self.target_lang.clone_from(&normalized);
+            self.dirty = true;
+            self.flush_now()?;
+        }
+        Ok(self.target_lang.clone())
     }
 
     #[must_use]
@@ -294,7 +324,11 @@ impl VocabStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let payload = serde_json::to_vec_pretty(&self.config)
+        let stored = StoredVoiceConfig {
+            config: self.config.clone(),
+            target_lang: self.target_lang.clone(),
+        };
+        let payload = serde_json::to_vec_pretty(&stored)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "voice config encode"))?;
         let tmp = path.with_extension("json.tmp");
         {
@@ -348,34 +382,65 @@ fn score_entry(entry: &VocabEntry, now_ms: u64) -> f64 {
     f64::from(entry.count) * (0.35 + 0.65 * recency)
 }
 
+/// Normalizes an optional BCP-47 language hint for Pipito (`"auto"` / `"system"` / empty -> `None`).
+#[must_use]
+pub fn normalize_target_lang(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("auto")
+        || trimmed.eq_ignore_ascii_case("system")
+    {
+        return None;
+    }
+    let normalized = trimmed.replace('_', "-");
+    if !(2..=16).contains(&normalized.len())
+        || !normalized
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || normalized.starts_with('-')
+        || normalized.ends_with('-')
+        || normalized.contains("--")
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
 fn has_richer_casing(candidate: &str, existing: &str) -> bool {
-    let cand_upper = candidate.chars().filter(char::is_ascii_uppercase).count();
-    let exist_upper = existing.chars().filter(char::is_ascii_uppercase).count();
+    let cand_upper = candidate.chars().filter(|c| c.is_uppercase()).count();
+    let exist_upper = existing.chars().filter(|c| c.is_uppercase()).count();
     cand_upper > exist_upper
 }
 
 fn normalize_word(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_matches(|c: char| {
-        matches!(
-            c,
-            '`' | '"'
-                | '\''
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | ','
-                | ';'
-                | ':'
-                | '!'
-                | '?'
-                | '<'
-                | '>'
-        )
+        krill_proto::screen::url::is_fullwidth_punct(c)
+            || matches!(
+                c,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '<'
+                    | '>'
+                    | '，'
+                    | '．'
+            )
     });
-    if trimmed.is_empty() || trimmed.len() > 64 || trimmed.chars().any(char::is_control) {
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed.chars().count() > 64
+        || trimmed.chars().any(char::is_control)
+    {
         return None;
     }
     Some(trimmed.to_owned())
@@ -389,6 +454,7 @@ pub fn extract_vocab_tokens(text: &str) -> Vec<String> {
 
     for raw_piece in text.split(|c: char| {
         c.is_whitespace()
+            || krill_proto::screen::url::is_fullwidth_punct(c)
             || matches!(
                 c,
                 ',' | ';'
@@ -417,6 +483,8 @@ pub fn extract_vocab_tokens(text: &str) -> Vec<String> {
                     | '#'
                     | '@'
                     | '\\'
+                    | '，'
+                    | '．'
             )
     }) {
         let piece = raw_piece.trim_matches(|c: char| matches!(c, '.' | ':' | '-' | '_' | '/'));
@@ -485,7 +553,8 @@ pub fn extract_corrections(before: &str, after: &str) -> Vec<String> {
 
 fn classify_token(raw: &str) -> Option<String> {
     let trimmed = raw.trim_matches(|c: char| matches!(c, '.' | ':' | '-' | '_' | '/'));
-    if trimmed.is_empty() || trimmed.len() > 64 {
+    let char_count = trimmed.chars().count();
+    if trimmed.is_empty() || trimmed.len() > 128 || char_count > 64 {
         return None;
     }
     // 순수 숫자·버전·긴 hex 해시 필터
@@ -497,12 +566,12 @@ fn classify_token(raw: &str) -> Option<String> {
     }
 
     let has_hangul = trimmed.chars().any(is_hangul);
-    let has_ascii_alpha = trimmed.chars().any(|c| c.is_ascii_alphabetic());
+    let has_alpha = trimmed.chars().any(char::is_alphabetic);
 
     if has_hangul {
         let stripped = strip_korean_particle(trimmed);
-        let char_count = stripped.chars().count();
-        if !(2..=24).contains(&char_count) {
+        let stripped_chars = stripped.chars().count();
+        if !(2..=24).contains(&stripped_chars) {
             return None;
         }
         if is_korean_stopword(stripped) {
@@ -512,16 +581,11 @@ fn classify_token(raw: &str) -> Option<String> {
         return Some(stripped.to_owned());
     }
 
-    if !has_ascii_alpha {
+    if !has_alpha {
         return None;
     }
 
-    let lower = trimmed.to_ascii_lowercase();
-    if is_english_stopword(&lower) {
-        return None;
-    }
-
-    // 파일명(확장자 포함: pwa_rpc.rs, Cargo.toml, bridge.json)
+    // 파일명(확장자 포함: pwa_rpc.rs, Cargo.toml, bridge.json, 設計書.md, résumé.md)
     if let Some((stem, ext)) = trimmed.rsplit_once('.')
         && !stem.is_empty()
         && (1..=6).contains(&ext.len())
@@ -531,22 +595,54 @@ fn classify_token(raw: &str) -> Option<String> {
         return Some(trimmed.to_owned());
     }
 
+    if !trimmed.is_ascii() {
+        if !trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || is_combining_mark(c) || matches!(c, '_' | '-'))
+        {
+            return None;
+        }
+        let base_chars = trimmed.chars().filter(|c| !is_combining_mark(*c)).count();
+        let has_cjk_or_kana = trimmed.chars().any(is_cjk_or_kana);
+        if has_cjk_or_kana {
+            return (2..=24).contains(&base_chars).then(|| trimmed.to_owned());
+        }
+        let is_unicode_acronym = (2..=8).contains(&base_chars)
+            && trimmed
+                .chars()
+                .all(|c| c.is_uppercase() || c.is_numeric() || is_combining_mark(c))
+            && trimmed.chars().any(char::is_uppercase);
+        let has_digit_or_sep = base_chars >= 2
+            && (trimmed.contains('_')
+                || trimmed.contains('-')
+                || trimmed.chars().any(char::is_numeric));
+        if (3..=48).contains(&base_chars) || is_unicode_acronym || has_digit_or_sep {
+            return Some(trimmed.to_owned());
+        }
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if is_english_stopword(&lower) {
+        return None;
+    }
+
     // 기술 식별자: snake_case, kebab-case, camelCase, PascalCase, 영숫자 혼합(E2EE, v1, krilld)
-    let is_snake_or_kebab = (trimmed.contains('_') || trimmed.contains('-')) && trimmed.len() >= 3;
+    let is_snake_or_kebab = (trimmed.contains('_') || trimmed.contains('-')) && char_count >= 3;
     let is_camel_or_pascal = has_internal_case_transition(trimmed);
-    let is_acronym = (2..=8).contains(&trimmed.len())
+    let is_acronym = (2..=8).contains(&char_count)
         && trimmed
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
         && trimmed.chars().any(|c| c.is_ascii_uppercase());
-    let has_digit_and_alpha = trimmed.len() >= 2 && trimmed.chars().any(|c| c.is_ascii_digit());
+    let has_digit_and_alpha = char_count >= 2 && trimmed.chars().any(|c| c.is_ascii_digit());
 
     if is_snake_or_kebab || is_camel_or_pascal || is_acronym || has_digit_and_alpha {
         return Some(trimmed.to_owned());
     }
 
     // 고유/기술 단어(3자 이상, 불용어 제외)
-    if trimmed.len() >= 3 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if char_count >= 3 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Some(trimmed.to_owned());
     }
 
@@ -581,6 +677,26 @@ const fn is_hangul(c: char) -> bool {
     matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{3131}'..='\u{318E}')
 }
 
+const fn is_cjk_or_kana(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+const fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{0591}'..='\u{05BD}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+    )
+}
+
 fn strip_korean_particle(word: &str) -> &str {
     const SUFFIXES: &[&str] = &[
         "에서는",
@@ -590,7 +706,6 @@ fn strip_korean_particle(word: &str) -> &str {
         "처럼은",
         "에서도",
         "으로도",
-        "까지는",
         "에서",
         "으로",
         "까지",

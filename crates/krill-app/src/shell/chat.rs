@@ -3552,7 +3552,14 @@ impl Shell {
     ) -> gpui::Entity<gpui_component::input::InputState> {
         let map_key = (key.clone(), answer_key.to_owned());
         if let Some(existing) = self.chat.question_other_inputs.get(&map_key) {
-            return existing.clone();
+            let existing = existing.clone();
+            krill_app::i18n::sync_input_placeholder(
+                &existing,
+                ctext::OTHER_OPTION_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
+            return existing;
         }
         let state = cx.new(|cx| {
             gpui_component::input::InputState::new(window, cx)

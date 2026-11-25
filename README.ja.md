@@ -101,7 +101,7 @@
 ### 1. アプリより長生きするセッション
 `krill-app` を終了、クラッシュ、更新しても、エージェントはバックグラウンドで動き続けます。アプリを開き直す（または `krill attach <id>` を実行する）と、保持されたキーフレームと `zstd` スクロールバックセグメントを再生します。保持量を超えた場合は明示的な `Gap` マーカーが表示されます。
 
-[アーキテクチャ §4.1 →](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)
+[アーキテクチャ §4.1 →](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)（韓国語）
 
 </td>
 <td width="50%" valign="top">
@@ -135,11 +135,11 @@
 <td width="50%" valign="top">
 
 ### 5. モバイル E2EE コンパニオン（PWA）
-**Settings → Mobile** で QR コードをスキャンすると、スマートフォンのブラウザまたはホーム画面の Web アプリ（PWA）からエージェントの状態をリアルタイムで確認し、ターミナルを開けます。Relay または Tailscale 経由で接続し、エンドツーエンドの **ChaCha20-Poly1305**（`HKDF-SHA256`）で暗号化します。
+Mac/Windows アプリの **Settings → Mobile** で QR コードをスキャンすると、スマートフォンのブラウザまたはホーム画面の Web アプリ（PWA）からエージェントの状態をリアルタイムで確認し、ターミナルを開けます。Relay または Tailscale 経由で接続し、エンドツーエンドの **ChaCha20-Poly1305**（`HKDF-SHA256`）で暗号化します。
 
 ホスト型 Relay を選ぶ場合は、デスクトップで Google にサインインします。スマートフォンではサインインせずに PWA を開き、QR ペアリングまたは保存済みのデバイスキーで認証します。
 
-[モバイルのセットアップ →](https://krill.page/en/docs)
+[モバイルのセットアップ →](https://krill.page/en/docs#mobile)
 
 </td>
 <td width="50%" valign="top">
@@ -190,7 +190,7 @@
 
 ```sh
 curl -fsSL https://krill.page/install.sh -o /tmp/krill-install.sh
-# Review the installer before running it.
+# 実行前にインストーラーの内容を確認してください。
 bash /tmp/krill-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 krill --help
@@ -218,17 +218,19 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\krill-install.ps1"
 |---|---|---|
 | **macOS、Apple Silicon（`arm64`）** | 主要なデスクトッププラットフォーム | リリース版のアプリと CLI、またはソースビルド |
 | **Windows、`x64`** | ネイティブデスクトップのプレビュー。デスクトップ GUI、対話型ログオン、スリープ、再起動の動作は、記録済みの Windows Server VM テスト以外の検証がまだ必要 | Windows リリース ZIP と PowerShell インストーラー |
-| **モバイル（iOS / Android）** | QR コードでペアリングするコンパニオン Web アプリ（PWA）、Relay または Tailscale 経由（ChaCha20-Poly1305 E2EE） | Mac アプリの **Settings → Mobile** から QR をスキャン（アプリストア版なし） |
+| **モバイル（iOS / Android）** | QR コードでペアリングするコンパニオン Web アプリ（PWA）、Relay または Tailscale 経由（ChaCha20-Poly1305 E2EE） | Mac/Windows アプリの **Settings → Mobile** から QR をスキャン（アプリストア版なし） |
 | **macOS、Intel（`x86_64`）** | このパブリックプレビューでは非対応 | 対応するリリースバンドルもソースインストールの保証もなし |
 | **Linux** | このパブリックプレビューでは非対応 | Linux デスクトップやダウンロード可能なリモートホストパッケージの提供は保証なし |
 | **Windows 11、ARM64** | Windows 11 の x64 エミュレーションで `x64` パッケージを実行。ネイティブ ARM64 ビルドなし | 同じ Windows リリース ZIP と PowerShell インストーラー |
 | **Windows 10 on ARM / 32 ビット Windows** | 非対応 | リリースパッケージなし |
 
+リポジトリ内に Linux 向けの実装やパッケージング実験コードが存在しても、サポート対象のダウンロードが提供されることを意味しません。プラットフォーム別の障害保証と検証範囲は[アーキテクチャ §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)（韓国語）に従います。
+
 ---
 
 ## 最初のセッションを成功させる
 
-1. Krill を開き、**Open folder…** でローカルの Git リポジトリを選択します。UI が韓国語の場合は、**설정 → 모양 → 언어 → English**（Settings → Appearance → Language）を選択します。
+1. Krill を開き、**Open folder…** でローカルの Git リポジトリを選択します。初回起動時は OS の言語に自動で合わせられ（韓国語以外の環境では英語）、**Settings → Appearance → Language** からいつでも切り替えられます。
 2. **New session**（`+`）メニューを開いて **Terminal** を選ぶか、Claude Code や Codex などのインストールおよび認証済みのエージェントを選びます。エージェントにリポジトリの調査を依頼します。
 3. サイドバーの **New worktree** を使い、一意の名前を入力して **Create** を選びます。承認する前にセットアップスクリプトを確認するか、**Skip setup** を選びます。そこで 2 つ目のエージェントを起動し、独立して作業させます。
 4. `krill ls` でセッション ID を記録します。セッションタブをそのままにしてアプリを終了し、開き直します。実行中のセッションが同じ ID で再接続されることを確認してください。セッションのタブやペインを明示的に閉じると、そのセッションは終了します。
@@ -245,7 +247,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\krill-install.ps1"
 | **`krilld` のクラッシュ** | holder が PTY とハンドルを保持しているため継続可能 | 読み取り済みで未記録のバイトは失われることがある。復旧時に `Gap` を記録 |
 | **両方のセッションサービスの停止、またはマシンの再起動** | 存続しない | 保存された履歴は実行中のプロセスではない。エージェントの会話の再開は別の操作 |
 
-これはアプリの再起動をまたぐ継続性であり、あらゆる形態のデータ損失に対する保証ではありません。プラットフォーム別の復旧と検証の制限は[アーキテクチャ §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)に定義されています。
+これはアプリの再起動をまたぐ継続性であり、あらゆる形態のデータ損失に対する保証ではありません。プラットフォーム別の復旧と検証の制限は[アーキテクチャ §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)（韓国語）に定義されています。
 
 ---
 
@@ -261,6 +263,4 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\krill-install.ps1"
 
 ## ライセンス
 
-Apache-2.0: [LICENSE](LICENSE)、Copyright 2026 Krill contributors。[第三者に関する通知](THIRD_PARTY_NOTICES.md)と[ライセンスの記録](docs/licensing/README.md)を参照してください。コントリビュートの際は、Zed の GPL-3.0 `terminal` および `terminal_view` のコードを読んだりコピーしたりしないでください。許可された Orca ソースの再利用については、[コントリビュートガイド](CONTRIBUTING.md)の説明に従ってクレジットを記載してください。
-
-使用状況メトリクスは同意ダイアログなしでデフォルトで有効です。収集するのは、ランダムなインストール ID、初回起動、アプリ起動、日次の操作、バージョン、OS、アーキテクチャです。プロンプト、ターミナル出力、コマンド、プロジェクトパス、アカウント情報は含まれません。収集を止めるには `krill telemetry disable` を実行します。`DO_NOT_TRACK=1` でも無効になります。送信状況と運用者向けの設定は[使用状況メトリクス](services/telemetry/CLIENT.md)を参照してください。エラー報告は別の設定で、デフォルトでオフです。
+Apache-2.0: [LICENSE](LICENSE)、Copyright 2026 Krill contributors。[第三者に関する通知](THIRD_PARTY_NOTICES.md)と[ライセンスの記録](docs/licensing/README.md)（韓国語）を参照してください。コントリビュートの際は、Zed の GPL-3.0 `terminal` および `terminal_view` のコードを読んだりコピーしたりしないでください。許可された Orca ソースの再利用については、[コントリビュートガイド](CONTRIBUTING.md)の説明に従ってクレジットを記載してください。

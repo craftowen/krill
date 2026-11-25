@@ -1090,7 +1090,11 @@ impl View {
                     .gap_4()
                     .child(hero)
                     .child(name_field)
-                    .children(self.error.clone().map(|e| ui::error_banner(p, e)))
+                    .children(
+                        self.error
+                            .clone()
+                            .map(|e| ui::error_banner(p, crate::i18n::cached_notice(&e))),
+                    )
                     .child(body)
                     .children(runs_on_row),
             )

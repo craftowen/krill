@@ -3032,7 +3032,7 @@ async function workRunCoalescing() {
   assert.equal(promoted.open, false);
   assert.equal(
     promoted.children[0].textContent,
-    "Read 1 file(s) · /work/cfg.toml",
+    "Read 1 file · /work/cfg.toml",
   );
   assert.deepEqual(
     promoted.children[1].children.map((n) => n.className),
@@ -3156,7 +3156,7 @@ async function workRunCoalescing() {
   );
   assert.equal(
     openRun.children[0].textContent,
-    "Read 1 file(s) · Ran 1 command(s) · step 2",
+    "Read 1 file · Ran 1 command · step 2",
   );
   assert.equal(openRun.children[1].children.length, 2);
   paged.remount();
@@ -3200,7 +3200,7 @@ async function workRunCoalescing() {
     "front trim across MAX_RENDERED_ITEMS preserves the surviving work run DOM node",
   );
   assert.equal(trimRun.open, true);
-  assert.equal(trimRun.children[0].textContent, "Read 1 file(s) · b.rs");
+  assert.equal(trimRun.children[0].textContent, "Read 1 file · b.rs");
   trimmed.dispose();
 
   const boundaries = fixture({ lang: "en" });
@@ -3747,10 +3747,10 @@ async function workRunProgressElapsedAndPreamble() {
   const foldedRun = foldFeed.children[1],
     finalCard = foldFeed.children[2];
   assert.equal(foldedRun.dataset.active, undefined);
-  assert.equal(foldedRun.dataset.elapsed, "12s");
+  assert.equal(foldedRun.dataset.elapsed, "12초");
   assert.equal(
     foldedRun.children[0].textContent,
-    "파일 1개 확인 · 파일 1개 수정 · Edit chat.js · 12s",
+    "파일 1개 확인 · 파일 1개 수정 · Edit chat.js · 12초",
   );
   assert.deepEqual(
     foldedRun.children[1].children.map((n) => n.className),
@@ -3883,7 +3883,7 @@ async function workRunProgressElapsedAndPreamble() {
   assert.equal(liveRun.dataset.elapsed, "3s");
   assert.equal(
     liveRun.children[0].textContent,
-    "Working · 0/1 · Read screens/chat.js · Read 1 file(s) · 3s",
+    "Working · 0/1 · Read screens/chat.js · Read 1 file · 3s",
   );
 
   nowMs = Date.parse("2026-11-16T01:00:15Z");
@@ -3915,7 +3915,7 @@ async function workRunProgressElapsedAndPreamble() {
   assert.equal(liveRun.dataset.elapsed, "15s");
   assert.equal(
     liveRun.children[0].textContent,
-    "Working · 1/2 · Edit screens/chat.js · Read 1 file(s) · Changed 1 file(s) · 15s",
+    "Working · 1/2 · Edit screens/chat.js · Read 1 file · Changed 1 file · 15s",
   );
 
   nowMs = Date.parse("2026-11-16T01:01:05Z");
@@ -3950,7 +3950,7 @@ async function workRunProgressElapsedAndPreamble() {
   assert.equal(liveRun.dataset.elapsed, "1m 04s");
   assert.equal(
     liveRun.children[0].textContent,
-    "Read 1 file(s) · Changed 1 file(s) · Edit screens/chat.js · 1m 04s",
+    "Read 1 file · Changed 1 file · Edit screens/chat.js · 1m 04s",
   );
   live.dispose();
 
@@ -3981,7 +3981,7 @@ async function workRunProgressElapsedAndPreamble() {
   });
   const neRun = noElapsed.find("chat-tool-run");
   assert.equal(neRun.dataset.elapsed, undefined);
-  assert.equal(neRun.children[0].textContent, "Ran 1 command(s) · git status");
+  assert.equal(neRun.children[0].textContent, "Ran 1 command · git status");
   noElapsed.dispose();
   console.log(
     "PASS work-run progress, elapsed & preamble folding: 160-scalar boundary, active m/n + tool title, 12s/1m 04s elapsed and omission",

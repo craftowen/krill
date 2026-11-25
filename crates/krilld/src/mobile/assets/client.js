@@ -540,15 +540,18 @@
           );
         },
         profiles() {
+          const tr = (s) => (M.i18n?.t ? M.i18n.t(s) : s);
           return hosts
             .filter((h) => !removed(h))
             .map((h) => ({
               id: h.id,
-              name: h.alias || h.name || "Desktop",
+              name:
+                h.alias ||
+                (!h.name || h.name === "Desktop" ? tr("Desktop") : h.name),
               platform: h.platform,
               endpoint: h.fixed
                 ? h.rid
-                  ? "Relay \xB7 " + h.rid.slice(0, 8)
+                  ? tr("Relay") + " \xB7 " + h.rid.slice(0, 8)
                   : h.routes?.tailscale?.origin
                 : h.origin,
               active: h.id === active?.id,

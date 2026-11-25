@@ -24,7 +24,7 @@ pub(super) fn agent_display_name(agent: &str) -> String {
         other => {
             let mut chars = other.chars();
             match chars.next() {
-                None => "Agent".to_string(),
+                None => ctext::AGENT_FALLBACK.get().to_string(),
                 Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
             }
         }
@@ -37,7 +37,11 @@ pub(super) fn fallback_choices_for_agent(agent: &str) -> (Vec<ComposerModelItem>
         .iter()
         .map(|m| ComposerModelItem {
             id: m.id.to_owned(),
-            label: m.label.to_owned(),
+            label: if m.id == "default" {
+                ctext::MODEL_DEFAULT.get().to_owned()
+            } else {
+                m.label.to_owned()
+            },
             efforts: m.efforts.iter().map(|e| (*e).to_owned()).collect(),
             default_effort: m.default_effort.map(str::to_owned),
         })
@@ -245,7 +249,7 @@ impl Shell {
         {
             agent_display_name(agent)
         } else {
-            "Agent".to_string()
+            ctext::AGENT_FALLBACK.get().to_string()
         };
         let effort_label = current_effort
             .filter(|e| !e.trim().is_empty())

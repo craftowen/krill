@@ -329,9 +329,37 @@ pub struct Preedit {
     pub origin: CellPoint,
     pub text: String,
     pub columns: usize,
+    /// Active conversion clause or mid-preedit caret range in column offsets from `origin`.
+    pub selected: Option<std::ops::Range<usize>>,
 }
 
 impl Preedit {
+    /// Caret column offset relative to `origin`, honoring mid-preedit IME cursor or active clause.
+    #[must_use]
+    pub(crate) fn caret_offset(&self) -> usize {
+        self.selected.as_ref().map_or(self.columns, |sel| {
+            if sel.start == sel.end {
+                sel.start.min(self.columns)
+            } else {
+                sel.end.min(self.columns)
+            }
+        })
+    }
+
+    /// Horizontal column scroll offset keeping the active clause/caret visible in narrow panes.
+    #[must_use]
+    pub(crate) fn visible_scroll_columns(&self, screen_cols: usize) -> usize {
+        let avail = screen_cols.saturating_sub(self.origin.column);
+        if avail == 0 || self.columns <= avail {
+            return 0;
+        }
+        let max_scroll = self.columns.saturating_sub(avail);
+        let focus = self.caret_offset();
+        focus
+            .saturating_sub(avail.saturating_sub(1))
+            .min(max_scroll)
+    }
+
     /// 한 셀에 그릴 묶음들: (칸 오프셋, 묶음 글자, 묶음 칸 수). 폭 0 문자는 앞 글자와 같은 칸이다.
     pub(crate) fn groups(&self) -> Vec<(usize, String, usize)> {
         let overlay = krill_term::ime::Overlay {
@@ -672,6 +700,12 @@ impl Element for TerminalElement {
         if self.pending.is_some() || self.preedit.is_some() {
             let paint_run = |run: &Preedit, underline: bool, window: &mut Window| {
                 let cols = |v: usize| cell.width * f32::from(u16::try_from(v).unwrap_or(u16::MAX));
+                let screen_cols = usize::from(self.screen.cols);
+                let scroll = run.visible_scroll_columns(screen_cols);
+                let visible_cols = run
+                    .columns
+                    .saturating_sub(scroll)
+                    .min(screen_cols.saturating_sub(run.origin.column));
                 let row = point(
                     x0 + cell.width
                         * f32::from(u16::try_from(run.origin.column).unwrap_or(u16::MAX)),
@@ -680,32 +714,27 @@ impl Element for TerminalElement {
                             * f32::from(u16::try_from(run.origin.line).unwrap_or(u16::MAX)),
                 );
                 window.paint_quad(fill(
-                    Bounds::new(
-                        row,
-                        size(
-                            cols(run.columns.min(
-                                usize::from(self.screen.cols).saturating_sub(run.origin.column),
-                            )),
-                            cell.height,
-                        ),
-                    ),
+                    Bounds::new(row, size(cols(visible_cols), cell.height)),
                     background,
                 ));
                 for (offset, text, group_cols) in run.groups() {
+                    if offset < scroll {
+                        continue;
+                    }
+                    let rel = offset - scroll;
                     // 확정 셀과 같은 강제 폭(2칸 글자는 2칸, 아니면 1칸)으로 같은 자리에 그린다.
                     let force = cell.width
                         * f32::from(u16::try_from(group_cols.max(1)).unwrap_or(u16::MAX));
                     if run
                         .origin
                         .column
-                        .saturating_add(offset)
+                        .saturating_add(rel)
                         .saturating_add(group_cols)
-                        > usize::from(self.screen.cols)
+                        > screen_cols
                     {
                         continue;
                     }
-                    let x =
-                        row.x + cell.width * f32::from(u16::try_from(offset).unwrap_or(u16::MAX));
+                    let x = row.x + cell.width * f32::from(u16::try_from(rel).unwrap_or(u16::MAX));
                     let layout = window.text_system().layout_line(
                         &text,
                         font_size,
@@ -734,8 +763,23 @@ impl Element for TerminalElement {
                         }
                     }
                     if underline && group_cols > 0 {
-                        let origin = point(x, row.y + underline_dy);
-                        let extent = size(cols(group_cols), DECORATION);
+                        let active_clause = run.selected.as_ref().is_some_and(|sel| {
+                            sel.start < sel.end
+                                && offset < sel.end
+                                && offset.saturating_add(group_cols) > sel.start
+                        });
+                        let thickness = if active_clause {
+                            DECORATION * 2.
+                        } else {
+                            DECORATION
+                        };
+                        let dy = if active_clause {
+                            underline_dy - DECORATION
+                        } else {
+                            underline_dy
+                        };
+                        let origin = point(x, row.y + dy);
+                        let extent = size(cols(group_cols), thickness);
                         window
                             .paint_quad(fill(Bounds::new(origin, extent), hsla(theme.foreground)));
                     }
@@ -747,13 +791,17 @@ impl Element for TerminalElement {
             if let Some(p) = &self.preedit {
                 paint_run(p, true, window);
             }
-            // 마지막 글자 끝(조합 중이면 preedit 끝, 아니면 확정 대기 끝)에 그리드와 같은 모양 커서.
+            // 조합 중이면 활성 문절/편집 커서 위치에, 확정 대기면 끝 위치에 그리드와 같은 모양 커서.
+            let screen_cols = usize::from(self.screen.cols);
             let (caret_column, caret_line) = match (&self.preedit, &self.pending) {
-                (Some(p), _) | (None, Some(p)) => (
-                    (p.origin.column + p.columns)
-                        .min(usize::from(self.screen.cols).saturating_sub(1)),
-                    p.origin.line,
-                ),
+                (Some(p), _) | (None, Some(p)) => {
+                    let scroll = p.visible_scroll_columns(screen_cols);
+                    let rel = p.caret_offset().saturating_sub(scroll);
+                    (
+                        (p.origin.column + rel).min(screen_cols.saturating_sub(1)),
+                        p.origin.line,
+                    )
+                }
                 (None, None) => return,
             };
             let caret = |v: usize| f32::from(u16::try_from(v).unwrap_or(u16::MAX));

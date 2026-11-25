@@ -52,6 +52,26 @@ const MASCOT_SVGS: [&[u8]; 20] = [
 /// Orca's default background (Sky). Saved as "no colour".
 pub const DEFAULT_BACKGROUND: u32 = ui::BOT_AVATAR_BACKGROUNDS[0].0;
 
+/// Localized accessible label for one of the built-in avatar background swatches.
+#[must_use]
+pub(super) fn background_label(rgb: u32) -> Option<&'static str> {
+    use crate::i18n::catalog::bots as text;
+    Some(match rgb {
+        0x00b3_dbf4 => text::AVATAR_COLOR_SKY.get(),
+        0x00ff_ffff => text::AVATAR_COLOR_WHITE.get(),
+        0x00c9_b8e8 => text::AVATAR_COLOR_LAVENDER.get(),
+        0x00f4_c4cf => text::AVATAR_COLOR_PINK.get(),
+        0x00f8_cfa8 => text::AVATAR_COLOR_PEACH.get(),
+        0x00f6_e3a1 => text::AVATAR_COLOR_BUTTER.get(),
+        0x00c5_dfb5 => text::AVATAR_COLOR_SAGE.get(),
+        0x00b5_e3d8 => text::AVATAR_COLOR_MINT.get(),
+        0x008f_a3b8 => text::AVATAR_COLOR_SLATE.get(),
+        0x003a_3f4b => text::AVATAR_COLOR_GRAPHITE.get(),
+        0x001f_2126 => text::AVATAR_COLOR_INK.get(),
+        _ => return None,
+    })
+}
+
 /// What the stored file name of an uploaded picture looks like (`avatar.png` in the bot folder).
 pub const UPLOAD_AVATAR: &str = "avatar.png";
 

@@ -1,4 +1,57 @@
-# 도메인·소개 사이트·아티팩트 공유 (`krill.page` / `share.krill.page`)
+# Krill Artifacts (`krill artifacts` & `share.krill.page`)
+
+[한국어 상세 가이드](#korean)
+
+Publish single-file HTML reports, interactive visuals, and Markdown documents as sandboxed public links on [`https://share.krill.page`](https://share.krill.page), and update, change retention on, or revoke the same URL anytime via the `krill artifacts` CLI or the desktop **Artifacts** modal.
+
+## CLI Quickstart
+
+Implementation: [`crates/krill/src/artifacts.rs`](../crates/krill/src/artifacts.rs)
+
+```sh
+# Scaffold a Krill Artifact Design System (KADS) HTML page (offline, no sharing gate required)
+krill artifacts init ./report.html [--archetype <report|brief|explorer|variants|deck>] [--theme <paper|light>] [--title "Performance Report"] [--force] [--json]
+
+# Static lint for sandbox (Origin: null), relative assets, and layout quality
+krill artifacts lint ./report.html [--strict] [--json]
+
+# Publish or update an HTML / Markdown file (reuses the same URL for previously shared files)
+krill artifacts share ./report.html [--title "Performance Report"] [--expires-in <days|never>] [--strict] [--api-url <url>] [--json]
+krill artifacts share ./notes.md --json
+
+# Force-update an existing shared file, or change retention without re-uploading
+krill artifacts update ./report.html [--title "Updated Title"] [--expires-in <days|never>] [--strict] [--api-url <url>] [--json]
+krill artifacts retention <slug> --expires-in 90 --json
+krill artifacts retention <slug> --expires-in never --json
+
+# Check local share status, list your artifacts, or revoke a link
+krill artifacts status ./report.html [--api-url <url>] [--json]
+krill artifacts list [--cursor <cursor>] [--api-url <url>] [--json]
+krill artifacts unshare ./report.html [--api-url <url>] [--json]
+krill artifacts delete <slug> [--api-url <url>] [--json]
+```
+
+## Public Sharing Gate (Off by Default)
+
+- `share`, `update`, and `retention` require the `<state_dir>/artifact-sharing.enabled` gate file. When absent, uploads fail with `artifact_sharing_disabled`.
+- Toggle it in the desktop app under **Settings → Artifacts → Allow public sharing** (there is no CLI subcommand to enable it; CLI-only users can explicitly create `touch "<state_dir>/artifact-sharing.enabled"` with mode `0600`).
+- This is a policy gate, not a security boundary against local processes that can write to `KRILL_STATE_DIR`. `list`, `status`, `unshare`, and `delete` always remain available so you can revoke existing links even when sharing is disabled.
+
+## Limits, Retention, and Sandbox Isolation
+
+- **Supported files & size:** Single `.html`, `.htm`, `.md`, or `.markdown` files up to **10 MiB** (empty files rejected). Relative local assets are not uploaded — inline assets or use absolute URLs.
+- **Retention & expiry:** Choose `1`–`3650` days or `never` via `--expires-in` (default 30 days, configurable in the Artifacts modal). Expired links become inaccessible immediately and are cleaned up hourly from storage; `never` links remain until explicitly deleted. Local source files are never deleted.
+- **HTML sandbox (`Origin: null`):** `share.krill.page` serves HTML artifacts with `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads;` (omitting `allow-same-origin`). Interactive scripts and charts run normally, but unguarded `localStorage`, `sessionStorage`, `indexedDB`, or `document.cookie` access throws `SecurityError` — run `krill artifacts lint` before sharing.
+- **Markdown sanitization:** Markdown artifacts are rendered server-side with `<script>`, `<iframe>`, inline `on*=` handlers, and `javascript:` URIs stripped.
+- **Desktop UI & account sync:** Open **Artifacts** from the sidebar to browse, preview, copy links, change retention, or delete artifacts, or click the Share button in the file header of any open HTML/Markdown file. Signing in with Google under **Settings → Mobile** (or `krill mobile login`) links your device's artifacts across signed-in devices when using the official `https://share.krill.page` server.
+
+For full infrastructure, REST API (`/v1/artifacts`), local state file layout, and operator deployment commands, see the Korean specification below.
+
+---
+
+<a id="korean"></a>
+
+## 도메인·소개 사이트·아티팩트 공유 (`krill.page` / `share.krill.page`)
 
 Krill의 공식 소개·문서 사이트(`https://krill.page`)와 HTML·Markdown 아티팩트 공개 공유 서비스(`https://share.krill.page`), 그리고 로컬 CLI(`krill artifacts`)의 아키텍처·와이어 규약·운영 방법을 정리한다.
 

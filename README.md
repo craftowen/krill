@@ -101,7 +101,7 @@ Measured on the same **Mac mini (Apple M6, 32 GB, macOS 27.0.1)** using unmodifi
 ### 1. Sessions That Outlive the App
 Quit, crash, or update `krill-app` while your agents keep working in the background. Reopen the app (or run `krill attach <id>`) to replay retained keyframes and `zstd` scrollback segments, with explicit `Gap` markers if retention overflows.
 
-[Architecture §4.1 →](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범)
+[Architecture §4.1 →](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) (Korean)
 
 </td>
 <td width="50%" valign="top">
@@ -135,11 +135,11 @@ Let a coordinator agent break down dependent tasks (`krill orchestration run-cre
 <td width="50%" valign="top">
 
 ### 5. Mobile E2EE Companion (PWA)
-Scan a QR code in **Settings → Mobile** to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
+Scan a QR code in **Settings → Mobile** in the Mac or Windows app to monitor live agent states and open terminals from your phone browser or Home Screen web app (PWA). Connects over Relay or Tailscale with end-to-end **ChaCha20-Poly1305** (`HKDF-SHA256`) encryption.
 
 Sign in with Google on your desktop when you choose the hosted relay. Your phone opens the PWA without signing in and authenticates with its QR pairing or saved device key.
 
-[Mobile Setup →](https://krill.page/en/docs)
+[Mobile Setup →](https://krill.page/en/docs#mobile)
 
 </td>
 <td width="50%" valign="top">
@@ -218,17 +218,19 @@ The installer verifies the ZIP's SHA-256, installs under `%LOCALAPPDATA%\Program
 |---|---|---|
 | **macOS, Apple Silicon (`arm64`)** | Primary desktop platform | Release app and CLI, or source build |
 | **Windows, `x64`** | Native desktop preview; desktop GUI, interactive logon, sleep, and reboot behavior still need validation beyond the recorded Windows Server VM tests | Windows release ZIP and PowerShell installer |
-| **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Mobile** in the Mac app (no app-store binary) |
+| **Mobile (iOS / Android)** | Companion web app (PWA) paired via QR code over Relay or Tailscale (ChaCha20-Poly1305 E2EE) | Scan QR from **Settings → Mobile** in the Mac or Windows app (no app-store binary) |
 | **macOS, Intel (`x86_64`)** | Not supported for this public preview | No supported release bundle or source-install promise |
 | **Linux** | Not supported for this public preview | No Linux desktop or downloadable remote-host package promised |
 | **Windows 11, ARM64** | Runs the `x64` package through Windows 11 x64 emulation; no native ARM64 build | Same Windows release ZIP and PowerShell installer |
 | **Windows 10 on ARM / 32-bit Windows** | Not supported | No release package |
 
+Linux implementation or packaging code in the repository does not promise a supported Linux download. Platform-specific failure guarantees and validation scope follow [Architecture §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) (Korean).
+
 ---
 
 ## First Successful Session
 
-1. Open Krill and use **Open folder…** to select a local Git repository. If the interface is Korean, select **설정 → 모양 → 언어 → English** (Settings → Appearance → Language).
+1. Open Krill and use **Open folder…** to select a local Git repository. On first launch, Krill automatically follows your OS language (English on non-Korean systems), and you can switch anytime in **Settings → Appearance → Language**.
 2. Open the **New session** (`+`) menu and choose **Terminal**, or choose an installed, authenticated agent such as Claude Code or Codex. Ask the agent to inspect the repository.
 3. Use **New worktree** in the sidebar, enter a unique name, and choose **Create**. Review any setup script before approving it, or choose **Skip setup**. Start a second agent there to work independently.
 4. Record the session IDs with `krill ls`. Quit and reopen the app while leaving the session tabs intact; check that the running sessions reconnect with the same IDs. Closing a session tab/pane explicitly terminates that session.
@@ -245,7 +247,7 @@ For copyable GUI, CLI, and source-build walkthroughs, see [Getting started](GETT
 | **`krilld` crash** | Can continue because the holder retains the PTY/handles | Bytes read but not yet recorded may be lost; recovery marks a `Gap` |
 | **Both session services stop, or the machine reboots** | Does not survive | Saved history is not a live process; agent conversation resume is a separate action |
 
-This is continuity across app restarts, not a guarantee against every form of data loss. Platform-specific recovery and validation limits are defined in [Architecture §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범).
+This is continuity across app restarts, not a guarantee against every form of data loss. Platform-specific recovery and validation limits are defined in [Architecture §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범) (Korean).
 
 ---
 
@@ -261,6 +263,4 @@ Design documents currently remain in Korean: [Architecture](docs/ARCHITECTURE.md
 
 ## License
 
-Apache-2.0 — [LICENSE](LICENSE), Copyright 2026 Krill contributors. See [third-party notices](THIRD_PARTY_NOTICES.md) and [license records](docs/licensing/README.md). Do not read or copy Zed's GPL-3.0 `terminal` or `terminal_view` code when contributing; credit any permitted Orca source reuse as described in [Contributing](CONTRIBUTING.md).
-
-Usage metrics are enabled by default without a consent dialog: a random installation ID, first launch, app launches, daily interaction, version, OS, and architecture. Prompts, terminal output, commands, project paths, and account details are excluded. Run `krill telemetry disable` to stop collection; `DO_NOT_TRACK=1` also disables it. See [usage metrics](services/telemetry/CLIENT.md) for delivery status and operator setup. Error reporting has a separate, default-off setting.
+Apache-2.0 — [LICENSE](LICENSE), Copyright 2026 Krill contributors. See [third-party notices](THIRD_PARTY_NOTICES.md) and [license records](docs/licensing/README.md) (Korean). Do not read or copy Zed's GPL-3.0 `terminal` or `terminal_view` code when contributing; credit any permitted Orca source reuse as described in [Contributing](CONTRIBUTING.md).

@@ -343,6 +343,18 @@ impl BotGroupMembersDialog {
 
 impl Render for BotGroupMembersDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::i18n::sync_input_placeholder(
+            &self.name_input,
+            text::GRP_NAME_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
+        crate::i18n::sync_input_placeholder(
+            &self.filter_input,
+            text::GRP_FILTER_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
         let p = ui::palette(cx);
         let is_create = self.is_create();
         let min_req = min_members(is_create);

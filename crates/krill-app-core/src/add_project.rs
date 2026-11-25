@@ -477,6 +477,19 @@ fn selected_card(
 
 impl Render for Dialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::i18n::sync_input_placeholder(&self.url, text::URL_PLACEHOLDER.get(), window, cx);
+        crate::i18n::sync_input_placeholder(
+            &self.dest,
+            text::REMOTE_PATH_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
+        crate::i18n::sync_input_placeholder(
+            &self.remote_path,
+            text::REMOTE_PATH_PLACEHOLDER.get(),
+            window,
+            cx,
+        );
         let p = ui::palette(cx);
         let title = match self.step {
             Step::Start => text::TITLE.get(),

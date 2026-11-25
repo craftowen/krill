@@ -1111,6 +1111,8 @@ enum Action {
         target_id: Option<String>,
         #[serde(default)]
         refine: Option<bool>,
+        #[serde(default)]
+        target_lang: Option<String>,
     },
     #[serde(rename = "voice.feedback")]
     VoiceFeedback {
@@ -1137,6 +1139,8 @@ enum Action {
         ignore_word: Option<String>,
         #[serde(default)]
         unignore_word: Option<String>,
+        #[serde(default)]
+        target_lang: Option<String>,
     },
 }
 #[derive(Debug, Deserialize)]
@@ -1304,7 +1308,7 @@ struct BotRefusedIoError(krill_proto::bots::BotSessionRefusal);
 
 impl std::fmt::Display for BotRefusedIoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.message_en(Some("this computer")))
+        f.write_str(&self.0.message_en(None))
     }
 }
 
@@ -1357,7 +1361,7 @@ impl Backend {
                 {
                     json!({
                         "ok": false,
-                        "error": refused.0.message_en(Some("this computer")),
+                        "error": refused.0.message_en(None),
                         "data": { "refusal": &refused.0 }
                     })
                 } else {
@@ -2988,6 +2992,7 @@ impl Backend {
                 target_kind,
                 target_id,
                 refine,
+                target_lang,
             } => {
                 let b64 = data_b64.or(audio_wav_b64).ok_or_else(invalid)?;
                 let wav_chunk = crate::voice::bridge::base64_decode(&b64)?;
@@ -3001,6 +3006,7 @@ impl Backend {
                         target_kind: kind,
                         target_id: target_id.as_deref(),
                         refine_override: refine,
+                        target_lang: target_lang.as_deref(),
                         upload_id: upload_id.as_deref(),
                         chunk_index: chunk_index.unwrap_or(0),
                         total_chunks: total_chunks.unwrap_or(1),
@@ -3052,7 +3058,14 @@ impl Backend {
                     "boosted": res.boosted,
                 }))
             }
-            Action::VoiceConfigGet {} => to_value(self.voice_service().config_get()),
+            Action::VoiceConfigGet {} => {
+                let svc = self.voice_service();
+                let mut val = to_value(svc.config_get())?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("target_lang".to_owned(), json!(svc.target_lang()));
+                }
+                Ok(val)
+            }
             Action::VoiceConfigSet {
                 refine_enabled,
                 desktop_shortcut,
@@ -3060,18 +3073,25 @@ impl Backend {
                 remove_pinned,
                 ignore_word,
                 unignore_word,
+                target_lang,
             } => {
-                let cfg =
-                    self.voice_service()
-                        .config_set(krill_proto::voice::VoiceConfigPatch {
-                            refine_enabled,
-                            desktop_shortcut,
-                            add_pinned,
-                            remove_pinned,
-                            ignore_word,
-                            unignore_word,
-                        })?;
-                to_value(cfg)
+                let svc = self.voice_service();
+                let cfg = svc.config_set(krill_proto::voice::VoiceConfigPatch {
+                    refine_enabled,
+                    desktop_shortcut,
+                    add_pinned,
+                    remove_pinned,
+                    ignore_word,
+                    unignore_word,
+                })?;
+                if let Some(lang) = target_lang {
+                    svc.set_target_lang(Some(&lang))?;
+                }
+                let mut val = to_value(cfg)?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("target_lang".to_owned(), json!(svc.target_lang()));
+                }
+                Ok(val)
             }
         }
     }
@@ -7934,20 +7954,22 @@ value = "{}"
         assert!(st["data"]["status"].is_string());
         assert_eq!(st["data"]["refine_enabled"], true);
 
-        // voice.config_set persists refine_enabled + pinned word and voice.config_get reads it back
+        // voice.config_set persists refine_enabled + pinned word + target_lang and voice.config_get reads it back
         let set: Value = serde_json::from_str(&backend.request(
-            r#"{"action":"voice.config_set","refine_enabled":false,"add_pinned":"Pipito"}"#,
+            r#"{"action":"voice.config_set","refine_enabled":false,"add_pinned":"Pipito","target_lang":"ja_JP"}"#,
         ))
         .unwrap();
         assert_eq!(set["ok"], true);
         assert_eq!(set["data"]["refine_enabled"], false);
         assert_eq!(set["data"]["pinned_vocab"], json!(["Pipito"]));
+        assert_eq!(set["data"]["target_lang"], "ja-JP");
 
         let get: Value =
             serde_json::from_str(&backend.request(r#"{"action":"voice.config_get"}"#)).unwrap();
         assert_eq!(get["ok"], true);
         assert_eq!(get["data"]["refine_enabled"], false);
         assert_eq!(get["data"]["pinned_vocab"], json!(["Pipito"]));
+        assert_eq!(get["data"]["target_lang"], "ja-JP");
 
         // voice.warm returns ok:true without blocking
         let warm: Value = serde_json::from_str(

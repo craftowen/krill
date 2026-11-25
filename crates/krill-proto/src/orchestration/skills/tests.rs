@@ -238,12 +238,36 @@ fn krig_bundle_uses_syntax_valid_markers_and_skips_developer_symlinks() {
     assert!(first.failures.is_empty(), "{:?}", first.failures);
 
     let krig_dir = home.join(".claude/skills/krig");
+    let has_hangul = |s: &str| {
+        s.chars().any(|c| {
+            matches!(
+                c,
+                '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}'
+            )
+        })
+    };
     let skill_md = fs::read_to_string(krig_dir.join("SKILL.md")).unwrap();
     assert!(skill_md.ends_with(&format!("{MARKER}\n")));
+    assert!(!has_hangul(&skill_md), "krig SKILL.md must be English");
 
     let openai_yaml = fs::read_to_string(krig_dir.join("agents/openai.yaml")).unwrap();
     assert!(openai_yaml.ends_with(&format!("{YAML_MARKER}\n")));
     assert!(!openai_yaml.contains(MARKER));
+    assert!(
+        !has_hangul(&openai_yaml),
+        "krig openai.yaml must be English"
+    );
+    for (relative, content) in KRIG_FILES {
+        let is_doc = std::path::Path::new(relative)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("yaml"));
+        if is_doc {
+            assert!(
+                !has_hangul(content),
+                "krig bundled doc {relative} must be English"
+            );
+        }
+    }
 
     let route_mjs = fs::read_to_string(krig_dir.join("scripts/route.mjs")).unwrap();
     assert!(route_mjs.ends_with(&format!("{JS_MARKER}\n")));

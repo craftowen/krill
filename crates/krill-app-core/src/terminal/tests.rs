@@ -313,6 +313,7 @@ fn preedit_groups_split_by_cell_for_forced_width() {
         origin: at,
         text: "한ㄱ".into(),
         columns: 4,
+        selected: None,
     };
     assert_eq!(
         p.groups(),
@@ -323,6 +324,7 @@ fn preedit_groups_split_by_cell_for_forced_width() {
         origin: at,
         text: "\u{1112}\u{1161}\u{11ab}a".into(),
         columns: 3,
+        selected: None,
     };
     assert_eq!(
         p.groups(),
@@ -331,6 +333,40 @@ fn preedit_groups_split_by_cell_for_forced_width() {
             (2, "a".to_owned(), 1)
         ]
     );
+}
+
+#[test]
+fn preedit_tracks_multiclause_caret_and_scrolls_long_cjk_in_narrow_panes() {
+    let at = CellPoint { line: 0, column: 0 };
+    // Japanese multi-clause conversion: active clause at columns 0..4, inactive 4..10.
+    let p = Preedit {
+        origin: at,
+        text: "日本語テスト".into(),
+        columns: 12,
+        selected: Some(0..4),
+    };
+    assert_eq!(p.caret_offset(), 4);
+    assert_eq!(p.visible_scroll_columns(20), 0);
+
+    // Mid-preedit editing caret at column 6 inside a 20-col preedit in a 10-col split pane.
+    let mid = Preedit {
+        origin: at,
+        text: "あいうえおかきくけこ".into(),
+        columns: 20,
+        selected: Some(6..6),
+    };
+    assert_eq!(mid.caret_offset(), 6);
+    assert_eq!(mid.visible_scroll_columns(10), 0);
+
+    // Tail typing in a 10-col split pane scrolls horizontally so the active tail remains visible.
+    let tail = Preedit {
+        origin: at,
+        text: "あいうえおかきくけこ".into(),
+        columns: 20,
+        selected: None,
+    };
+    assert_eq!(tail.caret_offset(), 20);
+    assert_eq!(tail.visible_scroll_columns(10), 10);
 }
 
 /// OWE-655: 배경 알파는 배경 quad에만 곱하고 글자색은 그대로 둔다.

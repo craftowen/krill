@@ -1018,7 +1018,7 @@ impl View {
                     }),
             )
             .when_some(relay.last_error.clone(), |d, err| {
-                d.child(ui::error_banner(p, err))
+                d.child(ui::error_banner(p, crate::i18n::cached_notice(&err)))
             });
 
         // 2. 13 Curated MCP Apps
@@ -1175,7 +1175,7 @@ impl View {
                     )
                     .when_some(
                         srv_status.as_ref().and_then(|s| s.last_error.clone()),
-                        |d, err| d.child(ui::error_banner(p, err)),
+                        |d, err| d.child(ui::error_banner(p, crate::i18n::cached_notice(&err))),
                     )
                     .when(
                         is_enabled && app.auth_kind == BotMcpAuthKind::BrowserOAuth,
@@ -1250,7 +1250,9 @@ impl View {
                                             ),
                                     ),
                             )
-                            .when_some(oauth_err, |dd, err| dd.child(ui::error_banner(p, err)))
+                            .when_some(oauth_err, |dd, err| {
+                                dd.child(ui::error_banner(p, crate::i18n::cached_notice(&err)))
+                            })
                         },
                     )
                     .when(

@@ -60,6 +60,7 @@ impl Render for Surface {
                 origin: CellPoint { line: 4, column: 8 },
                 text: "한글👩\u{200d}💻".into(),
                 columns: 6,
+                selected: None,
             });
             terminal.link = Some(Highlight {
                 line: 2,

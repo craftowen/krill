@@ -121,8 +121,9 @@ if [ -n "${MK_PANE_ID-}" ]; then
   export HERDR_ENV=1 PI_CLIPBOARD_OSC52=1
 fi
 if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
-  # OpenCode 격리 프로필만 XDG_DATA_HOME·XDG_STATE_HOME을 덮어쓴다. 처음 덮어쓰기 전 값(미설정 포함)을 기억했다가
-  # 호스트 계정·항목 제거 때 되돌린다. 그 사이 사용자가 직접 바꾼 값은 보존한다(daemon-01).
+  # Only isolated OpenCode profiles override XDG_DATA_HOME/XDG_STATE_HOME. Remember original
+  # values (including unset) before overriding, restore on host account/entry removal, and
+  # preserve values changed directly by the user in the meantime (daemon-01).
   __krill_opencode_xdg() {
     if [ -n "${1-}" ]; then
       if [ -z "${__krill_xdg_dir-}" ] || [ "${XDG_DATA_HOME-}" != "$__krill_xdg_dir/data" ]; then
@@ -158,7 +159,7 @@ if [ -z "${KRILL_ACCOUNT_PROVIDER+x}" ]; then
       if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
       if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
       unset ANTIGRAVITY_CLI_HOME
-      # 호스트 기본 계정은 `host_default_dir`(`$HOME/.config/opencode`)이다. 옛 `.local/share` 경로도 호스트로 본다.
+      # Host default account uses `host_default_dir` (`$HOME/.config/opencode`); legacy `.local/share` counts as host too.
       if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.config/opencode" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
         __krill_opencode_xdg "$OPENCODE_CONFIG_DIR"
         export OPENCODE_DB=opencode.db

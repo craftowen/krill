@@ -347,6 +347,12 @@ impl Shell {
             .and_then(|l| l.input.as_ref())
             .map(|(input, _)| input.clone())
         {
+            krill_app::i18n::sync_input_placeholder(
+                &existing,
+                text::LAUNCHER_SEARCH_PLACEHOLDER.get(),
+                window,
+                cx,
+            );
             return Some(existing);
         }
         if !self.split_launchers.contains_key(&pane) {

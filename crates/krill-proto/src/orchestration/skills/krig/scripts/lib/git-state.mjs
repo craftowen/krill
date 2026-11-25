@@ -13,10 +13,10 @@ export function isGitRepo(repoDir) {
 export function ensureGitRepo(repoDir) {
   const resolved = path.resolve(repoDir);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-    throw new Error(`대상 경로가 존재하지 않거나 디렉터리가 아닙니다: ${repoDir}`);
+    throw new Error(`Target path does not exist or is not a directory: ${repoDir}`);
   }
   if (!isGitRepo(resolved)) {
-    throw new Error(`유효한 git 작업 트리가 아닙니다: ${resolved}`);
+    throw new Error(`Not a valid git worktree: ${resolved}`);
   }
   return resolved;
 }
@@ -96,7 +96,7 @@ export function readBaseSha(repoDir, explicitBase = null) {
   if (explicitBase) {
     const sha = resolveCommitSha(repoDir, explicitBase);
     if (!sha) {
-      throw new Error(`지정한 기준 커밋(--base ${explicitBase})을 찾을 수 없습니다.`);
+      throw new Error(`Specified base commit (--base ${explicitBase}) was not found.`);
     }
     return { baseSha: sha, source: 'explicit' };
   }
@@ -106,14 +106,14 @@ export function readBaseSha(repoDir, explicitBase = null) {
     const raw = fs.readFileSync(baseFile, 'utf8').trim();
     const sha = resolveCommitSha(repoDir, raw);
     if (!sha) {
-      throw new Error(`.krig/base-sha에 유효하지 않은 커밋 해시가 기록되어 있습니다: ${raw || '(빈 파일)'}`);
+      throw new Error(`.krig/base-sha contains an invalid commit hash: ${raw || '(empty file)'}`);
     }
     return { baseSha: sha, source: '.krig/base-sha' };
   }
 
   const head = getHeadSha(repoDir);
   if (!head) {
-    throw new Error('저장소에 아직 커밋(HEAD)이 없습니다.');
+    throw new Error('Repository has no commits (HEAD) yet.');
   }
 
   const worktree = getWorktreeStatus(repoDir);
@@ -144,7 +144,7 @@ function buildUntrackedFileDiffBuffer(repoDir, relFile) {
       }
     );
     if (res.status !== 0 && res.status !== 1) {
-      throw new Error(`미추적 파일 diff 생성 실패 (${relFile}): ${(res.stderr ?? Buffer.alloc(0)).toString('utf8').trim()}`);
+      throw new Error(`Failed to diff untracked file (${relFile}): ${(res.stderr ?? Buffer.alloc(0)).toString('utf8').trim()}`);
     }
     return res.stdout ?? Buffer.alloc(0);
   }
@@ -161,7 +161,7 @@ function buildUntrackedFileDiffBuffer(repoDir, relFile) {
       }
     );
     if (res.status !== 0 && res.status !== 1) {
-      throw new Error(`미추적 파일 diff 생성 실패 (${relFile}): ${(res.stderr ?? Buffer.alloc(0)).toString('utf8').trim()}`);
+      throw new Error(`Failed to diff untracked file (${relFile}): ${(res.stderr ?? Buffer.alloc(0)).toString('utf8').trim()}`);
     }
     const rawBuf = res.stdout ?? Buffer.alloc(0);
     const nlIdx = rawBuf.indexOf(0x0a);
@@ -225,7 +225,7 @@ export function computeCombinedPatch(repoDir, baseSha, options = {}) {
 
   const trackedDiff = spawnSync('git', diffArgs, { maxBuffer: 64 * 1024 * 1024 });
   if (trackedDiff.status !== 0) {
-    throw new Error(`git diff 실행 실패: ${(trackedDiff.stderr ?? Buffer.alloc(0)).toString('utf8').trim()}`);
+    throw new Error(`git diff failed: ${(trackedDiff.stderr ?? Buffer.alloc(0)).toString('utf8').trim()}`);
   }
 
   const chunks = [trackedDiff.stdout ?? Buffer.alloc(0)];
@@ -248,7 +248,7 @@ export function computeCombinedPatch(repoDir, baseSha, options = {}) {
     maxBuffer: 64 * 1024 * 1024
   });
   if (patchRes.status !== 0) {
-    throw new Error(`git patch-id 계산 실패: ${(patchRes.stderr ?? '').trim()}`);
+    throw new Error(`git patch-id failed: ${(patchRes.stderr ?? '').trim()}`);
   }
 
   const diffText = combined.toString('utf8');
@@ -378,20 +378,20 @@ export function scanDiffHazards(diffText, repoDir = null) {
       hazards.push({
         kind: 'MERGE_CONFLICT_MARKER',
         file: currentFile,
-        detail: `해소되지 않은 병합 충돌 마커가 감지되었습니다: ${added.slice(0, 40)}`
+        detail: `Unresolved merge conflict marker detected: ${added.slice(0, 40)}`
       });
     } else if (/^>{7}\s/.test(added)) {
       openConflictInFile = false;
       hazards.push({
         kind: 'MERGE_CONFLICT_MARKER',
         file: currentFile,
-        detail: `해소되지 않은 병합 충돌 마커가 감지되었습니다: ${added.slice(0, 40)}`
+        detail: `Unresolved merge conflict marker detected: ${added.slice(0, 40)}`
       });
     } else if (openConflictInFile && /^={7}$/.test(added)) {
       hazards.push({
         kind: 'MERGE_CONFLICT_MARKER',
         file: currentFile,
-        detail: '해소되지 않은 병합 충돌 구분선(=======)이 감지되었습니다.'
+        detail: 'Unresolved merge conflict divider (=======) detected.'
       });
     }
 
@@ -400,7 +400,7 @@ export function scanDiffHazards(diffText, repoDir = null) {
         hazards.push({
           kind: 'SECRET_PATTERN_LEAK',
           file: currentFile,
-          detail: `변경분에 시크릿 패턴(${rule.name}) 의심 문자열이 포함되어 있습니다.`
+          detail: `Diff contains suspected secret pattern (${rule.name}).`
         });
       }
     }
@@ -416,7 +416,7 @@ export function scanDiffHazards(diffText, repoDir = null) {
           hazards.push({
             kind: 'SECRET_PATTERN_LEAK',
             file: relFile,
-            detail: `바이너리/혼합 파일에 시크릿 패턴(${rule.name}) 의심 문자열이 포함되어 있습니다.`
+            detail: `Binary/mixed file contains suspected secret pattern (${rule.name}).`
           });
         }
       }

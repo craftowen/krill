@@ -537,10 +537,31 @@ fn resolve(program: &[u8], path: Option<&[u8]>) -> Vec<u8> {
 
 /// Terminal.app처럼 시스템 로케일(`AppleLocale`→`ko_KR`)에서 LANG(`ko_KR.UTF-8`)을 만든다.
 ///
-/// 못 읽으면 `None`(호출자가 [`FALLBACK_LANG`]을 쓴다). `None`은 `AppleLocale`이 없을 때와
-/// 읽기·파싱 실패뿐이라, 결과는 "시스템 로케일 LANG" 아니면 "읽기 실패" 둘 중 하나다.
+/// 못 읽거나 macOS `/usr/share/locale/`에 없는 조합(예: `en_KR.UTF-8`, `en_KZ.UTF-8`)이면
+/// `None`을 돌려 호출자가 [`FALLBACK_LANG`]을 쓰게 한다.
 fn system_lang() -> Option<Vec<u8>> {
-    lang_from_locale(&system_locale()?)
+    let lang = lang_from_locale(&system_locale()?)?;
+    #[cfg(target_os = "macos")]
+    if !is_installed_macos_locale(&lang) {
+        return None;
+    }
+    Some(lang)
+}
+
+#[cfg(target_os = "macos")]
+fn is_installed_macos_locale(lang: &[u8]) -> bool {
+    is_installed_locale_in(std::path::Path::new("/usr/share/locale"), lang)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_installed_locale_in(root: &std::path::Path, lang: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(lang) else {
+        return false;
+    };
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return false;
+    }
+    root.join(name).is_dir()
 }
 
 /// ko_KR→ko_KR.UTF-8. @ 뒤(배리언트)와 . 뒤(기존 인코딩)는 버린다.
@@ -1043,5 +1064,29 @@ mod socket_environment_tests {
         }
         #[cfg(not(target_os = "macos"))]
         assert_eq!(system_locale(), None);
+    }
+
+    #[test]
+    fn installed_locale_check_rejects_nonexistent_regional_pairs() {
+        let root = std::env::temp_dir().join(format!("krill-locale-check-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("en_US.UTF-8")).unwrap();
+        std::fs::create_dir_all(root.join("ko_KR.UTF-8")).unwrap();
+
+        assert!(is_installed_locale_in(&root, b"en_US.UTF-8"));
+        assert!(is_installed_locale_in(&root, b"ko_KR.UTF-8"));
+        assert!(!is_installed_locale_in(&root, b"en_KR.UTF-8"));
+        assert!(!is_installed_locale_in(&root, b"en_KZ.UTF-8"));
+        assert!(!is_installed_locale_in(&root, b"../en_US.UTF-8"));
+        assert!(!is_installed_locale_in(&root, b""));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_installed_macos_locale(b"en_US.UTF-8"));
+            assert!(!is_installed_macos_locale(b"en_KR.UTF-8"));
+            assert!(!is_installed_macos_locale(b"en_KZ.UTF-8"));
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

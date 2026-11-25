@@ -37,23 +37,28 @@ fn device(created_at_ms: u64, last_seen_ms: u64) -> PairedMobileDevice {
 
 #[test]
 fn ago_scales_from_just_now_to_days() {
+    use crate::i18n::Language;
     let now = 10_000_000_000;
     assert_eq!(ago(now, now), text::JUST_NOW.get());
     assert_eq!(ago(now, now + 5_000), text::JUST_NOW.get());
-    assert!(
-        ago(now, now - 90_000).starts_with("1 "),
-        "got {}",
-        ago(now, now - 90_000)
+    assert_eq!(ago_in(now, now - 90_000, Language::Ko), "1분 전");
+    assert_eq!(ago_in(now, now - 5 * 60_000, Language::Ko), "5분 전");
+    assert_eq!(ago_in(now, now - 3_600_000, Language::Ko), "1시간 전");
+    assert_eq!(ago_in(now, now - 3 * 3_600_000, Language::Ko), "3시간 전");
+    assert_eq!(ago_in(now, now - 86_400_000, Language::Ko), "1일 전");
+    assert_eq!(ago_in(now, now - 2 * 86_400_000, Language::Ko), "2일 전");
+
+    assert_eq!(ago_in(now, now - 90_000, Language::En), "1 minute ago");
+    assert_eq!(ago_in(now, now - 5 * 60_000, Language::En), "5 minutes ago");
+    assert_eq!(ago_in(now, now - 3_600_000, Language::En), "1 hour ago");
+    assert_eq!(
+        ago_in(now, now - 3 * 3_600_000, Language::En),
+        "3 hours ago"
     );
-    assert!(
-        ago(now, now - 3 * 3_600_000).starts_with("3 "),
-        "got {}",
-        ago(now, now - 3 * 3_600_000)
-    );
-    assert!(
-        ago(now, now - 2 * 86_400_000).starts_with("2 "),
-        "got {}",
-        ago(now, now - 2 * 86_400_000)
+    assert_eq!(ago_in(now, now - 86_400_000, Language::En), "1 day ago");
+    assert_eq!(
+        ago_in(now, now - 2 * 86_400_000, Language::En),
+        "2 days ago"
     );
 }
 
@@ -738,7 +743,7 @@ fn mobile_page_sidebar_toggle_fits_without_overlap_or_shift(cx: &mut gpui::TestA
     for language in [crate::i18n::Language::En, crate::i18n::Language::Ko] {
         vcx.update(|_, cx| {
             super::super::edit_or_in_memory(cx, move |s| {
-                s.language = language;
+                s.language = language.into();
                 s.show_mobile_button = true;
             });
         });

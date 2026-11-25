@@ -263,7 +263,7 @@ pub fn meta(ks: &Keystroke, option_as_meta: bool) -> Option<Vec<u8>> {
             .next()
             .filter(|c| c.is_ascii_graphic() && chars.next().is_none())?
     };
-    if !option_as_meta && (m.shift || !matches!(c, 'b' | 'f' | 'd')) {
+    if !option_as_meta {
         return None;
     }
     let c = if m.shift { c.to_ascii_uppercase() } else { c };
@@ -439,7 +439,9 @@ mod tests {
         // 레거시 모드에서 `key`는 Option+글자를 보내지 않아 `meta`로 넘어간다.
         assert_eq!(encode("alt-b", 0, Event::Press), None);
         assert_eq!(meta(&ks("alt-b"), true).unwrap(), b"\x1bb");
-        assert_eq!(meta(&ks("alt-b"), false).unwrap(), b"\x1bb");
+        assert_eq!(meta(&ks("alt-b"), false), None);
+        assert_eq!(meta(&ks("alt-f"), false), None);
+        assert_eq!(meta(&ks("alt-d"), false), None);
         assert_eq!(meta(&ks("alt-a"), false), None);
         assert_eq!(meta(&ks("alt-shift-f"), true).unwrap(), b"\x1bF");
         assert_eq!(meta(&ks("alt-."), true).unwrap(), b"\x1b.");

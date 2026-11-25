@@ -641,6 +641,7 @@ impl View {
                 input
             })
             .clone();
+        crate::i18n::sync_input_placeholder(&search, hm::SEARCH_APPS.get(), window, cx);
         let query = search.read(cx).value().trim().to_lowercase();
         let added = Self::added_connectors(bot);
         let rail = self.connectors.add_rail;

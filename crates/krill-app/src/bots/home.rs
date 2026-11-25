@@ -211,6 +211,7 @@ struct HomeCacheKey {
     look_around_running: bool,
     look_steps_open: bool,
     minute_bucket: u64,
+    language: crate::i18n::Language,
 }
 
 /// Cached virtualized projection of the bot Home tab so hover, selection, and scroll never
@@ -786,6 +787,7 @@ impl View {
             look_around_running: self.soul_memory.look_around_running,
             look_steps_open: self.items.look_steps_open,
             minute_bucket: now / 60_000,
+            language: crate::i18n::language(),
         };
         let upcoming_seen = self.items.upcoming.as_ref().map(|u| u.items_seen_event_id);
         if let Some(host_seen) = upcoming_seen {

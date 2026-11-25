@@ -122,7 +122,7 @@ export function reflowMarkdown(markdown) {
     before.proseWords.join(' ') !== after.proseWords.join(' ')
     || JSON.stringify(before.fencedBlocks) !== JSON.stringify(after.fencedBlocks)
   ) {
-    throw new Error('무손실 검증 실패: 재정렬 전후 단어 토큰 또는 코드 블록이 일치하지 않습니다.');
+    throw new Error('Lossless check failed: word tokens or code blocks changed after reflow.');
   }
 
   return result;

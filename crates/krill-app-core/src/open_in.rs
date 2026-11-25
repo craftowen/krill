@@ -21,8 +21,11 @@ impl Target {
             Self::VsCode => "VS Code",
             Self::Cursor => "Cursor",
             Self::Zed => "Zed",
-            Self::Finder if cfg!(windows) => "File Explorer",
-            Self::Finder => "Finder",
+            Self::Finder if cfg!(windows) => crate::i18n::catalog::open_in::FILE_EXPLORER.get(),
+            Self::Finder if cfg!(target_os = "macos") => {
+                crate::i18n::catalog::open_in::FINDER.get()
+            }
+            Self::Finder => crate::i18n::catalog::open_in::FILE_MANAGER.get(),
         }
     }
 
