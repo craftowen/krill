@@ -120,7 +120,9 @@ use std::io::{self, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1147,7 +1149,7 @@ fn sqlite_wal_companion_exists(db_path: &Path) -> bool {
 fn run_sqlite3_json_rows(db_path: &Path, sql: &str) -> io::Result<Vec<Json>> {
     let bin = sqlite3_binary();
     let run_once = |target: &str| {
-        Command::new(bin)
+        krill_proto::os::background_command(bin)
             .arg("-readonly")
             .arg("-json")
             .arg(target)
@@ -6499,7 +6501,7 @@ fn import_orca_bot_items(
         }
         let _sql_guard = TempSqlFileGuard(sql_path.clone());
         let sql_stdin = File::open(&sql_path)?;
-        let out = Command::new(sqlite3_binary())
+        let out = krill_proto::os::background_command(sqlite3_binary())
             .arg("-bail")
             .arg(&dst_db)
             .stdin(Stdio::from(sql_stdin))

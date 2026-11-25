@@ -750,10 +750,11 @@ pub(super) fn local_machine_hostname() -> Option<String> {
     HOST.get_or_init(|| {
         let raw = sysinfo::System::host_name()
             .or_else(|| {
-                let mut cmd = std::process::Command::new("hostname");
+                let mut cmd = krill_proto::os::background_command("hostname");
                 #[cfg(not(windows))]
                 cmd.arg("-s");
-                cmd.output()
+                cmd.stdin(std::process::Stdio::null())
+                    .output()
                     .ok()
                     .filter(|o| o.status.success())
                     .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1666,8 +1667,9 @@ impl Shell {
             let version = cx
                 .background_executor()
                 .spawn(async move {
-                    let output = std::process::Command::new("agy")
+                    let output = krill_proto::os::background_command("agy")
                         .arg("--version")
+                        .stdin(std::process::Stdio::null())
                         .output()
                         .ok()?;
                     if !output.status.success() {

@@ -287,8 +287,7 @@ fn resolve_windows_chain_shell(
 fn run_chain_within(command: &OsStr, input: &[u8], wait: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + wait;
     let (shell_bin, shell_args) = chain_shell();
-    let mut shell = std::process::Command::new(shell_bin);
-    krill_proto::os::configure_background(&mut shell);
+    let mut shell = krill_proto::os::background_command(shell_bin);
     shell
         .args(shell_args)
         .arg(command)
@@ -447,7 +446,7 @@ fn execute(action: &str, yes: bool, dry_run: bool, out: &mut impl Write) -> io::
 
 /// `claude --version` 첫 줄. 바이너리가 없거나 못 읽으면 `None`이다.
 fn probe_claude_version() -> Option<String> {
-    let mut child = std::process::Command::new("claude")
+    let mut child = krill_proto::os::background_command("claude")
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

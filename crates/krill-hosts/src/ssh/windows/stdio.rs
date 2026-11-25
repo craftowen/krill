@@ -2,8 +2,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt as _;
-use std::os::windows::process::CommandExt as _;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
@@ -120,8 +119,7 @@ fn spawn_until(
     let (stdin, input) = Pipe::pair(deadline)?;
     let (stdout, output) = Pipe::pair(deadline)?;
     let (stderr, error) = Pipe::pair(deadline)?;
-    let child = Command::new(program)
-        .creation_flags(0x0800_0000)
+    let child = krill_proto::os::background_command(program)
         .args(args)
         .stdin(input)
         .stdout(output)

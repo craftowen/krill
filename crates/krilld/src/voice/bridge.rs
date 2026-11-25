@@ -124,6 +124,12 @@ impl BridgeClient {
         default_bridge_path()
     }
 
+    /// Pipito `bridge.json`이 존재하는지 가볍게 확인한다(네트워크·서브프로세스 호출 없음).
+    #[must_use]
+    pub fn is_installed(&self) -> bool {
+        self.bridge_path().is_some_and(|path| path.is_file())
+    }
+
     fn read_discovery(&self) -> io::Result<BridgeDiscovery> {
         let path = self
             .bridge_path()

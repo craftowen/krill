@@ -1,5 +1,6 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt as _;
+use std::process::Command;
 use std::time::Duration;
 
 struct Temp(std::path::PathBuf);

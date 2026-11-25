@@ -347,7 +347,7 @@ fn resolve_program(program: &Path, path: &OsStr) -> PathBuf {
 
 fn command(program: &Path, repo: &Path, args: &[OsString]) -> Command {
     let path = OsStr::from_bytes(crate::shell::login_path());
-    let mut cmd = Command::new(resolve_program(program, path));
+    let mut cmd = krill_proto::os::background_command(resolve_program(program, path));
     crate::child::own_group(&mut cmd)
         .args(FIXED_ARGS)
         .args(args)

@@ -294,7 +294,7 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
 
 /// 명시한 기준 ref가 없을 때만 부모의 현재 브랜치를 쓴다. detached HEAD·조회 실패는 데몬 기본값으로 폴백한다.
 fn parent_branch(parent: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = krill_proto::os::background_command("git")
         .arg("-C")
         .arg(parent)
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -375,7 +375,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn list_git_worktrees(repo: &std::path::Path) -> Result<Vec<(String, String, String)>, String> {
-    let out = std::process::Command::new("git")
+    let out = krill_proto::os::background_command("git")
         .arg("-C")
         .arg(repo)
         .args(["worktree", "list", "--porcelain"])
@@ -568,7 +568,7 @@ fn shown(key: &str) -> String {
 
 fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
     let key = krill_proto::orchestration::worktree_key(root);
-    let branch = std::process::Command::new("git")
+    let branch = krill_proto::os::background_command("git")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])

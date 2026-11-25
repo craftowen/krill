@@ -551,7 +551,7 @@ fn fetch_remote_icon_to_cache(
             return None;
         }
     }
-    let mut cmd = std::process::Command::new(system_curl());
+    let mut cmd = krill_proto::os::background_command(system_curl());
     cmd.args([
         "-fsSL",
         "--proto",
@@ -567,11 +567,6 @@ fn fetch_remote_icon_to_cache(
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x0800_0000);
-    }
     let retry_after = match cmd.output() {
         Ok(out) if out.status.success() => match write_cached_icon_bytes(&target, &out.stdout) {
             Ok(()) => return inspect_icon_file(&target),

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::control::CaptureFormat;
@@ -66,11 +66,7 @@ fn precheck_shell() -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        let mut git = Command::new("git");
-        {
-            use std::os::windows::process::CommandExt as _;
-            git.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
+        let mut git = krill_proto::os::background_command("git");
         let out = git
             .args(["var", "GIT_SHELL_PATH"])
             .stdin(Stdio::null())
@@ -110,7 +106,7 @@ pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -
         Ok(shell) => shell,
         Err(e) => return failed(format!("precheck failed: {e}")),
     };
-    let mut process = Command::new(&shell);
+    let mut process = krill_proto::os::background_command(&shell);
     #[cfg(windows)]
     if let Some(bin) = shell.parent() {
         // Git's `cmd` PATH entry does not expose sh utilities such as sleep and grep.

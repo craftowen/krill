@@ -805,12 +805,7 @@ pub fn preflight(path: &Path) -> io::Result<()> {
     if !valid_magic {
         return Err(io::Error::from_raw_os_error(8)); // ENOEXEC
     }
-    let mut command = Command::new(path);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    let mut command = crate::os::background_command(path);
     let status = command
         .env_clear()
         .stdin(Stdio::null())

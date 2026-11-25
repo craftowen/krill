@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1124,12 +1124,7 @@ fn curl_response(config: &str) -> Option<HttpResponse> {
 }
 
 pub(super) fn curl_exchange(config: &str, max_time_secs: &str) -> Result<HttpResponse, CurlError> {
-    let mut command = Command::new(system_curl());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000);
-    }
+    let mut command = krill_proto::os::background_command(system_curl());
     let mut child = command
         .args([
             "-q",
@@ -1663,7 +1658,7 @@ pub(crate) fn is_json_object_credential(raw: &[u8]) -> bool {
 // krilld가 SecItem으로 직접 읽으면 macOS가 매번 로그인 키체인 암호를 묻는다 — Orca처럼 같은 도구로 읽는다.
 #[cfg(all(not(test), not(windows)))]
 fn keychain(service: &str, account: &str) -> Option<Zeroizing<Vec<u8>>> {
-    let mut cmd = Command::new("/usr/bin/security");
+    let mut cmd = krill_proto::os::background_command("/usr/bin/security");
     cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
     let (status, stdout) = accounts::agy_native::run_command_with_timeout(
         &mut cmd,
@@ -1710,12 +1705,7 @@ fn pipe_command(
     args: &[&str],
     input: &[u8],
 ) -> Option<Zeroizing<Vec<u8>>> {
-    let mut command = Command::new(exe);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    let mut command = krill_proto::os::background_command(exe);
     let mut child = command
         .args(args)
         .stdin(Stdio::piped())
@@ -1862,7 +1852,7 @@ fn parse_codex_backend(text: &str) -> Usage {
 pub(crate) mod agy {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -2556,7 +2546,7 @@ pub(crate) mod agy {
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(RunAgyError::Stopped);
         }
-        let mut cmd = Command::new(exe);
+        let mut cmd = krill_proto::os::background_command(exe);
         cmd.args(args)
             .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
             .stdin(Stdio::null())

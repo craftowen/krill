@@ -646,7 +646,7 @@ fn stdout(out: Output, what: &str) -> Result<Vec<u8>, String> {
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
     let envs = super::compat::environment_in(q, wt)?;
     let shell = super::script_shell(q, wt)?;
-    let mut cmd = std::process::Command::new(shell);
+    let mut cmd = krill_proto::os::background_command(shell);
     crate::child::own_group(&mut cmd)
         .arg("-c")
         .arg(script)

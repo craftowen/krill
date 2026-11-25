@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read as _, Write as _};
 use std::os::windows::io::AsHandle as _;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ExitCode, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,7 +50,7 @@ pub(crate) fn session_agent_process(root: u32) -> Option<u32> {
 }
 
 fn probe(root: u32) -> io::Result<Vec<u32>> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = krill_proto::os::background_command(std::env::current_exe()?);
     command
         .args(["--console-members", &root.to_string()])
         .stdin(Stdio::null())

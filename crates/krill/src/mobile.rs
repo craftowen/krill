@@ -372,7 +372,7 @@ fn account(action: &str, json: bool) -> io::Result<()> {
         } else {
             println!("Approve this device in your browser:\n{url}");
         }
-        let mut browser = std::process::Command::new(if cfg!(target_os = "macos") {
+        let mut browser = krill_proto::os::background_command(if cfg!(target_os = "macos") {
             "open"
         } else if cfg!(windows) {
             "rundll32.exe"
@@ -380,12 +380,7 @@ fn account(action: &str, json: bool) -> io::Result<()> {
             "xdg-open"
         });
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            browser
-                .creation_flags(0x0800_0000)
-                .arg("url.dll,FileProtocolHandler");
-        }
+        browser.arg("url.dll,FileProtocolHandler");
         browser
             .arg(url)
             .stdin(std::process::Stdio::null())
