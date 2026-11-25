@@ -748,24 +748,30 @@ pub fn list_suggestions(
     bot_id: Option<&BotId>,
     include_dismissed: bool,
 ) -> io::Result<Vec<BotSuggestion>> {
-    let bots = match bot_id {
-        Some(id) => vec![store.get_bot(id)?.ok_or_else(|| {
-            io::Error::new(
+    if let Some(id) = bot_id {
+        if store.get_bot(id)?.is_none() {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("bot not found: {}", id.as_str()),
-            )
-        })?],
-        None => store.list_bots()?,
-    };
-    let mut out = Vec::new();
-    for bot in &bots {
-        let list = store.load_suggestions(&bot.id).unwrap_or_default();
-        for sugg in list {
-            if include_dismissed || !sugg.dismissed {
-                out.push(sugg);
-            }
+            ));
         }
+        let mut out: Vec<BotSuggestion> = store
+            .load_suggestions(id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|sugg| include_dismissed || !sugg.dismissed)
+            .collect();
+        out.sort_by_key(|a| std::cmp::Reverse(a.created_at_ms));
+        return Ok(out);
     }
+    let active_ids: std::collections::HashSet<BotId> =
+        store.list_bots()?.into_iter().map(|b| b.id).collect();
+    let mut out: Vec<BotSuggestion> = store
+        .load_all_suggestions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sugg| active_ids.contains(&sugg.bot_id) && (include_dismissed || !sugg.dismissed))
+        .collect();
     out.sort_by_key(|a| std::cmp::Reverse(a.created_at_ms));
     Ok(out)
 }

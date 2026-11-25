@@ -165,6 +165,25 @@ impl BotItemsStore {
         )
     }
 
+    /// Fast count of active `needs_you` items (excluding actively snoozed) without hydrating rows or events.
+    pub fn count_needs_you(&self, now_ms: u64) -> io::Result<usize> {
+        if !self.db_path.exists() && !self.is_open() {
+            return Ok(0);
+        }
+        self.with_conn(|conn| {
+            let count_i64: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM items \
+                     WHERE status = 'needs_you' \
+                     AND (snoozed_until_ms IS NULL OR snoozed_until_ms <= ?1)",
+                    params![u64_to_i64(now_ms)],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            Ok(usize::try_from(count_i64.max(0)).unwrap_or(0))
+        })
+    }
+
     /// Paginated item list with optional status/bucket filter (`needs_you`, `closed`, `snoozed`, etc.).
     #[expect(clippy::too_many_arguments, reason = "paginated filtered item query")]
     pub fn list_items_page_filtered(
@@ -176,6 +195,34 @@ impl BotItemsStore {
         limit: Option<u32>,
         cursor: Option<&str>,
         now_ms: u64,
+    ) -> io::Result<BotItemsPage> {
+        self.list_items_page_filtered_opts(
+            bot_id,
+            status_filter,
+            include_closed,
+            include_snoozed,
+            limit,
+            cursor,
+            now_ms,
+            true,
+        )
+    }
+
+    /// Paginated item list with optional status/bucket filter and optional `unseen_count` calculation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "paginated filtered item query with unseen toggle"
+    )]
+    pub fn list_items_page_filtered_opts(
+        &self,
+        bot_id: Option<&BotId>,
+        status_filter: Option<BotItemsStatusFilter>,
+        include_closed: bool,
+        include_snoozed: bool,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+        now_ms: u64,
+        include_unseen: bool,
     ) -> io::Result<BotItemsPage> {
         if !self.db_path.exists() && !self.is_open() {
             return Ok(BotItemsPage::default());
@@ -239,21 +286,25 @@ impl BotItemsStore {
                 .map_err(sql_err)?;
             let total_count = usize::try_from(total_i64.max(0)).unwrap_or(0);
 
-            let unseen_sql = format!(
-                "SELECT COUNT(*) FROM items i{where_clause} AND EXISTS (\
-                    SELECT 1 FROM item_events e \
-                    WHERE e.item_uid = i.uid \
-                    AND e.id > COALESCE((SELECT last_seen_event_id FROM items_seen s WHERE s.bot_id = i.owner_bot_id), 0)\
-                )"
-            );
-            let unseen_i64: i64 = conn
-                .query_row(
-                    &unseen_sql,
-                    rusqlite::params_from_iter(base_bind.clone()),
-                    |row| row.get(0),
-                )
-                .map_err(sql_err)?;
-            let unseen_count = usize::try_from(unseen_i64.max(0)).unwrap_or(0);
+            let unseen_count = if include_unseen {
+                let unseen_sql = format!(
+                    "SELECT COUNT(*) FROM items i{where_clause} AND EXISTS (\
+                        SELECT 1 FROM item_events e \
+                        WHERE e.item_uid = i.uid \
+                        AND e.id > COALESCE((SELECT last_seen_event_id FROM items_seen s WHERE s.bot_id = i.owner_bot_id), 0)\
+                    )"
+                );
+                let unseen_i64: i64 = conn
+                    .query_row(
+                        &unseen_sql,
+                        rusqlite::params_from_iter(base_bind.clone()),
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_err)?;
+                usize::try_from(unseen_i64.max(0)).unwrap_or(0)
+            } else {
+                0
+            };
 
             let mut page_sql = format!(
                 "SELECT uid, number, owner_bot_id, title, description, done_means, status, \
@@ -1315,6 +1366,9 @@ fn open_and_migrate(path: &PathBuf) -> io::Result<Connection> {
              UNIQUE(owner_bot_id, number)\n\
          );\n\
          CREATE INDEX IF NOT EXISTS idx_items_bot_status ON items(owner_bot_id, status);\n\
+         CREATE INDEX IF NOT EXISTS idx_items_activity ON items(last_activity_at_ms DESC, uid DESC);\n\
+         CREATE INDEX IF NOT EXISTS idx_items_status_activity ON items(status, last_activity_at_ms DESC, uid DESC);\n\
+         CREATE INDEX IF NOT EXISTS idx_items_bot_activity ON items(owner_bot_id, last_activity_at_ms DESC, uid DESC);\n\
          CREATE TABLE IF NOT EXISTS item_links (\n\
              id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
              item_uid TEXT NOT NULL REFERENCES items(uid) ON DELETE CASCADE,\n\
@@ -3435,6 +3489,92 @@ mod tests {
         assert_eq!(done.status, BotItemStatus::Done);
         assert_eq!(done.waiting_reason, None);
         assert_eq!(done.waiting_since_ms, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn count_needs_you_excludes_snoozed_and_closed_items() {
+        let dir = std::env::temp_dir().join(format!(
+            "krill-bot-items-count-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = BotItemsStore::new(dir.join("items.sqlite"));
+        let b1 = BotId::new("bot-count").unwrap();
+        let owner = BotItemActor::Owner { device: None };
+        // 1 active needs_you
+        store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: b1.clone(),
+                    title: "Needs decision".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                    waiting_reason: None,
+                },
+                &owner,
+                1_000,
+            )
+            .unwrap();
+        // 1 snoozed needs_you (snoozed until 10_000)
+        let snoozed = store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: b1.clone(),
+                    title: "Snoozed decision".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::NeedsYou),
+                    links: Vec::new(),
+                    waiting_reason: None,
+                },
+                &owner,
+                1_100,
+            )
+            .unwrap();
+        store
+            .update_item(
+                &UpdateBotItemParams {
+                    item_id: snoozed.uid,
+                    title: None,
+                    description: None,
+                    done_means: None,
+                    status: None,
+                    comment: None,
+                    decisions: Vec::new(),
+                    close_note: None,
+                    snoozed_until_ms: FieldPatch::Set(10_000),
+                    waiting_reason: None,
+                },
+                &owner,
+                1_200,
+            )
+            .unwrap();
+        // 1 working item
+        store
+            .create_item(
+                &CreateBotItemParams {
+                    bot_id: b1,
+                    title: "Working task".to_owned(),
+                    description: None,
+                    done_means: None,
+                    status: Some(BotItemStatus::Working),
+                    links: Vec::new(),
+                    waiting_reason: None,
+                },
+                &owner,
+                1_300,
+            )
+            .unwrap();
+
+        assert_eq!(store.count_needs_you(5_000).unwrap(), 1);
+        assert_eq!(store.count_needs_you(10_001).unwrap(), 2);
 
         fs::remove_dir_all(&dir).ok();
     }

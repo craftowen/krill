@@ -157,15 +157,259 @@ typeof b64 === "string" &&
 b64.length > 0 &&
 /^[A-Za-z0-9+/=]+$/.test(b64);
 const BOTS_ITEM_WAITING_CAPABILITY = "bots.item-waiting.v1";
+const resolveHostConn = (ctx, hostId) => {
+const conns = Array.isArray(ctx.connections) ? ctx.connections : ctx.getConnections?.() || [];
+return hostId ? conns.find((c) => c.id === hostId) : conns.find((c) => c.active) || conns[0] || null;
+};
 const hostSupportsItemWaiting = (ctx, hostId) => {
-const conns = Array.isArray(ctx.connections) ? ctx.connections : [];
-const conn = hostId ? conns.find((c) => c.id === hostId) : conns.find((c) => c.active) || conns[0];
+const conn = resolveHostConn(ctx, hostId);
 return Boolean(conn?.snapshot?.capabilities?.bots_item_waiting || (!hostId && ctx.state?.snapshot?.capabilities?.bots_item_waiting));
+};
+const hostSupportsBotsBundle = (ctx, hostId) => {
+const conn = resolveHostConn(ctx, hostId);
+return Boolean(conn?.snapshot?.capabilities?.bots_bundle || (!hostId && ctx.state?.snapshot?.capabilities?.bots_bundle));
 };
 const withWaitingCap = (ctx, hostId, req) =>
 hostSupportsItemWaiting(ctx, hostId)
 ? { ...req, capabilities: [BOTS_ITEM_WAITING_CAPABILITY] }
 : req;
+// Credential-scoped SWR cache + bounded localStorage cold-boot seed for #/bots, #/bots/:id, and #/up-next.
+const BOTS_SEED_PREFIX = "krill-mobile-bots-seed-v1:";
+const BOTS_SEED_TTL_MS = 24 * 60 * 60 * 1000;
+const BOTS_SEED_MAX_AVATAR_B64 = 180 * 1024;
+const BOTS_SEED_MAX_JSON = 180 * 1024;
+const botsCacheBuckets = new Map();
+const safeStorageGet = (key) => {
+try {
+return globalThis.localStorage?.getItem?.(key) ?? null;
+} catch {
+return null;
+}
+};
+const safeStorageSet = (key, value) => {
+try {
+globalThis.localStorage?.setItem?.(key, value);
+} catch {}
+};
+const safeStorageRemove = (key) => {
+try {
+globalThis.localStorage?.removeItem?.(key);
+} catch {}
+};
+function loadBotsSeed(bucket) {
+if (!bucket.persistable || bucket.seeded) return;
+bucket.seeded = true;
+const raw = safeStorageGet(`${BOTS_SEED_PREFIX}${bucket.hostId}`);
+if (!raw) return;
+try {
+const parsed = JSON.parse(raw);
+if (!parsed || typeof parsed !== "object" || parsed.scope !== bucket.scope) return;
+if (!Number.isFinite(parsed.savedAt) || Date.now() - parsed.savedAt > BOTS_SEED_TTL_MS) {
+safeStorageRemove(`${BOTS_SEED_PREFIX}${bucket.hostId}`);
+return;
+}
+if (parsed.hub && typeof parsed.hub === "object") {
+bucket.hub = {
+bots: Array.isArray(parsed.hub.bots) ? parsed.hub.bots : [],
+cursor: parsed.hub.cursor || null,
+items: Array.isArray(parsed.hub.items) ? parsed.hub.items : [],
+requests: Array.isArray(parsed.hub.requests) ? parsed.hub.requests : [],
+statuses: Array.isArray(parsed.hub.statuses) ? parsed.hub.statuses : [],
+groups: Array.isArray(parsed.hub.groups) ? parsed.hub.groups : [],
+sessions: Array.isArray(parsed.hub.sessions) ? parsed.hub.sessions : [],
+etag: typeof parsed.hub.etag === "string" ? parsed.hub.etag : null,
+at: Number(parsed.hub.at) || parsed.savedAt,
+};
+}
+if (parsed.avatars && typeof parsed.avatars === "object") {
+for (const [bid, av] of Object.entries(parsed.avatars)) {
+if (av && isSafeAvatarSrc(av.mime, av.data_base64)) bucket.avatars.set(bid, av);
+}
+}
+if (parsed.activeSessions && typeof parsed.activeSessions === "object") {
+for (const [bid, sid] of Object.entries(parsed.activeSessions)) {
+const n = Number(sid);
+if (Number.isSafeInteger(n) && n > 0) bucket.activeSessions.set(bid, n);
+}
+}
+} catch {}
+}
+function saveBotsSeed(bucket) {
+if (!bucket?.persistable) return;
+const avatarsObj = {};
+let avatarBytes = 0;
+let avatarCount = 0;
+for (const [bid, av] of bucket.avatars.entries()) {
+if (!av || !isSafeAvatarSrc(av.mime, av.data_base64)) continue;
+if (avatarCount >= 16 || avatarBytes + av.data_base64.length > BOTS_SEED_MAX_AVATAR_B64) break;
+avatarsObj[bid] = { bot_id: av.bot_id || bid, mime: av.mime, data_base64: av.data_base64 };
+avatarBytes += av.data_base64.length;
+avatarCount++;
+}
+const activeSessionsObj = {};
+let sessCount = 0;
+for (const [bid, sid] of bucket.activeSessions.entries()) {
+if (sessCount >= 50) break;
+if (Number.isSafeInteger(sid) && sid > 0) {
+activeSessionsObj[bid] = sid;
+sessCount++;
+}
+}
+const hubSeed = bucket.hub
+? {
+bots: (bucket.hub.bots || []).slice(0, 50),
+cursor: bucket.hub.cursor || null,
+items: (bucket.hub.items || []).slice(0, 40),
+requests: (bucket.hub.requests || []).slice(0, 30),
+statuses: (bucket.hub.statuses || []).slice(0, 50),
+groups: (bucket.hub.groups || []).slice(0, 50),
+sessions: (bucket.hub.sessions || []).slice(0, 100),
+etag: bucket.hub.etag || null,
+at: bucket.hub.at || Date.now(),
+}
+: null;
+const buildPayload = (withAvatars, withItems) =>
+JSON.stringify({
+scope: bucket.scope,
+savedAt: Date.now(),
+hub: hubSeed ? { ...hubSeed, ...(withItems ? {} : { items: [] }) } : null,
+avatars: withAvatars ? avatarsObj : {},
+activeSessions: activeSessionsObj,
+});
+let serialized = buildPayload(true, true);
+if (serialized.length > BOTS_SEED_MAX_JSON) serialized = buildPayload(false, true);
+if (serialized.length > BOTS_SEED_MAX_JSON) serialized = buildPayload(false, false);
+if (serialized.length <= BOTS_SEED_MAX_JSON) {
+safeStorageSet(`${BOTS_SEED_PREFIX}${bucket.hostId}`, serialized);
+}
+}
+function botsCacheBucket(ctx, hostId) {
+const conn = resolveHostConn(ctx, hostId);
+const hid = hostId ?? conn?.id ?? "local";
+const realScope = typeof conn?.cacheScope === "string" && conn.cacheScope ? conn.cacheScope : null;
+const scope = realScope || (conn?.id ? `id:${conn.id}` : "local");
+const key = `${hid}\0${scope}`;
+let bucket = botsCacheBuckets.get(key);
+if (!bucket) {
+// Evict any prior scope for the same hostId when credentials rotate.
+for (const [existingKey, existing] of botsCacheBuckets.entries()) {
+if (existing.hostId === hid) botsCacheBuckets.delete(existingKey);
+}
+bucket = {
+hostId: hid,
+scope,
+persistable: Boolean(realScope),
+seeded: false,
+hub: null,
+details: new Map(),
+todos: new Map(),
+avatars: new Map(),
+avatarInFlight: new Set(),
+activeSessions: new Map(),
+};
+botsCacheBuckets.set(key, bucket);
+loadBotsSeed(bucket);
+}
+return bucket;
+}
+function invalidateBotsCache(ctx, hostId, botId) {
+const bucket = botsCacheBucket(ctx, hostId);
+if (bucket.hub) bucket.hub.etag = null;
+for (const td of bucket.todos.values()) td.etag = null;
+for (const [k, d] of bucket.details.entries()) {
+if (!botId || k.startsWith(`${botId}:`)) d.etag = null;
+}
+}
+function rememberActiveSessions(bucket, sessions) {
+if (!bucket || !Array.isArray(sessions)) return;
+const seenBots = new Set();
+for (const s of sessions) {
+if (!s?.bot_id) continue;
+if (s.live && Number.isSafeInteger(Number(s.session_id)) && Number(s.session_id) > 0 && !seenBots.has(s.bot_id)) {
+seenBots.add(s.bot_id);
+bucket.activeSessions.set(s.bot_id, Number(s.session_id));
+}
+}
+}
+function fetchMissingAvatars(ctx, hostId, botList, onLoaded) {
+const bucket = botsCacheBucket(ctx, hostId);
+const missing = [];
+const seen = new Set();
+for (const b of botList || []) {
+if (!b?.id || !b.avatar || seen.has(b.id)) continue;
+if (bucket.avatars.has(b.id) || bucket.avatarInFlight.has(b.id)) continue;
+seen.add(b.id);
+missing.push(b.id);
+}
+if (!missing.length) return;
+if (hostSupportsBotsBundle(ctx, hostId)) {
+const runBatch = (ids) => {
+const batch = ids.slice(0, 32);
+const rest = ids.slice(32);
+for (const id of batch) bucket.avatarInFlight.add(id);
+rpcHost(ctx, hostId, { action: "bots.avatars.read", bot_ids: batch })
+.then((res) => {
+let changed = false;
+const map = res?.avatars && typeof res.avatars === "object" ? res.avatars : {};
+const remaining = Array.isArray(res?.remaining) ? res.remaining.filter((x) => typeof x === "string") : [];
+const remSet = new Set(remaining);
+for (const id of batch) {
+bucket.avatarInFlight.delete(id);
+if (remSet.has(id)) continue;
+const av = map[id];
+if (av && isSafeAvatarSrc(av.mime, av.data_base64)) {
+bucket.avatars.set(id, av);
+changed = true;
+} else {
+bucket.avatars.set(id, null);
+}
+}
+if (changed) saveBotsSeed(bucket);
+if (!ctx.signal.aborted && changed) onLoaded();
+const nextIds = [...remaining, ...rest].filter((id) => !bucket.avatars.has(id) && !bucket.avatarInFlight.has(id));
+if (!ctx.signal.aborted && nextIds.length) runBatch(nextIds);
+})
+.catch(() => {
+for (const id of batch) bucket.avatarInFlight.delete(id);
+});
+};
+runBatch(missing);
+return;
+}
+for (const id of missing) {
+bucket.avatarInFlight.add(id);
+rpcHost(ctx, hostId, { action: "bots.avatar.read", bot_id: id })
+.then((av) => {
+bucket.avatarInFlight.delete(id);
+if (av && isSafeAvatarSrc(av.mime, av.data_base64)) {
+bucket.avatars.set(id, av);
+saveBotsSeed(bucket);
+if (!ctx.signal.aborted) onLoaded();
+} else {
+bucket.avatars.set(id, null);
+}
+})
+.catch(() => {
+bucket.avatarInFlight.delete(id);
+});
+}
+}
+M.botsCache = {
+clearHost(hostId) {
+if (hostId === undefined || hostId === null) {
+for (const bucket of botsCacheBuckets.values()) {
+safeStorageRemove(`${BOTS_SEED_PREFIX}${bucket.hostId}`);
+}
+botsCacheBuckets.clear();
+return;
+}
+for (const [k, bucket] of botsCacheBuckets.entries()) {
+if (bucket.hostId === hostId) botsCacheBuckets.delete(k);
+}
+safeStorageRemove(`${BOTS_SEED_PREFIX}${hostId}`);
+},
+invalidate: invalidateBotsCache,
+};
 const statusTone = (status) => {
 if (status === "needs_you") return "waiting";
 if (status === "waiting") return "item-waiting";
@@ -2096,21 +2340,69 @@ groupView = null;
 lastGroupDraftKey = null;
 };
 const hostSig = () => botHosts().map((h) => h.id ?? "local").sort().join(",");
+const syncAvatarsFromCache = (hosts) => {
+for (const h of hosts) {
+const bucket = botsCacheBucket(ctx, h.id);
+for (const [bid, av] of bucket.avatars.entries()) {
+const avKey = h.id ? `${h.id}:${bid}` : bid;
+if (av) avatars.set(avKey, av);
+}
+}
+};
 const fetchAvatars = (listItems) => {
+const byHost = new Map();
 for (const b of listItems) {
-const avKey = b._hostId ? `${b._hostId}:${b.id}` : b.id;
-if (b.avatar && !avatars.has(avKey)) {
-avatars.set(avKey, null);
-rpcHost(ctx, b._hostId, { action: "bots.avatar.read", bot_id: b.id })
-.then((av) => {
-if (!ctx.signal.aborted && av) {
-avatars.set(avKey, av);
+const hid = b._hostId ?? null;
+let arr = byHost.get(hid);
+if (!arr) {
+arr = [];
+byHost.set(hid, arr);
+}
+arr.push(b);
+}
+for (const [hid, hostBots] of byHost.entries()) {
+fetchMissingAvatars(ctx, hid, hostBots, () => {
+syncAvatarsFromCache([{ id: hid }]);
 draw();
+});
 }
-})
-.catch(() => {});
+};
+const hydrateHubFromCache = () => {
+const f = filteredHosts();
+const hosts = f.length ? f.filter((h) => !h.connection?.blocked) : [{ id: null, name: ctx.state.snapshot?.host?.display_name || "" }];
+const tag = (h, arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+const hydratedBots = [];
+const hydratedItems = [];
+const hydratedReqs = [];
+const hydratedStats = [];
+const hydratedGroups = [];
+const hydratedSessions = [];
+let anyCached = false;
+botsCursors.clear();
+for (const h of hosts) {
+const bucket = botsCacheBucket(ctx, h.id);
+syncAvatarsFromCache([h]);
+if (!bucket.hub) continue;
+anyCached = true;
+hydratedBots.push(...tag(h, bucket.hub.bots));
+if (bucket.hub.cursor) {
+botsCursors.set(h.id ?? null, { hostId: h.id ?? null, hostName: h.name || "", cursor: bucket.hub.cursor });
 }
+hydratedItems.push(...tag(h, bucket.hub.items));
+hydratedReqs.push(...tag(h, bucket.hub.requests));
+hydratedStats.push(...tag(h, bucket.hub.statuses));
+hydratedGroups.push(...tag(h, bucket.hub.groups));
+hydratedSessions.push(...tag(h, bucket.hub.sessions));
 }
+if (!anyCached) return false;
+bots = hydratedBots;
+items = hydratedItems;
+requests = hydratedReqs;
+statuses = hydratedStats;
+groups = hydratedGroups;
+botSessions = hydratedSessions;
+loaded = true;
+return true;
 };
 async function loadGroup(groupId, threadId, hostId = activeGroupHost) {
 if (!ready() || !groupId) return;
@@ -2141,6 +2433,9 @@ const hostChanged = Boolean(prevHostSig && prevHostSig !== lastHostSig);
 if (!targets.length) {
 ++loadSeq;
 loading = false;
+clearActiveGroup();
+const hasCachedHost = filteredHosts().some((h) => h.cached && !h.connection?.blocked);
+if (!hasCachedHost || !hydrateHubFromCache()) {
 bots = [];
 items = [];
 requests = [];
@@ -2148,12 +2443,14 @@ statuses = [];
 groups = [];
 botSessions = [];
 botsCursors.clear();
-clearActiveGroup();
 loaded = true;
+}
 draw();
 return;
 }
 if (hostChanged) {
+clearActiveGroup();
+if (!hydrateHubFromCache()) {
 bots = [];
 items = [];
 requests = [];
@@ -2161,7 +2458,10 @@ statuses = [];
 groups = [];
 botSessions = [];
 botsCursors.clear();
-clearActiveGroup();
+}
+}
+if (reset) {
+for (const h of targets) invalidateBotsCache(ctx, h.id);
 }
 const seq = ++loadSeq;
 loading = true;
@@ -2170,6 +2470,54 @@ draw();
 try {
 const settled = await Promise.allSettled(
 targets.map(async (h) => {
+const bucket = botsCacheBucket(ctx, h.id);
+const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+if (hostSupportsBotsBundle(ctx, h.id)) {
+const prevHub = bucket.hub;
+const req = withWaitingCap(ctx, h.id, {
+action: "bots.hub",
+limit: 50,
+...(!reset && prevHub?.etag ? { since: prevHub.etag } : {}),
+});
+const res = await rpcHost(ctx, h.id, req);
+if (res?.unchanged && prevHub) {
+prevHub.at = Date.now();
+return {
+host: h,
+bots: tag(prevHub.bots),
+cursor: prevHub.cursor || null,
+items: tag(prevHub.items),
+requests: tag(prevHub.requests),
+statuses: tag(prevHub.statuses),
+groups: tag(prevHub.groups),
+sessions: tag(prevHub.sessions),
+};
+}
+const nextHub = {
+bots: res?.bots || [],
+cursor: res?.bots_next_cursor || null,
+items: res?.items || [],
+requests: res?.requests || [],
+statuses: res?.statuses || [],
+groups: res?.groups || [],
+sessions: res?.sessions || [],
+etag: typeof res?.etag === "string" ? res.etag : null,
+at: Date.now(),
+};
+bucket.hub = nextHub;
+rememberActiveSessions(bucket, nextHub.sessions);
+saveBotsSeed(bucket);
+return {
+host: h,
+bots: tag(nextHub.bots),
+cursor: nextHub.cursor,
+items: tag(nextHub.items),
+requests: tag(nextHub.requests),
+statuses: tag(nextHub.statuses),
+groups: tag(nextHub.groups),
+sessions: tag(nextHub.sessions),
+};
+}
 const [botsRes, itemsRes, accessRes, statusRes, groupRes, sessRes] = await Promise.all([
 rpcHost(ctx, h.id, { action: "bots.list", limit: 50 }),
 fetchBotItemsWithStatus(
@@ -2183,16 +2531,29 @@ rpcHost(ctx, h.id, { action: "bots.connectors.status" }),
 rpcHost(ctx, h.id, { action: "bots.groups.list", limit: 50 }),
 rpcHost(ctx, h.id, { action: "bots.sessions.list" }).catch(() => ({ sessions: [] })),
 ]);
-const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+const nextHub = {
+bots: botsRes?.bots || [],
+cursor: botsRes?.next_cursor || null,
+items: itemsRes?.items || [],
+requests: accessRes?.requests || [],
+statuses: statusRes?.statuses || [],
+groups: groupRes?.groups || [],
+sessions: sessRes?.sessions || [],
+etag: null,
+at: Date.now(),
+};
+bucket.hub = nextHub;
+rememberActiveSessions(bucket, nextHub.sessions);
+saveBotsSeed(bucket);
 return {
 host: h,
-bots: tag(botsRes?.bots),
-cursor: botsRes?.next_cursor || null,
-items: tag(itemsRes?.items),
-requests: tag(accessRes?.requests),
-statuses: tag(statusRes?.statuses),
-groups: tag(groupRes?.groups),
-sessions: tag(sessRes?.sessions),
+bots: tag(nextHub.bots),
+cursor: nextHub.cursor,
+items: tag(nextHub.items),
+requests: tag(nextHub.requests),
+statuses: tag(nextHub.statuses),
+groups: tag(nextHub.groups),
+sessions: tag(nextHub.sessions),
 };
 }),
 );
@@ -2223,6 +2584,7 @@ requests = perHost.flatMap((r) => r.requests);
 statuses = perHost.flatMap((r) => r.statuses);
 groups = perHost.flatMap((r) => r.groups);
 botSessions = perHost.flatMap((r) => r.sessions);
+syncAvatarsFromCache(perHost.map((r) => r.host));
 loaded = true;
 const matchedGroup = activeGroupId
 ? groups.find((g) => g.id === activeGroupId && (!activeGroupHost || (g._hostId ?? null) === (activeGroupHost ?? null)))
@@ -2233,7 +2595,6 @@ await loadGroup(matchedGroup.id, activeThreadId, activeGroupHost).catch(() => {}
 } else if (activeGroupId) {
 clearActiveGroup();
 }
-fetchAvatars(bots);
 } else if (reset || hostChanged) {
 bots = [];
 items = [];
@@ -2256,6 +2617,7 @@ failure = safeMsg(e, t);
 if (!ctx.signal.aborted && seq === loadSeq) {
 loading = false;
 draw();
+if (bots.length && ready()) Promise.resolve().then(() => !ctx.signal.aborted && fetchAvatars(bots));
 }
 }
 }
@@ -2549,7 +2911,7 @@ const groupOpen = !!(activeGroupId && groupView);
 if (groupOpen) {
 nodes.push(renderGroupPanel());
 if (!isLegacyOnly && ready()) {
-nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(false), multiHost: multiHost(), targetHosts: botHosts() }));
+nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => { for (const h of botHosts()) invalidateBotsCache(ctx, h.id); return load(false); }, multiHost: multiHost(), targetHosts: botHosts() }));
 }
 } else {
 // Top 1-line conditional banner (shown only when >=1 attention item)
@@ -2577,7 +2939,7 @@ onNext: () => {
 deckIndex++;
 draw();
 },
-onReload: () => load(false),
+onReload: () => { for (const h of botHosts()) invalidateBotsCache(ctx, h.id); return load(false); },
 onOpenBot: (bid, hid) => openBotDetail(ctx, bid, hid, "work"),
 });
 if (deck) nodes.push(deck);
@@ -2700,12 +3062,13 @@ nodes.push(botsSec);
 const recentNode = renderRecentSessionsSection(hosts);
 if (recentNode) nodes.push(recentNode);
 if (!isLegacyOnly && ready()) {
-nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => load(false), multiHost: multiHost(), targetHosts: botHosts() }));
+nodes.push(accessCtrl.update({ requests, bots, ready, reload: () => { for (const h of botHosts()) invalidateBotsCache(ctx, h.id); return load(false); }, multiHost: multiHost(), targetHosts: botHosts() }));
 }
 }
 sync(list, nodes);
 restoreAnchor(list, anchor);
 }
+hydrateHubFromCache();
 load();
 return {
 update() {
@@ -2724,7 +3087,7 @@ const screen = el("section", undefined, "details bots bot-detail bot-workspace s
 const header = ctx.header(botId, "/bots", undefined, { raw: true });
 const headerSub = el("small", "", "header-sub");
 header.querySelector(".header-copy")?.append(headerSub);
-const refreshBtn = button(t("Refresh"), () => load(), "icon-button refresh-button", "activity");
+const refreshBtn = button(t("Refresh"), () => load(true), "icon-button refresh-button", "activity");
 header.append(refreshBtn);
 const railMount = el("div", undefined, "bot-workspace-rail");
 const tabBar = el("div", undefined, "bot-seg-tabs bot-workspace-tabs");
@@ -2928,12 +3291,59 @@ let lastKnownBotSession = null;
 let loaded = false;
 let wasReady = ready();
 const detailNoStatusHosts = new Set();
+const activeHostId = () => resolveHostConn(ctx, null)?.id ?? null;
+const detailFilterKey = () => `${botId}:${includeClosed ? 1 : 0}:${includeSnoozed ? 1 : 0}`;
+const syncAvatarsFromBucket = () => {
+const bucket = botsCacheBucket(ctx, activeHostId());
+for (const [bid, av] of bucket.avatars.entries()) {
+if (av) avatars.set(bid, av);
+}
+};
+const hydrateDetailFromCache = () => {
+const bucket = botsCacheBucket(ctx, activeHostId());
+syncAvatarsFromBucket();
+if (bucket.hub) {
+allBots = bucket.hub.bots || [];
+allItems = bucket.hub.items || [];
+allGroups = bucket.hub.groups || [];
+allBotSessions = bucket.hub.sessions || [];
+}
+const exact = bucket.details.get(detailFilterKey());
+if (exact) {
+bot = exact.bot || allBots.find((b) => b.id === botId) || null;
+items = exact.items || [];
+itemsCursor = exact.itemsCursor || null;
+statuses = exact.statuses || [];
+suggestions = exact.suggestions || [];
+requests = exact.requests || [];
+upcoming = exact.upcoming || null;
+botSessions = exact.sessions || allBotSessions.filter((s) => s.bot_id === botId);
+loaded = true;
+} else {
+bot = allBots.find((b) => b.id === botId) || null;
+botSessions = allBotSessions.filter((s) => s.bot_id === botId);
+}
+if (h1 && bot?.name) h1.textContent = bot.name;
+const liveForBot = botSessions.filter((s) => s.live);
+if (liveForBot.length) {
+activeSessionId = liveForBot[0].session_id;
+} else if (!activeSessionId && bucket.activeSessions.has(botId)) {
+activeSessionId = bucket.activeSessions.get(botId);
+}
+return Boolean(exact || bot || activeSessionId);
+};
 function ensureChatMounted() {
 const wantSid = Number(activeSessionId);
 const canMount = Number.isSafeInteger(wantSid) && wantSid > 0 && typeof M.chat?.mount === "function";
 if (!canMount) {
 unmountChat();
+if (loading && !loaded) {
+const box = el("div", undefined, "account-placeholder bot-chat-loading");
+box.append(el("span", undefined, "spinner"), el("p", t("Loading…")));
+chatStage.replaceChildren(box);
+} else {
 renderChatEmptyState();
+}
 return;
 }
 ensureBotSessionEntry(wantSid);
@@ -2969,8 +3379,9 @@ if (ctx.signal.aborted) return;
 const sid = Number(res?.session_id);
 if (!Number.isSafeInteger(sid) || sid <= 0) throw Error(t("Could not open bot chat"));
 activeSessionId = sid;
+botsCacheBucket(ctx, activeHostId()).activeSessions.set(botId, sid);
 await refreshHost(ctx, null).catch(() => {});
-await load();
+await load(true);
 } catch (error) {
 if (ctx.signal.aborted) return;
 const refusal = readBotRefusal(error);
@@ -2996,7 +3407,7 @@ async () => {
 await ctx.rpc({ action: "bots.update", bot_id: botId, paused: false });
 ctx.toast?.(t("Bot resumed"));
 await refreshHost(ctx, null).catch(() => {});
-await load();
+await load(true);
 },
 "primary",
 ),
@@ -3063,16 +3474,95 @@ soulLoading = false;
 if (!ctx.signal.aborted) draw();
 }
 }
-async function load() {
+async function load(force = false) {
 if (!ready()) {
 draw();
 return;
 }
+const hid = activeHostId();
+const bucket = botsCacheBucket(ctx, hid);
+if (force) invalidateBotsCache(ctx, hid, botId);
 const seq = ++loadSeq;
 loading = true;
 failure = null;
 draw();
 try {
+const fKey = detailFilterKey();
+if (hostSupportsBotsBundle(ctx, hid)) {
+const cachedDetail = bucket.details.get(fKey);
+const needRail = !bucket.hub || force || Date.now() - (bucket.hub.at || 0) > 15000;
+const etagKey = `${fKey}:${needRail ? 1 : 0}`;
+const wsReq = withWaitingCap(ctx, null, {
+action: "bots.workspace",
+bot_id: botId,
+include_closed: includeClosed,
+include_snoozed: includeSnoozed,
+include_rail: needRail,
+...(!force && cachedDetail?.etagKey === etagKey && cachedDetail?.etag ? { since: cachedDetail.etag } : {}),
+});
+const res = await ctx.rpc(wsReq);
+if (ctx.signal.aborted || seq !== loadSeq) return;
+if (!res?.unchanged) {
+bot = res?.bot || null;
+if (h1 && bot?.name) h1.textContent = bot.name;
+items = res?.items || [];
+itemsCursor = res?.items_next_cursor || null;
+statuses = res?.statuses || [];
+suggestions = res?.suggestions || [];
+requests = res?.requests || [];
+upcoming = res?.upcoming && typeof res.upcoming === "object" ? res.upcoming : null;
+const respSessions = res?.sessions || [];
+if (Array.isArray(res?.bots)) {
+allBots = res.bots;
+allItems = Array.isArray(res.all_items) ? res.all_items : items;
+allGroups = Array.isArray(res.groups) ? res.groups : allGroups;
+allBotSessions = respSessions;
+botSessions = allBotSessions.filter((s) => s.bot_id === botId);
+bucket.hub = {
+...(bucket.hub || {}),
+bots: allBots,
+items: allItems,
+groups: allGroups,
+sessions: allBotSessions,
+at: Date.now(),
+};
+rememberActiveSessions(bucket, allBotSessions);
+} else {
+botSessions = respSessions.filter((s) => s.bot_id === botId);
+allBotSessions = [...allBotSessions.filter((s) => s.bot_id !== botId), ...botSessions];
+if (bot && allBots.length) {
+allBots = allBots.map((b) => (b.id === bot.id ? bot : b));
+}
+if (bucket.hub) {
+bucket.hub.bots = allBots.length ? allBots : bucket.hub.bots;
+bucket.hub.sessions = allBotSessions;
+}
+}
+const liveForBot = botSessions.filter((s) => s.live);
+if (activeSessionId && !liveForBot.some((s) => Number(s.session_id) === Number(activeSessionId))) {
+activeSessionId = liveForBot[0]?.session_id ?? null;
+} else if (!activeSessionId && liveForBot.length) {
+activeSessionId = liveForBot[0].session_id;
+}
+if (activeSessionId) bucket.activeSessions.set(botId, Number(activeSessionId));
+else bucket.activeSessions.delete(botId);
+bucket.details.set(fKey, {
+bot,
+items,
+itemsCursor,
+statuses,
+suggestions,
+requests,
+upcoming,
+sessions: botSessions,
+etag: typeof res?.etag === "string" ? res.etag : null,
+etagKey,
+at: Date.now(),
+});
+saveBotsSeed(bucket);
+}
+loaded = true;
+} else {
 const [botsRes, itemsRes, allItemsRes, statusRes, sugRes, accRes, upRes, sessRes, grpRes] = await Promise.all([
 ctx.rpc({ action: "bots.list", limit: 100 }),
 ctx.rpc(withWaitingCap(ctx, null, {
@@ -3115,20 +3605,34 @@ activeSessionId = liveForBot[0]?.session_id ?? null;
 } else if (!activeSessionId && liveForBot.length) {
 activeSessionId = liveForBot[0].session_id;
 }
+if (activeSessionId) bucket.activeSessions.set(botId, Number(activeSessionId));
+else bucket.activeSessions.delete(botId);
+bucket.hub = {
+...(bucket.hub || {}),
+bots: allBots,
+items: allItems,
+groups: allGroups,
+sessions: allBotSessions,
+at: Date.now(),
+};
+rememberActiveSessions(bucket, allBotSessions);
+bucket.details.set(fKey, {
+bot,
+items,
+itemsCursor,
+statuses,
+suggestions,
+requests,
+upcoming,
+sessions: botSessions,
+etag: null,
+etagKey: null,
+at: Date.now(),
+});
+saveBotsSeed(bucket);
 loaded = true;
-for (const b of allBots) {
-if (b.avatar && !avatars.has(b.id)) {
-avatars.set(b.id, null);
-rpcHost(ctx, null, { action: "bots.avatar.read", bot_id: b.id })
-.then((av) => {
-if (!ctx.signal.aborted && av?.data_base64) {
-avatars.set(b.id, av);
-draw();
 }
-})
-.catch(() => {});
-}
-}
+syncAvatarsFromBucket();
 } catch (e) {
 if (ctx.signal.aborted || seq !== loadSeq) return;
 failure = safeMsg(e, t);
@@ -3136,6 +3640,17 @@ failure = safeMsg(e, t);
 if (!ctx.signal.aborted && seq === loadSeq) {
 loading = false;
 draw();
+// Schedule avatar batch fetch strictly AFTER draw()/ensureChatMounted() so chat_poll always runs first on the serial RPC queue.
+const avatarBots = allBots.length ? allBots : bot ? [bot] : [];
+if (avatarBots.length && ready()) {
+Promise.resolve().then(() => {
+if (ctx.signal.aborted || !ready()) return;
+fetchMissingAvatars(ctx, activeHostId(), avatarBots, () => {
+syncAvatarsFromBucket();
+draw();
+});
+});
+}
 }
 }
 }
@@ -3177,7 +3692,7 @@ status: "planned",
 });
 ctx.closeSheet?.();
 ctx.toast?.(t("Item created"));
-await load();
+await load(true);
 };
 body.append(titleInput, descInput, button(t("Create Item"), create, "primary"));
 });
@@ -3309,7 +3824,7 @@ ctx.toast?.(refusal || t("Saved"), refusal ? 3000 : undefined);
 ctx.toast?.(t("Saved"));
 }
 await refreshHost(ctx, null).catch(() => {});
-await load();
+await load(true);
 };
 body.append(
 el("label", t("Agent"), "sheet-field-label"),
@@ -3425,7 +3940,7 @@ t("Stop"),
 async () => {
 await ctx.rpc({ action: "bots.sessions.stop", bot_id: botId, session_id: Number(primary.session_id) });
 ctx.toast?.(t("Session stopped"));
-await load();
+await load(true);
 },
 "ghost small",
 );
@@ -3445,7 +3960,7 @@ onNext: () => {
 deckIndex++;
 draw();
 },
-onReload: () => load(),
+onReload: () => load(true),
 });
 if (deck) topNodes.push(deck);
 sync(chatTop, topNodes);
@@ -3464,7 +3979,7 @@ items,
 bots: bot ? [bot] : [],
 showBot: false,
 ready,
-onReload: load,
+onReload: () => load(true),
 cardMap,
 container: itemsWrap,
 collapsible: true,
@@ -3484,15 +3999,15 @@ t("Look Around"),
 async () => {
 const res = await ctx.rpc({ action: "bots.look_around", bot_id: botId });
 ctx.toast?.(t("{0} suggestions ready", (res?.suggestions || []).length));
-await load();
+await load(true);
 },
 "secondary small",
 );
 lookBtn.disabled = !ready() || !!bot?.paused;
-const sugNode = renderSuggestionsSection(ctx, t, suggestions, bot ? [bot] : [], ready, load, false, false, lookBtn);
+const sugNode = renderSuggestionsSection(ctx, t, suggestions, bot ? [bot] : [], ready, () => load(true), false, false, lookBtn);
 if (sugNode) nodes.push(sugNode);
 if (requests.some((r) => r.status === "pending")) {
-nodes.push(accessCtrl.update({ requests, bots: bot ? [bot] : [], ready, reload: load, multiHost: false }));
+nodes.push(accessCtrl.update({ requests, bots: bot ? [bot] : [], ready, reload: () => load(true), multiHost: false }));
 }
 // Persistent collapsible External Reply (keeps textarea identity, focus, and draft across draw)
 replyInput.disabled = replyBtn.disabled = !ready();
@@ -3522,7 +4037,7 @@ t("Run now"),
 async () => {
 const res = await ctx.rpc({ action: "bots.look_around", bot_id: botId });
 ctx.toast?.(t("{0} suggestions ready", (res?.suggestions || []).length));
-await load();
+await load(true);
 },
 "secondary small",
 );
@@ -3599,7 +4114,7 @@ async () => {
 try {
 await ctx.rpc({ action: "bots.schedule.run", bot_id: botId, schedule_id: sid });
 ctx.toast?.(t("Schedule started"));
-await load();
+await load(true);
 } catch (err) {
 ctx.toast?.(safeMsg(err, t));
 }
@@ -3620,7 +4135,7 @@ enabled: !enabled,
 });
 if (res?.bot) bot = res.bot;
 ctx.toast?.(t("Schedule updated"));
-await load();
+await load(true);
 },
 "secondary small",
 );
@@ -3658,7 +4173,7 @@ const res = await ctx.rpc({ action: "bots.update", bot_id: botId, paused: nextPa
 if (res?.bot) bot = res.bot;
 ctx.toast?.(t(nextPaused ? "Bot paused" : "Bot resumed"));
 await refreshHost(ctx, null).catch(() => {});
-await load();
+await load(true);
 },
 bot.paused ? "primary small" : "secondary small",
 );
@@ -3761,7 +4276,7 @@ onPickGroup: (g) => {
 if (ctx.state?.ui) ctx.state.ui.activeBotGroup = { id: g.id, hostId: g._hostId ?? null };
 ctx.go("/bots");
 },
-onNewBot: () => openCreateBotSheet(ctx, t, () => load(), []),
+onNewBot: () => openCreateBotSheet(ctx, t, () => load(true), []),
 });
 railMount.replaceChildren(...(rail ? [rail] : []));
 railMount.hidden = !rail;
@@ -3813,6 +4328,9 @@ activeTab === "work"
 sync(list, paneNodes);
 }
 }
+hydrateDetailFromCache();
+if (ready()) loading = true;
+draw();
 load();
 return {
 update() {
@@ -3939,6 +4457,46 @@ async function fetchBotItems(hostId, reqFilter, cursor) {
 return fetchBotItemsWithStatus(ctx, hostId, itemRequestParams(reqFilter, cursor), noStatusFilterHosts);
 }
 let lastLoadedFilter = filter;
+const hydrateTodoFromCache = (reqFilter = filter) => {
+const f = filteredHosts();
+const hosts = f.length ? f.filter((h) => !h.connection?.blocked) : [];
+const tag = (h, arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+const hydratedBots = [];
+const hydratedItems = [];
+const hydratedReqs = [];
+const hydratedSugs = [];
+const hydratedFails = [];
+let anyCached = false;
+itemsCursors.clear();
+for (const h of hosts) {
+const bucket = botsCacheBucket(ctx, h.id);
+const td = bucket.todos.get(reqFilter);
+if (td) {
+anyCached = true;
+hydratedBots.push(...tag(h, td.bots));
+hydratedItems.push(...tag(h, td.items));
+if (td.cursor) {
+itemsCursors.set(h.id ?? null, { hostId: h.id ?? null, hostName: h.name || "", cursor: td.cursor });
+}
+hydratedReqs.push(...tag(h, td.requests));
+hydratedSugs.push(...tag(h, td.suggestions));
+hydratedFails.push(...(td.autoFails || []));
+} else if (reqFilter === "needs_you" && bucket.hub) {
+anyCached = true;
+hydratedBots.push(...tag(h, bucket.hub.bots));
+hydratedItems.push(...tag(h, bucket.hub.items));
+hydratedReqs.push(...tag(h, bucket.hub.requests));
+}
+}
+if (!anyCached) return false;
+bots = hydratedBots;
+items = hydratedItems;
+requests = hydratedReqs;
+suggestions = hydratedSugs;
+failedAutomations = hydratedFails;
+lastLoadedFilter = reqFilter;
+return true;
+};
 async function load(reset = true) {
 const targets = botHosts();
 const prevHostSig = lastHostSig;
@@ -3947,16 +4505,19 @@ const hostChanged = Boolean(prevHostSig && prevHostSig !== lastHostSig);
 const reqFilter = filter;
 const filterChanged = reqFilter !== lastLoadedFilter;
 if (!targets.length) {
+if (!hydrateTodoFromCache(reqFilter)) {
 bots = [];
 items = [];
 itemsCursors.clear();
 requests = [];
 suggestions = [];
 failedAutomations = [];
+}
 draw();
 return;
 }
 if (hostChanged || filterChanged) {
+if (!hydrateTodoFromCache(reqFilter)) {
 items = [];
 itemsCursors.clear();
 if (hostChanged) {
@@ -3966,6 +4527,10 @@ suggestions = [];
 failedAutomations = [];
 }
 }
+}
+if (reset) {
+for (const h of targets) invalidateBotsCache(ctx, h.id);
+}
 const seq = ++loadSeq;
 loading = true;
 failure = null;
@@ -3973,14 +4538,74 @@ draw();
 try {
 const settled = await Promise.allSettled(
 targets.map(async (h) => {
+const bucket = botsCacheBucket(ctx, h.id);
+const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
+if (hostSupportsBotsBundle(ctx, h.id)) {
+const prevTodo = bucket.todos.get(reqFilter);
+const req = withWaitingCap(ctx, h.id, {
+action: "bots.todo",
+include_closed: reqFilter === "closed",
+include_snoozed: reqFilter === "snoozed",
+...(reqFilter === "needs_you" || reqFilter === "waiting" || reqFilter === "closed" || reqFilter === "snoozed"
+? { status: reqFilter }
+: {}),
+limit: 25,
+...(!reset && prevTodo?.etag ? { since: prevTodo.etag } : {}),
+});
+const res = await rpcHost(ctx, h.id, req);
+if (res?.unchanged && prevTodo) {
+prevTodo.at = Date.now();
+return {
+host: h,
+bots: tag(prevTodo.bots),
+items: tag(prevTodo.items),
+cursor: prevTodo.cursor || null,
+requests: tag(prevTodo.requests),
+suggestions: tag(prevTodo.suggestions),
+autoFails: prevTodo.autoFails || [],
+};
+}
+const autoFails = (res?.failed_automations || []).map((fa) => ({
+hostId: h.id ?? null,
+hostName: h.name || "",
+botId: fa.bot_id,
+scheduleId: fa.schedule_id,
+title: fa.title || fa.schedule_id,
+detail: fa.last_refusal
+? mobileBotRefusalText(fa.last_refusal, t)
+: fa.last_error
+? safeMsg(fa.last_error, t)
+: "",
+}));
+const nextTodo = {
+bots: res?.bots || [],
+items: res?.items || [],
+cursor: res?.items_next_cursor || null,
+requests: res?.requests || [],
+suggestions: res?.suggestions || [],
+autoFails,
+etag: typeof res?.etag === "string" ? res.etag : null,
+at: Date.now(),
+};
+bucket.todos.set(reqFilter, nextTodo);
+return {
+host: h,
+bots: tag(nextTodo.bots),
+items: tag(nextTodo.items),
+cursor: nextTodo.cursor,
+requests: tag(nextTodo.requests),
+suggestions: tag(nextTodo.suggestions),
+autoFails,
+};
+}
 const [botsRes, itemsRes, accessRes, sugRes] = await Promise.all([
 rpcHost(ctx, h.id, { action: "bots.list", limit: 100 }),
 fetchBotItems(h.id, reqFilter, null),
 rpcHost(ctx, h.id, { action: "bots.access.list", limit: 50 }),
 rpcHost(ctx, h.id, { action: "bots.suggestions.list", include_dismissed: false }),
 ]);
-const tag = (arr) => (h.id ? (arr || []).map((x) => ({ ...x, _hostId: h.id, _hostName: h.name })) : (arr || []));
-const hostBots = tag(botsRes?.bots);
+const rawBots = botsRes?.bots || [];
+const hostBots = tag(rawBots);
 const schedBots = hostBots.filter((b) => Array.isArray(b.schedules) && b.schedules.length).slice(0, 8);
 const autoFails = [];
 if (schedBots.length) {
@@ -4008,13 +4633,24 @@ detail: run.last_refusal ? mobileBotRefusalText(run.last_refusal, t) : run.last_
 }
 }
 }
+const nextTodo = {
+bots: rawBots,
+items: itemsRes?.items || [],
+cursor: itemsRes?.next_cursor || null,
+requests: accessRes?.requests || [],
+suggestions: sugRes?.suggestions || [],
+autoFails,
+etag: null,
+at: Date.now(),
+};
+bucket.todos.set(reqFilter, nextTodo);
 return {
 host: h,
 bots: hostBots,
-items: tag(itemsRes?.items),
-cursor: itemsRes?.next_cursor || null,
-requests: tag(accessRes?.requests),
-suggestions: tag(sugRes?.suggestions),
+items: tag(nextTodo.items),
+cursor: nextTodo.cursor,
+requests: tag(nextTodo.requests),
+suggestions: tag(nextTodo.suggestions),
 autoFails,
 };
 }),
@@ -4420,12 +5056,13 @@ nodes.push(clearCard);
 }
 sync(list, nodes);
 }
-load(true);
+hydrateTodoFromCache();
+load(false);
 return {
 update() {
 const nextSig = hostSig();
 if (nextSig !== lastHostSig) {
-load(true);
+load(false);
 } else {
 draw();
 }
