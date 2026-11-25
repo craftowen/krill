@@ -12228,17 +12228,29 @@ fn multi_provider_add_search_edit_remove_and_custom_agent(cx: &mut TestAppContex
 }
 
 #[test]
-fn chat_auto_continue_after_rate_limit_defaults_off_and_toml_roundtrips() {
+fn chat_auto_continue_after_rate_limit_defaults_on_and_roundtrips_toml_and_json() {
     let mut settings = Settings::default();
-    assert!(!settings.chat_auto_continue_after_rate_limit);
+    assert!(settings.chat_auto_continue_after_rate_limit);
     assert!(
-        !Settings::parse_with_language("theme = 'dark'", Language::En)
+        Settings::parse_with_language("theme = 'dark'", Language::En)
             .unwrap()
             .chat_auto_continue_after_rate_limit
     );
-    settings.chat_auto_continue_after_rate_limit = true;
+    // Explicit false in TOML and JSON must be respected instead of overridden by default_true.
+    assert!(
+        !Settings::parse_with_language("chat_auto_continue_after_rate_limit = false", Language::En)
+            .unwrap()
+            .chat_auto_continue_after_rate_limit
+    );
+    let from_json_omitted: Settings = serde_json::from_str("{}").unwrap();
+    assert!(from_json_omitted.chat_auto_continue_after_rate_limit);
+    let from_json_false: Settings =
+        serde_json::from_str(r#"{"chat_auto_continue_after_rate_limit":false}"#).unwrap();
+    assert!(!from_json_false.chat_auto_continue_after_rate_limit);
+
+    settings.chat_auto_continue_after_rate_limit = false;
     let encoded = settings.to_toml();
-    assert!(encoded.contains("chat_auto_continue_after_rate_limit = true"));
+    assert!(encoded.contains("chat_auto_continue_after_rate_limit = false"));
     assert_eq!(
         Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
         settings
@@ -12317,4 +12329,24 @@ fn ssh_and_quick_command_forms_ignore_enter_during_ime_composition(cx: &mut Test
         after_qc, before_qc,
         "Quick command form must not submit while IME is composing (R2A-16)"
     );
+}
+
+#[test]
+fn resume_work_on_restart_defaults_off_and_roundtrips() {
+    let mut settings = Settings::default();
+    assert!(!settings.resume_work_on_restart);
+    assert!(
+        !Settings::parse_with_language("theme = 'dark'", Language::En)
+            .unwrap()
+            .resume_work_on_restart
+    );
+    settings.resume_work_on_restart = true;
+    let encoded = settings.to_toml();
+    assert!(encoded.contains("resume_work_on_restart = true"));
+    assert_eq!(
+        Settings::parse_with_language(&encoded, settings.resolved_language()).unwrap(),
+        settings
+    );
+    let from_json: Settings = serde_json::from_str(r#"{"resume_work_on_restart":true}"#).unwrap();
+    assert!(from_json.resume_work_on_restart);
 }

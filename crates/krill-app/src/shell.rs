@@ -1261,6 +1261,11 @@ impl Shell {
         cx.subscribe(
             &sidebar,
             |this, _, target: &sidebar::SwitchSessionAccount, cx| {
+                this.on_chat_account_switch_requested(
+                    &(target.host.clone(), target.session),
+                    &target.account_id,
+                    cx,
+                );
                 this.switch_sidebar_session_account(target.clone(), cx);
             },
         )
@@ -4474,6 +4479,7 @@ impl Shell {
                         self.workspace_closing.remove(&(host.clone(), to));
                         // View choices, transcript, draft, and scroll position stay on the rebound panes.
                         self.rebind_chat_session(&host, handoff.from, to, &panes);
+                        self.on_chat_session_rebound(&host, handoff.from, to, cx);
                     }
                     changed |= !panes.is_empty();
                     for pane in panes {
@@ -4555,6 +4561,7 @@ impl Shell {
         }
         self.recover_account_input(cx);
         self.reconcile_workspace_sessions(cx);
+        self.sync_auto_continue_for_host(&host, cx);
         if pending {
             if host.is_local() {
                 if self.account_handoff_poll.is_none()

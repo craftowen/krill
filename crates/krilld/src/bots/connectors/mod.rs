@@ -6,6 +6,8 @@
 //! enables Telegram, Slack, or Discord with configured credentials.
 
 pub mod discord;
+pub mod github;
+pub mod linear;
 pub mod router;
 pub mod slack;
 pub mod telegram;
@@ -32,7 +34,9 @@ use zeroize::Zeroizing;
 use crate::bots::connectors::discord::{
     DEFAULT_DISCORD_API_BASE, DiscordSender, spawn_discord_worker,
 };
-use crate::bots::connectors::router::{ConversationRouter, PlatformSender};
+use crate::bots::connectors::github::{DEFAULT_GITHUB_API_BASE, GitHubSender};
+use crate::bots::connectors::linear::{DEFAULT_LINEAR_GRAPHQL_URL, LinearSender};
+use crate::bots::connectors::router::{ConversationRouter, PlatformSender, TurnFailureKind};
 use crate::bots::connectors::slack::{DEFAULT_SLACK_API_BASE, SlackSender, spawn_slack_worker};
 use crate::bots::connectors::telegram::{
     DEFAULT_TELEGRAM_API_BASE, TelegramSender, spawn_telegram_worker,
@@ -80,6 +84,19 @@ pub struct OutboundBotReply {
     pub text: String,
     pub files: Vec<String>,
     pub reaction: Option<String>,
+}
+
+/// Outcome of attempting to resume a failed or restart-cut external turn (Orca #47233, #47898).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalResumeResult {
+    Resumed {
+        link: Box<ExternalConversationLink>,
+        session_id: SessionId,
+        turn_seq: u64,
+        queued_count: usize,
+    },
+    NotFailed,
+    BotPaused,
 }
 
 /// Callback interface exposed by `daemon-core` (`BotsManager` + `Registry`) for messaging
@@ -173,14 +190,35 @@ pub trait ConnectorBridge: Send + Sync {
 
     /// Lists all configured bots.
     fn list_bots(&self) -> Vec<BotConfig>;
+
+    /// Looks up a persistent [`ExternalConversationLink`] by ID (used by interactive Resume
+    /// ownership checks and restart-cut recovery).
+    fn get_link(&self, _link_id: &str) -> io::Result<Option<ExternalConversationLink>> {
+        Ok(None)
+    }
+
+    /// Retries a failed or restart-interrupted bot turn on `link_id` (fenced by `turn_seq`) and
+    /// preserves any queued messages behind it so they drain automatically (Orca #47233, #47898).
+    fn resume_failed_external_turn(
+        &self,
+        _bot_id: &BotId,
+        _link_id: &str,
+        _turn_seq: u64,
+        _sender_id: &str,
+        _sender_name: &str,
+    ) -> io::Result<ExternalResumeResult> {
+        Ok(ExternalResumeResult::NotFailed)
+    }
 }
 
-/// Configurable API base URLs for messaging connectors (overridable for loopback mock tests).
+/// Configurable API base URLs for messaging & tracker connectors (overridable for mock tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectorEndpoints {
     pub telegram: String,
     pub slack: String,
     pub discord: String,
+    pub github: String,
+    pub linear: String,
 }
 
 impl Default for ConnectorEndpoints {
@@ -189,6 +227,8 @@ impl Default for ConnectorEndpoints {
             telegram: DEFAULT_TELEGRAM_API_BASE.to_owned(),
             slack: DEFAULT_SLACK_API_BASE.to_owned(),
             discord: DEFAULT_DISCORD_API_BASE.to_owned(),
+            github: DEFAULT_GITHUB_API_BASE.to_owned(),
+            linear: DEFAULT_LINEAR_GRAPHQL_URL.to_owned(),
         }
     }
 }
@@ -335,7 +375,55 @@ impl ConnectorManager {
 
         for bot in bots {
             if bot.paused {
+                self.router
+                    .unregister_sender(&bot.id, ExternalSource::GitHub);
+                self.router
+                    .unregister_sender(&bot.id, ExternalSource::Linear);
                 continue;
+            }
+            if bot.connectors.github.enabled {
+                if let Ok(Some(tok)) = resolve_with_fallback(
+                    self.bridge.as_ref(),
+                    &bot.id,
+                    bot.connectors.github.token_secret_ref.as_deref(),
+                    "github_token",
+                    "github",
+                ) {
+                    let sender = Arc::new(GitHubSender::new(&self.endpoints.github, tok));
+                    self.router.register_sender(
+                        bot.id.clone(),
+                        ExternalSource::GitHub,
+                        sender as Arc<dyn PlatformSender>,
+                    );
+                } else {
+                    self.router
+                        .unregister_sender(&bot.id, ExternalSource::GitHub);
+                }
+            } else {
+                self.router
+                    .unregister_sender(&bot.id, ExternalSource::GitHub);
+            }
+            if bot.connectors.linear.enabled {
+                if let Ok(Some(key)) = resolve_with_fallback(
+                    self.bridge.as_ref(),
+                    &bot.id,
+                    bot.connectors.linear.api_key_secret_ref.as_deref(),
+                    "linear_api_key",
+                    "linear",
+                ) {
+                    let sender = Arc::new(LinearSender::new(&self.endpoints.linear, key));
+                    self.router.register_sender(
+                        bot.id.clone(),
+                        ExternalSource::Linear,
+                        sender as Arc<dyn PlatformSender>,
+                    );
+                } else {
+                    self.router
+                        .unregister_sender(&bot.id, ExternalSource::Linear);
+                }
+            } else {
+                self.router
+                    .unregister_sender(&bot.id, ExternalSource::Linear);
             }
             if bot.connectors.telegram.enabled {
                 let key = (bot.id.clone(), ExternalSource::Telegram);
@@ -826,6 +914,54 @@ impl ConnectorManager {
     /// Cleans up queued active turn states when a bot session exits or is killed (MB-10).
     pub fn on_session_removed(&self, session_id: SessionId) {
         self.router.on_session_removed(session_id);
+    }
+
+    /// Receives turn-completion notifications with explicit `turn_seq` and `workers_running`
+    /// context so written answers deliver immediately while helper workers keep running without
+    /// duplicate delivery or silent overwrite (Orca #47532).
+    pub fn on_turn_complete_with_context(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        turn_seq: Option<u64>,
+        final_reply: Option<&str>,
+        workers_running: bool,
+    ) {
+        self.router.on_turn_complete_with_context(
+            bot_id,
+            session_id,
+            turn_seq,
+            final_reply,
+            workers_running,
+        );
+    }
+
+    /// Reports a failed, rate-limited, or interrupted bot turn to its linked external conversation,
+    /// attaching an interactive `Resume` button on Slack (Orca #47233).
+    pub fn on_turn_failed(
+        &self,
+        bot_id: &BotId,
+        session_id: SessionId,
+        link_id: Option<&str>,
+        turn_seq: u64,
+        kind: TurnFailureKind,
+        raw_error: &str,
+    ) {
+        self.router
+            .on_turn_failed(bot_id, session_id, link_id, turn_seq, kind, raw_error);
+    }
+
+    /// Reports an in-flight bot turn cut off by a daemon restart to its linked external
+    /// conversation, offering an interactive `Resume` button on Slack (Orca #47898).
+    pub fn report_restart_cut_turn(
+        &self,
+        bot: &BotConfig,
+        link: &ExternalConversationLink,
+        turn_seq: u64,
+        status_message_id: Option<&str>,
+    ) -> bool {
+        self.router
+            .report_restart_cut_turn(bot, link, turn_seq, status_message_id)
     }
 
     /// Stops all connector workers cleanly and clears runtime state.

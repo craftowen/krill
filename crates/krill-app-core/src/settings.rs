@@ -312,9 +312,12 @@ pub struct Settings {
     /// 기본 계정 전환 시 실행 중 세션 처리(기본 `ask`).
     #[serde(default)]
     pub running_session_switch_policy: RunningSessionSwitchPolicy,
-    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 끔).
-    #[serde(default)]
+    /// 채팅 한도 배너: 리셋 시각이 보이면 그 뒤에 이어서 진행하라는 프롬프트를 자동 전송(기본 켬, Orca #47221).
+    #[serde(default = "default_true")]
     pub chat_auto_continue_after_rate_limit: bool,
+    /// 재부팅이나 데몬 크래시로 터미널 워커가 끊어졌을 때 저장된 대화를 자동 재개할지(기본 끔, Orca #46643).
+    #[serde(default)]
+    pub resume_work_on_restart: bool,
     /// 사이드바 봇 섹션 "봇 옵션"의 정렬(Orca `botSidebarView.sortBy`).
     pub bot_sidebar_sort: krill_ui::bot_types::BotSidebarSort,
     /// 일시정지한 봇 숨기기(Orca `hidePausedBots`).
@@ -522,7 +525,8 @@ impl Default for Settings {
             show_automations_button: true,
             show_mobile_button: true,
             running_session_switch_policy: RunningSessionSwitchPolicy::Ask,
-            chat_auto_continue_after_rate_limit: false,
+            chat_auto_continue_after_rate_limit: true,
+            resume_work_on_restart: false,
             bot_sidebar_sort: krill_ui::bot_types::BotSidebarSort::Manual,
             bot_sidebar_hide_paused: false,
             bot_sidebar_hide_sleeping_workers: false,
@@ -1967,10 +1971,16 @@ pub fn copy_on_select(cx: &App) -> bool {
         .is_some_and(|c| c.settings.copy_on_select)
 }
 
-/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 false.
+/// 채팅 한도 리셋 뒤 자동 재개를 기본으로 예약할지. `init` 전이면 기본값 true.
 pub fn chat_auto_continue_after_rate_limit(cx: &App) -> bool {
     cx.try_global::<Config>()
-        .is_some_and(|c| c.settings.chat_auto_continue_after_rate_limit)
+        .is_none_or(|c| c.settings.chat_auto_continue_after_rate_limit)
+}
+
+/// 재부팅·데몬 크래시 뒤 중단된 터미널 워커 대화를 자동 재개할지. `init` 전이면 기본값 false.
+pub fn resume_work_on_restart(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_some_and(|c| c.settings.resume_work_on_restart)
 }
 
 /// 사이드바 봇 섹션의 "봇 옵션". `init` 전이면 기본값.
@@ -9636,6 +9646,27 @@ impl SettingsView {
                 ),
             );
 
+        let resume_work_on_restart_row = crate::ui::group_row()
+            .child(self.search_focus.label(
+                p,
+                text::RESUME_WORK_ON_RESTART_TITLE.get(),
+                Some(text::RESUME_WORK_ON_RESTART_DESC.get()),
+            ))
+            .child(
+                layout::controls().child(
+                    layout::switch(
+                        p,
+                        "admin-resume-work-on-restart",
+                        s.resume_work_on_restart,
+                        false,
+                        |next, _, cx| {
+                            edit(cx, move |s| s.resume_work_on_restart = next);
+                        },
+                    )
+                    .aria_label(text::RESUME_WORK_ON_RESTART_TITLE.get()),
+                ),
+            );
+
         // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
         let yolo_seg = layout::segment(
             p,
@@ -9843,6 +9874,7 @@ impl SettingsView {
                     open_toml_row,
                     default_view_mode_row,
                     chat_auto_continue_row,
+                    resume_work_on_restart_row,
                     hooks_row,
                     auto_setup_row,
                     quick_commands_row,

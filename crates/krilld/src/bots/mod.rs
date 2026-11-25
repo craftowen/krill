@@ -41,15 +41,15 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::bots::connectors::{
-    AccessDecision, ConnectorBridge, ConnectorManager, DispatchOutcome, InboundExternalMessage,
-    OutboundBotReply,
+    AccessDecision, ConnectorBridge, ConnectorEndpoints, ConnectorManager, DispatchOutcome,
+    ExternalResumeResult, InboundExternalMessage, OutboundBotReply,
 };
 use crate::bots::google::{GoogleEndpoints, GoogleTriggerChecker};
 use crate::bots::groups::GroupCoordinator;
 use crate::bots::items::BotItemsStore;
 use crate::bots::look_around::{LookAroundTracker, SchedulerStateStore};
 use crate::bots::memory_tidy::MemoryTidyTracker;
-use crate::bots::runtime::BotRuntime;
+use crate::bots::runtime::{BotRuntime, RestartCutTurn};
 use crate::bots::secrets::SecretVault;
 use crate::bots::store::{BotStore, MemoryUpdateError};
 use crate::bots::tool_relay::{BotToolRelay, BuiltinMcpCallContext, BuiltinMcpHandler};
@@ -174,13 +174,54 @@ impl BotsManager {
         manager
     }
 
-    /// Rehydrates kept bot session bindings and starts any configured connectors/pollers once on boot.
+    /// Rehydrates kept bot session bindings, starts any configured connectors/pollers once on boot,
+    /// and notifies linked external conversations of any in-flight turns cut off by restart (Orca #47898).
     pub fn boot_recover(&self, registry: &Registry) {
         if self.boot_reconciled.set(()).is_err() {
             return;
         }
-        self.runtime.rehydrate_from_disk(&self.store, registry);
+        let (_rehydrated, cut_turns) = self
+            .runtime
+            .rehydrate_from_disk_with_cuts(&self.store, registry);
         self.reconcile_enabled_workers();
+        if !cut_turns.is_empty() {
+            self.report_pending_restart_cuts(&cut_turns);
+        }
+    }
+
+    fn report_pending_restart_cuts(&self, cuts: &[RestartCutTurn]) {
+        if cuts.is_empty() {
+            return;
+        }
+        let had_connectors = self.connectors.get().is_some();
+        let mgr = self.connector_manager();
+        if !had_connectors {
+            mgr.reload(None).ok();
+        }
+        for cut in cuts {
+            if cut.notified {
+                continue;
+            }
+            let Ok(Some(bot)) = self.store.get_bot(&cut.bot_id) else {
+                self.runtime
+                    .mark_restart_cut_notified(&cut.bot_id, &cut.link_id, cut.turn_seq);
+                continue;
+            };
+            let Ok(Some(link)) = self.store.get_link(&cut.link_id) else {
+                self.runtime
+                    .mark_restart_cut_notified(&cut.bot_id, &cut.link_id, cut.turn_seq);
+                continue;
+            };
+            if mgr.report_restart_cut_turn(
+                &bot,
+                &link,
+                cut.turn_seq,
+                cut.status_message_id.as_deref(),
+            ) {
+                self.runtime
+                    .mark_restart_cut_notified(&cut.bot_id, &cut.link_id, cut.turn_seq);
+            }
+        }
     }
 
     /// Access to the persistent bot store.
@@ -221,7 +262,12 @@ impl BotsManager {
                 registry: self.registry.clone(),
                 manager: self.self_weak.get().cloned().unwrap_or_default(),
             });
-            let cm = Arc::new(ConnectorManager::new(bridge));
+            let endpoints = ConnectorEndpoints {
+                github: self.tracker_endpoints.github_api_base.clone(),
+                linear: self.tracker_endpoints.linear_graphql_url.clone(),
+                ..ConnectorEndpoints::default()
+            };
+            let cm = Arc::new(ConnectorManager::with_endpoints(bridge, endpoints));
             self.runtime.attach_connectors(Arc::downgrade(&cm));
             cm
         })
@@ -443,6 +489,29 @@ impl BotsManager {
             }
 
             self.reconcile_enabled_workers_for(&bots);
+            let pending_cuts = self.runtime.pending_unnotified_restart_cuts();
+            if !pending_cuts.is_empty() {
+                self.report_pending_restart_cuts(&pending_cuts);
+            }
+            if self.runtime.has_pending_rate_limit_pauses() {
+                let auto_continue_enabled =
+                    crate::rejoin::recovery::read_chat_auto_continue_setting(&self.state_dir);
+                if auto_continue_enabled {
+                    let home = crate::usage::accounts::default_home();
+                    let accounts_snap = crate::usage::accounts::refresh_accounts_with(
+                        &home,
+                        Some(&self.state_dir),
+                        false,
+                    );
+                    self.runtime.poll_rate_limit_auto_continues(
+                        registry,
+                        &self.store,
+                        auto_continue_enabled,
+                        &accounts_snap,
+                        secs,
+                    );
+                }
+            }
 
             for bot in &bots {
                 if bot.paused {
@@ -2386,7 +2455,9 @@ impl BotsManager {
             !b.paused
                 && (b.connectors.telegram.enabled
                     || b.connectors.slack.enabled
-                    || b.connectors.discord.enabled)
+                    || b.connectors.discord.enabled
+                    || b.connectors.github.enabled
+                    || b.connectors.linear.enabled)
         });
         if any_chat_conn && self.connectors.get().is_none() {
             self.connector_manager().reload(None).ok();
@@ -2397,6 +2468,8 @@ impl BotsManager {
         if bot.connectors.telegram.enabled
             || bot.connectors.slack.enabled
             || bot.connectors.discord.enabled
+            || bot.connectors.github.enabled
+            || bot.connectors.linear.enabled
             || self.connectors.get().is_some()
         {
             self.connector_manager().reload(Some(&bot.id)).ok();
@@ -2438,6 +2511,8 @@ impl BotsManager {
             b.connectors.telegram.enabled
                 || b.connectors.slack.enabled
                 || b.connectors.discord.enabled
+                || b.connectors.github.enabled
+                || b.connectors.linear.enabled
         });
         if has_chat || self.connectors.get().is_some() {
             self.connector_manager().reload(bot_id)?;
@@ -3055,6 +3130,42 @@ impl ConnectorBridge for DaemonConnectorBridge {
             .upgrade()
             .and_then(|mgr| mgr.store.list_bots().ok())
             .unwrap_or_default()
+    }
+
+    fn get_link(&self, link_id: &str) -> io::Result<Option<ExternalConversationLink>> {
+        let mgr = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| io::Error::other("bots manager shut down"))?;
+        mgr.store.get_link(link_id)
+    }
+
+    fn resume_failed_external_turn(
+        &self,
+        bot_id: &BotId,
+        link_id: &str,
+        turn_seq: u64,
+        _sender_id: &str,
+        _sender_name: &str,
+    ) -> io::Result<ExternalResumeResult> {
+        let mgr = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| io::Error::other("bots manager shut down"))?;
+        let reg = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| io::Error::other("daemon registry unavailable"))?;
+        mgr.runtime.resume_failed_external_turn(
+            &reg,
+            &mgr.store,
+            &mgr.secrets,
+            &mgr.tool_relay,
+            &mgr.composio_base_url,
+            bot_id,
+            link_id,
+            turn_seq,
+        )
     }
 }
 
@@ -4203,6 +4314,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         mgr.on_hook_event(&reg, sid_empty, &stop_event);
@@ -4230,6 +4343,8 @@ mod tests {
                 created_at_ms: 1_500,
                 owner_turn_pending: true,
                 last_prompt: Some("Say hello".to_owned()),
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let mem_path = mgr.store().bot_home(&created).join("MEMORY.md");
@@ -4391,6 +4506,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: true,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
 
@@ -4552,6 +4669,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         // Same shape `krill bot schedules add|rm|enable|disable` sends.
@@ -4691,6 +4810,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let as_bot = |req| mgr.handle_rpc_for_peer(&reg, Some(sid), false, req);
@@ -5097,6 +5218,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         lock(&mgr.active_cron_sessions).insert((created.id.clone(), "daily".to_owned()), old_sid);
@@ -5311,6 +5434,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: true,
                 last_prompt: Some("Check inbox".to_owned()),
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         lock(&mgr.active_cron_sessions).insert((created.id.clone(), "nightly".to_owned()), sid);
@@ -5490,6 +5615,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let forgot = mgr.handle_rpc(
@@ -5701,6 +5828,8 @@ mod tests {
                 created_at_ms: 1_000,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
 
@@ -6037,6 +6166,8 @@ mod tests {
                 created_at_ms: 1_020,
                 owner_turn_pending: false,
                 last_prompt: None,
+                status_message_id: None,
+                rate_limit_pause: None,
             },
         );
         let forget_res = mgr.handle_rpc_for_peer(
