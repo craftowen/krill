@@ -509,6 +509,22 @@ pub fn move_path_to_trash(home: &Path, root: &Path, path: &Path) -> io::Result<P
 
 #[cfg(any(windows, test))]
 fn is_windows_network_or_device_path(path: &Path) -> bool {
+    if matches!(
+        path.as_os_str().as_encoded_bytes(),
+        [
+            b'\\' | b'/',
+            b'\\' | b'/',
+            b'?',
+            b'\\' | b'/',
+            drive,
+            b':',
+            b'\\' | b'/',
+            ..,
+        ] | [b'\\' | b'/', b'\\' | b'/', b'?', b'\\' | b'/', drive, b':']
+            if drive.is_ascii_alphabetic()
+    ) {
+        return false;
+    }
     if path.components().any(|component| {
         matches!(
             component,
@@ -523,25 +539,10 @@ fn is_windows_network_or_device_path(path: &Path) -> bool {
     }) {
         return true;
     }
-    match path.as_os_str().as_encoded_bytes() {
-        [
-            b'\\' | b'/',
-            b'\\' | b'/',
-            b'?',
-            b'\\' | b'/',
-            drive,
-            b':',
-            b'\\' | b'/',
-            ..,
-        ]
-        | [b'\\' | b'/', b'\\' | b'/', b'?', b'\\' | b'/', drive, b':']
-            if drive.is_ascii_alphabetic() =>
-        {
-            false
-        }
-        [b'\\' | b'/', b'\\' | b'/', ..] => true,
-        _ => false,
-    }
+    matches!(
+        path.as_os_str().as_encoded_bytes(),
+        [b'\\' | b'/', b'\\' | b'/', ..]
+    )
 }
 
 /// File explorer deletion uses the OS recovery surface on Windows. Account data is

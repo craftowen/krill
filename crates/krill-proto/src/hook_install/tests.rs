@@ -423,8 +423,9 @@ fn codex_same_config_path_matches_verbatim_and_noncanonical_spellings() {
     let sub = home.0.join("sub");
     fs::create_dir_all(&sub).unwrap();
     let canonical = home.0.join("config.toml");
-    let non_canonical = home.0.join("sub/../config.toml");
-    assert_ne!(canonical, non_canonical);
+    let plain_home = crate::os::shell_path(&home.0);
+    let non_canonical = PathBuf::from(format!("{}/sub/../config.toml", plain_home.display()));
+    assert_ne!(canonical.as_os_str(), non_canonical.as_os_str());
     assert!(codex::same_config_path(&non_canonical, &canonical));
 }
 

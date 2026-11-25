@@ -164,8 +164,12 @@ setup_script = "echo unc"
         .expect("verbatim UNC path must match ordinary UNC path");
     assert_eq!(unc_cfg.setup_script.as_deref(), Some("echo unc"));
 
-    // Unix paths remain case-sensitive.
+    // Unix paths remain case-sensitive on non-Windows hosts; Windows hosts treat root-relative
+    // paths case-insensitively.
+    #[cfg(not(windows))]
     assert!(!project_paths_match("/tmp/MyRepo", "/tmp/myrepo"));
+    #[cfg(windows)]
+    assert!(project_paths_match("/tmp/MyRepo", "/tmp/myrepo"));
 
     fs::remove_dir_all(root).ok();
 }

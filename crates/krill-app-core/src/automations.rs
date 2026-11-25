@@ -3810,10 +3810,11 @@ mod tests {
 
     #[test]
     fn editor_clears_incompatible_reuse_session_and_stale_agent_on_edit() {
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let original = Schedule {
             id: "audit".into(),
             cron: "0 9 * * *".into(),
-            cwd: "/tmp".into(),
+            cwd: cwd.clone(),
             command: vec!["claude".into(), "-p".into()],
             agent: Some("claude".into()),
             reuse_session: true,
@@ -3849,7 +3850,7 @@ mod tests {
         let isolate_codex = Schedule {
             id: "audit".into(),
             cron: "0 9 * * *".into(),
-            cwd: "/tmp".into(),
+            cwd: cwd.clone(),
             command: vec!["codex".into(), "exec".into()],
             prompt: "updated prompt".into(),
             workspace_mode: WorkspaceMode::Isolate,
@@ -3868,7 +3869,7 @@ mod tests {
         let non_agent = Schedule {
             id: "audit".into(),
             cron: "0 9 * * *".into(),
-            cwd: "/tmp".into(),
+            cwd,
             command: vec!["/usr/bin/make".into(), "test".into()],
             prompt: String::new(),
             workspace_mode: WorkspaceMode::Isolate,

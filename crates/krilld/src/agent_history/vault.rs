@@ -4402,12 +4402,13 @@ mod sweep_regressions {
         // 1. Oversized multibyte UTF-8 role (> 4096 bytes) must clamp on a valid UTF-8 boundary.
         let huge_role = "역할".repeat(1000); // 6000 bytes
         assert!(huge_role.len() > MAX_TEXT);
+        let role_cwd = root.join("huge-role-proj").to_string_lossy().into_owned();
         let role_file = oc_proj.join("ses-huge-role.json");
         fs::write(
             &role_file,
             serde_json::json!({
                 "id": "ses-huge-role",
-                "directory": "/tmp/huge-role-proj",
+                "directory": role_cwd,
                 "messages": [{
                     "id": "msg-huge-role",
                     "role": huge_role,
@@ -4442,7 +4443,7 @@ mod sweep_regressions {
         );
 
         // 2. 100 hits with ~11 KiB each (> 1 MiB) must cap under ipc::MAX_FRAME and set truncated.
-        let long_cwd = format!("/tmp/{}", "d".repeat(3800));
+        let long_cwd = format!("{}{}", root.join("bulk-").display(), "d".repeat(3800));
         let long_title = "가".repeat(120); // 360 B
         let long_role = "r".repeat(3800);
         let long_text = format!("FIND_R2D14_BULK {}", "한".repeat(400));

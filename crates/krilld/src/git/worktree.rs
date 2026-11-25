@@ -607,9 +607,14 @@ pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
 }
 
 fn trust_path_aliases(top: &Path) -> Vec<PathBuf> {
-    let mut aliases = Vec::new();
+    let mut aliases: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
-        if !aliases.contains(&p) {
+        // Compare raw OsStr rather than Path::eq because on Windows Path::eq treats `/` and `\`
+        // as equal, which would drop the alternate slash spelling needed for SHA-256 digest lookup.
+        if !aliases
+            .iter()
+            .any(|existing| existing.as_os_str() == p.as_os_str())
+        {
             aliases.push(p);
         }
     };

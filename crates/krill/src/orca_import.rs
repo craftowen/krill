@@ -3676,7 +3676,7 @@ fn apply_worktree_meta(
         .worktrees
         .retain(|k, _| normalize_import_path(Path::new(k)) != norm_key);
     store.worktrees.insert(
-        key,
+        norm_key.to_string_lossy().into_owned(),
         StoredWorktreeMeta {
             repo_id: repo_id.map(str::to_owned),
             display_name,
