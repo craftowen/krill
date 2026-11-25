@@ -26,8 +26,8 @@ const LINK_MENU_WIDTH: Pixels = px(420.);
 /// Bound clipboard-owner stalls, image conversion and filesystem preparation together.
 const PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Remote clipboard uploads (TIFF->PNG conversion + SSH / tunnel transfer) need a longer budget.
-const REMOTE_PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Remote clipboard uploads (TIFF->PNG conversion + chunked SSH / tunnel transfer) need a longer budget.
+const REMOTE_PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone)]
 pub(crate) struct RemoteUploadTarget {
@@ -41,6 +41,8 @@ pub(crate) struct RemoteUploadTarget {
 pub(super) struct PasteQueue {
     next: u64,
     entries: std::collections::VecDeque<QueuedInput>,
+    /// 진행 중인 원격 파일·이미지 붙여넣기/드롭 업로드 요청 ID 집합(상태바 `Sending` 표시용).
+    sending_remote: std::collections::BTreeSet<u64>,
 }
 impl PasteQueue {
     pub(super) fn has_pending_for(&self, pane: PaneId) -> bool {
@@ -49,6 +51,10 @@ impl PasteQueue {
 
     pub(super) fn pending_panes(&self) -> std::collections::BTreeSet<PaneId> {
         self.entries.iter().map(|entry| entry.pane).collect()
+    }
+
+    pub(super) fn sending_remote_count(&self) -> usize {
+        self.sending_remote.len()
     }
 
     /// 칸이 첫 세션을 배정받으면 그 전에 들어온 `session == None` 항목을 모두 그 첫 세션에 묶는다(APP-RUNTIME-003).
@@ -106,6 +112,20 @@ impl Shell {
                 entry.paths = paths.to_vec();
             }
         }
+    }
+
+    pub(super) fn begin_remote_upload(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.paste_queue.sending_remote.insert(id) {
+            cx.notify();
+        }
+    }
+
+    fn end_remote_upload(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        let removed = self.paste_queue.sending_remote.remove(&id);
+        if removed {
+            cx.notify();
+        }
+        removed
     }
 
     fn drop_policy_for(&self, pane: PaneId, cx: &App) -> DropPolicy {
@@ -492,8 +512,13 @@ impl Shell {
                 } else {
                     clipboard_external_paths(item).unwrap_or_default()
                 };
-                this.update(cx, |this, _| this.mark_file_paste(id, &paths))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    this.mark_file_paste(id, &paths);
+                    if remote_pane && remote_target.is_some() {
+                        this.begin_remote_upload(id, cx);
+                    }
+                })
+                .ok();
             }
             let attachment = item
                 .as_ref()
@@ -569,6 +594,9 @@ impl Shell {
             entries: vec![gpui::ClipboardEntry::ExternalPaths(paths.clone())],
         };
         self.mark_file_paste(id, &[]);
+        if remote_target.is_some() {
+            self.begin_remote_upload(id, cx);
+        }
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let attachment = clipboard_is_attachment(&item, policy);
@@ -628,6 +656,9 @@ impl Shell {
                 clipboard_external_paths(&item).unwrap_or_default()
             };
             self.mark_file_paste(id, &paths);
+            if remote_pane && remote_target.is_some() {
+                self.begin_remote_upload(id, cx);
+            }
         }
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -716,6 +747,9 @@ impl Shell {
                 self.paste_queue.entries.push_back(entry);
                 continue;
             }
+            if let QueuedKind::Paste(id, _) = entry.kind {
+                self.paste_queue.sending_remote.remove(&id);
+            }
             // A focus change cancels clipboard navigation intent. Keystrokes
             // already submitted to the still-existing session keep their order.
             if exists
@@ -790,11 +824,16 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let before = self.paste_queue.entries.len();
-        self.paste_queue
-            .entries
-            .retain(|entry| entry.pane != pane || keep.is_some() && entry.session == keep);
+        self.paste_queue.entries.retain(|entry| {
+            let retain = entry.pane != pane || keep.is_some() && entry.session == keep;
+            if !retain && let QueuedKind::Paste(id, _) = entry.kind {
+                self.paste_queue.sending_remote.remove(&id);
+            }
+            retain
+        });
         if self.paste_queue.entries.len() != before {
             self.refresh_pending_paste_banner(cx);
+            cx.notify();
         }
     }
 
@@ -824,6 +863,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        let was_sending = self.end_remote_upload(id, cx);
         // Expired/cancelled requests cannot reinsert payloads into the stream.
         let Some(index) = self.paste_queue.entries.iter().position(|entry| {
             matches!(entry.kind, QueuedKind::Paste(request, PreparedPaste::Pending) if request == id)
@@ -832,7 +872,7 @@ impl Shell {
         };
         let entry = &self.paste_queue.entries[index];
         if payload.is_none()
-            && entry.files
+            && (entry.files || was_sending)
             && entry.targets(self)
             && self.layout.focused() == Some(entry.pane)
         {
@@ -1870,7 +1910,7 @@ pub(crate) fn upload_bytes_via_target(
     };
 
     if features & krill_proto::control::FEAT_REMOTE_FS != 0 {
-        return upload_bytes_via_remote_fs(&mut stream, &filename, bytes, deadline);
+        return upload_bytes_via_remote_fs(&mut stream, &filename, bytes, timeout);
     }
     let mut chunks = bytes.chunks(RAW_CHUNK_BYTES);
     let first_chunk = chunks.next()?;
@@ -1933,25 +1973,26 @@ pub(crate) fn upload_bytes_via_target(
     Some(remote_path)
 }
 
-/// Reuse the existing bounded binary file protocol. Only the private destination allocation
-/// needs a helper PTY; image bytes never pass through argv, Base64, or terminal capture.
+/// Reuse the existing bounded binary file protocol. Only the private destination directory
+/// allocation needs a helper PTY; image bytes travel in adaptive acknowledged chunks into a
+/// real staging file and appear atomically on commit (never creating an empty placeholder
+/// upfront or leaving orphaned staging files on abort/error).
 fn upload_bytes_via_remote_fs(
     stream: &mut krill_proto::os::net::UnixStream,
     filename: &str,
     bytes: &[u8],
-    deadline: std::time::Instant,
+    step_timeout: Duration,
 ) -> Option<String> {
-    use krill_proto::control::{Reply, Request};
+    use krill_proto::control::{Failure, Reply, Request};
     use krill_proto::remote_fs::{
         MAX_REMOTE_CHUNK, RemoteFsReply, RemoteFsRequest, WireWriteOutcome,
     };
 
+    let alloc_deadline = std::time::Instant::now() + step_timeout;
     let script = format!(
         "umask 077; \
          d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\" 2>/dev/null || mktemp -d /tmp/krill-paste.XXXXXXXX) || exit 1; \
-         f=\"$d/{filename}\"; \
-         if : > \"$f\"; then printf 'KRILL_PASTE_OK:%s:END\\n' \"$f\"; \
-         else rm -rf \"$d\"; printf 'KRILL_PASTE_ERR\\n'; fi; sleep 3"
+         printf 'KRILL_PASTE_OK:%s/{filename}:END\\n' \"$d\"; sleep 3"
     );
     let path = run_custom_and_wait_marker(
         stream,
@@ -1959,43 +2000,104 @@ fn upload_bytes_via_remote_fs(
         b"/tmp",
         vec![b"-c".to_vec(), script.into_bytes()],
         "KRILL_PASTE",
-        deadline,
+        alloc_deadline,
     )?;
     if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
         return None;
     }
-    let mut offset = 0_u64;
-    for chunk in bytes.chunks(MAX_REMOTE_CHUNK) {
-        let commit = offset + chunk.len() as u64 == bytes.len() as u64;
+
+    let wire_path = path.as_bytes().to_vec();
+    let total_u64 = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+
+    let send_single_shot = |stream: &mut krill_proto::os::net::UnixStream| -> Option<String> {
+        let req = Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+            path: wire_path.clone(),
+            bytes: bytes.to_vec(),
+            expected: None,
+            stage_id: 0,
+            offset: 0,
+            commit: true,
+        });
+        let reply = clipboard_request_until(stream, &req, std::time::Instant::now() + step_timeout);
+        match reply {
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(stamp))))
+                if stamp.len == total_u64 =>
+            {
+                Some(path.clone())
+            }
+            _ => None,
+        }
+    };
+
+    if bytes.len() <= krill_app::remote_fs::FIRST_UPLOAD_CHUNK {
+        return send_single_shot(stream);
+    }
+
+    let stage_id = krill_app::remote_fs::next_stage_id();
+    let mut offset = 0usize;
+    let mut chunk_size = krill_app::remote_fs::FIRST_UPLOAD_CHUNK;
+    let mut base_rtt = Duration::MAX;
+    let mut staged = false;
+
+    while offset < bytes.len() {
+        let end = offset.saturating_add(chunk_size).min(bytes.len());
+        let chunk = &bytes[offset..end];
+        let commit = end == bytes.len();
         let request = Request::RemoteFs(RemoteFsRequest::WriteAtomic {
-            path: path.as_bytes().to_vec(),
+            path: wire_path.clone(),
             bytes: chunk.to_vec(),
             expected: None,
-            stage_id: 1, // The destination has its own unique private directory.
-            offset,
+            stage_id,
+            offset: u64::try_from(offset).unwrap_or(u64::MAX),
             commit,
         });
-        let reply = clipboard_request_until(stream, &request, deadline);
-        let accepted = match reply {
-            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::StageAck))) => !commit,
-            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(stamp)))) => {
-                commit && stamp.len == bytes.len() as u64
+        let sent_at = std::time::Instant::now();
+        let reply = clipboard_request_until(stream, &request, sent_at + step_timeout);
+        let elapsed = sent_at.elapsed();
+        match reply {
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::StageAck)))
+                if !commit =>
+            {
+                staged = true;
+                base_rtt = base_rtt.min(elapsed);
+                chunk_size =
+                    krill_app::remote_fs::next_upload_chunk_size(chunk.len(), elapsed, base_rtt);
+                offset = end;
             }
-            _ => false,
-        };
-        if !accepted {
-            tracing::warn!(
-                offset,
-                total = bytes.len(),
-                "remote clipboard file write failed"
-            );
-            // No path is delivered unless the final atomic commit is acknowledged. Dropping
-            // a failed stream avoids replaying an ambiguous write on another connection.
-            return None;
+            Some(Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(stamp))))
+                if commit && stamp.len == total_u64 =>
+            {
+                return Some(path);
+            }
+            Some(Reply::Failed(Failure::BadRequest))
+                if !staged && bytes.len() <= MAX_REMOTE_CHUNK =>
+            {
+                // Older remote daemon without chunked staging: fall back cleanly to single-shot.
+                return send_single_shot(stream);
+            }
+            _ => {
+                tracing::warn!(
+                    offset,
+                    total = bytes.len(),
+                    "remote clipboard file write failed"
+                );
+                if staged {
+                    let abort = Request::RemoteFs(RemoteFsRequest::AbortStage {
+                        path: wire_path.clone(),
+                        stage_id,
+                    });
+                    drop(clipboard_request_until(
+                        stream,
+                        &abort,
+                        std::time::Instant::now() + Duration::from_secs(2),
+                    ));
+                }
+                // No path is delivered unless the final atomic commit is acknowledged.
+                return None;
+            }
         }
-        offset += chunk.len() as u64;
     }
-    Some(path)
+    None
 }
 
 /// Refresh the remaining timeout on every syscall, including partial frame reads.

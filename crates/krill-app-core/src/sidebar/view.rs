@@ -82,6 +82,10 @@ pub(super) fn host_status_tone(
             p.destructive,
             reason.unwrap_or_else(|| text::HOST_DISCONNECTED.get()),
         ),
+        HostStatus::AuthFailed => (
+            p.destructive,
+            reason.unwrap_or_else(|| text::HOST_NEEDS_LOGIN.get()),
+        ),
     }
 }
 
@@ -532,7 +536,10 @@ impl Sidebar {
             .tooltip(move |window, cx| {
                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
             });
-        if remote.status == HostStatus::Disconnected {
+        if matches!(
+            remote.status,
+            HostStatus::Disconnected | HostStatus::AuthFailed
+        ) {
             let host = host.clone();
             badge
                 .child(
@@ -925,7 +932,8 @@ impl Sidebar {
                             .child(sessions.to_string()),
                     )
                     .when(
-                        *status == HostStatus::Disconnected && host.is_remote(),
+                        matches!(*status, HostStatus::Disconnected | HostStatus::AuthFailed)
+                            && host.is_remote(),
                         |d| {
                             let reconnect_host = host.clone();
                             let reconnect_key = host.as_key().to_owned();

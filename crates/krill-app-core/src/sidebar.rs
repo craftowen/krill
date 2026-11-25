@@ -1696,7 +1696,9 @@ impl Sidebar {
                 .remote_hosts
                 .iter()
                 .find(|r| r.id == *id)
-                .is_some_and(|r| r.status == HostStatus::Disconnected),
+                .is_some_and(|r| {
+                    matches!(r.status, HostStatus::Disconnected | HostStatus::AuthFailed)
+                }),
         }
     }
 
@@ -1996,8 +1998,11 @@ impl Sidebar {
                                 }
                             });
                         let label = spec.display_name().to_owned();
-                        let reconnected = entry.status == HostStatus::Disconnected
-                            && matches!(status, HostStatus::Connecting | HostStatus::Connected);
+                        let reconnected =
+                            matches!(
+                                entry.status,
+                                HostStatus::Disconnected | HostStatus::AuthFailed
+                            ) && matches!(status, HostStatus::Connecting | HostStatus::Connected);
                         changed |= entry.label != label || entry.status != status;
                         entry.label = label;
                         entry.status = status;

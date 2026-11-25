@@ -32,6 +32,44 @@ use crate::file_format::{self, ImageFormat, Kind, csv, raster};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REMOTE_CHUNK_U32: u32 = 512 * 1024;
+/// 다중 청크 원격 업로드의 시작 청크 크기(64 KiB): 느린 SSH/P2P 링크에서도 대화형 입력을 막지 않으면서
+/// 빠른 링크에서는 즉시 `MAX_REMOTE_CHUNK`(512 KiB)까지 커진다.
+pub const FIRST_UPLOAD_CHUNK: usize = 64 * 1024;
+/// 느린 링크에서 적응형 청크 크기가 내려갈 수 있는 하한(16 KiB).
+pub const MIN_UPLOAD_CHUNK: usize = 16 * 1024;
+/// 청크 하나가 링크를 점유하는 목표 시간(~350ms, Herdr `dfde150` 준용).
+const TARGET_CHUNK_TIME: Duration = Duration::from_millis(350);
+
+/// 직전 청크의 전송 시간(`elapsed`)과 최소 관측 왕복 시간(`base_rtt`)으로 다음 청크 크기를 정한다.
+/// 빠른 링크에서는 2배씩 `MAX_REMOTE_CHUNK`까지 커지고, 느린 링크에서는 `MIN_UPLOAD_CHUNK`까지 즉시 줄어든다.
+#[must_use]
+pub fn next_upload_chunk_size(last_size: usize, elapsed: Duration, base_rtt: Duration) -> usize {
+    let sending = elapsed
+        .saturating_sub(base_rtt)
+        .max(Duration::from_millis(1));
+    let target_ns = TARGET_CHUNK_TIME.as_nanos().max(1);
+    let sending_ns = sending.as_nanos().max(1);
+    let fits = u128::try_from(last_size)
+        .unwrap_or(0)
+        .saturating_mul(target_ns)
+        / sending_ns;
+    let fits = usize::try_from(fits).unwrap_or(MAX_REMOTE_CHUNK);
+    let upper = last_size.saturating_mul(2).min(MAX_REMOTE_CHUNK);
+    fits.clamp(MIN_UPLOAD_CHUNK, upper.max(MIN_UPLOAD_CHUNK))
+}
+
+/// 프로세스 내에서 절대 재사용되지 않는 0이 아닌 스테이징 핸들을 발급한다.
+#[must_use]
+pub fn next_stage_id() -> u64 {
+    static STAGE_SEQ: AtomicU64 = AtomicU64::new(1);
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = *SALT.get_or_init(|| {
+        std::collections::hash_map::RandomState::new().hash_one(std::process::id())
+    });
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = salt.wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    if id == 0 { 1 } else { id }
+}
 
 /// 이 PC에서 열기·내려받아 Finder에서 보기 시 단일 파일 스트리밍 최대 크기(4 GiB).
 pub const MAX_STAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -122,13 +160,9 @@ impl RemoteSession {
         match self.send_encoded(target, &encoded, can_retry) {
             Ok(reply) => Ok(reply),
             Err(err) if can_retry && is_retryable_stream_close(err.kind()) => {
-                self.stream = None;
                 self.send_encoded(target, &encoded, false)
             }
-            Err(err) => {
-                self.stream = None;
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 
@@ -156,17 +190,20 @@ impl RemoteSession {
             }
         };
         if let Err(e) = sock.write_all(encoded) {
+            self.stream = None;
             record_err(&e);
             return Err(e);
         }
         let frame = match ipc::read_frame(sock) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
+                self.stream = None;
                 let e = io::Error::from(io::ErrorKind::UnexpectedEof);
                 record_err(&e);
                 return Err(e);
             }
             Err(e) => {
+                self.stream = None;
                 record_err(&e);
                 return Err(e);
             }
@@ -176,13 +213,23 @@ impl RemoteSession {
         }
         target.record_outcome_for_epoch(epoch, true, None);
         let (kind, bytes) = frame;
-        match Reply::decode(kind, &bytes)? {
+        let reply = match Reply::decode(kind, &bytes) {
+            Ok(reply) => reply,
+            Err(e) => {
+                self.stream = None;
+                return Err(e.into());
+            }
+        };
+        match reply {
             Reply::RemoteFs(reply) => Ok(reply),
             Reply::Failed(f) => Err(io::Error::other(f.to_string())),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected remote_fs reply",
-            )),
+            _ => {
+                self.stream = None;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected remote_fs reply",
+                ))
+            }
         }
     }
 }
@@ -918,15 +965,20 @@ pub fn open(
 }
 
 /// 바이트를 원격 파일로 원자적으로 올린다(클립보드 이미지 등 원격 첨부 업로드).
+///
+/// - 단일 청크 이하(`<= FIRST_UPLOAD_CHUNK`)는 단일 RPC(`stage_id: 0`)로 전송한다.
+/// - 큰 파일은 단일 제어 연결 위에서 적응형 확인 청크(`stage_id != 0`)로 스테이징한 뒤 완료 시 원자 게시하며,
+///   실패 시 `AbortStage`로 임시 스테이징 파일을 정리한다.
+/// - 구버전 원격 데몬이 스테이징 요청을 거부(`BadRequest`)하고 크기가 `MAX_REMOTE_CHUNK` 이하이면 단일 전송으로 폴백한다.
 pub fn save_atomic_bytes(target: &HostTarget, path: &Path, data: &[u8]) -> io::Result<()> {
-    static STAGE_SEQ: AtomicU64 = AtomicU64::new(1);
-    let chunk_limit = MAX_REMOTE_CHUNK;
+    let mut session = RemoteSession::new();
+    let wire_path = path_to_wire(path);
 
-    if data.len() <= chunk_limit {
-        let reply = request(
+    let send_single_shot = |session: &mut RemoteSession| -> io::Result<()> {
+        let reply = session.request(
             target,
             RemoteFsRequest::WriteAtomic {
-                path: path_to_wire(path),
+                path: wire_path.clone(),
                 bytes: data.to_vec(),
                 expected: None,
                 stage_id: 0,
@@ -934,7 +986,7 @@ pub fn save_atomic_bytes(target: &HostTarget, path: &Path, data: &[u8]) -> io::R
                 commit: true,
             },
         )?;
-        return match reply {
+        match reply {
             RemoteFsReply::Written(WireWriteOutcome::Saved(_)) => Ok(()),
             RemoteFsReply::Written(WireWriteOutcome::Failed(e)) => Err(io::Error::other(e)),
             RemoteFsReply::Written(_) => {
@@ -944,48 +996,75 @@ pub fn save_atomic_bytes(target: &HostTarget, path: &Path, data: &[u8]) -> io::R
                 io::ErrorKind::InvalidData,
                 "unexpected write reply",
             )),
-        };
+        }
+    };
+
+    if data.len() <= FIRST_UPLOAD_CHUNK {
+        return send_single_shot(&mut session);
     }
 
-    let stage_id = std::collections::hash_map::RandomState::new()
-        .hash_one((
-            std::process::id(),
-            STAGE_SEQ.fetch_add(1, Ordering::Relaxed),
-        ))
-        .max(1);
+    let stage_id = next_stage_id();
     let mut offset = 0usize;
+    let mut chunk_size = FIRST_UPLOAD_CHUNK;
+    let mut base_rtt = Duration::MAX;
+    let mut staged = false;
+
     while offset < data.len() {
-        let end = (offset + chunk_limit).min(data.len());
+        let end = offset.saturating_add(chunk_size).min(data.len());
         let commit = end == data.len();
-        let reply = request(
+        let sent_at = Instant::now();
+        let reply = session.request(
             target,
             RemoteFsRequest::WriteAtomic {
-                path: path_to_wire(path),
+                path: wire_path.clone(),
                 bytes: data[offset..end].to_vec(),
                 expected: None,
                 stage_id,
                 offset: u64::try_from(offset).unwrap_or(u64::MAX),
                 commit,
             },
-        )?;
-        match reply {
-            RemoteFsReply::Written(WireWriteOutcome::StageAck) if !commit => {
+        );
+        let elapsed = sent_at.elapsed();
+        let outcome = match reply {
+            Ok(RemoteFsReply::Written(WireWriteOutcome::StageAck)) if !commit => {
+                staged = true;
+                base_rtt = base_rtt.min(elapsed);
+                chunk_size = next_upload_chunk_size(end - offset, elapsed, base_rtt);
                 offset = end;
+                continue;
             }
-            RemoteFsReply::Written(WireWriteOutcome::Saved(_)) if commit => return Ok(()),
-            RemoteFsReply::Written(WireWriteOutcome::Failed(e)) => {
-                return Err(io::Error::other(e));
+            Ok(RemoteFsReply::Written(WireWriteOutcome::Saved(_))) if commit => return Ok(()),
+            Ok(RemoteFsReply::Written(WireWriteOutcome::Failed(e))) => Err(io::Error::other(e)),
+            Ok(RemoteFsReply::Written(_)) => {
+                Err(io::Error::other("unexpected multi-chunk write state"))
             }
-            RemoteFsReply::Written(_) => {
-                return Err(io::Error::other("unexpected multi-chunk write state"));
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected write reply",
+            )),
+            Err(err) => {
+                // 구버전 원격 데몬이 스테이징을 지원하지 않아 첫 청크를 거부한 경우 단일 전송으로 폴백한다.
+                if !staged
+                    && data.len() <= MAX_REMOTE_CHUNK
+                    && err.to_string().to_ascii_lowercase().contains("bad request")
+                {
+                    return send_single_shot(&mut session);
+                }
+                Err(err)
             }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected write reply",
-                ));
-            }
+        };
+        if staged {
+            session
+                .request(
+                    target,
+                    RemoteFsRequest::AbortStage {
+                        path: wire_path.clone(),
+                        stage_id,
+                    },
+                )
+                .ok();
         }
+        return outcome;
     }
     Err(io::Error::other("unreachable multi-chunk write end"))
 }
@@ -1943,5 +2022,160 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn adaptive_upload_chunk_grows_on_fast_link_and_shrinks_on_slow_link() {
+        let ms = Duration::from_millis;
+        let rtt = ms(100);
+        let mut size = FIRST_UPLOAD_CHUNK;
+        while size < MAX_REMOTE_CHUNK {
+            let next = next_upload_chunk_size(size, rtt + ms(40), rtt);
+            assert!(next > size, "fast link must grow chunk: {size} -> {next}");
+            size = next;
+        }
+        assert_eq!(
+            next_upload_chunk_size(size, rtt, rtt),
+            MAX_REMOTE_CHUNK,
+            "never exceeds MAX_REMOTE_CHUNK"
+        );
+        assert_eq!(
+            next_upload_chunk_size(size, rtt + ms(350), rtt),
+            size,
+            "steady at target chunk duration"
+        );
+        assert_eq!(
+            next_upload_chunk_size(size, rtt + ms(700), rtt),
+            size / 2,
+            "shrinks immediately on slow link"
+        );
+        assert_eq!(
+            next_upload_chunk_size(MIN_UPLOAD_CHUNK, ms(5000), rtt),
+            MIN_UPLOAD_CHUNK,
+            "never below MIN_UPLOAD_CHUNK"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_atomic_bytes_aborts_on_mid_transfer_error_and_falls_back_for_older_daemons() {
+        use krill_proto::control::{Failure, Reply, Request};
+        use krill_proto::ipc::{self, ServerHello};
+        use krill_proto::os::net::UnixListener;
+
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let base_dir = std::env::temp_dir().join(format!(
+            "krill-rfs-upload-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::remove_dir_all(&base_dir).ok();
+        fs::create_dir_all(&base_dir).unwrap();
+
+        // Case 1: Mid-transfer failure on chunk 2 triggers AbortStage cleanup.
+        let abort_sock = base_dir.join("abort.sock");
+        let abort_listener = UnixListener::bind(&abort_sock).unwrap();
+        let saw_abort = Arc::new(AtomicBool::new(false));
+        let saw_abort_bg = Arc::clone(&saw_abort);
+        let abort_server = thread::spawn(move || {
+            let (mut stream, _) = abort_listener.accept().unwrap();
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 11,
+            };
+            stream.write_all(&hello.encode().unwrap()).unwrap();
+            drop(ipc::read_frame(&mut stream).unwrap().unwrap());
+            let mut chunk_count = 0usize;
+            while let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) {
+                let reply = match Request::decode(kind, &body).unwrap() {
+                    Request::RemoteFs(RemoteFsRequest::WriteAtomic { stage_id, .. }) => {
+                        assert_ne!(stage_id, 0);
+                        chunk_count += 1;
+                        if chunk_count == 1 {
+                            Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::StageAck))
+                        } else {
+                            Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Failed(
+                                "simulated ENOSPC on chunk 2".into(),
+                            )))
+                        }
+                    }
+                    Request::RemoteFs(RemoteFsRequest::AbortStage { stage_id, .. }) => {
+                        assert_ne!(stage_id, 0);
+                        saw_abort_bg.store(true, Ordering::Release);
+                        Reply::RemoteFs(RemoteFsReply::StageAborted(true))
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                stream.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+        let target_abort = HostTarget::remote("studio", abort_sock);
+        let payload = vec![0x5Au8; FIRST_UPLOAD_CHUNK * 3];
+        let err =
+            save_atomic_bytes(&target_abort, Path::new("/tmp/abort.png"), &payload).unwrap_err();
+        assert!(err.to_string().contains("ENOSPC"), "{err}");
+        abort_server.join().unwrap();
+        assert!(
+            saw_abort.load(Ordering::Acquire),
+            "client must send AbortStage to clean up staged file on mid-transfer failure"
+        );
+
+        // Case 2: Older remote daemon rejects staged write with BadRequest -> single-shot fallback succeeds.
+        let fallback_sock = base_dir.join("fallback.sock");
+        let fallback_listener = UnixListener::bind(&fallback_sock).unwrap();
+        let fallback_bytes = Arc::new(Mutex::new(Vec::new()));
+        let fallback_bytes_bg = Arc::clone(&fallback_bytes);
+        let fallback_server = thread::spawn(move || {
+            let (mut stream, _) = fallback_listener.accept().unwrap();
+            let hello = ServerHello {
+                proto_min: ipc::PROTO_MIN,
+                proto_max: ipc::PROTO_MAX,
+                features: ipc::FEATURES,
+                build: "older".into(),
+                instance_id: 12,
+            };
+            stream.write_all(&hello.encode().unwrap()).unwrap();
+            drop(ipc::read_frame(&mut stream).unwrap().unwrap());
+            while let Ok(Some((kind, body))) = ipc::read_frame(&mut stream) {
+                let reply = match Request::decode(kind, &body).unwrap() {
+                    Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+                        stage_id,
+                        bytes,
+                        commit,
+                        ..
+                    }) if stage_id != 0 => {
+                        let _ = (bytes, commit);
+                        Reply::Failed(Failure::BadRequest)
+                    }
+                    Request::RemoteFs(RemoteFsRequest::WriteAtomic {
+                        stage_id: 0,
+                        bytes,
+                        commit: true,
+                        ..
+                    }) => {
+                        let len = u64::try_from(bytes.len()).unwrap();
+                        *fallback_bytes_bg.lock().unwrap() = bytes;
+                        Reply::RemoteFs(RemoteFsReply::Written(WireWriteOutcome::Saved(
+                            WireStamp {
+                                modified_unix_ns: Some(1),
+                                len,
+                            },
+                        )))
+                    }
+                    other => panic!("unexpected fallback request: {other:?}"),
+                };
+                stream.write_all(&reply.encode().unwrap()).unwrap();
+            }
+        });
+        let target_fallback = HostTarget::remote("older", fallback_sock);
+        let small_multi: Vec<u8> = (0u8..251).cycle().take(FIRST_UPLOAD_CHUNK + 1024).collect();
+        save_atomic_bytes(&target_fallback, Path::new("/tmp/legacy.png"), &small_multi).unwrap();
+        fallback_server.join().unwrap();
+        assert_eq!(*fallback_bytes.lock().unwrap(), small_multi);
+
+        fs::remove_dir_all(&base_dir).ok();
     }
 }

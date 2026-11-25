@@ -1,12 +1,14 @@
 use std::fs;
 use std::io::{self, BufReader, Read as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use krill_proto::SessionId;
 use krill_proto::control::ClosedSessionRanges;
 
+use crate::registry::persistence::StateWriter;
 use crate::session::lock;
 use crate::usage::accounts::write_atomic_0600;
 
@@ -51,12 +53,16 @@ fn read_disk(path: &Path) -> io::Result<Option<ClosedSessionRanges>> {
     Ok(Some(disk.ranges))
 }
 
-fn write_disk(path: &Path, ranges: &ClosedSessionRanges) -> io::Result<()> {
-    let raw = serde_json::to_vec(&DiskFile {
+fn encode_disk(ranges: &ClosedSessionRanges) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(&DiskFile {
         version: VERSION,
         ranges: ranges.clone(),
     })
-    .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+}
+
+fn write_disk(path: &Path, ranges: &ClosedSessionRanges) -> io::Result<()> {
+    let raw = encode_disk(ranges)?;
     write_atomic_0600(path, &raw)
 }
 
@@ -87,7 +93,7 @@ pub(crate) fn known_floor(root: &Path) -> io::Result<u64> {
 }
 
 pub(crate) struct ClosedLedger {
-    path: Option<PathBuf>,
+    writer: Option<StateWriter>,
     corrupt: AtomicBool,
     ranges: Mutex<ClosedSessionRanges>,
 }
@@ -96,7 +102,7 @@ impl ClosedLedger {
     pub(crate) fn open(dir: Option<&Path>, live_or_kept: &[SessionId]) -> Self {
         let Some(root) = dir else {
             return Self {
-                path: None,
+                writer: None,
                 corrupt: AtomicBool::new(false),
                 ranges: Mutex::default(),
             };
@@ -116,15 +122,26 @@ impl ClosedLedger {
         for &id in live_or_kept {
             ranges.remove(id);
         }
-        if !corrupt
-            && on_disk.as_ref() != Some(&ranges)
-            && (!ranges.is_empty() || on_disk.is_some())
-            && let Err(error) = write_disk(&path, &ranges)
-        {
-            tracing::warn!(kind = ?error.kind(), "closed session ledger migration write failed");
-        }
+        let writer = if corrupt {
+            None
+        } else {
+            let needs_migration =
+                on_disk.as_ref() != Some(&ranges) && (!ranges.is_empty() || on_disk.is_some());
+            if needs_migration && let Err(error) = write_disk(&path, &ranges) {
+                tracing::warn!(kind = ?error.kind(), "closed session ledger migration write failed");
+            }
+            let w = StateWriter::new("closed-sessions", path.clone()).ok();
+            if needs_migration
+                && let Some(ref writer) = w
+                && let Ok(raw) = encode_disk(&ranges)
+            {
+                // Enqueue on the resilient writer so an initial ENOSPC retries until disk space returns.
+                writer.save(raw);
+            }
+            w
+        };
         Self {
-            path: Some(path),
+            writer,
             corrupt: AtomicBool::new(corrupt),
             ranges: Mutex::new(ranges),
         }
@@ -135,10 +152,24 @@ impl ClosedLedger {
         if !guard.insert(id) || self.corrupt.load(Ordering::Relaxed) {
             return;
         }
-        if let Some(path) = &self.path
-            && let Err(error) = write_disk(path, &guard)
-        {
-            tracing::warn!(kind = ?error.kind(), "closed session ledger write failed");
+        let encoded = encode_disk(&guard);
+        drop(guard);
+        if let Some(writer) = &self.writer {
+            match encoded {
+                Ok(raw) => {
+                    writer.save(raw);
+                    writer.flush_observed(Duration::from_millis(200)).ok();
+                }
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), "closed session ledger encode failed");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn flush(&self, timeout: Duration) {
+        if let Some(writer) = &self.writer {
+            writer.shutdown(timeout);
         }
     }
 

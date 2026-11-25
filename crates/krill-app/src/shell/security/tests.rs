@@ -923,13 +923,86 @@ fn target_upload_roundtrip(binary: bool, reject_chunk: bool, delayed: bool) {
         let uploaded_path = uploaded_path.expect("upload via HostTarget must succeed");
         assert_eq!(std::fs::read(&uploaded_path).unwrap(), payload);
         if binary {
-            assert_eq!(
-                writes, 3,
-                "binary chunks use the existing 512 KiB wire budget"
+            assert!(
+                (3..=8).contains(&writes),
+                "binary adaptive chunks must transfer in bounded acknowledged pieces (got {writes})"
             );
         }
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn remote_upload_sending_indicator_appears_in_flight_and_clears_on_finish_or_error(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = open(cx, state_path("remote-sending-indicator"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = view.read_with(cx, |shell, _| shell.layout.active_tab().focused);
+    view.update(cx, |shell, cx| {
+        shell.attach_test(pane, krill_proto::SessionId(77), ours, cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("status-remote-sending").is_none(),
+        "Sending indicator must be hidden when no remote upload is active"
+    );
+
+    // 1. In-flight remote upload shows Sending indicator in status bar; completion clears it cleanly.
+    let id_ok = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let id = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.begin_remote_upload(id, cx);
+            id
+        })
+    });
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("status-remote-sending").is_some(),
+        "Sending indicator must render while remote upload is in flight"
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(
+                id_ok,
+                Some(b"/tmp/remote/shot.png".to_vec()),
+                window,
+                cx,
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("status-remote-sending").is_none(),
+        "Sending indicator must clear once upload finishes"
+    );
+    assert!(view.read_with(cx, |shell, _| shell.notice.is_none()));
+
+    // 2. Failed remote upload clears Sending indicator and surfaces error feedback.
+    let id_fail = cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            let id = shell.begin_clipboard_paste(window, cx).unwrap();
+            shell.begin_remote_upload(id, cx);
+            id
+        })
+    });
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("status-remote-sending").is_some());
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.complete_clipboard_paste(id_fail, None, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("status-remote-sending").is_none());
+    assert!(
+        view.read_with(cx, |shell, _| shell.notice.is_some()),
+        "failed remote upload must surface error feedback"
+    );
 }
 
 /// Exercise the holder, PTY engine and capture path, rather than substituting shell stdout.

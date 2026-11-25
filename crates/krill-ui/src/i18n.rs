@@ -1775,6 +1775,9 @@ catalog! {
         PASTE_CONFIRM => ("붙여넣기", "Paste"),
         PASTE_CANCEL => ("취소", "Cancel"),
         FILE_PASTE_FAILED => ("파일 경로를 붙여넣지 못했습니다. 터미널의 셸과 경로를 확인하고 다시 시도하세요.", "Could not paste the file path. Check the terminal shell and path, then try again."),
+        REMOTE_SENDING => ("전송 중…", "Sending…"),
+        REMOTE_SENDING_COUNT => ("전송 중 ({count})…", "Sending ({count})…"),
+        REMOTE_SENDING_TIP => ("원격 호스트로 파일·이미지를 전송하고 있습니다.", "Sending pasted or dropped file to the remote host."),
         PASTE_WARNING => ("⚠ 여러 줄 붙여넣기 경고 ({lines}줄): 이 프로그램은 bracketed paste를 쓰지 않아 줄바꿈이 바로 실행될 수 있습니다 — {preview}", "⚠ Multiline paste warning ({lines} lines): this program does not use bracketed paste, so newlines may execute immediately — {preview}"),
     }
     crash {
@@ -1826,6 +1829,7 @@ catalog! {
         HOST_CONNECTED => ("연결됨", "Connected"),
         HOST_CONNECTING => ("연결 중", "Connecting"),
         HOST_DISCONNECTED => ("끊김", "Disconnected"),
+        HOST_NEEDS_LOGIN => ("로그인 필요 (인증 실패)", "Needs login (auth failed)"),
         HOST_RECONNECTING => ("다시 연결하는 중", "Reconnecting"),
         HOST_RECONNECT => ("다시 연결", "Reconnect"),
         HOST_REASON_OFFLINE => ("꺼져 있음", "Offline"),
@@ -2555,6 +2559,8 @@ catalog! {
         SSH_REMOTE_NOT_INSTALLED => ("krill 미설치", "krill not installed"),
         SSH_REMOTE_UNKNOWN_VERSION => ("버전 알 수 없음", "Unknown version"),
         SSH_REMOTE_UNSUPPORTED => ("미지원 원격 ({os})", "Unsupported remote ({os})"),
+        SSH_REMOTE_LINGER_WARN => ("Linux systemd linger가 꺼져 있어 SSH 연결이 닫히면 백그라운드 세션이 종료될 수 있습니다.", "Linux systemd linger is disabled; background sessions may stop when the last SSH login closes."),
+        SSH_REMOTE_LINGER_COPY => ("명령 복사", "Copy command"),
         SSH_REMOTE_WINDOWS => ("원격: {os} · {version} · 업데이트는 그 PC에서", "Remote: {os} · {version} · Update on that PC"),
         SSH_REMOTE_PROBE_FAILED => ("원격 정보를 가져오지 못했습니다: {error}", "Could not fetch remote info: {error}"),
         SSH_REMOTE_INSTALL_OK => ("{label}: 원격 설치 완료 ({version})", "{label}: Remote install complete ({version})"),

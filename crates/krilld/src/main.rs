@@ -108,10 +108,22 @@ fn main() -> ExitCode {
     };
     // holder가 맡아 둔 소켓이 있으면 이어 쓴다(OWE-491). `Err`: 게시는 고아 krilld에게서 세션을 넘겨받은 뒤에 한다.
     let reused = held.is_some();
+    let foreign_socket = daemon::state_dir_isolated() && !owns_mobile(&path);
     let mut lis = match held.map_or_else(|| Listener::bind(&path), |fd| Listener::adopt(&path, fd))
     {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if foreign_socket {
+                use std::io::Write as _;
+                writeln!(
+                    io::stderr(),
+                    "krilld: refusing to take over live socket {} from a different state directory",
+                    path.display()
+                )
+                .ok();
+                tracing::warn!("socket owned by another state dir daemon; refusing takeover");
+                return ExitCode::from(daemon::KRILLD_DUPLICATE);
+            }
             match linked.then(|| Handover::take(&path)) {
                 Some(Ok(h)) => Err(h),
                 // 중복 기동: 건강한 데몬이 소켓을 쥐고 있고 인계 상대도 없다. holder가 재기동하지
@@ -429,6 +441,7 @@ fn main() -> ExitCode {
         if let Some(bots) = registry.bots_if_initialized() {
             bots.shutdown();
         }
+        registry.flush_persistence(std::time::Duration::from_secs(2));
         return ExitCode::FAILURE;
     }
     handed.recv().ok();
@@ -436,6 +449,7 @@ fn main() -> ExitCode {
     if let Some(bots) = registry.bots_if_initialized() {
         bots.shutdown();
     }
+    registry.flush_persistence(std::time::Duration::from_secs(2));
     drop(done);
     tracing::info!("daemon handover complete");
     ExitCode::SUCCESS

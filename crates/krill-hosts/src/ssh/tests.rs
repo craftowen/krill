@@ -712,3 +712,101 @@ fn effective_config_fails_closed_does_not_cache_none_and_bypasses_remote_jobs_li
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn ssh_auth_failure_classifier_distinguishes_auth_from_transient_network_errors() {
+    for auth in [
+        "alice@box: Permission denied (publickey).",
+        "Permission denied (publickey,password).",
+        "Permission denied (keyboard-interactive).",
+        "Permission denied, please try again.",
+        "ssh: Authentication failed for host",
+        "Received disconnect from 10.0.0.5: Too many authentication failures",
+        "No more authentication methods to try.",
+        "sign_and_send_pubkey: signing failed for ED25519: agent refused operation",
+        "The agent has no identities.",
+        "Could not open a connection to your authentication agent.",
+        "Enter passphrase for key '/Users/alice/.ssh/id_ed25519':",
+        "Load key \"/Users/alice/.ssh/id_ed25519\": error in libcrypto",
+        "Host key verification failed.",
+    ] {
+        assert!(is_ssh_auth_failure(auth), "must classify as auth: {auth}");
+    }
+
+    for transient in [
+        "ssh: connect to host 10.0.0.5 port 22: Operation timed out",
+        "ssh: connect to host 10.0.0.5 port 22: Connection refused",
+        "ssh: connect to host 10.0.0.5 port 22: No route to host",
+        "ssh: connect to host 10.0.0.5 port 22: Network is unreachable",
+        "ssh: Could not resolve hostname box.invalid: nodename nor servname provided",
+        "Connection reset by peer",
+        "Broken pipe",
+        "unexpected EOF",
+        "mkdir: /opt/krill: Permission denied",
+    ] {
+        assert!(
+            !is_ssh_auth_failure(transient),
+            "must NOT classify as auth: {transient}"
+        );
+    }
+}
+
+#[test]
+fn parse_remote_query_linger_reads_lines_after_socket_marker() {
+    use crate::managed::LingerStatus;
+    let disabled = "/home/ubuntu\n.local/share/dev.krill.app\nkrill-user=ubuntu\nkrill-linger=no\n";
+    assert_eq!(
+        remote_socket_for_home(disabled).unwrap(),
+        PathBuf::from("/home/ubuntu/.local/share/dev.krill.app/run/krilld.sock")
+    );
+    assert_eq!(
+        parse_remote_query_linger(disabled),
+        LingerStatus::Disabled {
+            user: "ubuntu".into()
+        }
+    );
+
+    let enabled = "/home/ubuntu\n.local/share/dev.krill.app\nkrill-user=ubuntu\nkrill-linger=yes\n";
+    assert_eq!(parse_remote_query_linger(enabled), LingerStatus::Enabled);
+
+    let mac = "/Users/alice\nLibrary/Application Support/dev.krill.app\n";
+    assert_eq!(parse_remote_query_linger(mac), LingerStatus::NotApplicable);
+
+    let no_systemd =
+        "/home/ubuntu\n.local/share/dev.krill.app\nkrill-user=ubuntu\nkrill-linger=unavailable\n";
+    assert_eq!(
+        parse_remote_query_linger(no_systemd),
+        LingerStatus::NotApplicable
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tunnel_start_captures_stderr_on_auth_failure() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = PathBuf::from(format!("/tmp/krill-ssh-stderr-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("fake-ssh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'alice@box: Permission denied (publickey).' >&2\nexit 255\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let opts = SshOptions::new("alice@box");
+    let err = Tunnel::start_at_with_program(
+        &opts,
+        dir.join("l.sock"),
+        Path::new("/tmp/r.sock"),
+        script.as_os_str(),
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Permission denied (publickey)"),
+        "stderr lost: {msg}"
+    );
+    assert!(is_ssh_auth_failure(&msg));
+    std::fs::remove_dir_all(&dir).ok();
+}

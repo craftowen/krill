@@ -154,6 +154,8 @@ pub struct Store {
     cleared: Mutex<HashMap<SessionId, (u64, u64, bool)>>,
     /// 명시적 `Close`로 닫힌 세션 집합.
     closed: Mutex<HashSet<SessionId>>,
+    /// 디스크 쓰기 실패(`ENOSPC` 등)로 아직 `closed` 표식을 쓰지 못한 세션. 공간이 돌아오면 재시도한다.
+    pending_closed: Mutex<HashSet<SessionId>>,
     /// Active [`Store::clear`] calls suppressing stale async writes.
     clearing: AtomicUsize,
     /// Pending `set_paused(true)` callers; workers yield before taking `pause.read()`.
@@ -243,6 +245,7 @@ impl Store {
             pause: RwLock::default(),
             cleared: Mutex::default(),
             closed: Mutex::default(),
+            pending_closed: Mutex::default(),
             clearing: AtomicUsize::new(0),
             pause_waiters: Mutex::new(0),
             pause_wait_cv: Condvar::new(),
@@ -262,7 +265,48 @@ impl Store {
         if self.recording {
             let dir = self.session_dir(id);
             if dir.is_dir() {
-                write_closed(&dir);
+                if write_closed(&dir).is_err() {
+                    lock(&self.pending_closed).insert(id);
+                } else {
+                    lock(&self.pending_closed).remove(&id);
+                }
+            }
+        }
+    }
+
+    /// 디스크 부족 등으로 지연된 `cleared`·`closed` 표식 쓰기를 다시 시도한다.
+    pub fn retry_pending_markers(&self) {
+        if !self.recording {
+            return;
+        }
+        let pause = self.record_guard();
+        if pause.paused {
+            return;
+        }
+        let _gate = lock(&self.gate);
+        let generation = self.generation.load(Ordering::Acquire);
+        let pending_clears: Vec<(SessionId, u64)> = lock(&self.cleared)
+            .iter()
+            .filter_map(|(&id, &(recorded_gen, seq, unpersisted))| {
+                (recorded_gen == generation && unpersisted).then_some((id, seq))
+            })
+            .collect();
+        for (id, seq) in pending_clears {
+            let dir = self.session_dir(id);
+            if dir.is_dir()
+                && write_cleared(&dir, seq).is_ok()
+                && let Some(entry) = lock(&self.cleared).get_mut(&id)
+                && entry.0 == generation
+                && entry.1 == seq
+            {
+                entry.2 = false;
+            }
+        }
+        let pending_closed: Vec<SessionId> = lock(&self.pending_closed).iter().copied().collect();
+        for id in pending_closed {
+            let dir = self.session_dir(id);
+            if !dir.is_dir() || write_closed(&dir).is_ok() {
+                lock(&self.pending_closed).remove(&id);
             }
         }
     }
@@ -288,7 +332,7 @@ impl Store {
         let _gate = lock(&self.gate);
         let dir = self.session_dir(id);
         if self.recording && !cwd.as_os_str().is_empty() && dir.is_dir() {
-            write_private(&dir.join(CWD_FILE), cwd.as_os_str().as_bytes());
+            write_private(&dir.join(CWD_FILE), cwd.as_os_str().as_bytes()).ok();
         }
     }
 
@@ -417,8 +461,13 @@ impl Store {
             }
             entry.1
         };
-        if can_persist {
-            write_cleared(&dir, target);
+        if can_persist && write_cleared(&dir, target).is_err() {
+            let mut cleared = lock(&self.cleared);
+            if let Some(entry) = cleared.get_mut(&id)
+                && entry.0 == generation
+            {
+                entry.2 = true;
+            }
         }
     }
 
@@ -756,18 +805,8 @@ fn start_of(path: &Path) -> Option<u64> {
 }
 
 /// 세션 디렉터리에 스크롤백 지우기 기준선을 남긴다. 최선형이라 실패해도 메모리 기준선은 동작한다.
-fn write_cleared(dir: &Path, seq: u64) {
-    use krill_proto::os::fs::OpenOptionsExt as _;
-    use std::io::Write as _;
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dir.join(CLEARED_FILE))
-    {
-        file.write_all(&seq.to_le_bytes()).ok();
-    }
+fn write_cleared(dir: &Path, seq: u64) -> io::Result<()> {
+    write_private(&dir.join(CLEARED_FILE), &seq.to_le_bytes())
 }
 
 fn read_cleared(dir: &Path) -> Option<u64> {
@@ -776,22 +815,20 @@ fn read_cleared(dir: &Path) -> Option<u64> {
     Some(u64::from_le_bytes(arr))
 }
 
-fn write_closed(dir: &Path) {
-    write_private(&dir.join(CLOSED_FILE), b"");
+fn write_closed(dir: &Path) -> io::Result<()> {
+    write_private(&dir.join(CLOSED_FILE), b"")
 }
 
-fn write_private(path: &Path, bytes: &[u8]) {
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use krill_proto::os::fs::OpenOptionsExt as _;
     use std::io::Write as _;
-    if let Ok(mut file) = fs::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)
-    {
-        file.write_all(bytes).ok();
-    }
+        .open(path)?;
+    file.write_all(bytes)
 }
 
 /// [`Store::raw`]가 넘기는 원본 구간 조각.

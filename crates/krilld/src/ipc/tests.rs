@@ -218,3 +218,40 @@ fn handshake_survives_client_closing_after_hello() {
     }
     peer.join().unwrap();
 }
+
+/// Herdr #200: 다른 상태 디렉터리·심볼릭 링크·락 분리 등으로 이미 살아 있는 데몬의 소켓을 가리키는
+/// 두 번째 기동은 기존 소켓을 덮어쓰거나 지우지 않고 `AddrInUse`로 거부한다.
+#[test]
+fn duplicate_socket_guard_refuses_takeover_through_symlink_or_unlinked_lock() {
+    let dir1 = Dir::new("dup-live");
+    let dir2 = Dir::new("dup-foreign");
+    let live = Listener::bind(&dir1.sock()).unwrap();
+
+    // 1. 다른 상태 디렉터리에서 심볼릭 링크로 살아 있는 소켓을 가리켜도 락 파일이 달라 우회되지 않는다.
+    fs::create_dir_all(&dir2.0).unwrap();
+    fs::set_permissions(&dir2.0, Permissions::from_mode(0o700)).unwrap();
+    let alias = dir2.sock();
+    std::os::unix::fs::symlink(dir1.sock(), &alias).unwrap();
+    let err = Listener::bind(&alias).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+
+    // 2. 원래 `.lock`이 지워져 새 락을 잡을 수 있는 상황이라도 살아 있는 리스너가 응답하므로 거부된다.
+    fs::remove_file(with_suffix(&dir1.sock(), ".lock")).unwrap();
+    let err2 = Listener::bind(&dir1.sock()).unwrap_err();
+    assert_eq!(err2.kind(), io::ErrorKind::AddrInUse);
+    // probe_live_socket이 연결해 두고 닫은 프로브 연결을 소비한다.
+    let _probe = live.accept().unwrap();
+
+    // 원래 리스너는 아무 손상 없이 계속 연결을 수락하고 핸드셰이크를 수행한다.
+    let peer = client(
+        dir1.sock(),
+        krill_proto::daemon::client_hello(ClientRole::Cli, "survivor")
+            .encode()
+            .unwrap(),
+    );
+    let mut conn = live.accept().unwrap();
+    let (client_hello, _) = handshake(&mut conn, &hello()).unwrap();
+    assert_eq!(client_hello.name, "survivor");
+    drop(conn);
+    peer.join().unwrap();
+}

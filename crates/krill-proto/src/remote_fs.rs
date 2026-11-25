@@ -172,6 +172,13 @@ pub enum RemoteFsRequest {
     },
     /// 원격 호스트의 `127.0.0.1:<port>`로 TCP 연결을 맺고, 성공 응답 직후 제어 스트림을 양방향 바이트 터널로 전환한다.
     PortForward { port: u16 },
+    /// 진행 중인 다중 청크 스테이징(`stage_id != 0`)을 중단하고 임시 스테이징 파일을 지운다.
+    /// 구버전 데몬은 알 수 없는 variant를 `Failure::BadRequest`로 거절하므로 클라이언트가 조용히 무시할 수 있다.
+    AbortStage {
+        #[serde(deserialize_with = "remote_path")]
+        path: Vec<u8>,
+        stage_id: u64,
+    },
 }
 
 /// [`RemoteFsRequest`]의 응답. variant는 끝에만 붙인다.
@@ -193,6 +200,8 @@ pub enum RemoteFsReply {
     QuickOpenFiles(#[serde(deserialize_with = "quick_open_result")] Result<Vec<Vec<u8>>, String>),
     /// 포트 포워딩 연결 결과. `Ok(())` 프레임 직후부터 원시 TCP 바이트가 흐른다.
     PortForwarded(#[serde(deserialize_with = "unit_result")] Result<(), String>),
+    /// [`RemoteFsRequest::AbortStage`] 결과: 활성 스테이지를 실제로 지웠으면 `true`.
+    StageAborted(bool),
 }
 
 impl RemoteFsRequest {
@@ -419,11 +428,41 @@ mod tests {
         assert_ne!(crate::ipc::FEATURES & crate::control::FEAT_REMOTE_FS, 0);
         assert!(!RemoteFsRequest::PortForward { port: 8080 }.is_read_only());
         assert!(
+            !RemoteFsRequest::AbortStage {
+                path: b"/tmp/a.png".to_vec(),
+                stage_id: 7,
+            }
+            .is_read_only()
+        );
+        assert!(
             RemoteFsRequest::Stat {
                 path: b"/repo".to_vec()
             }
             .is_read_only()
         );
+    }
+
+    #[test]
+    fn abort_stage_roundtrip_and_path_limit() {
+        let req = Request::RemoteFs(RemoteFsRequest::AbortStage {
+            path: b"/tmp/krill-paste/img.png".to_vec(),
+            stage_id: 42,
+        });
+        let encoded = req.encode().unwrap();
+        let (kind, body) = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        assert_eq!(Request::decode(kind, &body).unwrap(), req);
+
+        let reply = Reply::RemoteFs(RemoteFsReply::StageAborted(true));
+        let encoded = reply.encode().unwrap();
+        let (kind, body) = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        assert_eq!(Reply::decode(kind, &body).unwrap(), reply);
+
+        let oversized = Request::RemoteFs(RemoteFsRequest::AbortStage {
+            path: vec![b'x'; MAX_REMOTE_PATH + 1],
+            stage_id: 1,
+        });
+        let raw = postcard::to_stdvec(&oversized).unwrap();
+        assert!(Request::decode(crate::control::kind::REQUEST, &raw).is_err());
     }
 
     #[test]

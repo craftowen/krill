@@ -154,13 +154,104 @@ pub enum VersionStatus {
     Unknown,
 }
 
-/// 원격 프로브 결과(OS·아키·홈·버전·소켓 번들).
+/// 원격 Linux 호스트의 systemd user linger 상태.
+///
+/// systemd Linux에서 linger가 꺼져 있으면 마지막 SSH 로그인 세션이 닫힐 때 `krill-holder`/`krilld`와
+/// 백그라운드 세션이 함께 종료될 수 있다. macOS·Windows·비systemd Linux에서는 [`Self::NotApplicable`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LingerStatus {
+    /// systemd user linger가 켜져 있음.
+    Enabled,
+    /// systemd Linux 호스트에서 linger가 꺼져 있음(`sudo loginctl enable-linger <user>` 권장).
+    Disabled { user: String },
+    /// 비Linux, 비systemd, 또는 조회 불가(경고하지 않음).
+    #[default]
+    NotApplicable,
+}
+
+impl LingerStatus {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled { .. })
+    }
+
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        match self {
+            Self::Disabled { user } => Some(user.as_str()),
+            Self::Enabled | Self::NotApplicable => None,
+        }
+    }
+
+    /// 복사해 실행할 수 있는 정확한 linger 활성화 명령(`sudo loginctl enable-linger <user>`).
+    #[must_use]
+    pub fn fix_command(&self) -> Option<String> {
+        let user = self.user()?;
+        valid_linux_username(user).then(|| format!("sudo loginctl enable-linger {user}"))
+    }
+}
+
+/// POSIX/Linux 사용자명 검사(셸 주입·공백·선행 `-` 거부).
+#[must_use]
+pub fn valid_linux_username(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 64
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// 원격 `krill-user=`·`krill-linger=` 출력과 OS를 [`LingerStatus`]로 해석한다.
+///
+/// Linux가 아니거나 `loginctl`/systemd가 없는 환경은 조용히 [`LingerStatus::NotApplicable`]을 돌려준다.
+#[must_use]
+pub fn parse_linger_status(
+    os: &RemoteOs,
+    raw_linger: Option<&str>,
+    raw_user: Option<&str>,
+) -> LingerStatus {
+    if !matches!(os, RemoteOs::Linux) {
+        return LingerStatus::NotApplicable;
+    }
+    let Some(value) = raw_linger.map(str::trim) else {
+        return LingerStatus::NotApplicable;
+    };
+    if value.eq_ignore_ascii_case("yes") {
+        return LingerStatus::Enabled;
+    }
+    if value.eq_ignore_ascii_case("no") {
+        let user = raw_user
+            .map(str::trim)
+            .filter(|u| valid_linux_username(u))
+            .map(ToOwned::to_owned);
+        if let Some(user) = user {
+            return LingerStatus::Disabled { user };
+        }
+    }
+    LingerStatus::NotApplicable
+}
+
+/// Linux systemd linger 조회용 POSIX `/bin/sh` 조각(비Linux·비systemd에서는 실패 없이 무시).
+pub(crate) const LINGER_PROBE_SNIPPET: &str = "if [ \"$(uname -s)\" = Linux ]; then \
+u=\"${USER:-$(id -un 2>/dev/null)}\"; \
+printf \"krill-user=%s\\n\" \"$u\"; \
+if [ -d /run/systemd/system ]; then \
+l=$(loginctl show-user \"$u\" -p Linger --value 2>/dev/null); \
+if [ \"$l\" = yes ] || [ \"$l\" = no ]; then printf \"krill-linger=%s\\n\" \"$l\"; \
+elif [ -n \"$u\" ] && [ -e \"/var/lib/systemd/linger/$u\" ]; then printf \"krill-linger=yes\\n\"; \
+elif [ -d /var/lib/systemd/linger ] || command -v loginctl >/dev/null 2>&1; then printf \"krill-linger=no\\n\"; \
+else printf \"krill-linger=unavailable\\n\"; fi; \
+else printf \"krill-linger=unavailable\\n\"; fi; fi";
+
+/// 원격 프로브 결과(OS·아키·홈·버전·소켓 번들·Linux linger 상태).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInfo {
     pub platform: RemotePlatform,
     pub home: String,
     pub version: RemoteVersion,
     pub socket_bundle: Option<String>,
+    pub linger: LingerStatus,
 }
 
 impl RemoteInfo {
@@ -216,10 +307,10 @@ impl RemoteInfo {
 }
 
 /// 원격 프로브 셸 스크립트(`/bin/sh -c '…'` 한 번 호출, fish·tcsh 로그인 셸 안전).
-/// `krill-os`·`krill-arch`·`krill-home`·`krill-version`·`krill-sock` 라벨 행만 출력한다.
+/// `krill-os`·`krill-arch`·`krill-home`·`krill-version`·`krill-sock`·(Linux 시)`krill-user`·`krill-linger` 라벨 행만 출력한다.
 pub fn probe_command() -> String {
     format!(
-        "/bin/sh -c 'printf \"krill-os=%s\\n\" \"$(uname -s)\"; printf \"krill-arch=%s\\n\" \"$(uname -m)\"; printf \"krill-home=%s\\n\" \"$HOME\"; if [ -f \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" ]; then printf \"krill-version=%s\\n\" \"$(cat \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" 2>/dev/null)\"; elif command -v krill >/dev/null 2>&1; then printf \"krill-version=%s\\n\" \"unmanaged\"; else printf \"krill-version=%s\\n\" \"missing\"; fi; b={}; if [ -S \"$HOME/Library/Application Support/$b/run/krilld.sock\" ]; then printf \"krill-sock=%s\\n\" \"$b\"; fi'",
+        "/bin/sh -c 'printf \"krill-os=%s\\n\" \"$(uname -s)\"; printf \"krill-arch=%s\\n\" \"$(uname -m)\"; printf \"krill-home=%s\\n\" \"$HOME\"; if [ -f \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" ]; then printf \"krill-version=%s\\n\" \"$(cat \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" 2>/dev/null)\"; elif command -v krill >/dev/null 2>&1; then printf \"krill-version=%s\\n\" \"unmanaged\"; else printf \"krill-version=%s\\n\" \"missing\"; fi; b={}; if [ -S \"$HOME/Library/Application Support/$b/run/krilld.sock\" ]; then printf \"krill-sock=%s\\n\" \"$b\"; fi; {LINGER_PROBE_SNIPPET}'",
         daemon::BUNDLE_ID
     )
 }
@@ -246,6 +337,8 @@ pub fn parse_probe(output: &str) -> io::Result<RemoteInfo> {
     let mut home: Option<String> = None;
     let mut version: Option<String> = None;
     let mut sock: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut linger: Option<String> = None;
     for line in output.lines() {
         let (key, value) = line.split_once('=').unwrap_or(("", ""));
         match key {
@@ -254,6 +347,8 @@ pub fn parse_probe(output: &str) -> io::Result<RemoteInfo> {
             "krill-home" => home = Some(value.to_owned()),
             "krill-version" => version = Some(value.to_owned()),
             "krill-sock" => sock = Some(value.to_owned()),
+            "krill-user" => user = Some(value.to_owned()),
+            "krill-linger" => linger = Some(value.to_owned()),
             _ => {}
         }
     }
@@ -280,15 +375,18 @@ pub fn parse_probe(output: &str) -> io::Result<RemoteInfo> {
     let socket_bundle = sock
         .map(|s| s.trim().to_owned())
         .filter(|s| *s == daemon::BUNDLE_ID);
+    let parsed_os = parse_os(&os_raw);
+    let linger = parse_linger_status(&parsed_os, linger.as_deref(), user.as_deref());
     Ok(RemoteInfo {
         platform: RemotePlatform {
-            os: parse_os(&os_raw),
+            os: parsed_os,
             arch: parse_arch(&arch_raw),
             kernel: os_raw.trim().chars().take(32).collect(),
         },
         home: home_raw,
         version,
         socket_bundle,
+        linger,
     })
 }
 
@@ -325,6 +423,7 @@ fn bridge_info(probe: &ssh::Probe) -> RemoteInfo {
         version: parse_version_value(&probe.version)
             .map_or(RemoteVersion::Unmanaged, RemoteVersion::Known),
         socket_bundle: None,
+        linger: LingerStatus::NotApplicable,
     }
 }
 

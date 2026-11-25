@@ -766,10 +766,7 @@ pub fn classify_ssh_error(stderr: &str) -> SshTestFailureKind {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("connection refused") {
         SshTestFailureKind::ConnectionRefused
-    } else if lower.contains("permission denied")
-        || lower.contains("publickey")
-        || lower.contains("authentication failed")
-    {
+    } else if krill_hosts::ssh::is_ssh_auth_failure(stderr) {
         SshTestFailureKind::AuthFailed
     } else {
         SshTestFailureKind::Other

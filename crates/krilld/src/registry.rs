@@ -53,12 +53,21 @@ mod closed_sessions;
 mod hibernation;
 mod hook_identity;
 mod orch_cache;
+pub(crate) mod persistence;
 mod schedule;
 mod session_ids;
 mod sidebar;
 #[cfg(all(test, unix))]
 mod stale_sessions_tests;
 pub mod usage_tick;
+
+struct RemoteFsConnGuard(u64);
+
+impl Drop for RemoteFsConnGuard {
+    fn drop(&mut self) {
+        crate::remote_fs::cleanup_connection(self.0);
+    }
+}
 
 /// `Terminate`가 없는 holder(v2 이하)에 닫기를 보내는 방법.
 const TERMINATE_SINCE: u16 = 3;
@@ -981,6 +990,7 @@ impl Registry {
         let mut body = body;
         let mut clients = HashMap::new();
         let mut control_slot = None;
+        let remote_fs_conn = RemoteFsConnGuard(crate::remote_fs::next_connection_id());
         loop {
             let decoded = Request::decode(control::kind::REQUEST, &body);
             if !mobile {
@@ -1171,6 +1181,14 @@ impl Registry {
                         Reply::Bot(self.on_bot_rpc_for_peer(&peer, role == Role::Observer, req))
                     } else {
                         peer.deny("bots", &self.audit);
+                        Reply::Failed(Failure::Denied)
+                    }
+                }
+                Ok(Request::RemoteFs(req)) => {
+                    if peer.scope.full() {
+                        Reply::RemoteFs(crate::remote_fs::serve_on_conn(remote_fs_conn.0, req))
+                    } else {
+                        peer.deny("remote-fs", &self.audit);
                         Reply::Failed(Failure::Denied)
                     }
                 }
@@ -4209,6 +4227,15 @@ impl Registry {
     /// Returns the [`crate::bots::BotsManager`] only if already lazily initialized (zero side effects).
     pub fn bots_if_initialized(&self) -> Option<&Arc<crate::bots::BotsManager>> {
         self.bots.get()
+    }
+
+    /// 데몬 종료 시 대기 중인 상태·닫힘 원장·세그먼트 표식을 제한 시간 내에 안전하게 비운다.
+    pub fn flush_persistence(&self, timeout: Duration) {
+        if let Some(store) = &self.store {
+            store.retry_pending_markers();
+        }
+        self.status.shutdown(timeout);
+        self.closed_ledger.flush(timeout);
     }
 
     /// Lazily initializes the [`crate::bots::BotsManager`] when a bot RPC or periodic bot tick needs it.

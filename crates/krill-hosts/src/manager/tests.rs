@@ -970,3 +970,174 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '
     drop(manager);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn auth_failure_uses_slow_backoff_schedule_and_allows_immediate_manual_reconnect() {
+    assert_eq!(HostManager::auth_backoff_delay(1), Duration::from_secs(120));
+    assert_eq!(HostManager::auth_backoff_delay(2), Duration::from_secs(300));
+    assert_eq!(HostManager::auth_backoff_delay(3), Duration::from_secs(600));
+    assert_eq!(HostManager::auth_backoff_delay(9), Duration::from_secs(600));
+
+    let dir = std::env::temp_dir().join(format!("krill-auth-backoff-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+base=$(dirname "$0")
+printf 'attempt\n' >> "$base/attempts"
+echo 'owen@studio.local: Permission denied (publickey).' >&2
+exit 255
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let agent_fp = Arc::new(AtomicU64::new(100));
+    let probe_fp = Arc::clone(&agent_fp);
+    let manager =
+        HostManager::with_ssh_and_agent_probe(dir.clone(), script.into_os_string(), move || {
+            Some(probe_fp.load(Ordering::Acquire))
+        });
+    let host = spec(Some("/tmp/remote.sock"));
+    manager.sync_specs(std::slice::from_ref(&host));
+
+    let attempts = || {
+        fs::read_to_string(dir.join("attempts"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    // First auth failure -> AuthFailed status + 2m backoff
+    let err = manager.ensure_tunnel_socket("studio").unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(manager.status("studio"), HostStatus::AuthFailed);
+    let remaining = manager.next_retry_in("studio").expect("2m backoff active");
+    assert!(
+        remaining >= Duration::from_secs(110) && remaining <= Duration::from_secs(120),
+        "expected ~2m backoff, got {remaining:?}"
+    );
+    assert_eq!(attempts(), 1);
+
+    // Subsequent automatic retries while backed off must NOT invoke ssh (fail2ban protection)
+    let blocked = manager.ensure_tunnel_socket("studio").unwrap_err();
+    assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(manager.status("studio"), HostStatus::AuthFailed);
+    assert_eq!(attempts(), 1);
+
+    // Recording WouldBlock IPC outcome must preserve AuthFailed status
+    manager.record_ipc_outcome("studio", false, Some(&blocked));
+    assert_eq!(manager.status("studio"), HostStatus::AuthFailed);
+
+    // Simulate expiry of 1st backoff -> 2nd auth failure steps up to 5m backoff
+    manager
+        .slot("studio")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .next_retry_at = Instant::now().checked_sub(Duration::from_secs(1));
+    AUTH_BACKOFF
+        .lock()
+        .unwrap()
+        .remove(&manager.offline_key(&host));
+    assert!(manager.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(attempts(), 2);
+    let remaining2 = manager.next_retry_in("studio").expect("5m backoff active");
+    assert!(
+        remaining2 >= Duration::from_secs(290) && remaining2 <= Duration::from_secs(300),
+        "expected ~5m backoff, got {remaining2:?}"
+    );
+
+    // Simulate expiry of 2nd backoff -> 3rd auth failure caps at 10m backoff
+    manager
+        .slot("studio")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .next_retry_at = Instant::now().checked_sub(Duration::from_secs(1));
+    AUTH_BACKOFF
+        .lock()
+        .unwrap()
+        .remove(&manager.offline_key(&host));
+    assert!(manager.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(attempts(), 3);
+    let remaining3 = manager.next_retry_in("studio").expect("10m backoff active");
+    assert!(
+        remaining3 >= Duration::from_secs(590) && remaining3 <= Duration::from_secs(600),
+        "expected ~10m backoff, got {remaining3:?}"
+    );
+
+    // Unlocking ssh-agent (fingerprint changes) immediately breaks the backoff and retries!
+    agent_fp.store(200, Ordering::Release);
+    assert!(manager.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(
+        attempts(),
+        4,
+        "ssh-agent unlock must trigger immediate retry"
+    );
+
+    // Manual reconnect immediately clears backoff and retries even without agent change
+    manager.reconnect_now("studio");
+    assert_eq!(manager.status("studio"), HostStatus::Connecting);
+    assert!(manager.next_retry_in("studio").is_none());
+    assert!(manager.ensure_tunnel_socket("studio").is_err());
+    assert_eq!(attempts(), 5, "manual reconnect must retry immediately");
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn linux_linger_disabled_is_captured_during_tunnel_connect() {
+    let dir = std::env::temp_dir().join(format!("krill-linger-connect-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ssh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  case "$a" in /bin/sh\ -c\ *HOME*)
+    printf '/home/ubuntu\n.local/share/dev.krill.app\nkrill-user=ubuntu\nkrill-linger=no\n'
+    exit 0;;
+  esac
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+: > "${fwd%%:*}"
+cat >/dev/null
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    manager.sync_specs(&[spec(None)]);
+    let _sock = manager.ensure_tunnel_socket("studio").unwrap();
+    assert_eq!(
+        manager.linger_status("studio"),
+        LingerStatus::Disabled {
+            user: "ubuntu".into()
+        }
+    );
+    let warnings = manager.linger_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].1.fix_command().as_deref(),
+        Some("sudo loginctl enable-linger ubuntu")
+    );
+    let info = manager
+        .connection_info("studio")
+        .expect("linger warning surfaced in connection_info");
+    assert!(
+        info.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("sudo loginctl enable-linger ubuntu"))
+    );
+
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}

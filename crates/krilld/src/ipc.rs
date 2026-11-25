@@ -26,6 +26,8 @@ use crate::sys;
 pub use krill_proto::daemon::SUN_PATH_MAX;
 /// 핸드셰이크 중 클라이언트 응답을 기다리는 최대 시간. 멈춘 클라이언트가 accept 흐름을 붙잡지 못하게 한다.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// 기동 시 기존 소켓에 살아 있는 데몬이 응답하는지 확인할 때 쓰는 짧은 타임아웃.
+const LIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 mod machine_identity;
 
@@ -87,6 +89,9 @@ impl Listener {
                 "socket directory must be a 0700 directory owned by this user",
             ));
         }
+        // 심볼릭 링크·다른 상태 디렉터리·락 파일 분리 등으로 이미 살아 있는 krilld가 `path`에서 듣고 있으면
+        // 락 파일을 잡거나 소켓을 덮어쓰기 전에 먼저 거부한다(Herdr #200).
+        ensure_no_live_daemon_at(path)?;
         let lock = lock(path)?;
         // 이 소켓을 맡은 holder가 살아 있으면(그 krilld가 재기동 대기 중이라 소켓 락이 비었다) 덮어쓰지 않는다.
         // 덮어쓰면 그 holder의 세션에 아무도 붙지 못한다(경로 B). 파일은 holder만 만든다.
@@ -98,6 +103,8 @@ impl Listener {
                 "a live holder owns the socket",
             ));
         }
+        // 락을 잡은 직후에도 살아 있는 소켓이 남아 있지 않은지 한 번 더 확인해 경합을 닫는다.
+        probe_live_socket(path)?;
         // 락을 쥔 프로세스만 여기 온다. 남은 `.tmp`는 bind와 rename 사이에 죽은 이전 소유자의 것이다.
         match fs::remove_file(&tmp) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -167,6 +174,54 @@ impl std::os::fd::AsFd for Listener {
 impl std::os::windows::io::AsSocket for Listener {
     fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
         sys::listener_socket(&self.sock)
+    }
+}
+
+/// `path`가 이미 살아 있는 데몬(또는 다른 상태 디렉터리의 심볼릭 링크 대상)의 소켓을 가리키면
+/// 덮어쓰거나 세션을 빼앗지 않고 `AddrInUse`로 거절한다(Herdr #200).
+fn ensure_no_live_daemon_at(path: &Path) -> io::Result<()> {
+    if let Ok(canon) = fs::canonicalize(path) {
+        for suffix in [".lock", ".holder.lock"] {
+            if let Ok(owner) = File::open(with_suffix(&canon, suffix))
+                && matches!(owner.try_lock(), Err(TryLockError::WouldBlock))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("another krilld already listens at {}", path.display()),
+                ));
+            }
+        }
+    }
+    probe_live_socket(path)
+}
+
+fn probe_live_socket(path: &Path) -> io::Result<()> {
+    match UnixStream::connect(path) {
+        Ok(mut stream) => {
+            stream.set_read_timeout(Some(LIVE_PROBE_TIMEOUT)).ok();
+            drop(
+                ipc::read_frame(&mut stream)
+                    .ok()
+                    .flatten()
+                    .and_then(|(kind, body)| ServerHello::decode(kind, &body).ok()),
+            );
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("another krilld already listens at {}", path.display()),
+            ))
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(())
+        }
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("another krilld already owns {}", path.display()),
+        )),
     }
 }
 
